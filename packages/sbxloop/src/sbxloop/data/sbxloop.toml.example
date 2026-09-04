@@ -100,6 +100,19 @@ secret_strategy = "proxy"
 # only the remote clone honours it, and it suits public repositories only.
 # A git without --filter support clones in full and logs.
 # clone_filter = "blob:none"
+# Whether a run clone's submodules are checked out. On by default: a
+# repository that vendors a dependency as a submodule does not build without
+# it. Each submodule comes from the host checkout's own copy when that copy
+# has the recorded commit, else from its .gitmodules URL with the run's
+# GitHub credential (which must be able to read that repository too); one
+# that neither route can populate fails provisioning by name. The hosts the
+# submodules fetch from join the run's egress allow list. Set false for a
+# repository whose submodules are optional or unreadable to the run — the
+# directories are then left empty. Either way, a run's changes INSIDE a
+# submodule are never delivered (the pull request is against this
+# repository); a submodule moved to a commit its remote has is delivered as
+# the moved pointer.
+# clone_submodules = true
 # Toolchains preinstalled in the agent sandbox. Unset = whatever the
 # workspace's manifests declare (go.mod, package.json, Cargo.toml, ...),
 # Python when nothing is recognized. Setting it replaces detection.

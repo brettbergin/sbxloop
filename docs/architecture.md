@@ -101,7 +101,11 @@ Before either exists, the provisioner decides what the agent sandbox is *for*:
 and which series of each (`.python-version` / `requires-python`, `.nvmrc` /
 `engines.node`; one `sandbox.toolchain` event per versioned toolchain, #627).
 That single answer builds the installer allowlist, drives the worker
-install, and scopes the project gate, so none of them can disagree.
+install, and scopes the project gate, so none of them can disagree. A fresh
+run clone has its submodules populated first (`hostgit.populate_submodules`,
+#692) — from the host checkout's copy when it has the recorded commit, else
+from the `.gitmodules` URL under the run's credential — and the hosts they
+fetch from join that allowlist (`sandbox.submodule_hosts`).
 The github sandbox exists only when the GitHub integration is configured
 (`[github] repo = "owner/repo"`, or at least one `[[github.repos]]` entry);
 without it, `pair.github` is `None`, `GH_TOKEN`

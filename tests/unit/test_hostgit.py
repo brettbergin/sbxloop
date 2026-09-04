@@ -7,6 +7,7 @@ independent of the code under test.
 
 from __future__ import annotations
 
+import logging
 import shutil
 import subprocess
 from pathlib import Path
@@ -1141,3 +1142,321 @@ class TestIsTracked:
         root = make_repo(tmp_path)
         monkeypatch.setattr(hostgit, "find_git", lambda: None)
         assert hostgit.is_tracked(root, root / "hello.txt") is None
+
+
+def make_submodule_setup(tmp_path: Path, remote_root: str) -> tuple[Path, Path, Path]:
+    """A library repo, its bare copy under ``tmp_path/remotes`` (served at
+    ``remote_root``), and a superproject checkout that vendors the library
+    as the submodule ``vendor/lib`` — populated, at the library's first
+    commit. Returns (superproject, lib checkout, lib bare)."""
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    git("init", "-b", "main", cwd=lib)
+    (lib / "lib.txt").write_text("v1\n")
+    git("add", ".", cwd=lib)
+    git("commit", "-m", "lib v1", cwd=lib)
+    lib_bare = bare_from(lib, tmp_path / "remotes", "lib.git")
+    app = make_repo(tmp_path, "app")
+    git("submodule", "add", "-q", f"{remote_root}/lib.git", "vendor/lib", cwd=app)
+    git("commit", "-q", "-m", "vendor lib", cwd=app)
+    return app, lib, lib_bare
+
+
+def lib_v2(lib: Path, lib_bare: Path) -> str:
+    """A second library commit, pushed to the bare remote; returns its sha."""
+    (lib / "lib.txt").write_text("v2\n")
+    git("commit", "-q", "-am", "lib v2", cwd=lib)
+    git("push", "-q", str(lib_bare), "main", cwd=lib)
+    return rev(lib)
+
+
+class TestSubmodules:
+    """#692: a run clone's submodules are populated, from the host checkout
+    when it can, and a moved gitlink surfaces as a ``160000`` change with
+    the commit it points at — never as the deletion of a directory."""
+
+    @pytest.fixture
+    def remote(self, tmp_path: Path):  # type: ignore[no-untyped-def]
+        (tmp_path / "remotes").mkdir()
+        with PrivateGitServer(tmp_path / "remotes", username="x", token="y", public=True) as srv:
+            yield srv
+
+    def test_lists_gitmodules_entries(self, tmp_path: Path, remote: PrivateGitServer) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        (sub,) = hostgit.list_submodules(app)
+        assert (sub.name, sub.path, sub.url) == (
+            "vendor/lib",
+            "vendor/lib",
+            f"{remote.url}/lib.git",
+        )
+        assert hostgit.list_submodules(make_repo(tmp_path, "plain")) == []
+
+    def test_fresh_clone_populates_from_the_host_checkout(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert not (clone / "vendor" / "lib" / "lib.txt").exists()  # a bare gitlink
+        before = len(remote.requests)
+        populated = hostgit.populate_submodules(clone, source=app, token=None)
+        assert populated == [("vendor/lib", "local")]
+        assert (clone / "vendor" / "lib" / "lib.txt").read_text() == "v1\n"
+        assert len(remote.requests) == before  # nothing fetched over the network
+        # origin points at the URL .gitmodules names, not at the host path
+        sub = clone / "vendor" / "lib"
+        assert git_out("remote", "get-url", "origin", cwd=sub) == f"{remote.url}/lib.git"
+        assert clone_config(clone, "submodule.vendor/lib.url") == f"{remote.url}/lib.git"
+        assert str(app) not in git_out("config", "--list", cwd=sub)
+
+    def test_a_stale_host_copy_falls_back_to_the_remote(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        """The host checkout's submodule lacks the commit the superproject
+        records (someone bumped the gitlink without `submodule update`)."""
+        app, lib, lib_bare = make_submodule_setup(tmp_path, remote.url)
+        v2 = lib_v2(lib, lib_bare)
+        git("update-index", "--cacheinfo", f"160000,{v2},vendor/lib", cwd=app)
+        git("commit", "-q", "-m", "bump lib without updating", cwd=app)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        populated = hostgit.populate_submodules(clone, source=app, token=None)
+        assert populated == [("vendor/lib", "remote")]
+        assert (clone / "vendor" / "lib" / "lib.txt").read_text() == "v2\n"
+        assert rev(clone / "vendor" / "lib") == v2
+        assert remote.requests  # the fallback went to the remote
+
+    def test_without_a_host_checkout_the_remote_is_the_source(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert hostgit.populate_submodules(clone, source=None, token=None) == [
+            ("vendor/lib", "remote")
+        ]
+        assert (clone / "vendor" / "lib" / "lib.txt").read_text() == "v1\n"
+
+    def test_a_private_submodule_takes_the_runs_token(self, tmp_path: Path) -> None:
+        token = "ghs_sub-token"
+        (tmp_path / "remotes").mkdir()
+        with PrivateGitServer(
+            tmp_path / "remotes", username="x-access-token", token=token
+        ) as private:
+            # The superproject is built while the server is public, then
+            # its .gitmodules is pointed at the same server made private.
+            private.public = True
+            app, _, _ = make_submodule_setup(tmp_path, private.url)
+            private.public = False
+            clone = tmp_path / "run"
+            hostgit.clone_for_run(app, clone, "sbxloop/r1")
+            with pytest.raises(ProvisionError) as excinfo:
+                hostgit.populate_submodules(clone, source=None, token=None)
+            assert "vendor/lib" in str(excinfo.value)
+            populated = hostgit.populate_submodules(clone, source=None, token=token)
+            assert populated == [("vendor/lib", "remote")]
+            assert (clone / "vendor" / "lib" / "lib.txt").read_text() == "v1\n"
+            assert token not in (clone / ".git" / "config").read_text()
+            assert (
+                token not in (clone / ".git" / "modules" / "vendor" / "lib" / "config").read_text()
+            )
+
+    def test_a_local_path_submodule_url_is_refused(self, tmp_path: Path) -> None:
+        """A `.gitmodules` URL naming a host path must not be followed: the
+        clone is read by the sandbox, and such a URL would copy any git
+        repository on the host into it."""
+        lib = make_repo(tmp_path, "lib")
+        app = make_repo(tmp_path, "app")
+        git(
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            str(lib),
+            "vendor/lib",
+            cwd=app,
+        )
+        git("commit", "-q", "-m", "vendor lib", cwd=app)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        with pytest.raises(ProvisionError) as excinfo:
+            hostgit.populate_submodules(clone, source=None, token=None)
+        assert "vendor/lib" in str(excinfo.value)
+        assert "clone_submodules = false" in str(excinfo.value)
+
+    def test_nested_submodules_populate_level_by_level(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        """The library itself vendors a submodule: the host checkout's copy
+        of it is the source one level down, the remote when that copy is
+        absent."""
+        core = tmp_path / "core"
+        core.mkdir()
+        git("init", "-b", "main", cwd=core)
+        (core / "core.txt").write_text("core\n")
+        git("add", ".", cwd=core)
+        git("commit", "-m", "core", cwd=core)
+        bare_from(core, tmp_path / "remotes", "core.git")
+        app, lib, lib_bare = make_submodule_setup(tmp_path, remote.url)
+        git("submodule", "add", "-q", f"{remote.url}/core.git", "deps/core", cwd=lib)
+        git("commit", "-q", "-m", "vendor core", cwd=lib)
+        git("push", "-q", str(lib_bare), "main", cwd=lib)
+        git("-C", "vendor/lib", "pull", "-q", "origin", "main", cwd=app)
+        git("-C", "vendor/lib", "submodule", "update", "--init", "-q", cwd=app)
+        git("commit", "-q", "-am", "bump lib", cwd=app)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert hostgit.populate_submodules(clone, source=app, token=None) == [
+            ("vendor/lib", "local"),
+            ("vendor/lib/deps/core", "local"),
+        ]
+        assert (clone / "vendor" / "lib" / "deps" / "core" / "core.txt").read_text() == "core\n"
+        clone2 = tmp_path / "run2"
+        hostgit.clone_for_run(app, clone2, "sbxloop/r2")
+        assert hostgit.populate_submodules(clone2, source=None, token=None) == [
+            ("vendor/lib", "remote"),
+            ("vendor/lib/deps/core", "remote"),
+        ]
+        assert (clone2 / "vendor" / "lib" / "deps" / "core" / "core.txt").read_text() == "core\n"
+
+    def test_no_submodules_is_a_no_op(self, tmp_path: Path) -> None:
+        source, clone = make_clone(tmp_path)
+        assert hostgit.populate_submodules(clone, source=source, token=None) == []
+
+    def test_a_gitmodules_entry_without_a_gitlink_is_skipped(
+        self, tmp_path: Path, remote: PrivateGitServer, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # a half-finished ``git rm``: the gitlink is gone, the .gitmodules
+        # entry stayed behind — nothing to check out, not a failed run
+        app, _lib, _lib_bare = make_submodule_setup(tmp_path, remote.url)
+        git("rm", "--cached", "vendor/lib", cwd=app)
+        git("commit", "-m", "drop the gitlink, keep the stanza", cwd=app)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        with caplog.at_level(logging.INFO):
+            assert hostgit.populate_submodules(clone, source=app, token=None) == []
+        assert not (clone / "vendor" / "lib").exists()
+        assert any("workspace.submodule_not_in_tree" in r.getMessage() for r in caplog.records)
+
+    def test_a_bumped_gitlink_is_a_160000_change_with_its_commit(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, lib, lib_bare = make_submodule_setup(tmp_path, remote.url)
+        v2 = lib_v2(lib, lib_bare)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_submodules(clone, source=app, token=None)
+        # the agent fetches and checks the new library commit out, staging
+        # nothing in the superproject
+        git("fetch", "-q", "origin", cwd=clone / "vendor" / "lib")
+        git("checkout", "-q", v2, cwd=clone / "vendor" / "lib")
+        notes: list[str] = []
+        (change,) = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF), notes=notes)
+        assert change == hostgit.WorkspaceChange(
+            path="vendor/lib", status="modified", mode="160000", sha=v2
+        )
+        assert change.is_gitlink
+        assert notes == []
+        # staged, the diff carries the sha itself: same answer
+        git("add", "vendor/lib", cwd=clone)
+        (change,) = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF))
+        assert change.sha == v2
+
+    def test_changes_inside_a_submodule_are_skipped_with_a_note(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_submodules(clone, source=app, token=None)
+        (clone / "vendor" / "lib" / "lib.txt").write_text("edited in place\n")
+        (clone / "README").write_text("real work\n")
+        notes: list[str] = []
+        changes = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF), notes=notes)
+        assert [c.path for c in changes] == ["README"]
+        assert notes == ["changes inside submodule `vendor/lib` are not delivered"]
+
+    def test_a_commit_the_remote_lacks_is_not_delivered(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_submodules(clone, source=app, token=None)
+        sub = clone / "vendor" / "lib"
+        (sub / "lib.txt").write_text("local\n")
+        git("commit", "-q", "-am", "local only", cwd=sub)
+        local = rev(sub)
+        notes: list[str] = []
+        assert hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF), notes=notes) == []
+        (note,) = notes
+        assert local[:12] in note and "vendor/lib" in note and "remote does not have" in note
+
+    def test_a_removed_submodule_is_a_gitlink_deletion(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_submodules(clone, source=app, token=None)
+        git("rm", "-q", "vendor/lib", cwd=clone)  # also drops its .gitmodules entry
+        changes = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF))
+        assert [(c.path, c.status, c.mode) for c in changes] == [
+            (".gitmodules", "modified", "100644"),
+            ("vendor/lib", "deleted", "160000"),
+        ]
+
+    def test_an_untouched_submodule_is_not_a_change(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_submodules(clone, source=app, token=None)
+        (clone / "README").write_text("real work\n")
+        changes = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF))
+        assert [c.path for c in changes] == ["README"]
+
+
+class TestSubmoduleHosts:
+    def test_hosts_come_from_gitmodules_urls(self, tmp_path: Path) -> None:
+        app = make_repo(tmp_path, "app")
+        (app / ".gitmodules").write_text(
+            '[submodule "a"]\n\tpath = a\n\turl = https://gitlab.example.com/o/a.git\n'
+            '[submodule "b"]\n\tpath = vendor/b\n\turl = git@github.com:o/b.git\n'
+            '[submodule "c"]\n\tpath = c\n\turl = ssh://git@git.corp.example:2222/o/c\n'
+            '[submodule "d"]\n\tpath = d\n\turl = ../d.git\n'
+            '[submodule "e"]\n\tpath = e\n\turl = /srv/git/e.git\n'
+            '[submodule "f"]\n\tpath = f\n\turl = https://github.com/o/f\n'
+        )
+        git("remote", "add", "origin", "https://github.com/o/app.git", cwd=app)
+        assert hostgit.submodule_hosts(app) == [
+            "gitlab.example.com",
+            "github.com",
+            "git.corp.example",
+        ]
+
+    def test_relative_urls_need_an_origin(self, tmp_path: Path) -> None:
+        app = make_repo(tmp_path, "app")
+        (app / ".gitmodules").write_text('[submodule "d"]\n\tpath = d\n\turl = ../d.git\n')
+        assert hostgit.submodule_hosts(app) == []
+
+    def test_no_gitmodules_is_empty(self, tmp_path: Path) -> None:
+        assert hostgit.submodule_hosts(make_repo(tmp_path)) == []
+        assert hostgit.submodule_hosts(tmp_path / "missing") == []
+
+    @pytest.mark.parametrize(
+        ("url", "host"),
+        [
+            ("https://github.com/o/r.git", "github.com"),
+            ("https://user:tok@ghe.example.com:8443/o/r", "ghe.example.com"),
+            ("ssh://git@[::1]:22/o/r", "::1"),
+            ("git@github.com:o/r.git", "github.com"),
+            ("/srv/git/r.git", None),
+            ("../r.git", None),
+            ("C:/git/r.git", None),
+        ],
+    )
+    def test_url_host(self, url: str, host: str | None) -> None:
+        assert hostgit.url_host(url) == host

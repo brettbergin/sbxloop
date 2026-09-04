@@ -680,19 +680,39 @@ def _plan_git_diff(source_dir: Path, base_sha: str, exclude: Sequence[str]) -> D
         return None
     excluded: dict[str, int] = {}
     kept: list[hostgit.WorkspaceChange] = []
-    for change in hostgit.changes_since(source_dir, diff_base):
+    submodule_notes: list[str] = []
+    for change in hostgit.changes_since(source_dir, diff_base, notes=submodule_notes):
         hit = exclusion_hit(change.path.split("/"), exclude)
         if hit is None:
             kept.append(change)
         else:
             excluded[hit] = excluded.get(hit, 0) + 1
+    for note in submodule_notes:
+        # Work inside a submodule, or a gitlink at a commit nobody else can
+        # fetch (#692): not the superproject's to deliver, said in the PR
+        # body and the log rather than dropped in silence.
+        log.warning("deliver.submodule_change_skipped", detail=note)
     if not kept:
-        raise DeliveryError(
-            f"nothing to deliver: {source_dir} has no changes relative to {diff_base[:12]}"
-        )
+        why = f"{source_dir} has no changes relative to {diff_base[:12]}"
+        if submodule_notes:
+            why += " that can be delivered: " + "; ".join(submodule_notes)
+        raise DeliveryError(f"nothing to deliver: {why}")
     entries: list[dict[str, Any]] = []
     uploads: dict[str, bytes] = {}
+    lines: list[str] = []
     for change in kept:
+        if change.is_gitlink:
+            # A submodule pointer: the tree entry IS the commit sha, there is
+            # no blob to upload. A removed submodule drops its path the same
+            # way a removed file does.
+            sha = change.sha if change.status != "deleted" else None
+            entries.append({"path": change.path, "mode": change.mode, "type": "commit", "sha": sha})
+            lines.append(
+                f"- {STATUS_MARKER[change.status]} `{change.path}`"
+                + (f" (submodule → {change.sha[:12]})" if sha else " (submodule)")
+            )
+            continue
+        lines.append(f"- {STATUS_MARKER[change.status]} `{change.path}`")
         if change.status == "deleted":
             entries.append({"path": change.path, "mode": FILE_MODE, "type": "blob", "sha": None})
             continue
@@ -701,17 +721,18 @@ def _plan_git_diff(source_dir: Path, base_sha: str, exclude: Sequence[str]) -> D
         uploads[change.path] = (
             str(full.readlink()).encode() if change.mode == "120000" else full.read_bytes()
         )
-    excluded_note = (
-        f"{sum(excluded.values())} file(s) excluded ({', '.join(sorted(excluded))})"
-        if excluded
-        else None
-    )
+    not_delivered: list[str] = []
+    if excluded:
+        not_delivered.append(
+            f"{sum(excluded.values())} file(s) excluded ({', '.join(sorted(excluded))})"
+        )
+    not_delivered.extend(submodule_notes)
     return DeliveryPlan(
         mode="git-diff",
         entries=entries,
         uploads=uploads,
-        lines=[f"- {STATUS_MARKER[c.status]} `{c.path}`" for c in kept],
-        excluded_note=excluded_note,
+        lines=lines,
+        excluded_note="; ".join(not_delivered) or None,
         note=f"delivered as the workspace's git diff against `{diff_base[:12]}`",
     )
 

@@ -15,6 +15,7 @@ from sbxloop.deliver import branch_name, deliver_workspace, ensure_repository
 from sbxloop.errors import DeliveryError, GithubOpsError
 from sbxloop.gh.ops import PrRef
 from tests.fakes.github_errors import github_error
+from tests.fakes.gitserver import PrivateGitServer, bare_from
 
 
 class StubOps:
@@ -770,6 +771,120 @@ class TestGitDiffDelivery:
         deliver(ops, clone)
         assert "keep.txt" in [e["path"] for e in tree_entries(ops)]
         assert "**Files (" in ops.pr_kwargs["body"]
+
+
+class TestSubmoduleDelivery:
+    """#692: a submodule is a gitlink, delivered as the commit it points at
+    — never as the deletion of the directory ``stat`` sees — and work
+    inside one is named as not delivered rather than dropped."""
+
+    @pytest.fixture
+    def workspace(self, tmp_path: Path):  # type: ignore[no-untyped-def]
+        """(clone, base_sha, bump): a run clone of a superproject vendoring
+        ``vendor/lib``, and a function that moves the library to a new
+        commit its remote has and returns that sha."""
+        lib = tmp_path / "lib"
+        lib.mkdir()
+        git("init", "-b", "main", cwd=lib)
+        (lib / "lib.txt").write_text("v1\n")
+        git("add", ".", cwd=lib)
+        git("commit", "-m", "lib v1", cwd=lib)
+        lib_bare = bare_from(lib, tmp_path / "remotes", "lib.git")
+        with PrivateGitServer(tmp_path / "remotes", username="x", token="y", public=True) as srv:
+            app = tmp_path / "app"
+            app.mkdir()
+            git("init", "-b", "main", cwd=app)
+            (app / "README").write_text("app\n")
+            git("add", ".", cwd=app)
+            git("submodule", "add", "-q", f"{srv.url}/lib.git", "vendor/lib", cwd=app)
+            git("commit", "-q", "-m", "init", cwd=app)
+            clone = tmp_path / "clone"
+            hostgit.clone_for_run(app, clone, "sbxloop/r1")
+            hostgit.populate_submodules(clone, source=app, token=None)
+
+            def bump() -> str:
+                (lib / "lib.txt").write_text("v2\n")
+                git("commit", "-q", "-am", "lib v2", cwd=lib)
+                git("push", "-q", str(lib_bare), "main", cwd=lib)
+                sha = git("rev-parse", "HEAD", cwd=lib)
+                git("fetch", "-q", "origin", cwd=clone / "vendor" / "lib")
+                git("checkout", "-q", sha, cwd=clone / "vendor" / "lib")
+                return sha
+
+            yield clone, git("rev-parse", "HEAD", cwd=app), bump
+
+    def _ops(self, base_sha: str) -> StubOps:
+        class KnownBaseOps(StubOps):
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                self.ref_lookups.append((repo, ref))
+                return base_sha
+
+        return KnownBaseOps()
+
+    def test_a_bumped_gitlink_is_a_commit_entry_with_no_blob(
+        self, workspace: tuple[Path, str, Any]
+    ) -> None:
+        clone, base_sha, bump = workspace
+        sha = bump()
+        (clone / "README").write_text("uses v2\n")
+        ops = self._ops(base_sha)
+        deliver(ops, clone)
+        uploaded = {e["path"] for batch in ops.blob_batches for e in batch}
+        assert uploaded == {"README"}
+        by_path = {e["path"]: e for e in tree_entries(ops)}
+        assert by_path["vendor/lib"] == {
+            "path": "vendor/lib",
+            "mode": "160000",
+            "type": "commit",
+            "sha": sha,
+        }
+        body = ops.pr_kwargs["body"]
+        assert f"- M `vendor/lib` (submodule → {sha[:12]})" in body
+        assert "Not delivered" not in body
+
+    def test_work_inside_a_submodule_is_named_not_delivered(
+        self, workspace: tuple[Path, str, Any]
+    ) -> None:
+        clone, base_sha, _ = workspace
+        (clone / "vendor" / "lib" / "lib.txt").write_text("patched in place\n")
+        (clone / "README").write_text("real work\n")
+        ops = self._ops(base_sha)
+        deliver(ops, clone)
+        assert [e["path"] for e in tree_entries(ops)] == ["README"]
+        body = ops.pr_kwargs["body"]
+        assert "**Not delivered:** changes inside submodule `vendor/lib` are not delivered" in body
+
+    def test_only_work_inside_a_submodule_is_nothing_to_deliver(
+        self, workspace: tuple[Path, str, Any]
+    ) -> None:
+        clone, base_sha, _ = workspace
+        (clone / "vendor" / "lib" / "lib.txt").write_text("patched in place\n")
+        with pytest.raises(DeliveryError, match="inside submodule `vendor/lib`"):
+            deliver(self._ops(base_sha), clone)
+
+    def test_an_untouched_submodule_stays_out_of_the_tree(
+        self, workspace: tuple[Path, str, Any]
+    ) -> None:
+        clone, base_sha, _ = workspace
+        (clone / "README").write_text("real work\n")
+        ops = self._ops(base_sha)
+        deliver(ops, clone)
+        assert [e["path"] for e in tree_entries(ops)] == ["README"]
+
+    def test_a_removed_submodule_drops_its_path(self, workspace: tuple[Path, str, Any]) -> None:
+        clone, base_sha, _ = workspace
+        git("rm", "-q", "vendor/lib", cwd=clone)
+        ops = self._ops(base_sha)
+        deliver(ops, clone)
+        by_path = {e["path"]: e for e in tree_entries(ops)}
+        assert by_path["vendor/lib"] == {
+            "path": "vendor/lib",
+            "mode": "160000",
+            "type": "commit",
+            "sha": None,
+        }
+        assert by_path[".gitmodules"]["type"] == "blob"
+        assert "- D `vendor/lib` (submodule)" in ops.pr_kwargs["body"]
 
 
 def _refs_calls(ops: StubOps) -> list[tuple[str, str]]:

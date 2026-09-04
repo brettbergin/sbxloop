@@ -279,10 +279,15 @@ def dedupe_domains(domains: Iterable[str]) -> list[str]:
 
 
 def agent_policy_allows(
-    config: Config, languages: Sequence[str], repo: str | None = None
+    config: Config,
+    languages: Sequence[str],
+    repo: str | None = None,
+    *,
+    extra_domains: Sequence[str] = (),
 ) -> list[str]:
     """The agent sandbox's network allowlist for ``languages`` (and
-    ``repo``'s private registries, #680).
+    ``repo``'s private registries, #680; ``extra_domains`` are what the
+    workspace itself asks for — the hosts its submodules fetch from, #692).
 
     The one builder behind a run's agent spec, the daemon's concierge
     sandbox and the bake's scratch sandbox (#615): what a template is baked
@@ -319,6 +324,7 @@ def agent_policy_allows(
             # not — the config names it on purpose.
             *registries.domains(config.registries_for(repo)),
             *config.sandbox.extra_allow_domains,
+            *extra_domains,
         ]
     )
 
@@ -404,7 +410,12 @@ class Provisioner:
             role="agent",
             workspace=workspace,
             template=template,
-            policy_allows=agent_policy_allows(self.config, languages, repo),
+            policy_allows=agent_policy_allows(
+                self.config,
+                languages,
+                repo,
+                extra_domains=self._submodule_hosts(run_id, workspace, languages, repo),
+            ),
             secrets=[self._agent_secret_spec()],
             persistent_env=self.agent_persistent_env(repo),
             secret_env=self.agent_secret_env(repo),
@@ -420,6 +431,30 @@ class Provisioner:
             persistent_env=self.github_repo_env(repo),
         )
         return agent, github
+
+    def _submodule_hosts(
+        self, run_id: str, workspace: Path, languages: Sequence[str], repo: str | None
+    ) -> list[str]:
+        """The hosts ``workspace``'s submodules fetch from (#692), said out
+        loud as an event when they widen the allow list the run would
+        otherwise get — an operator reading the chronology should see why
+        a host they never configured is reachable."""
+        hosts = hostgit.submodule_hosts(workspace)
+        if not hosts:
+            return []
+        baseline = agent_policy_allows(self.config, languages, repo)
+        new = [host for host in hosts if host not in baseline]
+        if new:
+            self.bus.emit(
+                "sandbox.submodule_hosts",
+                run_id,
+                hosts=new,
+                message=(
+                    "submodule hosts added to the agent sandbox's egress allow list: "
+                    + ", ".join(new)
+                ),
+            )
+        return hosts
 
     def resolve_languages(self, workspace: Path | None) -> toolchains.LanguageResolution:
         """The language set a run on ``workspace`` provisions (#624):
@@ -801,7 +836,7 @@ class Provisioner:
                 "workspace_isolation = 'clone' to run from HEAD anyway, or "
                 "'in-place' to run directly in the checkout"
             )
-        return self._clone_workspace(run_id, source, clone_dir, dirty=dirty), True
+        return self._clone_workspace(run_id, source, clone_dir, dirty=dirty, repo=run_repo), True
 
     def _assert_origin_matches(self, source: Path, repo: str | None) -> None:
         """Refuse a source checkout whose ``origin`` names another repository.
@@ -898,6 +933,7 @@ class Provisioner:
                     url, clone_dir, branch, clone_filter=clone_filter, token=token
                 )
                 self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
+                self._populate_submodules(run_id, clone_dir, source=None, token=lambda: token)
                 return clone_dir
             if token:
                 why = (
@@ -916,7 +952,43 @@ class Provisioner:
                 "repository in its [[github.repos]] entry"
             ) from exc
         self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
+        self._populate_submodules(run_id, clone_dir, source=None, token=lambda: token)
         return clone_dir
+
+    def _populate_submodules(
+        self,
+        run_id: str,
+        clone_dir: Path,
+        *,
+        source: Path | None,
+        token: Callable[[], str | None],
+    ) -> None:
+        """Check out a fresh clone's submodules (#692) and say which came
+        from where. Never called for a reused clone: the agent may have
+        moved a submodule, and ``submodule update`` would move it back.
+        ``token`` is asked for only when there is a submodule to populate —
+        in App mode it mints an installation token."""
+        if not hostgit.list_submodules(clone_dir):
+            return
+        if not self.config.sandbox.clone_submodules:
+            log.info(
+                "workspace.submodules_skipped",
+                run=run_id,
+                target=str(clone_dir),
+                reason="[sandbox] clone_submodules = false",
+            )
+            return
+        populated = hostgit.populate_submodules(clone_dir, source=source, token=token())
+        if not populated:
+            return
+        self.bus.emit(
+            "sandbox.workspace_submodules",
+            run_id,
+            target=str(clone_dir),
+            submodules=[{"path": path, "source": how} for path, how in populated],
+            message="populated submodules: "
+            + ", ".join(f"{path} ({how})" for path, how in populated),
+        )
 
     def _clone_token(self, repo: str) -> str | None:
         """The token the remote clone authenticates with, or ``None`` when
@@ -975,7 +1047,9 @@ class Provisioner:
     def _branch_name(self, run_id: str, repo: str | None = None) -> str:
         return branch_name(run_id, self.config.github.branch_prefix_for(repo))
 
-    def _clone_workspace(self, run_id: str, source: Path, clone_dir: Path, *, dirty: bool) -> Path:
+    def _clone_workspace(
+        self, run_id: str, source: Path, clone_dir: Path, *, dirty: bool, repo: str | None = None
+    ) -> Path:
         branch = self._branch_name(run_id)
         if (clone_dir / ".git").exists():
             # A run that crashed after cloning but before the workspace pin
@@ -1031,6 +1105,16 @@ class Provisioner:
             dirty=dirty,
             reused=False,
             message=message,
+        )
+        # The host checkout's own submodules are the first source; one it
+        # lacks comes from its remote under the run's token (None when the
+        # host holds no credential, or has no repository configured at all:
+        # a public submodule still clones).
+        self._populate_submodules(
+            run_id,
+            clone_dir,
+            source=source,
+            token=lambda: self._clone_token(repo) if repo is not None else None,
         )
         return clone_dir
 

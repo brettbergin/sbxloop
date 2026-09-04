@@ -22,13 +22,16 @@ class PrivateGitServer:
     """Serve every bare repo under ``root`` at ``http://127.0.0.1:<port>/<path>``.
 
     Use as a context manager; ``requests`` records the Authorization header
-    of every request so a test can assert what the client presented.
+    of every request so a test can assert what the client presented. With
+    ``public`` no credential is asked for — a public remote, for the cases
+    where what is under test is the fetch, not the credential.
     """
 
-    def __init__(self, root: Path, *, username: str, token: str) -> None:
+    def __init__(self, root: Path, *, username: str, token: str, public: bool = False) -> None:
         self.root = root
         self.username = username
         self.token = token
+        self.public = public
         self.requests: list[str | None] = []
         expected = "Basic " + base64.b64encode(f"{username}:{token}".encode()).decode()
         outer = self
@@ -40,7 +43,7 @@ class PrivateGitServer:
             def _serve(self) -> None:
                 presented = self.headers.get("Authorization")
                 outer.requests.append(presented)
-                if presented != expected:
+                if not outer.public and presented != expected:
                     self.send_response(401)
                     self.send_header("WWW-Authenticate", 'Basic realm="private"')
                     self.send_header("Content-Length", "0")
