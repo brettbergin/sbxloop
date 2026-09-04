@@ -1408,8 +1408,9 @@ back within the retention window — the finish summary prints it.
    - `COPILOT_GITHUB_TOKEN` — personal account, **Copilot Requests**
      permission. Used *only* by the agent sandbox.
 
-   Export it, or put it in a `.env` file (loaded automatically from the
-   working directory; real environment variables always win):
+   Export it, or put it in a `.env` file (loaded from `~/.config/sbxloop/`
+   and from the working directory when that is not inside a git checkout;
+   real environment variables always win):
 
    ```bash
    cp sbxloop.toml.example sbxloop.toml   # every key, commented, with its default
@@ -1466,11 +1467,32 @@ secret or registrations owned by other tools.
 ## Configuration
 
 Configuration resolves, in order, from `SBXLOOP_*` environment variables,
-`./sbxloop.toml`, `pyproject.toml [tool.sbxloop]`, and a user-level
+`sbxloop.toml`, `pyproject.toml [tool.sbxloop]`, and a user-level
 `~/.config/sbxloop/sbxloop.toml` (`$XDG_CONFIG_HOME` honoured) for settings
-that follow you rather than the checkout. `sbxloop init` writes a commented
-starter file — the same `sbxloop.toml.example` committed at the repo root; `sbxloop config show` prints every resolved value and where it
-came from. The notable knobs:
+that follow you rather than the checkout. The two files are looked for in
+the current directory and, inside a git checkout, in each parent up to the
+checkout's top level — the nearest one wins, so a command typed from
+`packages/foo/` of a monorepo sees the root config. `sbxloop init` writes a
+commented starter file — the same `sbxloop.toml.example` committed at the
+repo root; `sbxloop config show` prints every resolved value and where it
+came from.
+
+**Whose file is it.** A config file the target repository *carries* —
+tracked in git, so any merged pull request can change it, the loop's own
+included — is project config: it may set how the tree is built and checked
+(`[sandbox] languages`, `gate_command`), how its branches and PRs are named
+(`[github] branch_prefix`, `pr_title_template`, `commit_message_template`)
+and `[artifacts] exclude`, and nothing else. Egress policy, the merge gate,
+budgets, the daemon, `state_dir`, which repository the token delivers to:
+those are honoured only from files the operator owns — the user config, an
+*untracked* `sbxloop.toml` (what `sbxloop init` writes, or a daemon's runner
+directory outside any checkout) or the environment. Keys a tracked file may
+not set are dropped with a `config.project_layer.ignored` warning naming
+them. The same boundary applies to `.env`: it is read from the working
+directory only outside a git checkout (a checkout's `.env` belongs to the
+application in it) and always from `~/.config/sbxloop/.env`.
+
+The notable knobs:
 
 | Key                                                       | Default            | Meaning                                                                                                                                                                                                                                                                                                                                                            |
 | --------------------------------------------------------- | ------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

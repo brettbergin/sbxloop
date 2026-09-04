@@ -1045,3 +1045,31 @@ class TestCloneSize:
         assert (clone / "other.txt").read_text() == "other\n"
         with Repo(clone) as repo:
             assert repo.active_branch.name == "sbxloop/r1"
+
+
+class TestIsTracked:
+    def test_tracked_untracked_and_outside(self, tmp_path: Path) -> None:
+        root = make_repo(tmp_path)
+        assert hostgit.is_tracked(root, root / "hello.txt") is True
+        (root / "local.toml").write_text("x = 1\n")
+        assert hostgit.is_tracked(root, root / "local.toml") is False
+        assert hostgit.is_tracked(root, root / "missing.toml") is False
+        assert hostgit.is_tracked(root, tmp_path / "elsewhere.toml") is False
+
+    def test_nested_path_and_ignored_file(self, tmp_path: Path) -> None:
+        root = make_repo(tmp_path)
+        (root / ".gitignore").write_text("sbxloop.toml\n")
+        (root / "sbxloop.toml").write_text("model = 'x'\n")
+        git("add", ".gitignore", cwd=root)
+        git("commit", "-m", "ignore", cwd=root)
+        assert hostgit.is_tracked(root, root / "sbxloop.toml") is False
+        (root / "pkg").mkdir()
+        (root / "pkg" / "pyproject.toml").write_text("[tool.sbxloop]\n")
+        git("add", "pkg/pyproject.toml", cwd=root)
+        git("commit", "-m", "pkg", cwd=root)
+        assert hostgit.is_tracked(root, root / "pkg" / "pyproject.toml") is True
+
+    def test_without_git_is_unknown(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = make_repo(tmp_path)
+        monkeypatch.setattr(hostgit, "find_git", lambda: None)
+        assert hostgit.is_tracked(root, root / "hello.txt") is None

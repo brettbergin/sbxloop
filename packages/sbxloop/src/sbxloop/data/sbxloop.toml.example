@@ -13,6 +13,14 @@
 # line is how you change one — uncomment the `[section]` header along with
 # the key. Secrets never live here — they live in .env / the environment
 # (see .env.example).
+#
+# Keep this file out of git. A copy the repository carries (tracked) is read
+# as the *project's* config and may set only how the tree is built and
+# checked ([sandbox] languages / gate_command), how branches and PRs are
+# named ([github] branch_prefix / *_template) and [artifacts] exclude; every
+# other key in a tracked file is ignored with a warning. Operator settings
+# ([policy], [landing], [daemon], [budgets], state_dir, the repository) come
+# from an untracked copy, ~/.config/sbxloop/sbxloop.toml or the environment.
 
 # Model for agent sessions, whichever [agent] backend runs them ("auto"
 # lets the chosen SDK pick its default).

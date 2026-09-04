@@ -1529,6 +1529,108 @@ def _sbxloop_toml_layer(cwd: Path) -> dict[str, Any]:
     return _read_toml(path)
 
 
+def _has_config_file(directory: Path) -> bool:
+    return (directory / "sbxloop.toml").is_file() or bool(_pyproject_layer(directory))
+
+
+# What a repository may say about itself (#671). A `sbxloop.toml` or
+# `[tool.sbxloop]` that the target repository *carries* — tracked in git, so
+# any merged pull request (the loop's own included) can change it — is
+# project config: how the tree is built and checked, how its branches and
+# PRs are named. Everything else — egress policy, the merge gate, budgets,
+# the daemon, where state lives, which repository the token delivers to — is
+# the operator's, and is honoured only from files the operator owns.
+PROJECT_LAYER_KEYS: dict[str, frozenset[str]] = {
+    "sandbox": frozenset({"languages", "gate_command"}),
+    "github": frozenset({"branch_prefix", "pr_title_template", "commit_message_template"}),
+    "artifacts": frozenset({"exclude"}),
+}
+
+
+class ConfigDiscovery(NamedTuple):
+    """Where a load looked for its file layers.
+
+    ``root`` is the directory whose ``sbxloop.toml`` / ``pyproject.toml``
+    were read — ``cwd`` itself, or the nearest ancestor up to and including
+    the enclosing git checkout's top level that carries one (a run from
+    ``packages/foo/`` of a monorepo used to see built-in defaults, #671).
+    ``git_root`` is that checkout, or None outside one.
+    """
+
+    cwd: Path
+    root: Path
+    git_root: Path | None
+
+    def is_project_file(self, path: Path) -> bool:
+        """Whether ``path`` came with the repository rather than from the
+        operator: inside a checkout *and* tracked by git. A file whose
+        tracked-ness cannot be determined is treated as the repository's —
+        the restrictive reading."""
+        from sbxloop import hostgit
+
+        if self.git_root is None:
+            return False
+        return hostgit.is_tracked(self.git_root, path) is not False
+
+
+def discover_config(cwd: Path) -> ConfigDiscovery:
+    from sbxloop import hostgit
+
+    git_root = hostgit.repo_toplevel(cwd)
+    if git_root is None:
+        return ConfigDiscovery(cwd, cwd, None)
+    top = git_root.resolve()
+    for candidate in (cwd.resolve(), *cwd.resolve().parents):
+        if _has_config_file(candidate):
+            return ConfigDiscovery(cwd, candidate, top)
+        if candidate == top:
+            break
+    return ConfigDiscovery(cwd, cwd, top)
+
+
+def _project_layer(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Split a repository-carried layer into the keys it may set and the
+    dotted keys it may not."""
+    kept: dict[str, Any] = {}
+    dropped: list[str] = []
+    for section, value in raw.items():
+        allowed = PROJECT_LAYER_KEYS.get(section)
+        if allowed is None or not isinstance(value, dict):
+            dropped.extend(_flatten({section: value}))
+            continue
+        keep = {k: v for k, v in value.items() if k in allowed}
+        if keep:
+            kept[section] = keep
+        dropped.extend(_flatten({section: {k: v for k, v in value.items() if k not in allowed}}))
+    return kept, dropped
+
+
+def _file_layers(discovery: ConfigDiscovery) -> list[tuple[str, dict[str, Any]]]:
+    """The two file layers at the discovered root, each cut down to project
+    config when the repository carries it (see ``PROJECT_LAYER_KEYS``)."""
+    layers: list[tuple[str, dict[str, Any]]] = []
+    for name, read in (
+        ("pyproject.toml", _pyproject_layer),
+        ("sbxloop.toml", _sbxloop_toml_layer),
+    ):
+        raw = read(discovery.root)
+        path = discovery.root / name
+        if raw and discovery.is_project_file(path):
+            raw, dropped = _project_layer(raw)
+            if dropped:
+                log.warning(
+                    "config.project_layer.ignored",
+                    path=str(path),
+                    keys=sorted(dropped),
+                    hint="a repository's own config may set only project keys; "
+                    "operator settings belong in ~/.config/sbxloop/sbxloop.toml, "
+                    "an untracked sbxloop.toml, or the environment",
+                )
+            name = f"{name} (project)"
+        layers.append((name, raw))
+    return layers
+
+
 def user_config_path(env: Mapping[str, str]) -> Path | None:
     """``$XDG_CONFIG_HOME/sbxloop/sbxloop.toml`` (``~/.config/...`` when
     unset), or None when ``env`` names neither — the hermetic case."""
@@ -1594,21 +1696,41 @@ def _flatten(data: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     return flat
 
 
-def load_dotenv_file(cwd: Path | None = None) -> Path | None:
-    """Load ``<cwd>/.env`` into the process environment, if present.
+def load_dotenv_file(cwd: Path | None = None, env: Mapping[str, str] | None = None) -> Path | None:
+    """Load the operator's ``.env`` files into the process environment.
 
-    Real environment variables always win (``override=False``), so a ``.env``
-    file is a convenience layer for the two PATs and ``SBXLOOP_*`` settings —
-    never a way to silently shadow explicit exports. Returns the loaded path,
-    or None when there is no file.
+    Two places, most specific first: ``<cwd>/.env`` — but only when ``cwd``
+    is not inside a git checkout, because a checkout's ``.env`` is the
+    *application's* (its own secrets, its own settings) and must never leak
+    into the loop's environment (#671) — then ``~/.config/sbxloop/.env``
+    next to the user config. Real environment variables always win
+    (``override=False``), so a ``.env`` file is a convenience layer for the
+    PATs and ``SBXLOOP_*`` settings — never a way to silently shadow explicit
+    exports. Returns the first path loaded, or None when there is none.
     """
     from dotenv import load_dotenv
 
-    path = (cwd or Path.cwd()) / ".env"
-    if not path.is_file():
-        return None
-    load_dotenv(path, override=False)
-    return path
+    from sbxloop import hostgit
+
+    env = os.environ if env is None else env
+    cwd = cwd or Path.cwd()
+    candidates: list[Path] = []
+    local = cwd / ".env"
+    if local.is_file():
+        if hostgit.repo_toplevel(cwd) is None:
+            candidates.append(local)
+        else:
+            log.debug(
+                "config.dotenv.skipped",
+                path=str(local),
+                reason="inside a git checkout: an application's .env is never loaded",
+            )
+    user = user_config_path(env)
+    if user is not None and (user.parent / ".env").is_file():
+        candidates.append(user.parent / ".env")
+    for path in candidates:
+        load_dotenv(path, override=False)
+    return candidates[0] if candidates else None
 
 
 def load_config_with_sources(
@@ -1623,10 +1745,10 @@ def load_config_with_sources(
         load_dotenv_file(cwd)
     env = os.environ if env is None else env
 
+    discovery = discover_config(cwd)
     layers: list[tuple[str, dict[str, Any]]] = [
         ("user config", _user_config_layer(env)),
-        ("pyproject.toml", _pyproject_layer(cwd)),
-        ("sbxloop.toml", _sbxloop_toml_layer(cwd)),
+        *_file_layers(discovery),
         ("env", _env_layer(env)),
     ]
 
@@ -1666,7 +1788,7 @@ def load_config_with_sources(
         # An explicit relative state_dir means project-scoped state: pin it
         # to the directory the config was discovered in so its meaning
         # cannot drift with a later chdir.
-        config = config.model_copy(update={"state_dir": cwd / config.state_dir})
+        config = config.model_copy(update={"state_dir": discovery.root / config.state_dir})
 
     for dotted in _flatten(config.model_dump()):
         sources.setdefault(dotted, "default")
@@ -1675,6 +1797,7 @@ def load_config_with_sources(
     log.debug(
         "config.loaded",
         cwd=str(cwd),
+        root=str(discovery.root),
         state_dir=str(config.state_dir),
         layers={name: len(_flatten(layer)) for name, layer in layers},
         overrides=overridden,
