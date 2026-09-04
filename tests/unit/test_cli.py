@@ -2967,9 +2967,18 @@ class TestDoctorRepoHealthRow:
         assert got == {"acme/alpha": {"suspended": True, "reason": "x"}}
 
 
+class PatProvisioner:
+    """The provisioner a doctor Box stand-in carries: PAT mode, no bot login."""
+
+    bot_login: str | None = None
+
+    def gh_bot_login(self, repo: str | None = None) -> str | None:
+        return self.bot_login
+
+
 class TestDoctorBranchProtection:
-    """Approving-review branch protection 405s every loop merge: doctor
-    surfaces it as advice (human-out-of-the-loop doctrine)."""
+    """Rules of the base the loop cannot satisfy 405 every loop merge:
+    doctor lists them as advice (human-out-of-the-loop doctrine, #673)."""
 
     def _config(self, toml: str, workdir: Path) -> Any:
         from sbxloop.config import load_config
@@ -2984,25 +2993,95 @@ class TestDoctorBranchProtection:
         rows = repo_checks(
             config,
             {"GH_TOKEN": "tok"},
-            probe=lambda _e: RepoProbe(reachable=True, review_protected=True),
+            probe=lambda _e: RepoProbe(
+                reachable=True,
+                base_blockers=(
+                    "the base requires an approving review, which the loop cannot give "
+                    "its own pull request",
+                    "the base uses a merge queue; the loop merges its pull request "
+                    "directly and does not enqueue it",
+                ),
+            ),
         )
         main, protection = rows
         assert main.ok
         assert protection.name == "github repo acme/alpha branch protection"
         assert not protection.ok and not protection.hard
         assert "HTTP 405" in protection.detail
-        assert "human-out-of-the-loop" in protection.detail
+        # One blocker per line, every one of them.
+        assert "\n- the base requires an approving review" in protection.detail
+        assert "\n- the base uses a merge queue" in protection.detail
 
     def test_unverifiable_protection_adds_no_row(self, workdir: Path) -> None:
         from sbxloop.cli.doctor import RepoProbe, repo_checks
 
         config = self._config('[[github.repos]]\nrepo = "acme/alpha"\n', workdir)
-        (row,) = repo_checks(
-            config,
-            {"GH_TOKEN": "tok"},
-            probe=lambda _e: RepoProbe(reachable=True, review_protected=None),
-        )
-        assert row.ok
+        for probe in (
+            RepoProbe(reachable=True, base_blockers=None),
+            RepoProbe(reachable=True, base_blockers=()),
+        ):
+            (row,) = repo_checks(config, {"GH_TOKEN": "tok"}, probe=lambda _e, p=probe: p)
+            assert row.ok
+
+    def test_the_sandbox_probe_lists_every_blocker_of_the_base(self, workdir: Path) -> None:
+        """#673: the probe reads the base's rulesets and reports each rule
+        the loop cannot satisfy; a PAT cannot sign, a GitHub App can."""
+        from sbxloop.cli.doctor import sandbox_repo_probe
+
+        rules = [
+            {
+                "type": "pull_request",
+                "parameters": {
+                    "required_approving_review_count": 0,
+                    "require_last_push_approval": True,
+                },
+            },
+            {"type": "required_signatures"},
+        ]
+
+        class Box:
+            provisioner = PatProvisioner()
+
+            def __init__(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def ops(self) -> Any:
+                class Ops:
+                    def repo_lookup(self, repo: str) -> dict[str, Any]:
+                        return {"default_branch": "main"}
+
+                    def raw(self, method: str, path: str, body: Any = None) -> Any:
+                        from sbxloop.errors import GithubOpsError
+
+                        if path.endswith("/labels?per_page=100&page=1"):
+                            return []
+                        if path.endswith("/rules/branches/main"):
+                            return rules
+                        raise GithubOpsError("no protection", http_status=404)
+
+                return Ops()
+
+        import sbxloop.daemon.github as github_module
+
+        config = self._config('[[github.repos]]\nrepo = "acme/alpha"\n', workdir)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(github_module, "DaemonGithub", Box)
+            probe = sandbox_repo_probe(config, cli=None, boxes={})  # type: ignore[arg-type]
+            result = probe(config.github.repo_list()[0])
+            assert result.base_blockers is not None
+            assert [b.split(",")[0] for b in result.base_blockers] == [
+                "the base requires approval of the last push (require_last_push_approval)",
+                "the base requires signed commits; GitHub signs commits the loop creates "
+                "through its API only when it authenticates as a GitHub App",
+            ]
+            # The same base seen through a GitHub App: its commits are signed.
+            Box.provisioner = PatProvisioner()
+            Box.provisioner.bot_login = "acme-loop[bot]"
+            probe = sandbox_repo_probe(config, cli=None, boxes={})  # type: ignore[arg-type]
+            signed = probe(config.github.repo_list()[0])
+            assert signed.base_blockers is not None
+            assert len(signed.base_blockers) == 1
+            assert "signed commits" not in signed.base_blockers[0]
 
     def test_the_repo_row_says_how_the_loop_will_merge(self, workdir: Path) -> None:
         """#620: `auto` resolves against what the repository allows; an
@@ -3042,6 +3121,8 @@ class TestDoctorBranchProtection:
         from sbxloop.cli.doctor import sandbox_repo_probe
 
         class Box:
+            provisioner = PatProvisioner()
+
             def __init__(self, *a: Any, **kw: Any) -> None:
                 pass
 
@@ -3080,6 +3161,8 @@ class TestDoctorBranchProtection:
         from sbxloop.cli.doctor import sandbox_repo_probe
 
         class Box:
+            provisioner = PatProvisioner()
+
             def __init__(self, *a: Any, **kw: Any) -> None:
                 pass
 
@@ -3142,8 +3225,9 @@ class TestDoctorBranchProtection:
         )
         assert [row.name for row in clean] == ["github repo acme/alpha"]
 
-    def test_requires_approving_reviews_reads_both_sources(self) -> None:
-        from sbxloop.cli.doctor import _requires_approving_reviews
+    def test_base_blockers_read_both_sources(self) -> None:
+        from sbxloop.cli.doctor import _base_blockers
+        from sbxloop.config import Config
         from sbxloop.errors import GithubOpsError
 
         class Ops:
@@ -3156,17 +3240,30 @@ class TestDoctorBranchProtection:
                     raise answer
                 return answer
 
+        config = Config()
+
+        def blockers(ops: Any) -> tuple[str, ...] | None:
+            return _base_blockers(ops, "o/r", "main", config, can_sign=False)  # type: ignore[arg-type]
+
         classic = Ops({"required_pull_request_reviews": {"required_approving_review_count": 1}}, [])
-        assert _requires_approving_reviews(classic, "o/r", "main") is True
+        assert blockers(classic) == (
+            "the base requires an approving review, which the loop cannot give its own "
+            "pull request",
+        )
         unprotected = Ops(GithubOpsError("x", http_status=404), [])
-        assert _requires_approving_reviews(unprotected, "o/r", "main") is False
+        assert blockers(unprotected) == ()
+        # A conclusive rule from the readable source is reported even when
+        # the other source is admin-only.
         ruleset = Ops(
             GithubOpsError("x", http_status=403),
             [{"type": "pull_request", "parameters": {"required_approving_review_count": 2}}],
         )
-        assert _requires_approving_reviews(ruleset, "o/r", "main") is True
+        assert blockers(ruleset) == (
+            "the base requires 2 approving reviews, which the loop cannot give its own "
+            "pull request",
+        )
         unknown = Ops(GithubOpsError("x", http_status=403), GithubOpsError("x", http_status=403))
-        assert _requires_approving_reviews(unknown, "o/r", "main") is None
+        assert blockers(unknown) is None
 
 
 class TestInitRepo:

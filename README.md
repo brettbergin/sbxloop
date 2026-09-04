@@ -1129,11 +1129,18 @@ one API call) and re-judges the new head. A rule the loop cannot satisfy —
 most often a required approval its identity cannot give — shows as a
 `blocked` mergeability once the checks are green, or as a 405 on merge,
 which no retry fixes; the run ends `blocked` with the PR open and out of
-draft for a human, and the reason is read from the base's protection: the
-approvals still required (and the `merge_gate = "chat"` pointer when a
-review is the gate), a CODEOWNERS review, the merge queue, unresolved
-conversations. A 409 is a race with a push that landed since; the next
-poll re-judges.
+draft for a human, and the reason is read from the base's rulesets and
+classic protection in full — one line per rule the loop cannot satisfy:
+the approving reviews still required (and the `merge_gate = "chat"`
+pointer when a review is the gate), a CODEOWNERS review, approval of the
+last push (never satisfiable: the loop is always the last pusher), signed
+commits (satisfied by a GitHub App credential, whose API commits GitHub
+signs), a linear-history rule against `merge_method = "merge"`, a merge
+queue, a required deployment. The `run.blocked` event carries the same
+list, and `sbxloop doctor` reports it per repository before any run.
+Conversation resolution is not a blocker: the loop resolves the threads it
+answers. A 409 is a race with a push that landed since; the next poll
+re-judges.
 
 **Merge method.** `merge_method = "auto"` (the default) takes the first of
 squash, merge, rebase that the repository's settings allow, resolved once
