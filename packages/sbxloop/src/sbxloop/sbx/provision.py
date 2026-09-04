@@ -935,6 +935,7 @@ class Provisioner:
                 self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
                 self._populate_submodules(run_id, clone_dir, source=None, token=lambda: token)
                 self._populate_lfs(run_id, clone_dir, source=None, repo=repo, token=lambda: token)
+                self._fetch_tags(run_id, clone_dir, source=None, token=lambda: token)
                 return clone_dir
             if token:
                 why = (
@@ -955,7 +956,47 @@ class Provisioner:
         self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
         self._populate_submodules(run_id, clone_dir, source=None, token=lambda: token)
         self._populate_lfs(run_id, clone_dir, source=None, repo=repo, token=lambda: token)
+        self._fetch_tags(run_id, clone_dir, source=None, token=lambda: token)
         return clone_dir
+
+    def _fetch_tags(
+        self,
+        run_id: str,
+        clone_dir: Path,
+        *,
+        source: Path | None,
+        token: Callable[[], str | None],
+    ) -> None:
+        """Give a fresh ``--no-tags`` clone the repository's tags when its
+        build derives the version from them (#694), and say why. ``auto``
+        asks the workspace's manifests; ``always`` and ``never`` do not.
+        Never for a reused clone. ``token`` is asked for only when the
+        host checkout cannot supply the tags."""
+        mode = self.config.sandbox.fetch_tags
+        if mode == "never":
+            return
+        markers = toolchains.tag_version_markers(clone_dir)
+        if mode == "auto" and not markers:
+            return
+        source_tags = source is not None and hostgit.tag_count(source) > 0
+        fetched = hostgit.fetch_tags(
+            clone_dir, source=source, token=None if source_tags else token()
+        )
+        evidence = [f"{m.path}: {m.marker}" for m in markers]
+        self.bus.emit(
+            "sandbox.workspace_tags",
+            run_id,
+            target=str(clone_dir),
+            mode=mode,
+            markers=evidence,
+            tags=fetched.tags,
+            source=fetched.source,
+            message=(
+                f"fetched {fetched.tags} tag(s) from the "
+                f"{'host checkout' if fetched.source == 'local' else 'remote'}"
+                + (f" — {', '.join(evidence[:3])}" if evidence else " — fetch_tags = always")
+            ),
+        )
 
     def _populate_lfs(
         self,
@@ -1177,6 +1218,12 @@ class Provisioner:
             clone_dir,
             source=source,
             repo=repo,
+            token=lambda: self._clone_token(repo) if repo is not None else None,
+        )
+        self._fetch_tags(
+            run_id,
+            clone_dir,
+            source=source,
             token=lambda: self._clone_token(repo) if repo is not None else None,
         )
         return clone_dir

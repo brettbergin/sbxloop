@@ -72,6 +72,18 @@ EXPECTATIONS: dict[str, Expectation] = {
         gate=None,
         lint=(("uv run pytest -q", False),),
     ),
+    # A Python project whose version comes from git tags via setuptools-scm
+    # (#694): detected like any other Python project; the run clone is
+    # given the repository's tags (see test_tag_version_markers).
+    "python-scm": Expectation(
+        ("python",),
+        "detected",
+        versions={"python": ("3.13", "pyproject.toml")},
+        allowed=("release-assets.githubusercontent.com",),
+        not_allowed=("nodejs.org", "go.dev"),
+        gate=None,
+        lint=(("uv run pytest -q", False),),
+    ),
     # A pnpm monorepo: the root package.json fires javascript; the
     # workspace package's tsconfig.json, two levels down, fires typescript.
     "node-pnpm": Expectation(
@@ -357,3 +369,15 @@ def test_config_override_lint(fixture: str) -> None:
     for command, flagged in expected.lint:
         problems = config_override_problems(command, FIXTURES / fixture)
         assert bool(problems) is flagged, (command, problems)
+
+
+# Which fixtures derive their version from git tags (#694): exactly the one
+# built for it. Every other fixture keeps the bare --no-tags clone.
+TAG_VERSIONED = {"python-scm": ("pyproject.toml", "setuptools_scm")}
+
+
+@pytest.mark.parametrize("fixture", sorted(EXPECTATIONS))
+def test_tag_version_markers(fixture: str) -> None:
+    markers = toolchains.tag_version_markers(FIXTURES / fixture)
+    expected = TAG_VERSIONED.get(fixture)
+    assert markers == ((toolchains.TagMarker(*expected),) if expected else ())

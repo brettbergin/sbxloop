@@ -126,6 +126,15 @@ secret_strategy = "proxy"
 # out of the pull request and named in its "Not delivered" line rather than
 # committed as a plain blob.
 # clone_lfs = true
+# Whether a run clone gets the repository's tags. Run clones are cut
+# without tags to stay small; a project whose build reads its version off
+# the nearest tag (setuptools-scm, hatch-vcs, versioningit, Gradle's
+# axion-release, Rust's vergen, a Makefile's `git describe`) then builds as
+# 0.0.0 or not at all. "auto" (default) fetches tags when a manifest names
+# such a tool — from the host checkout where it has tags, else from the
+# remote with the run's GitHub credential; "always" fetches them for every
+# repository; "never" keeps the bare clone.
+# fetch_tags = "auto"
 # Toolchains preinstalled in the agent sandbox. Unset = whatever the
 # workspace's manifests declare (go.mod, package.json, Cargo.toml, ...),
 # Python when nothing is recognized. Setting it replaces detection.

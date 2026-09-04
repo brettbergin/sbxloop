@@ -1435,3 +1435,76 @@ class TestGitLfs:
         (tmp_path / "go.mod").write_text("module x\n")
         assert toolchains.resolve_languages((), tmp_path).languages == ("go",)
         assert toolchains.resolve_languages(["rust"], tmp_path).languages == ("rust",)
+
+
+# -- versions derived from git tags (#694) ----------------------------------
+
+
+class TestTagVersionMarkers:
+    """#694: a project whose build reads its version off git tags is
+    recognised by the tool it names, so the ``--no-tags`` run clone can be
+    given the tags it needs — and only then."""
+
+    def test_setuptools_scm_in_pyproject(self, tmp_path: Path) -> None:
+        (tmp_path / "pyproject.toml").write_text(
+            '[build-system]\nrequires = ["setuptools>=64", "setuptools_scm>=8"]\n'
+            "[tool.setuptools_scm]\n"
+        )
+        assert toolchains.tag_version_markers(tmp_path) == (
+            toolchains.TagMarker("pyproject.toml", "setuptools_scm"),
+        )
+
+    def test_hatch_vcs_and_versioningit(self, tmp_path: Path) -> None:
+        (tmp_path / "pyproject.toml").write_text(
+            '[build-system]\nrequires = ["hatchling", "hatch-vcs"]\n[tool.versioningit]\n'
+        )
+        assert [m.marker for m in toolchains.tag_version_markers(tmp_path)] == [
+            "hatch-vcs",
+            "versioningit",
+        ]
+
+    @pytest.mark.parametrize(
+        ("name", "content", "marker"),
+        [
+            ("Makefile", "VERSION := $(shell git describe --tags --always)\n", "git describe"),
+            ("Cargo.toml", '[build-dependencies]\nvergen = "8"\n', "vergen"),
+            (
+                "build.gradle.kts",
+                'plugins { id("pl.allegro.tech.build.axion-release") version "1.18.0" }\n',
+                "axion-release",
+            ),
+            ("App.csproj", '<PackageReference Include="MinVer" Version="5.0.0" />\n', "MinVer"),
+            (".goreleaser.yml", "before:\n  hooks:\n    - git describe --tags\n", "git describe"),
+        ],
+    )
+    def test_other_ecosystems(self, tmp_path: Path, name: str, content: str, marker: str) -> None:
+        (tmp_path / name).write_text(content)
+        assert toolchains.tag_version_markers(tmp_path) == (toolchains.TagMarker(name, marker),)
+
+    def test_a_commented_mention_does_not_count(self, tmp_path: Path) -> None:
+        (tmp_path / "Makefile").write_text(
+            "# we used to run git describe here\nbuild:\n\tgo build\n"
+        )
+        assert toolchains.tag_version_markers(tmp_path) == ()
+
+    def test_a_static_version_needs_no_tags(self, tmp_path: Path) -> None:
+        (tmp_path / "pyproject.toml").write_text('[project]\nname = "x"\nversion = "1.2.3"\n')
+        (tmp_path / "package.json").write_text('{"name": "x", "version": "1.0.0"}\n')
+        assert toolchains.tag_version_markers(tmp_path) == ()
+
+    def test_nested_manifests_within_bounds_count(self, tmp_path: Path) -> None:
+        pkg = tmp_path / "packages" / "core"
+        pkg.mkdir(parents=True)
+        (pkg / "pyproject.toml").write_text("[tool.setuptools_scm]\n")
+        deep = tmp_path / "a" / "b" / "c"
+        deep.mkdir(parents=True)
+        (deep / "pyproject.toml").write_text("[tool.setuptools_scm]\n")
+        vendored = tmp_path / "node_modules" / "x"
+        vendored.mkdir(parents=True)
+        (vendored / "Makefile").write_text("git describe\n")
+        assert toolchains.tag_version_markers(tmp_path) == (
+            toolchains.TagMarker("packages/core/pyproject.toml", "setuptools_scm"),
+        )
+
+    def test_a_missing_workspace_is_empty(self, tmp_path: Path) -> None:
+        assert toolchains.tag_version_markers(tmp_path / "nope") == ()

@@ -67,6 +67,7 @@ __all__ = [
     "TOOLCHAINS",
     "WORKSPACE_TOOLS",
     "LanguageResolution",
+    "TagMarker",
     "Toolchain",
     "ToolchainVersion",
     "UnsatisfiablePin",
@@ -78,6 +79,7 @@ __all__ = [
     "resolve",
     "resolve_languages",
     "supported_languages",
+    "tag_version_markers",
     "toolchain_versions",
 ]
 
@@ -1957,6 +1959,109 @@ def _mentions_lfs(attributes: Path) -> bool:
         if LFS_FILTER in body.split():
             return True
     return False
+
+
+# -- versions derived from git tags (#694) ------------------------------------
+#
+# Every run clone is cut ``--no-tags`` (#632). A project whose build reads
+# its version off the nearest tag then builds as ``0.0.0`` or refuses to
+# build at all; these are the tools that do so, and the files they are
+# declared in. Detection is by name in the manifest — a build plugin is
+# named where it is configured — plus the bare ``git describe`` of a
+# Makefile or script. Case-sensitive: these are identifiers, not prose.
+_TAG_VERSION_MARKERS: tuple[str, ...] = (
+    "setuptools_scm",
+    "setuptools-scm",
+    "hatch-vcs",
+    "versioningit",
+    "poetry-dynamic-versioning",
+    "dunamai",
+    "vergen",
+    "axion-release",
+    "nebula.release",
+    "com.palantir.git-version",
+    "MinVer",
+    "GitVersion",
+    "Nerdbank.GitVersioning",
+    "git describe",
+)
+_TAG_VERSION_FILES: frozenset[str] = frozenset(
+    {
+        "pyproject.toml",
+        "setup.py",
+        "setup.cfg",
+        "Cargo.toml",
+        "build.rs",
+        "build.gradle",
+        "build.gradle.kts",
+        "settings.gradle",
+        "settings.gradle.kts",
+        "Makefile",
+        "GNUmakefile",
+        "justfile",
+        "Justfile",
+        "Taskfile.yml",
+        "Taskfile.yaml",
+        "package.json",
+        "Directory.Build.props",
+        ".goreleaser.yml",
+        ".goreleaser.yaml",
+    }
+)
+_TAG_VERSION_SUFFIXES: tuple[str, ...] = (".csproj", ".fsproj")
+
+
+class TagMarker(NamedTuple):
+    """Where a workspace says its version comes from git tags: the file,
+    relative to the root, and the tool or command it names."""
+
+    path: str
+    marker: str
+
+
+def tag_version_markers(workspace: Path) -> tuple[TagMarker, ...]:
+    """The evidence that ``workspace`` derives its version from git tags
+    (#694), one entry per (file, marker) — empty for a project that does
+    not, which keeps the ``--no-tags`` clone.
+
+    Same bounds as :func:`detect_languages`: the root and ``DETECT_DEPTH``
+    levels below it, dependency trees skipped. Comment lines (``#``) are
+    ignored so a Makefile that mentions ``git describe`` in prose does not
+    count; a marker inside a manifest's own comment syntax that is not
+    ``#`` still counts, which errs toward fetching tags a project may not
+    need rather than building one without the tags it does.
+    """
+    found: list[TagMarker] = []
+    pending = [(workspace, 0)]
+    while pending:
+        directory, depth = pending.pop()
+        try:
+            entries = sorted(directory.iterdir(), key=lambda p: p.name)
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_file() and (
+                entry.name in _TAG_VERSION_FILES or entry.name.endswith(_TAG_VERSION_SUFFIXES)
+            ):
+                rel = entry.relative_to(workspace).as_posix()
+                found.extend(TagMarker(rel, marker) for marker in _markers_in(entry))
+            elif (
+                depth < DETECT_DEPTH
+                and entry.is_dir()
+                and not entry.name.startswith(".")
+                and entry.name not in SKIP_DIRS
+            ):
+                pending.append((entry, depth + 1))
+    return tuple(sorted(found))
+
+
+def _markers_in(manifest: Path) -> list[str]:
+    try:
+        text = manifest.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    body = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
+    return [marker for marker in _TAG_VERSION_MARKERS if marker in body]
 
 
 def detect_languages(workspace: Path) -> dict[str, tuple[str, ...]]:
