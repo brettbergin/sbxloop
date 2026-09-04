@@ -192,6 +192,15 @@ class SandboxConfig(_ConfigModel):
     # trip per touched file; see the "Clone size" note in `sbxloop.hostgit`.
     # Every run clone is already `--single-branch --no-tags` regardless.
     clone_filter: str | None = None
+    # Whether a run clone's submodules are populated (#692). On by default:
+    # a repository that vendors a dependency as a submodule does not build
+    # without it. Each submodule comes from the host checkout's own copy
+    # when that copy has the recorded commit, else from its `.gitmodules`
+    # URL with the run's GitHub credential; a submodule neither route can
+    # populate fails provisioning by name. Off leaves the submodule
+    # directories empty — for a repository whose submodules are optional
+    # (docs, examples) or live somewhere the run's credential cannot read.
+    clone_submodules: bool = True
     extra_allow_domains: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=list)
     # Operator environment for the agent sandbox (#679). `env` holds plain

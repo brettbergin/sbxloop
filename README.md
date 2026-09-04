@@ -431,6 +431,26 @@ filter is opt-in and applies only to the remote clone. A git without
 partial-clone support logs `workspace.clone_filter_unsupported` and clones
 in full rather than failing.
 
+**Submodules** are populated in every fresh run clone (#692), nested ones
+included. A submodule comes from the host checkout's own copy of it when that
+copy holds the commit the superproject records — no network, no credential —
+and otherwise from its `.gitmodules` URL with the run's GitHub credential, the
+same way the superproject's remote clone authenticates; the run's credential
+must therefore be able to read the submodule's repository too. A submodule
+neither route can populate fails provisioning naming it, rather than starting
+the run on an empty directory where a dependency should be;
+`[sandbox] clone_submodules = false` opts a repository whose submodules are
+optional or unreadable out, leaving the directories empty. The hosts the
+submodules fetch from join the agent sandbox's egress allow list, announced
+as `sandbox.submodule_hosts` when they widen it, and
+`sandbox.workspace_submodules` records what was populated from where. A
+resumed run never re-populates: the submodule stays at whatever commit the
+agent moved it to. At delivery, a submodule the run moved to a commit its
+remote has is delivered as the moved pointer (a `160000` tree entry); changes
+*inside* a submodule are never delivered — the pull request is against the
+superproject — and are named in the PR body's **Not delivered** line instead,
+as is a pointer at a commit the submodule's remote does not have.
+
 ### Environment for the agent sandbox
 
 A project's test suite often reads its environment — `RAILS_ENV`,
@@ -1819,6 +1839,7 @@ The notable knobs:
 | `[sandbox] workspace_isolation`                           | `auto`             | Per-run clone isolation when `workspace` is a git checkout (see below).                                                                                                                                                                                                                                                                                            |
 | `[sandbox] gate_command`                                  | detected           | The project's own gate, run over the whole tree before delivery.                                                                                                                                                                                                                                                                                                   |
 | `[sandbox] clone_filter`                                  | unset              | Git partial-clone filter (`"blob:none"`) for the remote clone of a repository with no host checkout; opt-in, see the clone section for the lazy-fetch hazard.                                                                                                                                                                                                      |
+| `[sandbox] clone_submodules`                              | `true`             | Whether a fresh run clone's submodules are populated — from the host checkout's copy when it has the recorded commit, else from the `.gitmodules` URL with the run's credential; a submodule neither can populate fails provisioning by name. `false` leaves them empty.                                                                                           |
 | `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                                                                                                                                                                                                         |
 | `[sandbox] env` / `secret_env`                            | `{}` / `[]`        | Environment for the agent sandbox's worker and everything it runs: plain values, and names whose values come from the daemon's environment (delivered like the credential, never logged). Per-repo overridable; see "Environment for the agent sandbox".                                                                                                           |
 | `[sandbox] apt_packages` / `setup_commands`               | `[]` / `[]`        | OS packages ensured beside the toolchains (fail closed), and commands run in the workspace before the first phase, each a `sandbox.setup` event. Per-repo overridable; see "OS packages and setup commands".                                                                                                                                                       |

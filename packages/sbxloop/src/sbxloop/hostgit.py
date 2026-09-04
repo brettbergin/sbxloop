@@ -56,12 +56,36 @@ URL, and is gone once the clone returns; any helper the host user has
 configured is switched off for that one process so the clone can only ever
 authenticate as the run. ``x-access-token`` is the username GitHub accepts
 for both credential kinds.
+
+Submodules (#692)
+-----------------
+A run clone is populated after it is cut (:func:`populate_submodules`),
+never through ``--recurse-submodules``: git would clone every submodule
+from its ``.gitmodules`` URL, which for a repository the host has checked
+out is a needless network round trip — and on a private remote a failing
+one. Each submodule is instead cloned from the host checkout's own copy
+when that copy holds the recorded commit, falling back to the remote with
+the run's token otherwise; the remote path is the only path a repository
+without a host checkout has. Nested submodules populate the same way,
+level by level. Populating happens only on a *fresh* clone: a resume
+re-entering a clone must never ``submodule update`` over a commit the
+agent moved a submodule to.
+
+Delivery reads modes from ``git diff --raw`` rather than the filesystem,
+so a submodule — a gitlink, mode ``160000``, which ``stat`` sees as a
+plain directory — is delivered as the commit it now points at, not as the
+deletion of the directory. What a run changed *inside* a submodule is not
+delivered at all: the pull request is against the superproject, and the
+submodule's own repository is not the one the run is for. Such changes
+are named in the delivery (see ``notes`` on :func:`changes_since`) rather
+than silently dropped.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -88,15 +112,37 @@ CLONE_OPTIONS = ("--single-branch", "--no-tags")
 ChangeStatus = Literal["added", "modified", "deleted"]
 
 
+GITLINK_MODE = "160000"
+_NULL_SHA = "0" * 40
+
+
 @dataclass(frozen=True)
 class WorkspaceChange:
     """One path the run changed relative to its base commit. ``mode`` is the
-    git tree mode to commit (``100644``/``100755``/``120000``); empty for
-    deletions."""
+    git tree mode to commit (``100644``/``100755``/``120000``, or
+    ``160000`` for a submodule gitlink); empty for a deleted file. ``sha``
+    is set only for a gitlink: the submodule commit the path now points at
+    (a gitlink has no content to upload — the sha *is* the entry)."""
 
     path: str
     status: ChangeStatus
     mode: str
+    sha: str = ""
+
+    @property
+    def is_gitlink(self) -> bool:
+        return self.mode == GITLINK_MODE
+
+
+@dataclass(frozen=True)
+class Submodule:
+    """One ``.gitmodules`` entry: its config ``name``, the ``path`` it is
+    checked out at (relative, POSIX) and the ``url`` it is fetched from as
+    written — possibly relative to the superproject's own remote."""
+
+    name: str
+    path: str
+    url: str
 
 
 @dataclass(frozen=True)
@@ -494,6 +540,204 @@ def clone_existing_branch(source: Path, target: Path, branch: str) -> str:
         ) from exc
 
 
+_SUBMODULE_CONFIG_RE = re.compile(r"^submodule\.(.+)\.(path|url) (.*)$")
+
+
+def list_submodules(repo_path: Path) -> list[Submodule]:
+    """The submodules ``repo_path``'s ``.gitmodules`` declares, in file
+    order; empty when there is no such file. A checkout is not needed —
+    the file is read with ``git config -f`` — so this also answers for a
+    workspace whose submodules were never populated."""
+    modules = repo_path / ".gitmodules"
+    if not modules.is_file():
+        return []
+    try:
+        with Repo(repo_path) as repo:
+            listing = repo.git.config(
+                "-f", str(modules), "--get-regexp", r"^submodule\..*\.(path|url)$"
+            )
+    except GitCommandError as exc:
+        if exc.status == 1:
+            return []  # no matching keys
+        raise ProvisionError(f"reading {modules} failed: {_describe(exc)}") from exc
+    except (InvalidGitRepositoryError, NoSuchPathError, ValueError) as exc:
+        raise ProvisionError(f"reading {modules} failed: {exc}") from exc
+    found: dict[str, dict[str, str]] = {}
+    for line in listing.splitlines():
+        match = _SUBMODULE_CONFIG_RE.match(line)
+        if match:
+            name, key, value = match.groups()
+            found.setdefault(name, {})[key] = value.strip()
+    return [
+        Submodule(name=name, path=entry["path"], url=entry.get("url", ""))
+        for name, entry in found.items()
+        if entry.get("path")
+    ]
+
+
+def populate_submodules(
+    clone: Path, *, source: Path | None, token: str | None
+) -> list[tuple[str, str]]:
+    """Check out every submodule of a freshly cut run ``clone`` (#692),
+    nested ones included; returns ``(path, how)`` per submodule populated,
+    ``how`` being ``"local"`` or ``"remote"``.
+
+    With ``source`` — the host checkout the clone was cut from — each
+    submodule is first cloned from the source's own populated copy of it,
+    which costs no network and needs no credential. That copy is usable
+    only when it holds the commit the superproject records; when it does
+    not (the host checkout's submodule is stale or was never initialised),
+    or is absent, the submodule comes from its ``.gitmodules`` URL, with the
+    run's ``token`` answering a credential challenge exactly as the
+    superproject's remote clone does. Either way the submodule's ``origin``
+    ends up at the ``.gitmodules`` URL (``git submodule sync``), so nothing
+    in the clone points back at a host path.
+
+    Only for a fresh clone: a resumed run's clone must keep whatever commit
+    the agent moved a submodule to. ``ProvisionError`` names the submodule
+    and its URL when neither route can populate it — a run that started on
+    an empty directory where a dependency should be would fail later and
+    worse.
+    """
+    populated: list[tuple[str, str]] = []
+    for sub in list_submodules(clone):
+        if not _is_gitlink_in_index(clone, sub.path):
+            # A ``.gitmodules`` entry whose gitlink was removed from the tree
+            # (a half-finished ``git rm``): nothing to check out, and
+            # ``submodule update`` would refuse the pathspec.
+            log.info(
+                "workspace.submodule_not_in_tree",
+                submodule=sub.path,
+                detail=f".gitmodules names {sub.path} but the tree has no gitlink there",
+            )
+            continue
+        local = source / sub.path if source is not None else None
+        how = "remote"
+        if local is not None and (local / ".git").exists():
+            try:
+                _submodule_update(clone, sub, local_source=local)
+            except GitCommandError as exc:
+                log.info(
+                    "workspace.submodule_local_source_unusable",
+                    submodule=sub.path,
+                    source=str(local),
+                    detail=_describe(exc),
+                    fallback=f"cloning it from {public_remote_url(sub.url)}",
+                )
+                _discard_half_populated(clone, sub.path)
+            else:
+                how = "local"
+        if how == "remote":
+            try:
+                _submodule_update(clone, sub, token=token)
+            except GitCommandError as exc:
+                raise ProvisionError(
+                    f"populating submodule {sub.path} of {clone} from "
+                    f"{public_remote_url(sub.url)} failed: {_describe(exc)}. The run's "
+                    "GitHub credential must be able to read that repository too; "
+                    "set [sandbox] clone_submodules = false to run without submodules"
+                ) from exc
+        populated.append((sub.path, how))
+        # A submodule's own submodules: same routes, one level down.
+        nested = populate_submodules(
+            clone / sub.path, source=local if how == "local" else None, token=token
+        )
+        populated.extend((f"{sub.path}/{path}", nested_how) for path, nested_how in nested)
+    return populated
+
+
+def _is_gitlink_in_index(clone: Path, path: str) -> bool:
+    entry: str = Repo(clone).git.ls_files("--stage", "--", path)
+    return entry.startswith(f"{GITLINK_MODE} ")
+
+
+def _submodule_update(
+    clone: Path, sub: Submodule, *, local_source: Path | None = None, token: str | None = None
+) -> None:
+    """``git submodule update --init`` for one submodule. With
+    ``local_source`` the clone reads that path instead of the ``.gitmodules``
+    URL — an override given on the command line so it is never written to
+    the clone's config — and ``submodule sync`` then points the submodule's
+    ``origin`` at the URL ``.gitmodules`` names, as a remote populate would
+    have. Without it the remote is used, under the run's credential."""
+    with Repo(clone) as repo:
+        if local_source is not None:
+            repo.git(
+                c=[
+                    f"submodule.{sub.name}.url={local_source}",
+                    "protocol.file.allow=always",
+                ]
+            ).submodule("update", "--init", "--", sub.path, env=_clone_env(None))
+            # `init` under the override wrote no URL to the clone's config
+            # (the override already answered), and `sync` only touches a
+            # registered submodule: register it now, from .gitmodules, then
+            # sync so the submodule's origin follows.
+            repo.git.submodule("init", "--", sub.path)
+            repo.git.submodule("sync", "--", sub.path)
+        else:
+            repo.git.submodule("update", "--init", "--", sub.path, env=_clone_env(token))
+
+
+def _discard_half_populated(clone: Path, path: str) -> None:
+    """Undo a failed local populate so the remote attempt starts clean: the
+    submodule's working tree and the ``.git/modules`` store git made for
+    it. The superproject's own config entry is left — ``submodule update
+    --init`` rewrites it."""
+    with contextlib.suppress(OSError):
+        shutil.rmtree(clone / path)
+        (clone / path).mkdir(parents=True)
+    with Repo(clone) as repo:
+        name = next((s.name for s in list_submodules(clone) if s.path == path), path)
+        store = Path(repo.git_dir) / "modules" / name
+        shutil.rmtree(store, ignore_errors=True)
+        with contextlib.suppress(GitCommandError):
+            repo.git.config("--unset", f"submodule.{name}.url")
+
+
+def submodule_hosts(repo_path: Path) -> list[str]:
+    """The hosts ``repo_path``'s submodules are fetched from, for the run's
+    egress allow list (#692): the agent may need to fetch inside a
+    submodule (``git submodule update`` after a bump, a ``git fetch`` to
+    look at upstream). Scheme URLs and scp-style ssh URLs contribute their
+    host; a relative URL (``../lib.git``) resolves against the checkout's
+    ``origin`` and so contributes *its* host; a local path contributes
+    nothing. Deduped, first occurrence winning; empty when there is no
+    ``.gitmodules`` or it cannot be read."""
+    try:
+        subs = list_submodules(repo_path)
+    except ProvisionError:
+        return []
+    origin = origin_url(repo_path)
+    hosts: list[str] = []
+    for sub in subs:
+        url = sub.url
+        if url.startswith(("./", "../")):
+            if origin is None:
+                continue
+            url = origin
+        host = url_host(url)
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def url_host(url: str) -> str | None:
+    """The host of a git URL — scheme (``https://user@host:443/o/r``) or
+    scp-style (``git@host:o/r``) — or None for a local path."""
+    _scheme, sep, rest = url.partition("://")
+    if sep:
+        authority = rest.partition("/")[0]
+    else:
+        userinfo, at, remainder = url.rpartition("@")
+        if not at or "/" in userinfo or ":" not in remainder:
+            return None  # a local path, or something no fetch would resolve
+        authority = remainder.partition(":")[0]
+    _userinfo, _at, hostport = authority.rpartition("@")
+    if hostport.startswith("["):  # bracketed IPv6 literal
+        return hostport[1:].partition("]")[0] or None
+    return hostport.partition(":")[0] or None
+
+
 def gitignored_files(root: Path) -> frozenset[str] | None:
     """Relative POSIX paths under ``root`` that the tree's own ``.gitignore``
     rules ignore, or None when git is unavailable or the probe fails.
@@ -620,7 +864,9 @@ def _merge_base(repo: Repo, ref: str, head: str) -> str | None:
         return None
 
 
-def changes_since(repo_path: Path, base: str) -> list[WorkspaceChange]:
+def changes_since(
+    repo_path: Path, base: str, *, notes: list[str] | None = None
+) -> list[WorkspaceChange]:
     """What the working tree changed relative to ``base``: tracked paths
     from ``git diff`` (committed or not — the agent may do either) plus
     untracked-but-not-ignored files, sorted by path.
@@ -629,13 +875,26 @@ def changes_since(repo_path: Path, base: str) -> list[WorkspaceChange]:
     git tree, which has no rename concept. Modes come from the working tree
     (what ``git add`` itself would record) so an executable script keeps
     ``100755``; symlinks are ``120000`` with the link target as content.
+
+    Submodules (#692) are told apart by the mode git reports (``160000``),
+    never by looking at the filesystem, where a gitlink is just a directory.
+    A moved gitlink comes back with the commit it now points at — read from
+    the submodule's HEAD when the agent moved it without staging, the one
+    case where git's own diff shows no new sha. What cannot be delivered is
+    *skipped*, and each skip is explained in ``notes`` when the caller
+    passes a list: work inside a submodule (its own tree is not the
+    superproject's), and a gitlink pointing at a commit the submodule's
+    remote does not have (a pointer nobody else could resolve).
     """
     changes: dict[str, WorkspaceChange] = {}
+    skipped = notes if notes is not None else []
     try:
         with Repo(repo_path) as repo:
-            listing = repo.git.diff("--name-status", "--no-renames", "-z", base)
-            for status, path in _pairs(listing):
-                changes[path] = _describe_change(repo_path, path, status)
+            listing = repo.git.diff("--raw", "--no-renames", "--abbrev=40", "-z", base)
+            for meta, path in _pairs(listing):
+                change = _change_from_raw(repo_path, path, meta, skipped)
+                if change is not None:
+                    changes[path] = change
             untracked = repo.git.ls_files("--others", "--exclude-standard", "-z")
             for path in untracked.split("\0"):
                 if path:
@@ -643,6 +902,75 @@ def changes_since(repo_path: Path, base: str) -> list[WorkspaceChange]:
     except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError) as exc:
         raise DeliveryError(f"git diff failed in {repo_path}: {exc}") from exc
     return [changes[path] for path in sorted(changes)]
+
+
+def _change_from_raw(
+    repo_path: Path, path: str, meta: str, notes: list[str]
+) -> WorkspaceChange | None:
+    """One ``git diff --raw`` record — ``:<old mode> <new mode> <old sha>
+    <new sha> <status>`` — as a change, or None for a submodule change that
+    is not deliverable (explained in ``notes``)."""
+    fields = meta.lstrip(":").split()
+    if len(fields) < 5:
+        raise DeliveryError(f"unexpected git diff --raw record in {repo_path}: {meta!r}")
+    old_mode, new_mode, old_sha, new_sha, status = fields[:5]
+    if GITLINK_MODE not in (old_mode, new_mode):
+        return _describe_change(repo_path, path, status)
+    if new_mode != GITLINK_MODE:
+        # The submodule is gone: removed outright (the tree drops the path)
+        # or replaced by a file, which git reports as one type-change record
+        # — the file is then an ordinary blob at the same path.
+        if new_mode == "000000":
+            return WorkspaceChange(path=path, status="deleted", mode=GITLINK_MODE)
+        return _describe_change(repo_path, path, status)
+    sub = repo_path / path
+    dirty = submodule_is_dirty(sub)
+    if new_sha == _NULL_SHA:
+        # Moved in the working tree without `git add`: the diff shows no
+        # commit, the submodule's HEAD is where it points now.
+        new_sha = head_commit(sub) or ""
+    if not new_sha or new_sha == old_sha:
+        # Nothing to point the superproject at that it does not already
+        # point at: the only change is inside the submodule.
+        if dirty or not new_sha:
+            notes.append(f"changes inside submodule `{path}` are not delivered")
+        return None
+    if dirty:
+        notes.append(f"changes inside submodule `{path}` are not delivered")
+    if not _commit_is_published(sub, new_sha):
+        notes.append(
+            f"submodule `{path}` points at commit {new_sha[:12]}, which its remote "
+            "does not have; that gitlink is not delivered (push the submodule first)"
+        )
+        return None
+    change_status: ChangeStatus = "added" if status.startswith("A") else "modified"
+    return WorkspaceChange(path=path, status=change_status, mode=GITLINK_MODE, sha=new_sha)
+
+
+def submodule_is_dirty(sub: Path) -> bool:
+    """Whether a populated submodule's working tree has changes of its own
+    (tracked edits or untracked files). An unpopulated or unreadable
+    submodule is not dirty: there is nothing in it to lose."""
+    try:
+        with Repo(sub) as repo:
+            return bool(repo.git.status("--porcelain").strip())
+    except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError, ValueError):
+        return False
+
+
+def _commit_is_published(sub: Path, sha: str) -> bool:
+    """Whether ``sha`` is reachable from any remote-tracking ref or tag of
+    the submodule — the evidence that it exists somewhere other than this
+    clone. A submodule whose repository cannot be read is taken at its
+    word: the gitlink is delivered rather than second-guessed."""
+    try:
+        with Repo(sub) as repo:
+            listing = repo.git.for_each_ref(
+                f"--contains={sha}", "refs/remotes", "refs/tags", "--format=%(refname)"
+            )
+            return bool(listing.strip())
+    except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError, ValueError):
+        return True
 
 
 def diff_text(repo_path: Path, remote_base_sha: str | None) -> str | None:
@@ -701,7 +1029,8 @@ def _pairs(listing: str) -> list[tuple[str, str]]:
 
 
 def _describe_change(repo_path: Path, path: str, git_status: str) -> WorkspaceChange:
-    """``git_status`` is git's name-status letter (A/M/D/T...)."""
+    """``git_status`` is git's name-status letter (A/M/D/T...). For blobs
+    only — a gitlink never reaches this (see :func:`_change_from_raw`)."""
     if git_status.startswith("D"):
         return WorkspaceChange(path=path, status="deleted", mode="")
     status: ChangeStatus = "added" if git_status.startswith("A") else "modified"
