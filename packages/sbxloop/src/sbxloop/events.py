@@ -232,7 +232,16 @@ class HostEventTypes:
     TASK_START = "task.start"
     TASK_STATE = "task.state"
     TASK_END = "task.end"
+    # Also carries `status="advisory"` (the check failed under
+    # `verify_mode = "advisory"` and blocked nothing) and `status="skipped"`
+    # (`ci-only`: the pull request's checks are the verification) — #682.
     PHASE_END = "phase.end"
+    # Once per run, before decomposition, when `verify_mode = "full"` and
+    # the workspace shows a suite that needs services the sandbox does not
+    # have (a compose file, testcontainers in a lockfile, `services:` in a
+    # workflow): `evidence` names what was seen, `hint` the knob (#682).
+    # A hint only — the mode never changes on its own.
+    VERIFY_SERVICES_DETECTED = "verify.services_detected"
     POLICY_ALLOW = "policy.allow"
     POLICY_DENY = "policy.deny"
     SANDBOX_PROVISION_START = "sandbox.provision_start"

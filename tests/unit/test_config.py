@@ -1070,3 +1070,35 @@ class TestAptPackagesAndSetupCommands:
         )
         with pytest.raises(ConfigError, match=r"github.repos\[\].apt_packages"):
             load_config(cwd=tmp_path, env={})
+
+
+class TestVerifyMode:
+    """`[sandbox] verify_mode` (#682): full by default, a `[[github.repos]]`
+    entry overrides it, and the vocabulary is closed."""
+
+    def test_full_by_default(self, tmp_path: Path) -> None:
+        config = load_config(cwd=tmp_path, env={})
+        assert config.sandbox.verify_mode == "full"
+        assert config.verify_mode_for(None) == "full"
+
+    def test_global_and_per_repository(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[sandbox]\n"
+            'verify_mode = "advisory"\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "o/web"\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "o/api"\n'
+            'verify_mode = "ci-only"\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        assert config.verify_mode_for("o/web") == "advisory"
+        assert config.verify_mode_for("o/api") == "ci-only"
+        assert config.verify_mode_for(None) == "advisory"
+
+    def test_unknown_mode_is_refused(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text('[sandbox]\nverify_mode = "skip"\n')
+        with pytest.raises(ConfigError, match="verify_mode"):
+            load_config(cwd=tmp_path, env={})

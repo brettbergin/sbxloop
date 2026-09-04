@@ -54,6 +54,9 @@ def render(name: str, **context: str) -> str:
     # The repository's PR conventions (#678) are a paragraph only when the
     # workspace declares some; most render calls have none to give.
     context.setdefault("pr_conventions", "")
+    # What the sandbox's verification did not decide (#682): advisory
+    # failures, or that nothing ran under `ci-only`. Empty under `full`.
+    context.setdefault("verification", "")
     context.setdefault("baseline_registries", _domain_list(BASELINE_REGISTRY_DOMAINS))
     context.setdefault("declarable_registries", _domain_list(WELL_KNOWN_REGISTRY_DOMAINS))
     return _template(name).substitute(context)

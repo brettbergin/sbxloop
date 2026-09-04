@@ -1525,6 +1525,10 @@ def format_for_discord(
         msg = _one_line(data.get("message") or "", 300)
         if status == "failed":
             return [line(f"✗ **{phase}**{where}" + (f" — {msg}" if msg else ""))]
+        if status == "advisory":
+            # A check that failed and blocked nothing (#682): the human is
+            # the one it is evidence for, so it is never verbose-only.
+            return [line(f"⚠ **{phase}**{where}" + (f" — {msg}" if msg else ""))]
         if status == "ok" and phase == "build" and msg:
             # The builder's report excerpt is the chronology's record of what
             # the attempt did — the plan card's replacement now that the
@@ -1567,6 +1571,20 @@ def format_for_discord(
         if level == "quiet":
             return []
         return [line(f"⚠ tooling: {_one_line(data.get('message') or '', 300)}")]
+    if t == HostEventTypes.VERIFY_SERVICES_DETECTED:
+        # The knob is the human's to turn (#682): the evidence and the hint
+        # reach the channel before the plan spends anything on the suite.
+        if level == "quiet":
+            return []
+        evidence = data.get("evidence")
+        seen = ", ".join(code(e) for e in evidence) if isinstance(evidence, list) else ""
+        return [
+            line(
+                "⚠ verify: the suite may need services the sandbox does not have"
+                + (f" ({seen})" if seen else "")
+                + f" — {_one_line(data.get('hint') or '', 300)}"
+            )
+        ]
     if t == "task.state":
         if verbose:
             return [line(f"· task {data.get('task_id')} → {data.get('state')}")]

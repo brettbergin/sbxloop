@@ -343,6 +343,7 @@ def deliver_workspace(
     title: str | None = None,
     commit_message: str | None = None,
     authored_body: str | None = None,
+    verification: str | None = None,
 ) -> PrRef:
     """Publish source_dir as one commit on a branch and open (or update) a PR.
 
@@ -350,7 +351,10 @@ def deliver_workspace(
     under the workspace, #678): it becomes the PR's body on the create, or
     replaces the open PR's body on a re-delivery. Without it the body is the
     repository's own pull request template, when ``source_dir`` has one,
-    followed by the loop's summary.
+    followed by the loop's summary. ``verification`` is what the sandbox's
+    checks did not decide (#682) — advisory failures, or that nothing ran
+    under `ci-only` — and closes the body as its own section, whichever
+    way the body was written.
 
     ``branch`` overrides the per-run branch name so a fix round lands on the
     pull request it was fixing: the existing branch is looked up and
@@ -478,7 +482,14 @@ def deliver_workspace(
                 ops,
                 repo,
                 pr_number,
-                body=_body(run_id, outcome, plan, closes=closes, authored=authored_body),
+                body=_body(
+                    run_id,
+                    outcome,
+                    plan,
+                    closes=closes,
+                    authored=authored_body,
+                    verification=verification,
+                ),
                 run_id=run_id,
             )
         return PrRef(number=pr_number, url=url)
@@ -492,6 +503,7 @@ def deliver_workspace(
         closes=closes,
         template=template[1] if template else None,
         authored=authored_body,
+        verification=verification,
     )
     try:
         pr = ops.pr_create(
@@ -943,15 +955,20 @@ def _body(
     closes: int | None = None,
     template: str | None = None,
     authored: str | None = None,
+    verification: str | None = None,
 ) -> str:
     """The pull request's description (#678). The agent's own
     ``.sbxloop/pr-body`` wins outright — it filled the repository's
     template in — with the run's provenance and ``Closes`` after a rule;
     otherwise a repository template opens the body verbatim, so a check
     that parses it (danger, a PR lint) sees the sections it expects, and
-    the loop's summary follows. ``Closes #N`` is always the last line: it
-    is what settles the issue."""
+    the loop's summary follows. A ``verification`` note (#682: what the
+    sandbox's checks did not decide) is its own section before the
+    footer, so a reviewer reads it whichever way the body was written.
+    ``Closes #N`` is always the last line: it is what settles the issue."""
     footer = f"\nCloses #{closes}\n" if closes is not None else ""
+    if verification and verification.strip():
+        footer = f"\n**Verification:** {verification.strip()}\n" + footer
     if authored and authored.strip():
         return (
             f"{authored.strip()}\n\n---\n\nArtifacts produced by sbxloop run `{run_id}`.\n" + footer

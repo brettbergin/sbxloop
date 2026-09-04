@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import queue
+import sqlite3
 import tarfile
 import tempfile
 import threading
@@ -63,6 +64,7 @@ from sbxloop.config import (
     DEFAULT_PR_TITLE_TEMPLATE,
     Config,
     RepoConfig,
+    VerifyMode,
     _flatten,
     load_config,
     load_dotenv_file,
@@ -179,6 +181,7 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import SBXLOOP_DIR
+from sbxloop.verifylint import services_evidence
 from sbxloop.worker.client import WorkerClient
 
 log = get_logger(__name__)
@@ -1342,6 +1345,7 @@ class LoopEngine:
         tasks = [t for t in self.store.get_tasks(run_id) if not is_fix_task(t.spec.id)]
         if not tasks:
             self._set_run_state(run_id, "decomposing")
+            self._hint_services(run_id, phases.workspace)
             started = time.time()
             graph = phases.decompose()
             if len(graph.tasks) > self.config.budgets.max_tasks:
@@ -1374,6 +1378,98 @@ class LoopEngine:
         # (as steer_run — there is no task left to steer).
         self._process_chat(run_id, phases, None, stage="between the task graph and the gate")
         return bool(failed_ids or skipped_ids)
+
+    @property
+    def _verify_mode(self) -> VerifyMode:
+        """What this run's verify phase and gate decide (#682)."""
+        return self.config.verify_mode_for(self.config.github.repo)
+
+    def _hint_services(self, run_id: str, workspace: Path | None) -> None:
+        """Name the evidence of a service-backed suite (#682) before the plan
+        is written, under the one mode where it costs the run something.
+
+        A hint, not a switch: a compose file for local development says
+        nothing certain about the unit suite, and an operator who set
+        `advisory` or `ci-only` already knows. Under `full` the gate is
+        mandatory and a `connection refused` from pytest spends revisions
+        and a replan on a check no revision can pass — this is the moment
+        a human can still change the knob.
+        """
+        if self._verify_mode != "full":
+            return
+        evidence = services_evidence(workspace)
+        if not evidence:
+            return
+        log.info("verify.services_detected", run=run_id, evidence=evidence)
+        self.bus.emit(
+            HostEventTypes.VERIFY_SERVICES_DETECTED,
+            run_id,
+            evidence=evidence,
+            hint=(
+                "the suite may need services the sandbox does not have; `[sandbox] "
+                'verify_mode = "advisory"` reports a failing verify without spending '
+                'the budget on it, `"ci-only"` leaves the judging to the pull request\'s '
+                "checks (a `[[github.repos]]` entry sets either per repository)"
+            ),
+        )
+
+    def _verification_note(self, run_id: str) -> str:
+        """What the review and the pull request are told about verification
+        that did not gate (#682): each advisory failure still standing, or
+        that nothing ran under `ci-only`. Empty under `full`, where a green
+        verify is the precondition of getting here.
+
+        Read from the phase rows rather than in-memory state, so a resumed
+        run tells the same story — and only the latest attempt of each
+        check counts: a failure a later attempt cleared is not evidence.
+        """
+        mode = self._verify_mode
+        if mode == "ci-only":
+            return (
+                'The operator set `verify_mode = "ci-only"`: no verify command and no '
+                "project gate ran in the sandbox. The pull request's own checks are the "
+                "verification."
+            )
+        if mode != "advisory":
+            return ""
+        latest: dict[tuple[str, str | None], sqlite3.Row] = {}
+        for row in self.store.phase_attempts(run_id):
+            if row["phase"] in ("verify", "gate"):
+                latest[(str(row["phase"]), row["task_id"])] = row
+        lines: list[str] = []
+        for (phase, task_id), row in latest.items():
+            if row["status"] != "advisory":
+                continue
+            try:
+                data = json.loads(row["output_json"] or "{}")
+            except ValueError:
+                continue
+            if phase == "gate":
+                first = next(
+                    (ln for ln in str(data.get("output") or "").splitlines() if ln.strip()), ""
+                )
+                lines.append(
+                    f"- project gate `{data.get('command')}` exit {data.get('exit_code')}"
+                    + (f": {first[:200]}" if first else "")
+                )
+            else:
+                feedback = str(data.get("feedback") or "")
+                for chunk in feedback.split(VERIFY_FAILURE_PREFIX):
+                    head = chunk.strip().splitlines()
+                    if head:
+                        lines.append(f"- task {task_id}: {head[0][:200]}")
+        if not lines:
+            return (
+                'The operator set `verify_mode = "advisory"`: every verify command and '
+                "the project gate ran in the sandbox and passed."
+            )
+        return (
+            'The operator set `verify_mode = "advisory"`: these checks failed in the '
+            "sandbox and blocked nothing. Weigh each as evidence — a failure the "
+            "sandbox explains (a service it does not have: `connection refused`, a "
+            "missing database or browser) is not a finding; one the diff explains "
+            "is.\n" + "\n".join(lines)
+        )
 
     def _announce_roster(self, run_id: str, tasks: Sequence[TaskRecord]) -> None:
         # Announce the full roster up front (with titles) so UIs can show
@@ -1498,28 +1594,50 @@ class LoopEngine:
         run_id, phases = p.run_id, p.phases
         self._set_run_state(run_id, "gating")
         gate = phases.project_gate()
+        mode = self._verify_mode
         attempt = 1 + sum(1 for row in self.store.phase_attempts(run_id) if row["phase"] == "gate")
         started = time.time()
-        if not gate:
+        if not gate or mode == "ci-only":
+            # Under `ci-only` (#682) the gate is the pull request's checks:
+            # the same command CI runs, on the runner that has the services.
+            reason_skipped = (
+                "the project declares no gate"
+                if not gate
+                else 'verify_mode = "ci-only": the pull request\'s checks are the gate'
+            )
             self.store.record_phase(
                 run_id,
                 "gate",
                 task_id=None,
                 attempt=attempt,
                 status="skipped",
-                output_json=json.dumps({"reason": "the project declares no gate"}),
+                output_json=json.dumps({"reason": reason_skipped, "command": gate}),
                 started_at=started,
             )
+            if gate:
+                self.bus.emit(
+                    HostEventTypes.PHASE_END,
+                    run_id,
+                    task_id=None,
+                    phase="gate",
+                    status="skipped",
+                    attempt=attempt,
+                    message=f"`{gate}` not run ({reason_skipped})",
+                )
             return None
         result = phases.shell_batch([gate])[0]
         passed = result.exit_code == 0
         output = clip_head_tail(result.output)
+        # An advisory failure (#682) is recorded as its own status, not as
+        # `failed`: it blocked nothing, and `_verification_note` reads the
+        # rows back to tell the review and the pull request what stood.
+        status = "ok" if passed else ("advisory" if mode == "advisory" else "failed")
         self.store.record_phase(
             run_id,
             "gate",
             task_id=None,
             attempt=attempt,
-            status="ok" if passed else "failed",
+            status=status,
             output_json=json.dumps(
                 {"command": gate, "exit_code": result.exit_code, "output": output}
             ),
@@ -1531,13 +1649,18 @@ class LoopEngine:
             run_id,
             task_id=None,
             phase="gate",
-            status="ok" if passed else "failed",
+            status=status,
             attempt=attempt,
             message=f"`{gate}` passed"
             if passed
-            else f"`{gate}` exit {result.exit_code}: {first_line}",
+            else f"`{gate}` exit {result.exit_code}: {first_line}"
+            + (
+                ' (advisory: verify_mode = "advisory", not blocking)'
+                if status == "advisory"
+                else ""
+            ),
         )
-        if passed:
+        if passed or status == "advisory":
             return None
         reason = self._fix_round(
             p,
@@ -1606,6 +1729,7 @@ class LoopEngine:
             title=pr_title,
             commit_message=commit_message,
             authored_body=authored_body,
+            verification=self._verification_note(run_id),
         )
         data = ops.pr_get(repo, pr.number)
         head = data.get("head")
@@ -1745,6 +1869,7 @@ class LoopEngine:
             tasks=self.store.get_tasks(run_id),
             history=render_review_history(rounds),
             refuted=closed_anchors(rounds),
+            verification=self._verification_note(run_id),
         )
         # Round n+1's word on a finding an earlier round raised belongs in
         # that finding's own thread, not restated in a fresh review body
@@ -3190,17 +3315,54 @@ class LoopEngine:
         task: TaskRecord,
     ) -> None:
         started = time.time()
+        mode = self._verify_mode
+        if mode == "ci-only":
+            # No verify job at all (#682): the pull request's checks judge
+            # the work in landing, on a runner that has the services. The
+            # row and the event keep the skip visible — a resumed run and a
+            # reader of the chronology both see that nothing ran.
+            self.store.record_phase(
+                run_id,
+                "verify",
+                task_id=task.spec.id,
+                attempt=task.revisions + 1,
+                status="skipped",
+                output_json=json.dumps(
+                    {
+                        "passed": None,
+                        "reason": 'verify_mode = "ci-only"',
+                        "commands": list(task.spec.verify_commands),
+                    }
+                ),
+                started_at=started,
+            )
+            self.bus.emit(
+                HostEventTypes.PHASE_END,
+                run_id,
+                task_id=task.spec.id,
+                phase="verify",
+                status="skipped",
+                message=(
+                    f"{len(task.spec.verify_commands)} verify command(s) not run "
+                    '(verify_mode = "ci-only": the pull request\'s checks are the '
+                    "verification)"
+                ),
+            )
+            self._set_task_state(run_id, task, "done")
+            return
         outcome = phases.verify(task)
         passed, feedback, results = outcome.passed, outcome.feedback, outcome.results
+        advisory = not passed and mode == "advisory"
         # `results` (the full command transcript) is persisted so a resumed
         # run reads the evidence from phase_attempts rather than in-memory
-        # state (#61).
+        # state (#61). An advisory failure (#682) gets its own status: it
+        # blocked nothing, and `_verification_note` reads the rows back.
         self.store.record_phase(
             run_id,
             "verify",
             task_id=task.spec.id,
             attempt=task.revisions + 1,
-            status="ok" if passed else "failed",
+            status="ok" if passed else ("advisory" if advisory else "failed"),
             output_json=json.dumps(
                 {"passed": passed, "feedback": clip(feedback), "results": results}
             ),
@@ -3214,15 +3376,29 @@ class LoopEngine:
         # in the phase_attempts table.
         failure_count = feedback.count(VERIFY_FAILURE_PREFIX)
         first_line = feedback.splitlines()[0] if feedback else "verify failed"
+        message = first_line if failure_count <= 1 else f"{first_line} (+{failure_count - 1} more)"
+        if advisory:
+            # The task is done on the builder's word (#682): the failure is
+            # evidence for the review and the pull request, never a
+            # revision or a replan. `verify_fingerprints` stays untouched —
+            # the suspect machinery is for checks that gate.
+            self.bus.emit(
+                HostEventTypes.PHASE_END,
+                run_id,
+                task_id=task.spec.id,
+                phase="verify",
+                status="advisory",
+                message=f'{message} (advisory: verify_mode = "advisory", not blocking)',
+            )
+            self._set_task_state(run_id, task, "done")
+            return
         self.bus.emit(
             HostEventTypes.PHASE_END,
             run_id,
             task_id=task.spec.id,
             phase="verify",
             status="failed",
-            message=(
-                first_line if failure_count <= 1 else f"{first_line} (+{failure_count - 1} more)"
-            ),
+            message=message,
         )
         repeated = self._record_verify_failures(task, outcome.failures)
         if repeated and task.verify_suspect:

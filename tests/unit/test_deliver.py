@@ -1452,3 +1452,55 @@ class TestNaming:
             )
         assert "'sbxloop/r42'" in str(info.value)
         assert "creations being restricted" in str(info.value)
+
+
+class TestVerificationSection:
+    """#682: what the sandbox's checks did not decide closes the body as its
+    own section, before `Closes`, whichever way the body was written."""
+
+    NOTE = 'The operator set `verify_mode = "advisory"`: these checks failed\n- task t1: x'
+
+    def test_the_section_precedes_closes_in_the_summary_body(self, tmp_path: Path) -> None:
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            closes=5,
+            verification=self.NOTE,
+        )
+        body = ops.pr_kwargs["body"]
+        assert body.startswith("Artifacts produced by sbxloop run `r42`.")
+        assert f"\n**Verification:** {self.NOTE}\n\nCloses #5\n" in body
+        assert body.endswith("\nCloses #5\n")
+
+    def test_the_section_follows_an_authored_body(self, tmp_path: Path) -> None:
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            authored_body="## Summary\n\nDid it.\n",
+            verification=self.NOTE,
+        )
+        body = ops.pr_kwargs["body"]
+        assert body.startswith(
+            "## Summary\n\nDid it.\n\n---\n\nArtifacts produced by sbxloop run `r42`."
+        )
+        assert body.endswith(f"\n**Verification:** {self.NOTE}\n")
+
+    def test_no_note_no_section(self, tmp_path: Path) -> None:
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            verification="  ",
+        )
+        assert "Verification" not in ops.pr_kwargs["body"]

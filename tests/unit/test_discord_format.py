@@ -323,6 +323,28 @@ class TestFormat:
             )
         ) == ["🔨 **build** · task `t2` — added the parser and its tests"]
         assert format_for_discord(ev("phase.end", task_id="t2", phase="verify", status="ok")) == []
+        # An advisory failure (#682) blocked nothing, and the human is who it
+        # is evidence for: a warning line at every level.
+        advisory = ev(
+            "phase.end",
+            task_id="t2",
+            phase="verify",
+            status="advisory",
+            message="verify command failed: `pytest` (exit 1) (advisory, not blocking)",
+        )
+        assert texts(format_for_discord(advisory)) == [
+            "⚠ **verify** · task `t2` — verify command failed: `pytest` (exit 1) "
+            "(advisory, not blocking)"
+        ]
+        assert texts(format_for_discord(advisory, level="quiet")) == texts(
+            format_for_discord(advisory)
+        )
+        # a skip under ci-only stays verbose-only, like any other non-failure
+        skipped = ev("phase.end", task_id="t2", phase="verify", status="skipped", message="not run")
+        assert format_for_discord(skipped) == []
+        assert texts(format_for_discord(skipped, level="verbose")) == [
+            "· verify · task `t2` — not run"
+        ]
 
     def test_newly_surfaced_events_and_levels(self) -> None:
         err = format_for_discord(ev("worker.error", message="job died"))
@@ -337,6 +359,17 @@ class TestFormat:
         warn = ev("sandbox.tooling_warning", message="node missing")
         assert texts(format_for_discord(warn)) == ["⚠ tooling: node missing"]
         assert format_for_discord(warn, level="quiet") == []
+        services = ev(
+            "verify.services_detected",
+            evidence=["docker-compose.yml (compose file)", "uv.lock mentions testcontainers"],
+            hint="set verify_mode",
+        )
+        assert texts(format_for_discord(services)) == [
+            "⚠ verify: the suite may need services the sandbox does not have "
+            "(`docker-compose.yml (compose file)`, `uv.lock mentions testcontainers`) "
+            "— set verify_mode"
+        ]
+        assert format_for_discord(services, level="quiet") == []
         cap = ev("agent.tool_cap", cap=40)
         assert texts(format_for_discord(cap)) == [
             "⛔ tool-call ceiling (40) reached — further calls are turned away; the agent was "

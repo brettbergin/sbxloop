@@ -609,6 +609,79 @@ def project_gate(
     return None
 
 
+# Lockfiles and manifests a test-container dependency would be pinned in
+# (#682). Read as text: the name is what matters, not the format.
+SERVICE_LOCKFILES = (
+    "uv.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "requirements-test.txt",
+    "pyproject.toml",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+    "Gemfile.lock",
+    "go.sum",
+    "Cargo.lock",
+    "packages.lock.json",
+    "Directory.Packages.props",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "composer.lock",
+)
+_COMPOSE_GLOBS = ("docker-compose*.yml", "docker-compose*.yaml", "compose.yml", "compose.yaml")
+_WORKFLOW_SERVICES_RE = re.compile(r"^\s*services:\s*(#.*)?$", re.MULTILINE)
+
+
+def services_evidence(workspace: Path | None) -> list[str]:
+    """What in the workspace says its suite needs services the sandbox does
+    not have (#682): compose files, a test-container dependency in a
+    lockfile, ``services:`` blocks in the GitHub workflows.
+
+    Evidence, not a decision: the loop reports it under
+    ``verify_mode = "full"`` and leaves the knob to the operator, because
+    a compose file for local development says nothing certain about the
+    unit suite. The root and one level down are looked at — a monorepo's
+    packages, a ``backend/`` — never the whole tree.
+    """
+    if workspace is None or not workspace.is_dir():
+        return []
+    evidence: list[str] = []
+    roots = [workspace, *sorted(p for p in workspace.iterdir() if p.is_dir() and p.name[0] != ".")]
+    for root in roots:
+        compose = {path for pattern in _COMPOSE_GLOBS for path in root.glob(pattern)}
+        for path in sorted(compose):
+            if path.is_file():
+                evidence.append(f"{path.relative_to(workspace).as_posix()} (compose file)")
+        for name in SERVICE_LOCKFILES:
+            path = root / name
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(errors="replace")
+            except OSError:
+                continue
+            if "testcontainers" in text.lower():
+                evidence.append(f"{path.relative_to(workspace).as_posix()} mentions testcontainers")
+    workflows = workspace / ".github" / "workflows"
+    if workflows.is_dir():
+        for path in sorted(workflows.iterdir()):
+            if path.suffix not in (".yml", ".yaml") or not path.is_file():
+                continue
+            try:
+                text = path.read_text(errors="replace")
+            except OSError:
+                continue
+            if _WORKFLOW_SERVICES_RE.search(text):
+                evidence.append(f"{path.relative_to(workspace).as_posix()} declares `services:`")
+    return evidence
+
+
 def gate_rule(gate: str | None) -> str:
     """The decompose prompt's gate paragraph, naming *this* project's gate.
 
