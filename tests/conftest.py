@@ -130,6 +130,31 @@ def _structlog_through_stdlib() -> None:
     configure_logging("DEBUG")
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _cli_console_follows_columns() -> None:
+    """Make the CLI's module-level rich ``Console`` read ``COLUMNS``/``LINES``
+    at render time, the way CLI tests assume when they ``monkeypatch.setenv``
+    them or pass ``env=`` to ``CliRunner.invoke``.
+
+    rich freezes both variables into the console when they are set at
+    construction, and construction happens at import. Importing GNU readline
+    (which pytest's startup does) ``setenv``s ``COLUMNS=80``/``LINES=24`` in
+    the C environment; the importing process never sees that in ``os.environ``
+    but every xdist worker inherits it, so on a Linux system Python the
+    console is born frozen at 80 columns and rich tables truncate cells the
+    tests look for. libedit builds (macOS, uv-managed CPython) do not, which
+    is why the failure only shows on distro interpreters.
+    """
+    from sbxloop.cli import app as app_module
+
+    console = app_module.console
+    # These are rich internals; fail loudly if a rich upgrade renames them
+    # rather than quietly bringing the frozen-width failure back.
+    assert hasattr(console, "_width") and hasattr(console, "_height")
+    console._width = None
+    console._height = None
+
+
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """Point HOME at the test's tmp dir.

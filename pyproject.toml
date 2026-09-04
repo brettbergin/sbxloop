@@ -1,3 +1,10 @@
+[tool.uv]
+# uv supplies the interpreter. Binding to a distro Python made the suite's
+# behaviour depend on how that Python was built (GNU readline exports
+# COLUMNS/LINES to every child process; libedit does not) and the CI matrix
+# on what ubuntu-latest happens to ship.
+python-preference = "only-managed"
+
 [tool.uv.workspace]
 members = ["packages/sbxloop", "packages/sbxloop-worker"]
 
