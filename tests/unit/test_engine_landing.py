@@ -151,6 +151,37 @@ class TestPollChecks:
         assert rec.waits == ["ci", "ci", "ci"]  # 0, 30, 60 -> 90 settles
         assert len(fake.checks_calls) == 4
 
+    def test_a_policy_reader_is_asked_on_every_poll(self) -> None:
+        """#674: a base whose rules cannot be read learns its required
+        checks from the PR's rollup, which grows as checks report — so a
+        required check that turns up mid-poll is waited on."""
+        fake = FakeGithub()
+        fake.protection_forbidden = True
+        fake.rollup_required = ("ci", "lint")
+        # `docs` pends throughout and is never waited on; `lint` is absent,
+        # then pending, then green — and gates the whole way.
+        fake.checks = [
+            ChecksVerdict("pending", 2, ("docs",), (), ("ci",)),
+            ChecksVerdict("pending", 3, ("docs", "lint"), (), ("ci",)),
+            ChecksVerdict("pending", 3, ("docs",), (), ("ci", "lint")),
+        ]
+        rec = Recorder(FakeClock(), per_tick=1.0)
+        policy_for = check_policy_reader(fake, REPO, "main", cfg=cfg(), number=7)
+        judged = poll_checks(
+            fake,
+            REPO,
+            fake.head_sha,
+            cfg=cfg(),
+            tick=rec.tick,
+            emit=rec.emit_checks,
+            clock=rec.clock,
+            policy_for=policy_for,
+        )
+        assert judged.state == "green" and judged.gating == ("ci", "lint")
+        assert judged.source == "pr-rollup"
+        assert rec.waits == ["ci", "ci"], "lint absent, then pending, then green"
+        assert fake.rollup_calls == 3, "the rollup is re-read on every poll"
+
     def test_settle_defaults_to_the_poll_start(self) -> None:
         fake = FakeGithub()
         fake.checks = [NO_CHECKS]
@@ -1137,7 +1168,19 @@ class TestBlockedWithGreenChecks:
         assert "requires an approving review" in blocked_reason(reviews, cfg())
         assert "merge_gate" not in blocked_reason(reviews, cfg(merge_gate="chat"))
         unknown = BaseRequirements(None, None, "unknown")
-        assert "could not be read" in blocked_reason(unknown, cfg())
+        assert "base's protection could not be read" in blocked_reason(unknown, cfg())
+        # #674: which source, and why classic protection is the usual one.
+        forbidden = BaseRequirements(None, None, "unknown", unread=("protection",))
+        why = blocked_reason(forbidden, cfg())
+        assert "base's classic branch protection could not be read" in why
+        assert "(reading classic protection needs admin)" in why
+        both = BaseRequirements(None, None, "unknown", unread=("protection", "rulesets"))
+        assert "classic branch protection and rulesets could not be read" in blocked_reason(
+            both, cfg()
+        )
+        # The rollup supplied the checks, but not the rule behind the refusal.
+        rollup = BaseRequirements(("ci",), None, "pr-rollup", unread=("protection",))
+        assert "classic branch protection could not be read" in blocked_reason(rollup, cfg())
         none = BaseRequirements((), 0, "protection")
         why = blocked_reason(none, cfg(), detail="Pull Request is not mergeable (HTTP 405)")
         assert "a rule it does not read" in why and why.endswith(

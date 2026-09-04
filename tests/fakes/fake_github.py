@@ -155,6 +155,13 @@ class FakeGithub(GithubOps):
         # 404, unprotected) and the rulesets list.
         self.protection: dict[str, Any] | None = None
         self.rules: list[dict[str, Any]] = []
+        # A token without admin: classic protection answers 403 (#674).
+        self.protection_forbidden = False
+        # What the PR's own rollup marks required (#674): the names GitHub
+        # would hold the merge for among the checks that have reported.
+        # None = the rollup cannot be read (GraphQL refused, say).
+        self.rollup_required: tuple[str, ...] | None = ()
+        self.rollup_calls = 0
         self.failed_logs: list[FailedCheck] = []
         self.reviews_payload: list[dict[str, Any]] = []
         self.comments_payload: list[dict[str, Any]] = []
@@ -421,6 +428,12 @@ class FakeGithub(GithubOps):
         if method == "GET" and path.endswith("/pulls") and "state=open&head=" in query:
             return [dict(self.pr)] if self.pr_created else []
         if method == "GET" and "/branches/" in path and path.endswith("/protection"):
+            if self.protection_forbidden:
+                raise GithubOpsError(
+                    "github op raw.api failed: GithubOpError: gh api GET "
+                    f"{path} failed (rc=1): Resource not accessible by integration (HTTP 403)",
+                    http_status=403,
+                )
             if self.protection is None:
                 raise GithubOpsError(
                     "github op raw.api failed: GithubOpError: gh api GET "
@@ -519,6 +532,12 @@ class FakeGithub(GithubOps):
     def pr_get(self, repo: str, number: int) -> dict[str, Any]:
         self._maybe_fail("pr_get")
         return {**self.pr, "head": dict(self.pr["head"])}
+
+    def pr_required_checks(self, repo: str, number: int) -> tuple[str, ...]:
+        self.rollup_calls += 1
+        if self.rollup_required is None:
+            raise GithubOpsError("statusCheckRollup failed: [{'type': 'FORBIDDEN'}]")
+        return tuple(self.rollup_required)
 
     def pr_checks(self, repo: str, sha: str) -> ChecksVerdict:
         self.checks_calls.append(sha)

@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.protection import BaseRequirements, read_base_requirements
+from sbxloop.gh.protection import BaseRequirements, read_base_requirements, with_pr_rollup
 
 UNPROTECTED = GithubOpsError("no protection", http_status=404)
 FORBIDDEN = GithubOpsError("admin only", http_status=403)
@@ -77,6 +77,10 @@ class TestRequiredContexts:
         got = read(FORBIDDEN, [])
         assert got.required_contexts is None
         assert got.source == "unknown"
+        assert got.unread == ("protection",)
+        assert read(FORBIDDEN, FORBIDDEN).unread == ("protection", "rulesets")
+        assert read({}, FORBIDDEN).unread == ("rulesets",)
+        assert read(UNPROTECTED, []).unread == ()
 
     def test_an_unreadable_rulesets_source_is_unknown(self) -> None:
         assert read({}, GithubOpsError("boom", http_status=500)).source == "unknown"
@@ -286,3 +290,47 @@ class TestBlockers:
             (), 0, "rulesets", conversation_resolution=True, dismiss_stale_reviews=True
         )
         assert rules.blockers() == []
+
+
+class TestWithPrRollup:
+    """#674: a base whose rules this token cannot read learns its required
+    checks from the pull request's own rollup, which GitHub evaluates
+    against the same rules and serves with pull access."""
+
+    class Rollup:
+        def __init__(self, required: tuple[str, ...] | Exception) -> None:
+            self.required, self.calls = required, 0
+
+        def pr_required_checks(self, repo: str, number: int) -> tuple[str, ...]:
+            self.calls += 1
+            if isinstance(self.required, Exception):
+                raise self.required
+            return self.required
+
+    def test_fills_the_required_set_when_a_source_was_unread(self) -> None:
+        unknown = read(FORBIDDEN, [])
+        got = with_pr_rollup(self.Rollup(("ci",)), "o/r", 7, unknown)
+        assert got.required_contexts == ("ci",)
+        assert got.source == "pr-rollup"
+        assert got.unread == ("protection",), "what could not be read is still on record"
+
+    def test_the_readable_sources_rules_are_kept(self) -> None:
+        rules = [{"type": "pull_request", "parameters": {"required_approving_review_count": 2}}]
+        got = with_pr_rollup(self.Rollup(("ci",)), "o/r", 7, read(FORBIDDEN, rules))
+        assert got.approvals_required == 2 and got.required_contexts == ("ci",)
+
+    def test_a_readable_base_is_not_asked(self) -> None:
+        rollup = self.Rollup(("ci",))
+        known = read({}, [])
+        assert with_pr_rollup(rollup, "o/r", 7, known) is known
+        assert rollup.calls == 0
+
+    def test_an_unreadable_rollup_leaves_the_base_unknown(self) -> None:
+        unknown = read(FORBIDDEN, [])
+        got = with_pr_rollup(self.Rollup(GithubOpsError("nope")), "o/r", 7, unknown)
+        assert got is unknown
+        assert with_pr_rollup(self.Rollup(RuntimeError("boom")), "o/r", 7, unknown) is unknown
+
+    def test_an_empty_rollup_is_an_empty_set_the_gate_reads_as_everything(self) -> None:
+        got = with_pr_rollup(self.Rollup(()), "o/r", 7, read(FORBIDDEN, []))
+        assert got.required_contexts == () and got.source == "pr-rollup"

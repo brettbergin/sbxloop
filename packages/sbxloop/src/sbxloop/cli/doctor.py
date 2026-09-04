@@ -97,6 +97,9 @@ class RepoProbe:
     # The delivery base's rules the loop cannot satisfy (#673) — each one
     # 405s every loop merge. Empty = none known; None = unverifiable.
     base_blockers: tuple[str, ...] | None = None
+    # The sources of the base's rules this token could not read (#674):
+    # "protection" (classic, admin-only) and/or "rulesets".
+    base_unread: tuple[str, ...] = ()
     # The merge methods the repository allows, in the loop's order of
     # preference (#620). None = the payload did not say.
     merge_methods: tuple[MergeMethod, ...] | None = None
@@ -274,7 +277,26 @@ def repo_checks(
                     hard=False,
                 )
             )
+        if result.base_unread:
+            rows.append(Check(f"{name} required checks", True, _unread_note(result.base_unread)))
     return rows
+
+
+def _unread_note(unread: tuple[str, ...]) -> str:
+    """What the loop does about a base whose rules this token cannot read
+    (#674): the required checks come from each pull request's own rollup
+    — what GitHub itself holds the merge for — so a bot with write but not
+    admin still gates only on what the base requires."""
+    if "protection" in unread:
+        what = "classic branch protection is not readable with this token (GitHub needs admin)"
+        if "rulesets" in unread:
+            what += " and the rulesets could not be read either"
+    else:
+        what = "the base's rulesets could not be read"
+    return (
+        f"{what}; the required checks will be read from each pull request's own rollup, "
+        "and a rule other than a check the base enforces shows up only as a blocked run"
+    )
 
 
 def _merge_method_status(
@@ -387,7 +409,7 @@ def _missing_permissions(data: dict[str, object]) -> tuple[str, ...]:
 
 def _base_blockers(
     ops: GithubOps, repo: str, base: str, config: Config, *, can_sign: bool
-) -> tuple[str, ...] | None:
+) -> tuple[tuple[str, ...] | None, tuple[str, ...]]:
     """The rules of ``base`` the loop cannot satisfy (#673).
 
     A required review is the classic one — the loop cannot approve its own
@@ -398,14 +420,15 @@ def _base_blockers(
     the landing gate uses for required checks (#611) — and judged by the
     same :func:`sbxloop.engine.landing.base_blockers` the run would report.
     ``None`` when GitHub would not say (a token without admin on classic
-    protection, say): unverifiable is not a verdict.
+    protection, say): unverifiable is not a verdict. The second element
+    names the sources that could not be read (#674).
     """
     from sbxloop.engine.landing import base_blockers
 
     requirements = read_base_requirements(ops, repo, base)
     if requirements.source == "unknown" and not requirements.blockers():
-        return None
-    return base_blockers(requirements, config.landing, can_sign=can_sign)
+        return None, requirements.unread
+    return base_blockers(requirements, config.landing, can_sign=can_sign), requirements.unread
 
 
 def credential_key(entry: RepoConfig) -> str:
@@ -474,22 +497,24 @@ def sandbox_repo_probe(
         missing = _missing_permissions(data)
         base = entry.deliver_base or str(data.get("default_branch") or "")
         has_issues = data.get("has_issues")
+        blockers, unread = (
+            _base_blockers(
+                ops,
+                entry.repo,
+                base,
+                config,
+                # A GitHub App's API commits arrive signed by GitHub.
+                can_sign=box.provisioner.gh_bot_login(entry.repo) is not None,
+            )
+            if base
+            else (None, ())
+        )
         return RepoProbe(
             reachable=True,
             detail="reachable, token has the required permissions" if not missing else "reachable",
             missing_permissions=missing,
-            base_blockers=(
-                _base_blockers(
-                    ops,
-                    entry.repo,
-                    base,
-                    config,
-                    # A GitHub App's API commits arrive signed by GitHub.
-                    can_sign=box.provisioner.gh_bot_login(entry.repo) is not None,
-                )
-                if base
-                else None
-            ),
+            base_blockers=blockers,
+            base_unread=unread,
             merge_methods=allowed_merge_methods(data),
             missing_labels=_missing_repo_labels(ops, config, entry),
             issues_enabled=has_issues if isinstance(has_issues, bool) else None,

@@ -174,9 +174,13 @@ def poll_checks(
     clock: Callable[[], float] = time.monotonic,
     settle_from: float | None = None,
     policy: CheckPolicy = NO_POLICY,
+    policy_for: PolicyFor | None = None,
 ) -> CheckJudgment:
     """Wait for the checks on ``head_sha`` to reach a final state, judged
-    under ``policy`` (:mod:`sbxloop.engine.checks`, #611).
+    under ``policy`` (:mod:`sbxloop.engine.checks`, #611) — or, when
+    ``policy_for`` is given, under what it answers for ``head_sha`` on
+    each poll: a base whose rules cannot be read learns its required
+    checks from the pull request as they report (#674).
 
     ``red`` returns immediately — the build is known broken and waiting on
     stragglers only delays the fix. ``green`` with check runs present
@@ -196,7 +200,7 @@ def poll_checks(
     last: CheckJudgment | None = None
     while True:
         verdict = ops.pr_checks(repo, head_sha)
-        checks = judge_checks(verdict, policy)
+        checks = judge_checks(verdict, policy_for(head_sha) if policy_for else policy)
         if checks != last:
             emit(
                 state=checks.state,
@@ -753,7 +757,7 @@ def land(
                     emit=functools.partial(emit, "landing.checks", pr=number, head=head),
                     clock=clock,
                     settle_from=head_seen[1],
-                    policy=policy,
+                    policy_for=policy_for,
                 )
             except CiTimeout as exc:
                 return Blocked(str(exc))
@@ -974,6 +978,9 @@ def base_blockers(
     )
 
 
+_UNREAD_NAMES = {"protection": "classic branch protection", "rulesets": "rulesets"}
+
+
 def blocked_reason(
     requirements: BaseRequirements,
     cfg: LandingConfig,
@@ -992,12 +999,18 @@ def blocked_reason(
         )
         if requirements.approvals_required and cfg.merge_gate != "chat":
             why += '\n- set `[landing] merge_gate = "chat"` to have a person approve from chat'
-    elif requirements.source == "unknown":
+    elif requirements.source == "unknown" or requirements.unread:
+        unread = " and ".join(_UNREAD_NAMES.get(name, name) for name in requirements.unread)
         why = (
             "GitHub reports the pull request as blocked with every check green, and the "
-            "base's protection could not be read; the usual causes are a required "
-            "review, a CODEOWNERS review, required conversation resolution, or a merge "
-            "queue"
+            f"base's {unread or 'protection'} could not be read"
+            + (
+                " (reading classic protection needs admin)"
+                if "protection" in requirements.unread
+                else ""
+            )
+            + "; the usual causes are a required review, a CODEOWNERS review, required "
+            "conversation resolution, or a merge queue"
         )
     else:
         why = (

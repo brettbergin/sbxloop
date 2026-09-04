@@ -1117,6 +1117,16 @@ could not be read, counts as the PR's own. A base that declares no required
 checks gates on all of them. `required_checks` names the gating set
 explicitly; `ignore_checks` drops a check everywhere.
 
+Classic branch protection is readable only by an admin, and an
+organization's bot usually has write, not admin. When the base's rules
+cannot be read, the required set is taken from the pull request itself:
+GitHub marks each check on the PR's head as required or not, evaluated
+against the very rules the token cannot read, and serves that with pull
+access. It is re-read on every poll (only checks that have reported are
+listed), the `ci.status` / `landing.checks` events say `source = "pr-rollup"`, and `sbxloop doctor` says on the repository row that the
+checks will come from the PR. Only when that is unreadable too does the
+loop fall back to gating on every check.
+
 **A workflow awaiting approval** — a check at `action_required`, which is
 how GitHub holds a first-time contributor's or a fork's workflow until a
 maintainer approves the run — is neither a failure nor something to wait

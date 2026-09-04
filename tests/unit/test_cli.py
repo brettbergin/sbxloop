@@ -3243,7 +3243,7 @@ class TestDoctorBranchProtection:
         config = Config()
 
         def blockers(ops: Any) -> tuple[str, ...] | None:
-            return _base_blockers(ops, "o/r", "main", config, can_sign=False)  # type: ignore[arg-type]
+            return _base_blockers(ops, "o/r", "main", config, can_sign=False)[0]  # type: ignore[arg-type]
 
         classic = Ops({"required_pull_request_reviews": {"required_approving_review_count": 1}}, [])
         assert blockers(classic) == (
@@ -3264,6 +3264,54 @@ class TestDoctorBranchProtection:
         )
         unknown = Ops(GithubOpsError("x", http_status=403), GithubOpsError("x", http_status=403))
         assert blockers(unknown) is None
+        # The probe also names which sources the token could not read (#674).
+        assert _base_blockers(ruleset, "o/r", "main", config, can_sign=False)[1] == (  # type: ignore[arg-type]
+            "protection",
+        )
+        assert _base_blockers(unknown, "o/r", "main", config, can_sign=False)[1] == (  # type: ignore[arg-type]
+            "protection",
+            "rulesets",
+        )
+        assert _base_blockers(classic, "o/r", "main", config, can_sign=False)[1] == ()  # type: ignore[arg-type]
+
+    def test_unreadable_classic_protection_says_the_checks_come_from_the_pr(
+        self, workdir: Path
+    ) -> None:
+        """#674: a write-not-admin token cannot read classic protection;
+        doctor says so, and that the required checks come from the PR's
+        rollup, instead of printing "unknown" or nothing."""
+        from sbxloop.cli.doctor import RepoProbe, repo_checks
+
+        config = self._config('[[github.repos]]\nrepo = "acme/alpha"\n', workdir)
+        main, row = repo_checks(
+            config,
+            {"GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(
+                reachable=True, base_blockers=None, base_unread=("protection",)
+            ),
+        )
+        assert main.ok and row.ok
+        assert row.name == "github repo acme/alpha required checks"
+        assert "classic branch protection is not readable with this token" in row.detail
+        assert "needs admin" in row.detail
+        assert "read from each pull request's own rollup" in row.detail
+        # Both unread: says so; only rulesets unread: names them.
+        (_, both) = repo_checks(
+            config,
+            {"GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(
+                reachable=True, base_blockers=None, base_unread=("protection", "rulesets")
+            ),
+        )
+        assert "rulesets could not be read either" in both.detail
+        (_, rules) = repo_checks(
+            config,
+            {"GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(
+                reachable=True, base_blockers=None, base_unread=("rulesets",)
+            ),
+        )
+        assert rules.detail.startswith("the base's rulesets could not be read;")
 
 
 class TestInitRepo:
