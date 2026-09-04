@@ -1334,3 +1334,25 @@ def test_a_manifest_that_is_not_utf8_provisions_without_error(
     toolchains.resolve_languages((), tmp_path)
     versions = toolchains.toolchain_versions([toolchain], tmp_path)
     assert (versions[toolchain].series, versions[toolchain].source) == (series, name)
+
+
+class TestDescribe:
+    """#689: the resolved set as one prompt line, versions and their
+    sources included, requirements pulled in, registry order."""
+
+    def test_versions_and_sources_are_named(self) -> None:
+        versions = {
+            "python": toolchains.ToolchainVersion("3.12", "pyproject.toml", ">=3.12"),
+            "javascript": toolchains.ToolchainVersion("22", "default"),
+        }
+        line = toolchains.describe(["typescript", "python", "go"], versions)
+        assert line == "python 3.12 (from pyproject.toml), javascript 22, typescript, go"
+
+    def test_nothing_resolved_says_so(self) -> None:
+        assert toolchains.describe([], None) == "(none)"
+        assert toolchains.describe(["not-a-language"]) == "(none)"
+
+    def test_a_default_set_reads_its_pins_from_the_workspace(self, tmp_path: Path) -> None:
+        (tmp_path / ".python-version").write_text("3.13\n")
+        versions = toolchains.toolchain_versions(["python"], tmp_path)
+        assert toolchains.describe(["python"], versions) == "python 3.13 (from .python-version)"

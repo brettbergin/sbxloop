@@ -68,6 +68,7 @@ __all__ = [
     "Toolchain",
     "ToolchainVersion",
     "UnsatisfiablePin",
+    "describe",
     "detect_languages",
     "install_domains",
     "normalize_language",
@@ -1919,6 +1920,26 @@ class LanguageResolution(NamedTuple):
     # host can honour, else the default (#627); what `resolve(languages,
     # versions)` rebuilds the entries for
     versions: Mapping[str, ToolchainVersion] = MappingProxyType({})
+
+
+def describe(
+    languages: Sequence[str], versions: Mapping[str, ToolchainVersion] | None = None
+) -> str:
+    """The resolved set as one line for a prompt (#689): each toolchain in
+    registry order (requirements included), with the series and where it
+    was declared for the ones that carry one — ``python 3.13 (from
+    pyproject.toml), javascript 22, go`` — so the builder is told what the
+    sandbox actually has rather than asked to guess from the task."""
+    parts = []
+    for toolchain in resolve(languages):
+        version = (versions or {}).get(toolchain.name)
+        if version is None:
+            parts.append(toolchain.name)
+        elif version.source == "default":
+            parts.append(f"{toolchain.name} {version.series}")
+        else:
+            parts.append(f"{toolchain.name} {version.series} (from {version.source})")
+    return ", ".join(parts) or "(none)"
 
 
 def toolchain_versions(

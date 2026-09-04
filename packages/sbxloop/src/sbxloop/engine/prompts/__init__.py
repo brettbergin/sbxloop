@@ -58,6 +58,10 @@ def render(name: str, **context: str) -> str:
     # text when the workspace has any, else nothing — a render call with
     # no workspace (a unit test, the concierge) gives none.
     context.setdefault("repo_conventions", "")
+    # Where the builder is and what it has (#689): the checkout path and
+    # the resolved toolchain set, rendered by the phase from the run.
+    context.setdefault("work_dir", "the current working directory")
+    context.setdefault("toolchains", "(none)")
     # What the sandbox's verification did not decide (#682): advisory
     # failures, or that nothing ran under `ci-only`. Empty under `full`.
     context.setdefault("verification", "")

@@ -20,9 +20,18 @@ tests/unit/test_prompts.py):
 Variables: $outcome, $task_id, $task_title, $task_description,
 $acceptance_criteria, $verify_commands, $prior_attempt, $feedback,
 $user_guidance, $repo_conventions (engine.repocontext, #688 — defaulted to ""
-by render()); $baseline_registries and $declarable_registries are injected
+by render()), $work_dir and $toolchains (#689 — the checkout path and the
+run's resolved toolchain set with versions, rendered by phases.py from
+toolchains.describe; both defaulted by render()); $baseline_registries and
+$declarable_registries are injected
 from policy.py, never hardcoded (test_registry_tiers_are_injected_not_hardcoded).
 Section rules:
+- "Where you are" / "How to change code here" (#689): the builder is told
+  it is on a feature branch of an existing repository that a human reviews
+  as a pull request, and carries the scope rule in the reviewer's words
+  ("beyond the outcome's scope is a defect" — test_build_and_review_share_the_scope_rule);
+  the greenfield framing ("write all outputs", "when creating the project")
+  must not come back (test_build_is_framed_as_a_branch_not_an_artifact).
 - Each ECOSYSTEM_NOTES row must keep its markers under "Ecosystem notes"
   (test_prompts_carry_ecosystem_notes, #142).
 - "workspace root", "cannot edit", "blocked domain", "egress", "sudo",
@@ -39,10 +48,29 @@ briefly state your approach first — a few sentences on what you will do and
 in what order — then complete the task by actually doing the work: create
 and edit files, run commands, and verify as you go.
 
-Work in the current working directory: it is the run's workspace, synced to
-the host so the user receives everything you put in it. Write all outputs and
-artifacts here — files created anywhere else are lost when the sandbox is
+## Where you are
+
+You are on a feature branch of an existing repository, checked out at
+$work_dir. It is the run's workspace, synced to the host: what you change
+here becomes one commit on that branch, and a human will read the diff as a
+pull request. Files written anywhere else are lost when the sandbox is
 destroyed.
+
+Resolved toolchains for this repository: $toolchains.
+
+## How to change code here
+
+- Match the conventions of the surrounding code: naming, layout, where tests
+  live, which formatter runs. Read a neighbouring module before writing a
+  new one, and put a new test where the existing ones are.
+- Change only what the task requires. Work deleted, rewritten or reformatted
+  beyond the outcome's scope is a defect the reviewer will reject: no
+  unrelated reformatting, no renames for taste, no "while I'm here" fixes —
+  note those in your summary instead.
+- Do not create top-level files unless the task asks for them. Never write
+  outside $work_dir.
+
+$repo_conventions
 
 ## Environment notes
 
@@ -59,12 +87,12 @@ destroyed.
   from in here.
 - After you finish, the task's verify commands (listed below) run
   mechanically under POSIX `sh -c` from the **workspace root**, exactly as
-  written — you cannot edit them. Create files at the paths those commands
-  check: if verification expects `requirements.txt` at the root, do not bury
-  it in a subdirectory; if a command enters a subdirectory, build there.
-- Ecosystem notes — read only the entry matching this task's toolchain and
-  ignore the rest. None of these is the default choice; work in the
-  ecosystem the task actually calls for.
+  written — you cannot edit them. Put files at the paths those commands
+  check: if verification expects a file at the root, do not bury it in a
+  subdirectory; if a command enters a subdirectory, build there.
+- Ecosystem notes — read only the entries for the resolved toolchains named
+  above and ignore the rest. None of these is the default choice; work in
+  the ecosystem the repository actually uses.
   - **Python** — the system Python is externally managed (PEP 668): bare
     `pip install X` fails. Create a virtualenv first —
     `python3 -m venv .venv && .venv/bin/pip install X` — and run project
@@ -73,14 +101,16 @@ destroyed.
     3.13 are on PATH, so `uv sync --all-packages` builds the locked
     environment (workspace members included) and `uv run …` runs
     everything in it (`uv run pytest -q`). `uv add X` is how a dependency
-    gets added, not `pip install`.
+    gets added, not `pip install`. A project without a lockfile declares
+    its dependencies where it already does (`pyproject.toml`,
+    `requirements.txt`) — add to that file, do not start a second one.
   - **JavaScript/Node** — install from the directory holding
     `package.json`; `node_modules/` is project-local, so nothing needs a
     global install. Use the client the lockfile names: `pnpm-lock.yaml` →
     `pnpm install`, `yarn.lock` → `yarn install`, `bun.lock` → `bun install`, otherwise `npm ci` — installing with a different client
     ignores the lockfile and rewrites it. `pnpm` and `yarn` are on PATH
     through corepack and run the version `packageManager` pins. `npm ci`
-    is the reproducible install but fails without a lockfile — use `npm install` when you are creating the project and no lockfile exists yet.
+    is the reproducible install but fails without a lockfile — use `npm install` only when the project has no lockfile at all.
     Run project dev binaries through the project (`npx --no-install eslint .`, or the package.json script via `npm run` / `pnpm run` /
     `yarn run` / `bun run`), never bare `eslint`/`jest`/`tsc`.
   - **TypeScript** — run `npx tsc --noEmit` from the directory holding
@@ -117,8 +147,6 @@ destroyed.
 ## Overall outcome
 
 $outcome
-
-$repo_conventions
 
 ## Task $task_id: $task_title
 

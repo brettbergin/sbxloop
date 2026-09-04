@@ -360,7 +360,13 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   author its own exam) — and any per-task `egress` declarations, both
   checked at JSON acceptance.
 - **BUILD** — full tool access, plans and does the work in one session,
-  narrating its approach first. The one phase that *continues* rather than
+  narrating its approach first. build.md frames the session as a clone on
+  a feature branch that a human reviews (#689): `$work_dir` and
+  `$toolchains` (the resolved set with versions, `toolchains.describe`)
+  say where it is and what it has, and the scope rule review.md judges by
+  — "beyond the outcome's scope is a defect" — is stated to the builder in
+  the same words (`test_build_and_review_share_the_scope_rule`). The one
+  phase that *continues* rather than
   starting fresh: a revision resumes the previous attempt's session where
   the SDK still has it, and is handed that attempt's report either way, so
   it builds on what was already established instead of re-deriving it. A

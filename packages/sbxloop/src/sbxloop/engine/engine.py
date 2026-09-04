@@ -694,6 +694,7 @@ class LoopEngine:
                         workdir=pair.agent_workdir,
                         workspace=pair.workspace,
                         languages=pair.languages.languages,
+                        versions=pair.languages.versions,
                     )
                     # Replay persisted chat guidance (steer_run verdicts)
                     # so a resumed run keeps the direction the user set.
