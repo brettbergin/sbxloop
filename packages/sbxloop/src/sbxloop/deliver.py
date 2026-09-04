@@ -260,7 +260,7 @@ def deliver_workspace(
         plan = _plan_snapshot(source_dir, exclude)
 
     if base is None:
-        base = str(ops.repo_get(repo).get("default_branch") or "main")
+        base = ops.default_branch(repo)
     base_sha = _base_commit_sha(ops, repo, base)
     if base_sha is None:
         log.warning(

@@ -35,6 +35,13 @@ class StubOps:
         self.repo_get_calls.append(repo)
         return {"default_branch": "main"}
 
+    def default_branch(self, repo: str) -> str:
+        # The real one's contract (#672): the reported name or an error.
+        name = self.repo_get(repo).get("default_branch")
+        if not name:
+            raise GithubOpsError(f"GitHub did not report a default branch for {repo}")
+        return str(name)
+
     def repo_lookup(self, repo: str) -> dict[str, Any] | None:
         self.repo_get_calls.append(repo)
         return {"default_branch": "main"}
@@ -199,6 +206,46 @@ class TestDeliverWorkspace:
             source_dir=clean,
         )
         assert "excluded" not in ops2.pr_kwargs["body"]
+
+    def test_base_is_the_repositorys_default_branch(self, tmp_path: Path) -> None:
+        """#672: a `develop`/`master` repository is delivered against that
+        branch — the base commit, the merge parent and the PR all name it."""
+
+        class DevelopOps(StubOps):
+            def repo_get(self, repo: str) -> dict[str, Any]:
+                self.repo_get_calls.append(repo)
+                return {"default_branch": "develop"}
+
+        ops = DevelopOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r1",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+        )
+        assert ops.ref_lookups[0] == ("o/r", "heads/develop")
+        assert ops.pr_kwargs["base"] == "develop"
+
+    def test_no_default_branch_reported_stops_the_delivery(self, tmp_path: Path) -> None:
+        """#672: no guess of `main` — the delivery fails before a single
+        ref lookup or blob upload."""
+
+        class BranchlessOps(StubOps):
+            def repo_get(self, repo: str) -> dict[str, Any]:
+                self.repo_get_calls.append(repo)
+                return {"full_name": repo}
+
+        ops = BranchlessOps()
+        with pytest.raises(GithubOpsError, match="did not report a default branch"):
+            deliver_workspace(
+                ops,  # type: ignore[arg-type]
+                "o/r",
+                run_id="r1",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
+        assert ops.ref_lookups == [] and ops.blob_batches == [] and ops.pr_kwargs == {}
 
     def test_explicit_base_skips_repo_get(self, tmp_path: Path) -> None:
         ops = StubOps()

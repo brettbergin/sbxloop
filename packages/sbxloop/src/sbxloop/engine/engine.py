@@ -1064,7 +1064,7 @@ class LoopEngine:
         base = p.repo_config.deliver_base if p.repo_config else self.config.github.deliver_base
         try:
             if base is None:
-                base = str(ops.repo_get(repo).get("default_branch") or "main")
+                base = ops.default_branch(repo)
             head_sha = ops.ref_lookup(repo, f"heads/{branch}")
             if head_sha is None:
                 self._prior_unusable(p, branch, "the branch is no longer on origin")
@@ -2425,13 +2425,17 @@ class LoopEngine:
         return True
 
     def _base_branch(self, p: Pipeline) -> str:
-        """The branch the PR targets: configured, else the repository's default."""
+        """The branch the PR targets: configured, else the repository's default.
+
+        Never a guess (#672): a run with no repository has no branch to
+        target, and every caller checks for one before asking.
+        """
         base = p.repo_config.deliver_base if p.repo_config else self.config.github.deliver_base
         if base:
             return base
-        if p.ops is not None and p.repo is not None:
-            return str(p.ops.repo_get(p.repo).get("default_branch") or "main")
-        return "main"
+        if p.ops is None or p.repo is None:
+            raise StateError(f"run {p.run_id} has no GitHub repository to take a base branch from")
+        return p.ops.default_branch(p.repo)
 
     def _merge_base_into_clone(self, p: Pipeline) -> hostgit.MergeResult | None:
         """Before a fix round: bring the current base into the run's clone,
@@ -2440,7 +2444,7 @@ class LoopEngine:
         None when the run has no mounted clone to merge into; a fetch/merge
         failure is logged and the round proceeds on the tree as it is."""
         workspace = p.pair.workspace
-        if workspace is None or not p.pair.mounted or p.ops is None:
+        if workspace is None or not p.pair.mounted or p.ops is None or p.repo is None:
             return None
         base = self._base_branch(p)
         try:
