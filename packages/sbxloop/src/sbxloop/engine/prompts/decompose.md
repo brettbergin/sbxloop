@@ -69,6 +69,14 @@ that does, and say so in the task description. A plan that deletes the
 retry loop when the person is seeing duplicate emails — sent by a second
 worker, not by retries — has done the wrong thing correctly.
 
+A **Discussion** section is the thread under the issue, oldest first, and
+a **Linked issues** section is what the thread refers to. Read them as a
+maintainer would: a later comment that narrows, corrects or re-scopes the
+body wins over the body, a linked issue's excerpt says how a related
+problem was framed or solved, and a clipping note means the thread is
+longer than what you see — plan against what is shown, not against a
+guess about the rest.
+
 $repo_conventions
 
 ## Rules

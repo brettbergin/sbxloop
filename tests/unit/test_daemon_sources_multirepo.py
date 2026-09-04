@@ -9,6 +9,7 @@ import pytest
 from sbxloop.config import RepoConfig
 from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.sources import (
+    STATUS_MARKER,
     GitHubIssueSource,
     MultiRepoIssueSource,
     RepoHealth,
@@ -202,7 +203,7 @@ class TestRouting:
         source = build(router, "o/a", "o/b")
         item = next(i for i in source.poll() if i.repo == "o/a")
         source.report_started(item, "r1")
-        assert router.per_repo["o/a"].comments == [(4, "Run `r1` started.")]
+        assert router.per_repo["o/a"].comments == [(4, f"Run `r1` started.\n\n{STATUS_MARKER}")]
         assert router.per_repo["o/b"].comments == []
 
     def test_merged_report_closes_the_issue_in_its_own_repo(self, router: RouterOps) -> None:

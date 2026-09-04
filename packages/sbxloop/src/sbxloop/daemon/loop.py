@@ -26,7 +26,6 @@ tick resumes it through the same guardrails as any dispatch.
 
 from __future__ import annotations
 
-import re
 import signal
 import threading
 import time
@@ -53,16 +52,18 @@ from sbxloop.daemon.model import (
     TickResult,
     WorkItem,
 )
-from sbxloop.daemon.sources import WorkSource
+from sbxloop.daemon.sources import HIDDEN_MARKER_RE, IssueContext, WorkSource
 from sbxloop.daemon.store import DaemonStore, MergeGate, ReviewHold
 from sbxloop.engine.checks import check_policy_reader
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.landing import (
+    UNKNOWN_IDENTITY,
     AwaitingReview,
     Blocked,
     Closed,
     Landed,
     LandingOutcome,
+    LoopIdentity,
     NeedsFix,
     UpdateState,
     land,
@@ -95,9 +96,9 @@ from sbxloop.sbx.prune import remove_run_sandbox, remove_run_sandbox_secrets
 
 log = get_logger(__name__)
 
-# Hidden markers earlier sbxloop versions left in issue bodies; they are
+# Hidden markers sbxloop leaves in issue bodies and comments; they are
 # bookkeeping, not part of the outcome the agent should read.
-_MARKER_RE = re.compile(r"<!--\s*sbxloop-\S+.*?-->", re.DOTALL)
+_MARKER_RE = HIDDEN_MARKER_RE
 
 
 @contextmanager
@@ -201,6 +202,48 @@ class RunHandle:
 # the tick algorithm is testable without sandboxes; the default builds a
 # fresh LoopEngine and calls start() or resume().
 Runner = Callable[[WorkItem, Config, str, EventBus, bool], RunResult]
+
+
+def _render_context(context: IssueContext) -> str:
+    """The discussion and linked-issue blocks as the outcome carries them."""
+    blocks: list[str] = []
+    if context.comments or context.omitted:
+        total = len(context.comments) + context.omitted
+        noun = "comment" if total == 1 else "comments"
+        lines = [f"## Discussion ({total} {noun})"]
+        if context.omitted:
+            earlier = "comment" if context.omitted == 1 else "comments"
+            lines.append(f"({context.omitted} earlier {earlier} omitted; the latest are shown)")
+        for comment in context.comments:
+            when = f" ({comment.created})" if comment.created else ""
+            lines.append(f"**@{comment.author}**{when}: {comment.body}")
+        blocks.append("\n\n".join(lines))
+    if context.linked:
+        lines = ["## Linked issues"]
+        for linked in context.linked:
+            state = linked.state if linked.kind == "issue" else f"{linked.state} {linked.kind}"
+            line = f"- #{linked.number} ({state}) — {linked.title}"
+            if linked.excerpt:
+                line += f": {linked.excerpt}"
+            lines.append(line)
+        blocks.append("\n".join(lines))
+    return "\n\n".join(blocks)
+
+
+def _fit_context(block: str, room: int, limit: int) -> str:
+    """``block`` cut to ``room`` characters with a note naming the budget;
+    whole when it fits. The note itself is what remains when there is no
+    room at all — the agent is told the discussion exists either way."""
+    if len(block) <= room:
+        return block
+    note = (
+        f"(discussion clipped by [budgets] outcome_max_chars={limit}: "
+        "{hidden} chars not shown — the issue on GitHub has the rest)"
+    )
+    keep = max(0, room - len(note.format(hidden=len(block))) - 2)
+    kept = block[:keep].rstrip()
+    hidden = len(block) - len(kept)
+    return f"{kept}\n\n{note.format(hidden=hidden)}" if kept else note.format(hidden=hidden)
 
 
 class DaemonLoop:
@@ -2379,8 +2422,19 @@ class DaemonLoop:
             )
 
     def outcome_text(self, item: WorkItem) -> str:
-        """The issue as the decomposer reads it: title, body, provenance.
-        Nothing else — the run has no lanes to be told about."""
+        """The issue as the decomposer reads it: title, body, the
+        discussion and the linked issues (#691), provenance. No lanes — the
+        run has none to be told about.
+
+        On real trackers the body is a one-liner and the substance is in
+        the comments, so the source is asked for them (minus the loop's
+        own) and for the issues they refer to. Title, body and provenance
+        are always carried whole; the discussion block is what
+        ``[budgets] outcome_max_chars`` cuts, with a note saying so. A
+        source that cannot read the comments leaves the outcome with an
+        explicit line saying the discussion is missing — the run goes on
+        with the ask itself rather than waiting on a GitHub read.
+        """
         parts = [item.title.strip()]
         body = _MARKER_RE.sub("", item.body).strip()
         if body:
@@ -2390,8 +2444,56 @@ class DaemonLoop:
         )
         if item.url:
             origin += f" ({item.url})"
-        parts.append(f"---\nThis work item came from: {origin}.")
+        provenance = f"---\nThis work item came from: {origin}."
+        context = self._issue_context_block(item)
+        if context:
+            # What the budget leaves once the block's own separator is paid for.
+            room = self.config.budgets.outcome_max_chars - len(
+                "\n\n".join([*parts, "", provenance])
+            )
+            parts.append(_fit_context(context, room, self.config.budgets.outcome_max_chars))
+        parts.append(provenance)
         return "\n\n".join(parts)
+
+    def _issue_context_block(self, item: WorkItem) -> str:
+        """The rendered discussion and linked issues, "" when the source
+        has none to offer, or the one-line note when it could not read them."""
+        read = getattr(self.source, "issue_context", None)
+        if read is None:
+            return ""
+        try:
+            context: IssueContext = read(item, own=self._own_identity(item).identity)
+        except Exception as exc:
+            log.warning("run.issue_context_failed", item=item.item_id, exc_info=True)
+            return (
+                "(The issue's comments could not be read — "
+                f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]} — so any "
+                "discussion under it is not shown here; the title and body above are "
+                "the whole ask as far as this run can see.)"
+            )
+        return _render_context(context)
+
+    def _own_identity(self, item: WorkItem) -> LoopIdentity:
+        """The loop's own GitHub identity, for leaving its comments out of
+        the discussion; unknown when nothing can answer, and then only the
+        marker-stamped comments are left out."""
+        if self.github is None:
+            return UNKNOWN_IDENTITY
+        repo = self._item_repo(item) or self.config.github.repo
+        if repo is None:
+            return UNKNOWN_IDENTITY
+        try:
+            return resolve_identity(
+                self.github.ops(),
+                repo,
+                None,
+                bot_login=self.github.provisioner.gh_bot_login(repo),
+                configured_login=self.config.github.bot_login_for(repo),
+            )
+        except Exception as exc:
+            self.github.note_failure(exc)
+            log.warning("run.identity_lookup_failed", item=item.item_id, exc_info=True)
+            return UNKNOWN_IDENTITY
 
     def _default_runner(
         self, item: WorkItem, item_config: Config, run_id: str, bus: EventBus, resume: bool

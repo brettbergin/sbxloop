@@ -381,6 +381,11 @@ secret_strategy = "proxy"
 # planner, builder and reviewer prompts carry, in characters. The block is
 # cut at the budget with an explicit note; 0 hands the prompts none of it.
 # repo_context_max_chars = 12000
+# How large the outcome the planner reads may grow once the issue's
+# discussion (comments, minus the loop's own) and linked issues are added
+# to its title and body, in characters. Title, body and provenance are
+# always whole; the discussion is cut at the remainder with an explicit note.
+# outcome_max_chars = 16000
 
 # [limits]
 # Sandbox resource guardrails (percent used; 0 disables). Sampled in-VM on
