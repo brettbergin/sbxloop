@@ -170,8 +170,9 @@ lenses:
   and breaks a caller's assumption is the classic leaked defect.
 
 Also check that the PR does what the outcome asked and nothing it did not:
-work deleted or rewritten beyond the outcome's scope is a finding, and so is
-an acceptance criterion the diff does not meet.
+work deleted, rewritten or reformatted beyond the outcome's scope is a
+defect, and so is an acceptance criterion the diff does not meet — the
+builder was told both in the same words.
 
 ## When the work is right and the check is wrong
 

@@ -29,12 +29,13 @@ from __future__ import annotations
 import hashlib
 import re
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Literal, NamedTuple, TypeVar
 
 from pydantic import BaseModel
 
+from sbxloop import toolchains
 from sbxloop.config import Config
 from sbxloop.deliver import pr_conventions
 from sbxloop.engine.model import SteerVerdict, TaskGraph, TaskRecord
@@ -237,6 +238,7 @@ class PhaseRunner:
         workdir: str | None = None,
         workspace: Path | None = None,
         languages: Sequence[str] | None = None,
+        versions: Mapping[str, toolchains.ToolchainVersion] | None = None,
     ) -> None:
         self.agent = agent
         self.config = config
@@ -260,6 +262,14 @@ class PhaseRunner:
         # config's own answer.
         self.languages: tuple[str, ...] = (
             tuple(languages) if languages is not None else config.sandbox.effective_languages
+        )
+        # And the series each was provisioned at (#627), named to the
+        # builder beside the set (#689). None (embedders, tests) reads the
+        # workspace's pins the way provisioning did.
+        self.versions: dict[str, toolchains.ToolchainVersion] = (
+            dict(versions)
+            if versions is not None
+            else toolchains.toolchain_versions(self.languages, workspace)
         )
         # Standing chat guidance (steer_run verdicts), injected into every
         # later build prompt. The engine appends live entries and
@@ -609,6 +619,8 @@ class PhaseRunner:
             prior_attempt=clip(prior_report) or "(none — this is the first attempt)",
             user_guidance=self._guidance(),
             repo_conventions=self.repo_conventions(),
+            work_dir=f"`{self.workdir}`" if self.workdir else "the current working directory",
+            toolchains=toolchains.describe(self.languages, self.versions),
         )
         return self._agent_job(
             prompt,

@@ -165,9 +165,15 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency or
   `verify_commands` (the whole mechanical exam — the builder cannot edit
   them) and any declared network egress needs (see
   [Network egress](#network-egress-least-privilege-by-plan)).
-- **Build** — one Copilot agent session plans and does the work in the
-  sandbox workspace, narrating its approach first. A revision resumes the
-  same session; a replan (or a chat steer) starts a fresh one.
+- **Build** — one agent session plans and does the work in the sandbox
+  workspace, narrating its approach first. It is told where it is — a
+  feature branch of an existing repository that a human will review as a
+  pull request, with the resolved toolchains and their versions named — and
+  how to change code there: match the surrounding conventions, change only
+  what the task requires (work beyond the outcome's scope is a defect, in
+  the reviewer's own words), create no top-level files the task did not ask
+  for. A revision resumes the same session; a replan (or a chat steer)
+  starts a fresh one.
 - **Verify** — mechanical: the task's `verify_commands` must exit 0, run from
   the workspace root. No LLM. The full command transcript is persisted with
   the attempt, so a resumed run judges with the real evidence. How much

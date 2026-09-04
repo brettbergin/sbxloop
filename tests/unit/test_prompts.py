@@ -156,7 +156,33 @@ def test_build_carries_environment_notes() -> None:
     assert "cannot edit" in build
 
 
-def test_build_shows_the_exam_and_asks_for_a_plan_first_report() -> None:
+def test_build_is_framed_as_a_branch_not_an_artifact() -> None:
+    """#689: the builder edits an existing repository on a feature branch
+    that a human reviews as a pull request — not a workspace it fills
+    with artifacts. The greenfield phrases must not come back."""
+    build = render("build", **build_context(work_dir="`/work/repo`", toolchains="python 3.13"))
+    assert "feature branch of an existing repository" in build
+    assert "checked out at\n`/work/repo`" in build or "checked out at `/work/repo`" in build
+    assert "read the diff as a\npull request" in build or "read the diff as a pull request" in build
+    assert "Resolved toolchains for this repository: python 3.13." in build
+    assert "Match the conventions of the surrounding code" in build
+    assert "Do not create top-level files unless the task asks for them" in build
+    for greenfield in ("Write all outputs", "write all outputs", "when creating the project"):
+        assert greenfield not in build, greenfield
+    # the notes point at the named set, not at "this task's toolchain"
+    assert "this task's toolchain" not in build
+
+
+def test_build_and_review_share_the_scope_rule() -> None:
+    """#689: the rule the reviewer judges by is the rule the builder is
+    given, in the same words, so scope creep is named before it is built
+    rather than only after."""
+    rule = "beyond the outcome's scope is a defect"
+    build = " ".join(render("build", **build_context()).split())
+    review = " ".join(render("review", **RENDER_CONTEXTS["review"]).split())
+    assert rule in build and rule in review
+    assert "Change only what the task requires" in build
+
     """The builder sees the decomposer-authored verify commands verbatim
     (it no longer writes them), and its report opens with the approach —
     the chronology's plan-card replacement."""
