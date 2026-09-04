@@ -616,13 +616,16 @@ class PhaseRunner:
         tasks: Sequence[TaskRecord],
         history: str,
         refuted: set[str],
+        verification: str = "",
     ) -> ReviewVerdict:
         """Review the delivered PR: a fresh read-only session over its diff.
 
         ``history`` is the rendered earlier rounds and ``refuted`` the
         anchors of findings the fixer refuted in them — the reviewer is
         told about both, and :class:`ReviewGuard` sends back, once, a
-        verdict that only re-raises refuted findings.
+        verdict that only re-raises refuted findings. ``verification`` is
+        what the sandbox's checks did not decide (#682): the advisory
+        failures still standing, or that nothing ran under `ci-only`.
         """
         limit = self.config.landing.review_diff_max_chars
         diff_shown = clip_head_tail(
@@ -654,6 +657,7 @@ class PhaseRunner:
                 "user_guidance": self._guidance(),
                 "project_gate": gate_rule(self.project_gate()),
                 "config_override_example": config_override_example(self.languages),
+                "verification": verification,
             },
             permission_mode="read_only",
             check=ReviewGuard(refuted).check,

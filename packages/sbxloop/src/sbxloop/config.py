@@ -104,6 +104,13 @@ WorkspaceSource = Literal["configured", "remote", "none"]
 SecretStrategy = Literal["proxy", "plain-env"]
 HarvestMode = Literal["per-task", "final"]
 WorkspaceIsolation = Literal["auto", "clone", "in-place"]
+# How much the in-sandbox verify phase decides (#682). `full`: a task's
+# verify commands and the project gate must pass (a failure spends
+# revisions, then a replan). `advisory`: they run and their result is
+# reported — to the chronology, the review and the pull request — but a
+# failure blocks nothing. `ci-only`: they do not run; the pull request's
+# own checks, in landing, are the verification.
+VerifyMode = Literal["full", "advisory", "ci-only"]
 
 
 class _Unset:
@@ -214,6 +221,14 @@ class SandboxConfig(_ConfigModel):
     # either list for its own runs.
     apt_packages: list[str] = Field(default_factory=list)
     setup_commands: list[str] = Field(default_factory=list)
+    # What the verify phase decides (#682). Most service-backed suites
+    # (a database, a broker, a browser the sandbox does not have) fail in
+    # the sandbox for reasons no revision can fix; `advisory` keeps the
+    # signal without spending the budget on it and `ci-only` leaves the
+    # judging to the pull request's checks. Under `full` the loop names
+    # the evidence it sees for such a suite (`verify.services_detected`)
+    # and changes nothing on its own.
+    verify_mode: VerifyMode = "full"
 
     @field_validator("env")
     @classmethod
@@ -625,6 +640,8 @@ class RepoConfig(_ConfigModel):
     # `[sandbox]` list, and a set list REPLACES it.
     apt_packages: list[str] | None = None
     setup_commands: list[str] | None = None
+    # This repository's verify mode (#682); None → `[sandbox] verify_mode`.
+    verify_mode: VerifyMode | None = None
 
     @field_validator("repo")
     @classmethod
@@ -1806,6 +1823,14 @@ class Config(_ConfigModel):
         if entry is not None and entry.setup_commands is not None:
             return list(entry.setup_commands)
         return list(self.sandbox.setup_commands)
+
+    def verify_mode_for(self, repo: str | None = None) -> VerifyMode:
+        """What ``repo``'s verify phase decides (#682): the entry's own mode
+        when set, else `[sandbox] verify_mode`."""
+        entry = self.github.effective_repo(repo)
+        if entry is not None and entry.verify_mode is not None:
+            return entry.verify_mode
+        return self.sandbox.verify_mode
 
     @model_validator(mode="after")
     def _repo_env_and_secret_env_are_disjoint(self) -> Config:

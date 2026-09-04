@@ -198,6 +198,22 @@ reported as a `sandbox.setup` event with delivered secret values scrubbed from
 the tail; the first failure raises out of provisioning like an install failure,
 so `keep_on_failure` applies. The bake installs the global package list only.
 
+### Verify mode (#682)
+
+`Config.verify_mode_for(repo)` resolves `[sandbox] verify_mode` with the
+`[[github.repos]]` override, and the engine reads it at three points: the
+per-task VERIFY phase, the GATE stage, and `_verification_note`, which turns
+the phase rows back into prose for the review prompt (`$verification`,
+defaulted empty by `prompts.render`) and the pull request body
+(`deliver_workspace(verification=...)`, a **Verification** section before
+`Closes`). The note is read from `phase_attempts`, not memory, so a resumed
+run tells the same story, and only the latest attempt of each check counts.
+The services hint (`verifylint.services_evidence`: compose files at the root
+or one level down, `testcontainers` in a lockfile or manifest, `services:`
+in a workflow) is emitted once per run by `_hint_services`, before
+decomposition and only under `full` — a hint the operator acts on, never a
+switch the loop flips.
+
 ### GitHub App installation auth (#568)
 
 `GITHUB_APP_ID` + `GITHUB_APP_INSTALLATION_ID` +
@@ -351,7 +367,11 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   replan (or a chat steer) clears the session — the approach it holds was
   the one thrown away.
 - **VERIFY** — mechanical: the task's decomposer-authored `verify_commands`
-  must all exit 0. No LLM.
+  must all exit 0. No LLM. Under `[sandbox] verify_mode = "advisory"` (#682)
+  a failure is recorded with its own phase status (`advisory`) and the task
+  is done regardless — no revision, no replan, no suspect fingerprint; under
+  `"ci-only"` no verify job is submitted at all (`skipped`). Both apply to a
+  fix task's verify commands too.
 - **GATE** — the project's own gate (`[sandbox] gate_command`, or the one
   `verifylint.project_gate` detects: a `check`/`ci`/`verify` target in a
   makefile, justfile or Taskfile; a package.json script run under the
@@ -363,7 +383,9 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   for the sandbox (#624), so the gate is always a command the toolchain
   can execute. The decomposer must put the gate in *some* task's
   exam, but a later task can break what an earlier one proved; this is the
-  last check on the tree exactly as it will be delivered. A run with no
+  last check on the tree exactly as it will be delivered. `verify_mode`
+  governs this stage the same way: `advisory` records a red gate without a
+  fix round, `ci-only` skips it. A run with no
   `[github] repo` (and no `[[github.repos]]`) ends `completed` here, its
   work in the workspace.
 - **DELIVER** — the tree becomes one commit on `sbxloop/<run>` (the

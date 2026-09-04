@@ -18,6 +18,7 @@ from sbxloop.verifylint import (
     node_script_runner,
     project_gate,
     runs_gate,
+    services_evidence,
 )
 
 
@@ -1079,3 +1080,56 @@ class TestConfigOverrideAcrossEcosystems:
         assert "OVERRIDES" in problem and "only narrows the run" in problem
         assert config_override_problems("uv run mypy packages/sbxloop/src/sbxloop", tmp_path) == []
         assert config_override_problems("uv run mypy", tmp_path) == []
+
+
+class TestServicesEvidence:
+    """#682: what in a workspace says its suite needs services the sandbox
+    does not have. Evidence for a hint — never a decision."""
+
+    def test_nothing_in_an_empty_or_plain_workspace(self, tmp_path: Path) -> None:
+        assert services_evidence(None) == []
+        assert services_evidence(tmp_path / "missing") == []
+        (tmp_path / "Makefile").write_text("check:\n\tpytest\n")
+        (tmp_path / "uv.lock").write_text('[[package]]\nname = "pytest"\n')
+        assert services_evidence(tmp_path) == []
+
+    def test_compose_files_at_the_root_and_one_level_down(self, tmp_path: Path) -> None:
+        (tmp_path / "docker-compose.yml").write_text("services:\n  db:\n    image: postgres\n")
+        (tmp_path / "docker-compose.test.yaml").write_text("services: {}\n")
+        (tmp_path / "backend").mkdir()
+        (tmp_path / "backend" / "compose.yaml").write_text("services: {}\n")
+        # not walked: hidden directories, and anything two levels down
+        (tmp_path / ".devcontainer").mkdir()
+        (tmp_path / ".devcontainer" / "docker-compose.yml").write_text("services: {}\n")
+        (tmp_path / "backend" / "deep").mkdir()
+        (tmp_path / "backend" / "deep" / "compose.yml").write_text("services: {}\n")
+        assert services_evidence(tmp_path) == [
+            "docker-compose.test.yaml (compose file)",
+            "docker-compose.yml (compose file)",
+            "backend/compose.yaml (compose file)",
+        ]
+
+    def test_testcontainers_in_a_lockfile_or_manifest(self, tmp_path: Path) -> None:
+        (tmp_path / "uv.lock").write_text('[[package]]\nname = "testcontainers"\n')
+        (tmp_path / "api").mkdir()
+        (tmp_path / "api" / "package-lock.json").write_text(
+            '{"packages": {"node_modules/@testcontainers/postgresql": {}}}'
+        )
+        (tmp_path / "go.sum").write_text("github.com/lib/pq v1.10.9 h1:abc=\n")
+        assert services_evidence(tmp_path) == [
+            "uv.lock mentions testcontainers",
+            "api/package-lock.json mentions testcontainers",
+        ]
+
+    def test_services_blocks_in_workflows(self, tmp_path: Path) -> None:
+        workflows = tmp_path / ".github" / "workflows"
+        workflows.mkdir(parents=True)
+        (workflows / "ci.yml").write_text(
+            "jobs:\n  test:\n    services:\n      postgres:\n        image: postgres:16\n"
+        )
+        # the word in a step, or a key with a value, is not a services block
+        (workflows / "lint.yaml").write_text(
+            "jobs:\n  lint:\n    steps:\n      - run: docker compose up services\n"
+        )
+        (workflows / "notes.md").write_text("services:\n")
+        assert services_evidence(tmp_path) == [".github/workflows/ci.yml declares `services:`"]

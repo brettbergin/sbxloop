@@ -170,7 +170,10 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency or
   same session; a replan (or a chat steer) starts a fresh one.
 - **Verify** — mechanical: the task's `verify_commands` must exit 0, run from
   the workspace root. No LLM. The full command transcript is persisted with
-  the attempt, so a resumed run judges with the real evidence.
+  the attempt, so a resumed run judges with the real evidence. How much
+  this decides is `[sandbox] verify_mode`: `full` (the default) gates;
+  `advisory` runs the commands and reports; `ci-only` skips them and
+  leaves the judging to the PR's checks — see "Suites that need services".
 - **Gate** — the project's own check (`[sandbox] gate_command`, or the one
   the project declares — a `check`/`ci`/`verify` target in a makefile,
   justfile or Taskfile, a package.json script run under the client its
@@ -525,6 +528,33 @@ command in the error, and `keep_on_failure` keeps the sandbox for `sbxloop shell
 `setup_commands`, which replaces the top-level list; a per-repo package list
 is paid at that repository's provision, since the bake reads the global list
 only.
+
+### Suites that need services
+
+Most backend suites want a database, a broker or a browser the sandbox
+does not have, and a mandatory verify phase spends the task's revisions
+and a replan on `connection refused` before giving up. `[sandbox] verify_mode` (#682) says how much the in-sandbox checks decide:
+
+```toml
+[sandbox]
+verify_mode = "advisory"   # full (default) | advisory | ci-only
+```
+
+`full` is the gate as it was: a task's verify commands and the project
+gate must pass. `advisory` runs them all and blocks on none — a failure is
+a `phase.end` with `status = "advisory"` in the chronology (⚠ in the
+channel), an evidence section in the review prompt, and a
+**Verification** section in the pull request body, so the reviewer weighs
+a `connection refused` against the diff instead of the loop spending
+budget on it. `ci-only` submits no verify job and skips the gate stage
+(both recorded `skipped`); landing's CI round, on a runner that has the
+services, is the verification. A `[[github.repos]]` entry sets the mode per
+repository. The mode never changes on its own: under `full`, a compose
+file, `testcontainers` in a lockfile or a `services:` block in a workflow
+is named once per run as a `verify.services_detected` event before the
+plan is written — the moment a human can still turn the knob — and the
+planner is told to scope verify commands to the subset that runs without
+the services either way.
 
 ## The daemon: an always-on outer loop
 
@@ -1691,6 +1721,7 @@ The notable knobs:
 | `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                                                                                                                                                                                                         |
 | `[sandbox] env` / `secret_env`                            | `{}` / `[]`        | Environment for the agent sandbox's worker and everything it runs: plain values, and names whose values come from the daemon's environment (delivered like the credential, never logged). Per-repo overridable; see "Environment for the agent sandbox".                                                                                                           |
 | `[sandbox] apt_packages` / `setup_commands`               | `[]` / `[]`        | OS packages ensured beside the toolchains (fail closed), and commands run in the workspace before the first phase, each a `sandbox.setup` event. Per-repo overridable; see "OS packages and setup commands".                                                                                                                                                       |
+| `[sandbox] verify_mode`                                   | `full`             | What the verify phase and the gate decide: `full` gates, `advisory` runs and reports without blocking, `ci-only` skips them and relies on the PR's checks. Per-repo overridable; see "Suites that need services".                                                                                                                                                  |
 | `[[registries]]`                                          | none               | Private package registries: each entry opens `host` for the agent sandbox and writes the ecosystem's client config (`~/.npmrc`, `PIP_INDEX_URL`, `GOPRIVATE`, `~/.cargo/config.toml`, `settings.xml`, `NuGet.Config`, `BUNDLE_*`); `auth_env` is delivered like `secret_env`. Per-repo overridable; see "Private package registries".                              |
 | `[sandbox] languages`                                     | detected           | Toolchains pre-installed in the agent sandbox; unset = detect from the workspace's manifests, `python` if none (see below).                                                                                                                                                                                                                                        |
 | `[policy] allow` / `deny`                                 | `[]`               | Bounds for task-declared egress.                                                                                                                                                                                                                                                                                                                                   |

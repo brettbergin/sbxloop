@@ -121,6 +121,17 @@ secret_strategy = "proxy"
 # `sandbox.setup` event; a non-zero exit fails the run at provisioning.
 # apt_packages = ["libpq-dev", "protobuf-compiler"]
 # setup_commands = ["npx playwright install --with-deps chromium", "pre-commit install-hooks"]
+# What the in-sandbox verify phase and the gate decide. "full": a task's
+# verify commands and the gate must pass (a failure spends revisions, then
+# a replan). "advisory": they run and the result is reported — to the
+# chronology, the review and the pull request body — but a failure blocks
+# nothing. "ci-only": they do not run; the pull request's own checks are
+# the verification. For a suite that needs services the sandbox does not
+# have (a database, a broker, a browser): under "full" the loop names the
+# evidence it sees — a compose file, testcontainers in a lockfile,
+# `services:` in a workflow — as a `verify.services_detected` event and
+# changes nothing on its own.
+# verify_mode = "full"
 
 # Private package registries. Each entry opens its `host` for the
 # agent sandbox AND writes the ecosystem's client config so its tooling
@@ -266,6 +277,7 @@ secret_strategy = "proxy"
 # registries = []                  # private registries; a set list REPLACES the top-level [[registries]]
 # apt_packages = ["libpq-dev"]     # OS packages beside the toolchains; a set list REPLACES [sandbox]'s
 # setup_commands = ["make setup"]  # run in the workspace before the first phase; REPLACES [sandbox]'s
+# verify_mode = "advisory"         # "full" | "advisory" | "ci-only"; unset uses [sandbox]'s
 # [[github.repos]]
 # repo = "you/other-repo"
 # enabled = false              # registered but not polled

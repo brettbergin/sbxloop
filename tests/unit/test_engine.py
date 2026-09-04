@@ -3800,3 +3800,169 @@ class TestSetupCommandsInThePipeline:
         assert setup.data["tail"] == "chromium: download failed"
         # no phase ran: the decomposer was never asked
         assert not [e for e in harness.events if e.job_id is not None]
+
+
+class TestVerifyMode:
+    """#682: `[sandbox] verify_mode`. `advisory` runs the checks and blocks
+    on none of them — the failure is evidence for the review and the pull
+    request; `ci-only` submits no verify job at all and leaves the judging
+    to the pull request's checks; `full` (the default) names the evidence
+    of a service-backed suite before the plan spends anything on it."""
+
+    REFUSED = "echo 'psycopg2.OperationalError: connection refused' >&2; exit 1"
+
+    def test_advisory_failure_completes_and_is_evidence_for_review_and_pr(
+        self, harness: Harness
+    ) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1", verify=[self.REFUSED])), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(
+            fake, sandbox={"verify_mode": "advisory", "gate_command": ""}, keep_sandboxes=True
+        )
+        result = engine.start("advisory verify")
+
+        assert result.state == "merged"
+        assert result.tasks[0].state == "done"
+        # no revision, no replan, no suspect bookkeeping: the failure gated nothing
+        assert result.tasks[0].revisions == 0
+        assert result.tasks[0].replans == 0
+        assert not result.tasks[0].verify_suspect
+        assert result.tasks[0].verify_fingerprints == []
+        verify_ends = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data["phase"] == "verify"
+        ]
+        assert [e.data["status"] for e in verify_ends] == ["advisory"]
+        assert "connection refused" in verify_ends[0].data["message"]
+        assert "not blocking" in verify_ends[0].data["message"]
+        # the review prompt carries the failure as evidence, framed as advisory
+        jobs = harness.agent_jobs(result.run_id)
+        (review_job,) = [j for j in jobs if "Review the pull request" in (j.get("prompt") or "")]
+        assert 'verify_mode = "advisory"' in review_job["prompt"]
+        assert "connection refused" in review_job["prompt"]
+        assert "task t1" in review_job["prompt"]
+        # and so does the pull request's body
+        body = fake.pr_kwargs["body"]
+        assert "**Verification:**" in body
+        assert "connection refused" in body
+
+    def test_advisory_pass_is_reported_as_such(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1", verify=["true"])), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, sandbox={"verify_mode": "advisory", "gate_command": ""})
+        result = engine.start("advisory verify that passes")
+        assert result.state == "merged"
+        assert "ran in the sandbox and passed" in fake.pr_kwargs["body"]
+        # a pass is a pass: nothing advisory (or failed) in the chronology
+        assert not [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data["phase"] == "verify"
+        ]
+
+    def test_advisory_gate_failure_spends_no_fix_round(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1", verify=["false"])), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(
+            fake, sandbox={"verify_mode": "advisory", "gate_command": "false"}
+        )
+        result = engine.start("advisory gate")
+        assert result.state == "merged"
+        assert HostEventTypes.FIX_ROUND not in harness.event_types()
+        (gate_end,) = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data["phase"] == "gate"
+        ]
+        assert gate_end.data["status"] == "advisory"
+        assert "project gate `false` exit 1" in fake.pr_kwargs["body"]
+
+    def test_ci_only_submits_no_verify_job(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1", verify=["false"])), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(
+            fake, sandbox={"verify_mode": "ci-only", "gate_command": "false"}, keep_sandboxes=True
+        )
+        result = engine.start("ci-only verify")
+
+        assert result.state == "merged"
+        assert result.tasks[0].state == "done"
+        assert result.tasks[0].revisions == 0
+        # neither the task's verify commands nor the gate ran: no shell job at all
+        jobs = harness.agent_jobs(result.run_id)
+        assert not [j for j in jobs if j.get("kind") == "shell.batch"]
+        ends = {
+            e.data["phase"]: e.data
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data["phase"] in ("verify", "gate")
+        }
+        assert ends["verify"]["status"] == "skipped"
+        assert "1 verify command(s) not run" in ends["verify"]["message"]
+        assert ends["gate"]["status"] == "skipped"
+        assert HostEventTypes.FIX_ROUND not in harness.event_types()
+        # landing still went through its CI round
+        assert HostEventTypes.CI_STATUS in harness.event_types()
+        # the review and the pull request both say nothing ran
+        (review_job,) = [j for j in jobs if "Review the pull request" in (j.get("prompt") or "")]
+        assert 'verify_mode = "ci-only"' in review_job["prompt"]
+        assert 'verify_mode = "ci-only"' in fake.pr_kwargs["body"]
+
+    def test_ci_only_skips_verify_without_a_delivery_repo_too(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1", verify=["false"])), BUILD])
+        result = harness.engine(sandbox={"verify_mode": "ci-only"}).start("ci-only, no github")
+        assert result.state == "completed"
+        assert result.tasks[0].state == "done"
+
+    def test_full_mode_still_gates(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1", verify=["false"])), BUILD])
+        result = harness.engine(budgets=NO_RETRY_BUDGETS).start("full verify")
+        assert result.state == "failed"
+        assert result.tasks[0].state == "failed"
+
+    def test_per_repo_override_wins(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1", verify=["false"])), FILES_BUILD, REVIEW_OK])
+        engine = harness.engine(
+            ops=fake,
+            landing=FAST_LANDING,
+            sandbox={"verify_mode": "full", "gate_command": ""},
+            github={"repo": fake.repo, "repos": [{"repo": fake.repo, "verify_mode": "advisory"}]},
+        )
+        result = engine.start("repo says advisory")
+        assert result.state == "merged"
+        assert result.tasks[0].state == "done"
+
+    def test_full_mode_hints_at_a_service_backed_suite(self, harness: Harness) -> None:
+        from tests.unit.test_hostgit import commit_all, make_repo
+
+        source = make_repo(harness.tmp_path)
+        (source / "docker-compose.yml").write_text("services:\n  db:\n    image: postgres\n")
+        commit_all(source, "compose")
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(sandbox={"workspace": str(source), "gate_command": ""})
+        result = engine.start("work on a service-backed repo")
+        assert result.state == "completed"
+        (hint,) = [e for e in harness.events if e.type == HostEventTypes.VERIFY_SERVICES_DETECTED]
+        assert hint.data["evidence"] == ["docker-compose.yml (compose file)"]
+        assert 'verify_mode = "advisory"' in hint.data["hint"]
+        # before the plan: the decomposer's job comes after the hint
+        first_job = next(i for i, e in enumerate(harness.events) if e.job_id is not None)
+        assert harness.events.index(hint) < first_job
+
+    def test_no_hint_without_evidence_or_under_another_mode(self, harness: Harness) -> None:
+        from tests.unit.test_hostgit import commit_all, make_repo
+
+        source = make_repo(harness.tmp_path)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        harness.engine(sandbox={"workspace": str(source), "gate_command": ""}).start("plain")
+        assert HostEventTypes.VERIFY_SERVICES_DETECTED not in harness.event_types()
+
+        harness.events.clear()
+        (source / "docker-compose.yml").write_text("services: {}\n")
+        commit_all(source, "compose")
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        harness.engine(
+            sandbox={"workspace": str(source), "gate_command": "", "verify_mode": "advisory"}
+        ).start("advisory already")
+        assert HostEventTypes.VERIFY_SERVICES_DETECTED not in harness.event_types()

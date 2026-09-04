@@ -551,3 +551,32 @@ def test_build_renders_standing_guidance() -> None:
 def test_bullet_list() -> None:
     assert bullet_list([]) == "(none)"
     assert bullet_list(["a", "b"]) == "- a\n- b"
+
+
+def test_decompose_scopes_verify_to_the_service_free_subset() -> None:
+    """#682: a verify command that needs a service the sandbox lacks fails
+    the same way on every attempt, so the planner is told to scope the
+    exam to what runs without it and to say so."""
+    text = render("decompose", outcome="o", max_tasks="3", project_gate="- gate rule", **EXAMPLE)
+    assert "external services the sandbox does not have" in text
+    assert "scope the\nverify command to the subset that runs without them" in text.replace(
+        "  ", ""
+    ) or "scope the verify command to the subset that runs without them" in " ".join(text.split())
+    assert "say so in the task's description" in text
+
+
+def test_review_prompt_carries_the_verification_note_when_given() -> None:
+    """#682: what the sandbox's checks did not decide is a section of the
+    review prompt under the gate, and nothing at all under `full`."""
+    note = (
+        'The operator set `verify_mode = "advisory"`: these checks failed\n'
+        "- task t1: `pytest` (exit 1)"
+    )
+    text = render("review", **RENDER_CONTEXTS["review"], verification=note)
+    assert note in text
+    gate_at = text.index("## The project's own gate")
+    rounds_at = text.index("## Earlier rounds")
+    assert gate_at < text.index(note) < rounds_at
+    plain = render("review", **RENDER_CONTEXTS["review"])
+    assert "verify_mode" not in plain
+    assert "$verification" not in plain

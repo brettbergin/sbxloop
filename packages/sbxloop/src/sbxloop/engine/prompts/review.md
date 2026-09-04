@@ -18,7 +18,9 @@ tests/unit/test_prompts.py):
 Variables: $outcome, $pr_number, $round, $diff, $tasks_summary,
 $prior_rounds, $user_guidance, $project_gate, $config_override_example
 (rendered by verifylint.config_override_example for the run's resolved
-toolchains, #634); $retry_context (defaulted by render()).
+toolchains, #634); $retry_context and $verification (what the sandbox's
+checks did not decide under an advisory or ci-only verify mode, #682;
+both defaulted by render()).
 Examples are domain-neutral on purpose (#634): no issue or PR numbers, no
 path, state name or product vocabulary from the loop's own repository —
 tests anchor on the rule phrases, not the examples
@@ -81,6 +83,8 @@ $project_gate
 
 A green gate is necessary, not sufficient: the defects that reach a PR are
 precisely the ones its tests do not encode.
+
+$verification
 
 ## Earlier rounds
 

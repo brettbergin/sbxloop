@@ -42,7 +42,9 @@ Section rules:
   (test_decompose_demands_an_upgrade_path_task_for_persisted_state, #524).
   The symptom-is-the-spec paragraph ("Symptom (as observed)", "Requested
   change", "a hint") must stay (test_decompose_treats_the_symptom_as_the_spec,
-  #535).
+  #535). The service-scoping rule ("external services the sandbox does not
+  have") must stay (test_decompose_scopes_verify_to_the_service_free_subset,
+  #682).
 -->
 
 # Decompose an outcome into a task graph
@@ -112,6 +114,14 @@ worker, not by retries — has done the wrong thing correctly.
   workspace, not the network — an API rate limit or a flake must not be
   able to fail work that is done. Check the local files or run the local
   tests instead.
+- If the suite needs **external services the sandbox does not have** — a
+  database, a broker, a browser, anything a compose file, a test-container
+  dependency or a `services:` block in the CI workflow provides — scope the
+  verify command to the subset that runs without them (a marker or tag
+  exclusion, a unit-only target, a directory the service-backed tests are
+  not in) and say so in the task's description. A verify command that
+  needs a service the sandbox lacks fails the same way on every attempt,
+  and the builder cannot change it.
   $project_gate
 - Never pass explicit paths to a config-driven tool whose file set is already
   pinned in the project's configuration (mypy `files`, ruff `include`/`src`,
