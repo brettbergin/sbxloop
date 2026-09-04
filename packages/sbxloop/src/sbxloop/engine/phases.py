@@ -39,6 +39,7 @@ from sbxloop.config import Config
 from sbxloop.deliver import pr_conventions
 from sbxloop.engine.model import SteerVerdict, TaskGraph, TaskRecord
 from sbxloop.engine.prompts import bullet_list, render
+from sbxloop.engine.repocontext import repo_conventions
 from sbxloop.engine.review import ReviewGuard, ReviewVerdict
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
@@ -494,10 +495,19 @@ class PhaseRunner:
                 "project_gate": gate_rule(self.project_gate()),
                 "config_override_example": config_override_example(self.languages),
                 "pr_conventions": pr_conventions(self.workspace),
+                "repo_conventions": self.repo_conventions(),
             },
             check=self._check_taskgraph,
         )
         return graph
+
+    def repo_conventions(self) -> str:
+        """The repository's own instruction files as a prompt section
+        (#688), re-read per call for the same reason as the gate: a task
+        may write the AGENTS.md the next task is held to."""
+        return repo_conventions(
+            self.workspace, max_chars=self.config.budgets.repo_context_max_chars
+        )
 
     def project_gate(self) -> str | None:
         """This project's own gate, honouring the operator's override.
@@ -598,6 +608,7 @@ class PhaseRunner:
             feedback=task.last_feedback or "(none — first attempt)",
             prior_attempt=clip(prior_report) or "(none — this is the first attempt)",
             user_guidance=self._guidance(),
+            repo_conventions=self.repo_conventions(),
         )
         return self._agent_job(
             prompt,
@@ -658,6 +669,7 @@ class PhaseRunner:
                 "project_gate": gate_rule(self.project_gate()),
                 "config_override_example": config_override_example(self.languages),
                 "verification": verification,
+                "repo_conventions": self.repo_conventions(),
             },
             permission_mode="read_only",
             check=ReviewGuard(refuted).check,

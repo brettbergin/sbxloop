@@ -1184,6 +1184,11 @@ class Budgets(_ConfigModel):
     # file-disjoint; per-task workspace isolation is what would make it
     # unconditionally safe.
     max_parallel_tasks: int = Field(default=1, ge=1)
+    # How much of the repository's own instruction files (AGENTS.md,
+    # CLAUDE.md, .cursorrules, CONTRIBUTING, CODEOWNERS — #688) every
+    # phase prompt carries, in characters; the block is cut at the budget
+    # with an explicit note. 0 hands the prompts none of it.
+    repo_context_max_chars: int = Field(default=12_000, ge=0)
 
 
 # How a landed PR is written onto the base branch. "auto" (the default)

@@ -376,6 +376,11 @@ secret_strategy = "proxy"
 # concurrent task shares one sandbox and one workspace, so "independent"
 # tasks can still clobber each other.
 # max_parallel_tasks = 1
+# How much of the repository's own instruction files (AGENTS.md, CLAUDE.md,
+# .cursorrules, copilot-instructions.md, CONTRIBUTING, CODEOWNERS) the
+# planner, builder and reviewer prompts carry, in characters. The block is
+# cut at the budget with an explicit note; 0 hands the prompts none of it.
+# repo_context_max_chars = 12000
 
 # [limits]
 # Sandbox resource guardrails (percent used; 0 disables). Sampled in-VM on
