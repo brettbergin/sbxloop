@@ -93,6 +93,14 @@ sbxloop logs <run>              # the persisted event stream
 sbxloop artifacts <run> --tree  # what the run produced
 ```
 
+`run` works on a checkout, and says which one before anything is
+provisioned: `--workspace PATH`, else the checkout the config names
+(`[sandbox] workspace` or a `[[github.repos]]` entry), else the git checkout
+enclosing the directory you typed the command in. If the sandbox cannot see
+that checkout the run stops there — it never quietly "succeeds" on an empty
+directory. With no checkout anywhere the run says `workspace: none` and
+works from an empty directory whose output is harvested as artifacts.
+
 `run` opens a live chat-style dashboard by default: agent messages as
 markdown panels, tool calls as compact lines, lifecycle events as dim
 one-liners. `--no-tui` prints the same transcript sequentially (good for CI
@@ -288,7 +296,7 @@ letting in-VM tooling fail confusingly on a full disk.
 
 | Command                                         | What it does                                                                                                                                                                                                                                                                                        |
 | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sbxloop run "OUTCOME"`                         | Start a run; with a repository it carries the work through to the merge. Options: `--repo`, `--deliver-base`, `--create-repo`, `--create-public`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`, `--no-chat`.                                                                      |
+| `sbxloop run "OUTCOME"`                         | Start a run; with a repository it carries the work through to the merge. Options: `--workspace`, `--repo`, `--deliver-base`, `--create-repo`, `--create-public`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`, `--no-chat`.                                                       |
 | `sbxloop daemon`                                | The always-on outer loop: claim labeled issues, run each one through to a merged PR, settle the issue, mirror to chat (Discord or Slack). Options: `--repo`, `--max-runs-per-day`, `--poll-interval`, `--discord-channel`, `--slack-channel`, `--once`, `--dry-run`, `--log-level`, `--log-format`. |
 | `sbxloop daemon items\|abandon\|retry\|requeue` | Inspect and steer individual work items from another shell without stopping the daemon (see below).                                                                                                                                                                                                 |
 | `sbxloop daemon ctl CMD`                        | Drive the running daemon from a script or cron: `status` (`--json` for one machine-readable object), `pause`, `resume`, `cancel`, `queue` — the same verbs as chat's `!sbx`, over a file queue in `state_dir/daemon/ctl/`.                                                                          |
@@ -846,9 +854,12 @@ are not re-posted.
 Every job in a run executes in the run's **workspace** — a host directory
 (`.sbxloop/runs/<run>/workspace`) that sbx mounts into the agent microVM.
 Provisioning *discovers* the in-VM mount point (marker file + bounded search)
-rather than assuming one; when the mount can't be found, jobs run in a
-fallback dir that is **harvested** to `.sbxloop/runs/<run>/artifacts` with
-`sbx cp` at each task end and at run finalize. Either way the files an agent
+rather than assuming one. A run that has no checkout to work on (nothing
+configured, not started from inside one) uses an empty per-run directory
+instead; when *that* mount can't be found, jobs run in a fallback dir that is
+**harvested** to `.sbxloop/runs/<run>/artifacts` with `sbx cp` at each task
+end and at run finalize. A configured checkout that fails to mount stops the
+run instead (`sbxloop doctor` has the workspace-mount probe). Either way the files an agent
 produces survive the sandbox:
 
 ```bash

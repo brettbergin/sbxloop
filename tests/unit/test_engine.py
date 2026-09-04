@@ -971,6 +971,106 @@ class TestKeepOnFailure:
         assert result.kept_sandboxes == [f"sbxloop-{result.run_id}-agent"]
 
 
+class TestRunWorkspace:
+    """What the run works on is announced first and enforced at provisioning
+    (#670): a configured checkout the agent cannot see stops the run; the
+    empty per-run directory nothing was configured for stays harvest mode,
+    on the first attempt and on a resume."""
+
+    def run_start(self, harness: Harness) -> Event:
+        (event,) = [e for e in harness.events if e.type == HostEventTypes.RUN_START]
+        return event
+
+    def test_first_event_names_the_configured_workspace(self, harness: Harness) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(harness.tmp_path)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(sandbox={"workspace": str(source), "gate_command": ""})
+        result = engine.start("work on the checkout")
+        assert result.state == "completed"
+        start = self.run_start(harness)
+        assert start.data["workspace"] == str(source)
+        assert start.data["workspace_source"] == "configured"
+
+    def test_first_event_says_when_there_is_no_workspace(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine().start("start from nothing")
+        assert result.state == "completed"
+        assert not result.mounted
+        start = self.run_start(harness)
+        assert start.data["workspace"] is None
+        assert start.data["workspace_source"] == "none"
+
+    def test_caller_label_wins_in_the_first_event(self, harness: Harness) -> None:
+        """The CLI knows it chose the checkout (a flag, the cwd); the engine
+        repeats that rather than re-deriving 'configured' from the pinned
+        config."""
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        source = harness.tmp_path / "ws"
+        source.mkdir()
+        engine = harness.engine(sandbox={"workspace": str(source), "gate_command": ""})
+        engine.start("flagged", workspace_source="--workspace")
+        assert self.run_start(harness).data["workspace_source"] == "--workspace"
+
+    def test_configured_workspace_that_never_mounts_stops_the_run(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        source = harness.tmp_path / "ws"
+        source.mkdir()
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(sandbox={"workspace": str(source)})
+        with pytest.raises(ProvisionError, match="was not visible inside the agent sandbox"):
+            engine.start("work on the checkout")
+        # The run never left provisioning — no job reached a worker, so the
+        # agent never saw an empty tree — and, like any infra failure, it is
+        # left resumable once the mount is fixed rather than marked failed.
+        assert harness.run_states() == ["provisioning"]
+        assert engine.store.list_runs()[0].state == "provisioning"
+        assert harness.sandboxes_left() == []
+
+    def test_harvest_mode_run_resumes_as_harvest_mode(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The resume pins the per-run directory by path — which on its own
+        would read as 'the work' — but the first provisioning recorded that
+        nothing was mounted, and the resume honours that verdict."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        harness.script([taskgraph(task("t1")), {"fail": "sandbox exploded"}])
+        engine = harness.engine()
+        with pytest.raises(WorkerError, match="sandbox exploded"):
+            engine.start("crashy harvest run")
+        run_id = engine.store.list_runs()[0].run_id
+        assert not engine.store.get_run(run_id).mounted
+
+        harness.script([*HAPPY_TASK])
+        result = harness.engine().resume(run_id)
+        assert result.state == "completed"
+        assert not result.mounted
+
+    def test_mounted_run_that_loses_its_mount_does_not_resume_on_nothing(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(harness.tmp_path)
+        harness.script([taskgraph(task("t1")), {"fail": "sandbox exploded"}])
+        engine = harness.engine(sandbox={"workspace": str(source), "gate_command": ""})
+        with pytest.raises(WorkerError, match="sandbox exploded"):
+            engine.start("crashy mounted run")
+        run_id = engine.store.list_runs()[0].run_id
+        assert engine.store.get_run(run_id).mounted
+
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        harness.script([*HAPPY_TASK])
+        with pytest.raises(ProvisionError, match="was not visible inside the agent sandbox"):
+            harness.engine(sandbox={"workspace": str(source), "gate_command": ""}).resume(run_id)
+
+
 class TestWorkspaceExecution:
     """The artifacts linchpin: jobs run in the workspace mount, so files the
     builder writes appear on the host live and survive sandbox teardown."""
@@ -1369,7 +1469,10 @@ class TestPrebakedTemplate:
         )
         run_id = new_run_id_for(engine)
         # apt and the go installer (both `sh -c`) succeed; the prebake probe
-        # (`python3 -c`) and the jobs still run against the fake sandbox.
+        # (`python3 -c`) and the jobs still run against the fake sandbox, and
+        # so does the workspace mount probe — with a configured workspace a
+        # swallowed probe is a provisioning failure, not harvest mode.
+        harness.fake_sbx.script(f"exec sbxloop-{run_id}-agent sh -c set --;", passthrough=True)
         harness.fake_sbx.script(f"exec sbxloop-{run_id}-agent sh -c", returncode=0)
         result = engine.start("use the baked template on a go repo", run_id=run_id)
 

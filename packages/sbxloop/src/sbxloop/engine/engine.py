@@ -357,6 +357,7 @@ class LoopEngine:
         repo: str | None = None,
         prior_branch: str | None = None,
         prior_pr: int | None = None,
+        workspace_source: str | None = None,
     ) -> RunResult:
         """Drive a fresh run all the way through.
 
@@ -374,13 +375,28 @@ class LoopEngine:
         that one repository for the whole run (and is persisted with the
         run, so a resume routes there too); ``None`` keeps the configured
         default, which is the only repository when just one is configured.
+
+        ``workspace_source`` labels where the run's tree came from for the
+        first event — a caller that chose it (the CLI's ``--workspace`` or
+        the git checkout around the command) says so; otherwise the config
+        speaks for itself. The workspace path itself always rides along, so
+        a run that is about to work on nothing announces it up front.
         """
         run_id = run_id or new_run_id()
         self._select_repo(repo)
         self.store.create_run(run_id, outcome, self.config.model_dump_json())
         if tasks:
             self.store.save_tasks(run_id, list(tasks))
-        self.bus.emit(HostEventTypes.RUN_START, run_id, outcome=outcome, seeded=len(tasks or ()))
+        workspace = self.config.workspace_for_repo(self.config.github.repo)
+        self.bus.emit(
+            HostEventTypes.RUN_START,
+            run_id,
+            outcome=outcome,
+            seeded=len(tasks or ()),
+            workspace=str(workspace) if workspace is not None else None,
+            workspace_source=workspace_source
+            or self.config.workspace_source(self.config.github.repo),
+        )
         self._prior = PriorArtifacts(branch=prior_branch, pr_number=prior_pr)
         return self._drive(run_id, outcome)
 
@@ -438,7 +454,16 @@ class LoopEngine:
             self.store.set_run_reason(run_id, None)
         self._rehydrate_config(run_id)
         self.bus.emit(HostEventTypes.RUN_START, run_id, outcome=run.outcome, resumed=True)
-        return self._drive(run_id, run.outcome, workspace=run.workspace, stage=stage)
+        # The first provisioning decided whether the agent must see this
+        # workspace; a harvest-mode run resumes as one instead of failing
+        # the mount check its empty per-run dir was never going to pass.
+        return self._drive(
+            run_id,
+            run.outcome,
+            workspace=run.workspace,
+            stage=stage,
+            expects_mount=run.mounted if run.workspace is not None else None,
+        )
 
     def _refuse_if_pruned(self, run_id: str) -> None:
         if workspace_pruned(self.store, run_id):
@@ -562,6 +587,7 @@ class LoopEngine:
         *,
         workspace: Path | None = None,
         stage: str | None = None,
+        expects_mount: bool | None = None,
     ) -> RunResult:
         self._waited_s = 0.0
         deadline = self.clock() + self.config.budgets.max_wall_clock_s
@@ -576,7 +602,9 @@ class LoopEngine:
         # recomputed from config, which would silently relocate it (#60).
         # The run's repository (its config was narrowed to it in
         # _select_repo) scopes the github sandbox's token and remote.
-        pair = provisioner.ensure_pair(run_id, workspace, self.config.github.repo)
+        pair = provisioner.ensure_pair(
+            run_id, workspace, self.config.github.repo, expects_mount=expects_mount
+        )
         assert pair.workspace is not None
         self._confirm_prior_checkout(run_id, pair)
         if workspace is not None and pair.workspace != workspace:

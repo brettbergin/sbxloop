@@ -16,10 +16,11 @@ from typer.testing import CliRunner
 import sbxloop
 from sbxloop.cli.app import app
 from sbxloop.cli.doctor import Check
+from sbxloop.config import Config, GithubConfig, RepoConfig, SandboxConfig
 from sbxloop.daemon.model import WorkItem
 from sbxloop.deliver import RepositoryProbe
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import GithubOpsError
+from sbxloop.errors import GithubOpsError, SbxloopError
 from sbxloop.events import Event
 from sbxloop_worker.protocol import Event as ProtocolEvent
 from tests.conftest import FakeSbx
@@ -1327,6 +1328,77 @@ class TestBakeCommand:
         assert "bake failed" in result.output
 
 
+class TestResolveRunWorkspace:
+    """`_resolve_run_workspace`: the flag, then the config, then the checkout
+    around the current directory; nothing anywhere is harvest mode."""
+
+    def test_flag_pins_the_directory_on_the_config(self, tmp_path: Path) -> None:
+        from sbxloop.cli.app import _resolve_run_workspace
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        config = Config(github=GithubConfig(repo="octo/app"))
+        pinned, chosen, source = _resolve_run_workspace(config, ws, cwd=tmp_path)
+        assert (chosen, source) == (ws.resolve(), "--workspace")
+        assert pinned.sandbox.workspace == ws.resolve()
+        assert pinned.workspace_for_repo("octo/app") == ws.resolve()
+        assert pinned.github.repos[0].workspace == ws.resolve()
+
+    def test_flag_must_exist(self, tmp_path: Path) -> None:
+        from sbxloop.cli.app import _resolve_run_workspace
+
+        with pytest.raises(SbxloopError, match="is not a directory"):
+            _resolve_run_workspace(Config(), tmp_path / "nope", cwd=tmp_path)
+
+    def test_configured_workspace_wins_over_the_cwd(self, tmp_path: Path) -> None:
+        from sbxloop.cli.app import _resolve_run_workspace
+        from tests.unit.test_hostgit import make_repo
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        root = make_repo(tmp_path)
+        config = Config(sandbox=SandboxConfig(workspace=ws))
+        same, chosen, source = _resolve_run_workspace(config, None, cwd=root)
+        assert (chosen, source) == (ws, "configured")
+        assert same is config
+
+    def test_checkout_configured_for_another_repository_means_a_clone(self, tmp_path: Path) -> None:
+        from sbxloop.cli.app import _resolve_run_workspace
+        from tests.unit.test_hostgit import make_repo
+
+        other = tmp_path / "other"
+        other.mkdir()
+        root = make_repo(tmp_path)
+        config = Config(
+            github=GithubConfig(
+                repo="octo/app",
+                repos=[
+                    RepoConfig(repo="octo/app"),
+                    RepoConfig(repo="octo/other", workspace=other),
+                ],
+            )
+        )
+        same, chosen, source = _resolve_run_workspace(config, None, cwd=root)
+        assert (chosen, source) == (None, "remote")
+        assert same is config
+
+    def test_enclosing_checkout_is_used(self, tmp_path: Path) -> None:
+        from sbxloop.cli.app import _resolve_run_workspace
+        from tests.unit.test_hostgit import make_repo
+
+        root = make_repo(tmp_path)
+        sub = root / "a" / "b"
+        sub.mkdir(parents=True)
+        pinned, chosen, source = _resolve_run_workspace(Config(), None, cwd=sub)
+        assert (chosen, source) == (root.resolve(), "cwd-checkout")
+        assert pinned.sandbox.workspace == root.resolve()
+
+    def test_nothing_anywhere_is_harvest_mode(self, tmp_path: Path) -> None:
+        from sbxloop.cli.app import _resolve_run_workspace
+
+        assert _resolve_run_workspace(Config(), None, cwd=tmp_path)[1:] == (None, "none")
+
+
 class TestRunCommand:
     def make_run_env(
         self, workdir: Path, monkeypatch: pytest.MonkeyPatch, responses: list[dict[str, Any]]
@@ -1366,9 +1438,97 @@ class TestRunCommand:
         )
         result = runner.invoke(app, ["run", "make it so", "--no-tui"])
         assert result.exit_code == 0, result.output
+        # Nothing configured and tmp_path is not a checkout: the run says so
+        # up front instead of quietly working on an empty directory (#670).
+        assert "workspace: none" in result.output
+        assert "harvested as artifacts" in result.output
         assert "finished" in result.output
         assert "completed" in result.output
         assert "t1: done" in result.output
+
+    def _run_start(self, workdir: Path) -> dict[str, Any]:
+        store = StateStore(workdir / ".sbxloop" / "state.db")
+        (run,) = store.list_runs()
+        (start,) = [event for _, event in store.events(run.run_id) if event.type == "run.start"]
+        return dict(start.data)
+
+    def test_run_workspace_flag_names_the_checkout(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        ws = workdir / "ws"
+        ws.mkdir()
+        result = runner.invoke(app, ["run", "make it so", "--no-tui", "--workspace", "ws"])
+        assert result.exit_code == 0, result.output
+        # Long tmp paths soft-wrap at the console width.
+        assert f"workspace: {ws.resolve()} (from --workspace)" in result.output.replace("\n", "")
+        store = StateStore(workdir / ".sbxloop" / "state.db")
+        (run,) = store.list_runs()
+        assert run.workspace == ws.resolve()
+        assert run.mounted
+        start = self._run_start(workdir)
+        assert start["workspace"] == str(ws.resolve())
+        assert start["workspace_source"] == "--workspace"
+
+    def test_run_workspace_flag_must_be_a_directory(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        result = runner.invoke(app, ["run", "make it so", "--no-tui", "--workspace", "missing"])
+        assert result.exit_code == 2, result.output
+        assert "invalid --workspace" in result.output
+        assert "is not a directory" in result.output
+        assert fake_sbx.invocations("create") == []
+
+    def test_run_inside_a_checkout_works_on_that_checkout(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`sbxloop run` typed from anywhere inside a git checkout means that
+        checkout (#670); the state dir still resolves under $HOME."""
+        from tests.unit.test_hostgit import make_repo
+
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        root = make_repo(workdir)
+        sub = root / "pkg"
+        sub.mkdir()
+        monkeypatch.chdir(sub)
+        result = runner.invoke(app, ["run", "make it so", "--no-tui"])
+        assert result.exit_code == 0, result.output
+        assert (
+            f"workspace: {root.resolve()} (the git checkout enclosing the current directory)"
+            in result.output.replace("\n", "")
+        )
+        start = self._run_start(workdir)
+        assert start["workspace"] == str(root.resolve())
+        assert start["workspace_source"] == "cwd-checkout"
+
+    def test_run_configured_workspace_is_reported_as_configured(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        ws = workdir / "configured-ws"
+        ws.mkdir()
+        monkeypatch.setenv("SBXLOOP_SANDBOX__WORKSPACE", str(ws))
+        result = runner.invoke(app, ["run", "make it so", "--no-tui"])
+        assert result.exit_code == 0, result.output
+        assert f"workspace: {ws} (configured)" in result.output.replace("\n", "")
+        assert self._run_start(workdir)["workspace_source"] == "configured"
+
+    def test_run_configured_workspace_that_never_mounts_stops(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A checkout the agent cannot see is a failed run, not a green run
+        on an empty directory (#670)."""
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        ws = workdir / "ws"
+        ws.mkdir()
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        result = runner.invoke(app, ["run", "make it so", "--no-tui", "--workspace", str(ws)])
+        assert result.exit_code == 2, result.output
+        assert "run failed:" in result.output
+        assert "was not visible inside the agent sandbox" in result.output
+        assert "sbxloop doctor" in result.output
+        assert "t1: done" not in result.output
 
     HAPPY_RUN: ClassVar[list[dict[str, Any]]] = [
         {

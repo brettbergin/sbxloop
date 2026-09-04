@@ -80,7 +80,15 @@ class FakeSbx:
         stdout: str = "",
         stderr: str = "",
         once: bool = False,
+        passthrough: bool = False,
     ) -> None:
+        """Script the fake's answer to every invocation starting with ``prefix``.
+
+        First match wins, in scripting order. ``passthrough`` reserves a
+        prefix for the fake's real behaviour so a broader prefix scripted
+        after it (say, every ``sh -c``) does not swallow it — the workspace
+        mount probe is the usual one to protect.
+        """
         path = self.state / "responses.json"
         responses = json.loads(path.read_text()) if path.is_file() else []
         responses.append(
@@ -90,6 +98,7 @@ class FakeSbx:
                 "stdout": stdout,
                 "stderr": stderr,
                 "once": once,
+                "passthrough": passthrough,
             }
         )
         path.write_text(json.dumps(responses))
