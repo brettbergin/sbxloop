@@ -599,9 +599,26 @@ language that has one (mypy `files`; `tsc` ignoring `tsconfig.json` when
 handed input files; rubocop inspecting an `Exclude`d file named on the
 command line; a Go build tag pulling an integration suite into `go test`),
 Python when none does, and the engine passes it as
-`$config_override_example`. The stories live beside the lint's
+`$config_override_example`. Every registry ecosystem has a story of its
+own (#690): mocha adding a positional path to its configured `spec`, a
+Cargo workspace's `default-members` overridden by `--workspace`,
+surefire's `excludes` overridden by `-Dtest`, PHPUnit dropping its
+`<testsuites>` for a path argument, a .NET solution filter reached past by
+naming the project, a CTest preset's `filter` lost without `--preset` —
+and a repository that resolved TypeScript reads the `tsc` story whichever
+order the set came in, since TypeScript pulls JavaScript in as a
+requirement. The stories of tools the lint reads live beside their
 `CONFIG_SCOPED_TOOLS` entries so a tool the lint learns to read gains its
-example in the same place. The lint itself reads beyond Python (#628): each
+example in the same place; the rest are `_STANDALONE_EXAMPLES`. The
+reviewer's gate paragraph is its own (`verifylint.reviewer_gate_rule`,
+#690): the decomposer's "one task MUST run the gate" is an instruction to a
+planner, and handed to a read-only reviewer it read as a step to perform —
+the reviewer is told the gate as a result to weigh, or that there is none
+to lean on. Likewise the diff the review prompt carries is cut by
+`phases.clip_diff` at `[landing] review_diff_max_chars`, and the cut
+carries a marker in the diff's own terms (`[diff clipped at N chars — M chars / L lines not shown; do not assume they are unchanged …]`), because
+the prompt's rule that an untouched file is unchanged is true of the tree
+and false of a clipped diff. The lint itself reads beyond Python (#628): each
 entry names how its tool treats an explicit path — `include` (mypy `files`,
 ruff `src`/`include`, pytest `testpaths`: a path outside the declared set
 overrides it, one inside only narrows the run), `exclude` (rubocop: a file

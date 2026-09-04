@@ -202,7 +202,10 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency or
 - **Review** — a fresh read-only session reads the PR's whole diff
   adversarially (concurrency, failure ordering, trust-boundary parsing,
   cross-module invariants, scope) and returns a verdict with line-anchored
-  findings. The verdict is the run's own and is authoritative; it is also
+  findings. The reviewer is told the project's gate as a result to weigh
+  (or that the repository declares none), not as a step to run, and a diff
+  the inline budget clipped says where the cut is rather than passing as
+  unchanged. The verdict is the run's own and is authoritative; it is also
   posted to the PR for the record. There is no per-task critic: the old
   per-task review stages judged task completion and rubber-stamped it while
   diff-level defects leaked to the PR; one adversarial pass over the

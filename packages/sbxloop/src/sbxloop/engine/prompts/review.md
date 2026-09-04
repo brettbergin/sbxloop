@@ -16,9 +16,12 @@ tests/unit/test_prompts.py):
   prompt reaches the model; everything below it is sent verbatim.
 
 Variables: $outcome, $pr_number, $round, $diff, $tasks_summary,
-$prior_rounds, $user_guidance, $project_gate, $config_override_example
-(rendered by verifylint.config_override_example for the run's resolved
-toolchains, #634); $retry_context and $verification (what the sandbox's
+$prior_rounds, $user_guidance, $project_gate (rendered by
+verifylint.reviewer_gate_rule — the gate as a result to weigh, or that
+there is none, #690; test_review_prompt_treats_the_gate_as_evidence),
+$config_override_example (rendered by verifylint.config_override_example
+for the run's resolved toolchains, #634 — one story per registry
+ecosystem, #690); $retry_context and $verification (what the sandbox's
 checks did not decide under an advisory or ci-only verify mode, #682;
 both defaulted by render()); $repo_conventions (engine.repocontext, #688 —
 defaulted to "" by render()).
@@ -85,7 +88,8 @@ at a time — each one a row shape nobody enumerated.
 $project_gate
 
 A green gate is necessary, not sufficient: the defects that reach a PR are
-precisely the ones its tests do not encode.
+precisely the ones its tests do not encode. You are reading, not building:
+the gate's result is evidence to weigh, not a step of yours to perform.
 
 $verification
 
@@ -138,9 +142,12 @@ $user_guidance
 
 ## The diff
 
-The PR's changes against its base (working tree included). Anything not
-shown here is unchanged; you can read the whole tree from the working
-directory.
+The PR's changes against its base (working tree included). A file the diff
+does not touch is unchanged, and you can read the whole tree from the
+working directory. If the diff carries a `[diff clipped …]` marker, the
+budget cut its middle: the lines it counts are real changes you have not
+seen, so read those files from the tree before you judge them — never
+treat the gap as unchanged.
 
 ```diff
 $diff

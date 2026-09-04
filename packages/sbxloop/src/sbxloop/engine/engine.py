@@ -2608,6 +2608,7 @@ class LoopEngine:
                 history=render_fix_history(rounds_so_far),
                 unanswered=unanswered_findings(rounds_so_far),
                 preexisting=checks.preexisting if checks is not None else (),
+                gate=gate,
             ),
             verify_commands=verify_commands,
             failed_checks=failed_checks,
