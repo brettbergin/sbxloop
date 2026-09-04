@@ -57,6 +57,8 @@ from sbxloop.gh.ops import (
     MergeOutcome,
     PostedFinding,
     PrRef,
+    QueueEntry,
+    QueueState,
     ReviewComment,
     ReviewEvent,
     ReviewThread,
@@ -163,6 +165,7 @@ class FakeGithub(GithubOps):
         self.rollup_required: tuple[str, ...] | None = ()
         self.rollup_calls = 0
         self.failed_logs: list[FailedCheck] = []
+        self.failed_logs_calls: list[str] = []
         self.reviews_payload: list[dict[str, Any]] = []
         self.comments_payload: list[dict[str, Any]] = []
         self.feedback = ""
@@ -172,6 +175,14 @@ class FakeGithub(GithubOps):
         # diff — every event, COMMENT included. True models that.
         self.refuse_inline_comments = False
         self.merge_outcomes: list[MergeOutcome] = []
+        # The base's merge queue (#676). ``queue_states`` is the script the
+        # queue reads consume (the last one sticks, like ``checks``); empty
+        # = "not queued, not merged". ``enqueue_ok`` False refuses the
+        # enqueue the way GitHub does (a GraphQL error).
+        self.queue_states: list[QueueState] = []
+        self.enqueue_ok = True
+        self.enqueued: list[tuple[str, str]] = []
+        self.queue_reads = 0
         # Anchors whose individual review comment GitHub refuses (422 "line
         # could not be resolved") in comment mode — per anchor, unlike
         # ``refuse_inline_comments`` which fails a whole review.
@@ -559,6 +570,7 @@ class FakeGithub(GithubOps):
     def checks_failed_logs(
         self, repo: str, sha: str, *, max_chars: int = 6000
     ) -> list[FailedCheck]:
+        self.failed_logs_calls.append(sha)
         return list(self.failed_logs)
 
     @property
@@ -680,6 +692,32 @@ class FakeGithub(GithubOps):
             self.pr["merged"] = True
             self.pr["merge_commit_sha"] = outcome.sha
         return outcome
+
+    def pr_enqueue(self, node_id: str, *, head: str = "") -> QueueEntry:
+        self.enqueued.append((node_id, head))
+        self._maybe_fail("pr_enqueue")
+        if not self.enqueue_ok:
+            raise GithubOpsError(
+                "enqueuePullRequest failed: [{'type': 'UNPROCESSABLE', 'message': "
+                "'Pull request is not mergeable'}]"
+            )
+        return QueueEntry(id="MQE_1", state="QUEUED", position=1, head="queue0")
+
+    def pr_queue_state(self, repo: str, number: int) -> QueueState:
+        self.queue_reads += 1
+        self._maybe_fail("pr_queue_state")
+        if not self.queue_states:
+            return QueueState(
+                merged=bool(self.pr.get("merged")),
+                closed=str(self.pr.get("state") or "") == "closed",
+                entry=None,
+                merge_sha=str(self.pr.get("merge_commit_sha") or ""),
+            )
+        state = self.queue_states.pop(0) if len(self.queue_states) > 1 else self.queue_states[0]
+        if state.merged:
+            self.pr["merged"] = True
+            self.pr["merge_commit_sha"] = state.merge_sha
+        return state
 
     def pr_update_branch(self, repo: str, number: int, *, expected_head_sha: str = "") -> bool:
         self.updates.append((number, expected_head_sha))

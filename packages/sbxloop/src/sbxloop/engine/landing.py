@@ -648,6 +648,11 @@ def land(
     PR unmerged). ``ci_timeout_s`` bounds the whole wait; a landing that
     has not settled by then is ``Blocked`` too.
 
+    A base that merges through a merge queue (#676) is not merged by the
+    loop at all: where the merge would happen, every other bar cleared,
+    the PR is enqueued and the queue is polled — see
+    :func:`_through_queue`.
+
     ``review_posted`` is whether the round that approved this PR actually
     got its review onto GitHub. False blocks the merge: a run whose review
     post failed would otherwise merge with no reviewable record at all.
@@ -855,9 +860,21 @@ def land(
                 blocked_at = head
                 tick("mergeability")
                 continue
-            return refused_by_base(
-                ops, repo, number, policy.requirements, cfg, head=head, login=login, is_bot=is_bot
-            )
+            if not queue_only(policy.requirements, cfg, is_bot=is_bot):
+                return refused_by_base(
+                    ops,
+                    repo,
+                    number,
+                    policy.requirements,
+                    cfg,
+                    head=head,
+                    login=login,
+                    is_bot=is_bot,
+                )
+            # The only rule left is the merge queue itself (#676). Whether
+            # GitHub reports a queue-bound PR as `blocked` before it is
+            # queued is field-unverified; the enqueue below is GitHub's
+            # own verdict either way, and its refusal is the block.
         # #520 step 5: the last gates before the merge are about the review
         # record itself. A run that could not post its approving review has
         # no review on the PR at all (#503), and a PR whose findings are
@@ -895,6 +912,24 @@ def land(
         if bot_reviewers and ("comment", *bot_reviewers) not in bots_named:
             bots_named.add(("comment", *bot_reviewers))
             _say(ops, repo, number, bot_review_comment(bot_reviewers))
+        if policy.requirements.merge_queue:
+            # The base merges through its queue (#676): the queue's own
+            # merge method applies, and PUT /merge would only be refused.
+            return _through_queue(
+                ops,
+                repo,
+                number,
+                node_id=node_id or _str(pr.get("node_id")),
+                head=head,
+                requirements=policy.requirements,
+                cfg=cfg,
+                login=login,
+                is_bot=is_bot,
+                tick=tick,
+                emit=emit,
+                clock=clock,
+                started=started,
+            )
         if method is None:
             # Resolved once per landing, last of all (#620): an explicit
             # method the repository refuses is a block, never a substitute.
@@ -910,6 +945,24 @@ def land(
             log.info("land.merge_stale", repo=repo, pr=number, detail=outcome.reason)
             tick("merge")
             continue
+        if outcome.blocked and names_merge_queue(outcome.reason):
+            # The rules could not be read, but GitHub's refusal names the
+            # queue itself (#676): enter it rather than hand over.
+            return _through_queue(
+                ops,
+                repo,
+                number,
+                node_id=node_id or _str(pr.get("node_id")),
+                head=head,
+                requirements=policy.requirements,
+                cfg=cfg,
+                login=login,
+                is_bot=is_bot,
+                tick=tick,
+                emit=emit,
+                clock=clock,
+                started=started,
+            )
         if outcome.blocked:
             # A bare 405 says "not mergeable" and nothing more. The base's
             # rules say what (#620); GitHub's own words ride along.
@@ -932,6 +985,120 @@ def land(
                 # not a failure of the thing that just succeeded.
                 log.warning("land.branch_delete_failed", repo=repo, branch=branch, exc_info=True)
         return Landed(outcome.sha)
+
+
+def queue_only(requirements: BaseRequirements, cfg: LandingConfig, *, is_bot: bool | None) -> bool:
+    """Whether the merge queue is the only rule of the base the loop does
+    not satisfy on its own (#676) — every other blocker, a review the
+    loop cannot give included, comes first."""
+    return requirements.merge_queue and not base_blockers(requirements, cfg, can_sign=bool(is_bot))
+
+
+def names_merge_queue(detail: str) -> bool:
+    """Whether GitHub's refusal of a merge names the merge queue (#676).
+    The wording is GitHub's and field-unverified; the rules read from
+    the base are the primary signal, this the fallback when they could
+    not be read."""
+    return "merge queue" in detail.lower()
+
+
+def _through_queue(
+    ops: GithubOps,
+    repo: str,
+    number: int,
+    *,
+    node_id: str | None,
+    head: str,
+    requirements: BaseRequirements,
+    cfg: LandingConfig,
+    login: str,
+    is_bot: bool | None,
+    tick: Tick,
+    emit: Emit,
+    clock: Callable[[], float],
+    started: float,
+) -> Landed | Blocked | AwaitingReview | NeedsFix | Closed:
+    """Land through the base's merge queue (#676): enqueue the head the
+    landing judged, then poll the queue until it merges the PR, removes
+    it, or the landing's ``ci_timeout_s`` runs out.
+
+    A removal is the queue's verdict on the PR *combined with what is
+    ahead of it*: its checks ran on the queue's own merge-group commit,
+    not the PR's head, so that commit's red checks are what the fix round
+    gets. A removal with no red check to name is a block, not a round —
+    a human dequeued it, or the queue said something the loop cannot
+    read — because a fix round with nothing to fix is budget burn.
+
+    A timeout leaves the PR in the queue: the queue merges or removes it
+    on its own, and pulling it out would throw away a merge about to
+    happen. The run ends ``Blocked`` naming that, and the daemon's
+    settle sees the merge when it comes.
+
+    A refused enqueue is the queue's 405: when the base's other rules
+    say what GitHub wants — a review, a signature — the outcome is
+    theirs (:func:`refused_by_base`, a park or a block naming each rule)
+    with GitHub's words riding along; when the queue was the only rule
+    left, GitHub's words are all there is.
+    """
+    if not node_id:
+        return Blocked("the base uses a merge queue and the pull request's node id is unknown")
+    before = ops.pr_queue_state(repo, number)
+    if before.merged:
+        return Landed(before.merge_sha, by_human=True)
+    if before.closed:
+        return Closed("the pull request was closed without being merged")
+    if before.entry is None:
+        try:
+            entry = ops.pr_enqueue(node_id, head=head)
+        except GithubOpsError as exc:
+            detail = f"GitHub refused to enqueue the pull request: {exc}"
+            if not queue_only(requirements, cfg, is_bot=is_bot):
+                return refused_by_base(
+                    ops,
+                    repo,
+                    number,
+                    requirements,
+                    cfg,
+                    head=head,
+                    login=login,
+                    is_bot=is_bot,
+                    detail=detail,
+                )
+            return Blocked(f"the base uses a merge queue and {detail}")
+        emit("land.enqueued", pr=number, head=head, position=entry.position, resumed=False)
+    else:
+        # Already queued — a resume, or a parked landing re-entering while
+        # the queue still holds it. Watch it rather than enqueue twice.
+        entry = before.entry
+        emit("land.enqueued", pr=number, head=head, position=entry.position, resumed=True)
+    queue_head = entry.head
+    while True:
+        if clock() - started >= cfg.ci_timeout_s:
+            return Blocked(
+                f"still in the merge queue after ci_timeout_s={cfg.ci_timeout_s:g}s; the "
+                "queue merges or removes it on its own"
+            )
+        tick("queue")
+        state = ops.pr_queue_state(repo, number)
+        if state.merged:
+            return Landed(state.merge_sha)
+        if state.closed:
+            return Closed("the pull request was closed without being merged")
+        if state.entry is not None:
+            queue_head = state.entry.head or queue_head
+            continue
+        reason = state.removed_reason if state.removals > before.removals else ""
+        failed = tuple(ops.checks_failed_logs(repo, queue_head)) if queue_head else ()
+        names = [c.name for c in failed]
+        emit("land.dequeued", pr=number, head=head, reason=reason, failed=names)
+        why = "the merge queue removed the pull request" + (f" ({reason})" if reason else "")
+        if failed:
+            return NeedsFix(
+                "ci",
+                f"{why}: its checks failed in the queue — {', '.join(names)}",
+                failed_checks=failed,
+            )
+        return Blocked(f"{why}, with no failing check of its own to fix; a human has to look")
 
 
 # The repository payload's flag for each merge method (GitHub's names).
@@ -1087,8 +1254,8 @@ def blocked_reason(
                 if "protection" in requirements.unread
                 else ""
             )
-            + "; the usual causes are a required review, a CODEOWNERS review, required "
-            "conversation resolution, or a merge queue"
+            + "; the usual causes are a required review, a CODEOWNERS review, or required "
+            "conversation resolution"
         )
     else:
         why = (

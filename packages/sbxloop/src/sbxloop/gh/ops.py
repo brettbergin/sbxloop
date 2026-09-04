@@ -65,6 +65,36 @@ class MergeOutcome(NamedTuple):
     stale: bool = False
 
 
+class QueueEntry(NamedTuple):
+    """The pull request's place in its base's merge queue (#676), as the
+    enqueue mutation and the queue read describe it. ``state`` is
+    GitHub's ``MergeQueueEntryState`` (QUEUED, AWAITING_CHECKS, MERGEABLE,
+    UNMERGEABLE, LOCKED); ``head`` is the commit the queue is testing for
+    this entry — the queue's own merge-group commit, not the PR's head —
+    which is where its checks report."""
+
+    id: str
+    state: str
+    position: int | None = None
+    head: str = ""
+
+
+class QueueState(NamedTuple):
+    """What the merge queue has done with the pull request so far (#676):
+    whether it is merged or closed, its live entry when it is queued, and
+    the queue's removals — ``removals`` counts every removed-from-queue
+    event on the PR's timeline (a caller compares against the count it
+    saw when it enqueued) and ``removed_reason`` is the latest one's
+    reason as GitHub words it."""
+
+    merged: bool
+    closed: bool
+    entry: QueueEntry | None
+    removals: int = 0
+    removed_reason: str = ""
+    merge_sha: str = ""
+
+
 class ReviewComment(BaseModel):
     """One inline comment, anchored to a line of the PR's diff."""
 
@@ -638,6 +668,46 @@ def fold_required_contexts(payload: Any) -> list[str]:
         if name:
             out.append(str(name))
     return out
+
+
+def fold_queue_entry(node: Any) -> QueueEntry | None:
+    """A GraphQL ``MergeQueueEntry`` node as a typed row; ``None`` when
+    there is no entry (the PR is not queued) or the node has no id."""
+    if not isinstance(node, dict) or not node.get("id"):
+        return None
+    head = node.get("headCommit")
+    position = node.get("position")
+    return QueueEntry(
+        id=str(node["id"]),
+        state=str(node.get("state") or ""),
+        position=int(position) if isinstance(position, int) else None,
+        head=str(head.get("oid") or "") if isinstance(head, dict) else "",
+    )
+
+
+def fold_queue_state(payload: Any) -> QueueState:
+    """The queue read's ``pullRequest`` folded to :class:`QueueState`
+    (#676). A payload with no pull request raises: the caller is waiting
+    on the queue and cannot tell "not queued" from "not read"."""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    repo = data.get("repository") if isinstance(data, dict) else None
+    pr = repo.get("pullRequest") if isinstance(repo, dict) else None
+    if not isinstance(pr, dict):
+        raise GithubOpsError(f"mergeQueueEntry returned no pull request: {payload!r}")
+    removals = pr.get("timelineItems")
+    count = removals.get("totalCount") if isinstance(removals, dict) else None
+    nodes = removals.get("nodes") if isinstance(removals, dict) else None
+    last = nodes[-1] if isinstance(nodes, list) and nodes else None
+    reason = last.get("reason") if isinstance(last, dict) else None
+    merge = pr.get("mergeCommit")
+    return QueueState(
+        merged=bool(pr.get("merged")),
+        closed=str(pr.get("state") or "").upper() == "CLOSED",
+        entry=fold_queue_entry(pr.get("mergeQueueEntry")),
+        removals=int(count) if isinstance(count, int) else 0,
+        removed_reason=str(reason or ""),
+        merge_sha=str(merge.get("oid") or "") if isinstance(merge, dict) else "",
+    )
 
 
 def review_threads_next_cursor(payload: Any) -> str | None:
@@ -1378,6 +1448,74 @@ class GithubOps:
             # blocked: something about the PR said no, and no retry fixes it.
             return MergeOutcome(False, "", f"merge was not confirmed: {data!r}", blocked=True)
         return MergeOutcome(True, str(data.get("sha") or ""), str(data.get("message") or "merged"))
+
+    # A base that merges through a merge queue refuses PUT /merge outright
+    # (#676); the queue is entered and read through GraphQL — the REST API
+    # has no queue surface. Field-unverified beyond GitHub's schema:
+    # ``expectedHeadOid`` on the enqueue input (the same race guard the
+    # merge's ``sha`` gives), ``headCommit`` on the entry, and the
+    # ``reason`` of a ``RemovedFromMergeQueueEvent``.
+    _ENQUEUE_MUTATION = (
+        "mutation($id: ID!, $head: GitObjectID) { "
+        "enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $head}) { "
+        "mergeQueueEntry { id state position headCommit { oid } } } }"
+    )
+    _QUEUE_QUERY = (
+        "query($owner: String!, $name: String!, $number: Int!) { "
+        "repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
+        "merged state mergeCommit { oid } "
+        "mergeQueueEntry { id state position headCommit { oid } } "
+        "timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) { "
+        "totalCount nodes { ... on RemovedFromMergeQueueEvent { reason } } } "
+        "} } }"
+    )
+
+    def pr_enqueue(self, node_id: str, *, head: str = "") -> QueueEntry:
+        """Add the PR to its base's merge queue; the entry GitHub made.
+
+        ``head`` is the commit the caller judged: GitHub refuses the
+        enqueue when the branch has moved past it, the way the merge's
+        ``sha`` makes a concurrent push lose the race. A refusal — the PR
+        is not mergeable, the queue is not required for its base, the
+        branch moved — is a GraphQL ``errors`` array under a 200 and is
+        raised as :class:`GithubOpsError` with GitHub's words.
+        """
+        variables: dict[str, Any] = {"id": node_id}
+        if head:
+            variables["head"] = head
+        data = self.raw(
+            "POST", "/graphql", {"query": self._ENQUEUE_MUTATION, "variables": variables}
+        )
+        if not isinstance(data, dict):
+            raise GithubOpsError(f"enqueuePullRequest returned a malformed result: {data!r}")
+        errors = data.get("errors")
+        if errors:
+            raise GithubOpsError(f"enqueuePullRequest failed: {errors!r}")
+        entry = fold_queue_entry(
+            ((data.get("data") or {}).get("enqueuePullRequest") or {}).get("mergeQueueEntry")
+        )
+        if entry is None:
+            raise GithubOpsError(f"enqueuePullRequest returned no queue entry: {data!r}")
+        return entry
+
+    def pr_queue_state(self, repo: str, number: int) -> QueueState:
+        """Where the PR stands with its base's merge queue (#676): merged,
+        closed, its live entry, and the queue's removals so far."""
+        owner, _, name = repo.partition("/")
+        data = self.raw(
+            "POST",
+            "/graphql",
+            {
+                "query": self._QUEUE_QUERY,
+                "variables": {"owner": owner, "name": name, "number": number},
+            },
+        )
+        if not isinstance(data, dict):
+            raise GithubOpsError(f"mergeQueueEntry returned a malformed result: {data!r}")
+        errors = data.get("errors")
+        if errors:
+            raise GithubOpsError(f"mergeQueueEntry failed: {errors!r}")
+        return fold_queue_state(data)
 
     def pr_update_branch(self, repo: str, number: int, *, expected_head_sha: str = "") -> bool:
         """Merge the base branch into the PR's branch; True when accepted.

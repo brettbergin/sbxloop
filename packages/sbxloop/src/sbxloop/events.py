@@ -192,6 +192,13 @@ class HostEventTypes:
     LANDING_CHECKS = "landing.checks"
     LAND_UNDRAFT = "land.undraft"
     LAND_UPDATE = "land.update"
+    # The base merges through a merge queue (#676): the PR entered it
+    # (`pr`, `head`, `position`, `resumed` when it was already queued) …
+    LAND_ENQUEUED = "land.enqueued"
+    # … and the queue removed it unmerged (`pr`, `head`, `reason` as GitHub
+    # words it, `failed` — the red checks on the queue's commit, which a
+    # fix round gets; none means the run blocks).
+    LAND_DEQUEUED = "land.dequeued"
     # Landing answered human threads nothing else in the pipeline would
     # ever speak to (`pr`, `acked`) — the reply is the not-silent part.
     LAND_HUMAN_ACK = "land.human_ack"

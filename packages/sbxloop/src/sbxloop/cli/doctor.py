@@ -414,8 +414,9 @@ def _base_blockers(
 
     A required review is the classic one — the loop cannot approve its own
     pull request — and a code-owner review, approval of the last push,
-    signed commits, a merge queue or a required deployment refuse a merge
-    the same way (HTTP 405, the run ends blocked). Read by
+    signed commits or a required deployment refuse a merge the same way
+    (HTTP 405, the run ends blocked); a merge queue is not one — the loop
+    enqueues (#676). Read by
     :func:`sbxloop.gh.protection.read_base_requirements` — the same reading
     the landing gate uses for required checks (#611) — and judged by the
     same :func:`sbxloop.engine.landing.base_blockers` the run would report.

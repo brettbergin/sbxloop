@@ -247,6 +247,9 @@ secret_strategy = "proxy"
 #                            # registers later (queued self-hosted runners, Jenkins reporting through webhooks)
 # ci_timeout_s = 3600        # per wait; exceeding it ends the run blocked
 # merge_method = "auto"      # auto | squash | merge | rebase — auto takes the first of squash, merge, rebase the repository allows; an explicit method the repository disallows ends the run blocked, named
+#                            # A base that merges through a merge queue is enqueued instead (the queue's own method applies): the
+#                            # run polls the queue every ci_poll_interval_s until it merges the PR or removes it — a removal for
+#                            # red checks on the queue's commit is one CI fix round; one with nothing to fix ends the run blocked.
 # delete_branch_on_merge = true
 # merge_update_attempts = 3  # update-branch calls when protection wants "up to date"
 # required_checks = []       # the checks that gate the merge; empty = what the base's protection declares, else all

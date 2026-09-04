@@ -851,6 +851,22 @@ class TestEmbeds:
         assert texts(format_for_discord(ev("land.update", pr=9, attempt=1))) == [
             "🚀 PR #9 updated from its base (attempt 1)"
         ]
+        assert texts(format_for_discord(ev("land.enqueued", pr=9, position=2, resumed=False))) == [
+            "🚀 PR #9 entered the merge queue at position 2"
+        ]
+        assert texts(
+            format_for_discord(ev("land.enqueued", pr=9, position=None, resumed=True))
+        ) == ["🚀 PR #9 already in the merge queue"]
+        dequeued = format_for_discord(
+            ev("land.dequeued", pr=9, reason="CI_FAILED", failed=["integration"])
+        )
+        assert texts(dequeued) == [
+            "🚧 PR #9 removed from the merge queue (CI_FAILED) — failing: integration"
+        ]
+        assert dequeued[0].flush
+        assert texts(format_for_discord(ev("land.dequeued", pr=9, reason="", failed=[]))) == [
+            "🚧 PR #9 removed from the merge queue"
+        ]
         merged = format_for_discord(ev("run.merged", pr=9, url="https://x/pull/9"))
         assert texts(merged) == ["🎉 **merged** PR [#9](https://x/pull/9)"] and merged[0].flush
         assert texts(

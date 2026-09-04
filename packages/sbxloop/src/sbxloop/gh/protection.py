@@ -60,7 +60,8 @@ class BaseRequirements(NamedTuple):
     ``last_push_approval`` is fatal by construction: the loop is always
     the last pusher, so no approval can ever satisfy it.
     ``required_deployments`` names the environments a deployment must
-    succeed in before the merge.
+    succeed in before the merge. ``merge_queue`` is not a blocker: the
+    landing enqueues the pull request instead of merging it (#676).
 
     ``unread`` names the sources that could not be read (``protection``,
     ``rulesets``), so a reason or a doctor row can say which — and why:
@@ -102,8 +103,8 @@ class BaseRequirements(NamedTuple):
         API only when the credential is a GitHub App; ``merge_method`` is
         the configured way to merge, so a linear-history rule blocks only
         a merge commit. Rules the loop satisfies on its own — conversation
-        resolution (it resolves the threads it answers) and stale-review
-        dismissal — are not blockers.
+        resolution (it resolves the threads it answers), stale-review
+        dismissal and a merge queue (it enqueues, #676) — are not blockers.
         """
         out: list[str] = []
         if self.last_push_approval:
@@ -134,11 +135,6 @@ class BaseRequirements(NamedTuple):
             out.append(
                 'the base requires a linear history and `[landing] merge_method = "merge"` '
                 "would add a merge commit; use squash or rebase"
-            )
-        if self.merge_queue:
-            out.append(
-                "the base uses a merge queue; the loop merges its pull request directly and "
-                "does not enqueue it"
             )
         if self.required_deployments:
             envs = ", ".join(self.required_deployments)

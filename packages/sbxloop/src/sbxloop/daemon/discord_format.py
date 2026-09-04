@@ -1090,6 +1090,12 @@ class StatusLine:
         elif t == HostEventTypes.LAND_UPDATE:
             self.landing = f"updating from base (attempt {d.get('attempt')})"
             self._dirty = True
+        elif t == HostEventTypes.LAND_ENQUEUED:
+            self.landing = "in the merge queue"
+            self._dirty = True
+        elif t == HostEventTypes.LAND_DEQUEUED:
+            self.landing = "removed from the merge queue"
+            self._dirty = True
 
     def finish(self, state: str) -> None:
         self.finished = state
@@ -1386,6 +1392,19 @@ def format_for_discord(
     if t == HostEventTypes.LAND_UPDATE:
         return [
             line(f"🚀 PR #{data.get('pr')} updated from its base (attempt {data.get('attempt')})")
+        ]
+    if t == HostEventTypes.LAND_ENQUEUED:
+        position = data.get("position")
+        where = f" at position {position}" if isinstance(position, int) else ""
+        verb = "already in" if data.get("resumed") else "entered"
+        return [line(f"🚀 PR #{data.get('pr')} {verb} the merge queue{where}")]
+    if t == HostEventTypes.LAND_DEQUEUED:
+        red = [str(name) for name in _list(data, "failed")]
+        reason = str(data.get("reason") or "")
+        tail = f" — failing: {', '.join(red)}" if red else ""
+        why = f" ({reason})" if reason else ""
+        return [
+            line(f"🚧 PR #{data.get('pr')} removed from the merge queue{why}{tail}", flush=True)
         ]
     if t == HostEventTypes.RUN_GATED:
         label = f"#{data.get('pr')}"
