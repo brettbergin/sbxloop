@@ -398,7 +398,8 @@ class Provisioner:
             template=template,
             policy_allows=agent_policy_allows(self.config, languages),
             secrets=[self._agent_secret_spec()],
-            persistent_env=self.agent_persistent_env(),
+            persistent_env=self.agent_persistent_env(repo),
+            secret_env=self.agent_secret_env(repo),
         )
         github = SandboxSpec(
             name=sandbox_name(run_id, "github"),
@@ -450,21 +451,52 @@ class Provisioner:
         """Hosts the agent sandbox's credential path needs (doctor rows)."""
         return self.backend().token_hosts
 
-    def agent_persistent_env(self) -> dict[str, str]:
-        """Non-secret env the agent sandbox needs for the chosen backend.
+    def agent_persistent_env(self, repo: str | None = None) -> dict[str, str]:
+        """The plain environment the agent sandbox's worker — and so every
+        agent turn and shell command it spawns — starts with.
 
-        The worker resolves its backend from ``SBXLOOP_WORKER_BACKEND``
-        (default copilot), so only the claude backend needs the selector
-        delivered. ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`` keeps the
-        Claude Code CLI hermetic — no telemetry or auto-update calls to
-        hosts the balanced network policy would only refuse.
+        The repository's ``[sandbox] env`` (#679) first, the loop's own
+        selector last so nothing an operator writes can shadow it. The
+        worker resolves its backend from ``SBXLOOP_WORKER_BACKEND`` (default
+        copilot), so only the claude backend needs it delivered;
+        ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`` keeps the Claude Code
+        CLI hermetic — no telemetry or auto-update calls to hosts the
+        balanced network policy would only refuse. Nothing secret goes here
+        — see :meth:`agent_secret_env`.
         """
-        if self.agent_backend() != "claude":
-            return {}
-        return {
-            "SBXLOOP_WORKER_BACKEND": "claude",
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-        }
+        env: dict[str, str] = dict(self.config.sandbox_env_for(repo))
+        if self.agent_backend() == "claude":
+            env["SBXLOOP_WORKER_BACKEND"] = "claude"
+            env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        return env
+
+    def agent_secret_env(self, repo: str | None = None) -> dict[str, str]:
+        """The ``[sandbox] secret_env`` values for ``repo``'s runs, read from
+        the daemon's environment (#679).
+
+        They ride the credential's non-proxy road — per-job stdin when this
+        sbx passes it through, the 0600 in-VM env file otherwise — and never
+        an ``sbx`` argument, an event, or a log line. The sbx secret proxy
+        is not an option: it binds a secret to one host, which an
+        ``NPM_TOKEN`` has no single answer for, and proxy secrets are
+        invisible to exec'd workers anyway; when the proxy *does* carry the
+        agent's own credential, these still take the env file (see
+        :meth:`_apply_operator_secrets`).
+
+        Every configured name must be set: the operator declared the
+        repository's tests need it, and a run without it would fail later,
+        inside the sandbox, for a reason no log line names. Raises
+        ProvisionError listing the unset names.
+        """
+        names = self.config.secret_env_for(repo)
+        missing = [name for name in names if not self.env.get(name)]
+        if missing:
+            raise ProvisionError(
+                f"[sandbox] secret_env names {missing} are not set in the daemon's "
+                "environment (secrets.env / the service unit); set them or remove "
+                "them from secret_env"
+            )
+        return {name: self.env[name] for name in names}
 
     def _agent_secret_spec(self) -> SecretSpec:
         env, host = self.backend().secret
@@ -948,6 +980,7 @@ class Provisioner:
         # App mode this mints the first installation token here.
         gh_cred = self.gh_credential(repo) if github_enabled else None
         tokens: dict[SandboxRole, str] = {"agent": self.agent_token()}
+        self.agent_secret_env(repo)
         if gh_cred is not None:
             tokens["github"] = gh_cred.token()
         # Decided once, before the parallel threads: a probe verdict recorded
@@ -1137,6 +1170,7 @@ class Provisioner:
             policy_allows=agent_policy_allows(self.config, self.config.sandbox.effective_languages),
             secrets=[self._agent_secret_spec()],
             persistent_env=self.agent_persistent_env(),
+            secret_env=self.agent_secret_env(),
         )
 
     def ensure_github_only(
@@ -1656,6 +1690,7 @@ class Provisioner:
             f"observed while provisioning {spec.name} ({env_name})",
         )
         if result.ok:
+            self._apply_operator_secrets(spec, sandbox)
             return
         # Auto-heal: fall back to non-proxy delivery for this sandbox —
         # per-job stdin when this sbx passes it through (the value transits
@@ -1784,7 +1819,10 @@ class Provisioner:
         Under ``plain-env`` the token writer already emitted these exports,
         so this is the ``proxy`` (default) strategy's path: the repository a
         github-ops sandbox is scoped to has to reach the worker, and the env
-        file is what the worker loads at startup. Nothing secret goes here.
+        file is what the worker loads at startup. Nothing secret goes here:
+        operator ``secret_env`` values wait for the visibility verdict
+        (:meth:`_apply_operator_secrets`), so a proxy downgrade to stdin
+        delivery never leaves them at rest first.
         """
         if not spec.persistent_env or self.config.secret_strategy == "plain-env":  # nosec B105
             return
@@ -1805,9 +1843,19 @@ class Provisioner:
         sandbox.write_text(ENV_FILE, lines)
         sandbox.exec(["chmod", "600", ENV_FILE])
 
+    def _apply_operator_secrets(self, spec: SandboxSpec, sandbox: Sandbox) -> None:
+        """The proxy carries the agent's credential, so nothing else will
+        rewrite the env file: operator ``secret_env`` values (#679) go into
+        it here, beside the plain environment already written. The file is
+        0600 in a VM the agent controls — the same standing as the plain-env
+        fallback, and the only road these values have."""
+        if not spec.secret_env:
+            return
+        self._write_env_file(sandbox, {**spec.persistent_env, **spec.secret_env})
+
     def _apply_plain_env(self, spec: SandboxSpec, sandbox: Sandbox, token: str) -> None:
         """Weaker fallback: write tokens/env into ~/.sbxloop/env.sh in the VM."""
-        exports: dict[str, str] = dict(spec.persistent_env)
+        exports: dict[str, str] = {**spec.persistent_env, **spec.secret_env}
         if spec.role == "agent":
             exports[self.agent_token_env()] = token
         else:
@@ -1883,7 +1931,8 @@ class Provisioner:
             return None
         if role == "agent":
             return lambda: {
-                **self.agent_persistent_env(),
+                **self.agent_persistent_env(repo),
+                **self.agent_secret_env(repo),
                 self.agent_token_env(): self.agent_token(),
             }
         cred = gh_cred

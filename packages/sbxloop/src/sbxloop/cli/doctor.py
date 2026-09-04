@@ -537,6 +537,39 @@ def _missing_repo_labels(
         return None
 
 
+def secret_env_checks(config: Config, env: dict[str, str]) -> list[Check]:
+    """One row when `[sandbox] secret_env` (or a repository's override)
+    names anything (#679): every name must be set in the daemon's
+    environment, or provisioning fails by name before a sandbox boots —
+    this row says so before the first run does. Values are never shown."""
+    scopes: list[tuple[str, list[str]]] = [("[sandbox]", list(config.sandbox.secret_env))]
+    scopes.extend(
+        (entry.repo, list(entry.secret_env))
+        for entry in config.github.repos
+        if entry.secret_env is not None
+    )
+    names = sorted({name for _scope, listed in scopes for name in listed})
+    if not names:
+        return []
+    unset = [name for name in names if not env.get(name)]
+    if not unset:
+        return [Check("sandbox secret env", True, f"set: {', '.join(names)}")]
+    where = "; ".join(
+        f"{scope}: {', '.join(n for n in listed if n in unset)}"
+        for scope, listed in scopes
+        if any(n in unset for n in listed)
+    )
+    return [
+        Check(
+            "sandbox secret env",
+            False,
+            f"not set in the daemon's environment — {where}; export them where the "
+            "daemon reads its secrets, or drop them from secret_env (runs that need "
+            "them fail at provisioning)",
+        )
+    ]
+
+
 def collect_checks(
     env: dict[str, str],
     cli: SbxCLI | None = None,
@@ -752,6 +785,7 @@ def collect_checks(
             "set" if agent.has_token(env) else agent.missing_token_detail,
         )
     )
+    checks.extend(secret_env_checks(config, env))
     # A github credential matters only when the GitHub integration is
     # configured; an unconfigured integration is a valid (GitHub-less)
     # setup, not a failure. A PAT or GitHub App credentials both satisfy it;

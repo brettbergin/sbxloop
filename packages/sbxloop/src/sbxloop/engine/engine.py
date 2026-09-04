@@ -648,7 +648,9 @@ class LoopEngine:
                         limits=self.config.limits,
                         # Per-job stdin delivery when provisioning chose it;
                         # None keeps the launch exactly as before (#592).
-                        job_env=provisioner.job_env("agent", sandbox=pair.agent),
+                        job_env=provisioner.job_env(
+                            "agent", self.config.github.repo, sandbox=pair.agent
+                        ),
                     )
                     github = (
                         WorkerClient(

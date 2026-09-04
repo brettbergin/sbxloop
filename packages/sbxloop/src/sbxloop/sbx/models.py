@@ -53,7 +53,12 @@ class SandboxSpec(BaseModel):
     template: str | None = None
     policy_allows: list[str] = Field(default_factory=list)
     secrets: list[SecretSpec] = Field(default_factory=list)
+    # Plain environment: may sit in the in-VM env file under any strategy.
     persistent_env: dict[str, str] = Field(default_factory=dict)
+    # Operator secrets (`[sandbox] secret_env`, #679): values that travel
+    # only the credential's non-proxy road — per-job stdin, or the 0600 env
+    # file — and never an `sbx` argument, an event, or a log line.
+    secret_env: dict[str, str] = Field(default_factory=dict)
 
 
 class SandboxInfo(BaseModel):

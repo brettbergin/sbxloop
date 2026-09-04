@@ -412,6 +412,34 @@ the reason the filter is opt-in and applies only there. A git without
 partial-clone support logs `workspace.clone_filter_unsupported` and clones
 in full rather than failing.
 
+### Environment for the agent sandbox
+
+A project's test suite often reads its environment — `RAILS_ENV`,
+`DATABASE_URL`, a `PIP_INDEX_URL` or `NPM_TOKEN` for a private registry,
+`GOFLAGS`. `[sandbox] env` and `secret_env` (#679) put that environment in
+front of every command the agent sandbox's worker runs — the agent's own
+turns and each task's verify commands alike:
+
+```toml
+[sandbox]
+env = { RAILS_ENV = "test", DATABASE_URL = "postgres://localhost/app_test" }
+secret_env = ["NPM_TOKEN", "PIP_INDEX_URL"]
+```
+
+`env` holds plain values, written into the config as given. `secret_env`
+holds *names* only: their values are read from the daemon's environment
+(the `secrets.env` the service unit loads, on a deployed host) at provision
+time and delivered the way the loop delivers its own credential — per job
+over the worker launch's stdin when this sbx passes it through, the 0600
+in-VM env file otherwise — and never as an `sbx` argument, an event field,
+or a log line. A name the daemon does not hold fails provisioning by name
+before a sandbox boots; `sbxloop doctor` lists unset names in its
+`sandbox secret env` row first. Neither may name a variable the loop
+delivers itself (`GH_TOKEN`, the agent credential, anything `SBXLOOP_*`).
+A `[[github.repos]]` entry can set either key for its own runs; a set value
+replaces the `[sandbox]` one, so a repository that needs no secret says
+`secret_env = []`.
+
 ## The daemon: an always-on outer loop
 
 `sbxloop daemon` is deliberately small. It polls the one configured
@@ -1575,6 +1603,7 @@ The notable knobs:
 | `[sandbox] gate_command`                                  | detected           | The project's own gate, run over the whole tree before delivery.                                                                                                                                                                                                                                                                                                   |
 | `[sandbox] clone_filter`                                  | unset              | Git partial-clone filter (`"blob:none"`) for the credential-free remote clone of a repository with no host checkout; opt-in, see the clone section for the lazy-fetch hazard.                                                                                                                                                                                      |
 | `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                                                                                                                                                                                                         |
+| `[sandbox] env` / `secret_env`                            | `{}` / `[]`        | Environment for the agent sandbox's worker and everything it runs: plain values, and names whose values come from the daemon's environment (delivered like the credential, never logged). Per-repo overridable; see "Environment for the agent sandbox".                                                                                                           |
 | `[sandbox] languages`                                     | detected           | Toolchains pre-installed in the agent sandbox; unset = detect from the workspace's manifests, `python` if none (see below).                                                                                                                                                                                                                                        |
 | `[policy] allow` / `deny`                                 | `[]`               | Bounds for task-declared egress.                                                                                                                                                                                                                                                                                                                                   |
 | `[github] repo`                                           | unset              | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public`, `pr_title_template`, `commit_message_template`, `branch_prefix`, `bot_login` beside it.                                                                                                                                     |

@@ -165,6 +165,18 @@ strategy that is *attempted*, not the one that usually runs. Where per-job stdin
 is unavailable, that means the in-VM env file. Tracked operationally in #46;
 interim hardening in #592.
 
+Operator secrets for the agent sandbox — `[sandbox] secret_env`, values read
+from the daemon's environment (#679) — take the same non-proxy tiers, and only
+those: the sbx proxy binds a secret to one host, which an `NPM_TOKEN` has no
+single answer for. `SandboxSpec` keeps them apart from the plain
+`persistent_env` so the proxy path can write the plain environment before the
+visibility probe and hold the secrets back until the verdict is in: a
+downgrade to stdin delivery then never leaves them at rest first, and a proxy
+that carries the agent's own credential puts them in the env file afterwards
+(`_apply_operator_secrets`), since nothing else would. They are never an `sbx`
+argument, an event field or a log line; a name the daemon does not hold fails
+provisioning before any sandbox boots.
+
 ### GitHub App installation auth (#568)
 
 `GITHUB_APP_ID` + `GITHUB_APP_INSTALLATION_ID` +

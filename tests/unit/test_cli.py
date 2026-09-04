@@ -971,6 +971,30 @@ class TestDoctor:
         assert result.exit_code == 1
         assert "FAIL" in result.output
 
+    def test_doctor_names_unset_secret_env_before_a_run_would(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`[sandbox] secret_env` names must be set in the daemon's
+        environment (#679); the row lists the unset ones by scope and never
+        shows a value."""
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        monkeypatch.setenv("NPM_TOKEN", "npm_value_never_shown")
+        monkeypatch.delenv("PIP_INDEX_URL", raising=False)
+        (workdir / "sbxloop.toml").write_text(
+            '[sandbox]\nsecret_env = ["NPM_TOKEN"]\n\n'
+            '[[github.repos]]\nrepo = "owner/repo"\nsecret_env = ["NPM_TOKEN", "PIP_INDEX_URL"]\n'
+        )
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 1
+        assert "sandbox secret env" in result.output
+        assert "owner/repo: PIP_INDEX_URL" in result.output
+        assert "npm_value_never_shown" not in result.output
+        monkeypatch.setenv("PIP_INDEX_URL", "https://pypi.example/simple")
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert "set: NPM_TOKEN, PIP_INDEX_URL" in result.output
+
     def _bake_record(
         self,
         workdir: Path,
