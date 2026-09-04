@@ -11,7 +11,7 @@ import subprocess
 import sys
 import urllib.error
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -36,11 +36,14 @@ class RecordingTransport:
         self,
         responses: dict[str, Any] | None = None,
         texts: dict[str, str | GithubOpError] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> None:
         self.calls: list[tuple[str, str, dict[str, Any] | None]] = []
         self.text_calls: list[tuple[str, str]] = []
+        self.header_calls: list[tuple[str, str]] = []
         self.responses = responses or {}
         self.texts = texts or {}
+        self.headers = headers or {}
 
     def request(
         self, method: str, path: str, body: dict[str, Any] | None = None
@@ -59,6 +62,10 @@ class RecordingTransport:
                     raise text
                 return text
         return ""
+
+    def request_headers(self, method: str, path: str) -> dict[str, str]:
+        self.header_calls.append((method, path))
+        return dict(self.headers)
 
 
 class TestOpRegistry:
@@ -151,6 +158,24 @@ class TestOpRegistry:
         out = execute_op("raw.api", {"method": "patch", "path": "/anything", "body": {"a": 1}}, t)
         assert out == {"ok": True}
         assert t.calls[0] == ("PATCH", "/anything", {"a": 1})
+
+    def test_token_scopes_reads_the_classic_pat_header(self) -> None:
+        """A classic PAT names its scopes on every response (#696); the op
+        asks /rate_limit, which costs nothing and every token may call."""
+        t = RecordingTransport(
+            headers={"x-oauth-scopes": "repo, workflow", "x-ratelimit-limit": "5000"}
+        )
+        assert execute_op("token.scopes", {}, t) == {"scopes": ["repo", "workflow"]}
+        assert t.header_calls == [("GET", "/rate_limit")]
+        assert t.calls == []
+
+    def test_token_scopes_is_none_without_the_header(self) -> None:
+        """A fine-grained PAT or an App installation token carries no
+        scopes header: None, not an empty list — doctor must ask another way."""
+        assert execute_op("token.scopes", {}, RecordingTransport(headers={})) == {"scopes": None}
+        # A classic PAT with no scopes at all (public read only) is a list.
+        t = RecordingTransport(headers={"x-oauth-scopes": ""})
+        assert execute_op("token.scopes", {}, t) == {"scopes": []}
 
     def test_unknown_op(self) -> None:
         with pytest.raises(GithubOpError, match="unknown github op"):
@@ -602,6 +627,39 @@ class TestGhCliTransport:
             ]
         ]
 
+    def test_request_headers_parses_gh_include_output(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``gh api --include`` prints the status line and headers before the
+        body; only the header block is read, names lower-cased (#696)."""
+        seen: list[list[str]] = []
+        raw = (
+            "HTTP/2.0 200 OK\r\n"
+            "Content-Type: application/json; charset=utf-8\r\n"
+            "X-OAuth-Scopes: repo, workflow\r\n"
+            "X-RateLimit-Limit: 5000\r\n"
+            "\r\n"
+            '{"resources": {"core": {"limit": 5000}}}\n'
+        )
+
+        def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+            seen.append(argv)
+            return subprocess.CompletedProcess(argv, 0, stdout=raw, stderr="")
+
+        monkeypatch.setattr(githubops.subprocess, "run", fake_run)
+        headers = GhCliTransport(gh="gh").request_headers("GET", "/rate_limit")
+        assert headers["x-oauth-scopes"] == "repo, workflow"
+        assert headers["content-type"].startswith("application/json")
+        assert "resources" not in str(headers)
+        assert "--include" in seen[0] and seen[0][-1] == "/rate_limit"
+
+    def test_parse_http_headers_without_a_block(self) -> None:
+        from sbxloop_worker.githubops import parse_http_headers
+
+        assert parse_http_headers("") == {}
+        assert parse_http_headers('{"a": 1}') == {}
+        assert parse_http_headers("HTTP/1.1 200 OK\nX-A: 1\n") == {"x-a": "1"}
+
     def test_request_text_failure_carries_status(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def fake_run(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
             return subprocess.CompletedProcess(argv, 1, stdout="", stderr="gh: Gone (HTTP 410)")
@@ -823,6 +881,38 @@ class TestRestTransport:
         transport = RestTransport(token="tok")
         with pytest.raises(GithubOpError, match="HTTP 404"):
             transport.request("GET", "/repos/o/r")
+
+    def test_request_headers_reads_the_response_headers(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The REST transport hands back the response's headers, names
+        lower-cased, the body unread (#696)."""
+        captured: dict[str, Any] = {}
+
+        class HeaderedResponse(FakeResponse):
+            headers: ClassVar[dict[str, str]] = {
+                "X-OAuth-Scopes": "repo",
+                "Content-Type": "application/json",
+            }
+
+        def fake_urlopen(request: Any, timeout: float = 0) -> HeaderedResponse:
+            captured["url"] = request.full_url
+            captured["auth"] = request.get_header("Authorization")
+            return HeaderedResponse(b"{}")
+
+        monkeypatch.setattr(githubops.urllib.request, "urlopen", fake_urlopen)
+        headers = RestTransport(token="tok123").request_headers("GET", "/rate_limit")
+        assert headers == {"x-oauth-scopes": "repo", "content-type": "application/json"}
+        assert captured == {"url": "https://api.github.com/rate_limit", "auth": "Bearer tok123"}
+
+    def test_request_headers_http_error_mapped(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_urlopen(request: Any, timeout: float = 0) -> Any:
+            raise urllib.error.HTTPError(request.full_url, 401, "bad", None, io.BytesIO(b"{}"))
+
+        monkeypatch.setattr(githubops.urllib.request, "urlopen", fake_urlopen)
+        with pytest.raises(GithubOpError, match="HTTP 401") as info:
+            RestTransport(token="tok").request_headers("GET", "/rate_limit")
+        assert info.value.http_status == 401
 
     def test_url_error_mapped(self, monkeypatch: pytest.MonkeyPatch) -> None:
         def fake_urlopen(request: Any, timeout: float = 0) -> Any:

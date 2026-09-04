@@ -14,7 +14,7 @@ import json
 import shutil
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -31,6 +31,13 @@ from sbxloop.engine.store import StateStore
 from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError
 from sbxloop.gh.labels import lifecycle_specs, missing_labels
 from sbxloop.gh.ops import GithubOps
+from sbxloop.gh.permissions import (
+    NEEDS,
+    Need,
+    missing_from_app,
+    missing_from_scopes,
+    split_required,
+)
 from sbxloop.gh.protection import read_base_requirements
 from sbxloop.sbx.bake import load_bake_record
 from sbxloop.sbx.cli import SbxCLI
@@ -81,19 +88,39 @@ class RepoProbeUnavailable(Exception):
     """
 
 
+@dataclass(frozen=True)
+class RepoCi:
+    """What the repository's own Actions look like (#696): how many
+    workflows are active, and the latest run on the delivery base."""
+
+    workflows: int
+    base: str = ""
+    latest: str | None = None
+
+
 @dataclass
 class RepoProbe:
     """What an out-of-process probe learned about one repository.
 
     ``reachable`` is the repository lookup (404/permission denied → False);
-    ``missing_permissions`` lists the scopes the token lacks; ``creatable``
-    is only meaningful for a repo configured with ``create_repo``.
+    ``missing_permissions`` names each permission the token lacks that a
+    run needs, with the feature that first needs it (#696) —
+    ``optional_permissions`` the ones a repository may never need;
+    ``creatable`` is only meaningful for a repo configured with
+    ``create_repo``.
     """
 
     reachable: bool
     detail: str = ""
     missing_permissions: tuple[str, ...] = ()
     creatable: bool | None = None
+    optional_permissions: tuple[str, ...] = ()
+    # Where the permissions verdict came from: the classic PAT's scopes,
+    # the App installation's grant, or a fine-grained PAT asked endpoint by
+    # endpoint. Empty = not checked.
+    permissions_source: str = ""
+    # The repository's Actions, for the CI row. None = could not be listed.
+    ci: RepoCi | None = None
     # The delivery base's rules the loop cannot satisfy (#673) — each one
     # 405s every loop merge. Empty = none known; None = unverifiable.
     base_blockers: tuple[str, ...] | None = None
@@ -233,7 +260,11 @@ def repo_checks(
             rows.append(Check(name, False, "; ".join(notes)))
             continue
         if result.missing_permissions:
-            notes.append(f"token missing {', '.join(result.missing_permissions)}")
+            notes.append(
+                "token missing "
+                + "; ".join(result.missing_permissions)
+                + f" — see docs/permissions.md{_source_note(result)}"
+            )
             rows.append(Check(name, False, "; ".join(notes)))
             continue
         notes.append(result.detail or "reachable, token has the required permissions")
@@ -242,6 +273,18 @@ def repo_checks(
         rows.append(Check(name, True, "; ".join(notes)))
         if merge_row is not None:
             rows.append(merge_row)
+        if result.optional_permissions:
+            rows.append(
+                Check(
+                    f"{name} workflows",
+                    False,
+                    "token lacks "
+                    + "; ".join(result.optional_permissions)
+                    + f" — a run whose changes stay out of .github/workflows is unaffected; "
+                    f"see docs/permissions.md{_source_note(result)}",
+                    hard=False,
+                )
+            )
         if result.issues_enabled is False:
             rows.append(
                 Check(
@@ -279,7 +322,33 @@ def repo_checks(
             )
         if result.base_unread:
             rows.append(Check(f"{name} required checks", True, _unread_note(result.base_unread)))
+        if result.ci is not None:
+            rows.append(_ci_row(name, result.ci))
     return rows
+
+
+def _source_note(result: RepoProbe) -> str:
+    return f" (per {result.permissions_source})" if result.permissions_source else ""
+
+
+def _ci_row(name: str, ci: RepoCi) -> Check:
+    """The repository's CI as the loop will meet it (#696): the CI stage
+    waits for the check runs on the delivered head, so a repository with
+    no workflow of its own has nothing to wait for unless another app
+    reports checks."""
+    if ci.workflows == 0:
+        return Check(
+            f"{name} ci",
+            True,
+            "no active Actions workflows — the CI stage has nothing of the repository's "
+            "own to wait for and passes on the delivered head; check runs another app "
+            "reports (a status check installed on the repository) still count",
+            hard=False,
+        )
+    latest = (
+        f"; latest run on {ci.base}: {ci.latest}" if ci.latest else f"; no run yet on {ci.base}"
+    )
+    return Check(f"{name} ci", True, f"{ci.workflows} active Actions workflow(s){latest}")
 
 
 def _unread_note(unread: tuple[str, ...]) -> str:
@@ -408,17 +477,15 @@ def host_lfs_check(config: Config) -> Check:
     )
 
 
-REQUIRED_REPO_PERMISSIONS = ("issues", "contents", "pull_requests")
-
-
-def _missing_permissions(data: dict[str, object]) -> tuple[str, ...]:
-    """Permissions the token lacks, from a ``GET /repos/{repo}`` payload.
+def _missing_from_push_bit(data: dict[str, object]) -> tuple[Need, ...]:
+    """The write needs a token lacks, from a ``GET /repos/{repo}`` payload.
 
     GitHub reports the *authenticated* token's effective access on the
     repository as ``permissions: {admin, maintain, push, triage, pull}``.
-    sbxloop needs to read the tree, open pull requests and drive issue
-    labels/comments — all of which are the ``push`` (write) level; anything
-    less can only read.
+    Every write a run does — delivering, the pull request, the labels — is
+    the ``push`` (write) level; anything less can only read. This is the
+    coarse answer for a credential that names its permissions no other way
+    (a fine-grained PAT).
     """
     perms = data.get("permissions")
     if not isinstance(perms, dict):
@@ -434,7 +501,99 @@ def _missing_permissions(data: dict[str, object]) -> tuple[str, ...]:
         # the installation, not the user-centric repo payload. Do not
         # invent a failure the first daemon write would disprove.
         return ()
-    return tuple(f"{kind}:write" for kind in REQUIRED_REPO_PERMISSIONS)
+    return tuple(n for n in NEEDS if n.level == "write" and n.required)
+
+
+# The read a fine-grained PAT is asked to prove each permission with
+# (#696): GitHub answers 401/403 when the permission is not on the token,
+# and anything else — 200, an empty list, 404 on an empty repository, 422
+# — means the permission is there. ``{repo}`` and ``{base}`` are filled in;
+# a probe naming ``{base}`` is skipped when the repository has no base yet.
+_READ_PROBES: tuple[tuple[str, str], ...] = (
+    ("contents", "/repos/{repo}/commits?per_page=1&sha={base}"),
+    ("issues", "/repos/{repo}/issues?per_page=1"),
+    ("pull_requests", "/repos/{repo}/pulls?per_page=1"),
+    ("checks", "/repos/{repo}/commits/{base}/check-runs?per_page=1"),
+    ("actions", "/repos/{repo}/actions/runs?per_page=1"),
+)
+
+
+def _missing_from_probes(ops: GithubOps, repo: str, base: str) -> tuple[Need, ...]:
+    """The needs a fine-grained PAT fails a read for. A permission the
+    token lacks entirely fails its read; a read-only grant on a write need
+    is the push bit's business (:func:`_missing_from_push_bit`)."""
+    by_permission = {n.permission: n for n in NEEDS}
+    missing: list[Need] = []
+    for permission, template in _READ_PROBES:
+        if "{base}" in template and not base:
+            continue
+        try:
+            ops.raw("GET", template.format(repo=repo, base=base))
+        except GithubOpsError as exc:
+            if exc.http_status in (401, 403):
+                missing.append(by_permission[permission])
+    return tuple(missing)
+
+
+def _credential_needs(
+    ops: GithubOps,
+    app_permissions: Mapping[str, str] | None,
+    repo: str,
+    base: str,
+    data: dict[str, Any],
+) -> tuple[tuple[Need, ...], tuple[Need, ...], str]:
+    """``(required, optional, source)`` — what the credential lacks of
+    :data:`NEEDS`, judged from whichever source describes it (#696): the
+    App installation's grant, a classic PAT's scopes, or — a fine-grained
+    PAT, which reports neither — the push bit plus one read per permission.
+    """
+    if app_permissions is not None:
+        # The installation's grant is the whole story: it is not a user.
+        missing = missing_from_app(app_permissions)
+        source = "the App installation's permissions"
+    else:
+        # A PAT is capped twice: by what the token was granted, and by what
+        # its user may do on this repository (the payload's push bit).
+        scopes = ops.token_scopes()
+        if scopes is not None:
+            found = (
+                *missing_from_scopes(scopes, private=bool(data.get("private"))),
+                *_missing_from_push_bit(data),
+            )
+            source = f"the classic PAT's scopes {', '.join(scopes) or '(none)'}"
+        else:
+            found = (*_missing_from_push_bit(data), *_missing_from_probes(ops, repo, base))
+            source = "a fine-grained PAT, asked endpoint by endpoint; workflows:write unverifiable"
+        lacking = {n.permission for n in found}
+        missing = tuple(n for n in NEEDS if n.permission in lacking)
+    required, optional = split_required(missing)
+    return required, optional, source
+
+
+def _ci_summary(ops: GithubOps, repo: str, base: str) -> RepoCi | None:
+    """The repository's active Actions workflows and its latest run on
+    ``base`` (#696); None when they could not be listed (actions:read
+    missing is reported as a permission, not here)."""
+    try:
+        listing = ops.raw("GET", f"/repos/{repo}/actions/workflows?per_page=100")
+    except GithubOpsError:
+        return None
+    workflows = listing.get("workflows") if isinstance(listing, dict) else None
+    if not isinstance(workflows, list):
+        return None
+    active = sum(1 for w in workflows if isinstance(w, dict) and w.get("state") == "active")
+    latest: str | None = None
+    if active and base:
+        try:
+            runs = ops.raw("GET", f"/repos/{repo}/actions/runs?branch={base}&per_page=1")
+        except GithubOpsError:
+            runs = None
+        listed = runs.get("workflow_runs") if isinstance(runs, dict) else None
+        if isinstance(listed, list) and listed and isinstance(listed[0], dict):
+            run = listed[0]
+            outcome = str(run.get("conclusion") or run.get("status") or "unknown")
+            latest = f"{run.get('name') or 'workflow'} {outcome}"
+    return RepoCi(workflows=active, base=base, latest=latest)
 
 
 def _base_blockers(
@@ -525,8 +684,10 @@ def sandbox_repo_probe(
             return RepoProbe(
                 reachable=False, detail="not found with this token", creatable=creatable
             )
-        missing = _missing_permissions(data)
         base = entry.deliver_base or str(data.get("default_branch") or "")
+        required, optional, source = _credential_needs(
+            ops, box.provisioner.gh_app_permissions(entry.repo), entry.repo, base, data
+        )
         has_issues = data.get("has_issues")
         blockers, unread = (
             _base_blockers(
@@ -542,8 +703,15 @@ def sandbox_repo_probe(
         )
         return RepoProbe(
             reachable=True,
-            detail="reachable, token has the required permissions" if not missing else "reachable",
-            missing_permissions=missing,
+            detail=(
+                f"reachable, token has the required permissions (per {source})"
+                if not required
+                else "reachable"
+            ),
+            missing_permissions=tuple(n.describe() for n in required),
+            optional_permissions=tuple(n.describe() for n in optional),
+            permissions_source=source,
+            ci=_ci_summary(ops, entry.repo, base),
             base_blockers=blockers,
             base_unread=unread,
             merge_methods=allowed_merge_methods(data),
@@ -840,8 +1008,8 @@ def collect_checks(
                 f"{cred.detail} (github integration: {configured})"
                 if cred.ok
                 else f"{cred.detail} — github repositories {configured} are "
-                "configured: create a fine-grained PAT (issues:write, "
-                "contents:read, ...) and export GH_TOKEN, or set GITHUB_APP_ID, "
+                "configured: create a fine-grained PAT with the permissions in "
+                "docs/permissions.md and export GH_TOKEN, or set GITHUB_APP_ID, "
                 "GITHUB_APP_INSTALLATION_ID and GITHUB_APP_PRIVATE_KEY[_PATH]",
             )
         )

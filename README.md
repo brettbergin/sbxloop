@@ -19,10 +19,10 @@ Checkpointing, resume and artifact harvesting throughout.
 
 Every run gets an isolated microVM agent sandbox — plus, when the GitHub integration is configured, a second github-ops sandbox, so no single environment ever holds both credentials:
 
-| Sandbox                | Credential                                                                                                                                                                                  | Purpose                                                                                                                                                                                     |
-| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sbxloop-<run>-agent`  | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission) — or `ANTHROPIC_API_KEY` with `[agent] backend = "claude"` ([Agent backends](#agent-backends-copilot-or-claude))   | Runs the configured agent SDK — [GitHub Copilot SDK](https://github.com/github/copilot-sdk) by default, or the Claude Agent SDK. All model calls and tool executions happen inside this VM. |
-| `sbxloop-<run>-github` | `GH_TOKEN` (fine-grained PAT: contents write, pull requests write, issues write) — or a GitHub App installation token, host-minted and auto-refreshed ([GitHub App auth](#github-app-auth)) | Performs the GitHub operations (branch, PR, review, CI polling, merge, issue labels) against the one configured repository. Only provisioned when `[github] repo` is set.                   |
+| Sandbox                | Credential                                                                                                                                                                                                  | Purpose                                                                                                                                                                                     |
+| ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sbxloop-<run>-agent`  | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission) — or `ANTHROPIC_API_KEY` with `[agent] backend = "claude"` ([Agent backends](#agent-backends-copilot-or-claude))                   | Runs the configured agent SDK — [GitHub Copilot SDK](https://github.com/github/copilot-sdk) by default, or the Claude Agent SDK. All model calls and tool executions happen inside this VM. |
+| `sbxloop-<run>-github` | `GH_TOKEN` (fine-grained PAT with the permissions in [docs/permissions.md](docs/permissions.md)) — or a GitHub App installation token, host-minted and auto-refreshed ([GitHub App auth](#github-app-auth)) | Performs the GitHub operations (branch, PR, review, CI polling, merge, issue labels) against the one configured repository. Only provisioned when `[github] repo` is set.                   |
 
 Both sandboxes run under sbx's **balanced network policy** (default-deny
 egress plus a curated allowlist), and tokens are injected through sbx's secret
@@ -1292,12 +1292,19 @@ existing-but-empty repository (no commits yet) is also handled: delivery
 bootstraps the initial commit itself.
 
 With `repo` set, runs provision the github-ops sandbox and require a second
-PAT, `GH_TOKEN`, used *only* by that sandbox. It needs `contents:write` (the
-branch, the merge) and `pull_requests:write` (the PR, the review, un-drafting,
-update-branch) on the repository; the daemon also needs `issues:write` to
-claim and settle issues. Without it, no github sandbox exists and
-repo-facing features refuse to run. The PAT can be replaced wholesale by a
-GitHub App installation — see [GitHub App auth](#github-app-auth).
+PAT, `GH_TOKEN`, used *only* by that sandbox. It needs the repository
+permissions in [docs/permissions.md](docs/permissions.md) — contents and
+pull requests to deliver and merge, issues to claim and settle, checks and
+actions to wait on CI and read failed-job logs. Without it, no github
+sandbox exists and repo-facing features refuse to run. The PAT can be
+replaced wholesale by a GitHub App installation — see
+[GitHub App auth](#github-app-auth). `sbxloop doctor --probe` checks the
+token against that table before a run can fail on it (#696): a required
+permission the token lacks is a failing row naming the permission and the
+feature that first needs it, a missing `workflows:write` is a warning
+(only a delivery touching `.github/workflows/` needs it), and a
+`github repo <r> ci` row says what Actions the repository has for the CI
+stage to wait on — or that it has none.
 
 **Delivery** is one atomic commit via the git data API on branch
 `sbxloop/<run>`, opened as a draft pull request, with the harvested tree
@@ -1497,9 +1504,11 @@ daemon's guardrails are what you are trusting instead.
 ### GitHub App auth
 
 The github-ops side can authenticate as a **GitHub App installation**
-instead of a PAT (#568): create a GitHub App (repository permissions:
-Contents read & write, Pull requests read & write, Issues read & write),
-install it on the repository, and configure
+instead of a PAT (#568): create a GitHub App with the repository
+permissions in [docs/permissions.md](docs/permissions.md) (Contents, Pull
+requests and Issues read & write; Checks and Actions read; Workflows read
+& write if runs may edit workflow files), install it on the repository, and
+configure
 
 ```bash
 GITHUB_APP_ID=12345                         # the App's numeric id

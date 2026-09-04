@@ -51,7 +51,7 @@ from typing import Literal, NamedTuple
 
 from sbxloop import backends, hostgit, toolchains
 from sbxloop.config import Config, RepoConfig
-from sbxloop.errors import ProvisionError, SbxError
+from sbxloop.errors import GithubOpsError, ProvisionError, SbxError
 from sbxloop.events import EventBus
 from sbxloop.gh.appauth import (
     APP_ID_ENV,
@@ -639,6 +639,23 @@ class Provisioner:
             return None
         if isinstance(cred, GhApp):
             return cred.source.bot_login()
+        return None
+
+    def gh_app_permissions(self, repo: str | None = None) -> Mapping[str, str] | None:
+        """What the App installation may do, as GitHub reported it with the
+        token mint (#696) — ``None`` in PAT mode, when the credential is
+        misconfigured, or when the mint carried no permissions map. Doctor
+        compares this to what a run needs; the engine never reads it.
+        """
+        try:
+            cred = self.gh_credential(repo)
+        except ProvisionError:
+            return None
+        if isinstance(cred, GhApp):
+            try:
+                return cred.source.permissions()
+            except GithubOpsError:
+                return None
         return None
 
     def _repo_entry(self, repo: str | None) -> RepoConfig | None:

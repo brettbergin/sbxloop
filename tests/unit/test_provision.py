@@ -2,6 +2,7 @@
 
 import logging
 import shutil
+import time
 from pathlib import Path
 from typing import ClassVar
 
@@ -1780,6 +1781,54 @@ class TestBotLoginResolution:
             config=config,
         )
         assert provisioner.gh_bot_login("owner/repo") is None
+
+
+class TestAppPermissionsResolution:
+    """`Provisioner.gh_app_permissions` (#696): what the installation may
+    do, from the token mint — for doctor, never the engine."""
+
+    def test_pat_mode_answers_none(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        assert make_provisioner(fake_sbx, tmp_path).gh_app_permissions(None) is None
+
+    def test_app_mode_reports_the_mint_permissions(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.gh import appauth
+
+        minted: list[int] = []
+
+        def mint(creds: object, **kwargs: object) -> appauth.InstallationToken:
+            minted.append(1)
+            return appauth.InstallationToken(
+                "ghs_x", time.time() + 3600.0, {"contents": "write", "checks": "read"}
+            )
+
+        monkeypatch.setattr(appauth, "mint_installation_token", mint)
+        provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
+        assert provisioner.gh_app_permissions(None) == {"contents": "write", "checks": "read"}
+        assert provisioner.gh_app_permissions(None) == {"contents": "write", "checks": "read"}
+        assert minted == [1], "the cached token answers"
+
+    def test_a_failed_mint_answers_none_not_raise(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.errors import GithubOpsError
+        from sbxloop.gh import appauth
+
+        def boom(creds: object, **kwargs: object) -> appauth.InstallationToken:
+            raise GithubOpsError("refused")
+
+        monkeypatch.setattr(appauth, "mint_installation_token", boom)
+        provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
+        assert provisioner.gh_app_permissions(None) is None
+
+    def test_a_misconfigured_credential_answers_none(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = make_provisioner(
+            fake_sbx, tmp_path, env={**TestGithubAppAuth.APP_ENV, "GH_TOKEN": "github_pat_x"}
+        )
+        assert provisioner.gh_app_permissions(None) is None
 
 
 class TestStdinEnvDelivery:

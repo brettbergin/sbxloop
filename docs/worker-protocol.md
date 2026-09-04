@@ -186,7 +186,10 @@ produced. Query history with
 `search.issues`,
 `raw.api`, `blobs.create_many`, `checks.failed_logs` (the failing check runs on a
 commit with their Actions job logs, head+tail clipped; the REST transport fetches
-the log's blob-storage redirect without the bearer token). Transport inside the sandbox: `gh api` when gh
+the log's blob-storage redirect without the bearer token), `token.scopes` (the
+classic PAT's `X-OAuth-Scopes` from `GET /rate_limit`, or `null` for a
+fine-grained PAT or App token — how `sbxloop doctor` learns what the credential
+may do, #696). Transport inside the sandbox: `gh api` when gh
 is available, otherwise a pure-stdlib REST client — both produce identical
 result shapes.
 
