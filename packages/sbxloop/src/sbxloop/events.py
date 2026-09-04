@@ -244,6 +244,10 @@ class HostEventTypes:
     # registry default), so a probe failure can be read against the
     # interpreter the project asked for.
     SANDBOX_TOOLCHAIN = "sandbox.toolchain"
+    # One per operator setup step (#681): the `apt_packages` install when a
+    # template lacked any, and each `setup_commands` entry with its exit
+    # code, duration and output tail (delivered secret values scrubbed).
+    SANDBOX_SETUP = "sandbox.setup"
     SANDBOX_READY = "sandbox.ready"
     SANDBOX_PREBAKED = "sandbox.prebaked"
     SANDBOX_CLEANUP = "sandbox.cleanup"

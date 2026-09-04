@@ -1008,3 +1008,65 @@ class TestSandboxEnv:
         (tmp_path / "sbxloop.toml").write_text(body)
         with pytest.raises(ConfigError, match=match):
             load_config(cwd=tmp_path, env={})
+
+
+class TestAptPackagesAndSetupCommands:
+    """`[sandbox] apt_packages` / `setup_commands` (#681): OS packages beside
+    the toolchains and pre-run commands, per repository."""
+
+    def test_unset_by_default(self, tmp_path: Path) -> None:
+        config = load_config(cwd=tmp_path, env={})
+        assert config.sandbox.apt_packages == []
+        assert config.sandbox.setup_commands == []
+        assert config.apt_packages_for(None) == []
+        assert config.setup_commands_for(None) == []
+
+    def test_lists_parse_and_a_repository_override_replaces_them(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[sandbox]\n"
+            'apt_packages = ["libpq-dev", "protobuf-compiler", "libpq-dev", "ffmpeg=7:6.1-1"]\n'
+            'setup_commands = ["npx playwright install --with-deps chromium", '
+            '"pre-commit install-hooks"]\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "o/web"\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "o/go"\n'
+            "apt_packages = []\n"
+            'setup_commands = ["go mod download"]\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        # duplicates collapse, order kept; an apt version pin is a package
+        assert config.sandbox.apt_packages == ["libpq-dev", "protobuf-compiler", "ffmpeg=7:6.1-1"]
+        assert config.setup_commands_for("o/web") == [
+            "npx playwright install --with-deps chromium",
+            "pre-commit install-hooks",
+        ]
+        assert config.apt_packages_for("o/web") == config.sandbox.apt_packages
+        # The override REPLACES: an empty list is a real "nothing extra".
+        assert config.apt_packages_for("o/go") == []
+        assert config.setup_commands_for("o/go") == ["go mod download"]
+        assert config.apt_packages_for("o/unknown") == config.sandbox.apt_packages
+
+    @pytest.mark.parametrize(
+        ("body", "match"),
+        [
+            ('apt_packages = ["libpq-dev; rm -rf /"]', "is not an apt package name"),
+            ('apt_packages = ["Lib PQ"]', "is not an apt package name"),
+            ('apt_packages = [""]', "is not an apt package name"),
+            ('setup_commands = ["  "]', "cannot be empty"),
+            ('setup_commands = ["make\\nmake test"]', "one command per entry"),
+        ],
+    )
+    def test_refusals(self, tmp_path: Path, body: str, match: str) -> None:
+        (tmp_path / "sbxloop.toml").write_text(f"[sandbox]\n{body}\n")
+        with pytest.raises(ConfigError, match=match):
+            load_config(cwd=tmp_path, env={})
+
+    def test_repository_entries_are_checked_the_same_way(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            '[[github.repos]]\nrepo = "o/web"\napt_packages = ["$(evil)"]\n'
+        )
+        with pytest.raises(ConfigError, match=r"github.repos\[\].apt_packages"):
+            load_config(cwd=tmp_path, env={})

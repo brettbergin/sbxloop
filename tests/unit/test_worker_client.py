@@ -1677,3 +1677,202 @@ class TestBackendReady:
             stderr="Error: sandbox not found",
         )
         assert client.backend_ready("claude") is False
+
+
+APT_PROBE = 'exec boxa sh -c for p in "$@"'
+
+
+class TestAptPackages:
+    """`[sandbox] apt_packages` (#681): the operator's OS packages, probed
+    with dpkg and installed in one apt call — and, unlike the toolchains,
+    fail closed."""
+
+    def ladder(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> WorkerClient:
+        script_probes_for(fake_sbx, ["python"], returncode=0)
+        script_git_probe(fake_sbx)
+        script_search_fallback_probe(fake_sbx)
+        script_ladder_success(fake_sbx)
+        return make_client(sandbox, EventBus())
+
+    def test_present_packages_touch_no_apt(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        client = self.ladder(sandbox, fake_sbx)
+        fake_sbx.script(APT_PROBE, stdout="")
+        client.install(ensure_dev_tools=True, apt_packages=["libpq-dev", "ffmpeg"])
+        joined = [" ".join(c) for c in fake_sbx.invocations("exec")]
+        assert not [j for j in joined if "apt-get" in j]
+        assert client.apt_installed == []
+        probe = [j for j in joined if 'for p in "$@"' in j]
+        assert probe and probe[0].endswith("sbxloop-apt-probe libpq-dev ffmpeg")
+
+    def test_missing_packages_install_in_one_call(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx
+    ) -> None:
+        client = self.ladder(sandbox, fake_sbx)
+        fake_sbx.script(APT_PROBE, stdout="ffmpeg\nprotobuf-compiler\n")
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        client.install(
+            ensure_dev_tools=True, apt_packages=["libpq-dev", "ffmpeg", "protobuf-compiler"]
+        )
+        apt = [
+            " ".join(c) for c in fake_sbx.invocations("exec") if "apt-get install" in " ".join(c)
+        ]
+        assert apt == [
+            "exec boxa sh -c sudo -n apt-get update -q && "
+            "sudo -n apt-get install -y -q ffmpeg protobuf-compiler"
+        ]
+        assert client.apt_installed == ["ffmpeg", "protobuf-compiler"]
+
+    def test_failed_install_is_a_worker_error_naming_the_package(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx
+    ) -> None:
+        client = self.ladder(sandbox, fake_sbx)
+        fake_sbx.script(APT_PROBE, stdout="libfoo-dev\n")
+        fake_sbx.script(
+            "exec boxa sh -c sudo -n apt-get",
+            returncode=100,
+            stderr="E: Unable to locate package libfoo-dev",
+        )
+        with pytest.raises(WorkerError, match=r"\['libfoo-dev'\] did not install \(rc=100\)"):
+            client.install(ensure_dev_tools=True, apt_packages=["libfoo-dev"])
+
+    def test_unanswerable_probe_fails_closed(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        client = self.ladder(sandbox, fake_sbx)
+        fake_sbx.script(APT_PROBE, returncode=127, stderr="sh: dpkg: not found")
+        with pytest.raises(WorkerError, match="could not probe apt packages"):
+            client.install(ensure_dev_tools=True, apt_packages=["libpq-dev"])
+
+    def test_prebaked_path_ensures_them_too(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        """A template baked without the list (or a per-repo list the bake
+        never saw) is topped up on the fast path as well."""
+        import sbxloop
+
+        sandbox.write_text(
+            "/home/agent/.sbxloop/bake.json",
+            json.dumps(
+                {
+                    "worker_version": sbxloop.__version__,
+                    "python": sys.executable,
+                    "runtime_cached": True,
+                    "baked_at": 0.0,
+                }
+            ),
+        )
+        script_toolchain_probe_batch(fake_sbx, missing=[])
+        fake_sbx.script(APT_PROBE, stdout="libpq-dev\n")
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        client = make_client(sandbox, EventBus(), python="python3")
+        client.install(
+            extras="copilot",
+            ensure_dev_tools=True,
+            expect_prebaked=True,
+            apt_packages=["libpq-dev"],
+        )
+        assert client.prebaked
+        assert client.apt_installed == ["libpq-dev"]
+
+    def test_github_role_install_never_asks(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        """Only the dev-tools (agent) install carries the list: the github
+        sandbox runs API ops and gets no OS packages."""
+        script_ladder_success(fake_sbx)
+        client = make_client(sandbox, EventBus())
+        client.install(ensure_dev_tools=False, apt_packages=["libpq-dev"])
+        joined = [" ".join(c) for c in fake_sbx.invocations("exec")]
+        assert not [j for j in joined if 'for p in "$@"' in j or "apt-get" in j]
+
+
+class TestSetupCommands:
+    """`[sandbox] setup_commands` (#681): run in the workspace with the
+    job environment, one sandbox.setup event each, fail closed."""
+
+    def events(self, bus: EventBus) -> list[Event]:
+        seen: list[Event] = []
+        bus.subscribe(seen.append)
+        return seen
+
+    def test_runs_in_cwd_and_emits_an_event_per_command(
+        self, sandbox: Sandbox, tmp_path: Path
+    ) -> None:
+        bus = EventBus()
+        seen = self.events(bus)
+        client = make_client(sandbox, bus)
+        work = tmp_path / "ws"
+        work.mkdir()
+        (work / "marker").write_text("here\n")
+        client.run_setup(["cat marker", "printf done"], run_id="r1", cwd=str(work))
+        setup = [e for e in seen if e.type == "sandbox.setup"]
+        assert [e.data["command"] for e in setup] == ["cat marker", "printf done"]
+        assert [e.data["rc"] for e in setup] == [0, 0]
+        assert setup[0].data["tail"] == "here"
+        assert setup[1].data["tail"] == "done"
+        assert all(e.run_id == "r1" and e.data["sandbox"] == "boxa" for e in setup)
+
+    def test_env_file_is_sourced_when_present(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """Without per-job stdin delivery the in-VM env file is what the
+        command sees — the same file the worker process loads."""
+        client = make_client(sandbox, EventBus())
+        fake_sbx.script(
+            "exec boxa sh -c exec sh -lc",
+            returncode=0,
+            stdout="from-env-file\n",
+        )
+        client.run_setup(['printf %s "$MY_SETTING"'], run_id="r1", cwd=str(tmp_path))
+        launch = [c for c in fake_sbx.invocations("exec") if "sh -lc" in " ".join(c)]
+        assert len(launch) == 1
+        script = " ".join(launch[0])
+        assert "[ -f /home/agent/.sbxloop/env.sh ] && . /home/agent/.sbxloop/env.sh;" in script
+        assert f"cd {tmp_path} &&" in script
+        assert "SBXLOOP_JOB_ENV" not in script
+
+    def test_stdin_delivery_reaches_the_command_and_is_scrubbed_from_the_tail(
+        self,
+        sandbox: Sandbox,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Under per-job stdin delivery (#592) the exports are piped in
+        exactly as for a job — and a command that echoes one back does
+        not put the value in the event."""
+        monkeypatch.setenv("SBX_FAKE_EXEC_STDIN", "1")
+        bus = EventBus()
+        seen = self.events(bus)
+        token = "artifactory-token-7c1e-setup"
+        client = make_client(
+            sandbox, bus, job_env=lambda: {"NPM_TOKEN": token, "RAILS_ENV": "test"}
+        )
+        client.run_setup(
+            ['printf "npm token=%s env=%s" "$NPM_TOKEN" "$RAILS_ENV"'],
+            run_id="r1",
+            cwd=str(tmp_path),
+        )
+        (setup,) = [e for e in seen if e.type == "sandbox.setup"]
+        assert setup.data["rc"] == 0
+        assert setup.data["tail"] == "npm token=*** env=test"
+        launch = [c for c in fake_sbx.invocations("exec") if "SBXLOOP_JOB_ENV" in " ".join(c)]
+        assert len(launch) == 1
+        assert token not in " ".join(launch[0])
+
+    def test_first_failure_stops_the_sequence_and_names_the_command(
+        self, sandbox: Sandbox, tmp_path: Path
+    ) -> None:
+        bus = EventBus()
+        seen = self.events(bus)
+        client = make_client(sandbox, bus)
+        with pytest.raises(WorkerError, match=r"setup command failed \(rc=3\)") as info:
+            client.run_setup(
+                ["printf ok", "echo 'no browsers' >&2; exit 3", "printf never"],
+                run_id="r1",
+                cwd=str(tmp_path),
+            )
+        assert "echo 'no browsers' >&2; exit 3" in str(info.value)
+        assert "no browsers" in str(info.value)
+        setup = [e for e in seen if e.type == "sandbox.setup"]
+        assert [e.data["rc"] for e in setup] == [0, 3]
+        assert setup[1].data["tail"] == "no browsers"
+
+    def test_no_commands_is_a_no_op(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
+        client = make_client(sandbox, EventBus())
+        client.run_setup([], run_id="r1", cwd="/work")
+        assert not fake_sbx.invocations("exec")

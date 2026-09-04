@@ -64,6 +64,31 @@ LOOP_MANAGED_ENV = frozenset(
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
+# A Debian package name (policy 5.6.1), optionally pinned `=version` or
+# suffixed `/release`, exactly as `apt-get install` takes it. Anything else
+# — a space, a shell character — is refused at load rather than joined into
+# the apt command line.
+_APT_PACKAGE_RE = re.compile(r"^[a-z0-9][a-z0-9+.\-]+(?:=[A-Za-z0-9+.:~\-]+|/[a-z\-]+)?$")
+
+
+def _check_apt_packages(value: list[str], key: str) -> list[str]:
+    for name in value:
+        if not _APT_PACKAGE_RE.match(name):
+            raise ValueError(f"{key}: {name!r} is not an apt package name")
+    return list(dict.fromkeys(value))
+
+
+def _check_setup_commands(value: list[str], key: str) -> list[str]:
+    for command in value:
+        if not command.strip():
+            raise ValueError(f"{key}: a setup command cannot be empty")
+        if "\n" in command:
+            raise ValueError(
+                f"{key}: one command per entry (a newline in {command!r}); chain with && or ;"
+            )
+    return value
+
+
 def _check_env_names(names: Sequence[str], key: str) -> None:
     for name in names:
         if not _ENV_NAME_RE.match(name):
@@ -175,12 +200,36 @@ class SandboxConfig(_ConfigModel):
     # either setting for its own runs.
     env: dict[str, str] = Field(default_factory=dict)
     secret_env: list[str] = Field(default_factory=list)
+    # OS packages and pre-run setup the toolchains do not cover (#681).
+    # `apt_packages` join the resolved toolchains' apt install (a `libpq-dev`,
+    # `protobuf-compiler`, a JDK for a Python project) — probed with `dpkg`
+    # first, so a template baked with them installs nothing. `setup_commands`
+    # run in the workspace after the clone, the toolchains and the
+    # registries' client files, before the first agent phase, under the
+    # run's egress policy and with the sandbox environment above (a
+    # `playwright install --with-deps`, a `pre-commit install-hooks`).
+    # Each command's exit and output tail is a `sandbox.setup` event; a
+    # non-zero exit fails the run at provisioning (the gate would fail
+    # anyway, and this names the cause). A `[[github.repos]]` entry replaces
+    # either list for its own runs.
+    apt_packages: list[str] = Field(default_factory=list)
+    setup_commands: list[str] = Field(default_factory=list)
 
     @field_validator("env")
     @classmethod
     def _check_env(cls, value: dict[str, str]) -> dict[str, str]:
         _check_env_names(list(value), "sandbox.env")
         return value
+
+    @field_validator("apt_packages")
+    @classmethod
+    def _check_apt_packages(cls, value: list[str]) -> list[str]:
+        return _check_apt_packages(value, "sandbox.apt_packages")
+
+    @field_validator("setup_commands")
+    @classmethod
+    def _check_setup_commands(cls, value: list[str]) -> list[str]:
+        return _check_setup_commands(value, "sandbox.setup_commands")
 
     @field_validator("secret_env")
     @classmethod
@@ -572,6 +621,10 @@ class RepoConfig(_ConfigModel):
     # This repository's private registries (#680); None → the top-level
     # `[[registries]]`, and a set list REPLACES it.
     registries: list[RegistryConfig] | None = None
+    # This repository's OS packages and setup commands (#681); None → the
+    # `[sandbox]` list, and a set list REPLACES it.
+    apt_packages: list[str] | None = None
+    setup_commands: list[str] | None = None
 
     @field_validator("repo")
     @classmethod
@@ -620,6 +673,18 @@ class RepoConfig(_ConfigModel):
         if value is not None:
             _check_registries(value, "github.repos[].registries")
         return value
+
+    @field_validator("apt_packages")
+    @classmethod
+    def _check_apt_packages(cls, value: list[str] | None) -> list[str] | None:
+        return None if value is None else _check_apt_packages(value, "github.repos[].apt_packages")
+
+    @field_validator("setup_commands")
+    @classmethod
+    def _check_setup_commands(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        return _check_setup_commands(value, "github.repos[].setup_commands")
 
     @field_validator(*(f"{name}_label" for name in LABEL_KINDS))
     @classmethod
@@ -1725,6 +1790,22 @@ class Config(_ConfigModel):
         return list(
             dict.fromkeys(r.auth_env for r in self.registries_for(repo) if r.auth_env is not None)
         )
+
+    def apt_packages_for(self, repo: str | None = None) -> list[str]:
+        """The OS packages ``repo``'s agent sandbox gets beside its toolchains
+        (#681): the entry's own list when set, else `[sandbox] apt_packages`."""
+        entry = self.github.effective_repo(repo)
+        if entry is not None and entry.apt_packages is not None:
+            return list(entry.apt_packages)
+        return list(self.sandbox.apt_packages)
+
+    def setup_commands_for(self, repo: str | None = None) -> list[str]:
+        """The commands run in ``repo``'s workspace before the first phase
+        (#681): the entry's own list when set, else `[sandbox] setup_commands`."""
+        entry = self.github.effective_repo(repo)
+        if entry is not None and entry.setup_commands is not None:
+            return list(entry.setup_commands)
+        return list(self.sandbox.setup_commands)
 
     @model_validator(mode="after")
     def _repo_env_and_secret_env_are_disjoint(self) -> Config:

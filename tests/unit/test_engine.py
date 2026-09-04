@@ -3756,3 +3756,47 @@ class TestOperatorSandboxEnvInThePipeline:
         monkeypatch.delenv("OPERATOR_GREETING", raising=False)
         harness.script([taskgraph(task("t1", verify=[self.CHECK])), BUILD])
         assert harness.engine(budgets=NO_RETRY_BUDGETS).start("see the env").state == "failed"
+
+
+class TestSetupCommandsInThePipeline:
+    """#681: `[sandbox] setup_commands` run in the cloned workspace before
+    the first phase, and a failing one ends the run at provisioning with
+    the command on the run's events. The fake sbx runs them on the host,
+    in the run's real workspace directory."""
+
+    def test_commands_run_in_the_workspace_before_the_first_phase(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(
+            sandbox={
+                "setup_commands": ["printf setup-ran > .setup-marker", "test -f .setup-marker"]
+            }
+        )
+        result = engine.start("set the workspace up")
+
+        assert result.state == "completed"
+        assert result.workspace is not None
+        assert (result.workspace / ".setup-marker").read_text() == "setup-ran"
+        setup = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_SETUP]
+        assert [e.data["command"] for e in setup] == [
+            "printf setup-ran > .setup-marker",
+            "test -f .setup-marker",
+        ]
+        assert all(e.data["rc"] == 0 for e in setup)
+        # before any phase: the first agent job comes after the last setup event
+        first_job = next(i for i, e in enumerate(harness.events) if e.job_id is not None)
+        last_setup = max(i for i, e in enumerate(harness.events) if e.type == "sandbox.setup")
+        assert last_setup < first_job
+
+    def test_a_failing_command_fails_the_run_at_provisioning(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(
+            sandbox={"setup_commands": ["echo 'chromium: download failed' >&2; exit 9"]}
+        )
+        with pytest.raises(WorkerError, match=r"setup command failed \(rc=9\)") as info:
+            engine.start("set the workspace up")
+        assert "chromium: download failed" in str(info.value)
+        (setup,) = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_SETUP]
+        assert setup.data["rc"] == 9
+        assert setup.data["tail"] == "chromium: download failed"
+        # no phase ran: the decomposer was never asked
+        assert not [e for e in harness.events if e.job_id is not None]
