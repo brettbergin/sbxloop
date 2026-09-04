@@ -45,9 +45,9 @@ SLACK_TOKEN_ENV = "SLACK_BOT_TOKEN"  # nosec B105 - env var name, not a secret
 DISCORD_MESSAGES_URL = "https://discord.com/api/v10/channels/{channel_id}/messages"
 SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
 # Discord's edge refuses ``urllib``'s default ``Python-urllib/3.x`` agent
-# outright (Cloudflare error 1010, an HTTP 403 with no Discord error body)
+# outright (Cloudflare error 1010: a 403 with no Discord error body)
 # whatever the token — field failure, db 2026-09-04: every deploy notice
-# since #639 shipped came back "HTTP 403" while the bridge, whose SDK sends
+# since #639 shipped came back as a 403 while the bridge, whose SDK sends
 # its own ``DiscordBot`` agent, posted fine. The shape Discord documents for
 # bots; Slack does not care but gets the same identification.
 USER_AGENT = f"DiscordBot (https://github.com/brettbergin/sbxloop, {__version__})"
