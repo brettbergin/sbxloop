@@ -2128,7 +2128,7 @@ class TestOperatorSandboxEnv:
         self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
         provisioner = self._provisioner(fake_sbx, tmp_path, with_secret=False)
-        with pytest.raises(ProvisionError, match=r"secret_env names \['NPM_TOKEN'\] are not set"):
+        with pytest.raises(ProvisionError, match=r"auth_env names \['NPM_TOKEN'\] are not set"):
             provisioner.ensure_pair("r1", repo="owner/repo")
         assert fake_sbx.invocations("create") == []
 
@@ -2164,3 +2164,142 @@ class TestOperatorSandboxEnv:
             fake_sbx, tmp_path, config=config, env={"ANTHROPIC_API_KEY": "sk-ant-x", **TOKENS}
         )
         assert provisioner.agent_persistent_env()["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+
+
+class TestPrivateRegistries:
+    """`[[registries]]` (#680): the host joins the agent sandbox's allowlist,
+    the client config lands in the VM, and the credential travels only the
+    way `secret_env` does."""
+
+    SECRET = "artifactory-token-7c1e"  # nosec B105 - test fixture
+    REGISTRIES: ClassVar[list[dict[str, object]]] = [
+        {
+            "kind": "npm",
+            "host": "artifactory.example.com",
+            "url": "https://artifactory.example.com/api/npm/npm-virtual/",
+            "auth_env": "NPM_TOKEN",
+            "scope": "@example",
+        },
+        {
+            "kind": "pypi",
+            "host": "artifactory.example.com",
+            "url": "https://artifactory.example.com/api/pypi/pypi-virtual/simple",
+            "auth_env": "NPM_TOKEN",
+            "auth_user": "svc-ci",
+        },
+        {"kind": "go", "host": "github.example.com"},
+    ]
+
+    def _config(self, tmp_path: Path, **overrides: object) -> Config:
+        return Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "sandbox": {"extra_allow_domains": ["mirror.example.com"]},
+                "registries": self.REGISTRIES,
+                "github": {"repos": [{"repo": "owner/repo"}]},
+                **overrides,
+            }
+        )
+
+    def _provisioner(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        *,
+        config: Config | None = None,
+        with_secret: bool = True,
+        bus: EventBus | None = None,
+    ) -> Provisioner:
+        env = dict(TOKENS)
+        if with_secret:
+            env["NPM_TOKEN"] = self.SECRET
+        return make_provisioner(
+            fake_sbx, tmp_path, config=config or self._config(tmp_path), env=env, bus=bus
+        )
+
+    def test_registry_hosts_join_the_agent_allowlist_beside_extra_allow_domains(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        agent, github = provisioner.build_specs("r1", tmp_path, "owner/repo")
+        assert "artifactory.example.com" in agent.policy_allows
+        assert "github.example.com" in agent.policy_allows
+        assert "mirror.example.com" in agent.policy_allows  # extra_allow_domains keeps working
+        assert len(agent.policy_allows) == len(set(agent.policy_allows))  # one rule per host
+        assert "artifactory.example.com" not in github.policy_allows
+        provisioner.ensure_pair("r1", repo="owner/repo")
+        (allow_call,) = [
+            call
+            for call in fake_sbx.invocations("policy")
+            if call[1:3] == ["allow", "network"] and "sbxloop-r1-agent" in call
+        ]
+        assert "artifactory.example.com" in allow_call[3].split(",")
+
+    def test_client_files_and_env_land_in_the_vm_and_the_token_never_hits_argv(
+        self, fake_sbx: FakeSbx, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = self._provisioner(fake_sbx, tmp_path, bus=bus)
+        with caplog.at_level(logging.DEBUG):
+            provisioner.ensure_pair("r1", repo="owner/repo")
+        home = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent"
+        npmrc = (home / ".npmrc").read_text()
+        assert "@example:registry=https://artifactory.example.com/api/npm/npm-virtual/\n" in npmrc
+        assert "//artifactory.example.com/api/npm/npm-virtual/:_authToken=${NPM_TOKEN}\n" in npmrc
+        assert self.SECRET not in npmrc
+        assert (home / ".netrc").read_text() == (
+            f"machine artifactory.example.com login svc-ci password {self.SECRET}\n"
+        )
+        env_sh = (home / ".sbxloop/env.sh").read_text()
+        assert "export GOPRIVATE=github.example.com\n" in env_sh
+        assert (
+            "export PIP_INDEX_URL=https://artifactory.example.com/api/pypi/pypi-virtual/simple\n"
+            in env_sh
+        )
+        assert f"export NPM_TOKEN={self.SECRET}\n" in env_sh
+        # the files were staged with cp and locked down, never passed inline
+        chmods = [c for c in fake_sbx.invocations("exec") if "chmod" in c and ".netrc" in c[-1]]
+        assert chmods and chmods[0][-2:] == ["600", "/home/agent/.netrc"]
+        for call in fake_sbx.invocations():
+            assert all(self.SECRET not in arg for arg in call), call
+        for event in events:
+            assert self.SECRET not in repr(event.data), event
+        assert all(self.SECRET not in record.getMessage() for record in caplog.records)
+        assert not (fake_sbx.sandbox_fs("sbxloop-r1-github") / "home/agent/.netrc").exists()
+
+    def test_an_unset_credential_fails_provisioning_by_name_before_any_sandbox(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = self._provisioner(fake_sbx, tmp_path, with_secret=False)
+        with pytest.raises(ProvisionError, match=r"auth_env names \['NPM_TOKEN'\] are not set"):
+            provisioner.ensure_pair("r1", repo="owner/repo")
+        assert fake_sbx.invocations("create") == []
+
+    def test_operator_env_wins_over_a_registry_derived_variable(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        config = self._config(
+            tmp_path,
+            sandbox={"env": {"GOPRIVATE": "github.example.com,gitlab.example.com"}},
+        )
+        provisioner = self._provisioner(fake_sbx, tmp_path, config=config)
+        assert provisioner.agent_persistent_env("owner/repo")["GOPRIVATE"] == (
+            "github.example.com,gitlab.example.com"
+        )
+
+    def test_a_repository_override_replaces_the_global_list(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        config = self._config(
+            tmp_path,
+            github={"repos": [{"repo": "owner/repo", "registries": []}]},
+        )
+        # NPM_TOKEN deliberately absent: the override dropped every
+        # registry, so nothing may ask for it.
+        provisioner = self._provisioner(fake_sbx, tmp_path, config=config, with_secret=False)
+        agent, _github = provisioner.build_specs("r1", tmp_path, "owner/repo")
+        assert "artifactory.example.com" not in agent.policy_allows
+        assert agent.files == {}
+        assert "GOPRIVATE" not in agent.persistent_env

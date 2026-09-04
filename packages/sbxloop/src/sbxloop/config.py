@@ -245,6 +245,149 @@ class SandboxConfig(_ConfigModel):
         return tuple(self.languages) or DEFAULT_LANGUAGES
 
 
+RegistryKind = Literal["npm", "pypi", "go", "cargo", "maven", "nuget", "gem", "generic"]
+
+# Kinds whose credential is a `~/.netrc` entry (pip, uv, go's git fetch,
+# curl all honour it) and so need a login beside the token.
+NETRC_REGISTRY_KINDS = frozenset({"pypi", "go", "generic"})
+# Kinds whose client file names a username explicitly.
+USERNAME_REGISTRY_KINDS = NETRC_REGISTRY_KINDS | {"maven", "nuget", "gem"}
+# Kinds that point at a URL, not just a host.
+URL_REGISTRY_KINDS = frozenset({"npm", "pypi", "cargo", "maven", "nuget", "gem"})
+_HOST_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$")
+_NPM_SCOPE_RE = re.compile(r"^@[a-z0-9][a-z0-9._-]*$")
+_REGISTRY_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+
+
+class RegistryConfig(_ConfigModel):
+    """One private package registry the agent sandbox must reach (#680).
+
+    `host` joins the sandbox's network allowlist; `kind` picks the client
+    file or environment sbxloop writes so the ecosystem's tooling actually
+    uses the registry (`~/.npmrc`, `PIP_INDEX_URL`, `GOPRIVATE`,
+    `~/.cargo/config.toml`, `~/.m2/settings.xml`, `NuGet.Config`,
+    `BUNDLE_*`) — see ``sbxloop.sbx.registries`` for what each kind
+    writes. `auth_env` names the daemon-environment variable holding the
+    credential; it is delivered like `[sandbox] secret_env` (never an
+    `sbx` argument, event, or log line) and referenced from the client
+    file by name wherever the ecosystem expands environment variables, so
+    only the `.netrc` kinds hold the value at rest (0600, in a VM the
+    agent owns anyway).
+    """
+
+    kind: RegistryKind
+    host: str
+    # The registry endpoint; required for every kind but `go` and `generic`,
+    # which are host-only (a module path / any other host).
+    url: str | None = None
+    # Daemon-environment variable holding the credential (delivered as a
+    # secret, #679) and, for the kinds that pair a login with it, the login.
+    auth_env: str | None = None
+    auth_user: str | None = None
+    # npm only: `@scope` served from this registry; unset → the default
+    # registry for unscoped packages too.
+    scope: str | None = None
+    # cargo registry name / maven `<server>` and `<mirror>` id / NuGet
+    # source key; derived from `host` when unset.
+    name: str | None = None
+
+    @field_validator("host")
+    @classmethod
+    def _check_host(cls, value: str) -> str:
+        value = value.strip().lower()
+        if not _HOST_RE.match(value):
+            raise ValueError(f"registries[].host must be a bare hostname, got {value!r}")
+        return value
+
+    @field_validator("auth_env")
+    @classmethod
+    def _check_auth_env(cls, value: str | None) -> str | None:
+        if value is not None:
+            _check_env_names([value], "registries[].auth_env")
+        return value
+
+    @field_validator("scope")
+    @classmethod
+    def _check_scope(cls, value: str | None) -> str | None:
+        if value is not None and not _NPM_SCOPE_RE.match(value):
+            raise ValueError(
+                f"registries[].scope must be an npm scope such as '@org', got {value!r}"
+            )
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str | None) -> str | None:
+        if value is not None and not _REGISTRY_NAME_RE.match(value):
+            raise ValueError(
+                f"registries[].name must be letters, digits, '-' or '_', got {value!r}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _fields_fit_the_kind(self) -> RegistryConfig:
+        where = f"registries[{self.kind} {self.host}]"
+        if self.kind in URL_REGISTRY_KINDS and self.kind != "gem" and self.url is None:
+            raise ValueError(f"{where}: kind={self.kind} needs url")
+        if self.kind not in URL_REGISTRY_KINDS and self.url is not None:
+            raise ValueError(f"{where}: kind={self.kind} takes only host, not url")
+        if self.url is not None:
+            # cargo spells a sparse index `sparse+https://...`; the host
+            # check looks through the prefix.
+            parts = urlsplit(self.url.removeprefix("sparse+") if self.kind == "cargo" else self.url)
+            if parts.scheme not in ("http", "https") or not parts.netloc:
+                raise ValueError(f"{where}: url must be http(s)://..., got {self.url!r}")
+            if (parts.hostname or "").lower() != self.host:
+                raise ValueError(
+                    f"{where}: url {self.url!r} is not on host {self.host!r} — host is "
+                    "what the sandbox is allowed to reach, and the url must be there"
+                )
+        if self.scope is not None and self.kind != "npm":
+            raise ValueError(f"{where}: scope is npm-only")
+        if self.auth_user is not None and self.auth_env is None:
+            raise ValueError(f"{where}: auth_user needs auth_env")
+        if self.auth_env is not None:
+            if self.kind in USERNAME_REGISTRY_KINDS and not self.auth_user:
+                raise ValueError(
+                    f"{where}: kind={self.kind} pairs the credential with a login; "
+                    "set auth_user (what the registry expects beside the token)"
+                )
+            if self.kind not in USERNAME_REGISTRY_KINDS and self.auth_user is not None:
+                raise ValueError(
+                    f"{where}: kind={self.kind} authenticates by token; drop auth_user"
+                )
+        return self
+
+    @property
+    def effective_name(self) -> str:
+        return self.name or re.sub(r"[^a-z0-9]+", "-", self.host).strip("-")
+
+    @property
+    def identity(self) -> tuple[str, ...]:
+        """What must be unique within one list: npm by scope (one unscoped
+        default plus any number of scopes), the named kinds by name, the
+        single-index kinds (pypi, gem) once, host-only kinds by host."""
+        if self.kind == "npm":
+            return ("npm", self.scope or "")
+        if self.kind in ("cargo", "maven", "nuget"):
+            return (self.kind, self.effective_name)
+        if self.kind in ("go", "generic"):
+            return (self.kind, self.host)
+        return (self.kind,)
+
+
+def _check_registries(entries: Sequence[RegistryConfig], key: str) -> None:
+    seen: set[tuple[str, ...]] = set()
+    for entry in entries:
+        if entry.identity in seen:
+            what = " ".join(entry.identity) or entry.kind
+            raise ValueError(
+                f"{key}: more than one {what!r} registry; an ecosystem's tooling can "
+                "follow only one default (npm takes one registry per scope)"
+            )
+        seen.add(entry.identity)
+
+
 class PolicyConfig(_ConfigModel):
     """Operator bounds for task-declared egress.
 
@@ -426,6 +569,9 @@ class RepoConfig(_ConfigModel):
     # global setting held and this repository still needs).
     env: dict[str, str] | None = None
     secret_env: list[str] | None = None
+    # This repository's private registries (#680); None → the top-level
+    # `[[registries]]`, and a set list REPLACES it.
+    registries: list[RegistryConfig] | None = None
 
     @field_validator("repo")
     @classmethod
@@ -467,6 +613,13 @@ class RepoConfig(_ConfigModel):
             return None
         _check_env_names(value, "github.repos[].secret_env")
         return list(dict.fromkeys(value))
+
+    @field_validator("registries")
+    @classmethod
+    def _check_registries(cls, value: list[RegistryConfig] | None) -> list[RegistryConfig] | None:
+        if value is not None:
+            _check_registries(value, "github.repos[].registries")
+        return value
 
     @field_validator(*(f"{name}_label" for name in LABEL_KINDS))
     @classmethod
@@ -1489,6 +1642,9 @@ class Config(_ConfigModel):
     install_workers: bool = True
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
+    # Private package registries every run's agent sandbox reaches and is
+    # configured for (#680); a `[[github.repos]]` entry may replace the list.
+    registries: list[RegistryConfig] = Field(default_factory=list)
     github: GithubConfig = Field(default_factory=GithubConfig)
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     budgets: Budgets = Field(default_factory=Budgets)
@@ -1549,6 +1705,27 @@ class Config(_ConfigModel):
             return list(entry.secret_env)
         return list(self.sandbox.secret_env)
 
+    @field_validator("registries")
+    @classmethod
+    def _check_registries(cls, value: list[RegistryConfig]) -> list[RegistryConfig]:
+        _check_registries(value, "registries")
+        return value
+
+    def registries_for(self, repo: str | None = None) -> list[RegistryConfig]:
+        """The private registries ``repo``'s agent sandbox is configured for
+        (#680): the entry's own list when set, else `[[registries]]`."""
+        entry = self.github.effective_repo(repo)
+        if entry is not None and entry.registries is not None:
+            return list(entry.registries)
+        return list(self.registries)
+
+    def registry_auth_envs_for(self, repo: str | None = None) -> list[str]:
+        """The daemon-environment names the registries' credentials come
+        from — delivered as secrets beside :meth:`secret_env_for`."""
+        return list(
+            dict.fromkeys(r.auth_env for r in self.registries_for(repo) if r.auth_env is not None)
+        )
+
     @model_validator(mode="after")
     def _repo_env_and_secret_env_are_disjoint(self) -> Config:
         """A repository's *effective* pair must be disjoint too: an entry
@@ -1559,6 +1736,18 @@ class Config(_ConfigModel):
             )
             if both:
                 raise ValueError(f"github.repos[{entry.repo}]: env and secret_env both name {both}")
+        # A registry's credential is a secret too (#680): plain env must not
+        # name it, in the global scope or any repository's effective one.
+        for scope in (None, *(entry.repo for entry in self.github.repos)):
+            both = sorted(
+                set(self.sandbox_env_for(scope)) & set(self.registry_auth_envs_for(scope))
+            )
+            if both:
+                where = "[sandbox]" if scope is None else f"github.repos[{scope}]"
+                raise ValueError(
+                    f"{where}: env and a registry's auth_env both name {both}: the credential "
+                    "is read from the daemon's environment, not written in the config"
+                )
         return self
 
     @model_validator(mode="after")

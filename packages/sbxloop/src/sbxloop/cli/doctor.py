@@ -539,14 +539,24 @@ def _missing_repo_labels(
 
 def secret_env_checks(config: Config, env: dict[str, str]) -> list[Check]:
     """One row when `[sandbox] secret_env` (or a repository's override)
-    names anything (#679): every name must be set in the daemon's
-    environment, or provisioning fails by name before a sandbox boots —
-    this row says so before the first run does. Values are never shown."""
-    scopes: list[tuple[str, list[str]]] = [("[sandbox]", list(config.sandbox.secret_env))]
+    names anything (#679), or a `[[registries]]` entry has an `auth_env`
+    (#680): every name must be set in the daemon's environment, or
+    provisioning fails by name before a sandbox boots — this row says so
+    before the first run does. Values are never shown."""
+    scopes: list[tuple[str, list[str]]] = [
+        ("[sandbox]", list(config.sandbox.secret_env)),
+        # (no brackets: the detail is rich markup on the way to the table)
+        ("registries", [r.auth_env for r in config.registries if r.auth_env]),
+    ]
     scopes.extend(
         (entry.repo, list(entry.secret_env))
         for entry in config.github.repos
         if entry.secret_env is not None
+    )
+    scopes.extend(
+        (f"{entry.repo} registries", [r.auth_env for r in entry.registries if r.auth_env])
+        for entry in config.github.repos
+        if entry.registries is not None
     )
     names = sorted({name for _scope, listed in scopes for name in listed})
     if not names:
@@ -564,8 +574,8 @@ def secret_env_checks(config: Config, env: dict[str, str]) -> list[Check]:
             "sandbox secret env",
             False,
             f"not set in the daemon's environment — {where}; export them where the "
-            "daemon reads its secrets, or drop them from secret_env (runs that need "
-            "them fail at provisioning)",
+            "daemon reads its secrets, or drop them from secret_env / auth_env (runs "
+            "that need them fail at provisioning)",
         )
     ]
 

@@ -1493,6 +1493,7 @@ def config_policy() -> None:
         baseline_allows,
     )
     from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS, github_policy_allows
+    from sbxloop.sbx.registries import domains as registry_domains
 
     try:
         config = load_config()
@@ -1500,7 +1501,10 @@ def config_policy() -> None:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
 
-    extra = list(config.sandbox.extra_allow_domains)
+    extra = [
+        *registry_domains(config.registries_for()),
+        *config.sandbox.extra_allow_domains,
+    ]
     baseline = ", ".join(
         dict.fromkeys([*AGENT_ALLOW_DOMAINS, *config.github.allow_domains, *extra])
     )

@@ -995,6 +995,31 @@ class TestDoctor:
         assert result.exit_code == 0, result.output
         assert "set: NPM_TOKEN, PIP_INDEX_URL" in result.output
 
+    def test_doctor_names_an_unset_registry_credential(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `[[registries]]` auth_env is a secret the daemon must hold
+        (#680); the same row covers it."""
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        monkeypatch.delenv("ARTIFACTORY_TOKEN", raising=False)
+        (workdir / "sbxloop.toml").write_text(
+            "[[registries]]\n"
+            'kind = "npm"\n'
+            'host = "artifactory.example.com"\n'
+            'url = "https://artifactory.example.com/api/npm/npm-virtual/"\n'
+            'auth_env = "ARTIFACTORY_TOKEN"\n'
+        )
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 1
+        assert "sandbox secret env" in result.output
+        assert "ARTIFACTORY_TOKEN" in result.output
+        monkeypatch.setenv("ARTIFACTORY_TOKEN", "value_never_shown")
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert "set: ARTIFACTORY_TOKEN" in result.output
+        assert "value_never_shown" not in result.output
+
     def _bake_record(
         self,
         workdir: Path,

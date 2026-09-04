@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
 import pytest
 from pydantic import ValidationError
 
@@ -267,6 +269,41 @@ class TestBounds:
             allow, deny = effective_egress_bounds(config)
             reason = egress_rejection(domain, allow, deny)
             assert reason is not None and "deny" in reason
+
+
+class TestRegistryBounds:
+    """A configured private registry's host is in bounds for a plan and
+    already granted at provisioning (#680)."""
+
+    CONFIG: ClassVar[dict[str, object]] = {
+        "registries": [
+            {
+                "kind": "npm",
+                "host": "artifactory.example.com",
+                "url": "https://artifactory.example.com/api/npm/npm-virtual/",
+            }
+        ]
+    }
+
+    def test_registry_host_is_in_bounds_without_policy_allow(self) -> None:
+        allow, _deny = effective_egress_bounds(Config.model_validate(self.CONFIG))
+        assert egress_rejection("artifactory.example.com", allow, []) is None
+        assert egress_rejection("artifactory.example.com", *effective_egress_bounds(Config()))
+
+    def test_granter_treats_the_host_as_already_granted(self, fake_sbx: FakeSbx) -> None:
+        events: list[Event] = []
+        bus = EventBus()
+        bus.subscribe(events.append)
+        granter = EgressGranter(
+            SbxCLI(binary=str(fake_sbx.binary)),
+            Config.model_validate(self.CONFIG),
+            bus,
+            "r1",
+            "sbxloop-r1-agent",
+        )
+        granter.apply("t1", [("artifactory.example.com", "install deps")])
+        assert fake_sbx.policies() == []
+        assert not [e for e in events if e.type == HostEventTypes.POLICY_DENY]
 
 
 class TestEgressSpec:
