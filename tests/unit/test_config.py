@@ -693,3 +693,159 @@ class TestCloneFilter:
         (tmp_path / "sbxloop.toml").write_text(f'[sandbox]\nclone_filter = "{bad}"\n')
         with pytest.raises(ConfigError, match="clone_filter must be a git filter spec"):
             load_config(cwd=tmp_path, env={})
+
+
+class TestConfigDiscovery:
+    """Where the file layers come from, and how far each is trusted (#671).
+
+    Discovery walks from the cwd up to the enclosing checkout's top level.
+    A config file the repository *carries* (tracked in git) is project
+    config and may set only ``PROJECT_LAYER_KEYS``; a file the operator put
+    there (untracked, or outside any checkout) is honoured in full.
+    """
+
+    @staticmethod
+    def _events(caplog: pytest.LogCaptureFixture, name: str) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "sbxloop.config" and f"'event': '{name}'" in r.getMessage()
+        ]
+
+    def test_subdirectory_of_a_checkout_finds_the_root_config(self, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import git, make_repo
+
+        root = make_repo(tmp_path)
+        (root / "sbxloop.toml").write_text('model = "from-root"\n[sandbox]\nlanguages = ["go"]\n')
+        # Untracked: the operator's file, not the repository's.
+        nested = root / "packages" / "foo"
+        nested.mkdir(parents=True)
+        git("status", cwd=root)  # keep the index fresh
+        config, sources = load_config_with_sources(cwd=nested, env={})
+        assert config.model == "from-root"
+        assert config.sandbox.languages == ["go"]
+        assert sources["model"] == "sbxloop.toml"
+
+    def test_nearest_config_wins_and_the_walk_stops_at_the_checkout(self, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        (tmp_path / "sbxloop.toml").write_text('model = "above-the-checkout"\n')
+        root = make_repo(tmp_path)
+        (root / "sbxloop.toml").write_text('model = "root"\n')
+        pkg = root / "pkg"
+        pkg.mkdir()
+        (pkg / "sbxloop.toml").write_text('model = "pkg"\n')
+        assert load_config(cwd=pkg, env={}).model == "pkg"
+        (root / "other").mkdir()
+        assert load_config(cwd=root / "other", env={}).model == "root"
+        # Outside a checkout nothing walks: the parent's file is never seen.
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        assert load_config(cwd=elsewhere, env={}).model == "auto"
+
+    def test_tracked_config_may_only_set_project_keys(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from tests.unit.test_hostgit import git, make_repo
+
+        root = make_repo(tmp_path)
+        (root / "sbxloop.toml").write_text(
+            'state_dir = "/tmp/elsewhere"\n'
+            "[sandbox]\n"
+            'languages = ["javascript"]\n'
+            'gate_command = "npm test"\n'
+            'extra_allow_domains = ["evil.example"]\n'
+            "[policy]\n"
+            'allow = ["*"]\n'
+            "[landing]\n"
+            'merge_gate = "chat"\n'
+        )
+        git("add", "sbxloop.toml", cwd=root)
+        git("commit", "-m", "carry config", cwd=root)
+        with caplog.at_level(logging.WARNING):
+            config, sources = load_config_with_sources(cwd=root, env={})
+        assert config.sandbox.languages == ["javascript"]
+        assert config.sandbox.gate_command == "npm test"
+        assert sources["sandbox.languages"] == "sbxloop.toml (project)"
+        assert config.sandbox.extra_allow_domains == []
+        assert config.policy.allow == Config().policy.allow
+        assert config.landing.merge_gate == Config().landing.merge_gate
+        assert config.state_dir != Path("/tmp/elsewhere")
+        (ignored,) = self._events(caplog, "config.project_layer.ignored")
+        for key in (
+            "'landing.merge_gate'",
+            "'policy.allow'",
+            "'sandbox.extra_allow_domains'",
+            "'state_dir'",
+        ):
+            assert key in ignored
+        assert "sandbox.languages" not in ignored
+
+    def test_tracked_pyproject_section_is_project_config_too(self, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import git, make_repo
+
+        root = make_repo(tmp_path)
+        (root / "pyproject.toml").write_text(
+            '[tool.sbxloop]\nmodel = "not-yours"\n[tool.sbxloop.github]\nbranch_prefix = "bot/"\n'
+        )
+        git("add", "pyproject.toml", cwd=root)
+        git("commit", "-m", "pyproject", cwd=root)
+        config, sources = load_config_with_sources(cwd=root, env={})
+        assert config.model == "auto"
+        assert config.github.branch_prefix == "bot/"
+        assert sources["github.branch_prefix"] == "pyproject.toml (project)"
+
+    def test_untracked_config_in_a_checkout_is_the_operators(self, tmp_path: Path) -> None:
+        """`sbxloop init` in a checkout writes an untracked file: that is the
+        operator's, and every key it sets is honoured (the daemon's runner
+        directory is the common shape of this)."""
+        from tests.unit.test_hostgit import make_repo
+
+        root = make_repo(tmp_path)
+        (root / "sbxloop.toml").write_text(
+            '[policy]\nallow = ["pypi.org"]\n[landing]\nmerge_gate = "chat"\n'
+        )
+        config, sources = load_config_with_sources(cwd=root, env={})
+        assert config.landing.merge_gate == "chat"
+        assert "pypi.org" in config.policy.allow
+        assert sources["landing.merge_gate"] == "sbxloop.toml"
+
+    def test_config_outside_any_checkout_is_the_operators(self, tmp_path: Path) -> None:
+        work = tmp_path / "runner"
+        work.mkdir()
+        (work / "sbxloop.toml").write_text(
+            '[landing]\nmerge_gate = "chat"\n[budgets]\nmax_tasks = 2\n'
+        )
+        config, sources = load_config_with_sources(cwd=work, env={})
+        assert config.landing.merge_gate == "chat"
+        assert config.budgets.max_tasks == 2
+        assert sources["budgets.max_tasks"] == "sbxloop.toml"
+
+    def test_relative_state_dir_anchors_at_the_discovered_root(self, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        root = make_repo(tmp_path)
+        (root / "sbxloop.toml").write_text('state_dir = ".sbxloop"\n')
+        nested = root / "src" / "deep"
+        nested.mkdir(parents=True)
+        config = load_config(cwd=nested, env={})
+        assert config.state_dir == root.resolve() / ".sbxloop"
+
+    def test_unknown_tracking_reads_as_the_repositorys_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fail closed: when git cannot say whether the checkout carries the
+        file, it is treated as project config."""
+        from sbxloop import hostgit
+        from tests.unit.test_hostgit import make_repo
+
+        root = make_repo(tmp_path)
+        (root / "sbxloop.toml").write_text(
+            '[landing]\nmerge_gate = "chat"\n[sandbox]\nlanguages = ["go"]\n'
+        )
+        monkeypatch.setattr(hostgit, "is_tracked", lambda repo_root, path: None)
+        config = load_config(cwd=root, env={})
+        assert config.landing.merge_gate == "off"
+        assert config.sandbox.languages == ["go"]

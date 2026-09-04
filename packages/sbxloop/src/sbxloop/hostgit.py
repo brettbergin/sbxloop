@@ -118,6 +118,50 @@ def repo_toplevel(path: Path) -> Path | None:
     return Path(top) if top else None
 
 
+def is_tracked(repo_root: Path, path: Path) -> bool | None:
+    """Whether ``path`` (inside the checkout at ``repo_root``) is in git's
+    index — a file the repository carries, as opposed to one the operator
+    dropped into the tree (``sbxloop init``, an ignored ``sbxloop.toml``).
+
+    None when git is unavailable or the probe fails, so the caller decides
+    what "could not tell" means for it. The checkout may be one a sandbox
+    agent has written to, so its config is untrusted: ``core.fsmonitor``
+    (a hook git would run) is forced off on the command line, and inherited
+    ``GIT_*`` variables are dropped so they cannot point git elsewhere.
+    ``ls-files`` never executes anything else.
+    """
+    git = find_git()
+    if git is None:
+        return None
+    try:
+        relative = path.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return False
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    try:
+        proc = subprocess.run(  # nosec B603 - list argv, git binary, no shell
+            [git, "-c", "core.fsmonitor=false", "ls-files", "--error-unmatch", "--", str(relative)],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        log.debug("git.is_tracked_probe_failed", root=str(repo_root), exc_info=True)
+        return None
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    log.debug(
+        "git.is_tracked_probe_failed",
+        root=str(repo_root),
+        rc=proc.returncode,
+        stderr=proc.stderr.decode("utf-8", "replace")[-400:],
+    )
+    return None
+
+
 def head_commit(repo_path: Path) -> str | None:
     """The commit sha of HEAD, or None on an unborn HEAD (no commits yet)."""
     try:
