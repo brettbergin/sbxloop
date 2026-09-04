@@ -738,6 +738,7 @@ def fix_brief(
     history: str = "",
     unanswered: Sequence[ReviewFinding] = (),
     preexisting: Sequence[str] = (),
+    gate: str | None = None,
 ) -> str:
     """What one fix round is for, concretely.
 
@@ -758,7 +759,15 @@ def fix_brief(
     ``preexisting`` names the failing checks that were already red on the
     commit the PR is built on (#611) — required by the base, so still to
     be fixed, but not this PR's doing, and the fixer should know that.
+    ``gate`` is the project's own gate command, named where the brief asks
+    for it to be run (#690): "the project's own gate" told a fixer to run
+    something the brief never identified.
     """
+    run_gate = (
+        f"run the project's own gate (`{gate}`)"
+        if gate
+        else "run the tasks' verify commands (this repository declares no single gate)"
+    )
     what = _pr_label(pr_number)
     parts = [
         f"{what[0].upper()}{what[1:]} is not yet acceptable (fix round {round}, {kind}): {why}.",
@@ -837,13 +846,13 @@ def fix_brief(
                 # might mistake for an empty log.
                 blocks.append(
                     f"{heading}\n\nThe log for this check is not readable from here; "
-                    "the link above is where it lives. Reproduce the failure with "
-                    "the project's own gate before changing anything."
+                    "the link above is where it lives. Reproduce the failure — "
+                    f"{run_gate} — before changing anything."
                 )
         parts.append(
             "Failing checks, with their log output where it could be read:\n\n"
             + "\n\n".join(blocks)
-            + "\n\nMake these pass; run the project's own gate here before you finish."
+            + f"\n\nMake these pass; {run_gate} here before you finish."
         )
     if objections:
         who = "an automated reviewer" if kind == "bot" else "a human"

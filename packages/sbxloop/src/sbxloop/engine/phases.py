@@ -52,6 +52,7 @@ from sbxloop.verifylint import (
     gate_rule,
     lint_verify_commands,
     project_gate,
+    reviewer_gate_rule,
 )
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, Usage
@@ -223,6 +224,32 @@ def clip_head_tail(
         return text
     dropped = len(text) - head - tail
     return f"{text[:head]}\n...(clipped {dropped} chars)...\n{text[-tail:]}"
+
+
+def clip_diff(diff: str | None, limit: int) -> str:
+    """The review prompt's copy of the PR diff, cut to ``limit`` characters.
+
+    Head and tail survive (the tail carries the last files' hunks, the head
+    the first); what goes is the middle, mid-hunk. The marker says so in
+    the diff's own terms — how many characters and lines are missing — and
+    tells the reviewer not to read the gap as "unchanged" (#690): the
+    prompt's rule that anything not shown is untouched holds for the tree,
+    not for a diff the budget cut, and a reviewer that took the marker for
+    a hunk boundary approved changes it never saw.
+    """
+    diff = diff or ""
+    head = min(REVIEW_DIFF_HEAD_CLIP, limit * 2 // 3)
+    tail = limit // 3
+    if len(diff) <= head + tail:
+        return diff
+    hidden = diff[head:-tail]
+    return (
+        f"{diff[:head]}\n"
+        f"[diff clipped at {limit} chars — {len(hidden)} chars / "
+        f"{hidden.count(chr(10)) + 1} lines not shown; do not assume they are "
+        f"unchanged — read those files from the working tree]\n"
+        f"{diff[-tail:]}"
+    )
 
 
 class PhaseRunner:
@@ -650,10 +677,7 @@ class PhaseRunner:
         what the sandbox's checks did not decide (#682): the advisory
         failures still standing, or that nothing ran under `ci-only`.
         """
-        limit = self.config.landing.review_diff_max_chars
-        diff_shown = clip_head_tail(
-            diff, head=min(REVIEW_DIFF_HEAD_CLIP, limit * 2 // 3), tail=limit // 3
-        )
+        diff_shown = clip_diff(diff, self.config.landing.review_diff_max_chars)
         board = bullet_list(
             [
                 f"{t.spec.id} [{t.state}] {t.spec.title}"
@@ -678,7 +702,7 @@ class PhaseRunner:
                 "tasks_summary": board,
                 "prior_rounds": history,
                 "user_guidance": self._guidance(),
-                "project_gate": gate_rule(self.project_gate()),
+                "project_gate": reviewer_gate_rule(self.project_gate()),
                 "config_override_example": config_override_example(self.languages),
                 "verification": verification,
                 "repo_conventions": self.repo_conventions(),

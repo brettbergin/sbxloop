@@ -5,6 +5,7 @@ from importlib import resources
 
 import pytest
 
+from sbxloop import toolchains
 from sbxloop.engine import prompts
 from sbxloop.engine.prompts import _strip_contract_header, bullet_list, render
 from sbxloop.policy import BASELINE_REGISTRY_DOMAINS, WELL_KNOWN_REGISTRY_DOMAINS
@@ -412,14 +413,48 @@ def test_config_override_example_follows_the_resolved_toolchain() -> None:
         (["python"], "[tool.mypy]"),
         (["typescript"], "tsconfig.json"),
         (["node", "typescript"], "tsconfig.json"),
+        # TypeScript pulls JavaScript in as a requirement, so the resolved
+        # set arrives in registry order — the tsc story still wins (#690).
+        (["javascript", "typescript"], "tsconfig.json"),
+        (["javascript"], ".mocharc.yml"),
+        (["bun"], ".mocharc.yml"),
         (["ruby"], "--force-exclusion"),
-        (["rust"], "[tool.mypy]"),
+        (["rust"], "default-members"),
+        (["java"], "maven-surefire-plugin"),
+        (["php"], "<testsuites>"),
+        (["dotnet"], "App.slnf"),
+        (["cpp"], "CMakePresets.json"),
+        (["make"], "[tool.mypy]"),
         (["go", "python"], "go test ./..."),
     ):
         text = config_override_example(languages)
         assert marker in text, (languages, marker)
         assert "the remedy is re-authoring the command to the bare form" in text, languages
         assert text.startswith("```"), languages
+
+
+def test_every_ecosystem_has_its_own_override_story() -> None:
+    """#690: six registry ecosystems fell back to the Python story. Every
+    language toolchain reads one of its own, in the same shape — the gate
+    named, the command that reached past its configuration, the remedy —
+    and no story is another ecosystem's."""
+    task_runners = {"make", "just", "task"}
+    seen: dict[str, str] = {}
+    for language in toolchains.supported_languages():
+        if language in task_runners:
+            continue
+        text = config_override_example([language])
+        assert "The project gate runs `" in text, language
+        assert "The task's verify command runs `" in text, language
+        assert "on every attempt" in text, language
+        assert "the remedy is re-authoring the command to the bare form" in text, language
+        if language != "python":
+            assert "[tool.mypy]" not in text, language
+        seen[language] = text
+    # bun is a JavaScript client and reads the JavaScript story; every
+    # other ecosystem's is its own.
+    assert seen.pop("bun") == seen["javascript"]
+    assert len(set(seen.values())) == len(seen)
 
 
 DOMAIN_ANCHORS: tuple[str, ...] = (

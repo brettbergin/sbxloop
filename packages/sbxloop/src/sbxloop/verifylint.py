@@ -873,6 +873,32 @@ def gate_rule(gate: str | None) -> str:
     )
 
 
+def reviewer_gate_rule(gate: str | None) -> str:
+    """The review prompt's gate paragraph — evidence, not an instruction.
+
+    The decomposer's :func:`gate_rule` says "one task MUST run the gate":
+    an instruction to the planner. Handed to the reviewer verbatim it read
+    as an instruction to *run* it, which the reviewer neither can (its
+    session is read-only) nor should (the sandbox already did, and the
+    verification notes carry what that left undecided, #682) — and with
+    no gate at all it told the reviewer nothing was required of a plan it
+    was not writing (#690). The reviewer's paragraph names the gate as a
+    result to weigh, or says plainly that there is none to lean on.
+    """
+    if not gate:
+        return (
+            "This repository declares no single gate command, so there is no gate "
+            "result to lean on: judge the diff on its own and on what each task's "
+            "verify commands actually checked."
+        )
+    return (
+        f"This repository's gate is `{gate}`. The sandbox ran it before delivering "
+        "the pull request, and the verification notes below say what it left "
+        "undecided; treat its result as evidence about the diff — do not re-run "
+        "it, and do not raise a finding that only asks for it to be run."
+    )
+
+
 def runs_gate(command: str, gate: str) -> bool:
     """Whether ``command`` invokes ``gate``.
 
@@ -1205,20 +1231,161 @@ CONFIG_SCOPED_TOOLS: dict[str, ConfigScopedTool] = {
 }
 
 
-def config_override_example(languages: Sequence[str] | None = None) -> str:
-    """The rendered config-override example for a run's resolved toolchains.
+# Worked examples for the ecosystems whose override is not a tool the lint
+# reads (#690): the story is the same shape — the configured set, the
+# explicit argument that reached past it, the failure no revision can fix —
+# but the mechanism is a workspace manifest, a build-tool filter or a test
+# runner's suite list rather than a file-set key the lint could check. Each
+# one was checked against the tool's documented behaviour (mocha's against
+# mocha 11 itself: positional paths are *added to* a configured `spec`).
+_STANDALONE_EXAMPLES: tuple[ConfigOverrideExample, ...] = (
+    ConfigOverrideExample(
+        language="javascript",
+        fence="yaml",
+        config="# .mocharc.yml\nspec:\n  - test/unit/**/*.test.js",
+        story=(
+            "The project gate runs `npm test` (`mocha`) and passes: `spec` names "
+            "the unit tree and leaves `test/integration` out. The task's verify "
+            "command runs `npx --no-install mocha --recursive test`; a path on "
+            "the command line is added to the configured `spec`, not substituted "
+            "for it, so the integration suite comes along — it dials a database "
+            'the sandbox does not have and fails with "connect ECONNREFUSED '
+            f'127.0.0.1:5432" on every attempt. {_REMEDY} and letting the '
+            "configuration choose the files."
+        ),
+    ),
+    ConfigOverrideExample(
+        language="rust",
+        fence="toml",
+        config=(
+            "# Cargo.toml\n[workspace]\n"
+            'members = ["crates/core", "crates/cli", "crates/integration"]\n'
+            'default-members = ["crates/core", "crates/cli"]'
+        ),
+        story=(
+            "The project gate runs `cargo test` at the workspace root and passes: "
+            "`default-members` keeps `crates/integration` out of the default set. "
+            "The task's verify command runs `cargo test --workspace`; the flag "
+            "selects every member, `crates/integration` included, and that crate "
+            "links a native library the sandbox does not carry, so the build "
+            'fails with "could not find native static library" on every attempt. '
+            f"{_REMEDY}, or `-p <crate>` for the crate the task is about."
+        ),
+    ),
+    ConfigOverrideExample(
+        language="java",
+        fence="xml",
+        config=(
+            "<!-- pom.xml -->\n<plugin>\n"
+            "  <artifactId>maven-surefire-plugin</artifactId>\n"
+            "  <configuration>\n"
+            "    <excludes><exclude>**/*IT.java</exclude></excludes>\n"
+            "  </configuration>\n</plugin>"
+        ),
+        story=(
+            "The project gate runs `./mvnw -q verify` and passes: surefire's "
+            "`excludes` keeps the `*IT` classes out of the unit phase. The task's "
+            "verify command runs `./mvnw -q test -Dtest='Order*'`; the `test` "
+            "property overrides `includes` and `excludes` alike, so "
+            "`OrderRepositoryIT` runs with the unit tests — it needs a database "
+            'the sandbox does not have and fails with "Connection refused" on '
+            f"every attempt. {_REMEDY} and letting the plugin choose the classes."
+        ),
+    ),
+    ConfigOverrideExample(
+        language="php",
+        fence="xml",
+        config=(
+            "<!-- phpunit.xml -->\n<testsuites>\n"
+            '  <testsuite name="unit">\n'
+            "    <directory>tests</directory>\n"
+            "    <exclude>tests/Integration</exclude>\n"
+            "  </testsuite>\n</testsuites>"
+        ),
+        story=(
+            "The project gate runs `./vendor/bin/phpunit` and passes: the suite "
+            "declared in `phpunit.xml` leaves `tests/Integration` out. The task's "
+            "verify command runs `./vendor/bin/phpunit tests`; a path argument "
+            "makes PHPUnit ignore the configured test suites and run every test "
+            "under it, so the integration tests come along — they need a database "
+            'the sandbox does not have and fail with "SQLSTATE[HY000] [2002] '
+            f'Connection refused" on every attempt. {_REMEDY} and letting the '
+            "configuration choose the suites."
+        ),
+    ),
+    ConfigOverrideExample(
+        language="dotnet",
+        fence="json",
+        config=(
+            "// App.slnf\n{\n"
+            '  "solution": {\n'
+            '    "path": "App.sln",\n'
+            '    "projects": ["src/App/App.csproj", "tests/App.Tests/App.Tests.csproj"]\n'
+            "  }\n}"
+        ),
+        story=(
+            "The project gate runs `dotnet test App.slnf` and passes: the solution "
+            "filter lists the projects CI builds, and `tests/App.Integration` is "
+            "not among them. The task's verify command runs `dotnet test "
+            "tests/App.Integration/App.Integration.csproj`; naming the project "
+            "reaches past the filter, and that project's fixtures start a "
+            'container the sandbox cannot run, so it fails with "Cannot connect to '
+            'the Docker daemon" on every attempt. '
+            f"{_REMEDY} — the filter the gate names."
+        ),
+    ),
+    ConfigOverrideExample(
+        language="cpp",
+        fence="json",
+        config=(
+            "// CMakePresets.json\n{\n"
+            '  "testPresets": [{\n'
+            '    "name": "default", "configurePreset": "default",\n'
+            '    "filter": { "exclude": { "label": "integration" } }\n'
+            "  }]\n}"
+        ),
+        story=(
+            "The project gate runs `ctest --preset default` and passes: the "
+            "preset's `filter` excludes every test labelled `integration`. The "
+            "task's verify command runs `ctest --test-dir build`; without the "
+            "preset there is no filter, so the labelled tests run too — they "
+            "connect to a broker the sandbox does not have and fail with "
+            '"Connection refused" on every attempt. '
+            f"{_REMEDY}, the preset the gate names."
+        ),
+    ),
+)
+# A JavaScript client resolves as its own toolchain (#627) but its projects
+# read the JavaScript story.
+_EXAMPLE_ALIASES = {"bun": "javascript"}
 
-    The first language in ``languages`` that has an example wins, so a mixed
-    repository reads the example for its primary toolchain; a run whose
-    languages carry none (or no languages at all) reads the Python one, the
-    ecosystem the lint itself checks.
-    """
+
+def _override_examples() -> dict[str, ConfigOverrideExample]:
     by_language = {
         tool.example.language: tool.example
         for tool in CONFIG_SCOPED_TOOLS.values()
         if tool.example is not None
     }
-    for language in languages or ():
+    for example in _STANDALONE_EXAMPLES:
+        by_language[example.language] = example
+    return by_language
+
+
+def config_override_example(languages: Sequence[str] | None = None) -> str:
+    """The rendered config-override example for a run's resolved toolchains.
+
+    Every ecosystem in the toolchain registry has a story of its own (#690):
+    the first language in ``languages`` that carries one wins, so a mixed
+    repository reads the example for its primary toolchain — except that a
+    repository which resolved TypeScript reads the `tsc` story whichever
+    order the set came in, because TypeScript pulls JavaScript in as a
+    requirement and the TypeScript compiler is the gate such a project
+    actually runs. A run with no languages at all reads the Python one, the
+    ecosystem the lint itself checks.
+    """
+    by_language = _override_examples()
+    names = [_EXAMPLE_ALIASES.get(language, language) for language in languages or ()]
+    for language in sorted(names, key=lambda name: name != "typescript"):
         if language in by_language:
             return by_language[language].render()
     return by_language["python"].render()

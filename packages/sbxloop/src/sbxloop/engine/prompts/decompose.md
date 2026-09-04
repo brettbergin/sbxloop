@@ -90,9 +90,9 @@ $repo_conventions
   revision budget against something no revision can fix. They run under
   POSIX `sh -c` (not bash) from the **workspace root**: if the work lands
   in a subdirectory, every command must name it explicitly
-  (`cd app && .venv/bin/pytest`); a bare `test -f requirements.txt` fails
-  when the file lives one level down, and a test runner aimed at a
-  directory holding no project can exit 0 having tested nothing. Write
+  (`cd app && <test runner>`); a bare `test -f <manifest>` fails when the
+  file lives one level down, and a test runner aimed at a directory
+  holding no project can exit 0 having tested nothing. Write
   portable shell — `[ ]` not `[[ ]]`, `printf` for escape sequences, no
   here-strings, and never wrap a check in a shell of its own (no
   `sh -c`, `bash -c`, `sh -lc`, in any quoting: the runner already provides
@@ -135,7 +135,10 @@ $repo_conventions
 - Never pass explicit paths to a config-driven tool whose file set is already
   pinned in the project's configuration (mypy `files`, ruff `include`/`src`,
   pytest `testpaths`; tsc's `include`; rubocop's `AllCops`/`Exclude`; a Go
-  build constraint and the tag that lifts it). An explicit path argument
+  build constraint and the tag that lifts it; mocha's `spec`; a Cargo
+  workspace's `default-members`; surefire's `excludes`; PHPUnit's
+  `<testsuites>`; a .NET solution filter; a CTest preset's `filter`). An
+  explicit path argument
   **overrides the configured file set** and drags in modules the project
   deliberately excludes — build hooks, generated code, vendored trees,
   integration suites — whose dependencies are not installed, so the command
