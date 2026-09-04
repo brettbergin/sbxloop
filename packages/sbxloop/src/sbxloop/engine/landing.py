@@ -101,6 +101,10 @@ class Gated(NamedTuple):
 
 class Blocked(NamedTuple):
     why: str
+    # The base's rules the loop cannot satisfy, one per rule (#673) —
+    # empty when the block is not about the base's rules, or they could
+    # not be read.
+    blockers: tuple[str, ...] = ()
 
 
 class HumanObjection(NamedTuple):
@@ -819,7 +823,7 @@ def land(
                 blocked_at = head
                 tick("mergeability")
                 continue
-            return Blocked(blocked_reason(policy.requirements, cfg))
+            return blocked_by_base(policy.requirements, cfg, can_sign=bool(is_bot))
         # #520 step 5: the last gates before the merge are about the review
         # record itself. A run that could not post its approving review has
         # no review on the PR at all (#503), and a PR whose findings are
@@ -875,7 +879,9 @@ def land(
         if outcome.blocked:
             # A bare 405 says "not mergeable" and nothing more. The base's
             # rules say what (#620); GitHub's own words ride along.
-            return Blocked(blocked_reason(policy.requirements, cfg, detail=outcome.reason))
+            return blocked_by_base(
+                policy.requirements, cfg, detail=outcome.reason, can_sign=bool(is_bot)
+            )
         if cfg.delete_branch_on_merge and branch:
             try:
                 ops.branch_delete(repo, branch)
@@ -945,18 +951,48 @@ def _repo_payload(ops: GithubOps, repo: str) -> dict[str, Any] | None:
         return None
 
 
-def blocked_reason(requirements: BaseRequirements, cfg: LandingConfig, *, detail: str = "") -> str:
-    """Why GitHub will not merge a PR whose checks are green (#620): what
-    the base's rules are known to want, else the usual suspects — and
-    the one knob that helps when a review is the bar."""
-    if requirements.requires_reviews:
-        why = (
-            "the base branch requires an approving review, which the loop cannot give "
-            "its own pull request"
+def blocked_by_base(
+    requirements: BaseRequirements,
+    cfg: LandingConfig,
+    *,
+    detail: str = "",
+    can_sign: bool = False,
+) -> Blocked:
+    """The outcome for a PR GitHub will not merge with its checks green:
+    :func:`blocked_reason` as the run's verdict, and the base's blockers
+    (#673) for the event and the transcript."""
+    blockers = base_blockers(requirements, cfg, can_sign=can_sign)
+    return Blocked(blocked_reason(requirements, cfg, detail=detail, can_sign=can_sign), blockers)
+
+
+def base_blockers(
+    requirements: BaseRequirements, cfg: LandingConfig, *, can_sign: bool = False
+) -> tuple[str, ...]:
+    """The base's rules the loop as configured cannot satisfy (#673)."""
+    return tuple(
+        requirements.blockers(can_approve=False, can_sign=can_sign, merge_method=cfg.merge_method)
+    )
+
+
+def blocked_reason(
+    requirements: BaseRequirements,
+    cfg: LandingConfig,
+    *,
+    detail: str = "",
+    can_sign: bool = False,
+) -> str:
+    """Why GitHub will not merge a PR whose checks are green (#620): every
+    rule of the base the loop is known not to satisfy, one per line
+    (#673); else the usual suspects — and the one knob that helps when a
+    review is the bar."""
+    blockers = base_blockers(requirements, cfg, can_sign=can_sign)
+    if blockers:
+        why = "the base branch's rules require what the loop cannot supply:\n" + "\n".join(
+            f"- {reason}" for reason in blockers
         )
-        if cfg.merge_gate != "chat":
-            why += ' — set `[landing] merge_gate = "chat"` to have a person approve from chat'
-    elif requirements.requires_reviews is None:
+        if requirements.approvals_required and cfg.merge_gate != "chat":
+            why += '\n- set `[landing] merge_gate = "chat"` to have a person approve from chat'
+    elif requirements.source == "unknown":
         why = (
             "GitHub reports the pull request as blocked with every check green, and the "
             "base's protection could not be read; the usual causes are a required "
@@ -966,9 +1002,8 @@ def blocked_reason(requirements: BaseRequirements, cfg: LandingConfig, *, detail
     else:
         why = (
             "GitHub reports the pull request as blocked with every check green; the "
-            "base's rules require something the loop cannot supply — a CODEOWNERS "
-            "review, required conversation resolution, a merge queue, or a check the "
-            "loop does not see"
+            "base's rules require something the loop cannot supply — a rule it does not "
+            "read, or a check it does not see"
         )
     if detail:
         why += f" (GitHub: {detail})"

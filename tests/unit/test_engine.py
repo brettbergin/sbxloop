@@ -2404,6 +2404,39 @@ class TestPipeline:
         # read before the merge: 300s of waiting against a 10s budget
         assert engine._waited_s == 300.0
 
+    def test_a_blocked_run_names_every_rule_of_the_base_it_cannot_meet(
+        self, harness: Harness
+    ) -> None:
+        """#673: the base's rulesets are read in full; the run's reason
+        lists each rule the loop cannot satisfy, one per line, and the
+        `run.blocked` event carries them as a list."""
+        fake = FakeGithub()
+        fake.merge_outcomes = [BLOCKED_405]
+        fake.rules = [
+            {
+                "type": "pull_request",
+                "parameters": {
+                    "required_approving_review_count": 1,
+                    "require_last_push_approval": True,
+                },
+            },
+            {"type": "merge_queue"},
+        ]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("land it")
+        assert result.state == "blocked"
+        (blocked,) = self._events(harness, HostEventTypes.RUN_BLOCKED)
+        blockers = blocked.data["blockers"]
+        assert [b.split(",")[0] for b in blockers] == [
+            "the base requires approval of the last push (require_last_push_approval)",
+            "the base requires an approving review",
+            "the base uses a merge queue; the loop merges its pull request directly and "
+            "does not enqueue it",
+        ]
+        assert all(f"\n- {b}" in result.reason for b in blockers)
+        assert '`[landing] merge_gate = "chat"`' in result.reason
+
     def test_landing_405_blocks_and_a_resume_finishes(self, harness: Harness) -> None:
         """A protection rule no round can satisfy hands the PR to a human;
         once they have acted, the run resumes at landing — no decompose, no
@@ -2421,6 +2454,7 @@ class TestPipeline:
         assert not result.succeeded
         (blocked,) = self._events(harness, HostEventTypes.RUN_BLOCKED)
         assert blocked.data["pr"] == 7 and blocked.data["why"] == result.reason
+        assert blocked.data["blockers"] == []  # the base declared no rule the loop misses
         run = engine.store.get_run(result.run_id)
         assert run.state == "blocked" and run.stage == "landing"
         assert run.reason == result.reason

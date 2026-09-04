@@ -94,9 +94,9 @@ class RepoProbe:
     detail: str = ""
     missing_permissions: tuple[str, ...] = ()
     creatable: bool | None = None
-    # Whether the delivery base requires approving reviews to merge — the
-    # repo config that 405s every loop merge. None = unverifiable.
-    review_protected: bool | None = None
+    # The delivery base's rules the loop cannot satisfy (#673) — each one
+    # 405s every loop merge. Empty = none known; None = unverifiable.
+    base_blockers: tuple[str, ...] | None = None
     # The merge methods the repository allows, in the loop's order of
     # preference (#620). None = the payload did not say.
     merge_methods: tuple[MergeMethod, ...] | None = None
@@ -263,15 +263,14 @@ def repo_checks(
                     hard=False,
                 )
             )
-        if result.review_protected:
+        if result.base_blockers:
             rows.append(
                 Check(
                     f"{name} branch protection",
                     False,
-                    "the delivery base requires approving reviews — the loop cannot "
-                    "approve its own pull request, so every merge is refused "
-                    "(HTTP 405) and runs end blocked; drop the required-review rule "
-                    "(incompatible with human-out-of-the-loop operation)",
+                    "the delivery base has rules the loop cannot satisfy, so every merge "
+                    "is refused (HTTP 405) and runs end blocked:\n"
+                    + "\n".join(f"- {reason}" for reason in result.base_blockers),
                     hard=False,
                 )
             )
@@ -386,18 +385,27 @@ def _missing_permissions(data: dict[str, object]) -> tuple[str, ...]:
     return tuple(f"{kind}:write" for kind in REQUIRED_REPO_PERMISSIONS)
 
 
-def _requires_approving_reviews(ops: Any, repo: str, base: str) -> bool | None:
-    """Whether ``base`` requires approving reviews to merge.
+def _base_blockers(
+    ops: GithubOps, repo: str, base: str, config: Config, *, can_sign: bool
+) -> tuple[str, ...] | None:
+    """The rules of ``base`` the loop cannot satisfy (#673).
 
-    That protection is the one repository setting incompatible with
-    human-out-of-the-loop operation: the loop cannot approve its own pull
-    request, so GitHub answers every merge with a 405 and the run ends
-    blocked. Read by :func:`sbxloop.gh.protection.read_base_requirements`
-    — the same reading the landing gate uses for required checks (#611) —
+    A required review is the classic one — the loop cannot approve its own
+    pull request — and a code-owner review, approval of the last push,
+    signed commits, a merge queue or a required deployment refuse a merge
+    the same way (HTTP 405, the run ends blocked). Read by
+    :func:`sbxloop.gh.protection.read_base_requirements` — the same reading
+    the landing gate uses for required checks (#611) — and judged by the
+    same :func:`sbxloop.engine.landing.base_blockers` the run would report.
     ``None`` when GitHub would not say (a token without admin on classic
     protection, say): unverifiable is not a verdict.
     """
-    return read_base_requirements(ops, repo, base).requires_reviews
+    from sbxloop.engine.landing import base_blockers
+
+    requirements = read_base_requirements(ops, repo, base)
+    if requirements.source == "unknown" and not requirements.blockers():
+        return None
+    return base_blockers(requirements, config.landing, can_sign=can_sign)
 
 
 def credential_key(entry: RepoConfig) -> str:
@@ -470,7 +478,18 @@ def sandbox_repo_probe(
             reachable=True,
             detail="reachable, token has the required permissions" if not missing else "reachable",
             missing_permissions=missing,
-            review_protected=_requires_approving_reviews(ops, entry.repo, base) if base else None,
+            base_blockers=(
+                _base_blockers(
+                    ops,
+                    entry.repo,
+                    base,
+                    config,
+                    # A GitHub App's API commits arrive signed by GitHub.
+                    can_sign=box.provisioner.gh_bot_login(entry.repo) is not None,
+                )
+                if base
+                else None
+            ),
             merge_methods=allowed_merge_methods(data),
             missing_labels=_missing_repo_labels(ops, config, entry),
             issues_enabled=has_issues if isinstance(has_issues, bool) else None,

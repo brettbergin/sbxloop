@@ -2613,9 +2613,20 @@ class LoopEngine:
             # follow-ups carry the follow-up label, never the trigger label.
             self._file_followups(p, run)
         elif isinstance(outcome, Blocked):
-            log.warning("run.blocked", run=run_id, pr=number, why=outcome.why)
+            log.warning(
+                "run.blocked",
+                run=run_id,
+                pr=number,
+                why=outcome.why,
+                blockers=list(outcome.blockers),
+            )
             self.bus.emit(
-                HostEventTypes.RUN_BLOCKED, run_id, pr=number, url=run.pr_url, why=outcome.why
+                HostEventTypes.RUN_BLOCKED,
+                run_id,
+                pr=number,
+                url=run.pr_url,
+                why=outcome.why,
+                blockers=list(outcome.blockers),
             )
         return outcome
 

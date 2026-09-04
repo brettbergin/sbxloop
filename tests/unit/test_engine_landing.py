@@ -1133,16 +1133,66 @@ class TestBlockedWithGreenChecks:
     def test_the_reason_names_what_is_known(self) -> None:
         from sbxloop.gh.protection import BaseRequirements
 
-        reviews = BaseRequirements((), True, "protection")
+        reviews = BaseRequirements((), 1, "protection")
         assert "requires an approving review" in blocked_reason(reviews, cfg())
         assert "merge_gate" not in blocked_reason(reviews, cfg(merge_gate="chat"))
         unknown = BaseRequirements(None, None, "unknown")
         assert "could not be read" in blocked_reason(unknown, cfg())
-        none = BaseRequirements((), False, "protection")
+        none = BaseRequirements((), 0, "protection")
         why = blocked_reason(none, cfg(), detail="Pull Request is not mergeable (HTTP 405)")
-        assert "CODEOWNERS" in why and why.endswith(
+        assert "a rule it does not read" in why and why.endswith(
             "(GitHub: Pull Request is not mergeable (HTTP 405))"
         )
+
+    def test_the_reason_lists_every_blocker_one_per_line(self) -> None:
+        """#673: each rule of the base the loop cannot satisfy is its own
+        line; the fatal last-push rule comes first, and the merge-gate hint
+        is one more line when a review is among them."""
+        from sbxloop.gh.protection import BaseRequirements
+
+        rules = BaseRequirements(
+            (),
+            2,
+            "rulesets",
+            code_owner_review=True,
+            last_push_approval=True,
+            signed_commits=True,
+            merge_queue=True,
+            required_deployments=("staging",),
+        )
+        why = blocked_reason(rules, cfg(merge_method="merge"), detail="HTTP 405")
+        lines = why.split("\n")
+        assert lines[0] == "the base branch's rules require what the loop cannot supply:"
+        assert lines[1].startswith("- the base requires approval of the last push")
+        assert lines[2].startswith("- the base requires 2 approving reviews")
+        assert lines[3].startswith("- the base requires a review from a code owner")
+        assert lines[4].startswith("- the base requires signed commits")
+        assert lines[5].startswith("- the base uses a merge queue")
+        assert lines[6].startswith("- the base requires a successful deployment to staging")
+        assert lines[7].startswith('- set `[landing] merge_gate = "chat"`')
+        assert why.endswith("(GitHub: HTTP 405)")
+        # Signing is the credential's to satisfy; a linear-history rule only
+        # blocks a merge commit.
+        signed = BaseRequirements((), 0, "rulesets", signed_commits=True, linear_history=True)
+        assert blocked_reason(signed, cfg(merge_method="squash"), can_sign=True).startswith(
+            "GitHub reports the pull request as blocked"
+        )
+        assert "linear history" in blocked_reason(signed, cfg(merge_method="merge"), can_sign=True)
+
+    def test_a_blocked_outcome_carries_the_blockers(self) -> None:
+        fake = FakeGithub()
+        fake.pr["mergeable_state"] = "blocked"
+        fake.rules = [
+            {"type": "pull_request", "parameters": {"require_last_push_approval": True}},
+            {"type": "merge_queue"},
+        ]
+        lp = Landing(fake)
+        outcome = lp.run(policy_for=lp.against_base())
+        assert isinstance(outcome, Blocked)
+        assert len(outcome.blockers) == 2
+        assert outcome.blockers[0].startswith("the base requires approval of the last push")
+        assert outcome.blockers[1].startswith("the base uses a merge queue")
+        assert all(f"- {b}" in outcome.why for b in outcome.blockers)
 
     def test_a_405_on_the_merge_is_rewritten_with_the_bases_rules(self) -> None:
         fake = FakeGithub()
