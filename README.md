@@ -440,6 +440,54 @@ A `[[github.repos]]` entry can set either key for its own runs; a set value
 replaces the `[sandbox]` one, so a repository that needs no secret says
 `secret_env = []`.
 
+### Private package registries
+
+A repository whose `.npmrc` points at Artifactory, whose Python index is
+private, or whose Go modules live on an internal host cannot install its
+dependencies from the public baseline — so no gate can pass. `[[registries]]`
+(#680) declares each such registry once and does both halves of the job: the
+`host` joins the agent sandbox's network allowlist (like
+`extra_allow_domains`, and in bounds for a plan that names it), and the
+ecosystem's client configuration is written into the sandbox before the
+worker installs, so the tooling actually uses it:
+
+```toml
+[[registries]]
+kind = "npm"                 # npm | pypi | go | cargo | maven | nuget | gem | generic
+host = "artifactory.example.com"
+url = "https://artifactory.example.com/api/npm/npm-virtual/"
+auth_env = "NPM_TOKEN"       # a daemon-environment variable, delivered like secret_env
+scope = "@example"           # npm only: this scope; unset = the default registry
+
+[[registries]]
+kind = "go"
+host = "github.example.com"  # → GOPRIVATE=github.example.com
+```
+
+| kind      | writes                                                                                                                                                      |
+| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `npm`     | `~/.npmrc`: `@scope:registry=` (or `registry=`) and `//host/path/:_authToken=${AUTH_ENV}`; read by npm, pnpm and yarn classic                               |
+| `pypi`    | `PIP_INDEX_URL` and `UV_DEFAULT_INDEX` — the registry *is* the index, so point it at a virtual/group repository that proxies PyPI; credential in `~/.netrc` |
+| `go`      | `GOPRIVATE` naming the host (every `go` entry joins it); credential in `~/.netrc` for the git fetch                                                         |
+| `cargo`   | `~/.cargo/config.toml` `[registries.NAME]` with a sparse index; token in `CARGO_REGISTRIES_<NAME>_TOKEN`                                                    |
+| `maven`   | `~/.m2/settings.xml`: a `<mirror>` of `*` and a `<server>` whose password is `${env.AUTH_ENV}`; Gradle does not read it                                     |
+| `nuget`   | `~/.nuget/NuGet/NuGet.Config`: a package source plus credentials referencing `%AUTH_ENV%`; nuget.org stays unless the repository clears it                  |
+| `gem`     | `BUNDLE_<HOST>=user:token` for bundler; with `url`, `~/.gemrc` lists it as the gem source                                                                   |
+| `generic` | nothing but the allowlist entry, plus `~/.netrc` when `auth_env` is set                                                                                     |
+
+`auth_env` is a secret in every sense `secret_env` is: read from the daemon's
+environment at provision time, unset names fail provisioning before a sandbox
+boots (the `sandbox secret env` row of `sbxloop doctor` lists them), and the
+value never rides an `sbx` argument, an event, or a log line. Wherever the
+ecosystem expands environment variables in its own config the client file
+names the variable and holds no secret; the netrc kinds (`pypi`, `go`,
+`generic`) have no such form, so `~/.netrc` holds the value at rest, 0600, in
+a VM the agent owns anyway — those kinds pair it with `auth_user`, the login
+the registry expects beside the token. A derived variable a repository sets
+in `[sandbox] env` (its own `GOPRIVATE`) wins over the registry's. A
+`[[github.repos]]` entry may carry its own `registries` list, which replaces
+the top-level one.
+
 ## The daemon: an always-on outer loop
 
 `sbxloop daemon` is deliberately small. It polls the one configured
@@ -1604,6 +1652,7 @@ The notable knobs:
 | `[sandbox] clone_filter`                                  | unset              | Git partial-clone filter (`"blob:none"`) for the credential-free remote clone of a repository with no host checkout; opt-in, see the clone section for the lazy-fetch hazard.                                                                                                                                                                                      |
 | `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                                                                                                                                                                                                         |
 | `[sandbox] env` / `secret_env`                            | `{}` / `[]`        | Environment for the agent sandbox's worker and everything it runs: plain values, and names whose values come from the daemon's environment (delivered like the credential, never logged). Per-repo overridable; see "Environment for the agent sandbox".                                                                                                           |
+| `[[registries]]`                                          | none               | Private package registries: each entry opens `host` for the agent sandbox and writes the ecosystem's client config (`~/.npmrc`, `PIP_INDEX_URL`, `GOPRIVATE`, `~/.cargo/config.toml`, `settings.xml`, `NuGet.Config`, `BUNDLE_*`); `auth_env` is delivered like `secret_env`. Per-repo overridable; see "Private package registries".                              |
 | `[sandbox] languages`                                     | detected           | Toolchains pre-installed in the agent sandbox; unset = detect from the workspace's manifests, `python` if none (see below).                                                                                                                                                                                                                                        |
 | `[policy] allow` / `deny`                                 | `[]`               | Bounds for task-declared egress.                                                                                                                                                                                                                                                                                                                                   |
 | `[github] repo`                                           | unset              | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public`, `pr_title_template`, `commit_message_template`, `branch_prefix`, `bot_login` beside it.                                                                                                                                     |

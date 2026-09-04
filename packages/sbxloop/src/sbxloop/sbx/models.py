@@ -59,6 +59,11 @@ class SandboxSpec(BaseModel):
     # only the credential's non-proxy road — per-job stdin, or the 0600 env
     # file — and never an `sbx` argument, an event, or a log line.
     secret_env: dict[str, str] = Field(default_factory=dict)
+    # Client files for the configured registries (`[[registries]]`, #680):
+    # in-VM path → contents, delivered with `sbx cp` and chmod 600. The
+    # `.netrc` kinds carry a credential in the text, so a spec is as
+    # sensitive as its secret_env.
+    files: dict[str, str] = Field(default_factory=dict)
 
 
 class SandboxInfo(BaseModel):

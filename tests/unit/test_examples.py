@@ -373,6 +373,8 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             parsed = tomllib.loads(f"{key} = {value}")
         except tomllib.TOMLDecodeError:
             continue  # a multi-line value (the exclude list); covered below
+        if section == "registries":
+            continue  # array-of-tables entries load as whole blocks, below
         if section == "github.repos":
             doc: dict[str, Any] = {"github": {"repos": [{"repo": "you/your-repo", **parsed}]}}
         elif section == "github":
@@ -390,3 +392,23 @@ def test_every_commented_key_is_a_real_config_key() -> None:
         Config.model_validate(doc)
         checked += 1
     assert checked > 50, f"expected the example to document many keys, saw {checked}"
+
+
+def test_example_registry_entries_load_together() -> None:
+    """A `[[registries]]` entry's keys are coupled by `kind` (a go entry takes
+    no url, a pypi entry needs auth_user), so the commented entries are
+    validated as whole blocks — uncommenting all of them loads as one list."""
+    blocks: list[str] = []
+    for line in EXAMPLE.read_text().splitlines():
+        stripped = re.sub(r"^#\s?", "", line)
+        if stripped == "[[registries]]":
+            blocks.append("")
+        elif blocks and line.startswith("#") and re.match(r"^[a-z_]+ = ", stripped):
+            blocks[-1] += stripped + "\n"
+        elif blocks and not line.strip():
+            break
+    entries = [tomllib.loads(block) for block in blocks]
+    assert len(entries) >= 4
+    assert {entry["kind"] for entry in entries} >= {"npm", "pypi", "cargo", "go"}
+    config = Config.model_validate({"registries": entries})
+    assert [r.kind for r in config.registries] == [entry["kind"] for entry in entries]

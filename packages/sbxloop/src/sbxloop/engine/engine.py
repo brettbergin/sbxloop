@@ -701,7 +701,12 @@ class LoopEngine:
                         pair=pair,
                         phases=phases,
                         granter=EgressGranter(
-                            self.sbx, self.config, self.bus, run_id, pair.agent.name
+                            self.sbx,
+                            self.config,
+                            self.bus,
+                            run_id,
+                            pair.agent.name,
+                            repo=self.config.github.repo,
                         ),
                         deadline=deadline,
                         ops=ops,

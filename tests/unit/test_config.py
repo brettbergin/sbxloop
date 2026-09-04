@@ -851,6 +851,91 @@ class TestConfigDiscovery:
         assert config.sandbox.languages == ["go"]
 
 
+class TestRegistries:
+    """`[[registries]]` (#680): private package registries, per repository."""
+
+    def test_unset_by_default(self, tmp_path: Path) -> None:
+        config = load_config(cwd=tmp_path, env={})
+        assert config.registries == []
+        assert config.registries_for(None) == []
+        assert config.registry_auth_envs_for(None) == []
+
+    def test_entries_parse_and_auth_envs_are_collected(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[[registries]]\n"
+            'kind = "npm"\n'
+            'host = "artifactory.example.com"\n'
+            'url = "https://artifactory.example.com/api/npm/npm-virtual/"\n'
+            'auth_env = "NPM_TOKEN"\n'
+            'scope = "@example"\n'
+            "\n"
+            "[[registries]]\n"
+            'kind = "go"\n'
+            'host = "github.example.com"\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        assert [r.kind for r in config.registries] == ["npm", "go"]
+        assert config.registries[0].scope == "@example"
+        assert config.registry_auth_envs_for(None) == ["NPM_TOKEN"]
+
+    def test_a_repository_override_replaces_the_global_list(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[[registries]]\n"
+            'kind = "go"\n'
+            'host = "github.example.com"\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "owner/inherits"\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "owner/own"\n'
+            "[[github.repos.registries]]\n"
+            'kind = "pypi"\n'
+            'host = "pypi.example.com"\n'
+            'url = "https://pypi.example.com/simple"\n'
+            'auth_env = "PYPI_TOKEN"\n'
+            'auth_user = "svc"\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "owner/none"\n'
+            "registries = []\n"
+        )
+        config = load_config(cwd=tmp_path, env={})
+        assert [r.host for r in config.registries_for("owner/inherits")] == ["github.example.com"]
+        assert [r.host for r in config.registries_for("owner/own")] == ["pypi.example.com"]
+        assert config.registry_auth_envs_for("owner/own") == ["PYPI_TOKEN"]
+        assert config.registries_for("owner/none") == []
+
+    def test_one_default_per_ecosystem(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[[registries]]\n"
+            'kind = "pypi"\n'
+            'host = "a.example.com"\n'
+            'url = "https://a.example.com/simple"\n'
+            "[[registries]]\n"
+            'kind = "pypi"\n'
+            'host = "b.example.com"\n'
+            'url = "https://b.example.com/simple"\n'
+        )
+        with pytest.raises(ConfigError, match="more than one 'pypi' registry"):
+            load_config(cwd=tmp_path, env={})
+
+    def test_a_credential_name_cannot_also_be_plain_env(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[sandbox]\n"
+            'env = { NPM_TOKEN = "literal" }\n'
+            "[[registries]]\n"
+            'kind = "npm"\n'
+            'host = "a.example.com"\n'
+            'url = "https://a.example.com/npm/"\n'
+            'auth_env = "NPM_TOKEN"\n'
+        )
+        with pytest.raises(
+            ConfigError, match=r"env and a registry's auth_env both name \['NPM_TOKEN'\]"
+        ):
+            load_config(cwd=tmp_path, env={})
+
+
 class TestSandboxEnv:
     """`[sandbox] env` / `secret_env` (#679): plain values and names whose
     values the daemon's environment holds, per repository."""

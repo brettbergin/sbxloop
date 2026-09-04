@@ -64,6 +64,7 @@ from sbxloop.gh.appauth import (
 from sbxloop.ids import branch_name
 from sbxloop.log import get_logger
 from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
+from sbxloop.sbx import registries
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import (
     PROBE_EXEC_STDIN_ENV,
@@ -277,8 +278,11 @@ def dedupe_domains(domains: Iterable[str]) -> list[str]:
     return seen
 
 
-def agent_policy_allows(config: Config, languages: Sequence[str]) -> list[str]:
-    """The agent sandbox's network allowlist for ``languages``.
+def agent_policy_allows(
+    config: Config, languages: Sequence[str], repo: str | None = None
+) -> list[str]:
+    """The agent sandbox's network allowlist for ``languages`` (and
+    ``repo``'s private registries, #680).
 
     The one builder behind a run's agent spec, the daemon's concierge
     sandbox and the bake's scratch sandbox (#615): what a template is baked
@@ -310,6 +314,10 @@ def agent_policy_allows(config: Config, languages: Sequence[str]) -> list[str]:
             *config.github.allow_domains,
             *((ANTHROPIC_TOKEN_HOST,) if claude else ()),
             *baseline_allows((*PROMPT_ADVERTISED_DOMAINS, *installers), config.policy.deny),
+            # Operator-declared hosts: a private registry the operator
+            # configured is reachable like extra_allow_domains is, deny or
+            # not — the config names it on purpose.
+            *registries.domains(config.registries_for(repo)),
             *config.sandbox.extra_allow_domains,
         ]
     )
@@ -396,10 +404,11 @@ class Provisioner:
             role="agent",
             workspace=workspace,
             template=template,
-            policy_allows=agent_policy_allows(self.config, languages),
+            policy_allows=agent_policy_allows(self.config, languages, repo),
             secrets=[self._agent_secret_spec()],
             persistent_env=self.agent_persistent_env(repo),
             secret_env=self.agent_secret_env(repo),
+            files=self.agent_files(repo),
         )
         github = SandboxSpec(
             name=sandbox_name(run_id, "github"),
@@ -455,8 +464,11 @@ class Provisioner:
         """The plain environment the agent sandbox's worker — and so every
         agent turn and shell command it spawns — starts with.
 
-        The repository's ``[sandbox] env`` (#679) first, the loop's own
-        selector last so nothing an operator writes can shadow it. The
+        What the repository's private registries need (``GOPRIVATE``,
+        ``PIP_INDEX_URL``; #680) first, the repository's ``[sandbox] env``
+        (#679) over it — an operator's explicit value wins over a derived
+        one — and the loop's own selector last so nothing an operator
+        writes can shadow it. The
         worker resolves its backend from ``SBXLOOP_WORKER_BACKEND`` (default
         copilot), so only the claude backend needs it delivered;
         ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`` keeps the Claude Code
@@ -464,7 +476,10 @@ class Provisioner:
         balanced network policy would only refuse. Nothing secret goes here
         — see :meth:`agent_secret_env`.
         """
-        env: dict[str, str] = dict(self.config.sandbox_env_for(repo))
+        env: dict[str, str] = {
+            **registries.plain_env(self.config.registries_for(repo)),
+            **self.config.sandbox_env_for(repo),
+        }
         if self.agent_backend() == "claude":
             env["SBXLOOP_WORKER_BACKEND"] = "claude"
             env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
@@ -472,7 +487,8 @@ class Provisioner:
 
     def agent_secret_env(self, repo: str | None = None) -> dict[str, str]:
         """The ``[sandbox] secret_env`` values for ``repo``'s runs, read from
-        the daemon's environment (#679).
+        the daemon's environment (#679), plus what its private registries'
+        ``auth_env`` credentials derive (#680).
 
         They ride the credential's non-proxy road — per-job stdin when this
         sbx passes it through, the 0600 in-VM env file otherwise — and never
@@ -488,15 +504,29 @@ class Provisioner:
         inside the sandbox, for a reason no log line names. Raises
         ProvisionError listing the unset names.
         """
-        names = self.config.secret_env_for(repo)
+        names = list(
+            dict.fromkeys(
+                [*self.config.secret_env_for(repo), *self.config.registry_auth_envs_for(repo)]
+            )
+        )
         missing = [name for name in names if not self.env.get(name)]
         if missing:
             raise ProvisionError(
-                f"[sandbox] secret_env names {missing} are not set in the daemon's "
-                "environment (secrets.env / the service unit); set them or remove "
-                "them from secret_env"
+                f"[sandbox] secret_env / [[registries]] auth_env names {missing} are not "
+                "set in the daemon's environment (secrets.env / the service unit); set "
+                "them or remove them from the config"
             )
-        return {name: self.env[name] for name in names}
+        values = {name: self.env[name] for name in names}
+        return {**values, **registries.secret_env(self.config.registries_for(repo), values)}
+
+    def agent_files(self, repo: str | None = None) -> dict[str, str]:
+        """The registry client files for ``repo``'s agent sandbox (#680);
+        the netrc kinds embed the credential, so this raises like
+        :meth:`agent_secret_env` when one is unset."""
+        regs = self.config.registries_for(repo)
+        if not regs:
+            return {}
+        return {f.path: f.text for f in registries.client_files(regs, self.agent_secret_env(repo))}
 
     def _agent_secret_spec(self) -> SecretSpec:
         env, host = self.backend().secret
@@ -1038,6 +1068,7 @@ class Provisioner:
                 # (it folds persistent_env in itself), so it must have the
                 # last word.
                 self._verify_secret_env(run_id, spec, sandbox, tokens[spec.role])
+            self._apply_files(spec, sandbox)
             sandbox.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR, TOOLS_DIR)
             if self.post_create is not None:
                 self.post_create(sandbox, spec.role)
@@ -1171,6 +1202,7 @@ class Provisioner:
             secrets=[self._agent_secret_spec()],
             persistent_env=self.agent_persistent_env(),
             secret_env=self.agent_secret_env(),
+            files=self.agent_files(),
         )
 
     def ensure_github_only(
@@ -1256,6 +1288,7 @@ class Provisioner:
                 registered_secret_rms.extend(self._apply_secrets(spec, created, token))
                 self._apply_persistent_env(spec, created)
                 self._verify_secret_env(label, spec, created, token)
+            self._apply_files(spec, created)
             created.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR, TOOLS_DIR)
             hook = post_create or self.post_create
             if hook is not None:
@@ -1812,6 +1845,17 @@ class Provisioner:
             message=f"workspace mount not found in VM; {outcome}",
         )
         return None, "mount discovery found no marker under any candidate root"
+
+    def _apply_files(self, spec: SandboxSpec, sandbox: Sandbox) -> None:
+        """Write the spec's registry client files (#680): staged in with
+        ``sbx cp`` (the contents never touch an argv) and made 0600, since
+        the netrc kinds hold a credential. Before the worker install and
+        any toolchain — a toolchain installer creates its own directory
+        beside these files and leaves them alone."""
+        for path, text in spec.files.items():
+            sandbox.exec(["mkdir", "-p", path.rsplit("/", 1)[0]])
+            sandbox.write_text(path, text)
+            sandbox.exec(["chmod", "600", path])
 
     def _apply_persistent_env(self, spec: SandboxSpec, sandbox: Sandbox) -> None:
         """Write the spec's non-secret environment into the VM's env file.

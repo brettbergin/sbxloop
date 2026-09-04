@@ -177,6 +177,16 @@ that carries the agent's own credential puts them in the env file afterwards
 argument, an event field or a log line; a name the daemon does not hold fails
 provisioning before any sandbox boots.
 
+Private registries (`[[registries]]`, #680) build on both roads. The host joins
+the agent allowlist beside `extra_allow_domains` — in `agent_policy_allows`, the
+plan-validation bounds and the granter's already-granted set alike, so a plan
+naming it neither fails nor re-grants. The client files ride `SandboxSpec.files`
+and are staged with `sbx cp` then chmod 600 after the credential delivery step,
+before the worker install; the credential itself is one more `secret_env` name,
+so it takes exactly the tiers above, and wherever the ecosystem's client
+expands environment variables the file references it by name. Only the netrc
+kinds hold a value at rest, and only in the agent's own VM.
+
 ### GitHub App installation auth (#568)
 
 `GITHUB_APP_ID` + `GITHUB_APP_INSTALLATION_ID` +

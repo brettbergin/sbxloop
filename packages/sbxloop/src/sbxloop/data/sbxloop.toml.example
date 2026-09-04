@@ -114,6 +114,42 @@ secret_strategy = "proxy"
 # env = { RAILS_ENV = "test", DATABASE_URL = "postgres://localhost/app_test" }
 # secret_env = ["NPM_TOKEN", "PIP_INDEX_URL"]
 
+# Private package registries. Each entry opens its `host` for the
+# agent sandbox AND writes the ecosystem's client config so its tooling
+# uses the registry: ~/.npmrc for npm (pnpm, yarn classic), PIP_INDEX_URL +
+# UV_DEFAULT_INDEX for pypi, GOPRIVATE for go, ~/.cargo/config.toml for
+# cargo, ~/.m2/settings.xml for maven, NuGet.Config for nuget, BUNDLE_* for
+# gem; `generic` opens a host only. `auth_env` names the daemon-environment
+# variable holding the credential — delivered like `secret_env` above and
+# referenced by NAME from the client file wherever the tool expands
+# environment variables (npm, maven, nuget, cargo, bundler); the netrc kinds
+# (pypi, go, generic) pair it with `auth_user` in a 0600 ~/.netrc. pypi and
+# maven make the registry THE source (point them at a virtual/group
+# repository that proxies the public index); npm with `scope` serves that
+# scope only. A [[github.repos]] entry may set its own `registries` list,
+# which replaces this one.
+# [[registries]]
+# kind = "npm"                          # npm | pypi | go | cargo | maven | nuget | gem | generic
+# host = "artifactory.example.com"
+# url = "https://artifactory.example.com/api/npm/npm-virtual/"
+# auth_env = "NPM_TOKEN"
+# scope = "@example"                    # npm only: serve this scope, leave the rest on npmjs
+# [[registries]]
+# kind = "pypi"
+# host = "artifactory.example.com"
+# url = "https://artifactory.example.com/api/pypi/pypi-virtual/simple/"
+# auth_env = "PYPI_TOKEN"
+# auth_user = "ci-bot"                  # the login beside the token (netrc kinds, maven, nuget, gem)
+# [[registries]]
+# kind = "cargo"
+# host = "artifactory.example.com"
+# url = "sparse+https://artifactory.example.com/api/cargo/cargo-local/index/"
+# auth_env = "CARGO_TOKEN"
+# name = "company"                      # cargo/maven/nuget: the registry's name in the client config
+# [[registries]]
+# kind = "go"
+# host = "github.example.com"           # → GOPRIVATE=github.example.com
+
 # [policy]
 # Bounds for plan-declared egress. At PLAN time the agent may declare extra
 # domains a task needs during EXECUTE (each with a justification); they are
@@ -219,6 +255,7 @@ secret_strategy = "proxy"
 # review_notify = ["<chat user id>"] # pinged when a PR waits for a review; unset uses [landing]'s
 # env = { RAILS_ENV = "test" }     # agent-sandbox environment; a set value REPLACES [sandbox]'s
 # secret_env = []                  # names read from the daemon env; [] = this repo needs none
+# registries = []                  # private registries; a set list REPLACES the top-level [[registries]]
 # [[github.repos]]
 # repo = "you/other-repo"
 # enabled = false              # registered but not polled
