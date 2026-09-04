@@ -415,9 +415,13 @@ GITIGNORED = "gitignored"
 def scan_artifacts(
     root: Path, exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES, *, gitignore: bool = True
 ) -> ArtifactScan:
-    """Regular files under root, sorted for stable output, partitioned into
-    kept files and per-entry counts of files whose path contains an excluded
-    component (at any depth, so vendored nested .git dirs are caught too).
+    """Regular files and symlinks under root, sorted for stable output,
+    partitioned into kept files and per-entry counts of files whose path
+    contains an excluded component (at any depth, so vendored nested .git
+    dirs are caught too). A symlink is kept as the link itself — whatever
+    it points at, resolving or not — because that is what git tracks and
+    what a snapshot delivery must reproduce (#695); nothing is followed
+    into a symlinked directory.
 
     Entries containing a glob metacharacter match components via fnmatch
     (``*.egg-info`` — dynamically named directories that no exact name can
@@ -430,7 +434,7 @@ def scan_artifacts(
     ``.gitignore`` does (#249). Name-based entries take precedence in the
     tally; ``exclude`` stays the operator's override on top of both.
     """
-    candidates = [p for p in sorted(root.rglob("*")) if p.is_file()]
+    candidates = [p for p in sorted(root.rglob("*")) if p.is_symlink() or p.is_file()]
     ignored: frozenset[str] = frozenset()
     if gitignore and ((root / ".git").exists() or any(p.name == ".gitignore" for p in candidates)):
         # Local import: hostgit pulls in GitPython, which this pure model

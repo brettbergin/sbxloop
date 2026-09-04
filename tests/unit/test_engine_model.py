@@ -216,6 +216,25 @@ class TestArtifactFiles:
         assert tuple(echoed.exclude) == DEFAULT_ARTIFACT_EXCLUDES
 
 
+class TestSymlinksInScan:
+    """#695: a symlink is an artifact in its own right — git tracks the link,
+    so the scan keeps it as itself, target resolving or not — and nothing is
+    followed into a symlinked directory."""
+
+    def test_symlinks_are_kept_as_themselves(self, tmp_path: Path) -> None:
+        root = tmp_path / "ws"
+        (root / "shared").mkdir(parents=True)
+        (root / "shared" / "a.txt").write_text("a\n")
+        (root / "cfg.txt").write_text("c\n")
+        (root / "cfg.link").symlink_to("cfg.txt")
+        (root / "shared.link").symlink_to("shared")
+        (root / "dangling").symlink_to("nowhere")
+        rels = [p.relative_to(root).as_posix() for p in artifact_files(root)]
+        assert rels == ["cfg.link", "cfg.txt", "dangling", "shared/a.txt", "shared.link"]
+        # the directory symlink is listed once, not walked into
+        assert "shared.link/a.txt" not in rels
+
+
 class TestDefaultBuildOutputExcludes:
     """The default denylist covers regenerable dependency/build trees for the
     supported languages, and deliberately leaves ambiguous generic names in."""

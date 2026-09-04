@@ -151,7 +151,27 @@ ChangeStatus = Literal["added", "modified", "deleted"]
 
 
 GITLINK_MODE = "160000"
+SYMLINK_MODE = "120000"
+EXECUTABLE_MODE = "100755"
+REGULAR_MODE = "100644"
 _NULL_SHA = "0" * 40
+
+
+def tree_mode(full: Path) -> str:
+    """The git tree mode ``git add`` would record for a path on disk:
+    ``120000`` for a symlink (whatever it points at, or whether it resolves),
+    ``100755`` for an executable, ``100644`` otherwise. Shared by the
+    git-diff and snapshot delivery plans (#695) so neither flattens what
+    the other keeps."""
+    if full.is_symlink():
+        return SYMLINK_MODE
+    return EXECUTABLE_MODE if full.stat().st_mode & 0o111 else REGULAR_MODE
+
+
+def blob_content(full: Path, mode: str) -> bytes:
+    """What the blob for ``full`` uploads: a symlink's target string (git
+    stores the link, not what it points at), a file's bytes otherwise."""
+    return str(full.readlink()).encode() if mode == SYMLINK_MODE else full.read_bytes()
 
 
 @dataclass(frozen=True)
@@ -1321,14 +1341,11 @@ def _describe_change(repo_path: Path, path: str, git_status: str) -> WorkspaceCh
         return WorkspaceChange(path=path, status="deleted", mode="")
     status: ChangeStatus = "added" if git_status.startswith("A") else "modified"
     full = repo_path / path
-    if full.is_symlink():
-        return WorkspaceChange(path=path, status=status, mode="120000")
-    if not full.is_file():
+    if not full.is_symlink() and not full.is_file():
         # Gone from disk but still in the index (rm without git rm): git
         # diff against a commit still lists it; the tree must drop it.
         return WorkspaceChange(path=path, status="deleted", mode="")
-    executable = bool(full.stat().st_mode & 0o111)
-    return WorkspaceChange(path=path, status=status, mode="100755" if executable else "100644")
+    return WorkspaceChange(path=path, status=status, mode=tree_mode(full))
 
 
 def _fetch_branch_from_source(clone: Repo, source: Path, branch: str) -> None:

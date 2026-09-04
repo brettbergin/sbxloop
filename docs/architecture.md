@@ -422,7 +422,11 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
 - **DELIVER** — the tree becomes one commit on `sbxloop/<run>` (the
   prefix, the PR title and the commit message are `[github]` templates)
   and a draft PR (see [Delivery](#delivery)); every later round re-delivers
-  onto the same branch, so one run is one PR. The repository's own
+  onto the same branch, so one run is one PR. A checkout delivers its git
+  diff against the base, a history-less workspace a snapshot, and both
+  go through one tree builder (`deliver._blob_upload`, #695) that keeps
+  exec bits (`100755`) and symlinks (`120000`) as `hostgit.tree_mode`
+  reads them from disk. The repository's own
   conventions shape the PR (#678): `deliver.pr_template` opens the body
   with the repository's pull request template, the agent's
   `.sbxloop/pr-body` (read from the workspace by `exec`, like

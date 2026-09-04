@@ -1301,7 +1301,12 @@ GitHub App installation — see [GitHub App auth](#github-app-auth).
 
 **Delivery** is one atomic commit via the git data API on branch
 `sbxloop/<run>`, opened as a draft pull request, with the harvested tree
-filtered by `[artifacts] exclude`. Every fix round re-delivers onto the same
+filtered by `[artifacts] exclude`. A run clone delivers its `git diff`
+against the base — deletions and renames included; a workspace without a
+git history delivers a snapshot of the tree. Either way the tree records
+what is on disk (#695): an executable script arrives `100755` and a symlink
+arrives as a symlink (`120000`, its target as the content), never flattened
+to a plain file. Every fix round re-delivers onto the same
 branch — force-moved, the open PR reused — so one run is one PR, and
 `sbxloop resume <run>` at `delivering` is the retry path when a delivery
 failed. The PR's description is the repository's own pull request template

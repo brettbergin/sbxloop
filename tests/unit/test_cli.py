@@ -316,6 +316,20 @@ class TestArtifactsCommand:
         assert ".gitignore" in result.output
         assert "1 file(s) excluded (.git)" in result.output
 
+    def test_symlinks_list_as_themselves(self, workdir: Path) -> None:
+        """#695: a symlink — even one that does not resolve — is an
+        artifact, listed in both shapes rather than crashing the listing."""
+        workspace = self.seed_with_workspace(workdir, mounted=True)
+        (workspace / "cfg.yml").write_text("a: 1\n")
+        (workspace / "cfg.link").symlink_to("cfg.yml")
+        (workspace / "dangling").symlink_to("nowhere")
+        for flag in ([], ["--tree"]):
+            result = runner.invoke(app, ["artifacts", "rseeded11", *flag])
+            assert result.exit_code == 0, result.output
+            assert "3 file(s)" in result.output
+            assert "cfg.link" in result.output
+            assert "dangling" in result.output
+
     def test_missing_directory_errors(self, workdir: Path) -> None:
         workspace = self.seed_with_workspace(workdir, mounted=True)
         workspace.rmdir()

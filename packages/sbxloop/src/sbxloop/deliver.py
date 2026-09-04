@@ -13,13 +13,19 @@ Two ways of building that tree (#248):
   from ``hostgit.clone_for_run``, or an in-place checkout), only what the
   run changed relative to its base commit is committed: added/modified
   files as blobs with their real mode (``100755`` kept), deletions as
-  ``sha: null`` tree entries. A snapshot overlay could never delete or
-  rename a file and flipped every executable to ``100644`` — silently
-  wrong PRs against an existing repository, the one failure a reviewer
-  may not notice.
+  ``sha: null`` tree entries. A snapshot overlay can never delete or
+  rename a file — silently wrong PRs against an existing repository, the
+  one failure a reviewer may not notice.
 - **snapshot** — every kept file layered onto the base tree; the right
   answer for greenfield workspaces (no git history to diff against), and
   the fallback when a checkout carries no usable base commit.
+
+Both plans record what is on disk (#695): an executable script is
+``100755`` and a symlink is ``120000`` with its target as content,
+whichever way the tree was built — a harvested ``bin/`` entrypoint used to
+arrive non-executable and a symlinked config de-linked, because the
+snapshot wrote ``100644`` for everything. ``FILE_MODE`` remains only for
+deletions, where the mode is a formality.
 
 Scaffold status: this is a real, unit-tested code path (stubbed GithubOps),
 but per the project pattern — unverified external behaviors get a seam and
@@ -657,14 +663,35 @@ def _plan_snapshot(source_dir: Path, exclude: Sequence[str]) -> DeliveryPlan:
     scan = scan_artifacts(source_dir, exclude)
     if not scan.files:
         raise DeliveryError(f"nothing to deliver: no files in {source_dir}")
-    rel = [f.relative_to(source_dir).as_posix() for f in scan.files]
+    changes = [
+        hostgit.WorkspaceChange(
+            path=f.relative_to(source_dir).as_posix(), status="added", mode=hostgit.tree_mode(f)
+        )
+        for f in scan.files
+    ]
+    entries: list[dict[str, Any]] = []
+    uploads: dict[str, bytes] = {}
+    for change in changes:
+        entry, content = _blob_upload(source_dir, change)
+        entries.append(entry)
+        uploads[change.path] = content
     return DeliveryPlan(
         mode="snapshot",
-        entries=[{"path": path, "mode": FILE_MODE, "type": "blob"} for path in rel],
-        uploads={path: file.read_bytes() for path, file in zip(rel, scan.files, strict=True)},
-        lines=[f"- `{path}`" for path in rel],
+        entries=entries,
+        uploads=uploads,
+        lines=[f"- `{change.path}`" for change in changes],
         excluded_note=scan.excluded_note,
     )
+
+
+def _blob_upload(source_dir: Path, change: hostgit.WorkspaceChange) -> tuple[dict[str, Any], bytes]:
+    """The tree entry and blob content for an added or modified path — the
+    one tree builder both plans share (#695), so a symlink uploads its
+    target string under ``120000`` and an executable keeps ``100755``
+    whether the plan came from ``git diff`` or a walk of the tree."""
+    full = source_dir / change.path
+    entry = {"path": change.path, "mode": change.mode, "type": "blob"}
+    return entry, hostgit.blob_content(full, change.mode)
 
 
 def _plan_git_diff(source_dir: Path, base_sha: str, exclude: Sequence[str]) -> DeliveryPlan | None:
@@ -717,11 +744,9 @@ def _plan_git_diff(source_dir: Path, base_sha: str, exclude: Sequence[str]) -> D
         if change.status == "deleted":
             entries.append({"path": change.path, "mode": FILE_MODE, "type": "blob", "sha": None})
             continue
-        entries.append({"path": change.path, "mode": change.mode, "type": "blob"})
-        full = source_dir / change.path
-        uploads[change.path] = (
-            str(full.readlink()).encode() if change.mode == "120000" else full.read_bytes()
-        )
+        entry, content = _blob_upload(source_dir, change)
+        entries.append(entry)
+        uploads[change.path] = content
     not_delivered: list[str] = []
     if excluded:
         not_delivered.append(
