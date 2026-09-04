@@ -887,6 +887,86 @@ class TestSubmoduleDelivery:
         assert "- D `vendor/lib` (submodule)" in ops.pr_kwargs["body"]
 
 
+@pytest.mark.skipif(hostgit.lfs_version() is None, reason="git-lfs is not installed on this host")
+class TestLfsDelivery:
+    """#693: a file ``.gitattributes`` routes through Git LFS is refused
+    rather than committed as a blob where the repository expects a pointer
+    — named in the PR body, with the rest of the work still delivered."""
+
+    @pytest.fixture
+    def workspace(self, tmp_path: Path) -> tuple[Path, str]:
+        """(clone, base_sha): a populated run clone of a checkout whose
+        ``*.bin`` files live in LFS."""
+        app = tmp_path / "app"
+        app.mkdir()
+        git("init", "-b", "main", cwd=app)
+        git("lfs", "install", "--local", cwd=app)
+        (app / ".gitattributes").write_text("*.bin filter=lfs diff=lfs merge=lfs -text\n")
+        (app / "asset.bin").write_bytes(bytes(range(256)))
+        (app / "README").write_text("app\n")
+        git("add", "-A", cwd=app)
+        git("commit", "-q", "-m", "init", cwd=app)
+        clone = tmp_path / "clone"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_lfs(clone, source=app, lfs_url=None, token=None)
+        return clone, git("rev-parse", "HEAD", cwd=app)
+
+    def _ops(self, base_sha: str) -> StubOps:
+        class KnownBaseOps(StubOps):
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                self.ref_lookups.append((repo, ref))
+                return base_sha
+
+        return KnownBaseOps()
+
+    def test_an_added_lfs_file_is_named_not_delivered(
+        self, workspace: tuple[Path, str], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        clone, base_sha = workspace
+        (clone / "new.bin").write_bytes(b"\x00" * 32)
+        (clone / "README").write_text("real work\n")
+        ops = self._ops(base_sha)
+        with caplog.at_level(logging.WARNING):
+            deliver(ops, clone)
+        assert [e["path"] for e in tree_entries(ops)] == ["README"]
+        body = ops.pr_kwargs["body"]
+        assert "**Not delivered:** LFS-tracked file `new.bin` is not delivered" in body
+        assert "does not push objects to the repository's LFS store" in body
+        assert any("deliver.lfs_change_skipped" in r.getMessage() for r in caplog.records)
+
+    def test_a_modified_lfs_file_is_refused_the_same_way(self, workspace: tuple[Path, str]) -> None:
+        clone, base_sha = workspace
+        (clone / "asset.bin").write_bytes(b"\xff" * 32)
+        (clone / "README").write_text("real work\n")
+        ops = self._ops(base_sha)
+        deliver(ops, clone)
+        assert [e["path"] for e in tree_entries(ops)] == ["README"]
+        assert "LFS-tracked file `asset.bin` is not delivered" in ops.pr_kwargs["body"]
+
+    def test_only_lfs_changes_is_nothing_to_deliver(self, workspace: tuple[Path, str]) -> None:
+        clone, base_sha = workspace
+        (clone / "new.bin").write_bytes(b"\x00" * 32)
+        with pytest.raises(DeliveryError, match=r"LFS-tracked file `new\.bin`"):
+            deliver(self._ops(base_sha), clone)
+
+    def test_deleting_an_lfs_file_delivers(self, workspace: tuple[Path, str]) -> None:
+        clone, base_sha = workspace
+        (clone / "asset.bin").unlink()
+        ops = self._ops(base_sha)
+        deliver(ops, clone)
+        by_path = {e["path"]: e for e in tree_entries(ops)}
+        assert by_path["asset.bin"]["sha"] is None
+        assert "Not delivered" not in ops.pr_kwargs["body"]
+
+    def test_an_untouched_lfs_file_stays_out_of_the_tree(self, workspace: tuple[Path, str]) -> None:
+        clone, base_sha = workspace
+        (clone / "README").write_text("real work\n")
+        ops = self._ops(base_sha)
+        deliver(ops, clone)
+        assert [e["path"] for e in tree_entries(ops)] == ["README"]
+        assert "Not delivered" not in ops.pr_kwargs["body"]
+
+
 def _refs_calls(ops: StubOps) -> list[tuple[str, str]]:
     return [(m, p) for m, p, _ in ops.raw_calls if "/git/refs" in p]
 

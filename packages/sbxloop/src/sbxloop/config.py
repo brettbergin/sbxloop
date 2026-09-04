@@ -201,6 +201,18 @@ class SandboxConfig(_ConfigModel):
     # directories empty — for a repository whose submodules are optional
     # (docs, examples) or live somewhere the run's credential cannot read.
     clone_submodules: bool = True
+    # Whether a run clone's Git LFS objects are populated (#693). On by
+    # default: a repository whose `.gitattributes` routes files through
+    # `filter=lfs` keeps its fixtures and assets there, and a run on the
+    # pointer files fails on the first test that opens one. Objects come
+    # from the host checkout's LFS store where it has them, else from the
+    # repository's LFS endpoint with the run's GitHub credential; that
+    # needs git-lfs on the host, and a repository using LFS fails
+    # provisioning by name without it. Off runs on the pointer files — for
+    # a repository whose LFS content the run does not need, or whose store
+    # the run's credential cannot read. Either way a file the run adds or
+    # changes under an LFS attribute is never delivered as a plain blob.
+    clone_lfs: bool = True
     extra_allow_domains: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=list)
     # Operator environment for the agent sandbox (#679). `env` holds plain

@@ -105,7 +105,13 @@ install, and scopes the project gate, so none of them can disagree. A fresh
 run clone has its submodules populated first (`hostgit.populate_submodules`,
 #692) — from the host checkout's copy when it has the recorded commit, else
 from the `.gitmodules` URL under the run's credential — and the hosts they
-fetch from join that allowlist (`sandbox.submodule_hosts`).
+fetch from join that allowlist (`sandbox.submodule_hosts`). A clone whose
+`.gitattributes` routes files through Git LFS is populated the same way
+(`hostgit.populate_lfs`, #693) — the host checkout's LFS store first, the
+repository's LFS endpoint under the run's credential second — with the
+`git-lfs` workspace tool and its hosts riding along into the sandbox; an
+LFS-tracked add or edit is refused at delivery rather than committed as a
+blob.
 The github sandbox exists only when the GitHub integration is configured
 (`[github] repo = "owner/repo"`, or at least one `[[github.repos]]` entry);
 without it, `pair.github` is `None`, `GH_TOKEN`

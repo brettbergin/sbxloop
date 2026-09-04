@@ -5,17 +5,26 @@ This is what "a private repository" means to a clone: every request is
 answered 401 until the client presents the credential, and a wrong one is
 401 too. Tests point :func:`sbxloop.hostgit.clone_from_remote` at
 ``server.url`` and prove the run's token — and nothing else — gets in.
+
+The same server answers the Git LFS batch API (#693) for the objects a
+test seeds with :meth:`PrivateGitServer.seed_lfs`, behind the same
+credential: ``POST <repo>/info/lfs/objects/batch`` hands out download
+URLs on this host, ``GET <repo>/info/lfs/objects/<oid>`` serves the
+bytes. The client under test is the real git-lfs.
 """
 
 from __future__ import annotations
 
 import base64
+import json
 import os
 import subprocess  # nosec B404 - drives git http-backend in tests
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import urlsplit
+
+LFS_CONTENT_TYPE = "application/vnd.git-lfs+json"
 
 
 class PrivateGitServer:
@@ -33,6 +42,11 @@ class PrivateGitServer:
         self.token = token
         self.public = public
         self.requests: list[str | None] = []
+        # LFS objects by oid, served to any repository path on this host
+        self.lfs_objects: dict[str, bytes] = {}
+        # every LFS request path, so a test can tell an object fetch from
+        # a git fetch
+        self.lfs_requests: list[str] = []
         expected = "Basic " + base64.b64encode(f"{username}:{token}".encode()).decode()
         outer = self
 
@@ -49,7 +63,10 @@ class PrivateGitServer:
                     self.send_header("Content-Length", "0")
                     self.end_headers()
                     return
-                outer._backend(self)
+                if "/info/lfs/objects" in urlsplit(self.path).path:
+                    outer._lfs(self)
+                else:
+                    outer._backend(self)
 
             do_GET = _serve
             do_POST = _serve
@@ -68,6 +85,56 @@ class PrivateGitServer:
     def __exit__(self, *exc: object) -> None:
         self._server.shutdown()
         self._server.server_close()
+
+    def seed_lfs(self, checkout: Path) -> None:
+        """Serve every object in ``checkout``'s LFS store (what a
+        ``git lfs push`` from it would have put on the server)."""
+        store = checkout / ".git" / "lfs" / "objects"
+        for obj in store.rglob("*"):
+            if obj.is_file():
+                self.lfs_objects[obj.name] = obj.read_bytes()
+
+    def _lfs(self, handler: BaseHTTPRequestHandler) -> None:
+        path = urlsplit(handler.path).path
+        self.lfs_requests.append(path)
+        prefix, _sep, tail = path.rpartition("/info/lfs/objects/")
+        if handler.command == "POST" and tail == "batch":
+            length = int(handler.headers.get("Content-Length") or 0)
+            request = json.loads(handler.rfile.read(length) or b"{}")
+            objects = []
+            for wanted in request.get("objects", ()):
+                oid = wanted["oid"]
+                if oid in self.lfs_objects:
+                    objects.append(
+                        {
+                            "oid": oid,
+                            "size": len(self.lfs_objects[oid]),
+                            "actions": {
+                                "download": {"href": f"{self.url}{prefix}/info/lfs/objects/{oid}"}
+                            },
+                        }
+                    )
+                else:
+                    objects.append(
+                        {
+                            "oid": oid,
+                            "size": wanted.get("size", 0),
+                            "error": {"code": 404, "message": "Object does not exist"},
+                        }
+                    )
+            payload = json.dumps({"transfer": "basic", "objects": objects}).encode()
+            handler.send_response(200)
+            handler.send_header("Content-Type", LFS_CONTENT_TYPE)
+        elif handler.command == "GET" and tail in self.lfs_objects:
+            payload = self.lfs_objects[tail]
+            handler.send_response(200)
+            handler.send_header("Content-Type", "application/octet-stream")
+        else:
+            payload = b"not found"
+            handler.send_response(404)
+        handler.send_header("Content-Length", str(len(payload)))
+        handler.end_headers()
+        handler.wfile.write(payload)
 
     def _backend(self, handler: BaseHTTPRequestHandler) -> None:
         """Run one request through `git http-backend` as CGI."""

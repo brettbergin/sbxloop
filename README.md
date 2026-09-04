@@ -451,6 +451,27 @@ remote has is delivered as the moved pointer (a `160000` tree entry); changes
 superproject — and are named in the PR body's **Not delivered** line instead,
 as is a pointer at a commit the submodule's remote does not have.
 
+**Git LFS** works the same way (#693). A run clone is cut with the pointer
+files, and a fresh clone of a repository whose `.gitattributes` routes files
+through `filter=lfs` is then populated from the host: every object the host
+checkout's own LFS store holds is hard-linked into the clone — no network, no
+credential — and whatever is still a pointer afterwards is fetched from the
+repository's LFS endpoint (`<clone url>.git/info/lfs`) with the run's GitHub
+credential, which must therefore be able to read the LFS store too. The host
+needs `git-lfs` installed (`apt install git-lfs`; `sbxloop doctor` says so in
+the `host git-lfs` row); without it, or when an object is missing and there
+is no endpoint to fetch it from, provisioning fails naming the fix rather
+than starting the run on pointer files. `[sandbox] clone_lfs = false` opts a
+repository out and runs on the pointers. The clone's own config carries the
+LFS filters, so a build that touches an asset's mtime does not turn it into a
+change, and `sandbox.workspace_lfs` records how many objects came from where.
+At delivery, an added or modified file that `.gitattributes` routes through
+LFS is **not delivered** — the pull request API writes blobs, and committing
+the asset's bytes where the repository expects a pointer would be worse than
+refusing — and is named in the PR body's **Not delivered** line
+(`deliver.lfs_change_skipped` in the log); deleting one delivers, since a
+dropped pointer needs no object behind it.
+
 ### Environment for the agent sandbox
 
 A project's test suite often reads its environment — `RAILS_ENV`,
@@ -1654,8 +1675,12 @@ that already ships the toolchain costs no install and no network. It is
 continues, since the agent has passwordless `sudo apt-get` as an escape
 hatch. And it is **selected, not accumulated** — an explicit `languages`
 replaces detection rather than adding to it, so nothing is installed for a
-language you did not ask for. Heavier toolchains are better baked into a
-template (`sbxloop bake`) than downloaded per run.
+language you did not ask for. The one rider is `git-lfs` (#693): not a
+language and not selectable, it is added to whatever set was resolved
+whenever a `.gitattributes` in the workspace routes files through
+`filter=lfs`, so the sandbox can read and write the assets the repository
+keeps there. Heavier toolchains are better baked into a template
+(`sbxloop bake`) than downloaded per run.
 
 ### Installer hosts are allowed for the selected toolchains
 
@@ -1684,6 +1709,7 @@ over an installer host (the toolchain then fails to provision, loudly).
 | `dotnet`     | `builds.dotnet.microsoft.com`                                                                      |
 | `just`       | `github.com`, `release-assets.githubusercontent.com`                                               |
 | `task`       | `github.com`, `release-assets.githubusercontent.com`                                               |
+| `git-lfs`    | `lfs.github.com`, `github-cloud.githubusercontent.com`, `media.githubusercontent.com`              |
 
 `sbxloop bake` allows the same hosts for the configured `languages` (there is
 no workspace to detect from at bake time) and installs those toolchains into
@@ -1840,6 +1866,7 @@ The notable knobs:
 | `[sandbox] gate_command`                                  | detected           | The project's own gate, run over the whole tree before delivery.                                                                                                                                                                                                                                                                                                   |
 | `[sandbox] clone_filter`                                  | unset              | Git partial-clone filter (`"blob:none"`) for the remote clone of a repository with no host checkout; opt-in, see the clone section for the lazy-fetch hazard.                                                                                                                                                                                                      |
 | `[sandbox] clone_submodules`                              | `true`             | Whether a fresh run clone's submodules are populated — from the host checkout's copy when it has the recorded commit, else from the `.gitmodules` URL with the run's credential; a submodule neither can populate fails provisioning by name. `false` leaves them empty.                                                                                           |
+| `[sandbox] clone_lfs`                                     | `true`             | Whether a fresh run clone's Git LFS pointer files are populated — from the host checkout's LFS store when it holds the object, else from the repository's LFS endpoint with the run's credential; needs `git-lfs` on the host, and an object neither can supply fails provisioning by name. `false` leaves the pointer files.                                      |
 | `[sandbox] extra_allow_domains`                           | `[]`               | Static egress allows applied to every run.                                                                                                                                                                                                                                                                                                                         |
 | `[sandbox] env` / `secret_env`                            | `{}` / `[]`        | Environment for the agent sandbox's worker and everything it runs: plain values, and names whose values come from the daemon's environment (delivered like the credential, never logged). Per-repo overridable; see "Environment for the agent sandbox".                                                                                                           |
 | `[sandbox] apt_packages` / `setup_commands`               | `[]` / `[]`        | OS packages ensured beside the toolchains (fail closed), and commands run in the workspace before the first phase, each a `sandbox.setup` event. Per-repo overridable; see "OS packages and setup commands".                                                                                                                                                       |

@@ -79,6 +79,29 @@ delivered at all: the pull request is against the superproject, and the
 submodule's own repository is not the one the run is for. Such changes
 are named in the delivery (see ``notes`` on :func:`changes_since`) rather
 than silently dropped.
+
+Git LFS (#693)
+--------------
+Every clone runs with ``GIT_LFS_SKIP_SMUDGE=1``: a host whose git has the
+LFS filters installed would otherwise try to download every LFS object
+during the checkout — from the host checkout's path, which serves none —
+and a host without them writes pointer files anyway. The clone therefore
+always starts as pointers, and :func:`populate_lfs` turns them into the
+objects on purpose: the LFS filters are configured in the clone itself
+(``git lfs install --local``, so ``git status`` in the sandbox compares
+cleaned content and an untouched asset is not "modified"), the objects the
+host checkout already has are hard-linked out of its store, and whatever
+is still missing is fetched from the repository's LFS endpoint with the
+run's token through the same one-shot helper the clone uses. That needs
+``git-lfs`` on the host, and a repository that uses LFS fails to provision
+without it — said with the package name — rather than starting a run on
+pointer files. ``[sandbox] clone_lfs = false`` is the deliberate way to run
+on pointers.
+
+Delivery does not push LFS objects. A file the run added or changed under
+an ``filter=lfs`` attribute is left out of the pull request and named in
+its **Not delivered** line (:func:`lfs_tracked`): committing the bytes as a
+plain blob is exactly the mistake such repositories forbid.
 """
 
 from __future__ import annotations
@@ -346,7 +369,9 @@ def clone_for_run(source: Path, target: Path, branch: str) -> str:
     raw_upstream = origin_url(source)
     upstream = public_remote_url(raw_upstream) if raw_upstream is not None else None
     try:
-        with Repo.clone_from(str(source), str(target), multi_options=list(CLONE_OPTIONS)) as clone:
+        with Repo.clone_from(
+            str(source), str(target), env=_local_clone_env(), multi_options=list(CLONE_OPTIONS)
+        ) as clone:
             clone.git.checkout("-b", branch)
             if upstream is not None:
                 clone.git.remote("set-url", "origin", upstream)
@@ -426,6 +451,16 @@ _CLONE_CREDENTIAL_HELPER = (
 )
 
 
+# Git LFS objects are never fetched by a clone's checkout (#693): the host
+# populates them afterwards, deliberately — see the module docstring.
+_SKIP_LFS_SMUDGE = {"GIT_LFS_SKIP_SMUDGE": "1"}
+
+
+def _local_clone_env() -> dict[str, str]:
+    """The environment a clone of a host checkout runs under."""
+    return dict(_SKIP_LFS_SMUDGE)
+
+
 def _clone_env(token: str | None) -> dict[str, str]:
     """The environment a remote clone runs under.
 
@@ -441,6 +476,7 @@ def _clone_env(token: str | None) -> dict[str, str]:
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ASKPASS": "",
         "GCM_INTERACTIVE": "never",
+        **_SKIP_LFS_SMUDGE,
     }
     if token:
         env.update(
@@ -508,7 +544,9 @@ def clone_existing_branch(source: Path, target: Path, branch: str) -> str:
     upstream = public_remote_url(raw_upstream) if raw_upstream is not None else None
     remote_ref = f"origin/{branch}"
     try:
-        with Repo.clone_from(str(source), str(target), multi_options=list(CLONE_OPTIONS)) as clone:
+        with Repo.clone_from(
+            str(source), str(target), env=_local_clone_env(), multi_options=list(CLONE_OPTIONS)
+        ) as clone:
             if remote_ref not in {r.name for r in clone.refs}:
                 # A single-branch clone of a clone carries only the source's
                 # HEAD branch as `origin/<head>`, never its remote-tracking
@@ -736,6 +774,187 @@ def url_host(url: str) -> str | None:
     if hostport.startswith("["):  # bracketed IPv6 literal
         return hostport[1:].partition("]")[0] or None
     return hostport.partition(":")[0] or None
+
+
+# ---------------------------------------------------------------------------
+# Git LFS (#693)
+
+
+@dataclass(frozen=True)
+class LfsPopulation:
+    """What :func:`populate_lfs` did: LFS-tracked files in the checkout,
+    how many objects came out of the host checkout's store, and how many
+    were fetched from the repository's LFS endpoint."""
+
+    files: int
+    linked: int
+    fetched: int
+
+
+def lfs_version() -> str | None:
+    """The host's ``git lfs version`` line, or None when git-lfs is not
+    installed (git then does not know the subcommand)."""
+    git = find_git()
+    if git is None:
+        return None
+    try:
+        proc = subprocess.run(  # nosec B603 - list argv, git binary, no shell
+            [git, "lfs", "version"], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def lfs_endpoint(repo_url: str) -> str:
+    """The Git LFS batch endpoint for a GitHub-style https clone URL:
+    ``<url>.git/info/lfs`` — where git-lfs itself would look for a remote
+    at that URL, given here explicitly because a clone cut from a host
+    checkout has the host path as its origin."""
+    url = repo_url.rstrip("/")
+    if not url.endswith(".git"):
+        url += ".git"
+    return f"{url}/info/lfs"
+
+
+def populate_lfs(
+    clone: Path, *, source: Path | None, lfs_url: str | None, token: str | None
+) -> LfsPopulation:
+    """Turn the pointer files of a freshly cut run ``clone`` into their
+    LFS objects (#693), and configure the clone so git treats them as LFS
+    from then on.
+
+    ``source`` is the host checkout the clone was cut from: every object
+    its LFS store holds is hard-linked into the clone's (a copy when the
+    two are on different filesystems), which is the whole population for a
+    checkout that was itself pulled — no network, no credential, and
+    nothing written to the source. What is still a pointer afterwards is
+    fetched from ``lfs_url`` (see :func:`lfs_endpoint`) with ``token``
+    answering the credential challenge exactly as a remote clone does.
+
+    ``ProvisionError`` when git-lfs is not installed on the host, when
+    objects are missing and there is no endpoint to fetch them from, or
+    when the fetch fails or leaves pointers behind — each naming the fix. A
+    run that started on pointer files would fail later and worse. Only for
+    a fresh clone: a resumed clone keeps whatever the agent did.
+    """
+    if lfs_version() is None:
+        raise ProvisionError(
+            f"{clone} uses Git LFS (.gitattributes routes files through filter=lfs) but "
+            "git-lfs is not installed on the host: install it (apt install git-lfs / "
+            "brew install git-lfs) or set [sandbox] clone_lfs = false to run on the "
+            "pointer files"
+        )
+    repo = Repo(clone)
+    # The clean/smudge filters in the clone's own config — not the host's
+    # global one, which the run must not depend on — and no hooks: the
+    # pre-push hook pushes objects, and nothing pushes from a run clone.
+    repo.git.lfs("install", "--local", "--skip-repo")
+    pointers = _lfs_pointers(repo)
+    if not pointers:
+        return LfsPopulation(len(_lfs_files(repo)), 0, 0)
+    linked = 0
+    if source is not None:
+        linked = _link_lfs_objects(source, clone, [oid for oid, _path in pointers])
+        if linked:
+            repo.git.lfs("checkout", env=_local_clone_env())
+            pointers = _lfs_pointers(repo)
+    fetched = 0
+    if pointers:
+        if lfs_url is None:
+            raise ProvisionError(
+                f"{len(pointers)} Git LFS object(s) of {clone} are not in the host checkout's "
+                f"LFS store ({', '.join(path for _oid, path in pointers[:5])}"
+                f"{', …' if len(pointers) > 5 else ''}) and the run has no GitHub repository "
+                "to fetch them from: `git lfs pull` in the host checkout, or set "
+                "[sandbox] clone_lfs = false to run on the pointer files"
+            )
+        try:
+            repo.git(c=[f"lfs.url={lfs_url}"]).lfs("pull", env=_clone_env(token))
+        except GitCommandError as exc:
+            raise ProvisionError(
+                f"fetching {len(pointers)} Git LFS object(s) for {clone} from {lfs_url} "
+                f"failed: {_describe(exc)}. The run's GitHub credential must be able to "
+                "read the repository's LFS store; set [sandbox] clone_lfs = false to run "
+                "on the pointer files"
+            ) from exc
+        fetched = len(pointers)
+        remaining = _lfs_pointers(repo)
+        if remaining:
+            raise ProvisionError(
+                f"{len(remaining)} Git LFS object(s) of {clone} are still pointer files "
+                f"after `git lfs pull` from {lfs_url}: "
+                + ", ".join(path for _oid, path in remaining[:5])
+            )
+    return LfsPopulation(len(_lfs_files(repo)), linked, fetched)
+
+
+def _lfs_files(repo: Repo) -> list[tuple[str, str, str]]:
+    """``(oid, marker, path)`` for every LFS-tracked file in the checkout —
+    the marker ``*`` when the object is checked out, ``-`` for a pointer."""
+    out: str = repo.git.lfs("ls-files", "--long")
+    files: list[tuple[str, str, str]] = []
+    for line in out.splitlines():
+        oid, _sp, rest = line.partition(" ")
+        marker, _sp, path = rest.partition(" ")
+        if oid and marker in ("*", "-") and path:
+            files.append((oid, marker, path))
+    return files
+
+
+def _lfs_pointers(repo: Repo) -> list[tuple[str, str]]:
+    return [(oid, path) for oid, marker, path in _lfs_files(repo) if marker == "-"]
+
+
+def _lfs_store(repo_path: Path) -> Path:
+    """The checkout's LFS object store (``lfs/objects`` under the common
+    git dir — a linked worktree shares its main checkout's)."""
+    common: str = Repo(repo_path).git.rev_parse("--git-common-dir")
+    return (repo_path / common).resolve() / "lfs" / "objects"
+
+
+def _link_lfs_objects(source: Path, clone: Path, oids: Sequence[str]) -> int:
+    """Hard-link the objects ``source``'s store has among ``oids`` into the
+    clone's store (copying where linking is refused); returns how many."""
+    try:
+        store = _lfs_store(source)
+    except (GitCommandError, InvalidGitRepositoryError, NoSuchPathError):
+        return 0
+    target_store = clone / ".git" / "lfs" / "objects"
+    linked = 0
+    for oid in oids:
+        obj = store / oid[:2] / oid[2:4] / oid
+        if not obj.is_file():
+            continue
+        dest = target_store / oid[:2] / oid[2:4] / oid
+        if dest.exists():
+            linked += 1
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(obj, dest)
+        except OSError:
+            shutil.copy2(obj, dest)
+        linked += 1
+    return linked
+
+
+def lfs_tracked(repo_path: Path, paths: Sequence[str]) -> list[str]:
+    """Those of ``paths`` the checkout's attributes route through Git LFS
+    (``filter=lfs``), from ``git check-attr`` — the working tree's
+    ``.gitattributes`` included, so a pattern the run itself added counts."""
+    if not paths:
+        return []
+    out: str = Repo(repo_path).git.check_attr("-z", "filter", "--", *paths)
+    fields = out.split("\0")
+    tracked: list[str] = []
+    for i in range(0, len(fields) - 2, 3):
+        path, _attr, value = fields[i], fields[i + 1], fields[i + 2]
+        if value == "lfs" and path not in tracked:
+            tracked.append(path)
+    return tracked
 
 
 def gitignored_files(root: Path) -> frozenset[str] | None:
