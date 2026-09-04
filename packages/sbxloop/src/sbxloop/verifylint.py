@@ -572,9 +572,12 @@ def _dotnet_gate(workspace: Path, languages: Sequence[str] | None = None) -> str
 class GateDetector:
     """One convention: the detector, and the toolchain its command needs.
 
-    ``language`` is None for a task runner (make, just, task) that any
-    sandbox has; otherwise the registry name whose toolchain must be in
-    the run's resolved set (#624) for the command to be runnable at all.
+    ``language`` is the registry name whose toolchain must be in the run's
+    resolved set (#624) for the command to be runnable at all — the task
+    runners included (#685): ``make`` only ever arrived with
+    build-essential and ``just``/``task`` never did, so each is an entry
+    the manifest selects. None would mean a command every sandbox can run;
+    no detector emits one.
     Rule: a detector may only emit a command the resolved toolchain can
     run — a gate the executor cannot invoke is unsatisfiable, not strict.
     Every detector receives the resolved set for that reason; only the
@@ -590,9 +593,9 @@ class GateDetector:
 # usually made the task runner the front door; the language-native
 # fallbacks come last, after every declaration.
 GATE_DETECTORS: tuple[GateDetector, ...] = (
-    GateDetector(_make_gate),
-    GateDetector(_just_gate),
-    GateDetector(_task_gate),
+    GateDetector(_make_gate, "make"),
+    GateDetector(_just_gate, "just"),
+    GateDetector(_task_gate, "task"),
     GateDetector(_npm_gate, "javascript"),
     GateDetector(_tox_gate, "python"),
     GateDetector(_nox_gate, "python"),

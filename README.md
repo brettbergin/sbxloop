@@ -180,7 +180,9 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency or
   lockfile names, tox, nox, a Rakefile task, a composer script, a Gradle
   wrapper, a `pom.xml`, a cargo alias — or, for Go, Rust and .NET, the tool
   itself) over the whole tree, mechanical. A detector only fires for a
-  language the sandbox was provisioned with. A later task can break what an earlier one proved,
+  toolchain the sandbox was provisioned with — the task runners included:
+  a Makefile, justfile or Taskfile selects `make`, `just` or `task` the
+  way `go.mod` selects Go. A later task can break what an earlier one proved,
   so this is the last look at the tree exactly as it will be delivered. A run
   with no `[github] repo` ends **`completed`** here, its work in the
   workspace.
@@ -1533,8 +1535,17 @@ languages = ["python"]   # optional; unset = detect from the workspace
 | `go`         | `golang`                   | `go.mod`                                                                                           | Go toolchain (pinned tarball from `go.dev`)                                                                                  |
 | `rust`       | `rs`, `cargo`              | `Cargo.toml`                                                                                       | cargo, rustc, rustfmt, clippy (pinned rustup)                                                                                |
 | `dotnet`     | `csharp`, `c#`, `net`      | `global.json`, `Directory.Build.props`, `*.sln`, `*.csproj`, `*.fsproj`                            | .NET SDK (pinned build from Microsoft), plus `DOTNET_ROOT`                                                                   |
+| `make`       | `gnumake`                  | `Makefile`, `makefile`, `GNUmakefile`                                                              | `make` (apt)                                                                                                                 |
+| `just`       | —                          | `justfile`, `.justfile`, `Justfile`                                                                | just (pinned release binary from GitHub)                                                                                     |
+| `task`       | `go-task`, `taskfile`      | `Taskfile.yml`, `Taskfile.yaml`                                                                    | Task (pinned release binary from GitHub)                                                                                     |
 
 Selecting an entry also selects what it is built on — `languages = ["typescript"]` provisions the Node runtime first, then `tsc`.
+
+The three task runners are entries because the gate detector emits their
+commands: `make check` on a Go repo fronted by a Makefile needs `make`, and
+no sandbox has `just` or `task` unless something installed it. A manifest
+selects the runner like any other entry — whether or not it declares a gate
+target, since the agent runs `make build` too.
 
 The `javascript` entry covers the package managers too. `corepack enable`
 puts `pnpm` and `yarn` shims on PATH; each shim runs the version the
@@ -1566,8 +1577,8 @@ template (`sbxloop bake`) than downloaded per run.
 
 ### Installer hosts are allowed for the selected toolchains
 
-The apt-only entries (`cpp`, `ruby`, `java`) need only the apt mirrors, which
-are in the sandbox's always-reachable baseline. The rest download from a
+The apt-only entries (`cpp`, `ruby`, `java`, `make`) need only the apt
+mirrors, which are in the sandbox's always-reachable baseline. The rest download from a
 vendor or registry, and **provisioning runs before any task**, so a task's
 `egress` declaration is too late to help it. Each toolchain therefore carries
 its installer hosts, and the agent sandbox is created with the hosts of the
@@ -1585,6 +1596,8 @@ over an installer host (the toolchain then fails to provision, loudly).
 | `go`         | `go.dev`, `dl.google.com`                            |
 | `rust`       | `static.rust-lang.org`                               |
 | `dotnet`     | `builds.dotnet.microsoft.com`                        |
+| `just`       | `github.com`, `release-assets.githubusercontent.com` |
+| `task`       | `github.com`, `release-assets.githubusercontent.com` |
 
 `sbxloop bake` allows the same hosts for the configured `languages` (there is
 no workspace to detect from at bake time) and installs those toolchains into

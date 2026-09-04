@@ -752,17 +752,38 @@ class TestCompiledAndScriptedEcosystems:
 
 class TestGateNeedsItsToolchain:
     """Rule: a detector may only emit a command the resolved toolchains
-    can run (#625). Task runners are consulted whatever the set; a
-    language's own runner only when that language was resolved (#624)."""
+    can run (#625). A language's own runner only when that language was
+    resolved (#624) — and the task runners are toolchains too (#685):
+    `make` only ever came with build-essential, `just` and `task` never."""
 
     def test_a_rakefile_under_a_python_only_sandbox_is_no_gate(self, tmp_path: Path) -> None:
         write(tmp_path, "Rakefile", "task :ci do\nend\n")
         assert project_gate(tmp_path, languages=("python",)) is None
         assert project_gate(tmp_path, languages=("ruby",)) == "bundle exec rake ci"
 
-    def test_a_task_runner_is_consulted_under_any_set(self, tmp_path: Path) -> None:
-        write(tmp_path, "Makefile", "check:\n\t@echo\n")
-        assert project_gate(tmp_path, languages=()) == "make check"
+    @pytest.mark.parametrize(
+        ("manifest", "body", "runner", "gate"),
+        [
+            ("Makefile", "check:\n\t@echo\n", "make", "make check"),
+            ("justfile", "check:\n    echo\n", "just", "just check"),
+            ("Taskfile.yml", "tasks:\n  check:\n    cmds: [echo]\n", "task", "task check"),
+        ],
+    )
+    def test_a_task_runner_needs_its_own_toolchain(
+        self, tmp_path: Path, manifest: str, body: str, runner: str, gate: str
+    ) -> None:
+        # A Go repo fronted by a Makefile, on a sandbox whose explicit
+        # `languages` left make out, cannot be handed `make check`; the
+        # manifest-detected set carries the runner, so the gate stands.
+        write(tmp_path, manifest, body)
+        assert project_gate(tmp_path, languages=("go",)) is None
+        assert project_gate(tmp_path, languages=("go", runner)) == gate
+        assert project_gate(tmp_path) == gate
+
+    def test_every_detector_names_its_toolchain(self) -> None:
+        # None would mean "every sandbox can run this", which was the
+        # #685 bug: no such command exists.
+        assert all(detector.language is not None for detector in GATE_DETECTORS)
 
     def test_no_resolution_consults_every_detector(self, tmp_path: Path) -> None:
         write(tmp_path, "go.mod", "module x\n")

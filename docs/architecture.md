@@ -379,9 +379,10 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   Rakefile `ci`/`check`/`default` task; a composer `check`/`ci` script;
   `./gradlew check`; `mvn -q verify`; a cargo `ci` alias; and, when a Go,
   Rust or .NET repo declares nothing, the tool itself — `go vet && go test`, `cargo test`, `dotnet test`) over the whole tree, mechanical.
-  Detectors tied to a language only run when that language was resolved
-  for the sandbox (#624), so the gate is always a command the toolchain
-  can execute. The decomposer must put the gate in *some* task's
+  Every detector is tied to a toolchain and only runs when that toolchain
+  was resolved for the sandbox (#624) — `make`, `just` and `task` are
+  entries of their own, selected by their manifests (#685) — so the gate is
+  always a command the sandbox can execute. The decomposer must put the gate in *some* task's
   exam, but a later task can break what an earlier one proved; this is the
   last check on the tree exactly as it will be delivered. `verify_mode`
   governs this stage the same way: `advisory` records a red gate without a
