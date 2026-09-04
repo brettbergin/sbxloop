@@ -1172,6 +1172,113 @@ class TestMountDiscovery:
             pair.cleanup()
 
 
+class TestMountExpected:
+    """A workspace that *is* the work must be seen by the agent (#670).
+
+    Harvest mode is for the bare per-run directory nothing was configured
+    for. Once a checkout is configured — or handed over explicitly — a mount
+    the agent cannot find is a provisioning failure, never a quiet run on an
+    empty directory that "succeeds" with unrelated files.
+    """
+
+    def configured(self, fake_sbx: FakeSbx, tmp_path: Path) -> tuple[Provisioner, list[Event]]:
+        source = tmp_path / "checkout"
+        source.mkdir()
+        (source / "README").write_text("the repo\n")
+        return make_isolation_provisioner(fake_sbx, tmp_path, source)
+
+    def test_configured_workspace_that_never_mounts_fails_closed(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        provisioner, events = self.configured(fake_sbx, tmp_path)
+        with pytest.raises(ProvisionError) as info:
+            provisioner.ensure_pair("r1")
+        message = str(info.value)
+        assert "was not visible inside the agent sandbox sbxloop-r1-agent" in message
+        assert "found no marker under any candidate root" in message
+        assert "sbxloop doctor" in message
+        # The pair is torn down: nothing is left for `sandbox prune`.
+        boxes = fake_sbx.state / "sandboxes"
+        assert not boxes.is_dir() or not any(boxes.iterdir())
+        (mount,) = [e for e in events if e.type == "sandbox.workspace_mount"]
+        assert mount.data["mounted"] is False
+        assert mount.data["probe"] == "answered"
+        # ... and the event does not promise a harvest that is not coming.
+        assert "the run stops" in mount.data["message"]
+        assert "harvest" not in mount.data["message"]
+
+    def test_configured_workspace_with_a_broken_probe_fails_closed(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """Could not tell is not "not mounted": the probe's own failure is
+        what the message names, so field debugging chases the right cause."""
+        fake_sbx.script("exec sbxloop-r1-agent sh -c set --", returncode=1, stderr="find: boom")
+        provisioner, events = self.configured(fake_sbx, tmp_path)
+        with pytest.raises(ProvisionError, match="mount discovery probe failed") as info:
+            provisioner.ensure_pair("r1")
+        assert "probe exited 1: find: boom" in str(info.value)
+        (mount,) = [e for e in events if e.type == "sandbox.workspace_mount"]
+        assert mount.data["probe"] == "error"
+        assert "the run stops" in mount.data["message"]
+
+    def test_explicit_workspace_expects_a_mount(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An embedder or a resume hands the workspace over by path: that
+        path is the work, whatever the config says."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        workspace = tmp_path / "handed-over"
+        workspace.mkdir()
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        with pytest.raises(ProvisionError, match="was not visible inside the agent sandbox"):
+            provisioner.ensure_pair("r1", workspace=workspace)
+
+    def test_explicit_workspace_can_be_declared_harvest_mode(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A resumed harvest-mode run passes its recorded verdict and keeps
+        working the way its first provisioning did."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        workspace = tmp_path / "state/runs/r1/workspace"
+        workspace.mkdir(parents=True)
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        pair = provisioner.ensure_pair("r1", workspace=workspace, expects_mount=False)
+        try:
+            assert not pair.mounted
+            assert pair.agent_workdir == WORK_DIR
+        finally:
+            pair.cleanup()
+
+    def test_mounted_configured_workspace_is_unchanged(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner, _events = self.configured(fake_sbx, tmp_path)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert pair.mounted
+            assert (Path(pair.agent_workdir) / "README").read_text() == "the repo\n"
+        finally:
+            pair.cleanup()
+
+    def test_unconfigured_run_stays_harvest_mode(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The game-repo case: nothing configured, the operator wants the
+        artifact flow. The event still says so."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        pair = make_provisioner(fake_sbx, tmp_path, bus=bus).ensure_pair("r1")
+        try:
+            assert not pair.mounted
+            (mount,) = [e for e in events if e.type == "sandbox.workspace_mount"]
+            assert "artifacts will be harvested" in mount.data["message"]
+        finally:
+            pair.cleanup()
+
+
 class TestConformanceRecording:
     """Provisioning's own field checks double as conformance probes: every
     run refreshes the version-keyed verdict cache for free."""

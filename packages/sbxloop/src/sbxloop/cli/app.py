@@ -156,6 +156,63 @@ def _store(config: Config) -> StateStore:
     return StateStore(config.state_dir / "state.db")
 
 
+def _resolve_run_workspace(
+    config: Config, flag: Path | None, *, cwd: Path
+) -> tuple[Config, Path | None, str]:
+    """The checkout a one-shot ``sbxloop run`` works on, and where it came from.
+
+    In order: ``--workspace``; whatever the config already resolves for the
+    run's repository (or configures for another — that run clones from its
+    remote instead, see ``Provisioner._resolve_workspace_source``); the git
+    checkout enclosing ``cwd``. A run from inside a checkout used to operate
+    on an *empty* per-run directory and report success (#670) — the
+    enclosing checkout is what the person typing the command means.
+
+    None with no checkout anywhere is harvest mode, kept as is: the agent
+    starts from nothing and the output is collected as artifacts.
+    """
+    from sbxloop import hostgit
+
+    if flag is not None:
+        chosen = flag.expanduser()
+        if not chosen.is_dir():
+            raise SbxloopError(f"{chosen} is not a directory")
+        return _pin_workspace(config, chosen.resolve()), chosen.resolve(), "--workspace"
+    source = config.workspace_source(config.github.repo)
+    if source == "configured":
+        return config, config.workspace_for_repo(config.github.repo), source
+    if source == "remote":
+        # Configured for some other repository: the provisioner clones this
+        # one from its remote rather than borrowing that checkout.
+        return config, None, source
+    root = hostgit.repo_toplevel(cwd)
+    if root is None:
+        return config, None, "none"
+    return _pin_workspace(config, root), root, "cwd-checkout"
+
+
+_WORKSPACE_SOURCE_TEXT = {
+    "--workspace": "from --workspace",
+    "configured": "configured",
+    "cwd-checkout": "the git checkout enclosing the current directory",
+}
+
+
+def _pin_workspace(config: Config, workspace: Path) -> Config:
+    """Make ``workspace`` the one checkout this run works on.
+
+    Set on the ``[sandbox]`` section and on every repository entry the run
+    still carries (at most one after ``run`` narrows), so
+    ``Config.workspace_for_repo`` resolves to it whichever path it takes and
+    the provisioner's origin check still guards a checkout of the wrong
+    repository.
+    """
+    sandbox = config.sandbox.model_copy(update={"workspace": workspace})
+    repos = [entry.model_copy(update={"workspace": workspace}) for entry in config.github.repos]
+    github = config.github.model_copy(update={"repos": repos})
+    return config.model_copy(update={"sandbox": sandbox, "github": github})
+
+
 def _resolve_repo(config: Config, selector: str | None) -> RepoConfig:
     """The repository a command acts on.
 
@@ -567,6 +624,15 @@ def run(
             help="Make a repository created via --create-repo public.",
         ),
     ] = None,
+    workspace: Annotated[
+        Path | None,
+        typer.Option(
+            "--workspace",
+            "-w",
+            help="Repository checkout to work on. Default: [sandbox] workspace (or the "
+            "repo entry's), then the git checkout enclosing the current directory.",
+        ),
+    ] = None,
     model: Annotated[
         str | None,
         typer.Option(
@@ -656,9 +722,32 @@ def run(
             "(see `sbxloop init`), then re-run."
         )
         raise typer.Exit(2)
+    try:
+        config, chosen, source = _resolve_run_workspace(config, workspace, cwd=Path.cwd())
+    except SbxloopError as exc:
+        console.print(f"[bold red]invalid --workspace:[/] {exc}")
+        raise typer.Exit(2) from exc
+    if chosen is not None:
+        console.print(f"workspace: {chosen} ({_WORKSPACE_SOURCE_TEXT[source]})")
+    elif source == "remote":
+        console.print(
+            f"workspace: a fresh clone of {config.github.repo} (the configured checkout "
+            "belongs to another repository)"
+        )
+    else:
+        console.print(
+            "workspace: none — not inside a git checkout and none configured; the "
+            "agent starts from an empty directory and the run's output is harvested "
+            "as artifacts (pass [cyan]--workspace PATH[/] to work on a checkout)"
+        )
     engine = LoopEngine(config)
     try:
-        result = _drive_with_ui(engine, tui=tui, chat=chat, action=lambda: engine.start(outcome))
+        result = _drive_with_ui(
+            engine,
+            tui=tui,
+            chat=chat,
+            action=lambda: engine.start(outcome, workspace_source=source),
+        )
     except SbxloopError as exc:
         console.print(f"[bold red]run failed:[/] {exc}")
         raise typer.Exit(2) from exc

@@ -584,8 +584,21 @@ class Provisioner:
     # -- provisioning ------------------------------------------------------
 
     def ensure_pair(
-        self, run_id: str, workspace: Path | None = None, repo: str | None = None
+        self,
+        run_id: str,
+        workspace: Path | None = None,
+        repo: str | None = None,
+        *,
+        expects_mount: bool | None = None,
     ) -> SandboxPair:
+        """Provision the run's sandbox pair around its workspace.
+
+        ``expects_mount`` says whether the agent sandbox must see the
+        workspace: None lets the workspace's origin decide (an explicit path
+        is the work; an unconfigured per-run dir is not), a resume passes
+        the verdict its first provisioning recorded so a harvest-mode run
+        stays one (#670).
+        """
         if workspace is not None:
             # An explicit workspace is authoritative: it is either the
             # resume pin from the runs table (which must be reused in place
@@ -593,8 +606,12 @@ class Provisioner:
             # embedder's deliberate choice. Isolation applies only to
             # config-sourced workspaces on fresh runs.
             workspace = workspace.resolve()
+            if expects_mount is None:
+                expects_mount = True
         else:
-            workspace = self._resolve_workspace(run_id, repo)
+            workspace, resolved_expects = self._resolve_workspace_source(run_id, repo)
+            if expects_mount is None:
+                expects_mount = resolved_expects
         workspace.mkdir(parents=True, exist_ok=True)
         # Resolved here, after the workspace exists and before any microVM
         # does: the agent sandbox's egress allowlist is fixed at creation,
@@ -622,7 +639,9 @@ class Provisioner:
                 source=version.source,
                 constraint=version.constraint,
             )
-        return self._provision_pair(run_id, workspace, repo, languages=languages)
+        return self._provision_pair(
+            run_id, workspace, repo, languages=languages, expects_mount=expects_mount
+        )
 
     def _run_repo(self, repo: str | None) -> str | None:
         """The ``owner/name`` this run acts on, or None when there is none."""
@@ -634,10 +653,21 @@ class Provisioner:
         return self.config.github.repo
 
     def _resolve_workspace(self, run_id: str, repo: str | None = None) -> Path:
-        """Where this fresh run works: the per-run dir, *this repo's*
-        configured workspace, or — when that workspace is a git checkout — a
-        per-run clone of it, so runs never disturb the checkout's branch
-        setup.
+        """Where this fresh run works (see :meth:`_resolve_workspace_source`)."""
+        return self._resolve_workspace_source(run_id, repo)[0]
+
+    def _resolve_workspace_source(self, run_id: str, repo: str | None = None) -> tuple[Path, bool]:
+        """Where this fresh run works, and whether that tree is *the work*.
+
+        The path is the per-run dir, *this repo's* configured workspace, or —
+        when that workspace is a git checkout — a per-run clone of it, so
+        runs never disturb the checkout's branch setup. The flag is False
+        only for the bare per-run dir nothing was configured for: the agent
+        starts from nothing and the run's output is harvested as artifacts.
+        Everywhere else the tree carries the repository the ask is about,
+        and the agent sandbox must see it — a mount that cannot be found is
+        then a provisioning failure, not a quiet fall back to an empty
+        directory (#670).
 
         The clone source is resolved per repository
         (:meth:`Config.workspace_for_repo`), never from a daemon-wide path:
@@ -657,30 +687,30 @@ class Provisioner:
                 # A workspace is configured somewhere, but none of it belongs
                 # to this repository. Its tree must come from its own remote
                 # or not at all — never from another repo's checkout.
-                return self._clone_repo_remote(run_id, run_repo, clone_dir)
+                return self._clone_repo_remote(run_id, run_repo, clone_dir), True
             if mode == "clone":
                 raise ProvisionError(
                     "workspace_isolation = 'clone' requires [sandbox] workspace "
                     "to point at a git checkout"
                 )
-            return clone_dir
+            return clone_dir, False
         source = source.resolve()
         self._assert_origin_matches(source, run_repo)
         if mode == "in-place" or source == clone_dir:
-            return source
+            return source, True
         git = hostgit.find_git()
         if git is None:
             if mode == "clone":
                 raise ProvisionError("workspace_isolation = 'clone' but no git binary is on PATH")
             log.debug("workspace.in_place", path=str(source), reason="no git binary on PATH")
-            return source
+            return source, True
         root = hostgit.repo_toplevel(source)
         if root is None:
             if mode == "clone":
                 raise ProvisionError(
                     f"workspace_isolation = 'clone' but {source} is not a git repository"
                 )
-            return source
+            return source, True
         if root != source:
             raise ProvisionError(
                 f"workspace {source} is inside a git checkout (root {root}) but is "
@@ -709,7 +739,7 @@ class Provisioner:
                 "workspace_isolation = 'clone' to run from HEAD anyway, or "
                 "'in-place' to run directly in the checkout"
             )
-        return self._clone_workspace(run_id, source, clone_dir, dirty=dirty)
+        return self._clone_workspace(run_id, source, clone_dir, dirty=dirty), True
 
     def _assert_origin_matches(self, source: Path, repo: str | None) -> None:
         """Refuse a source checkout whose ``origin`` names another repository.
@@ -907,6 +937,7 @@ class Provisioner:
         repo: str | None = None,
         *,
         languages: toolchains.LanguageResolution | None = None,
+        expects_mount: bool = True,
     ) -> SandboxPair:
         # The github sandbox (and its token requirement) exists only when the
         # GitHub integration is configured; without [github].repo a run has
@@ -1019,9 +1050,23 @@ class Provisioner:
                             errors.append(exc)
                     if errors:
                         raise errors[0]
-            agent_workdir = self._discover_mount(run_id, sandboxes["agent"], workspace)
+            agent_workdir, why = self._discover_mount(
+                run_id, sandboxes["agent"], workspace, expects_mount=expects_mount
+            )
             mounted = agent_workdir is not None
             if agent_workdir is None:
+                if expects_mount:
+                    # The tree the ask is about is on the host and the agent
+                    # cannot see it. Falling back to an empty directory here
+                    # is how a run "succeeds" by planning a greenfield
+                    # project and delivering files unrelated to the repo.
+                    raise ProvisionError(
+                        f"workspace {workspace} was not visible inside the agent "
+                        f"sandbox {sandboxes['agent'].name}: {why}. Check the "
+                        "sandbox row of `sbxloop doctor` (workspace-mount probe) "
+                        "and the sbx version; the run does not continue on an "
+                        "empty directory"
+                    )
                 agent_workdir = WORK_DIR
                 sandboxes["agent"].mkdirs(agent_workdir)
             return SandboxPair(
@@ -1647,14 +1692,19 @@ class Provisioner:
             message=message,
         )
 
-    def _discover_mount(self, run_id: str, sandbox: Sandbox, workspace: Path) -> str | None:
+    def _discover_mount(
+        self, run_id: str, sandbox: Sandbox, workspace: Path, *, expects_mount: bool = False
+    ) -> tuple[str | None, str]:
         """Find where sbx mounted the host workspace inside the agent VM.
 
         Writes a nonce marker file into the host workspace, then runs one
         bounded in-sandbox search for it over candidate roots. Returns the
-        in-VM directory containing the marker, or None when discovery fails
-        (→ harvest mode; non-fatal, mirroring _verify_secret_env's
-        probe-don't-assume pattern). The marker is always removed.
+        in-VM directory containing the marker and an empty reason, or None
+        and the reason discovery came up empty. The caller decides what
+        None means: harvest mode when nothing was configured (non-fatal,
+        mirroring _verify_secret_env's probe-don't-assume pattern), a
+        provisioning failure when ``expects_mount`` — the events emitted
+        here say which. The marker is always removed.
 
         A failed probe degrades the same way a clean "not mounted" answer
         does, but the two are kept distinguishable (#63): the
@@ -1668,7 +1718,8 @@ class Provisioner:
             (workspace / marker).write_text("")
         except OSError:
             log.warning("mount.marker_write_failed", run=run_id, workspace=str(workspace))
-            return None
+            return None, "the discovery marker could not be written into the workspace"
+        outcome = "the run stops" if expects_mount else "artifacts will be harvested"
         probe_error = ""
         try:
             command = mount_probe_command(workspace, marker)
@@ -1699,7 +1750,7 @@ class Provisioner:
                 probe="answered",
                 path=mount_dir,
             )
-            return mount_dir
+            return mount_dir, ""
         if probe_error:
             # No verdict recorded: an infra failure is not knowledge about
             # sbx mount semantics and must not clobber the cached answer.
@@ -1709,10 +1760,9 @@ class Provisioner:
                 name=sandbox.name,
                 mounted=False,
                 probe="error",
-                message=f"mount discovery probe failed ({probe_error}); "
-                "artifacts will be harvested",
+                message=f"mount discovery probe failed ({probe_error}); {outcome}",
             )
-            return None
+            return None, f"the mount discovery probe failed ({probe_error})"
         self._record_probe(
             PROBE_WORKSPACE_MOUNT,
             "not-found",
@@ -1724,9 +1774,9 @@ class Provisioner:
             name=sandbox.name,
             mounted=False,
             probe="answered",
-            message="workspace mount not found in VM; artifacts will be harvested",
+            message=f"workspace mount not found in VM; {outcome}",
         )
-        return None
+        return None, "mount discovery found no marker under any candidate root"
 
     def _apply_persistent_env(self, spec: SandboxSpec, sandbox: Sandbox) -> None:
         """Write the spec's non-secret environment into the VM's env file.

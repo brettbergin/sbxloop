@@ -54,6 +54,7 @@ ENV_PREFIX = "SBXLOOP_"
 RESERVED_ENV_KEYS = frozenset({"worker_backend", "echo_script"})
 
 WorkerTransport = Literal["stream", "poll"]
+WorkspaceSource = Literal["configured", "remote", "none"]
 SecretStrategy = Literal["proxy", "plain-env"]
 HarvestMode = Literal["per-task", "final"]
 WorkspaceIsolation = Literal["auto", "clone", "in-place"]
@@ -1481,6 +1482,24 @@ class Config(_ConfigModel):
         if not self.github.multi_repo and entry.enabled:
             return legacy
         return legacy if hostgit.origin_matches_repo(legacy, entry.repo) else None
+
+    def workspace_source(self, repo: str | None) -> WorkspaceSource:
+        """Where a fresh run for ``repo`` gets its tree from.
+
+        ``configured``: :meth:`workspace_for_repo` names a host checkout.
+        ``remote``: a workspace is configured, but for another repository —
+        the run clones ``repo`` from its own remote rather than borrowing
+        that checkout. ``none``: nothing is configured anywhere; the agent
+        starts from an empty directory and the run's output is harvested as
+        artifacts.
+        """
+        if self.workspace_for_repo(repo) is not None:
+            return "configured"
+        if self.sandbox.workspace is not None or any(
+            entry.workspace is not None for entry in self.github.repos
+        ):
+            return "remote"
+        return "none"
 
 
 def _read_toml(path: Path) -> dict[str, Any]:
