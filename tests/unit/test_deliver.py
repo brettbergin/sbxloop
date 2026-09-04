@@ -1059,6 +1059,195 @@ class TestContinuedHistory:
         assert commit_body is not None and commit_body["parents"] == ["PRIORHEAD"]
 
 
+class TestPrConventions:
+    """#678: the repository's pull request template opens the body, the
+    agent's own `.sbxloop/pr-body` wins over it, and a title lint in the
+    tree is detected — each from the delivered tree itself."""
+
+    def test_the_template_opens_the_body_verbatim(self, tmp_path: Path) -> None:
+        root = make_workspace(tmp_path)
+        (root / ".github").mkdir()
+        (root / ".github" / "PULL_REQUEST_TEMPLATE.md").write_text(
+            "## Summary\n\n## Checklist\n- [ ] tests\n"
+        )
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=root,
+            closes=5,
+        )
+        body = ops.pr_kwargs["body"]
+        assert body.startswith("## Summary\n\n## Checklist\n- [ ] tests\n\n---\n\n")
+        assert "Artifacts produced by sbxloop run `r42`." in body
+        assert body.endswith("\nCloses #5\n")
+
+    def test_the_agents_body_wins_over_the_template(self, tmp_path: Path) -> None:
+        root = make_workspace(tmp_path)
+        (root / "PULL_REQUEST_TEMPLATE.md").write_text("## Summary\n")
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=root,
+            closes=5,
+            authored_body="  ## Summary\n\nDid the thing.\n\n- [x] tests\n\n",
+        )
+        body = ops.pr_kwargs["body"]
+        assert body.startswith("## Summary\n\nDid the thing.\n\n- [x] tests\n\n---\n\n")
+        assert "Files (" not in body, "the authored body replaces the summary"
+        assert "sbxloop run `r42`" in body and body.endswith("\nCloses #5\n")
+
+    def test_without_either_the_body_reads_as_before(self, tmp_path: Path) -> None:
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+        )
+        body = ops.pr_kwargs["body"]
+        assert body.startswith("Artifacts produced by sbxloop run `r42`.\n\n**Outcome:** x\n")
+        assert "---" not in body
+
+    def test_a_redelivery_with_an_authored_body_rewrites_the_open_pr(self, tmp_path: Path) -> None:
+        class KnownPrOps(StubOps):
+            def pr_get(self, repo: str, number: int) -> dict[str, Any]:
+                return {"number": number, "html_url": "https://github.com/o/r/pull/12"}
+
+            def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
+                raise AssertionError("a known PR must not be re-created")
+
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "PATCH" and path.endswith("/pulls/12"):
+                    self.raw_calls.append((method, path, body))
+                    return {}
+                return super().raw(method, path, body)
+
+        ops = KnownPrOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            pr_number=12,
+            authored_body="## Fixed\n",
+        )
+        (patch,) = [b for m, p, b in ops.raw_calls if m == "PATCH" and p.endswith("/pulls/12")]
+        assert patch is not None and patch["body"].startswith("## Fixed\n\n---\n\n")
+
+    def test_a_redelivery_without_one_leaves_the_body_alone(self, tmp_path: Path) -> None:
+        class KnownPrOps(StubOps):
+            def pr_get(self, repo: str, number: int) -> dict[str, Any]:
+                return {"number": number, "html_url": "https://github.com/o/r/pull/12"}
+
+        ops = KnownPrOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            pr_number=12,
+        )
+        assert not [b for m, p, b in ops.raw_calls if m == "PATCH" and p.endswith("/pulls/12")]
+
+    def test_pr_template_takes_githubs_first_choice_and_skips_empty_ones(
+        self, tmp_path: Path
+    ) -> None:
+        from sbxloop.deliver import pr_template
+
+        # One spelling per directory: the checkout may sit on a
+        # case-insensitive filesystem, where the two spellings are one file.
+        root = make_workspace(tmp_path)
+        assert pr_template(root) is None
+        (root / "docs").mkdir()
+        (root / "docs" / "pull_request_template.md").write_text("docs one\n")
+        assert pr_template(root)[1] == "docs one"  # type: ignore[index]
+        (root / "PULL_REQUEST_TEMPLATE.md").write_text("root one\n")
+        assert pr_template(root) == ("PULL_REQUEST_TEMPLATE.md", "root one")
+        (root / ".github").mkdir()
+        (root / ".github" / "PULL_REQUEST_TEMPLATE.md").write_text("  \n")
+        assert pr_template(root) == ("PULL_REQUEST_TEMPLATE.md", "root one"), (
+            "an empty template is no template"
+        )
+        (root / ".github" / "PULL_REQUEST_TEMPLATE.md").write_text("gh one\n")
+        assert pr_template(root) == (".github/PULL_REQUEST_TEMPLATE.md", "gh one")
+
+    @pytest.mark.parametrize(
+        ("files", "expected"),
+        [
+            ({}, None),
+            ({"commitlint.config.js": "module.exports = {}"}, "commitlint.config.js"),
+            ({".commitlintrc.yml": "extends: []"}, ".commitlintrc.yml"),
+            ({"package.json": '{"commitlint": {}}'}, "package.json (commitlint)"),
+            ({"package.json": '{"name": "x"}'}, None),
+            ({"package.json": "not json"}, None),
+            (
+                {".github/workflows/pr.yml": "uses: amannn/action-semantic-pull-request@v5\n"},
+                ".github/workflows/pr.yml (amannn/action-semantic-pull-request)",
+            ),
+            (
+                {".github/workflows/lint.yaml": "uses: wagoid/commitlint-github-action@v6\n"},
+                ".github/workflows/lint.yaml (wagoid/commitlint-github-action)",
+            ),
+            ({".github/workflows/ci.yml": "uses: actions/checkout@v4\n"}, None),
+            ({"src/commitlint.config.js": "x"}, None),
+        ],
+    )
+    def test_conventional_titles_names_the_evidence(
+        self, tmp_path: Path, files: dict[str, str], expected: str | None
+    ) -> None:
+        from sbxloop.deliver import conventional_titles
+
+        root = make_workspace(tmp_path)
+        for rel, text in files.items():
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text(text)
+        assert conventional_titles(root) == expected
+
+    @pytest.mark.parametrize(
+        ("title", "expected"),
+        [
+            ("feat(api): add the endpoint", "feat(api): add the endpoint"),
+            ("fix!: drop  the\n thing", "fix!: drop the thing"),
+            ("Add the endpoint", "chore: add the endpoint"),
+            ("sbxloop: Add the endpoint", "chore: sbxloop: Add the endpoint"),
+            ("Feat: shouting type", "chore: feat: shouting type"),
+            ("revert: the last change", "revert: the last change"),
+            ("", "chore: deliver artifacts"),
+        ],
+    )
+    def test_conventional_title_keeps_one_and_guesses_otherwise(
+        self, title: str, expected: str
+    ) -> None:
+        from sbxloop.deliver import conventional_title
+
+        assert conventional_title(title) == expected
+
+    def test_pr_conventions_is_a_paragraph_only_when_the_workspace_says_so(
+        self, tmp_path: Path
+    ) -> None:
+        from sbxloop.deliver import pr_conventions
+
+        root = make_workspace(tmp_path)
+        assert pr_conventions(None) == "" and pr_conventions(root) == ""
+        (root / "commitlint.config.js").write_text("x")
+        text = pr_conventions(root)
+        assert "`commitlint.config.js`" in text and "`type(scope): summary`" in text
+        assert "pr-body" not in text
+        (root / "PULL_REQUEST_TEMPLATE.md").write_text("## Why\n")
+        text = pr_conventions(root)
+        assert "`PULL_REQUEST_TEMPLATE.md`" in text and "`.sbxloop/pr-body`" in text
+        assert text.count("\n- ") == 1 and text.startswith("- ")
+
+
 class TestNaming:
     """#621: the PR title and commit message are the operator's templates,
     rendered with the plan's title when the model gave one; unset, they

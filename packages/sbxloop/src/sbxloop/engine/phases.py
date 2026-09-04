@@ -36,6 +36,7 @@ from typing import Literal, NamedTuple, TypeVar
 from pydantic import BaseModel
 
 from sbxloop.config import Config
+from sbxloop.deliver import pr_conventions
 from sbxloop.engine.model import SteerVerdict, TaskGraph, TaskRecord
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.review import ReviewGuard, ReviewVerdict
@@ -492,6 +493,7 @@ class PhaseRunner:
                 "max_tasks": str(self.config.budgets.max_tasks),
                 "project_gate": gate_rule(self.project_gate()),
                 "config_override_example": config_override_example(self.languages),
+                "pr_conventions": pr_conventions(self.workspace),
             },
             check=self._check_taskgraph,
         )

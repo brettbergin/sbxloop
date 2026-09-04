@@ -59,8 +59,21 @@ from urllib.parse import quote
 from pydantic import ValidationError
 
 from sbxloop import hostgit
-from sbxloop.config import Config, RepoConfig, _flatten, load_config, load_dotenv_file
-from sbxloop.deliver import deliver_workspace, ensure_repository, render_naming
+from sbxloop.config import (
+    DEFAULT_PR_TITLE_TEMPLATE,
+    Config,
+    RepoConfig,
+    _flatten,
+    load_config,
+    load_dotenv_file,
+)
+from sbxloop.deliver import (
+    conventional_title,
+    conventional_titles,
+    deliver_workspace,
+    ensure_repository,
+    render_naming,
+)
 from sbxloop.engine.checks import CheckJudgment, check_policy_reader
 from sbxloop.engine.followups import (
     Candidate,
@@ -86,6 +99,7 @@ from sbxloop.engine.landing import (
 )
 from sbxloop.engine.model import (
     PIPELINE_STAGES,
+    PR_BODY_FILE,
     RESUMABLE_RUN_STATES,
     TERMINAL_RUN_STATES,
     FixKind,
@@ -1522,7 +1536,8 @@ class LoopEngine:
         title = self._retitled(p, run.pr_title)
         if title != run.pr_title:
             self.store.set_run_title(run_id, title)
-        pr_title, commit_message = self._naming(p, title)
+        pr_title, commit_message = self._naming(p, title, source)
+        authored_body = self._authored_body(p)
         # Only the first delivery of an adopted branch continues its
         # history; once this run has delivered, later rounds force-move
         # onto their own head as they always did.
@@ -1553,6 +1568,7 @@ class LoopEngine:
             parent=parent,
             title=pr_title,
             commit_message=commit_message,
+            authored_body=authored_body,
         )
         data = ops.pr_get(repo, pr.number)
         head = data.get("head")
@@ -1588,9 +1604,13 @@ class LoopEngine:
             round=round_no,
         )
 
-    def _naming(self, p: Pipeline, title: str | None) -> tuple[str, str]:
+    def _naming(self, p: Pipeline, title: str | None, source: Path) -> tuple[str, str]:
         """The PR title and commit message from the `[github]` templates
-        (#621) — the repo entry's own when it overrides them."""
+        (#621) — the repo entry's own when it overrides them. A repository
+        that lints titles as conventional commits (#678) and a title
+        template nobody set get the bare conventional title instead of
+        `sbxloop: {title}`, which no such lint accepts; a template the
+        operator wrote is theirs and stands."""
         assert p.repo is not None
         gh = self.config.github
         entry = p.repo_config
@@ -1604,7 +1624,35 @@ class LoopEngine:
                 template, title=title, outcome=p.outcome, run_id=p.run_id, repo=str(p.repo)
             )
 
-        return render(title_template), render(message_template)
+        pr_title = render(title_template)
+        if title_template == DEFAULT_PR_TITLE_TEMPLATE:
+            evidence = conventional_titles(source)
+            if evidence:
+                pr_title = conventional_title(render("{title}"))
+                log.info(
+                    "deliver.conventional_title",
+                    run=p.run_id,
+                    evidence=evidence,
+                    title=pr_title,
+                )
+        return pr_title, render(message_template)
+
+    def _authored_body(self, p: Pipeline) -> str | None:
+        """The pull request description the agent wrote, if any: the whole
+        of ``.sbxloop/pr-body`` under the workspace (#678) — the
+        repository's template filled in, or a fix round's corrected body —
+        read and taken away like the title file, so it names one round."""
+        path = f"{p.pair.agent_workdir}/{PR_BODY_FILE}"
+        try:
+            result = p.pair.agent.exec(["sh", "-c", 'cat "$1" && rm -f "$1"', "sh", path])
+        except SbxError:
+            log.warning("deliver.body_file_unread", run=p.run_id, path=path, exc_info=True)
+            return None
+        body = result.stdout.strip() if result.returncode == 0 else ""
+        if not body:
+            return None
+        log.info("deliver.body_from_workspace", run=p.run_id, chars=len(body))
+        return body
 
     def _retitled(self, p: Pipeline, current: str | None) -> str | None:
         """The PR title after a fix round: a round that had to retitle

@@ -51,6 +51,9 @@ def render(name: str, **context: str) -> str:
     declares a domain that needs no declaration or omits one that does.
     """
     context.setdefault("retry_context", "")
+    # The repository's PR conventions (#678) are a paragraph only when the
+    # workspace declares some; most render calls have none to give.
+    context.setdefault("pr_conventions", "")
     context.setdefault("baseline_registries", _domain_list(BASELINE_REGISTRY_DOMAINS))
     context.setdefault("declarable_registries", _domain_list(WELL_KNOWN_REGISTRY_DOMAINS))
     return _template(name).substitute(context)

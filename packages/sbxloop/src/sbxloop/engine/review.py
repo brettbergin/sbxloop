@@ -36,7 +36,7 @@ from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from sbxloop.engine.model import FixKind, TaskSpec
+from sbxloop.engine.model import PR_BODY_FILE, FixKind, TaskSpec
 from sbxloop.gh.ops import FailedCheck, ReviewComment, ReviewEvent
 
 # How many inline comments one posted review may carry. A reviewer that
@@ -60,7 +60,10 @@ PR_TITLE_HINT = (
     f"If a failing check judges the pull request's *title* rather than its code "
     f"(a title lint, a conventional-commits or semantic-PR check), write the "
     f"corrected title alone, on one line, to `{PR_TITLE_FILE}` under the workspace "
-    f"root; the loop retitles the pull request on re-delivery."
+    f"root; the loop retitles the pull request on re-delivery. If a failing check "
+    f"judges the pull request's *description* (a template checklist, a body lint), "
+    f"write the whole corrected description to `{PR_BODY_FILE}`; the loop replaces "
+    f"the description on re-delivery. Neither file is delivered."
 )
 
 Severity = Literal["blocking", "major", "minor", "nit"]

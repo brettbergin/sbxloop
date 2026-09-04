@@ -53,13 +53,20 @@ The worker performs the per-file blob POSTs in-sandbox and streams
 from __future__ import annotations
 
 import base64
+import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from sbxloop import hostgit
-from sbxloop.engine.model import DEFAULT_ARTIFACT_EXCLUDES, exclusion_hit, scan_artifacts
+from sbxloop.engine.model import (
+    DEFAULT_ARTIFACT_EXCLUDES,
+    PR_BODY_FILE,
+    exclusion_hit,
+    scan_artifacts,
+)
 from sbxloop.errors import DeliveryError, GithubOpsError
 from sbxloop.gh.ops import GithubOps, PrRef
 from sbxloop.ids import branch_name as branch_name  # re-export; shared with hostgit isolation
@@ -69,6 +76,56 @@ log = get_logger(__name__)
 
 FILE_MODE = "100644"
 BODY_FILE_LIST_CAP = 50
+# The places GitHub reads a pull request template from (#678), in the
+# order it prefers them; the first that exists is the one a human opening
+# a PR in the browser would be handed. A template *directory* holds
+# alternatives GitHub only applies by query parameter, so it is not one.
+PR_TEMPLATE_PATHS = (
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    ".github/pull_request_template.md",
+    "PULL_REQUEST_TEMPLATE.md",
+    "pull_request_template.md",
+    "docs/PULL_REQUEST_TEMPLATE.md",
+    "docs/pull_request_template.md",
+)
+PR_TEMPLATE_CAP = 16 * 1024
+# What says a repository lints pull-request titles as conventional commits
+# (#678): commitlint's config files, a `commitlint` key in package.json,
+# or a workflow running one of the two common title actions.
+_COMMITLINT_FILES = (
+    "commitlint.config.js",
+    "commitlint.config.cjs",
+    "commitlint.config.mjs",
+    "commitlint.config.ts",
+    "commitlint.config.json",
+    "commitlint.config.yaml",
+    "commitlint.config.yml",
+    ".commitlintrc",
+    ".commitlintrc.json",
+    ".commitlintrc.yaml",
+    ".commitlintrc.yml",
+    ".commitlintrc.js",
+    ".commitlintrc.cjs",
+    ".commitlintrc.ts",
+)
+_TITLE_ACTIONS = ("amannn/action-semantic-pull-request", "wagoid/commitlint-github-action")
+# A conventional-commit subject: `type(scope)!: summary`, the type one of
+# config-conventional's default `type-enum` — the set the lints enforce
+# unless a repository extends it, so `sbxloop: …` is not one.
+CONVENTIONAL_TYPES = (
+    "build",
+    "chore",
+    "ci",
+    "docs",
+    "feat",
+    "fix",
+    "perf",
+    "refactor",
+    "revert",
+    "style",
+    "test",
+)
+CONVENTIONAL_TITLE = re.compile(r"^(" + "|".join(CONVENTIONAL_TYPES) + r")(\([^()]*\))?!?: \S")
 TITLE_CLIP = 72
 # Cap on base64 payload bytes per blobs.create_many job. The manifest rides
 # inside the job JSON (staged into the sandbox with one `sbx cp`), so this
@@ -285,8 +342,15 @@ def deliver_workspace(
     parent: str | None = None,
     title: str | None = None,
     commit_message: str | None = None,
+    authored_body: str | None = None,
 ) -> PrRef:
     """Publish source_dir as one commit on a branch and open (or update) a PR.
+
+    ``authored_body`` is the description the agent wrote (``.sbxloop/pr-body``
+    under the workspace, #678): it becomes the PR's body on the create, or
+    replaces the open PR's body on a re-delivery. Without it the body is the
+    repository's own pull request template, when ``source_dir`` has one,
+    followed by the loop's summary.
 
     ``branch`` overrides the per-run branch name so a fix round lands on the
     pull request it was fixing: the existing branch is looked up and
@@ -409,14 +473,33 @@ def deliver_workspace(
         _retitle(
             ops, repo, pr_number, current=str(data.get("title") or ""), wanted=title, run_id=run_id
         )
+        if authored_body and authored_body.strip():
+            _rebody(
+                ops,
+                repo,
+                pr_number,
+                body=_body(run_id, outcome, plan, closes=closes, authored=authored_body),
+                run_id=run_id,
+            )
         return PrRef(number=pr_number, url=url)
+    template = pr_template(source_dir)
+    if template is not None:
+        log.info("deliver.pr_template", run=run_id, repo=repo, path=template[0])
+    body = _body(
+        run_id,
+        outcome,
+        plan,
+        closes=closes,
+        template=template[1] if template else None,
+        authored=authored_body,
+    )
     try:
         pr = ops.pr_create(
             repo,
             base=base,
             head=branch,
             title=title,
-            body=_body(run_id, outcome, plan, closes=closes),
+            body=body,
             draft=draft,
         )
     except GithubOpsError as exc:
@@ -431,14 +514,7 @@ def deliver_workspace(
                 hint="the repository has no draft pull requests; opening the PR ready for review",
             )
             draft = False
-            pr = ops.pr_create(
-                repo,
-                base=base,
-                head=branch,
-                title=title,
-                body=_body(run_id, outcome, plan, closes=closes),
-                draft=False,
-            )
+            pr = ops.pr_create(repo, base=base, head=branch, title=title, body=body, draft=False)
             log.info(
                 "deliver.pr_opened", run=run_id, repo=repo, pr=pr.number, url=pr.url, draft=False
             )
@@ -751,7 +827,98 @@ def _retitle(
     log.info("deliver.title_changed", run=run_id, repo=repo, pr=number, old=current, new=wanted)
 
 
-def _body(run_id: str, outcome: str, plan: DeliveryPlan, *, closes: int | None = None) -> str:
+def pr_template(root: Path) -> tuple[str, str] | None:
+    """The repository's pull request template (#678): ``(path, text)`` for
+    the first of :data:`PR_TEMPLATE_PATHS` under ``root`` with any text in
+    it, else ``None``. Read as bytes and decoded leniently — a template is
+    prose, and one odd byte must not fail a delivery."""
+    for rel in PR_TEMPLATE_PATHS:
+        path = root / rel
+        try:
+            if not path.is_file():
+                continue
+            text = path.read_bytes()[:PR_TEMPLATE_CAP].decode("utf-8", "replace").strip()
+        except OSError:
+            continue
+        if text:
+            return rel, text
+    return None
+
+
+def conventional_titles(root: Path) -> str | None:
+    """What, if anything, says this repository lints pull-request titles as
+    conventional commits (#678): the path of the evidence, else ``None``.
+    A workflow counts only when it runs one of the known title actions;
+    reading it is bounded to the workflows directory, never the tree."""
+    for rel in _COMMITLINT_FILES:
+        if (root / rel).is_file():
+            return rel
+    package = root / "package.json"
+    if package.is_file():
+        try:
+            data = json.loads(package.read_bytes()[: PR_TEMPLATE_CAP * 4])
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict) and "commitlint" in data:
+            return "package.json (commitlint)"
+    workflows = root / ".github" / "workflows"
+    if workflows.is_dir():
+        for path in sorted(workflows.iterdir()):
+            if path.suffix not in (".yml", ".yaml") or not path.is_file():
+                continue
+            try:
+                text = path.read_bytes()[: PR_TEMPLATE_CAP * 4].decode("utf-8", "replace")
+            except OSError:
+                continue
+            for action in _TITLE_ACTIONS:
+                if action in text:
+                    return f".github/workflows/{path.name} ({action})"
+    return None
+
+
+def conventional_title(title: str) -> str:
+    """``title`` as a conventional-commit subject (#678): kept when it
+    already is one (the planner read the repository's history), else
+    ``chore:`` + the subject lowercased at its first letter — the guess
+    config-conventional's default rules accept (a sentence-case subject
+    is itself a violation), and a red title check is still a fix round
+    away via ``.sbxloop/pr-title``."""
+    title = " ".join(title.split())
+    if CONVENTIONAL_TITLE.match(title):
+        return title
+    return f"chore: {title[:1].lower()}{title[1:]}" if title else "chore: deliver artifacts"
+
+
+def pr_conventions(root: Path | None) -> str:
+    """The decompose prompt's paragraph on this repository's pull-request
+    conventions (#678): its title lint, its template — or nothing, when
+    the workspace declares neither, so the model is not taught a
+    convention the repository does not have."""
+    if root is None:
+        return ""
+    lines: list[str] = []
+    evidence = conventional_titles(root)
+    if evidence:
+        lines.append(
+            f"- This repository lints pull request titles as conventional commits "
+            f"(`{evidence}`): `pr_title` MUST read `type(scope): summary` — a lowercase "
+            f"type from feat, fix, docs, refactor, test, chore, build, ci, perf; the "
+            f"scope optional; the summary lowercase, imperative, without a trailing period."
+        )
+    template = pr_template(root)
+    if template:
+        lines.append(
+            f"- This repository has a pull request template (`{template[0]}`). The last "
+            f"task MUST write the template filled in for this change — each section "
+            f"answered, each checklist item ticked only when it is true — to "
+            f"`{PR_BODY_FILE}` under the workspace root, alone in that file; the loop "
+            f"uses it as the pull request's description. It is never delivered as a "
+            f"file, and a task must not commit it."
+        )
+    return "\n".join(lines)
+
+
+def _summary(run_id: str, outcome: str, plan: DeliveryPlan) -> str:
     listed = plan.lines[:BODY_FILE_LIST_CAP]
     if plan.count > BODY_FILE_LIST_CAP:
         listed.append(f"- … +{plan.count - BODY_FILE_LIST_CAP} more")
@@ -765,6 +932,44 @@ def _body(run_id: str, outcome: str, plan: DeliveryPlan, *, closes: int | None =
         body += f"\n**Not delivered:** {plan.excluded_note}\n"
     if plan.note:
         body += f"\n_{plan.note}_\n"
-    if closes is not None:
-        body += f"\nCloses #{closes}\n"
     return body
+
+
+def _body(
+    run_id: str,
+    outcome: str,
+    plan: DeliveryPlan,
+    *,
+    closes: int | None = None,
+    template: str | None = None,
+    authored: str | None = None,
+) -> str:
+    """The pull request's description (#678). The agent's own
+    ``.sbxloop/pr-body`` wins outright — it filled the repository's
+    template in — with the run's provenance and ``Closes`` after a rule;
+    otherwise a repository template opens the body verbatim, so a check
+    that parses it (danger, a PR lint) sees the sections it expects, and
+    the loop's summary follows. ``Closes #N`` is always the last line: it
+    is what settles the issue."""
+    footer = f"\nCloses #{closes}\n" if closes is not None else ""
+    if authored and authored.strip():
+        return (
+            f"{authored.strip()}\n\n---\n\nArtifacts produced by sbxloop run `{run_id}`.\n" + footer
+        )
+    summary = _summary(run_id, outcome, plan)
+    if template:
+        return f"{template.strip()}\n\n---\n\n{summary}{footer}"
+    return summary + footer
+
+
+def _rebody(ops: GithubOps, repo: str, number: int, *, body: str, run_id: str) -> None:
+    """Replace the open PR's description when a fix round authored one
+    (#678) — a check that judges the body is otherwise incurable. Best
+    effort, like the retitle: a refused edit must not fail a delivery
+    that landed."""
+    try:
+        ops.raw("PATCH", f"/repos/{repo}/pulls/{number}", {"body": body})
+    except GithubOpsError:
+        log.warning("deliver.body_unchanged", run=run_id, repo=repo, pr=number, exc_info=True)
+        return
+    log.info("deliver.body_changed", run=run_id, repo=repo, pr=number, chars=len(body))

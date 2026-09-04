@@ -19,7 +19,9 @@ tests/unit/test_prompts.py):
 
 Variables: $outcome, $max_tasks, $project_gate, $config_override_example
 (rendered by verifylint.config_override_example for the run's resolved
-toolchains, #634); $retry_context (defaulted to "" by render());
+toolchains, #634); $pr_conventions (deliver.pr_conventions, #678 — defaulted
+to "" by render(), a paragraph only when the workspace has a title lint or a
+pull request template); $retry_context (defaulted to "" by render());
 $baseline_registries and $declarable_registries are injected from policy.py,
 never hardcoded (test_registry_tiers_are_injected_not_hardcoded).
 Examples are domain-neutral on purpose (#634): no issue or PR numbers, no
@@ -132,6 +134,8 @@ worker, not by retries — has done the wrong thing correctly.
   a length limit, whatever they do). Say what the change does, not that
   it was automated. Leave it `null` when the workspace has no history to
   learn from.
+
+$pr_conventions
 
 ## The config-override, worked
 
