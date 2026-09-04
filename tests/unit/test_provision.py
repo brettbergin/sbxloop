@@ -1,5 +1,6 @@
 """Provisioner tests: specs, token split, policy, secrets, rollback."""
 
+import logging
 import shutil
 from pathlib import Path
 from typing import ClassVar
@@ -2000,3 +2001,166 @@ class TestClaudeAgentBackend:
         assert "ANTHROPIC_API_KEY=sk-ant-claude-agent-key" in content
         assert "SBXLOOP_WORKER_BACKEND=claude" in content
         assert "COPILOT_GITHUB_TOKEN" not in content
+
+
+class TestOperatorSandboxEnv:
+    """`[sandbox] env` / `secret_env` reach the agent sandbox (#679): plain
+    values as given, secret values from the daemon's environment — and the
+    secret only ever travels the way the credential does."""
+
+    SECRET = "npm_secret_value_9f3a"  # nosec B105 - test fixture
+
+    def _config(self, tmp_path: Path, **repo_overrides: object) -> Config:
+        entry: dict[str, object] = {"repo": "owner/repo", **repo_overrides}
+        return Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "sandbox": {
+                    "env": {"RAILS_ENV": "test", "GREETING": "hello world"},
+                    "secret_env": ["NPM_TOKEN"],
+                },
+                "github": {"repos": [entry]},
+            }
+        )
+
+    def _provisioner(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        *,
+        config: Config | None = None,
+        with_secret: bool = True,
+        bus: EventBus | None = None,
+    ) -> Provisioner:
+        env = dict(TOKENS)
+        if with_secret:
+            env["NPM_TOKEN"] = self.SECRET
+        return make_provisioner(
+            fake_sbx, tmp_path, config=config or self._config(tmp_path), env=env, bus=bus
+        )
+
+    def test_the_agent_spec_carries_both_and_the_github_spec_neither(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        agent, github = provisioner.build_specs("r1", tmp_path, "owner/repo")
+        assert agent.persistent_env == {"RAILS_ENV": "test", "GREETING": "hello world"}
+        assert agent.secret_env == {"NPM_TOKEN": self.SECRET}
+        assert "RAILS_ENV" not in github.persistent_env
+        assert github.secret_env == {}
+
+    def test_env_file_delivery_writes_both_and_argv_and_events_hold_neither(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The fake's default: proxy secrets invisible, no stdin passthrough,
+        so the 0600 env file is the delivery. The secret's VALUE appears in
+        that file and nowhere else — not in an `sbx` argument, an event, or
+        a log line."""
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = self._provisioner(fake_sbx, tmp_path, bus=bus)
+        with caplog.at_level(logging.DEBUG):
+            provisioner.ensure_pair("r1", repo="owner/repo")
+        env_sh = (
+            fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+        ).read_text()
+        assert "export RAILS_ENV=test\n" in env_sh
+        assert "export GREETING='hello world'\n" in env_sh
+        assert f"export NPM_TOKEN={self.SECRET}\n" in env_sh
+        github_sh = fake_sbx.sandbox_fs("sbxloop-r1-github") / "home/agent/.sbxloop/env.sh"
+        if github_sh.exists():
+            assert "NPM_TOKEN" not in github_sh.read_text()
+        for call in fake_sbx.invocations():
+            assert all(self.SECRET not in arg for arg in call), call
+        for event in events:
+            assert self.SECRET not in repr(event.data), event
+        assert all(self.SECRET not in record.getMessage() for record in caplog.records)
+
+    def test_stdin_delivery_pipes_both_per_job_and_writes_nothing(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBX_FAKE_EXEC_STDIN", "1")
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        provisioner.ensure_pair("r1", repo="owner/repo")
+        # The plain env was written before the visibility verdict; the
+        # secret waited for it and now rides stdin only.
+        env_sh = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+        assert "export RAILS_ENV=test\n" in env_sh.read_text()
+        assert self.SECRET not in env_sh.read_text()
+        provider = provisioner.job_env("agent", "owner/repo")
+        assert provider is not None
+        exports = provider()
+        assert exports["RAILS_ENV"] == "test"
+        assert exports["NPM_TOKEN"] == self.SECRET
+        assert exports["COPILOT_GITHUB_TOKEN"] == TOKENS["COPILOT_GITHUB_TOKEN"]
+        for call in fake_sbx.invocations():
+            assert all(self.SECRET not in arg for arg in call), call
+
+    def test_a_working_proxy_still_puts_the_secret_in_the_env_file(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the sbx proxy carries the agent's credential nothing else
+        rewrites the env file, and the proxy is no road for an operator
+        secret (no single host to bind it to) — so it is written there
+        once the visibility verdict is in, beside the plain env."""
+        monkeypatch.setenv("SBX_FAKE_EXEC_STDIN", "1")
+        # the fake's exec inherits the host env: a real-looking token here
+        # is what a visible proxy secret looks like to the probe
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "github_pat_visible")
+        monkeypatch.setenv("GH_TOKEN", "github_pat_visible")
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        provisioner.ensure_pair("r1", repo="owner/repo")
+        assert provisioner.job_env("agent", "owner/repo") is None
+        env_sh = (
+            fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+        ).read_text()
+        assert "export RAILS_ENV=test\n" in env_sh
+        assert f"export NPM_TOKEN={self.SECRET}\n" in env_sh
+        assert "COPILOT_GITHUB_TOKEN" not in env_sh
+        for call in fake_sbx.invocations():
+            assert all(self.SECRET not in arg for arg in call), call
+
+    def test_an_unset_secret_fails_provisioning_by_name_before_any_sandbox(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = self._provisioner(fake_sbx, tmp_path, with_secret=False)
+        with pytest.raises(ProvisionError, match=r"secret_env names \['NPM_TOKEN'\] are not set"):
+            provisioner.ensure_pair("r1", repo="owner/repo")
+        assert fake_sbx.invocations("create") == []
+
+    def test_a_repository_override_replaces_the_global_setting(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        config = self._config(tmp_path, env={"GOFLAGS": "-mod=vendor"}, secret_env=[])
+        # NPM_TOKEN deliberately absent from the daemon env: the override
+        # dropped it, so nothing may ask for it.
+        provisioner = self._provisioner(fake_sbx, tmp_path, config=config, with_secret=False)
+        agent, _github = provisioner.build_specs("r1", tmp_path, "owner/repo")
+        assert agent.persistent_env == {"GOFLAGS": "-mod=vendor"}
+        assert agent.secret_env == {}
+        provisioner.ensure_pair("r1", repo="owner/repo")
+        env_sh = (
+            fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+        ).read_text()
+        assert "GOFLAGS=-mod=vendor" in env_sh
+        assert "RAILS_ENV" not in env_sh
+
+    def test_the_backend_selector_stays_on_top_of_operator_env(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        config = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "agent": {"backend": "claude"},
+                "sandbox": {"env": {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "0"}},
+                **GITHUB_ENABLED,
+            }
+        )
+        provisioner = make_provisioner(
+            fake_sbx, tmp_path, config=config, env={"ANTHROPIC_API_KEY": "sk-ant-x", **TOKENS}
+        )
+        assert provisioner.agent_persistent_env()["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"

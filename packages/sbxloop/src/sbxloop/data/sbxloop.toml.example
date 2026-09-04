@@ -103,6 +103,16 @@ secret_strategy = "proxy"
 # workspace's manifests declare (go.mod, package.json, Cargo.toml, ...),
 # Python when nothing is recognized. Setting it replaces detection.
 # languages = ["python", "node"]
+# Environment for the agent sandbox's worker and every command it runs (the
+# agent's turns, verify commands). `env` holds plain values as written here;
+# `secret_env` names variables whose VALUES are read from the daemon's own
+# environment at provision time and delivered like the agent credential
+# (per-job stdin or the 0600 in-VM env file) — never an sbx argument, event
+# or log line. A name the daemon does not hold fails provisioning by name;
+# `sbxloop doctor` lists unset ones. Neither may name what the loop delivers
+# itself (GH_TOKEN, the agent credential, SBXLOOP_*).
+# env = { RAILS_ENV = "test", DATABASE_URL = "postgres://localhost/app_test" }
+# secret_env = ["NPM_TOKEN", "PIP_INDEX_URL"]
 
 # [policy]
 # Bounds for plan-declared egress. At PLAN time the agent may declare extra
@@ -207,6 +217,8 @@ secret_strategy = "proxy"
 # bot_login = "other-app[bot]"     # identity override; unset uses [github]'s
 # reviewers = ["their-lead"]       # review requests; unset uses [github]'s, [] requests nobody
 # review_notify = ["<chat user id>"] # pinged when a PR waits for a review; unset uses [landing]'s
+# env = { RAILS_ENV = "test" }     # agent-sandbox environment; a set value REPLACES [sandbox]'s
+# secret_env = []                  # names read from the daemon env; [] = this repo needs none
 # [[github.repos]]
 # repo = "you/other-repo"
 # enabled = false              # registered but not polled

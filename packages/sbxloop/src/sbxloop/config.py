@@ -40,6 +40,7 @@ from pydantic import (
     model_validator,
 )
 
+from sbxloop.backends import ANTHROPIC_TOKEN_ENV, COPILOT_TOKEN_ENV
 from sbxloop.errors import ConfigError
 from sbxloop.ids import DEFAULT_BRANCH_PREFIX
 from sbxloop.log import LogFormat, LogLevel, get_logger
@@ -52,6 +53,26 @@ ENV_PREFIX = "SBXLOOP_"
 # SBXLOOP_-prefixed variables consumed by the *worker process* rather than
 # host configuration; the env config layer must not treat them as settings.
 RESERVED_ENV_KEYS = frozenset({"worker_backend", "echo_script"})
+
+# Environment the loop delivers to a sandbox itself (#679): the credentials
+# it mints and the worker's own selectors. Operator `[sandbox] env` /
+# `secret_env` may not name them — a config that did would either clobber
+# the run's credential or be clobbered silently, and neither is a setting.
+LOOP_MANAGED_ENV = frozenset(
+    {"GH_TOKEN", "GITHUB_TOKEN", "GH_REPO", COPILOT_TOKEN_ENV, ANTHROPIC_TOKEN_ENV}
+)
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def _check_env_names(names: Sequence[str], key: str) -> None:
+    for name in names:
+        if not _ENV_NAME_RE.match(name):
+            raise ValueError(f"{key}: {name!r} is not an environment variable name")
+        if name.startswith(ENV_PREFIX) or name in LOOP_MANAGED_ENV:
+            raise ValueError(
+                f"{key}: {name} is delivered by sbxloop itself and cannot be configured"
+            )
+
 
 WorkerTransport = Literal["stream", "poll"]
 WorkspaceSource = Literal["configured", "remote", "none"]
@@ -141,6 +162,41 @@ class SandboxConfig(_ConfigModel):
     clone_filter: str | None = None
     extra_allow_domains: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=list)
+    # Operator environment for the agent sandbox (#679). `env` holds plain
+    # values — `RAILS_ENV`, `DATABASE_URL`, a `PIP_INDEX_URL` — written as
+    # given and visible wherever the config is; `secret_env` names variables
+    # whose VALUES are read from the daemon's own environment at provision
+    # time (an `NPM_TOKEN`) and delivered the way the loop delivers its own
+    # credentials: the 0600 in-VM env file or per-job stdin, never an `sbx`
+    # argument, event, or log line. A named secret the daemon does not hold
+    # fails provisioning by name (`sbxloop doctor` lists them first).
+    # Neither may name a variable the loop delivers itself (`GH_TOKEN`, the
+    # agent credential, `SBXLOOP_*`). A `[[github.repos]]` entry replaces
+    # either setting for its own runs.
+    env: dict[str, str] = Field(default_factory=dict)
+    secret_env: list[str] = Field(default_factory=list)
+
+    @field_validator("env")
+    @classmethod
+    def _check_env(cls, value: dict[str, str]) -> dict[str, str]:
+        _check_env_names(list(value), "sandbox.env")
+        return value
+
+    @field_validator("secret_env")
+    @classmethod
+    def _check_secret_env(cls, value: list[str]) -> list[str]:
+        _check_env_names(value, "sandbox.secret_env")
+        return list(dict.fromkeys(value))
+
+    @model_validator(mode="after")
+    def _env_and_secret_env_are_disjoint(self) -> SandboxConfig:
+        both = sorted(set(self.env) & set(self.secret_env))
+        if both:
+            raise ValueError(
+                f"sandbox.env and sandbox.secret_env both name {both}: a variable is "
+                "either a plain value or a secret read from the daemon's environment"
+            )
+        return self
 
     @field_validator("clone_filter")
     @classmethod
@@ -365,6 +421,11 @@ class RepoConfig(_ConfigModel):
     # Chat user ids to @mention when such a PR waits (#675); None →
     # `[landing] review_notify`. The requester is always mentioned.
     review_notify: list[str] | None = None
+    # This repository's agent-sandbox environment (#679); None → the
+    # `[sandbox]` value, and a set value REPLACES it (restate what the
+    # global setting held and this repository still needs).
+    env: dict[str, str] | None = None
+    secret_env: list[str] | None = None
 
     @field_validator("repo")
     @classmethod
@@ -391,6 +452,21 @@ class RepoConfig(_ConfigModel):
     @classmethod
     def _check_bot_login(cls, value: str | None) -> str | None:
         return None if value is None else _check_login(value, "github.repos[].bot_login")
+
+    @field_validator("env")
+    @classmethod
+    def _check_env(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        if value is not None:
+            _check_env_names(list(value), "github.repos[].env")
+        return value
+
+    @field_validator("secret_env")
+    @classmethod
+    def _check_secret_env(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        _check_env_names(value, "github.repos[].secret_env")
+        return list(dict.fromkeys(value))
 
     @field_validator(*(f"{name}_label" for name in LABEL_KINDS))
     @classmethod
@@ -1455,6 +1531,35 @@ class Config(_ConfigModel):
         the default repository, and a repository with no entry gets the
         daemon-wide set."""
         return self.daemon.labels_for(self.github.effective_repo(repo))
+
+    def sandbox_env_for(self, repo: str | None = None) -> dict[str, str]:
+        """The plain environment ``repo``'s agent sandbox gets (#679): the
+        entry's own mapping when set, else `[sandbox] env`."""
+        entry = self.github.effective_repo(repo)
+        if entry is not None and entry.env is not None:
+            return dict(entry.env)
+        return dict(self.sandbox.env)
+
+    def secret_env_for(self, repo: str | None = None) -> list[str]:
+        """The names whose values ``repo``'s agent sandbox receives from the
+        daemon's environment (#679): the entry's own list when set, else
+        `[sandbox] secret_env`."""
+        entry = self.github.effective_repo(repo)
+        if entry is not None and entry.secret_env is not None:
+            return list(entry.secret_env)
+        return list(self.sandbox.secret_env)
+
+    @model_validator(mode="after")
+    def _repo_env_and_secret_env_are_disjoint(self) -> Config:
+        """A repository's *effective* pair must be disjoint too: an entry
+        that overrides only one of them can collide with the global other."""
+        for entry in self.github.repos:
+            both = sorted(
+                set(self.sandbox_env_for(entry.repo)) & set(self.secret_env_for(entry.repo))
+            )
+            if both:
+                raise ValueError(f"github.repos[{entry.repo}]: env and secret_env both name {both}")
+        return self
 
     @model_validator(mode="after")
     def _chat_backend_is_consistent(self) -> Config:

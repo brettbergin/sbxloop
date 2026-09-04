@@ -3729,3 +3729,30 @@ class TestBotSuffixLanding:
         assert not any("did not arrive with a changes-requested" in b for b in bodies), (
             "the loop must not ack its own finding threads"
         )
+
+
+class TestOperatorSandboxEnvInThePipeline:
+    """#679: `[sandbox] env` is in the environment of every command the
+    agent sandbox's worker runs — here a task's verify command. The fake
+    sbx's exec inherits the test process's environment, so the variable is
+    one nothing but the config sets."""
+
+    CHECK = '[ "$OPERATOR_GREETING" = "hello from config" ]'
+
+    def test_a_configured_variable_is_in_the_verify_commands_environment(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OPERATOR_GREETING", raising=False)
+        harness.script([taskgraph(task("t1", verify=[self.CHECK])), BUILD])
+        engine = harness.engine(
+            sandbox={"env": {"OPERATOR_GREETING": "hello from config"}},
+            budgets=NO_RETRY_BUDGETS,
+        )
+        assert engine.start("see the env").state == "completed"
+
+    def test_without_the_setting_the_same_check_fails(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OPERATOR_GREETING", raising=False)
+        harness.script([taskgraph(task("t1", verify=[self.CHECK])), BUILD])
+        assert harness.engine(budgets=NO_RETRY_BUDGETS).start("see the env").state == "failed"

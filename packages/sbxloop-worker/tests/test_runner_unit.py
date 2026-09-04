@@ -384,3 +384,45 @@ class TestPersistentEnvFile:
             assert os.environ["SBXLOOP_TEST_PERSISTENT_SENTINEL"] == "from-persistent"
         finally:
             os.environ.pop("SBXLOOP_TEST_PERSISTENT_SENTINEL", None)
+
+    def test_operator_env_from_the_env_file_reaches_the_jobs_subprocess(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`[sandbox] env` / `secret_env` arrive as exports in the env file
+        (#679); the worker loads them into its own environment, which every
+        job's subprocess — the agent CLI, a verify command — inherits."""
+        monkeypatch.delenv("SBXLOOP_TEST_OPERATOR_ENV", raising=False)
+        env_file = tmp_path / "env.sh"
+        env_file.write_text("export SBXLOOP_TEST_OPERATOR_ENV='from operator'\n")
+        job_path = tmp_path / "job.json"
+        job_path.write_text(
+            JobRequest(
+                job_id="j3",
+                run_id="r1",
+                kind="shell.check",
+                argv=["sh", "-c", 'printf %s "$SBXLOOP_TEST_OPERATOR_ENV"'],
+            ).model_dump_json()
+        )
+        result_path = tmp_path / "r.json"
+        code = main(
+            [
+                "run",
+                "--job",
+                str(job_path),
+                "--events",
+                str(tmp_path / "e.jsonl"),
+                "--result",
+                str(result_path),
+                "--heartbeat",
+                "0",
+                "--env-file",
+                str(env_file),
+            ]
+        )
+        try:
+            assert code == 0
+            result = json.loads(result_path.read_text())
+            assert result["exit_code"] == 0
+            assert result["output_text"] == "from operator"
+        finally:
+            os.environ.pop("SBXLOOP_TEST_OPERATOR_ENV", None)
