@@ -50,6 +50,26 @@ def test_decompose_asks_for_a_pr_title_in_the_repos_style() -> None:
     assert '"pr_title"' in text, "the JSON example carries the key"
 
 
+def test_decompose_carries_the_repositorys_pr_conventions_only_when_given() -> None:
+    """#678: the title lint and the template are a paragraph rendered from
+    the workspace (deliver.pr_conventions); the template itself teaches
+    neither, so a repository without them is not told it has them."""
+    from sbxloop.deliver import pr_conventions
+
+    bare = render("decompose", outcome="o", max_tasks="5", project_gate="- gate", **EXAMPLE)
+    assert "conventional commits" not in bare and "pr-body" not in bare
+    told = render(
+        "decompose",
+        outcome="o",
+        max_tasks="5",
+        project_gate="- gate",
+        pr_conventions="- This repository lints pull request titles as conventional commits",
+        **EXAMPLE,
+    )
+    assert "- This repository lints pull request titles as conventional commits" in told
+    assert pr_conventions(None) == ""
+
+
 def test_decompose_states_the_uv_project_convention() -> None:
     # #250: the decomposer writes ALL the verify commands, and the lint
     # holds them to the uv convention when a lockfile is present — so the

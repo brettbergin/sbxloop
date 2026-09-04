@@ -151,7 +151,10 @@ secret_strategy = "proxy"
 # matched to the repository's commit-subject style; falls back to the run's
 # outcome), {outcome}, {run_id}, {repo}. Every one is overridable per
 # repository in a `[[github.repos]]` entry. The defaults are what the loop
-# always wrote.
+# always wrote — except on a repository that lints titles as conventional
+# commits (commitlint, action-semantic-pull-request), where the default
+# title becomes the plan's `type(scope): summary` alone; a template set
+# here is always used as written.
 # pr_title_template = "sbxloop: {title}"
 # commit_message_template = "sbxloop run {run_id}: deliver artifacts\n\nOutcome: {outcome}"
 # Branches are `<branch_prefix><run id>`; pick a prefix the repository's

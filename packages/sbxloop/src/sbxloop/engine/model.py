@@ -322,6 +322,12 @@ class RunResult(_Model):
         return self.state in ("merged", "completed")
 
 
+# Where the agent leaves the pull request's description (#678): under the
+# workspace's `.sbxloop/`, which delivery never ships (it is the first
+# exclude below), read by the engine before the delivery — the body's twin
+# of `engine.review.PR_TITLE_FILE`.
+PR_BODY_FILE = ".sbxloop/pr-body"
+
 # Path components excluded from artifact listings, harvest and delivery by
 # default. A denylist, not "anything dot-prefixed": agents legitimately
 # produce .github/workflows, .gitignore, .env.example and friends — only

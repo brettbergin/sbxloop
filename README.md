@@ -1071,7 +1071,14 @@ GitHub App installation — see [GitHub App auth](#github-app-auth).
 filtered by `[artifacts] exclude`. Every fix round re-delivers onto the same
 branch — force-moved, the open PR reused — so one run is one PR, and
 `sbxloop resume <run>` at `delivering` is the retry path when a delivery
-failed. The PR stays a draft until the review approves and CI is green, so a
+failed. The PR's description is the repository's own pull request template
+(`.github/PULL_REQUEST_TEMPLATE.md` and the other places GitHub reads it
+from) verbatim, followed by the loop's summary — so a check that parses the
+template sees its sections — and the planner is told the template exists
+and that the last task should write it filled in to `.sbxloop/pr-body`
+under the workspace, which then *is* the description (read, never
+delivered); a fix round can rewrite the description the same way when a
+check judges it. `Closes #N` is always the last line. The PR stays a draft until the review approves and CI is green, so a
 watching human reads "draft" as "sbxloop is still working on this". A
 repository plan without draft pull requests (GitHub answers the draft with
 a 422 saying so) gets a ready PR on one retry, logged
@@ -1090,8 +1097,15 @@ gets names it accepts. `{title}` is the plan's own `pr_title`, written in
 the repository's commit style (the decomposer is shown the recent `git log`), falling back to the run's outcome. A fix round can retitle the PR
 by writing `.sbxloop/pr-title` in the workspace — the file is read, never
 delivered — so a red title-lint check is curable like any other; a
-re-delivery whose title changed renames the PR. A branch creation GitHub
-refuses (422) fails the delivery quoting GitHub and naming the knob its
+re-delivery whose title changed renames the PR. A repository that lints
+titles as conventional commits — a `commitlint.config.*` or
+`.commitlintrc*`, a `commitlint` key in `package.json`, a workflow running
+`amannn/action-semantic-pull-request` or `wagoid/commitlint-github-action`
+— is detected from the tree: the planner is told to write `pr_title` as
+`type(scope): summary`, and when `pr_title_template` is the default the PR
+gets the bare conventional title instead of `sbxloop: {title}` (a title
+without a type becomes `chore: …`, lowercased; a template the operator
+wrote is left alone). A branch creation GitHub refuses (422) fails the delivery quoting GitHub and naming the knob its
 wording points at: a branch-name or creation rule → `branch_prefix`; a
 signature rule → signed commits, satisfied by a GitHub App credential; a
 locked or archived repository → nothing to configure; wording the loop

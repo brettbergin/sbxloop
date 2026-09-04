@@ -3447,6 +3447,92 @@ class TestNamingInThePipeline:
         assert engine.store.get_run(result.run_id).pr_title == "fix: the corrected title"
 
 
+class TestPrConventionsInThePipeline:
+    """#678: the repository's own pull request conventions — a title lint,
+    a template, the agent's `.sbxloop/pr-body` — shape the PR the run opens."""
+
+    def test_a_title_lint_in_the_workspace_drops_the_sbxloop_prefix(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        plan = taskgraph(task("t1"))
+        plan["json"]["pr_title"] = "feat(hello): add the greeting"
+        build = {"text": "wrote", "files": {"hello.txt": "hi\n", "commitlint.config.js": "x"}}
+        harness.script([plan, build, REVIEW_OK])
+        result = harness.pipeline(fake).start("write hello.txt")
+        assert result.state == "merged"
+        assert fake.pr_kwargs["title"] == "feat(hello): add the greeting"
+
+    def test_a_title_lint_with_no_plan_title_gets_a_conventional_guess(
+        self, harness: Harness
+    ) -> None:
+        fake = FakeGithub()
+        build = {"text": "wrote", "files": {"hello.txt": "hi\n", ".commitlintrc.json": "{}"}}
+        harness.script([taskgraph(task("t1")), build, REVIEW_OK])
+        result = harness.pipeline(fake).start("Write hello.txt")
+        assert result.state == "merged"
+        assert fake.pr_kwargs["title"] == "chore: write hello.txt"
+
+    def test_an_operators_title_template_stands_over_the_lint(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        build = {"text": "wrote", "files": {"hello.txt": "hi\n", "commitlint.config.js": "x"}}
+        harness.script([taskgraph(task("t1")), build, REVIEW_OK])
+        engine = harness.engine(
+            ops=fake,
+            github={"repo": fake.repo, "pr_title_template": "bot: {title}"},
+            landing=FAST_LANDING,
+        )
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+        assert fake.pr_kwargs["title"] == "bot: write hello.txt"
+
+    def test_the_repositorys_template_opens_the_body(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        build = {
+            "text": "wrote",
+            "files": {
+                "hello.txt": "hi\n",
+                ".github/PULL_REQUEST_TEMPLATE.md": "## Why\n\n- [ ] tests added\n",
+            },
+        }
+        harness.script([taskgraph(task("t1")), build, REVIEW_OK])
+        result = harness.pipeline(fake).start("write hello.txt")
+        assert result.state == "merged"
+        body = fake.pr_kwargs["body"]
+        assert body.startswith("## Why\n\n- [ ] tests added\n")
+        assert f"sbxloop run `{result.run_id}`" in body
+
+    def test_the_agents_pr_body_is_the_description_and_never_ships(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        build = {
+            "text": "wrote",
+            "files": {
+                "hello.txt": "hi\n",
+                ".github/PULL_REQUEST_TEMPLATE.md": "## Why\n",
+                ".sbxloop/pr-body": "## Why\n\nBecause hello.\n\n- [x] tests added\n",
+            },
+        }
+        harness.script([taskgraph(task("t1")), build, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+        body = fake.pr_kwargs["body"]
+        assert body.startswith("## Why\n\nBecause hello.\n\n- [x] tests added\n")
+        assert f"sbxloop run `{result.run_id}`" in body
+        delivered = [e["path"] for batch in fake.blob_batches for e in batch]
+        assert ".sbxloop/pr-body" not in delivered
+
+    def test_a_fix_round_can_rewrite_the_body(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.checks = [ChecksVerdict("red", 1, (), ("pr-lint",)), GREEN]
+        fake.failed_logs = [FailedCheck("pr-lint", "failure", "checklist unticked", "https://x")]
+        rebody = {"text": "rewrote", "files": {".sbxloop/pr-body": "## Why\n\n- [x] done\n"}}
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, rebody, REVIEW_OK])
+        result = harness.pipeline(fake).start("write hello.txt")
+        assert result.state == "merged"
+        assert ".sbxloop/pr-body" in result.tasks[1].spec.description
+        patched = [b for m, p, b in fake.raw_calls if m == "PATCH" and p == "/repos/o/r/pulls/7"]
+        assert patched and patched[-1]["body"].startswith("## Why\n\n- [x] done\n")
+
+
 class TestWorkflowApprovalInThePipeline:
     """#612: a check waiting on a maintainer's approval ends the run
     blocked and named — no round, no wait."""

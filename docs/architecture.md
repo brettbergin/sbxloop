@@ -336,7 +336,18 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
 - **DELIVER** — the tree becomes one commit on `sbxloop/<run>` (the
   prefix, the PR title and the commit message are `[github]` templates)
   and a draft PR (see [Delivery](#delivery)); every later round re-delivers
-  onto the same branch, so one run is one PR.
+  onto the same branch, so one run is one PR. The repository's own
+  conventions shape the PR (#678): `deliver.pr_template` opens the body
+  with the repository's pull request template, the agent's
+  `.sbxloop/pr-body` (read from the workspace by `exec`, like
+  `.sbxloop/pr-title`, and taken away) replaces the body outright — on
+  the create, or by `PATCH` on a re-delivery — and
+  `deliver.conventional_titles` detects a commitlint / semantic-PR title
+  lint from the tree, on which a default `pr_title_template` renders the
+  bare conventional title (`deliver.conventional_title`) instead of
+  `sbxloop: {title}`. The decompose prompt's `$pr_conventions`
+  (`deliver.pr_conventions`) tells the planner both, and only when the
+  workspace declares them.
 - **REVIEW** — a fresh read-only session reads the PR's whole diff
   adversarially (concurrency, failure ordering, trust-boundary parsing,
   cross-module invariants, scope) and returns a verdict with line-anchored
