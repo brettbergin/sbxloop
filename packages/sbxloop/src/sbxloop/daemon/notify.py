@@ -32,6 +32,7 @@ from collections.abc import Callable, Mapping
 from typing import Any, NamedTuple
 from urllib.request import Request
 
+from sbxloop import __version__
 from sbxloop.config import Config
 from sbxloop.daemon.slack_format import to_mrkdwn
 from sbxloop.errors import SbxloopError
@@ -43,6 +44,13 @@ SLACK_TOKEN_ENV = "SLACK_BOT_TOKEN"  # nosec B105 - env var name, not a secret
 
 DISCORD_MESSAGES_URL = "https://discord.com/api/v10/channels/{channel_id}/messages"
 SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
+# Discord's edge refuses ``urllib``'s default ``Python-urllib/3.x`` agent
+# outright (Cloudflare error 1010, an HTTP 403 with no Discord error body)
+# whatever the token — field failure, db 2026-09-04: every deploy notice
+# since #639 shipped came back "HTTP 403" while the bridge, whose SDK sends
+# its own ``DiscordBot`` agent, posted fine. The shape Discord documents for
+# bots; Slack does not care but gets the same identification.
+USER_AGENT = f"DiscordBot (https://github.com/brettbergin/sbxloop, {__version__})"
 # Both services cap a message well under this; a longer notice is the
 # caller's mistake, reported before any request goes out.
 MAX_CHARS = 2000
@@ -104,7 +112,11 @@ def post_notice(
             data=json.dumps(
                 {"content": text, "allowed_mentions": {"parse": []}, "flags": 4}
             ).encode(),
-            headers={"Authorization": f"Bot {token}", "Content-Type": "application/json"},
+            headers={
+                "Authorization": f"Bot {token}",
+                "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+            },
             method="POST",
         )
         _send(opener, request, timeout_s, backend)
@@ -122,6 +134,7 @@ def post_notice(
             headers={
                 "Authorization": f"Bearer {token}",
                 "Content-Type": "application/json; charset=utf-8",
+                "User-Agent": USER_AGENT,
             },
             method="POST",
         )
@@ -138,6 +151,9 @@ def _send(opener: OpenUrl, request: Request, timeout_s: float, backend: str) -> 
         detail = f"HTTP {exc.code}"
         if exc.code in (401, 403):
             detail += " — the bot token is invalid, or the bot is not in the channel"
+            if backend == "discord" and b"error code: 1010" in _body(exc):
+                # Cloudflare, not Discord: the request never reached the API.
+                detail += " (Cloudflare 1010: Discord's edge refused this client's User-Agent)"
         elif exc.code == 404:
             detail += " — no such channel for this bot"
         raise SbxloopError(f"posting to {backend} failed: {detail}") from exc
@@ -146,6 +162,14 @@ def _send(opener: OpenUrl, request: Request, timeout_s: float, backend: str) -> 
     if len(body) > _MAX_REPLY_BYTES:
         raise SbxloopError(f"posting to {backend} failed: reply exceeds {_MAX_REPLY_BYTES} bytes")
     return body
+
+
+def _body(exc: urllib.error.HTTPError) -> bytes:
+    """The first bytes of an error reply, or nothing when it cannot be read."""
+    try:
+        return bytes(exc.read(256))
+    except Exception:
+        return b""
 
 
 def _check_slack_reply(body: bytes) -> None:

@@ -16,7 +16,7 @@ from typer.testing import CliRunner
 from sbxloop.cli.app import app
 from sbxloop.config import Config
 from sbxloop.daemon import notify
-from sbxloop.daemon.notify import MAX_CHARS, Posted, post_notice
+from sbxloop.daemon.notify import MAX_CHARS, USER_AGENT, Posted, post_notice
 from sbxloop.errors import SbxloopError
 
 runner = CliRunner()
@@ -82,6 +82,9 @@ class TestDiscord:
         assert request.full_url == "https://discord.com/api/v10/channels/123/messages"
         assert request.get_method() == "POST"
         assert request.get_header("Authorization") == "Bot tok"
+        # Discord's edge bans urllib's default agent (Cloudflare 1010).
+        assert request.get_header("User-agent") == USER_AGENT
+        assert USER_AGENT.startswith("DiscordBot (https://")
         assert opener.timeouts == [7.0]
         payload = opener.payload
         # House dialect goes through untouched; no pings, no link previews.
@@ -103,6 +106,16 @@ class TestDiscord:
         with pytest.raises(SbxloopError, match=f"posting to discord failed: .*{hint}"):
             post_notice(_discord(tmp_path), "hi", env={"DISCORD_BOT_TOKEN": "tok"}, open_url=opener)
 
+    def test_an_edge_block_is_named_as_such(self, tmp_path: Path) -> None:
+        # Cloudflare's 1010 body: the request never reached Discord, so the
+        # token/channel hint alone would send the operator the wrong way.
+        error = urllib.error.HTTPError(
+            "https://x", 403, "Forbidden", {}, io.BytesIO(b"error code: 1010\n")
+        )  # type: ignore[arg-type]
+        opener = Recorder(raise_=error)
+        with pytest.raises(SbxloopError, match=r"Cloudflare 1010.*User-Agent"):
+            post_notice(_discord(tmp_path), "hi", env={"DISCORD_BOT_TOKEN": "tok"}, open_url=opener)
+
     def test_network_errors_are_sbxloop_errors(self, tmp_path: Path) -> None:
         opener = Recorder(raise_=urllib.error.URLError("no route"))
         with pytest.raises(SbxloopError, match=r"posting to discord failed: .*no route"):
@@ -122,6 +135,7 @@ class TestSlack:
         request = opener.only
         assert request.full_url == "https://slack.com/api/chat.postMessage"
         assert request.get_header("Authorization") == "Bearer xoxb"
+        assert request.get_header("User-agent") == USER_AGENT
         payload = opener.payload
         assert payload["channel"] == "C0123ABCDEF"
         assert payload["text"] == "*deploy* starting — <https://example.test/run/1|run>"
