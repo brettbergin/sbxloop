@@ -55,13 +55,22 @@ def park(h: Harness, key: str = "1", **item_overrides: Any) -> str:
 
 
 def landed(h: Harness, run_id: str) -> Any:
-    """Wait for the landing thread an approval spawned; returns the hold."""
+    """Wait for the landing thread an approval spawned to finish — the
+    hold, the item and the notices are all written by it; returns the
+    hold."""
+    import threading
+
     deadline = time.time() + 10
+    name = f"sbxloop-review-{run_id}"
     while time.time() < deadline:
-        hold = h.dstore.review_hold_for(run_id)
-        if hold is not None and hold.state != "approving":
-            return hold
-        time.sleep(0.05)
+        threads = [t for t in threading.enumerate() if t.name == name]
+        if not threads:
+            hold = h.dstore.review_hold_for(run_id)
+            if hold is not None and hold.state != "approving":
+                return hold
+        for thread in threads:
+            thread.join(timeout=0.05)
+        time.sleep(0.01)
     raise AssertionError("the landing thread did not finish")
 
 
