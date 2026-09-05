@@ -1552,6 +1552,53 @@ class Provisioner:
                 raise
             raise ProvisionError(f"provisioning run {run_id} failed: {exc}") from exc
 
+    # -- a workload's repository checkout (#758) ---------------------------
+
+    def clone_repo_into_data_dir(self, run_id: str, workspace: Path, repo: str) -> Path:
+        """A plain checkout of ``repo`` for a workload whose plan asked for
+        one, cut into its data directory at ``<workspace>/<name>`` — the
+        agent reads it there (the data directory is what the agent box
+        sees). Single-branch from the remote under the host's GitHub
+        credential; no submodules, LFS or tags, and nothing to deliver:
+        publishing to a repository is the pr sink's (#759). An existing
+        checkout (a resume) is reused as it stands.
+        """
+        clone_dir = workspace / repo.split("/", 1)[1]
+        if (clone_dir / ".git").exists():
+            self.bus.emit(
+                "sandbox.workspace_clone",
+                run_id,
+                source=repo,
+                target=str(clone_dir),
+                commit=hostgit.head_commit(clone_dir),
+                branch=self._branch_name(run_id, repo),
+                dirty=False,
+                reused=True,
+                message=f"reusing the checkout of {repo} at {clone_dir}",
+            )
+            return clone_dir
+        if hostgit.find_git() is None:
+            raise ProvisionError(f"no git binary is on PATH to clone {repo} for the workload")
+        url = f"{self.config.github.web_url}/{repo}"
+        branch = self._branch_name(run_id, repo)
+        token = self._clone_token(repo)
+        try:
+            sha = hostgit.clone_from_remote(
+                url, clone_dir, branch, clone_filter=self.config.sandbox.clone_filter, token=token
+            )
+        except ProvisionError as exc:
+            why = (
+                "check that the host's GitHub credential has contents:read on it"
+                if token
+                else "no GitHub credential is configured on the host, so only a public "
+                "repository can be cloned; export GH_TOKEN or configure a GitHub App"
+            )
+            raise ProvisionError(
+                f"cloning {repo} from {url} into the workload's data directory failed: {exc}. {why}"
+            ) from exc
+        self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
+        return clone_dir
+
     # -- the service sandbox (#765) ----------------------------------------
 
     def service_spec(

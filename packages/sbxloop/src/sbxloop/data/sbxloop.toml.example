@@ -231,6 +231,35 @@ secret_strategy = "proxy"
 # scheme = ""
 # description = "read-only weather forecasts"
 
+# Named bounds for `--kind workload` runs. The operator's plan
+# declares what each task needs — hosts, credentials by name, a sink, a
+# repository — and the run's profile decides what is granted; a need
+# outside the profile fails the run closed, with a `run.needs_refused`
+# event naming the key here that would allow it. `egress`: patterns (as
+# `[policy] allow`) bounding the hosts the AGENT box may be granted —
+# `[policy] deny` still wins. `credentials`: the `[[credentials]]` names a
+# plan may ask for; a granted one is held by the run's separate service
+# box, never the agent's. `sinks`: where a result may go (`chat`, `issue`,
+# `artifact`, `pr`). `repo`: whether a plan may ask for a checkout of a
+# configured repository in its data directory. `budgets`: `[budgets]` keys
+# overridden for this profile's runs. `publish = "hold"` (park a finished
+# run for a human release) arrives with the daemon's workload intake and is
+# refused until then. A workload run with no profile at all may declare no
+# needs.
+# [[workloads]]
+# name = "research"
+# description = "read the web, call the weather API, report in the thread"
+# egress = ["*.example.com"]
+# credentials = ["weather"]
+# sinks = ["chat", "artifact"]
+# repo = false
+# publish = "auto"
+# budgets = { max_tasks = 8, max_wall_clock_s = 3600.0 }
+
+# [workload]
+# The profile a workload run gets when `sbxloop run --profile` names none.
+# default = "research"
+
 # [policy]
 # Bounds for plan-declared egress. At PLAN time the agent may declare extra
 # domains a task needs during EXECUTE (each with a justification); they are

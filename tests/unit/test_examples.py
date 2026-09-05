@@ -373,13 +373,16 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             parsed = tomllib.loads(f"{key} = {value}")
         except tomllib.TOMLDecodeError:
             continue  # a multi-line value (the exclude list); covered below
-        if section in ("registries", "credentials"):
+        if section in ("registries", "credentials", "workloads"):
             continue  # array-of-tables entries load as whole blocks, below
         if section == "github.repos":
             doc: dict[str, Any] = {"github": {"repos": [{"repo": "you/your-repo", **parsed}]}}
         elif section == "github":
             # `[github]` needs a repository before any other key is meaningful.
             doc = {"github": {"repo": "you/your-repo", **parsed}}
+        elif section == "workload":
+            # `[workload] default` names a profile that must exist.
+            doc = {"workload": parsed, "workloads": [{"name": parsed["default"]}]}
         elif section == "chat":
             # `[chat] backend` names a section that must carry a channel_id.
             doc = {
@@ -412,6 +415,37 @@ def test_example_registry_entries_load_together() -> None:
     assert {entry["kind"] for entry in entries} >= {"npm", "pypi", "cargo", "go"}
     config = Config.model_validate({"registries": entries})
     assert [r.kind for r in config.registries] == [entry["kind"] for entry in entries]
+
+
+def test_example_workload_profile_loads_with_its_credential() -> None:
+    """The commented `[[workloads]]` entry loads as one block beside the
+    `[[credentials]]` entry it names, and `[workload] default` finds it —
+    uncommenting the three together is a working configuration."""
+
+    def block_after(header: str) -> dict[str, Any]:
+        text = ""
+        in_block = False
+        for line in EXAMPLE.read_text().splitlines():
+            stripped = re.sub(r"^#\s?", "", line)
+            if stripped == header:
+                in_block = True
+            elif in_block and line.startswith("#") and re.match(r"^[a-z_]+ = ", stripped):
+                text += stripped + "\n"
+            elif in_block and stripped.startswith("["):
+                break
+        return tomllib.loads(text)
+
+    profile = block_after("[[workloads]]")
+    credential = block_after("[[credentials]]")
+    section = block_after("[workload]")
+    config = Config.model_validate(
+        {"credentials": [credential], "workloads": [profile], "workload": section}
+    )
+    (entry,) = config.workloads
+    assert entry.name == profile["name"] == section["default"]
+    assert entry.credentials == [credential["name"]]
+    assert entry.budgets.set_keys == sorted(profile["budgets"])
+    assert config.workload_profile() is entry
 
 
 def test_example_credential_entry_loads() -> None:

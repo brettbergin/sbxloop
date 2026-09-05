@@ -1430,6 +1430,25 @@ def format_for_discord(
         if files:
             text += f" · {files} file{'s' if files != 1 else ''}"
         return [line(text)]
+    if t == HostEventTypes.RUN_NEEDS_GRANTED:
+        # What the plan asked for and the profile allowed (#758): names
+        # and hosts only, never a value.
+        parts = [
+            f"{label} " + ", ".join(code(str(v)) for v in values)
+            for label, key in (
+                ("hosts", "hosts"),
+                ("credentials", "credentials"),
+                ("sinks", "sinks"),
+                ("repos", "repos"),
+            )
+            if (values := _list(data, key))
+        ]
+        profile = data.get("profile")
+        text = f"🔐 needs granted under profile {code(str(profile))}: " + "; ".join(parts)
+        return [line(text, flush=True)]
+    if t == HostEventTypes.RUN_NEEDS_REFUSED:
+        text = "🚫 need refused: " + _one_line(data.get("message") or "", 300)
+        return [line(text, flush=True)]
     if t == HostEventTypes.JUDGE_DEGRADED:
         err = _one_line(data.get("error") or "", 300)
         return [

@@ -943,6 +943,144 @@ class TestCredentials:
             load_config(cwd=tmp_path, env={})
 
 
+class TestWorkloads:
+    """`[[workloads]]` profiles and `[workload] default` (#758): what a
+    workload run's plan may ask for, validated whole at load time."""
+
+    CATALOGUE = (
+        '[[credentials]]\nname = "weather"\nenv = "WEATHER_API_KEY"\n'
+        'host = "api.weather.example.com"\n\n'
+    )
+
+    def test_unset_by_default(self, tmp_path: Path) -> None:
+        config = load_config(cwd=tmp_path, env={})
+        assert config.workloads == []
+        assert config.workload.default is None
+        assert config.workload_profile() is None
+        assert config.for_workload_profile(None) is config
+
+    def test_profile_parses_with_defaults_and_overrides(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            self.CATALOGUE + "[[workloads]]\n"
+            'name = "research"\n'
+            'description = "reads the web"\n'
+            'egress = ["*.Example.com", " data.example.org "]\n'
+            'credentials = ["weather", "weather"]\n'
+            'sinks = ["chat", "artifact", "chat"]\n'
+            "repo = true\n"
+            "budgets = { max_tasks = 3, max_wall_clock_s = 60.0 }\n"
+            "\n"
+            "[[workloads]]\n"
+            'name = "bare"\n'
+            "\n"
+            "[workload]\n"
+            'default = "research"\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        research, bare = config.workloads
+        assert research.egress == ["*.example.com", "data.example.org"]
+        assert research.credentials == ["weather"]
+        assert research.sinks == ["chat", "artifact"]
+        assert research.repo is True
+        assert research.publish == "auto"
+        assert research.budgets.set_keys == ["max_tasks", "max_wall_clock_s"]
+        assert research.covers_host("api.example.com")
+        assert research.covers_host("data.example.org")
+        assert not research.covers_host("other.example.org")
+        assert (bare.egress, bare.credentials, bare.sinks, bare.repo) == ([], [], [], False)
+        assert bare.budgets.set_keys == []
+        assert config.workload_profile() is research
+        assert config.workload_profile("bare") is bare
+
+    def test_for_workload_profile_pins_the_choice_and_applies_budgets(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[budgets]\nmax_tasks = 12\nmax_revisions_per_task = 4\n\n"
+            "[[workloads]]\n"
+            'name = "research"\n'
+            "budgets = { max_tasks = 3 }\n"
+            "\n"
+            "[[workloads]]\n"
+            'name = "bare"\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        narrowed = config.for_workload_profile("research")
+        assert narrowed.workload.default == "research"
+        assert narrowed.budgets.max_tasks == 3
+        assert narrowed.budgets.max_revisions_per_task == 4
+        # the profile list itself is untouched, so the persisted config still
+        # dumps what the operator wrote and a resume sees no drift
+        assert narrowed.workloads == config.workloads
+        assert config.workload.default is None
+        assert config.budgets.max_tasks == 12
+        # a profile without overrides pins the name and keeps the budgets
+        bare = config.for_workload_profile("bare")
+        assert bare.workload.default == "bare"
+        assert bare.budgets == config.budgets
+
+    def test_unknown_profile_name_is_a_config_error(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text('[[workloads]]\nname = "research"\n')
+        config = load_config(cwd=tmp_path, env={})
+        with pytest.raises(ConfigError, match=r"'nope' is not declared.*declared: research"):
+            config.workload_profile("nope")
+        with pytest.raises(ConfigError, match="'nope'"):
+            config.for_workload_profile("nope")
+
+    @pytest.mark.parametrize(
+        ("body", "problem"),
+        [
+            (
+                '[[workloads]]\nname = "research"\ncredentials = ["weather"]\n',
+                "workloads.research.credentials names 'weather', which is not declared "
+                r"under \[\[credentials\]\] \(declared: none\)",
+            ),
+            (
+                '[[workloads]]\nname = "research"\n\n[workload]\ndefault = "nope"\n',
+                r"\[workload\] default = 'nope' names no \[\[workloads\]\] profile "
+                r"\(declared: research\)",
+            ),
+            (
+                '[[workloads]]\nname = "research"\n\n[[workloads]]\nname = "research"\n',
+                "profile 'research' is declared twice",
+            ),
+            (
+                '[[workloads]]\nname = "Research Team"\n',
+                "workloads\\[\\].name must be lowercase",
+            ),
+            (
+                '[[workloads]]\nname = "research"\negress = ["https://example.com/path"]\n',
+                "workloads\\[\\].egress patterns must be domains",
+            ),
+            (
+                '[[workloads]]\nname = "research"\nsinks = ["email"]\n',
+                "sinks",
+            ),
+            (
+                '[[workloads]]\nname = "research"\npublish = "hold"\n',
+                'publish = "hold" is not available yet',
+            ),
+            (
+                '[[workloads]]\nname = "research"\nbudgets = { max_tasks = 0 }\n',
+                "max_tasks",
+            ),
+            (
+                '[[workloads]]\nname = "research"\nbudgets = { max_turns = 3 }\n',
+                "max_turns",
+            ),
+        ],
+    )
+    def test_unsound_profiles_are_refused(self, tmp_path: Path, body: str, problem: str) -> None:
+        (tmp_path / "sbxloop.toml").write_text(body)
+        with pytest.raises(ConfigError, match=problem):
+            load_config(cwd=tmp_path, env={})
+
+    def test_unknown_default_without_profiles_lists_none(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text('[workload]\ndefault = "research"\n')
+        with pytest.raises(
+            ConfigError, match=r"names no \[\[workloads\]\] profile \(declared: none\)"
+        ):
+            load_config(cwd=tmp_path, env={})
+
+
 class TestRegistries:
     """`[[registries]]` (#680): private package registries, per repository."""
 

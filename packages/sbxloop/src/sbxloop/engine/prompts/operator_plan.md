@@ -16,8 +16,8 @@ tests/unit/test_prompts.py):
 - This comment block is stripped by sbxloop.engine.prompts.render before the
   prompt reaches the model; everything below it is sent verbatim.
 
-Variables: $outcome, $max_tasks, $work_dir, $user_guidance, $retry_context
-(defaulted to "" by render()).
+Variables: $outcome, $max_tasks, $work_dir, $bounds, $user_guidance,
+$retry_context (defaulted to "" by render()).
 Examples are domain-neutral on purpose: no issue or PR numbers, no path,
 state name or product vocabulary from the loop's own repository — tests
 anchor on the rule phrases, not the examples, so an example may be swapped
@@ -88,10 +88,16 @@ lost when the sandbox is destroyed.
   issue, a repository, a file), by name; `repo` — a repository the task
   needs, as `owner/name`. Declare it here or do without it: an executor
   cannot ask for a host or a credential mid-task. Use empty lists and
-  `null` for a task with no needs (the common case).
+  `null` for a task with no needs (the common case). What this run may be
+  granted is listed below: a need outside it is refused and the run ends
+  before any task runs, so plan within it or plan around it.
 - Tasks must form a DAG: no cycles, dependencies only on listed ids.
 - Also give `title`: one line naming the work, the way a colleague would
   refer to it. Leave it `null` if the outcome already is that line.
+
+## What this run may ask for
+
+$bounds
 
 ## Standing user guidance
 

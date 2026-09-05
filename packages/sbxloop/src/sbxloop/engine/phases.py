@@ -928,6 +928,7 @@ class PhaseRunner:
                 "outcome": self.outcome,
                 "max_tasks": str(self.config.budgets.max_tasks),
                 "work_dir": self._work_dir(),
+                "bounds": self._bounds_section(),
                 "user_guidance": self._guidance(),
             },
             system_message=OPERATOR_SYSTEM_MESSAGE,
@@ -1008,6 +1009,54 @@ class PhaseRunner:
 
     def _work_dir(self) -> str:
         return f"`{self.workdir}`" if self.workdir else "the current working directory"
+
+    def _bounds_section(self) -> str:
+        """The run's workload profile (#758) as the planner reads it: what
+        a task may declare in ``needs`` and be granted. Names and hosts
+        only — a credential's value is never anywhere near a prompt."""
+        profile = self.config.workload_profile()
+        if profile is None:
+            return (
+                "This run has no workload profile: no host, credential, sink or "
+                "repository can be granted. Declare no needs — plan work that "
+                "reaches nothing beyond the always-reachable package registries."
+            )
+        lines = [
+            f"Profile `{profile.name}`"
+            + (f" — {profile.description}" if profile.description else "")
+            + ":"
+        ]
+        lines.append(
+            "- hosts: "
+            + (
+                ", ".join(f"`{p}`" for p in profile.egress)
+                if profile.egress
+                else "none beyond the always-reachable package registries"
+            )
+        )
+        if profile.credentials:
+            named = []
+            for name in profile.credentials:
+                entry = self.config.credential(name)
+                what = f"`{name}`"
+                if entry is not None:
+                    what += (
+                        f" ({entry.host}"
+                        + (f": {entry.description}" if entry.description else "")
+                        + ")"
+                    )
+                named.append(what)
+            lines.append("- credentials, by name: " + ", ".join(named))
+        else:
+            lines.append("- credentials: none")
+        lines.append(
+            "- sinks: " + (", ".join(f"`{s}`" for s in profile.sinks) if profile.sinks else "none")
+        )
+        lines.append(
+            "- a repository checkout (`repo`, as `owner/name`, one configured for this "
+            "host): " + ("allowed" if profile.repo else "not allowed")
+        )
+        return "\n".join(lines)
 
     @staticmethod
     def _needs_section(task: TaskRecord) -> str:

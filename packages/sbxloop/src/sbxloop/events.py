@@ -240,6 +240,16 @@ class HostEventTypes:
     # (how many data-directory files the task touched). The full output
     # lives on the task row, never on the wire.
     TASK_OUTPUT = "task.output"
+    # What the workload's plan asked for and the run's profile granted
+    # (#758), once after planning: `profile` (name or None), `hosts`,
+    # `credentials` (names only), `sinks`, `repos`. Only when the plan
+    # declared a need.
+    RUN_NEEDS_GRANTED = "run.needs_granted"
+    # A need the profile does not cover (#758): `profile`, `need` (host /
+    # credential / sink / repo), `value`, `task_id`, `key` — the
+    # sbxloop.toml key that would have allowed it — and `message`. The run
+    # fails closed on the first; every refusal is on the record.
+    RUN_NEEDS_REFUSED = "run.needs_refused"
     # The judge's verdict on one workload task (#756): `task_id`,
     # `attempt`, `passed`, `unmet`, `notes`.
     JUDGE_VERDICT = "judge.verdict"
