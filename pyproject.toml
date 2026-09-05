@@ -83,15 +83,24 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests", "packages/sbxloop-worker/tests"]
-markers = ["slow: long-running packaging/build tests"]
+markers = [
+    # Auto-applied to every test on the fake sbx (root conftest.py); also set
+    # by hand on real-git (lfs, submodules) and packaging tests. The commit
+    # gate is `-m "not slow"`; CI runs both halves.
+    "slow: process-bound tests (fake sbx, real workers, real git, builds)",
+]
 # Coverage is CI's job (`make test-cov`): tracing costs ~15% wall on full
 # runs, and --cov-fail-under in addopts makes every partial run (single
 # file, -k, --pdb) fail its gate.
 addopts = [
     "-ra",
-    # Engine tests are subprocess-bound (fake sbx + real workers), so the
-    # suite parallelizes ~linearly. worksteal rebalances the long tail of
-    # multi-second engine tests. Pass -n0 for a serial run (-s, --pdb).
+    # Engine tests are subprocess-bound (fake sbx + real workers): they spend
+    # their time blocked in fork/exec and pipe reads, so they want every
+    # logical core — `auto` is os.cpu_count() (no psutil here). Measured on a
+    # 8c/16t Mac: the pipeline tests run 20% faster at 16 workers than at 8,
+    # and 4 vs 8 is a wash, so do not pass a smaller -n by hand. worksteal
+    # rebalances the long tail of multi-second engine tests. Pass -n0 for a
+    # serial run (-s, --pdb).
     "-n=auto",
     "--dist=worksteal",
 ]

@@ -114,8 +114,12 @@ def fake_sbx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeSbx:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     shim = bin_dir / "sbx"
+    # ``-I -S`` skips site-packages, ``.pth`` files and the user site: the fake
+    # is stdlib-only, and the suite execs it thousands of times, so interpreter
+    # start-up is a measurable share of wall clock (#750).
     shim.write_text(
-        f'#!/bin/sh\nSBX_FAKE_DIR="{state}" exec "{sys.executable}" "{FAKE_SBX_SOURCE}" "$@"\n'
+        "#!/bin/sh\n"
+        f'SBX_FAKE_DIR="{state}" exec "{sys.executable}" -I -S "{FAKE_SBX_SOURCE}" "$@"\n'
     )
     shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     monkeypatch.setenv("PATH", str(bin_dir), prepend=":")

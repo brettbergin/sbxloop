@@ -73,12 +73,26 @@ jobs:
       - run: uv sync --all-packages
       - run: uv run bandit -c pyproject.toml -r packages/sbxloop/src packages/sbxloop-worker/src
 
-  test:
+  # The suite in three slices per interpreter: the ~3900 in-process tests,
+  # and the ~770 process-bound `slow` tests (fake sbx, real workers, real
+  # git) spread over two runners with the deterministic `--shard` from the
+  # root conftest. Each slice writes its own coverage data; `test` below
+  # combines them and holds the 85% line, so the required contexts stay
+  # `test (3.13)` / `test (3.14)`.
+  pytest:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.13", "3.14"]
+        slice: [fast, slow-1, slow-2]
+        include:
+          - slice: fast
+            select: -m "not slow"
+          - slice: slow-1
+            select: -m slow --shard 1/2
+          - slice: slow-2
+            select: -m slow --shard 2/2
     steps:
       - uses: actions/checkout@v4
         with:
@@ -87,7 +101,35 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --all-packages --python ${{ matrix.python-version }}
-      - run: uv run --python ${{ matrix.python-version }} pytest --cov=sbxloop --cov=sbxloop_worker --cov-report=term-missing --cov-fail-under=85
+      - run: uv run --python ${{ matrix.python-version }} pytest ${{ matrix.select }} --cov=sbxloop --cov=sbxloop_worker --cov-report=
+        env:
+          COVERAGE_FILE: .coverage.${{ matrix.slice }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.python-version }}-${{ matrix.slice }}
+          path: .coverage.${{ matrix.slice }}
+          include-hidden-files: true
+          if-no-files-found: error
+
+  test:
+    needs: pytest
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-packages --python ${{ matrix.python-version }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-${{ matrix.python-version }}-*
+          merge-multiple: true
+      - run: uv run --python ${{ matrix.python-version }} coverage combine .coverage.*
+      - run: uv run --python ${{ matrix.python-version }} coverage report --show-missing --fail-under=85
 
   build:
     runs-on: ubuntu-latest

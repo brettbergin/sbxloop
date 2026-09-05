@@ -1980,7 +1980,11 @@ matched them would run every job twice.
 Unit and contract tests run against a **fake sbx CLI** — no Docker Sandboxes
 install is required for development. The suite runs parallel by default
 (pytest-xdist; pass `-n0` for a serial run when debugging with `-s`/`--pdb`).
-The real-sbx end-to-end suite runs in CI via a manually dispatched workflow.
+Every test on the fake sbx is process-bound and carries the `slow` marker
+automatically: `make test-fast` (`-m "not slow"`) is the two-minute commit
+gate, `make test` is everything, and CI runs the slow half spread over
+runners with `--shard I/N`. The real-sbx end-to-end suite runs in CI via a
+manually dispatched workflow.
 
 ## Documentation
 

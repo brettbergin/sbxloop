@@ -960,6 +960,7 @@ class TestSubmoduleDelivery:
 
 
 @pytest.mark.skipif(hostgit.lfs_version() is None, reason="git-lfs is not installed on this host")
+@pytest.mark.slow
 class TestLfsDelivery:
     """#693: a file ``.gitattributes`` routes through Git LFS is refused
     rather than committed as a blob where the repository expects a pointer
