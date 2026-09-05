@@ -4,7 +4,6 @@ UI thread."""
 
 from __future__ import annotations
 
-import time
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -19,11 +18,13 @@ from textual.widgets import Input, TabbedContent, TabPane, Tree
 from textual.worker import get_current_worker
 
 from sbxloop.cli.tui import TASK_STATE_STYLES
+from sbxloop.config import TUI_CONTROL_CHANNEL
 from sbxloop.engine.model import artifacts_dir, scan_artifacts
 from sbxloop.tui.data import ConsoleState, EventTail, RunDetail, build_run_detail
 from sbxloop.tui.format import (
     SPEND_NOT_REPORTED,
     age,
+    clock,
     duration,
     run_title,
     state_label,
@@ -31,9 +32,11 @@ from sbxloop.tui.format import (
     tokens,
 )
 from sbxloop.tui.screens.base import ConsoleScreen
+from sbxloop.tui.widgets.chat_input import ChatInput
 from sbxloop.tui.widgets.chronology import ChronologyLog
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop.tui.widgets.tables import ConsoleTable
+from sbxloop.tui.widgets.thread import ThreadView
 from sbxloop_worker.protocol import Event
 
 _TREE_MAX_FILES = 500
@@ -42,15 +45,17 @@ _TREE_MAX_FILES = 500
 class RunDetailScreen(ConsoleScreen):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "back", "Back"),
-        Binding("r", "refresh_run", "Refresh", show=False),
         Binding("f", "follow", "Follow events"),
         Binding("slash", "event_filter", "Event type filter"),
         Binding("v", "toggle_view", "Transcript/lines", show=False),
+        Binding("r", "reply_or_refresh", "Reply / refresh", show=False),
+        Binding("i", "compose", "Type", show=False),
     ]
     DEFAULT_CSS = """
     RunDetailScreen #header { height: auto; max-height: 8; padding: 0 1; border: round $primary; }
     RunDetailScreen TabbedContent { height: 1fr; }
     RunDetailScreen ChronologyLog { height: 1fr; }
+    RunDetailScreen #thread-box { height: 1fr; display: none; }
     """
 
     def __init__(self, run_id: str) -> None:
@@ -64,10 +69,14 @@ class RunDetailScreen(ConsoleScreen):
         # The artifacts scan walks a workspace and may fork git: once on
         # mount, on `r`, and when the tab is opened — not every tick.
         self._scan_artifacts_next = True
+        # The run's local-bridge thread, once the run has one; until then
+        # the tab shows the chronology derived from the persisted events.
+        self._thread_view: ThreadView | None = None
         # Events that land while follow is off wait for it.
         self._held: list[tuple[int, Event]] = []
         # Bumped by every reset of a tail: a load still in flight from
-        # before the reset lands with the old number and is dropped.
+        # before the reset lands with the old number and is dropped, so
+        # the reset view never loses rows to a stale delta.
         self._generation = 0
 
     def compose(self) -> ComposeResult:
@@ -76,6 +85,7 @@ class RunDetailScreen(ConsoleScreen):
             yield TextPanel(Text(f"run {self.run_id}", style="bold cyan"), id="header")
             with TabbedContent(id="tabs"):
                 with TabPane("Thread", id="thread"):
+                    yield Vertical(id="thread-box")
                     yield ChronologyLog("transcript", id="thread-log", max_lines=4000)
                 with TabPane("Tasks", id="tasks"):
                     yield ConsoleTable(
@@ -134,7 +144,9 @@ class RunDetailScreen(ConsoleScreen):
         self._scan_artifacts_next = False
         try:
             detail = build_run_detail(mailbox, self.run_id)
-            thread = self._thread_tail.pull() if self._thread_tail else []
+            thread = (
+                self._thread_tail.pull() if self._thread_tail and self._thread_view is None else []
+            )
             events = self._events_tail.pull() if self._events_tail else []
             artifacts = self._scan_artifacts(detail) if scan else None
         except Exception as exc:
@@ -180,7 +192,9 @@ class RunDetailScreen(ConsoleScreen):
             return
         self.detail = detail
         header.update(self._header(detail))
-        self.query_one("#thread-log", ChronologyLog).feed(thread)
+        self._thread_tab(detail)
+        if self._thread_view is None:
+            self.query_one("#thread-log", ChronologyLog).feed(thread)
         # Events that land while follow is off wait, so toggling it back on
         # catches up rather than leaving a gap.
         self._held.extend(events)
@@ -192,6 +206,21 @@ class RunDetailScreen(ConsoleScreen):
         self.query_one("#landing-body", TextPanel).update(self._landing(detail))
         if artifacts is not None:
             self._artifacts(*artifacts)
+
+    def _thread_tab(self, detail: RunDetail) -> None:
+        if self._thread_view is not None:
+            self._thread_view.pull()
+            return
+        # With `thread_per_run = false` the run "thread" is the control
+        # channel itself: that is the Chat screen, not this run's thread.
+        if detail.thread is None or detail.thread.thread_id == TUI_CONTROL_CHANNEL:
+            return
+        view = ThreadView(detail.thread.thread_id, thread=True, run_id=self.run_id)
+        self._thread_view = view
+        self.query_one("#thread-log", ChronologyLog).display = False
+        box = self.query_one("#thread-box", Vertical)
+        box.display = True
+        box.mount(view)
 
     # -- rendering ---------------------------------------------------------------
 
@@ -276,7 +305,7 @@ class RunDetailScreen(ConsoleScreen):
                         row["phase"],
                         str(row["attempt"]),
                         row["status"],
-                        time.strftime("%H:%M:%S", time.localtime(started)) if started else "—",
+                        clock(started),
                         duration((ended - started) if started and ended else None),
                         tokens(row["input_tokens"]),
                         tokens(row["output_tokens"]),
@@ -339,7 +368,7 @@ class RunDetailScreen(ConsoleScreen):
                 ),
             )
         for event in detail.landing_events:
-            when = time.strftime("%H:%M", time.localtime(event.ts))
+            when = clock(event.ts, seconds=False)
             summary = ", ".join(
                 f"{k}={v}"
                 for k, v in list(event.data.items())[:6]
@@ -396,6 +425,16 @@ class RunDetailScreen(ConsoleScreen):
         self.load()
         self.console_app.action_refresh()
 
+    def action_reply_or_refresh(self) -> None:
+        if self._thread_view is not None:
+            self._thread_view.reply_to_focused()
+        else:
+            self.action_refresh_run()
+
+    def action_compose(self) -> None:
+        if self._thread_view is not None:
+            self._thread_view.query_one(ChatInput).focus()
+
     def action_follow(self) -> None:
         self.follow = not self.follow
         self.app.notify(f"events follow {'on' if self.follow else 'off'}")
@@ -404,6 +443,8 @@ class RunDetailScreen(ConsoleScreen):
             self._held = []
 
     def action_toggle_view(self) -> None:
+        if self._thread_view is not None:
+            return  # the tab shows the run's thread; nothing to re-render
         log = self.query_one("#thread-log", ChronologyLog)
         log.reset("lines" if log.view == "transcript" else "transcript")
         if self._thread_tail:

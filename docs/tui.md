@@ -103,13 +103,51 @@ last error and last update. `Enter` opens the item's run.
 
 ## Chat
 
-*Lands with the console's chat screens.* The control channel (the
-concierge, `!sbx` verbs, daemon notices) and each run's thread are the local
-bridge's rows. Addressing the bot is the literal `@sbx` token (the console
-inserts it with `ctrl+t`) or a reply to one of its rows — the two gestures
-the routing rules already understand; plain text is left alone, as on
-Discord. Clicking a choice or the approve button writes a `choice` /
-`approve` row under the question or prompt.
+The Chat screen (`4`) is the control channel and a run's **Thread** tab is
+that run's thread — both are the daemon's local chat bridge's rows, the
+same rows Discord or Slack would show: the headline card, the status line
+and tool digest edited in place, agent messages as Markdown, notices, the
+concierge's replies with its `🛠 concierge: …` tool line, clarifying
+questions, the merge-gate prompt.
+
+```
+┌ control channel ───────────────────────────────────────────────────────────┐
+│ 13:40:02  brett   what's running?                                          │
+│ 13:40:05  sbx     r7ab3kq2m — Add retries… is on task 2 of 5     (edited)  │
+│           🛠 concierge: sbx_control(status) · run_detail(r7ab3kq2m)        │
+│ 13:45:11  sbx     Is this about the wording, the layout, or the timing?    │
+│           [ 1 Layout ]  [ 2 Timing ]                                       │
+│ 13:55:40  sbx     ⏸ ready to merge — waiting for your approval             │
+│           [ Approve merge ]                                                │
+├────────────────────────────────────────────────────────────────────────────┤
+│ @sbx ▸ ask the concierge…  (ctrl+t: addressed ✓ · !sbx for commands)       │
+└────────────────────────────────────────────────────────────────────────────┘
+```
+
+The routing rules are the bridge's, not the console's:
+
+| you type                                                                        | the daemon reads it as                                                     |
+| ------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| `!sbx status` (any `!sbx` verb)                                                 | a command — the same dispatcher `sbxloop daemon ctl` uses                  |
+| `@sbx …`, or anything with the address gesture on (`ctrl+t`, sticky per screen) | in the control channel a **concierge** turn; in a run's thread a **steer** |
+| `r`, then text                                                                  | a reply to the bot's latest row — addressed by definition                  |
+| plain text                                                                      | left alone, as on Discord: people talking among themselves                 |
+
+`Esc` leaves the form (a reply target is cleared first) and `i` returns to
+it; while the form is focused every key types, so `q` and the mode numbers
+act after `Esc`. A question with enumerable answers shows a button per
+answer; on the Chat screen with the form left, `1`–`5` pick without the
+mouse (with no question open the numbers are the mode keys again) and `r`
+replies to the bot's latest row. In a run's thread, click the button or
+type the number. Typing the answer works too. A long channel opens on its newest rows, with a note counting the
+older ones the daemon still keeps. A merge gate shows
+**Approve merge** while the gate stands; `!sbx merge <item>` is its typed
+twin. Your own rows show dimmed until the daemon claims them; a row typed
+while no daemon was reading is refused with a note, never executed. Edits,
+reactions (`⏳` → `✅` under a steer) and resolved gates repaint in place.
+The console speaks as `[tui] operator_id` (the login name by default), and
+the bar counts unread control-channel rows while you are elsewhere.
+`--read-only` disables the form and the buttons.
 
 ## Administration
 

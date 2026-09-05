@@ -117,6 +117,10 @@ class MailboxClient:
         with self._lock:
             return self.daemon.local_latest_ids()
 
+    def count_after(self, channel_id: str, after_id: int) -> int:
+        with self._lock:
+            return self.daemon.local_count_after(channel_id, after_id)
+
     def gate_open(self, run_id: str) -> bool:
         with self._lock:
             gate = self.daemon.merge_gate_for(run_id)
