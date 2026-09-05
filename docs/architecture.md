@@ -35,6 +35,70 @@ Two distributions ship from this repo in lockstep versions:
   `github-copilot-sdk` sits behind the worker's `[copilot]` extra, so the
   host never installs the Copilot runtime.
 
+## The credential split, in one picture
+
+Two credentials exist in a deployment, and **no single VM ever holds both**.
+The green plane is the agent credential and the model traffic it buys; the
+red plane is the GitHub credential and the repository traffic it buys. They
+meet nowhere except on the host, which holds the token *sources* and injects
+each one into the box that needs it — never into the other.
+
+```mermaid
+flowchart LR
+    operator["operator<br/>chat, or a labelled issue"]
+
+    host["<b>Host — sbxloop daemon</b><br/>holds both token sources, injects each<br/>into one box only · harvests the agent's tree<br/>· speaks typed github.op jobs · mediates<br/>every hop, no VM can address another"]
+
+    subgraph green["Agent plane — the model runs here, and there is no GitHub token in it"]
+        conc["concierge sandbox<br/>long-lived, chat's agent"]
+        agent["run agent sandbox<br/>ephemeral · dev toolchains<br/>· builds and tests the repo"]
+    end
+
+    subgraph red["GitHub plane — the token lives here, and there is no model in it"]
+        dgh["daemon github-ops sandbox<br/>long-lived, issue lifecycle"]
+        ghbox["run github-ops sandbox<br/>ephemeral · branch, PR,<br/>review, CI, merge"]
+    end
+
+    model["Model provider<br/>Copilot / Anthropic"]
+    gh["GitHub<br/>the one configured repository"]
+
+    operator --> host
+    host ==>|"agent credential<br/>COPILOT_GITHUB_TOKEN or ANTHROPIC_API_KEY"| conc
+    host ==> agent
+    conc ==> model
+    agent ==> model
+    host ==>|"GitHub credential<br/>GH_TOKEN PAT or App installation token"| dgh
+    host ==> ghbox
+    dgh ==> gh
+    ghbox ==> gh
+    agent -.->|"a tree of changes,<br/>no credential"| host
+    conc -.->|"a request to file or label an issue"| host
+    agent x-- "no channel, no route, no forwarded token" --x ghbox
+
+    linkStyle 1,2,3,4 stroke:#2e9e4f,stroke-width:3px
+    linkStyle 5,6,7,8 stroke:#d64545,stroke-width:3px
+    linkStyle 9,10 stroke:#c99a00,stroke-width:2px
+    linkStyle 11 stroke:#888,stroke-width:2px
+
+    style green fill:#eef8f1,stroke:#2e9e4f,stroke-width:2px
+    style red fill:#fdefef,stroke:#d64545,stroke-width:2px
+    style host fill:#f4f4f8,stroke:#555,stroke-width:2px
+```
+
+Read three things off it:
+
+- **The agent side can never touch the repository.** It has no GitHub token
+  and no route to one. Everything that reaches GitHub was harvested by the
+  host and re-spoken as a typed `github.op` job — a closed vocabulary, not a
+  shell.
+- **The GitHub side can never be talked into anything.** It holds the token
+  but runs no model and has no dev tools; it executes named ops and nothing
+  else.
+- **The two never meet.** Not by convention — by construction: no VM can
+  address the host or another VM, so a direct agent↔github channel does not
+  exist to be misused. That is what makes the split worth having; the
+  credential being in a different VM is not, on its own, the control.
+
 ## Design principles
 
 Two properties are the load-bearing walls of sbxloop's security model. They are
