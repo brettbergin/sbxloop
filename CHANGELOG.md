@@ -6,6 +6,14 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Console chat: one line per short message.** Every message was drawn
+  as a header line (time, author, reactions) with its text on the line
+  below, so a channel of one-liners read at half density. A short message
+  now reads as one line, as the design and Discord do; cards, code and
+  multi-line bodies still drop below their header.
+
 ### Added
 
 - **Console config, secrets and doctor screens** (#774). The last
