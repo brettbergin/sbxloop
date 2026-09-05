@@ -321,7 +321,13 @@ class FakeConcierge:
         self.gate.set()
 
     def submit_turn(
-        self, text: str, *, author: str, author_id: str | None = None, on_tool: Any = None
+        self,
+        text: str,
+        *,
+        author: str,
+        author_id: str | None = None,
+        on_tool: Any = None,
+        via: str | None = None,
     ) -> Any:
         import concurrent.futures
 
@@ -329,6 +335,7 @@ class FakeConcierge:
 
         self.turns.append((text, author))
         self.author_ids = [*getattr(self, "author_ids", []), author_id]
+        self.vias = [*getattr(self, "vias", []), via]
         future: concurrent.futures.Future[Any] = concurrent.futures.Future()
 
         def run() -> None:
@@ -2571,3 +2578,12 @@ class TestGateViewRearm:
         bridge.dstore.create_merge_gate("r1", "gh:issue:1", "o/r", 9, "u", None, [], "t1", 1.0)
         bridge._register_gate_views(client)
         assert armed == []
+
+
+def test_discord_owns_only_snowflakes(tmp_path: Path) -> None:
+    """With the console's bridge beside it, a login name on a work item is
+    not Discord's to mention; a snowflake is."""
+    bridge, _, _ = make_bridge(tmp_path)
+    assert bridge._owns_user_id("123456789012345678") and bridge._owns_user_id("1")
+    assert not bridge._owns_user_id("brett") and not bridge._owns_user_id("U0123ABCDEF")
+    assert bridge._mentions(["1", "brett", "2"]) == "<@1> <@2>"

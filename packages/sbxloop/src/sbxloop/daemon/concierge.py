@@ -37,11 +37,11 @@ import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, get_args
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
 from urllib.parse import quote
 
 from sbxloop.cli.tui import format_event
-from sbxloop.config import Config
+from sbxloop.config import BridgeBackend, Config
 from sbxloop.daemon.chat_choices import (
     ChoiceQuestion,
     PendingFiling,
@@ -112,7 +112,11 @@ CLOSE_REASONS = ("completed", "not_planned")
 #: see ``ChatBridge.on_watch``.
 VIA_CONCIERGE_SUFFIX = " (via concierge)"
 #: How the prompt names the chat service, by `[chat] backend`.
-CHAT_NAMES: dict[str, str] = {"discord": "Discord", "slack": "Slack"}
+CHAT_NAMES: dict[str, str] = {
+    "discord": "Discord",
+    "slack": "Slack",
+    "local": "the operator console",
+}
 
 
 class ConciergeReply(NamedTuple):
@@ -235,8 +239,12 @@ class Concierge:
         # The active chat backend's section (prefix, threading) and its proper
         # name for the prompt; a config with no chat at all (tests, a headless
         # daemon) reads Discord's defaults so every string still renders.
-        self._chat = config.chat_settings or config.discord
-        self._chat_name = CHAT_NAMES.get(config.chat_backend or "", "chat")
+        # The surface a turn is worded for — its command prefix, threading and
+        # proper name — is the bridge the turn came in on (``submit_turn``'s
+        # ``via``); between turns, the external backend when one is
+        # configured, else the operator console.
+        self._default_via: str = config.chat_backend or "local"
+        self._turn_via: str | None = None
         self.loop = loop
         self.dstore = dstore
         self._store_factory = store_factory
@@ -246,6 +254,7 @@ class Concierge:
         # an issue they ask for records them as its requester. Turns run one
         # at a time on the executor, so one slot is enough.
         self._turn_author_id: str | None = None
+
         self.host = host
         self.bus = bus
         self.clock = clock
@@ -292,6 +301,18 @@ class Concierge:
         self._warm = threading.Thread(target=run, name="sbxloop-concierge-warmup", daemon=True)
         self._warm.start()
 
+    @property
+    def _via(self) -> str:
+        return self._turn_via or self._default_via
+
+    @property
+    def _chat(self) -> Any:
+        return self.config.chat_section(cast(BridgeBackend, self._via))
+
+    @property
+    def _chat_name(self) -> str:
+        return CHAT_NAMES.get(self._via, "chat")
+
     def submit_turn(
         self,
         text: str,
@@ -299,10 +320,12 @@ class Concierge:
         author: str,
         author_id: str | None = None,
         on_tool: ToolCallback | None = None,
+        via: str | None = None,
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
-        recorded as the requester of any issue this turn files."""
+        recorded as the requester of any issue this turn files; ``via`` is
+        the bridge the message came in on, so the reply is worded for it."""
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("concierge is closed")
@@ -312,10 +335,12 @@ class Concierge:
             with self._state_lock:
                 self._pending -= 1
             self._turn_author_id = author_id
+            self._turn_via = via
             try:
                 return self._run_turn(text, author=author, on_tool=on_tool)
             finally:
                 self._turn_author_id = None
+                self._turn_via = None
 
         return self._executor.submit(run)
 
@@ -1011,6 +1036,11 @@ class Concierge:
             )
         return tools
 
+    def _thread_for(self, run_id: str) -> ChatThread | None:
+        """The run's thread on the surface this turn is answered on, else
+        the one an external bridge opened."""
+        return self.dstore.chat_thread(run_id, self._via) or self.dstore.chat_thread(run_id)
+
     def _link(self, thread: ChatThread) -> str:
         if self._thread_link is not None:
             return self._thread_link(thread)
@@ -1067,7 +1097,7 @@ class Concierge:
         item_id = self.dstore.item_for_run(run_id)
         item_id = normalize_item_id(item_id) if item_id else item_id
         item = self.dstore.get(item_id) if item_id else None
-        thread = self.dstore.chat_thread(run_id)
+        thread = self._thread_for(run_id)
         lines = [
             f"run {run.run_id}: state={run.state}, created {_age(self.clock() - run.created_at)} "
             f"ago, updated {_age(self.clock() - run.updated_at)} ago",
@@ -1184,7 +1214,7 @@ class Concierge:
             lines.append(f"body: {_one_line(item.body, 600)}")
         lines.append(f"runs: {', '.join(runs) if runs else '(none yet)'}")
         if runs:
-            thread = self.dstore.chat_thread(runs[-1])
+            thread = self._thread_for(runs[-1])
             if thread is not None:
                 lines.append(f"latest run's {self._chat_name} thread: {self._link(thread)}")
         return "\n".join(lines)

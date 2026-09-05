@@ -50,11 +50,11 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
-from sbxloop.config import ChatBackend, ChatBridgeConfig, Config
+from sbxloop.config import BridgeBackend, ChatBridgeConfig, Config
 from sbxloop.daemon.chat_choices import (
     Choice,
     ChoiceQuestion,
@@ -289,7 +289,7 @@ class ChatBridge(ABC):
     """
 
     #: The ``[chat] backend`` name this bridge serves.
-    backend: ClassVar[ChatBackend]
+    backend: ClassVar[BridgeBackend]
     #: The service's proper name, for attribution ("Discord user `x`") and logs.
     label: ClassVar[str]
     #: How this service spells a user mention in message text.
@@ -486,6 +486,17 @@ class ChatBridge(ABC):
         """``<@id>`` — the same on both services."""
         return f"<@{user_id}>"
 
+    def _owns_user_id(self, user_id: str) -> bool:
+        """Whether ``user_id`` is one this service can address. Requester
+        and watcher ids are backend-less in the store (a work item carries
+        whoever asked, whichever bridge they asked on), so with several
+        bridges running each renders only the ids that are its own rather
+        than a foreign id as a broken mention."""
+        return True
+
+    def _mentions(self, user_ids: Iterable[str]) -> str:
+        return " ".join(self.mention_user(uid) for uid in user_ids if self._owns_user_id(uid))
+
     def _typing(self, channel: Any) -> Any:
         """A "typing…" indicator context while the concierge thinks; a no-op
         where the service has none."""
@@ -636,9 +647,10 @@ class ChatBridge(ABC):
             self._engine = engine
             # Non-blocking subscriber: just enqueue; the pump renders + sends.
             self._unsubscribe = bus.subscribe(lambda ev: self._events.put((run_id, ev)))
-        if item.requested_by:
+        if item.requested_by and self._owns_user_id(item.requested_by):
             # Whoever asked for the work through the concierge is pinged with
-            # the outcome without having to ask for a watch.
+            # the outcome without having to ask for a watch — by the bridge
+            # whose id it is.
             with self._watch_lock:
                 watchers = self._watchers.setdefault(run_id, [])
                 if item.requested_by not in watchers:
@@ -916,8 +928,8 @@ class ChatBridge(ABC):
         report: RunReport,
         thread: ChatThread | None,
     ) -> str:
-        mentions = " ".join(self.mention_user(uid) for uid in watchers)
-        lines = [f"{mentions} run `{run_id}` finished: **{state}**"]
+        mentions = self._mentions(watchers)
+        lines = [f"{mentions} run `{run_id}` finished: **{state}**".strip()]
         if report.task_summary:
             lines.append(f"tasks: {_one_line(report.task_summary, 200)}")
         if report.pr:
@@ -993,11 +1005,13 @@ class ChatBridge(ABC):
             async with self._typing(channel):
                 future = self.concierge.submit_turn(
                     # author_id is what records the requester on a filed
-                    # issue, so the run's finish can ping them.
+                    # issue, so the run's finish can ping them; via is the
+                    # surface the reply is worded for.
                     text,
                     author=author,
                     author_id=msg.author_id,
                     on_tool=on_tool,
+                    via=self.backend,
                 )
                 reply = await asyncio.wrap_future(future)
         except asyncio.CancelledError:
@@ -1777,7 +1791,7 @@ class ChatBridge(ABC):
         """The approval prompt: who it pings, what stands ready, and the
         typed commands that work on every backend (a component backend adds
         its button on top, never instead)."""
-        mentions = " ".join(self.mention_user(uid) for uid in gate.notify_ids)
+        mentions = self._mentions(gate.notify_ids)
         item = normalize_item_id(gate.item_id)
         prefix = self.chat.command_prefix
         head = "⏸ **ready to merge — waiting for your approval**"
@@ -1863,7 +1877,7 @@ class ChatBridge(ABC):
                 f" — {_one_line(str(detail), 200)}" if detail else ""
             )
         else:
-            mentions = " ".join(self.mention_user(uid) for uid in fresh.notify_ids)
+            mentions = self._mentions(fresh.notify_ids)
             text = (
                 "⚠ approval by "
                 + str(who)
@@ -1913,7 +1927,7 @@ class ChatBridge(ABC):
             known = self.dstore.chat_thread(notice.run_id, self.backend)
         # A notice with people to address (#675: a PR waiting for their
         # review) pings them where it lands — the ask has to reach them.
-        prefix = " ".join(self.mention_user(uid) for uid in notice.mention_ids)
+        prefix = self._mentions(notice.mention_ids)
         pings = bool(prefix)
         text = f"{prefix} {daemon_notice(notice)}" if pings else daemon_notice(notice)
         if known is not None:

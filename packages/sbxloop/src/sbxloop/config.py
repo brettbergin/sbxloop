@@ -1532,6 +1532,11 @@ ChronologyLevel = Literal["quiet", "normal", "verbose"]
 
 ChatBackend = Literal["discord", "slack"]
 CHAT_BACKENDS: tuple[ChatBackend, ...] = ("discord", "slack")
+#: Every bridge the daemon can run: the external ``[chat] backend`` choices
+#: plus ``local``, the operator console's bridge, which is always on.
+BridgeBackend = Literal["discord", "slack", "local"]
+#: The local bridge's control channel id (its threads are ``thread:<id>``).
+TUI_CONTROL_CHANNEL = "control"
 
 
 class ChatBridgeConfig(_ConfigModel):
@@ -1637,6 +1642,36 @@ class SlackConfig(ChatBridgeConfig):
     @property
     def channel_ref(self) -> str:
         return self.channel_id or ""
+
+
+class TuiConfig(ChatBridgeConfig):
+    """The operator console, ``sbxloop tui`` — always on. The daemon keeps a
+    local chat mailbox in ``state.db`` with the same headline, thread,
+    steering, concierge and merge-gate experience ``[discord]`` / ``[slack]``
+    give, and the console attaches to it on the daemon host; there is no
+    channel to configure and no token. The rendering knobs are the shared
+    ones; these are the terminal's own."""
+
+    # Who the console speaks as (watches, mentions, GitHub attribution);
+    # empty means the login name of whoever runs it.
+    operator_id: str = ""
+    # Glyph markers in the console (off: ASCII stand-ins).
+    emoji: bool = True
+    # The systemd --user unit the console tails (journalctl) and can restart.
+    daemon_unit: str = "sbxloop-daemon"
+    # How often the console re-reads the store while a screen is live.
+    refresh_s: float = Field(default=0.5, ge=0.1, le=10.0)
+    # Mailbox rows older than this are pruned by the daemon (0 keeps them);
+    # an open merge gate's prompt is never pruned.
+    retention_days: float = Field(default=14.0, ge=0.0)
+
+    @property
+    def enabled(self) -> bool:
+        return True
+
+    @property
+    def channel_ref(self) -> str:
+        return TUI_CONTROL_CHANNEL
 
 
 class ChatConfig(_ConfigModel):
@@ -1780,6 +1815,7 @@ class Config(_ConfigModel):
     chat: ChatConfig = Field(default_factory=ChatConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
+    tui: TuiConfig = Field(default_factory=TuiConfig)
     concierge: ConciergeConfig = Field(default_factory=ConciergeConfig)
 
     @field_validator("state_dir", mode="after")
@@ -1920,7 +1956,9 @@ class Config(_ConfigModel):
             )
         return self
 
-    def chat_section(self, backend: ChatBackend) -> DiscordConfig | SlackConfig:
+    def chat_section(self, backend: BridgeBackend) -> DiscordConfig | SlackConfig | TuiConfig:
+        if backend == "local":
+            return self.tui
         return self.discord if backend == "discord" else self.slack
 
     @property
@@ -1941,7 +1979,9 @@ class Config(_ConfigModel):
     def chat_settings(self) -> DiscordConfig | SlackConfig | None:
         """The active backend's section, or None when the daemon is headless."""
         backend = self.chat_backend
-        return None if backend is None else self.chat_section(backend)
+        if backend is None:
+            return None
+        return self.discord if backend == "discord" else self.slack
 
     def workspace_for_repo(self, repo: str | None) -> Path | None:
         """The host checkout runs for ``repo`` clone and refresh from.

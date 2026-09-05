@@ -464,6 +464,10 @@ class DiscordBridge(ChatBridge):
         tid = getattr(target, "id", None)
         return str(int(tid)) if tid else ""
 
+    def _owns_user_id(self, user_id: str) -> bool:
+        # A Discord user id is a snowflake.
+        return user_id.isdigit()
+
     def thread_link(self, thread: ChatThread) -> str:
         return f"<#{thread.thread_id}>"
 

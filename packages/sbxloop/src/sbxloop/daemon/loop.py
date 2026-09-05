@@ -26,6 +26,7 @@ tick resumes it through the same guardrails as any dispatch.
 
 from __future__ import annotations
 
+import os
 import signal
 import threading
 import time
@@ -38,7 +39,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, Protocol, cast
 from zoneinfo import ZoneInfo
 
-from sbxloop import hostgit
+from sbxloop import __version__, hostgit
 from sbxloop.config import Config, GithubConfig, SandboxConfig
 from sbxloop.daemon.github import DaemonGithub
 from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
@@ -268,6 +269,7 @@ class DaemonLoop:
         self.source = source
         self.sbx = sbx
         self.clock = clock
+        self.started_at = clock()
         self.frontend = frontend
         # The daemon's own gh-ops box: what the gate-approve path merges
         # with. None only in tests that never approve.
@@ -675,6 +677,11 @@ class DaemonLoop:
             # either — a restart here orphans the issue (#530).
             "claiming": self._claiming,
             "stopping": self._stop.is_set(),
+            # The process behind the answer: what a console needs to signal
+            # it when no service manager stands in front, and to show uptime.
+            "pid": os.getpid(),
+            "started_at": self.started_at,
+            "version": __version__,
             # Per-repository polling health (#516); [] for a single-repo daemon.
             "repos": [
                 {**h.to_json(), "state": h.state}
