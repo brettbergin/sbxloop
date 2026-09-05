@@ -1252,18 +1252,111 @@ class TestSinks:
         assert refusal["key"] == "workloads.research.sinks"
         assert (refusal["need"], refusal["value"]) == ("sink", "artifact")
 
-    def test_the_pr_sink_is_not_available_yet(
+    def _upstream(self, harness: Harness, monkeypatch: pytest.MonkeyPatch) -> Path:
+        """A repository the run may check out, cloned in place of a fetch
+        from GitHub (the way the #758 checkout tests do)."""
+        from sbxloop import hostgit
+        from tests.unit.test_hostgit import make_repo
+
+        upstream = make_repo(harness.tmp_path, "upstream")
+        monkeypatch.setattr(
+            hostgit,
+            "clone_from_remote",
+            lambda url, target, branch, **kw: hostgit.clone_for_run(upstream, target, branch),
+        )
+        return upstream
+
+    def test_the_pr_sink_delivers_the_checkout_as_one_pull_request(
+        self, harness: Harness, profiled: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """aw/05b: a task that worked in the repository it asked for and
+        chose the pr sink has its checkout's diff delivered as one pull
+        request — committed, opened, labelled, and that is the whole
+        publish: no gate, no review, no CI wait, and no `pr_number` on
+        the run for the daemon to settle."""
+        self._upstream(harness, monkeypatch)
+        fake = FakeGithub(repo="o/docs")
+        harness.script(
+            [
+                plan(needing("t1", sink="pr", repo="o/docs"), title="Reword the greeting"),
+                {
+                    "text": "## Result\nreworded the greeting",
+                    "files": {"docs/hello.txt": "hello\n", "docs/new.md": "# new\n"},
+                },
+                PASS,
+            ]
+        )
+        engine = harness.engine(
+            **{**profiled, "workloads": [{**PUBLISHING, "repo": True}]},
+            ops=fake,
+            github={"repo": "o/docs"},
+        )
+        result = engine.start("make the docs friendlier", kind="workload")
+        assert result.state == "completed", result.reason
+        assert fake.pr_created and fake.pr_create_calls == 1
+        kw = fake.pr_kwargs
+        assert kw["repo"] == "o/docs" and kw["head"] == f"sbxloop/{result.run_id}"
+        assert kw["title"] == "sbxloop: Reword the greeting" and kw["draft"] is False
+        assert kw["body"].startswith(
+            "Reword the greeting — 1/1 task(s) passed the judge\n"
+            "t1: reworded the greeting (2 files)\n\n"
+            "## t1: Task t1\n\nreworded the greeting\n\n"
+            "Files: `docs/hello.txt`, `docs/new.md`\n\n---\n\n"
+            f"Artifacts produced by sbxloop run `{result.run_id}`."
+        )
+        # the checkout's diff: the edited file and the new one, nothing else
+        assert sorted(f["path"] for batch in fake.blob_batches for f in batch) == [
+            "hello.txt",
+            "new.md",
+        ]
+        assert "sbxloop:result" in fake.labels_created
+        (posted,) = self.published(harness)
+        url = "https://github.com/o/docs/pull/7"
+        assert (posted["sink"], posted["location"], posted["tasks"]) == ("pr", url, ["t1"])
+        assert posted["message"] == f"result delivered as {url}"
+        assert [(p.sink, p.location, p.files) for p in result.published] == [("pr", url, 2)]
+        assert result.pr_number is None and result.pr_url is None
+        # delivery was the whole publish: the run went straight to completed
+        assert harness.run_states() == WORKLOAD_STATES
+        assert [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER] == []
+
+    def test_the_pr_sink_needs_the_tasks_own_checkout(
         self, harness: Harness, profiled: dict[str, Any]
     ) -> None:
         fake = FakeGithub()
         harness.script([plan(needing("t1", sink="pr")), BUILD, PASS])
         engine = harness.engine(
-            **{**profiled, "workloads": [PUBLISHING]}, ops=fake, github={"repo": fake.repo}
+            **{**profiled, "workloads": [{**PUBLISHING, "repo": True}]},
+            ops=fake,
+            github={"repo": fake.repo},
         )
         result = engine.start("deliver it", kind="workload")
         assert result.state == "failed"
         (refusal,) = self.refused(harness)
-        assert refusal["key"] is None and "not available yet" in refusal["message"]
+        assert refusal["key"] is None and "declare `repo` on the task" in refusal["message"]
+        assert fake.pr_create_calls == 0
+
+    def test_a_checkout_without_changes_fails_the_pr_sink_named(
+        self, harness: Harness, profiled: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A task that chose the pr sink and changed nothing in its
+        checkout has nothing to deliver: the run fails at publishing,
+        named, rather than opening an empty pull request."""
+        self._upstream(harness, monkeypatch)
+        fake = FakeGithub(repo="o/docs")
+        harness.script(
+            [plan(needing("t1", sink="pr", repo="o/docs")), {"text": "## Result\nnothing"}, PASS]
+        )
+        engine = harness.engine(
+            **{**profiled, "workloads": [{**PUBLISHING, "repo": True}]},
+            ops=fake,
+            github={"repo": "o/docs"},
+        )
+        result = engine.start("deliver it", kind="workload")
+        assert result.state == "failed" and result.reason is not None
+        assert result.reason.startswith("publishing to pr failed: nothing to deliver")
+        assert not fake.pr_created
+        assert harness.run_states()[-2:] == ["publishing", "failed"]
 
     @pytest.mark.parametrize("mounted", [True, False])
     def test_the_artifact_sink_delivers_the_declared_files_only(

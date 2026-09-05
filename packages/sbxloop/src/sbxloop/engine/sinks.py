@@ -21,16 +21,18 @@ from sbxloop.gh.labels import LabelSpec
 # The sink a task publishes to when its plan named none.
 DEFAULT_SINK: SinkName = "chat"
 # The order the publishing stage works the sinks: the durable ones first,
-# the chat reply last so it can name what they delivered. (`pr` joins when
-# it lands.)
-PUBLISH_ORDER: tuple[SinkName, ...] = ("artifact", "issue", "chat")
+# the chat reply last so it can name what they delivered.
+PUBLISH_ORDER: tuple[SinkName, ...] = ("artifact", "pr", "issue", "chat")
 
 # The label a result issue carries, so a repository can tell the loop's
 # results from its work queue (`[workload] result_label`).
 RESULT_LABEL_DESCRIPTOR = ("6f42c1", "a result an sbxloop workload delivered")
 
-# GitHub caps an issue body at 65536 characters; the closing note must fit.
+# GitHub caps an issue or pull request body at 65536 characters; the
+# closing note and the footer around the result must fit under it.
 MAX_ISSUE_BODY_CHARS = 60_000
+# What `deliver.deliver_workspace` appends under a body it is handed.
+PR_FOOTER_RESERVE = 200
 # How many of a task's files the text names before counting the rest.
 MAX_LISTED_FILES = 20
 
@@ -127,9 +129,36 @@ def chat_text(tasks: Sequence[TaskRecord], title: str | None, carried: Sequence[
     return "\n\n".join(parts)
 
 
-def issue_title(title: str | None, outcome: str) -> str:
-    """The result issue's title: the plan's own line, else the outcome's
-    first line, clipped the way GitHub would wrap it anyway."""
+def repo_of(carried: Sequence[TaskRecord]) -> str | None:
+    """The one repository the pr sink delivers to: the checkout the
+    carried tasks declared in ``needs.repo``. None when they named none
+    or more than one — the grant refuses a pr task without a repo and a
+    run's `[github]` is narrowed to one repository, so publishing never
+    sees either, but the sink checks rather than assumes."""
+    repos = list(dict.fromkeys(t.spec.needs.repo for t in carried if t.spec.needs.repo))
+    return repos[0] if len(repos) == 1 else None
+
+
+def clipped(text: str, reserve: int) -> str:
+    """``text`` under GitHub's body cap with ``reserve`` characters left
+    for what follows it, the cut marked."""
+    note = "\n\n*(clipped: the full result is on the run's tasks)*"
+    budget = MAX_ISSUE_BODY_CHARS - reserve - len(note)
+    if len(text) <= budget:
+        return text
+    return text[:budget].rstrip() + note
+
+
+def pr_body(tasks: Sequence[TaskRecord], title: str | None, carried: Sequence[TaskRecord]) -> str:
+    """The result pull request's description: the closing line and each
+    carried task's result — delivery adds the run's own footer."""
+    return clipped(chat_text(tasks, title, carried), PR_FOOTER_RESERVE)
+
+
+def result_title(title: str | None, outcome: str) -> str:
+    """The result issue's or pull request's title: the plan's own line,
+    else the outcome's first line, clipped the way GitHub would wrap it
+    anyway."""
     line = (title or "").strip() or next(
         (ln.strip() for ln in outcome.splitlines() if ln.strip()), "workload result"
     )
@@ -147,9 +176,5 @@ def issue_body(
     """The result issue's body: the closing line, each carried task's
     result, and a footer naming the run and what it was asked."""
     footer = f"---\n*sbxloop run `{run_id}`*\n\n**Asked:** {outcome.strip()}"
-    note = "\n\n*(clipped: the full result is on the run's tasks)*"
-    text = chat_text(tasks, title, carried)
-    budget = MAX_ISSUE_BODY_CHARS - len(footer) - len(note) - 3
-    if len(text) > budget:
-        text = text[:budget].rstrip() + note
+    text = clipped(chat_text(tasks, title, carried), len(footer) + 3)
     return f"{text}\n\n{footer}\n"

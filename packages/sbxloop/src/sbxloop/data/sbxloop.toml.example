@@ -243,8 +243,10 @@ secret_strategy = "proxy"
 # always-available `chat` reply — `issue` (one result issue filed in
 # `[github] repo`, which needs the github box), `artifact` (the files the
 # task reported, copied to `runs/<run>/artifacts` for `sbxloop artifacts`),
-# `pr` (files delivered to a repository). `repo`: whether a plan may ask for a checkout of a
-# configured repository in its data directory. `budgets`: `[budgets]` keys
+# `pr` (the task's changes to the checkout it asked for, opened as one pull
+# request — delivery is the whole publish; needs `repo`). `repo`: whether a
+# plan may ask for a checkout of a configured repository in its data
+# directory. `budgets`: `[budgets]` keys
 # overridden for this profile's runs. `publish = "hold"` (park a finished
 # run for a human release) arrives with the daemon's workload intake and is
 # refused until then. A workload run with no profile at all may declare no
