@@ -544,6 +544,19 @@ def _row_to_chat_thread(row: sqlite3.Row) -> ChatThread:
     )
 
 
+def dispatch_eligible_at(item: WorkItem, backoff_s: float) -> float:
+    """When the daemon's dispatch rule lets ``item`` go: a scheduled retry
+    waits its own clock; a resume-pending run and a first attempt go at
+    once; a failed attempt waits ``attempts * backoff`` after its update.
+    The one place the rule lives, so `next_queued` and a console agree."""
+    eligible = 0.0
+    if item.not_before is not None:
+        eligible = max(eligible, item.not_before)
+    if item.run_id is None and item.attempts > 0:
+        eligible = max(eligible, item.updated_at + item.attempts * backoff_s)
+    return eligible
+
+
 def parse_breaker(opened: str | None, failures: str | None) -> tuple[float | None, int]:
     """The two ``daemon_state`` breaker values as the loop keeps them."""
     opened_at = float(opened) if opened not in (None, "") else None
@@ -1549,21 +1562,30 @@ class DaemonStore:
         when the previous process died, so it goes first and skips the
         retry backoff — that backoff spaces out *failed* attempts, and an
         interruption is not a failure."""
+        for item in self.queued_in_order():
+            if dispatch_eligible_at(item, backoff_s) <= now:
+                return item
+        return None
+
+    def queued_in_order(self) -> list[WorkItem]:
+        """Every queued item in the order :meth:`next_queued` considers them:
+        interrupted runs awaiting resume first, then FIFO."""
         with self._lock:
-            for row in self._conn.execute(
-                "SELECT * FROM daemon_work_items WHERE state = 'queued' "
-                "ORDER BY (run_id IS NULL) ASC, created_at ASC, rowid ASC"
-            ):
-                item = _row_to_item(row)
-                if item.not_before is not None and now < item.not_before:
-                    continue  # a scheduled retry (#523) waits its own clock
-                if (
-                    item.run_id is not None
-                    or item.attempts == 0
-                    or now - item.updated_at >= item.attempts * backoff_s
-                ):
-                    return item
-            return None
+            return [
+                _row_to_item(row)
+                for row in self._conn.execute(
+                    "SELECT * FROM daemon_work_items WHERE state = 'queued' "
+                    "ORDER BY (run_id IS NULL) ASC, created_at ASC, rowid ASC"
+                )
+            ]
+
+    def run_items(self) -> dict[str, str]:
+        """``run_id -> item_id`` for every run the daemon dispatched (the ledger)."""
+        with self._lock:
+            return {
+                str(r["run_id"]): str(r["item_id"])
+                for r in self._conn.execute("SELECT run_id, item_id FROM daemon_runs")
+            }
 
     def queued(self) -> list[WorkItem]:
         with self._lock:

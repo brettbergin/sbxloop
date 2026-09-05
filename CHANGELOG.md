@@ -8,6 +8,23 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **`sbxloop tui`: the operator console** (#770). A person on the daemon
+  host had the CLI's one-shot commands and journald. `sbxloop tui` is a
+  terminal console that reads the daemon's `state.db` read-only and asks
+  the daemon `status` through the `ctl` queue every few seconds: an
+  Overview (the run in flight, the queue, who waits on a human, recent
+  runs), Runs with a per-run screen (the `sbxloop run` transcript tailed
+  from the store, tasks, every phase attempt with its tokens and turns —
+  never a currency, landing state and the newest landing events,
+  artifacts, the dense event lines with a type filter), the Queue, and
+  Help. `--run` opens a run at once, `--read-only` removes every action,
+  `--state-dir` overrides the daemon's rule. Textual is a core dependency.
+  `docs/tui.md` documents the layout and keys; the docs' mention of a
+  `sbxloop watch` TUI that never shipped now names this. The chat screens
+  and the admin screens follow.
+
+### Added
+
 - **The daemon always runs a local chat bridge for the operator console**
   (#769). A person on the daemon host had the CLI and journald; everything
   a run *shows* — the headline, the thread, the status line and tool digest

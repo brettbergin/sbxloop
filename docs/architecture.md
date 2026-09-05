@@ -1347,7 +1347,7 @@ calls get their own rendering rules (`sbxloop.cli.cmdfmt`,
   character caps stay in `discord_format`: the fenced body is clipped to
   `TOOL_EXCERPT_MAX_CHARS` (1200) and the finished message to
   `DISCORD_MAX_MESSAGE`, so no input can overflow Discord's limit. The
-  `sbxloop watch` TUI renders a failed tool call through the same shared
+  `sbxloop run` transcript (and the `sbxloop tui` console) renders a failed tool call through the same shared
   helper, so its excerpt has the same head+tail shape, per-line clip and
   elision marker rather than a plain last-N-lines tail.
 - **No link previews, ever.** The bridge posts its own embed cards (headline,

@@ -167,3 +167,21 @@ def test_reads_are_serialised_across_threads(tmp_path: Path) -> None:
         t.join()
     assert errors == []
     client.close()
+
+
+def test_newest_event_reads_and_the_ledger_map(tmp_path: Path) -> None:
+    path, dstore, store = stores(tmp_path)
+    store.create_run("r1", "x")
+    store.append_event(Event.now("land.update", "r1", pr=1, attempt=1))
+    store.append_event(Event.now("land.held_by_draft", "r1", pr=1))
+    store.append_event(Event.now("land.update", "r1", pr=1, attempt=2))
+    dstore.upsert_new(WorkItem(item_id="gh:issue:1", source_key="1", title="One"), now=1.0)
+    dstore.mark_running("gh:issue:1", "r1", now=2.0)
+    client = MailboxClient(path, operator_id="b")
+    assert client.last_event("r1", "land.update").data["attempt"] == 2  # type: ignore[union-attr]
+    assert client.last_event("r1", "land.held_by_draft") is not None
+    assert client.last_event("r1", "run.gated") is None
+    assert client.last_event_ts_many(["r1", "nope"]).keys() == {"r1"}
+    assert client.run_items() == {"r1": "gh:issue:1"}
+    assert [i.item_id for i in client.queued_in_order()] == []
+    client.close()

@@ -320,6 +320,12 @@ class EmbedSpec:
         return "\n".join(lines)
 
 
+def code_segments(text: str) -> list[tuple[str, bool]]:
+    """``(segment, is_code)`` pairs: fenced blocks and inline spans marked,
+    so a dialect converter (Slack's, the console's) leaves them alone."""
+    return _code_segments(text)
+
+
 def embed_to_json(spec: EmbedSpec) -> str:
     """The card as JSON, for a transport that stores rather than posts —
     the dataclass's own fields, so a field added to :class:`EmbedSpec`
