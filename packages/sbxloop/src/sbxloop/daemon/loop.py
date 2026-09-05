@@ -26,6 +26,7 @@ tick resumes it through the same guardrails as any dispatch.
 
 from __future__ import annotations
 
+import json
 import os
 import signal
 import threading
@@ -49,6 +50,7 @@ from sbxloop.daemon.model import (
     NoticeKind,
     NoticeLevel,
     RunReport,
+    TaskOutcome,
     TickOutcome,
     TickResult,
     WorkItem,
@@ -73,9 +75,12 @@ from sbxloop.engine.landing import (
 from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
     TERMINAL_RUN_STATES,
+    RunKind,
     RunRecord,
     RunResult,
     RunState,
+    TaskRecord,
+    workload_summary,
 )
 from sbxloop.engine.reconcile import acknowledge_human_threads
 from sbxloop.engine.store import StateStore
@@ -2692,6 +2697,12 @@ class DaemonLoop:
             if result is not None and result.workspace
             else (str(record.workspace) if record is not None and record.workspace else None)
         )
+        kind: RunKind = record.kind if record is not None else (result.kind if result else "code")
+        outputs: tuple[TaskOutcome, ...] = ()
+        closing: str | None = None
+        if kind == "workload":
+            outputs = tuple(self._task_outcome(run_id, t) for t in tasks)
+            closing = workload_summary(tasks, record.pr_title if record is not None else None)
         return RunReport(
             run_id,
             state,
@@ -2701,6 +2712,43 @@ class DaemonLoop:
             rounds=rounds,
             reason=reason,
             workspace=workspace,
+            kind=kind,
+            outputs=outputs,
+            summary=closing,
+        )
+
+    def _task_outcome(self, run_id: str, task: TaskRecord) -> TaskOutcome:
+        """One task as the finish card shows it (#757): its output and the
+        judge's last word, read from the judge's own phase row."""
+        verdict: str | None = None
+        try:
+            raw = self.store.latest_phase_output(run_id, task.spec.id, "judge")
+        except SbxloopError:
+            raw = None
+        if raw:
+            try:
+                row = json.loads(raw)
+            except ValueError:
+                row = {}
+            if row.get("degraded"):
+                verdict = "no usable verdict — failed closed"
+            elif row.get("passed"):
+                verdict = "passed"
+            else:
+                unmet = [str(u) for u in row.get("unmet") or []]
+                verdict = "failed"
+                if unmet:
+                    verdict += f" — unmet: {unmet[0]}"
+                    if len(unmet) > 1:
+                        verdict += f" (+{len(unmet) - 1} more)"
+        output = task.output
+        return TaskOutcome(
+            task.spec.id,
+            task.spec.title,
+            task.state,
+            output.summary if output is not None else "",
+            output.file_count if output is not None else 0,
+            verdict,
         )
 
     # -- recovery ------------------------------------------------------------------------
@@ -3001,6 +3049,12 @@ class DaemonLoop:
             pr_number=record.pr_number,
             pr_url=record.pr_url,
             reason=record.reason,
+            kind=record.kind,
+            summary=(
+                workload_summary(self.store.get_tasks(run_id), record.pr_title)
+                if record.kind == "workload"
+                else None
+            ),
         )
 
     # -- helpers ------------------------------------------------------------------------

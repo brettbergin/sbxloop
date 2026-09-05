@@ -18,10 +18,16 @@ import pytest
 from sbxloop import hostgit
 from sbxloop.config import Config
 from sbxloop.daemon.loop import DaemonLoop, RunHandle, day_window
-from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
+from sbxloop.daemon.model import DaemonNotice, RunReport, TaskOutcome, WorkItem
 from sbxloop.daemon.sources import IssueComment, IssueContext, LinkedIssue
 from sbxloop.daemon.store import DaemonStore
-from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, TaskRecord, TaskSpec
+from sbxloop.engine.model import (
+    TERMINAL_RUN_STATES,
+    RunResult,
+    TaskOutput,
+    TaskRecord,
+    TaskSpec,
+)
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
@@ -2874,3 +2880,114 @@ class TestRepoHealthSurface:
         assert h.loop.status()["repos"] == []
         with pytest.raises(ValueError, match="only a multi-repository daemon"):
             h.loop.resume_repo("o/a")
+
+
+class TestWorkloadReport:
+    """#757: the report the frontends get for a workload carries each task's
+    output and the judge's verdict, and the same closing line the engine's
+    RunResult does, read from the same store rows."""
+
+    @staticmethod
+    def _seed(h: Harness, run_id: str = "w1") -> None:
+        h.store.create_run(run_id, "count the lines", kind="workload")
+        h.store.set_run_title(run_id, "Count the lines")
+        h.store.save_tasks(
+            run_id,
+            [
+                TaskSpec(id="t1", title="Fetch"),
+                TaskSpec(id="t2", title="Count"),
+                TaskSpec(id="t3", title="Report"),
+            ],
+        )
+        t1, t2, t3 = h.store.get_tasks(run_id)
+        t1.state, t1.output = "done", TaskOutput(summary="fetched 3 files", files=["a", "b", "c"])
+        t2.state, t2.output = "failed", TaskOutput(summary="counts written", files=["x"])
+        t3.state = "skipped"
+        for t in (t1, t2, t3):
+            h.store.update_task(run_id, t)
+        h.store.record_phase(
+            run_id,
+            "judge",
+            task_id="t1",
+            attempt=1,
+            status="ok",
+            output_json='{"passed": true, "unmet": [], "notes": ""}',
+            started_at=1.0,
+        )
+        for attempt, row in enumerate(
+            (
+                '{"passed": true, "unmet": []}',
+                '{"passed": false, "unmet": ["`summary.csv` has one row per file", "sorted"]}',
+            ),
+            start=1,
+        ):
+            h.store.record_phase(
+                run_id,
+                "judge",
+                task_id="t2",
+                attempt=attempt,
+                status="ok",
+                output_json=row,
+                started_at=float(attempt),
+            )
+        h.store.set_run_state(run_id, "completed")
+
+    def test_report_carries_outputs_verdicts_and_the_closing_line(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        self._seed(h)
+        report = h.loop._report("w1", None)
+        assert report.kind == "workload" and report.state == "completed"
+        assert report.task_summary == "1/3 tasks done"
+        assert report.pr is None and report.branch is None
+        assert report.outputs == (
+            TaskOutcome("t1", "Fetch", "done", "fetched 3 files", 3, "passed"),
+            TaskOutcome(
+                "t2",
+                "Count",
+                "failed",
+                "counts written",
+                1,
+                "failed — unmet: `summary.csv` has one row per file (+1 more)",
+            ),
+            TaskOutcome("t3", "Report", "skipped", "", 0, None),
+        )
+        assert report.summary == (
+            "Count the lines — 1/3 task(s) passed the judge\n"
+            "t1: fetched 3 files (3 files)\n"
+            "t2: counts written (1 file)"
+        )
+
+    def test_a_degraded_judge_row_reads_as_failed_closed(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        self._seed(h)
+        h.store.record_phase(
+            "w1",
+            "judge",
+            task_id="t2",
+            attempt=3,
+            status="failed",
+            output_json='{"passed": false, "unmet": [], "degraded": true}',
+            started_at=3.0,
+        )
+        outcomes = {o.task_id: o.verdict for o in h.loop._report("w1", None).outputs}
+        assert outcomes["t2"] == "no usable verdict — failed closed"
+        h.store.record_phase(
+            "w1", "judge", task_id="t2", attempt=4, status="ok", output_json="{", started_at=4.0
+        )
+        assert {o.task_id: o.verdict for o in h.loop._report("w1", None).outputs}["t2"] == "failed"
+
+    def test_a_code_run_report_has_no_outputs(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [gh_item()]
+        assert h.loop.tick().outcome == "done"
+        run_id = h.runs[0][0]
+        report = h.loop._report(run_id, None)
+        assert report.kind == "code" and report.outputs == () and report.summary is None
+
+    def test_result_from_record_keeps_the_kind_and_the_summary(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        self._seed(h)
+        result = h.loop._result_from_record("w1")
+        assert result.kind == "workload" and result.state == "completed"
+        assert result.summary == h.loop._report("w1", None).summary
+        assert [tid for tid, _ in result.outputs] == ["t1", "t2"]

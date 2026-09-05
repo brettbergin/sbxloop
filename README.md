@@ -335,10 +335,18 @@ answers with a verdict (`judge.verdict`). A failing verdict quotes the
 unmet criteria, which become the next attempt's brief under
 `max_revisions_per_task`; past the budget the run fails naming the
 criterion, and a judge that produces no usable verdict twice fails the
-task closed (`judge.degraded`) — silence is never a pass. `status` shows a
-run's kind; a code run's trail is byte-identical with the flag absent.
-Output sinks, workload profiles and scheduled intake land on this base in
-later pull requests.
+task closed (`judge.degraded`) — silence is never a pass. Every attempt
+leaves the task an **output**: the `## Result` section of the operator's
+report (its first line as a one-line summary) and the files the attempt
+left in the data directory, persisted with the task and announced as
+`task.output`. The run's result carries them — `sbxloop run` ends with a
+closing line ("2/2 task(s) passed the judge" and one line per task),
+`status <run>` lists each task's output, `status <run> --json` prints the
+run, its tasks and their outputs as one object for scripts, and the
+Discord finish card lists every task's result with the judge's word on it
+where a code run's card shows the PR. `status` shows a run's kind; a code
+run's trail is byte-identical with the flag absent. Output sinks, workload
+profiles and scheduled intake land on this base in later pull requests.
 
 ## CLI reference
 

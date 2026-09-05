@@ -757,7 +757,17 @@ CLAUDE.md costs its tokens once, through the prompt.
 ## Persistence and resume
 
 `StateStore` is a WAL-mode SQLite database at `<state_dir>/state.db` with
-four tables: `runs`, `tasks`, `phase_attempts`, `events`. It runs
+four tables: `runs`, `tasks`, `phase_attempts`, `events`. A workload task's
+row also carries its `TaskOutput` (`tasks.output_json`, #757): the
+`## Result` section of the operator's report, its first line as the
+summary, and the names of the files the attempt left in the data directory
+— the engine marks the directory before a task's first attempt
+(`.sbxloop/task-<id>.start`) and lists what is newer after each one,
+pruning the harvest excludes and capping the list at 200 names (the rest
+is a count). The engine's `RunResult.summary`, the daemon's `RunReport`
+and `status --json` all compose the run's closing line from those rows
+(`workload_summary`), so no surface needs a model turn to say what the
+run produced. It runs
 `synchronous=NORMAL`, which is the safe setting under WAL: commits no longer
 fsync one-by-one, and a crash can only lose the tail of the WAL, never
 corrupt the database. Streaming `agent.message_delta` events are *not*
@@ -1261,7 +1271,10 @@ advisory or ignored, and the baseline sha — emitted when it says more than
 "all green, all gating"), `land.bot_standing` (an automated reviewer's
 changes-requested review the merge goes over, #613), `land.human_ack` /
 `land.human_ack_capped`, `land.undraft` / `land.update`, and `run.merged` / `run.blocked` with
-the PR and why. `run.state` fires on every stage entry — the state *is* the
+the PR and why. A workload adds `judge.verdict` / `judge.degraded` (#756)
+and `task.output` (#757: the task, the attempt, the one-line summary and
+how many files the attempt left), emitted after each execute attempt and
+before the judge's word on it. `run.state` fires on every stage entry — the state *is* the
 stage. These carry no information the agent's reply did not — they exist so
 a surface can show the decision without showing the agent's JSON, which is
 what the Discord bridge does.

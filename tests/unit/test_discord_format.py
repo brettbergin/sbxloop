@@ -42,7 +42,7 @@ from sbxloop.daemon.discord_format import (
     summary_embed,
     summary_text,
 )
-from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
+from sbxloop.daemon.model import DaemonNotice, RunReport, TaskOutcome, WorkItem
 from sbxloop.events import Event
 
 
@@ -795,6 +795,59 @@ class TestEmbeds:
         # A merged run's reason (none) is not a field.
         assert "Reason" not in {n for n, _, _ in card.fields}
 
+    def test_finish_card_for_a_workload_lists_each_tasks_result(self) -> None:
+        """#757: a workload has no PR to show; its card carries every task's
+        own result line, its file count, and the judge's verdict where it
+        was not a pass — the whole run view in one field."""
+        item = WorkItem(item_id="discord:m1", source_key="m1", title="Count the lines")
+        outputs = (
+            TaskOutcome("t1", "Fetch the files", "done", "fetched 3 files", 3, "passed"),
+            TaskOutcome(
+                "t2",
+                "Count them",
+                "failed",
+                "counts written",
+                1,
+                "failed — unmet: `summary.csv` holds one row per file — every count is 0",
+            ),
+            TaskOutcome("t3", "Report", "skipped", "", 0, None),
+        )
+        report = RunReport(
+            "r1",
+            "completed",
+            "1/3 tasks done",
+            kind="workload",
+            outputs=outputs,
+            summary="Count the lines — 1/3 task(s) passed the judge",
+        )
+        card = finish_embed(item, report, "completed")
+        assert card.title == "✅ finished: completed"
+        names = [n for n, _, _ in card.fields]
+        assert names == ["Tasks"]
+        tasks = {n: v for n, v, _ in card.fields}["Tasks"]
+        assert tasks.splitlines() == [
+            "✅ `t1` Fetch the files — fetched 3 files (3 files)",
+            "❌ `t2` Count them — counts written (1 file)",
+            "  ⚖️ failed — unmet: `summary.csv` holds one row per file — every count is 0",
+            "⏭ `t3` Report",
+        ]
+        assert finish_text("completed", report) == "**finished: completed** — 1/3 tasks done"
+        # A long plan is clipped to the first eight tasks and counted.
+        many = tuple(TaskOutcome(f"t{i}", f"T{i}", "done", "ok", 0, "passed") for i in range(11))
+        long = finish_embed(item, report._replace(outputs=many), "completed")
+        text = {n: v for n, v, _ in long.fields}["Tasks"]
+        assert text.count("\n") == 8 and text.endswith("… and 3 more task(s)")
+
+    def test_task_output_event_line(self) -> None:
+        line = texts(
+            format_for_discord(
+                ev("task.output", task_id="t1", attempt=1, summary="wrote `a.csv`", files=2)
+            )
+        )
+        assert line == ["📦 output: task `t1` — wrote `a.csv` · 2 files"]
+        bare = texts(format_for_discord(ev("task.output", task_id="t2", attempt=2, files=0)))
+        assert bare == ["📦 output: task `t2` — (no result reported)"]
+
     def test_finish_card_for_operator_cancel_says_who_and_how_to_continue(self) -> None:
         """#246: a cancel is not a failure; the card must name the requester
         and tell the human the run is resumable (or already re-queued)."""
@@ -1086,6 +1139,30 @@ class TestRunSummary:
         work = fields["Needed work"]
         assert "• `t2` verify: **failed** — verify command failed: `pytest -q` (exit 1)" in work
         assert "• 1 policy denial(s)" in work
+
+    def test_summary_card_speaks_of_the_judge_for_a_workload(self) -> None:
+        """#757: the same ledgers, in the workload's words — the run.start
+        kind decides, so a resumed workload reads the same way."""
+        stats = RunStats()
+        for event in (
+            tev(100.0, "run.start", outcome="count things", kind="workload", resumed=True),
+            tev(101.0, "run.tasks", tasks=[{"id": "t1"}, {"id": "t2"}]),
+            tev(120.0, "task.output", task_id="t1", attempt=1, summary="ok", files=1),
+            tev(161.0, "task.state", task_id="t1", state="done", revisions=0),
+            tev(162.0, "task.end", task_id="t2", state="done", revisions=1),
+            tev(220.0, "run.end", state="completed"),
+        ):
+            stats.observe(event)
+        assert stats.kind == "workload"
+        for i in range(5):
+            stats.rework.append((f"t{i}", "judge", "failed", "nope"))
+        report = RunReport("r1", "completed", "2/2 tasks done", kind="workload")
+        card = summary_embed(stats, report, "completed")
+        fields = {n: v for n, v, _ in card.fields}
+        assert "PR" not in fields["Went well"]
+        assert "• 1 task(s) passed the judge without revision" in fields["Went well"]
+        assert "• … and 1 more judge failure(s)" in fields["Needed work"]
+        assert RunStats().kind == "code"
 
     def test_summary_card_degrades_without_stats(self) -> None:
         """A run the pump never saw events for still gets a summary; unknown

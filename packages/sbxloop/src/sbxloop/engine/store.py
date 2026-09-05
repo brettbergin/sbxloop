@@ -20,6 +20,7 @@ from sbxloop.engine.model import (
     RunKind,
     RunRecord,
     RunState,
+    TaskOutput,
     TaskRecord,
     TaskSpec,
 )
@@ -106,6 +107,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     session_id TEXT,
     verify_fingerprints TEXT NOT NULL DEFAULT '[]',
     verify_suspect INTEGER NOT NULL DEFAULT 0,
+    output_json TEXT,
     PRIMARY KEY (run_id, task_id)
 );
 CREATE TABLE IF NOT EXISTS phase_attempts (
@@ -206,6 +208,8 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
             "verify_suspect",
             "ALTER TABLE tasks ADD COLUMN verify_suspect INTEGER NOT NULL DEFAULT 0",
         ),
+        # A workload task's TaskOutput (#757); NULL for every code task.
+        ("output_json", "ALTER TABLE tasks ADD COLUMN output_json TEXT"),
     ),
 }
 
@@ -617,7 +621,7 @@ class StateStore:
             cursor = self._conn.execute(
                 "UPDATE tasks SET state = ?, revisions = ?, replans = ?,"
                 " last_feedback = ?, session_id = ?, verify_fingerprints = ?,"
-                " verify_suspect = ? WHERE run_id = ? AND task_id = ?",
+                " verify_suspect = ?, output_json = ? WHERE run_id = ? AND task_id = ?",
                 (
                     task.state,
                     task.revisions,
@@ -626,6 +630,7 @@ class StateStore:
                     task.session_id,
                     json.dumps(task.verify_fingerprints),
                     int(task.verify_suspect),
+                    task.output.model_dump_json() if task.output is not None else None,
                     run_id,
                     task.spec.id,
                 ),
@@ -651,6 +656,9 @@ class StateStore:
             session_id=row["session_id"],
             verify_fingerprints=json.loads(row["verify_fingerprints"] or "[]"),
             verify_suspect=bool(row["verify_suspect"]),
+            output=(
+                TaskOutput.model_validate_json(row["output_json"]) if row["output_json"] else None
+            ),
         )
 
     # -- phase attempts ----------------------------------------------------

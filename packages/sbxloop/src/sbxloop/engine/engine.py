@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import json
 import queue
+import shlex
 import sqlite3
 import tarfile
 import tempfile
@@ -100,6 +101,7 @@ from sbxloop.engine.landing import (
     resolve_identity,
 )
 from sbxloop.engine.model import (
+    MAX_OUTPUT_FILES,
     PIPELINE_STAGES,
     PR_BODY_FILE,
     RESUMABLE_RUN_STATES,
@@ -111,10 +113,12 @@ from sbxloop.engine.model import (
     RunState,
     SteerVerdict,
     TaskGraph,
+    TaskOutput,
     TaskRecord,
     TaskSpec,
     TaskState,
     scan_artifacts,
+    workload_summary,
 )
 from sbxloop.engine.phases import (
     VERIFY_FAILURE_PREFIX,
@@ -888,6 +892,7 @@ class LoopEngine:
             pr_number=run.pr_number,
             pr_url=run.pr_url,
             reason=reason,
+            summary=workload_summary(tasks, run.pr_title) if kind == "workload" else None,
         )
 
     def _install_workers(
@@ -3521,7 +3526,7 @@ class LoopEngine:
                 # The operator executes and the judge decides (#756); the
                 # task walks the same two states a code run's does.
                 if task.state == "executing":
-                    self._phase_execute(run_id, phases, task, granter)
+                    self._phase_execute(run_id, phases, task, granter, pair)
                 elif task.state == "verifying":
                     self._phase_judge(run_id, phases, task)
                 else:  # pragma: no cover - defensive
@@ -3655,16 +3660,23 @@ class LoopEngine:
         phases: PhaseRunner,
         task: TaskRecord,
         granter: EgressGranter,
+        pair: SandboxPair,
     ) -> None:
         """One operator session on one workload task (#756): the build
         phase's shape — grants, session resume, the prior report — with the
         session's tool calls digested for the judge and persisted beside
-        the report, so a resumed run judges the same evidence."""
+        the report, so a resumed run judges the same evidence.
+
+        The task's output (#757) is cut here too: the report's result
+        section, and the data-directory files newer than the marker the
+        task's first attempt set — listed, not claimed.
+        """
         with self._sandbox_lock:
             granter.apply(
                 task.spec.id, [(egress.domain, egress.reason) for egress in task.spec.egress]
             )
         started = time.time()
+        self._mark_task_start(run_id, pair, task)
         resume = task.session_id if task.session_id in self._live_sessions else None
         digest = ToolDigest()
         result = phases.execute(
@@ -3715,8 +3727,82 @@ class LoopEngine:
             attempt=task.revisions + 1,
             message=headline[:300] or "(the operator produced no report)",
         )
+        earlier = task.output.files if task.output is not None else []
+        files, more = self._task_files(run_id, pair, task, earlier)
+        task.output = TaskOutput.from_report(report, files=files, more_files=more)
+        self.bus.emit(
+            HostEventTypes.TASK_OUTPUT,
+            run_id,
+            task_id=task.spec.id,
+            attempt=task.revisions + 1,
+            summary=task.output.summary,
+            files=task.output.file_count,
+        )
         task.last_feedback = ""
         self._set_task_state(run_id, task, "verifying")
+
+    @staticmethod
+    def _task_marker(task: TaskRecord) -> str:
+        # Under the VM's own `.sbxloop`, never the data directory: the
+        # marker is not an output and needs no exclude.
+        return f"{SBXLOOP_DIR}/task-{task.spec.id}.start"
+
+    def _mark_task_start(self, run_id: str, pair: SandboxPair, task: TaskRecord) -> None:
+        """Set the task's marker before its FIRST attempt only, so a
+        revision's listing still covers what the earlier attempts left."""
+        marker = shlex.quote(self._task_marker(task))
+        try:
+            result = pair.agent.exec(
+                [
+                    "sh",
+                    "-c",
+                    f"mkdir -p {shlex.quote(SBXLOOP_DIR)} && [ -e {marker} ] || : > {marker}",
+                ]
+            )
+            ok, detail = result.ok, result.stderr
+        except SbxError as exc:
+            ok, detail = False, str(exc)
+        if not ok:
+            log.warning("task.mark_failed", run=run_id, task=task.spec.id, detail=detail[-300:])
+
+    def _task_files(
+        self, run_id: str, pair: SandboxPair, task: TaskRecord, earlier: Sequence[str] = ()
+    ) -> tuple[list[str], int]:
+        """The data-directory files the task's attempts touched: everything
+        newer than its marker, under the same excludes the harvest and the
+        artifact listing apply, plus the files an earlier attempt listed
+        that still exist — a resumed run's fresh sandbox has a fresh marker,
+        and the persisted output is what remembers the attempts before it.
+        Best-effort like the harvest — a failed listing is logged and the
+        output says no files, never the run."""
+        prune = " -o ".join(f"-name {shlex.quote(name)}" for name in self.config.artifacts.exclude)
+        prune_expr = f"\\( {prune} \\) -prune -o " if prune else ""
+        keep = ""
+        if earlier:
+            names = " ".join(shlex.quote(name) for name in earlier)
+            keep = f'for f in {names}; do [ -f "$f" ] && printf "%s\\n" "$f"; done; '
+        script = (
+            f"cd {shlex.quote(pair.agent_workdir)} && {keep}find . {prune_expr}"
+            f"-type f -newer {shlex.quote(self._task_marker(task))} -print"
+        )
+        try:
+            result = pair.agent.exec(["sh", "-c", script])
+        except SbxError as exc:
+            log.warning("task.files_failed", run=run_id, task=task.spec.id, detail=str(exc)[-300:])
+            return [], 0
+        if not result.ok:
+            log.warning(
+                "task.files_failed", run=run_id, task=task.spec.id, detail=result.stderr[-300:]
+            )
+            return [], 0
+        paths = sorted(
+            {
+                line[2:] if line.startswith("./") else line
+                for line in result.stdout.splitlines()
+                if line.strip()
+            }
+        )
+        return paths[:MAX_OUTPUT_FILES], max(0, len(paths) - MAX_OUTPUT_FILES)
 
     def _phase_judge(self, run_id: str, phases: PhaseRunner, task: TaskRecord) -> None:
         """The judge's verdict on the task's last execute attempt (#756).

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from sbxloop.engine.model import TaskRecord, TaskSpec
+from sbxloop.engine.model import TaskOutput, TaskRecord, TaskSpec
 from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import StateError
 from sbxloop_worker.protocol import Event, Usage
@@ -149,6 +149,40 @@ class TestTasks:
         assert loaded.revisions == 2
         assert loaded.last_feedback == "try harder"
         assert loaded.session_id == "s-1"
+
+    def test_task_output_round_trips_and_is_null_by_default(self, store: StateStore) -> None:
+        store.create_run("r1", "x", kind="workload")
+        store.save_tasks("r1", [TaskSpec(id="t1", title="A")])
+        task = store.get_tasks("r1")[0]
+        assert task.output is None
+        task.output = TaskOutput(summary="wrote it", text="## Result\nwrote it", files=["a"])
+        store.update_task("r1", task)
+        loaded = store.get_tasks("r1")[0]
+        assert loaded.output == task.output
+        task.output = None
+        store.update_task("r1", task)
+        assert store.get_tasks("r1")[0].output is None
+
+    def test_pre_task_output_database_migrates_in_place(self, tmp_path: Path) -> None:
+        """#757: a tasks table from before outputs gains `output_json`; the
+        rows it held read back with no output and can be given one."""
+        db = engine_db(tmp_path, "pre_task_output")
+        insert_run_row(db, run_id="old", outcome="legacy", state="building", updated_at=2.0)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO tasks (run_id, task_id, order_idx, state, spec_json)"
+            " VALUES ('old', 't1', 0, 'done', ?)",
+            (TaskSpec(id="t1", title="T").model_dump_json(),),
+        )
+        conn.commit()
+        conn.close()
+        store = StateStore(db)
+        task = store.get_tasks("old")[0]
+        assert task.state == "done" and task.output is None
+        task.output = TaskOutput(summary="s")
+        store.update_task("old", task)
+        # reopening does not re-apply the ALTER
+        assert StateStore(db).get_tasks("old")[0].output == TaskOutput(summary="s")
 
     def test_append_task_orders_after_the_saved_graph(self, store: StateStore) -> None:
         """A fix round is appended behind every graph task, and a second

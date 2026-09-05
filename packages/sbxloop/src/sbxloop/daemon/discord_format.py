@@ -47,7 +47,7 @@ from sbxloop.cli.tui import (
     TOOL_ARGS_LINE_CLIP,
 )
 from sbxloop.cli.tui import _one_line as _one_line_mid
-from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
+from sbxloop.daemon.model import DaemonNotice, RunReport, TaskOutcome, WorkItem
 from sbxloop.engine.model import PIPELINE_STAGES, WORKLOAD_STAGES
 from sbxloop.events import Event, HostEventTypes
 from sbxloop.excerpt import (
@@ -1232,6 +1232,9 @@ _STAGE_DOING = {
     "fixing": "in a fix round",
     "awaiting_ci": "waiting on CI",
     "landing": "landing the pull request",
+    # A workload's post-graph stages (#757).
+    "judging": "re-running every task's check on the finished data directory",
+    "publishing": "publishing the result",
 }
 # Stages where the engine is polling GitHub rather than running an agent job.
 _WAIT_STAGES = frozenset({"awaiting_ci", "landing"})
@@ -1416,6 +1419,17 @@ def format_for_discord(
         if unmet:
             text += f" — {_one_line(unmet[0], 200)}"
         return [line(text, flush=True)]
+    if t == HostEventTypes.TASK_OUTPUT:
+        # The task's own result line (#757), before the judge's word on it.
+        files = int(data.get("files") or 0)
+        text = f"📦 output: task {code(data.get('task_id'))}"
+        if summary := _one_line(data.get("summary") or "", 200):
+            text += f" — {summary}"
+        else:
+            text += " — (no result reported)"
+        if files:
+            text += f" · {files} file{'s' if files != 1 else ''}"
+        return [line(text)]
     if t == HostEventTypes.JUDGE_DEGRADED:
         err = _one_line(data.get("error") or "", 300)
         return [
@@ -1799,6 +1813,23 @@ def headline_embed(
     ).clamped()
 
 
+def _outputs_text(outputs: tuple[TaskOutcome, ...], limit: int = 8) -> str:
+    lines: list[str] = []
+    for out in outputs[:limit]:
+        marker = {"done": "✅", "failed": "❌", "skipped": "⏭"}.get(out.state, "▫")
+        line = f"{marker} {code(out.task_id)} {_one_line(out.title, 60)}"
+        if out.summary:
+            line += f" — {_one_line(out.summary, 140)}"
+        if out.files:
+            line += f" ({out.files} file{'s' if out.files != 1 else ''})"
+        if out.verdict and out.verdict != "passed":
+            line += f"\n  ⚖️ {_one_line(out.verdict, 160)}"
+        lines.append(line)
+    if len(outputs) > limit:
+        lines.append(f"… and {len(outputs) - limit} more task(s)")
+    return "\n".join(lines)
+
+
 def finish_text(state: str, report: RunReport) -> str:
     text = f"**finished: {state}** — {report.task_summary}"
     if report.cancelled_by:
@@ -1832,6 +1863,10 @@ def finish_embed(
         fields.append(("PR", link(f"#{report.pr[0]}", report.pr[1]), True))
     if report.rounds:
         fields.append(("Fix rounds", str(report.rounds), True))
+    if report.outputs:
+        # A workload's result (#757): each task's own result line and the
+        # judge's word on it, where a code run's card shows the PR.
+        fields.append(("Tasks", _outputs_text(report.outputs), False))
     if report.reason and state != "merged":
         fields.append(("Reason", _one_line(report.reason, 600), False))
     if unanswered:
@@ -1891,6 +1926,9 @@ class RunStats:
         self.total_tasks = 0
         self.states: dict[str, str] = {}
         self.revisions: dict[str, int] = {}
+        # Which run shape the ledgers describe (#757): a workload's tasks
+        # pass the judge where a code run's pass verify.
+        self.kind = "code"
 
     def observe(self, event: Event) -> None:
         if self.first_ts is None:
@@ -1898,8 +1936,10 @@ class RunStats:
         self.last_ts = event.ts
         d = event.data
         t = event.type
-        if t == HostEventTypes.RUN_START and d.get("resumed"):
-            self.resumed = True
+        if t == HostEventTypes.RUN_START:
+            self.kind = str(d.get("kind") or "code")
+            if d.get("resumed"):
+                self.resumed = True
         elif t == "agent.usage":
             self.turns += 1
             if d.get("input_tokens") is not None:
@@ -2014,7 +2054,8 @@ def _went_well(stats: RunStats, report: RunReport) -> list[str]:
         1 for tid, s in stats.states.items() if s == "done" and not stats.revisions.get(tid)
     )
     if clean:
-        out.append(f"{clean} task(s) verified without revision")
+        how = "passed the judge" if stats.kind == "workload" else "verified"
+        out.append(f"{clean} task(s) {how} without revision")
     if stats.steers and stats.steers_answered == stats.steers:
         out.append(f"answered all {stats.steers} steering message(s)")
     return out
@@ -2028,7 +2069,8 @@ def _needed_work(stats: RunStats, report: RunReport, unanswered: int) -> list[st
             line += f" — {_one_line(reason, 160)}"
         out.append(line)
     if len(stats.rework) > 4:
-        out.append(f"… and {len(stats.rework) - 4} more verify failure(s)")
+        what = "judge" if stats.kind == "workload" else "verify"
+        out.append(f"… and {len(stats.rework) - 4} more {what} failure(s)")
     failed = sum(1 for s in stats.states.values() if s == "failed")
     if failed:
         out.append(f"{failed} task(s) failed")
