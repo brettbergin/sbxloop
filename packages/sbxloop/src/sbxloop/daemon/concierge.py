@@ -48,7 +48,7 @@ from sbxloop.daemon.chat_choices import (
     parse_choice_question,
     parse_pending_filing,
 )
-from sbxloop.daemon.control import dispatch, format_log_tail, plain
+from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX, dispatch, format_log_tail, plain
 from sbxloop.daemon.discord_format import agent_model_label
 from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.store import ChatThread, DaemonStore
@@ -99,8 +99,10 @@ _RUN_STATES = list(get_args(RunState))
 #: Run states that mean the run is over — nothing more will happen to it, so a
 #: watch on one of these is answered immediately instead of registered.
 _FINISHED_RUN_STATES = TERMINAL_RUN_STATES
-#: Levels ``daemon_log`` accepts, coarsest last — the filter is at-or-above.
-_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+#: Verbs the in-sandbox model may not issue through ``sbx_control``: a
+#: process-level act stays with a human at a keyboard (ctl, chat, the
+#: console). ``cancel`` is the model's way to stop work.
+_DENIED_CONTROL_VERBS = frozenset({"stop"})
 # GitHub's ``state_reason`` for a close. ``completed`` means the thing was
 # actually done; ``not_planned`` is the triage verdict — duplicate, won't fix,
 # stale. Nothing else is accepted, so the model cannot invent a reason.
@@ -780,7 +782,7 @@ class Concierge:
                     parameters=_schema(
                         {
                             "tail": {"type": "integer", "minimum": 1, "maximum": 500},
-                            "level": {"type": "string", "enum": list(_LOG_LEVELS)},
+                            "level": {"type": "string", "enum": list(LOG_LEVELS)},
                             "grep": {"type": "string"},
                         }
                     ),
@@ -1052,9 +1054,18 @@ class Concierge:
         command = str(args.get("command", "")).strip()
         if not command:
             return "usage: sbx_control(command) — e.g. status, pause, cancel --retry, queue"
+        verb = command.split()[0].lower()
+        if verb in _DENIED_CONTROL_VERBS:
+            return (
+                f"(command not accepted) `{verb}` is an operator's verb — it stops the daemon "
+                "process itself — and is not available from here; `cancel` stops the current "
+                "run, `pause` keeps the daemon from claiming more."
+            )
         reply = dispatch(
             self.loop, command, prefix=self._chat.command_prefix, by=by, via="concierge"
         )
+        if reply.after is not None:
+            reply.after()
         text = plain(reply.text)
         if reply.status is not None:
             text += "\n" + _status_detail(reply.status)
@@ -1333,7 +1344,7 @@ class Concierge:
 
     def _tool_daemon_log(self, args: dict[str, Any], by: str) -> str:
         return format_log_tail(
-            tail=_int_arg(args, "tail", 50, 1, 500),
+            tail=_int_arg(args, "tail", 50, 1, LOG_TAIL_MAX),
             level=str(args.get("level") or "").strip().upper() or None,
             grep=str(args.get("grep") or "") or None,
         )

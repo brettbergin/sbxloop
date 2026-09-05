@@ -13,11 +13,18 @@ All notable changes to sbxloop are documented here. The project adheres to
   over ssh, and stopping the daemon gracefully was a signal. `!sbx log [--tail N] [--level L] [--grep TEXT]` and `sbxloop daemon ctl log` answer
   from the in-process ring buffer — one rendering shared with the
   concierge's `daemon_log` tool, so the three cannot drift — and `stop`
-  asks the daemon to claim nothing new and exit once the current run
-  finishes (`cancel` first to stop that run now); like every ctl request
-  it is served only by a live daemon, refused when stale, and audited.
-
-### Added
+  asks the daemon to claim nothing new and exit once the current run —
+  and any approved merge it is still landing — finishes (`cancel` first
+  to stop that run now); like every ctl request it is served only by a
+  live daemon, refused when stale, and audited. A log tail sent to chat
+  drops its oldest lines to fit the message, never its newest; `--tail`
+  and `--level` may follow `--grep`; `status` says when a stop is under
+  way; the stop flag goes up only once the reply is on its way, so a chat
+  bridge is not closed under its own answer; and the concierge's
+  `sbx_control` tool refuses `stop` — ending the process stays with a
+  person. Under a service manager that restarts the daemon (the shipped
+  unit does) `stop` is a restart that drops in-memory holds: `pause` is
+  the way to keep it off work.
 
 - **Console chat: the control channel and run threads** (#771). With the
   shell alone an operator could watch a run but not speak to it. The Chat

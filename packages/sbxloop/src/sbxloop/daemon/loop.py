@@ -281,6 +281,10 @@ class DaemonLoop:
         self.install_workers = install_workers
         self._runner = runner or self._default_runner
         self._stop = threading.Event()
+        # An operator's `stop`: unlike a signal, it lets a landing the
+        # daemon is completing finish before the process exits.
+        self._graceful = False
+        self._landing_threads: list[threading.Thread] = []
         # Pause is a set of named holds (#534): an operator's `pause` and a
         # deploy's `pause --hold deploy-<id>` coexist, and each side releases
         # only its own. The daemon idles while any hold stands.
@@ -373,6 +377,9 @@ class DaemonLoop:
         return holds
 
     def request_stop(self) -> None:
+        """Operator ``stop``: claim nothing new, finish the run in flight
+        and any landing in progress, then let ``run_forever`` return."""
+        self._graceful = True
         self._stop.set()
 
     def cancel_current(self, requester: str | None = None, *, retry: bool = False) -> bool:
@@ -732,6 +739,8 @@ class DaemonLoop:
                 self._log_tick(result, time.monotonic() - started)
                 if result.dispatched is None:
                     self._stop.wait(self.config.daemon.poll_interval_s)
+            if self._graceful:
+                self._join_landings()
         finally:
             self._notice("daemon.stopped", "daemon stopped", ticks=ticks)
 
@@ -2046,12 +2055,14 @@ class DaemonLoop:
         if not self.dstore.claim_merge_gate(gate.run_id):
             return f"{gate.item_id} is already being merged — hold on."
         who = by or "operator"
-        threading.Thread(
+        thread = threading.Thread(
             target=self._complete_landing,
             args=(gate, who),
             daemon=True,
             name=f"sbxloop-merge-{gate.run_id}",
-        ).start()
+        )
+        self._landing_threads = [t for t in self._landing_threads if t.is_alive()] + [thread]
+        thread.start()
         return (
             f"✅ approved by {who} — completing the landing of PR #{gate.pr_number} "
             "(update if behind → checks → merge); I'll report in the run's thread."
@@ -2061,9 +2072,27 @@ class DaemonLoop:
         """The approve thread's wait between GitHub polls: bounded sleeps,
         cut short only by daemon shutdown (the boot reconcile then puts the
         gate back up)."""
-        if self._stop.is_set():
+        if self._stop.is_set() and not self._graceful:
             raise RunCancelledError("daemon stopping — approve again after the restart")
         time.sleep(min(self.config.landing.ci_poll_interval_s, 30.0))
+
+    def _join_landings(self) -> None:
+        """An operator's ``stop`` waits for the landings in flight: a merge
+        cut short between update-branch and merge is the one state a
+        restart cannot make right on its own."""
+        for thread in self._landing_threads:
+            if not thread.is_alive():
+                continue
+            log.info("daemon.stop_waits_for_landing", thread=thread.name)
+            thread.join(timeout=self.config.daemon.shutdown_grace_s)
+            if thread.is_alive():
+                log.warning(
+                    "daemon.stop_landing_timeout",
+                    thread=thread.name,
+                    grace_s=self.config.daemon.shutdown_grace_s,
+                    hint="the gate is re-armed at the next start",
+                )
+        self._landing_threads = []
 
     def _complete_landing(self, gate: MergeGate, by: str) -> None:
         """Finish a parked landing with gh ops alone — no sandbox pair, no
