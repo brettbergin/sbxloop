@@ -1778,6 +1778,94 @@ class TestSendSuppressesUnfurls:
         assert channel.sent_kwargs[0]["suppress_embeds"] is True
         assert channel.sent_kwargs[0]["allowed_mentions"] == "none"
 
+    def test_files_under_the_cap_are_uploaded_and_the_rest_named(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#799: a result's files become ``discord.File`` uploads on the
+        same message when they fit; an oversize or missing one is named
+        in the text with its host path, never dropped."""
+        import sys
+        import types
+
+        fake = types.ModuleType("discord")
+
+        class File:
+            def __init__(self, path: str, filename: str | None = None) -> None:
+                self.path, self.filename = path, filename
+
+        fake.File = File  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "discord", fake)
+        small = tmp_path / "small.txt"
+        small.write_text("hi")
+        big = tmp_path / "big.bin"
+        big.write_bytes(b"x" * 2000)
+        bridge, client, _ = make_bridge(tmp_path, max_attachment_bytes=1000)
+        channel = client.channels[42]
+        self._send(
+            bridge, channel, "📣 result", files=[str(small), str(big), str(tmp_path / "gone.txt")]
+        )
+        (kwargs,) = channel.sent_kwargs
+        assert [(f.path, f.filename) for f in kwargs["files"]] == [(str(small), "small.txt")]
+        text = channel.sent[0]
+        assert text.startswith("📣 result\n")
+        assert (
+            f"📎 `big.bin` (2.0 KB) — too large to attach, kept on the daemon host at `{big}`"
+            in text
+        )
+        assert f"📎 `gone.txt` — not found on the daemon host at `{tmp_path / 'gone.txt'}`" in text
+
+    def test_files_are_named_when_discord_py_is_absent_or_rejects_them(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sys
+        import types
+
+        small = tmp_path / "small.txt"
+        small.write_text("hi")
+        # no discord.py: every file is named by path, nothing is uploaded
+        monkeypatch.setitem(sys.modules, "discord", None)
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        self._send(bridge, channel, "📣 result", files=[str(small)])
+        assert "files" not in channel.sent_kwargs[0]
+        assert channel.sent[0] == f"📣 result\n📎 `small.txt` — on the daemon host at `{small}`"
+        # discord.py present but the upload refused: retried without it, named
+        fake = types.ModuleType("discord")
+        fake.File = lambda path, filename=None: (path, filename)  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "discord", fake)
+        real_send = channel.send
+
+        async def send(text: str | None = None, **kwargs: Any) -> Any:
+            if "files" in kwargs:
+                raise RuntimeError("Request entity too large")
+            return await real_send(text, **kwargs)
+
+        channel.send = send  # type: ignore[method-assign]
+        self._send(bridge, channel, "📣 result", files=[str(small)])
+        assert "files" not in channel.sent_kwargs[-1]
+        assert channel.sent[-1] == f"📣 result\n📎 `small.txt` — on the daemon host at `{small}`"
+
+    def test_more_than_ten_files_attach_ten_and_name_the_rest(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import sys
+        import types
+
+        fake = types.ModuleType("discord")
+        fake.File = lambda path, filename=None: filename  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "discord", fake)
+        paths = []
+        for i in range(12):
+            f = tmp_path / f"f{i:02d}.txt"
+            f.write_text("x")
+            paths.append(str(f))
+        bridge, client, _ = make_bridge(tmp_path)
+        channel = client.channels[42]
+        self._send(bridge, channel, "📣 result", files=paths)
+        (kwargs,) = channel.sent_kwargs
+        assert kwargs["files"] == [f"f{i:02d}.txt" for i in range(10)]
+        assert "📎 `f10.txt`" in channel.sent[0] and "📎 `f11.txt`" in channel.sent[0]
+
     def test_send_with_our_embed_masks_urls_instead_of_flagging(self, tmp_path: Path) -> None:
         from sbxloop.daemon.discord_format import EmbedSpec
 

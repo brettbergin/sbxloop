@@ -38,7 +38,7 @@ import re
 import socket
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from sbxloop.cli.cmdfmt import format_command
@@ -371,20 +371,24 @@ class Chunk:
     ``embed`` chunks carry an ``EmbedSpec`` (``text`` is the content
     fallback shown in notifications and by clients that hide embeds).
     ``flush`` asks the pump to send everything buffered so far right away.
+    ``files`` are host paths the message carries as attachments where the
+    backend can (#799) — only a ``block`` carries them, since a line
+    coalesces with its neighbours into one message.
     """
 
     text: str = ""
     embed: EmbedSpec | None = None
     kind: str = "line"
     flush: bool = False
+    files: tuple[str, ...] = ()
 
 
 def line(text: str, *, flush: bool = False) -> Chunk:
     return Chunk(text=text, kind="line", flush=flush)
 
 
-def block(text: str, *, flush: bool = True) -> Chunk:
-    return Chunk(text=text, kind="block", flush=flush)
+def block(text: str, *, flush: bool = True, files: tuple[str, ...] = ()) -> Chunk:
+    return Chunk(text=text, kind="block", flush=flush, files=files)
 
 
 # -- markdown splitting ---------------------------------------------------------------------
@@ -1436,16 +1440,25 @@ def format_for_discord(
     if t == HostEventTypes.RUN_PUBLISHED:
         # Where the result went (#759). The chat sink's message is the
         # result itself, posted whole into the thread; the others get a
-        # line naming where they landed.
+        # line naming where they landed. The files a sink carried ride the
+        # last message as attachments (#799) — the bridge attaches what it
+        # can and names the rest.
+        paths = tuple(str(x) for x in _list(data, "paths") if x)
         if data.get("sink") == "chat":
             text = str(data.get("message") or "").strip() or "*(no result reported)*"
-            return [
+            chunks = [
                 block(part)
                 for part in split_markdown(
                     text, max_chars, header="📣 **result**", cont="📣 *(cont. {i}/{n})*"
                 )
             ]
-        return [line(f"📤 published: {_one_line(data.get('message') or '', 300)}", flush=True)]
+            if paths:
+                chunks[-1] = replace(chunks[-1], files=paths)
+            return chunks
+        text = f"📤 published: {_one_line(data.get('message') or '', 300)}"
+        if paths:
+            return [block(text, files=paths)]
+        return [line(text, flush=True)]
     if t == HostEventTypes.RUN_NEEDS_GRANTED:
         # What the plan asked for and the profile allowed (#758): names
         # and hosts only, never a value.

@@ -2239,15 +2239,19 @@ class LoopEngine:
             carried = sinks.tasks_for(tasks, sink)
             if not carried or sink in landed:
                 continue
+            # The host paths of the files this sink carries (#799): the
+            # chat backend attaches them to the result where it can, and
+            # names them otherwise. Only the record (``Published``) persists.
+            paths: list[str] = []
             try:
                 if sink == "artifact":
-                    entry = self._publish_artifact(p, run, carried)
+                    entry, paths = self._publish_artifact(p, run, carried)
                 elif sink == "pr":
                     entry = self._publish_pr(p, run, tasks, carried)
                 elif sink == "issue":
                     entry = self._publish_issue(p, run, tasks, carried)
                 else:
-                    entry = self._publish_chat(run, tasks, carried)
+                    entry, paths = self._publish_chat(p, run, carried)
             except (
                 SbxError,
                 GithubOpsError,
@@ -2265,6 +2269,7 @@ class LoopEngine:
                 location=entry.location,
                 tasks=entry.tasks,
                 files=entry.files,
+                paths=paths,
                 message=(
                     sinks.chat_text(tasks, run.pr_title, carried)
                     if sink == "chat"
@@ -2273,12 +2278,13 @@ class LoopEngine:
             )
         return None
 
-    def _publish_artifact(
+    def _stage_files(
         self, p: Pipeline, run: RunRecord, carried: Sequence[TaskRecord]
-    ) -> Published:
+    ) -> tuple[Path, list[str]]:
         """Copy the files the tasks declared — only those — out to
         ``runs/<run>/artifacts``: a host copy from a mounted workspace, a
-        tar of the listed paths from an unmounted one."""
+        tar of the listed paths from an unmounted one. Returns the
+        directory and the files' host paths, in declaration order."""
         target = artifacts_dir(run, self.config.state_dir)
         assert target is not None
         files = sinks.declared_files(carried)
@@ -2292,12 +2298,20 @@ class LoopEngine:
                     shutil.copy2(p.pair.workspace / rel, dest)
             else:
                 self._copy_out(p.pair, target, files)
-        return Published(
+        return target, [str(target / rel) for rel in files]
+
+    def _publish_artifact(
+        self, p: Pipeline, run: RunRecord, carried: Sequence[TaskRecord]
+    ) -> tuple[Published, list[str]]:
+        """The artifact sink: the declared files, staged on the host."""
+        target, paths = self._stage_files(p, run, carried)
+        entry = Published(
             sink="artifact",
             location=str(target),
             tasks=[t.spec.id for t in carried],
-            files=len(files),
+            files=len(paths),
         )
+        return entry, paths
 
     def _publish_pr(
         self,
@@ -2392,18 +2406,23 @@ class LoopEngine:
         )
 
     def _publish_chat(
-        self, run: RunRecord, tasks: Sequence[TaskRecord], carried: Sequence[TaskRecord]
-    ) -> Published:
+        self, p: Pipeline, run: RunRecord, carried: Sequence[TaskRecord]
+    ) -> tuple[Published, list[str]]:
         """The chat sink is the ``run.published`` event itself: its
         ``message`` is the reply, posted where the run was asked for by
         whoever drives the engine (the daemon's thread, the CLI's
-        terminal). Nothing to deliver from here but the record."""
-        return Published(
+        terminal). The files the tasks declared are staged on the host the
+        way the artifact sink stages them (#799) — a result that names a
+        file nobody can open is not a delivered result — and their paths
+        ride the event for the backend to attach or name."""
+        _, paths = self._stage_files(p, run, carried)
+        entry = Published(
             sink="chat",
             location="chat",
             tasks=[t.spec.id for t in carried],
-            files=sum(t.output.file_count for t in carried if t.output is not None),
+            files=len(paths),
         )
+        return entry, paths
 
     # -- post-build stages -------------------------------------------------
 

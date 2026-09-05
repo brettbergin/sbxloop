@@ -863,6 +863,35 @@ class TestEmbeds:
         parts = format_for_discord(ev("run.published", sink="chat", location="chat", message=long))
         assert len(parts) > 1 and all(len(p.text) <= 1900 for p in parts)
 
+    def test_run_published_files_ride_the_last_message(self) -> None:
+        """#799: the files a sink carried attach to the result's last part
+        (chat) or turn the 📤 line into its own message (artifact); a line
+        never carries files, since lines coalesce."""
+        long = "x" * 5000
+        paths = ["/state/runs/r1/artifacts/a.csv", "/state/runs/r1/artifacts/b.png"]
+        parts = format_for_discord(
+            ev("run.published", sink="chat", location="chat", message=long, paths=paths)
+        )
+        assert len(parts) > 1
+        assert [p.files for p in parts[:-1]] == [()] * (len(parts) - 1)
+        assert parts[-1].files == tuple(paths) and parts[-1].kind == "block"
+        (delivered,) = format_for_discord(
+            ev(
+                "run.published",
+                sink="artifact",
+                location="/state/runs/r1/artifacts",
+                message="2 files delivered to /state/runs/r1/artifacts",
+                paths=paths,
+            )
+        )
+        assert delivered.kind == "block" and delivered.files == tuple(paths)
+        assert delivered.text.startswith("📤 published: 2 files delivered")
+        # agent-shaped data: a non-list `paths` is no paths
+        (plain,) = format_for_discord(
+            ev("run.published", sink="artifact", location="x", message="m", paths="nope")
+        )
+        assert plain.kind == "line" and plain.files == ()
+
     def test_finish_card_names_where_a_workload_published(self) -> None:
         item = WorkItem(item_id="discord:m1", source_key="m1", title="Digest")
         report = RunReport(

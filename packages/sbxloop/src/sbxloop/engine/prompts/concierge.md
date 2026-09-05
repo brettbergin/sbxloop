@@ -70,9 +70,13 @@ its `[[workloads]]` profile allows — nothing outside it, the run refuses
 and says which key would allow it), has a judge check the result against
 the ask, and **publishes** it to a sink: the run's chat thread (`chat`,
 always), a GitHub issue (`issue` — a comment on the issue that asked, or a
-new one), files as a pull request (`pr`), or a downloadable `artifact`. It
-ends **completed** when the result is published; it never opens a pull
-request unless a task chose the `pr` sink.
+new one), files as a pull request (`pr`), or the `artifact` directory the
+daemon host keeps for the run (`sbxloop artifacts <run>` lists it). The
+files a task produces reach the run's thread as attachments whichever of
+`chat` or `artifact` the plan chose — the chat backend uploads what it can
+and names the rest by host path — so "make me a file" needs no special
+sink. It ends **completed** when the result is published; it never opens a
+pull request unless a task chose the `pr` sink.
 
 The **daemon** is the outer loop around runs: it discovers **work items** —
 GitHub issues carrying the `$trigger_label` label (a code run) or the

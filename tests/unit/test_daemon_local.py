@@ -424,3 +424,24 @@ def test_cards_follow_the_embeds_knob(tmp_path: Path, embeds: bool) -> None:
             assert "queued" in reply.text
     finally:
         bridge.close(drain_wait_s=1)
+
+
+def test_a_result_with_files_names_them_by_host_path(tmp_path: Path) -> None:
+    """#799: the console runs on the daemon host, so a path is the file —
+    the local bridge names every file the result carried."""
+    import asyncio
+    import types
+
+    bridge, dstore, _ = make_bridge(tmp_path)
+    target = types.SimpleNamespace(id="thread:1")
+    asyncio.run(
+        bridge._send(
+            target, "📣 result", files=["/state/runs/r1/artifacts/a.csv", "/state/runs/r1/b.png"]
+        )
+    )
+    (text,) = texts(dstore, "thread:1")
+    assert text == (
+        "📣 result\n"
+        "📎 `a.csv` — on the daemon host at `/state/runs/r1/artifacts/a.csv`\n"
+        "📎 `b.png` — on the daemon host at `/state/runs/r1/b.png`"
+    )
