@@ -13,7 +13,10 @@ written before the migration keep resolving.
 
 Chat asks are work items too (#760): ``chat:<message>`` names the message
 that asked, on the surface the concierge answered — an opaque key with no
-grammar beyond its prefix, since the transport mints it.
+grammar beyond its prefix, since the transport mints it. So are the ticks
+of a schedule (#761): ``sched:<name>:<due>`` names the schedule and the
+minute it was due, in UTC. Both are *local* ids — nothing on GitHub stands
+behind them.
 """
 
 from __future__ import annotations
@@ -26,6 +29,7 @@ GhKind = Literal["issue", "pr"]
 
 GH_PREFIX = "gh:"
 CHAT_PREFIX = "chat:"
+SCHED_PREFIX = "sched:"
 
 _KINDS: tuple[GhKind, ...] = get_args(GhKind)
 _NUMBER_RE = re.compile(r"^[0-9]+$")
@@ -97,6 +101,37 @@ def is_chat_id(value: str) -> bool:
     return value.startswith(CHAT_PREFIX) and len(value) > len(CHAT_PREFIX)
 
 
+def schedule_item_id(name: str, due: str) -> str:
+    """The work item id for one tick of a schedule: its name and the
+    minute it was due (``2026-09-05T07:00Z``)."""
+    if not name or ":" in name or any(ch.isspace() for ch in name):
+        raise ValueError(f"malformed schedule name: {name!r}")
+    if not due or any(ch.isspace() for ch in due):
+        raise ValueError(f"malformed schedule due: {due!r}")
+    return f"{SCHED_PREFIX}{name}:{due}"
+
+
+def is_schedule_id(value: str) -> bool:
+    """True when ``value`` is a schedule tick's item id."""
+    return value.startswith(SCHED_PREFIX) and len(value) > len(SCHED_PREFIX)
+
+
+def parse_schedule_id(value: str) -> tuple[str, str]:
+    """``(name, due)`` from a schedule tick's id; ``ValueError`` otherwise."""
+    if not is_schedule_id(value):
+        raise ValueError(f"not a schedule id: {value!r}")
+    name, sep, due = value[len(SCHED_PREFIX) :].partition(":")
+    if not sep or not name or not due:
+        raise ValueError(f"malformed schedule id: {value!r}")
+    return name, due
+
+
+def is_local_id(value: str) -> bool:
+    """True for an id with nothing on GitHub behind it — a chat ask or a
+    schedule tick: no issue to read, comment on or label."""
+    return is_chat_id(value) or is_schedule_id(value)
+
+
 def is_gh_id(value: str) -> bool:
     """True when ``value`` is a well-formed GitHub id (typed or legacy)."""
     return try_parse_gh_id(value) is not None
@@ -165,6 +200,7 @@ def normalize_item_id(value: str) -> str:
 __all__ = [
     "CHAT_PREFIX",
     "GH_PREFIX",
+    "SCHED_PREFIX",
     "GhId",
     "GhKind",
     "chat_item_id",
@@ -172,10 +208,14 @@ __all__ = [
     "has_gh_prefix",
     "is_chat_id",
     "is_gh_id",
+    "is_local_id",
     "is_repo_slug",
+    "is_schedule_id",
     "issue_item_id",
     "normalize_item_id",
     "parse_gh_id",
+    "parse_schedule_id",
     "pr_item_id",
+    "schedule_item_id",
     "try_parse_gh_id",
 ]

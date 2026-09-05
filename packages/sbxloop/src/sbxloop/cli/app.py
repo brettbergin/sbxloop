@@ -1802,6 +1802,7 @@ def daemon(
         CompositeSource,
         GitHubLabels,
         MultiRepoIssueSource,
+        ScheduleSource,
         WorkSource,
         build_github_source,
     )
@@ -1880,13 +1881,13 @@ def daemon(
     # backend and no `[github]` runs on those alone.
     # (`--once` skips the concierge but still runs what one already queued.)
     chat_intake = config.chat_backend is not None and bool(config.concierge.enabled)
-    if not config.github.enabled and not chat_intake:
+    if not config.github.enabled and not chat_intake and not config.schedules:
         log.error(
             "daemon.no_repository",
             hint="set --repo owner/name (or [github] repo / [[github.repos]]): the "
             "daemon's work is the labeled issues of the configured repositories — or "
             "configure a chat backend with the concierge on, and workloads asked for "
-            "in chat are its work",
+            "in chat are its work — or declare [[schedules]], and their ticks are",
         )
         raise typer.Exit(2)
     if config.github.enabled and not config.github.enabled_repos():
@@ -2007,12 +2008,21 @@ def daemon(
             suspend_after=config.daemon.repo_suspend_after,
             persist=persist_repo_health,
         )
-        if chat_intake:
-            # Chat-started workloads (#760) ride the same queue; the
-            # composite routes each item back to where it came from.
-            source = CompositeSource(source, ChatSource())
+        if chat_intake or config.schedules:
+            # Chat-started (#760) and scheduled (#761) workloads ride the
+            # same queue; the composite routes each item back to where it
+            # came from.
+            source = CompositeSource(
+                source,
+                ChatSource() if chat_intake else None,
+                ScheduleSource() if config.schedules else None,
+            )
     else:
-        source = ChatSource()
+        source = CompositeSource(
+            None,
+            ChatSource() if chat_intake else None,
+            ScheduleSource() if config.schedules else None,
+        )
 
     # One line an operator can read back from the journal to know exactly
     # what this daemon is: where its state went (with the anchored default,

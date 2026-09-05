@@ -662,11 +662,15 @@ class Concierge:
                         "cancel [--retry] | queue | items | abandon <item> [reason] | "
                         "retry <item> | requeue <item> | merge <item|run> | "
                         "release <item|run> | grant-rounds <run> <n> | "
-                        "resume-repo <owner/name>. Pass the "
+                        "resume-repo <owner/name> | "
+                        "schedules [pause <name>|resume <name>]. Pass the "
                         "command line without the prefix. Mutating commands take effect "
                         "immediately. merge approves a PR parked behind the merge gate; "
                         "release publishes a workload result the profile held back "
                         "(both only when the person asking clearly wants it). "
+                        "schedules lists the [[schedules]] workloads with their last fire "
+                        "and next due; schedules pause/resume parks one schedule's ticks "
+                        "without pausing the daemon. "
                         "grant-rounds gives a run that exhausted its fix "
                         'rounds n more and resumes it on its own PR at once ("give '
                         'rXXXX two more rounds"). Pause is a set '

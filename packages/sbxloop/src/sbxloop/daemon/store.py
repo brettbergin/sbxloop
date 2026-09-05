@@ -36,8 +36,9 @@ from pathlib import Path
 from typing import Any, NamedTuple
 
 from sbxloop.daemon.model import ItemState, PendingReport, WorkItem
+from sbxloop.daemon.schedule import ScheduleRow
 from sbxloop.errors import DaemonError
-from sbxloop.ghids import CHAT_PREFIX, GH_PREFIX, normalize_item_id, try_parse_gh_id
+from sbxloop.ghids import CHAT_PREFIX, GH_PREFIX, SCHED_PREFIX, normalize_item_id, try_parse_gh_id
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -106,10 +107,11 @@ _REQUESTERS_BODY = """(
 )"""
 
 _REQUESTERS_COLUMNS = "source_key, requester_id, created_at"
-# The repo-less rows that are repo-less by design (#760): a chat-started
-# workload has no repository to backfill, attribute or drop it for. The
-# ids are literal-prefixed, so the clause is a constant, not a parameter.
-_NOT_CHAT = f"item_id NOT LIKE '{CHAT_PREFIX}%'"
+# The repo-less rows that are repo-less by design (#760, #761): a
+# chat-started or scheduled workload has no repository to backfill,
+# attribute or drop it for. The ids are literal-prefixed, so the clause is
+# a constant, not a parameter.
+_NOT_LOCAL = f"item_id NOT LIKE '{CHAT_PREFIX}%' AND item_id NOT LIKE '{SCHED_PREFIX}%'"
 
 _CHAT_THREADS_BODY = (
     "(run_id TEXT NOT NULL, backend TEXT NOT NULL DEFAULT 'discord', "
@@ -326,6 +328,22 @@ CREATE INDEX IF NOT EXISTS idx_local_messages_updated
     ON daemon_local_messages(channel_id, updated_at);
 CREATE INDEX IF NOT EXISTS idx_local_messages_pending
     ON daemon_local_messages(id) WHERE direction = 'in' AND taken_at IS NULL;
+
+-- One row per `[[schedules]]` entry the daemon has seen (#761). anchor is
+-- when it was first seen — the origin of an `every` grid; last_due the
+-- latest due instant acted on (fired, skipped or swallowed while paused),
+-- so a late daemon catches up with one tick and never re-fires one;
+-- last_fired_at / last_item the fire that actually queued something;
+-- paused_by who parked the schedule (`schedules pause <name>`).
+CREATE TABLE IF NOT EXISTS daemon_schedules (
+    name          TEXT PRIMARY KEY,
+    anchor        REAL NOT NULL,
+    last_due      REAL,
+    last_fired_at REAL,
+    last_item     TEXT,
+    paused_by     TEXT,
+    paused_at     REAL
+);
 """
 #: The schema's index statements alone, for a rebuild to recreate inside
 #: its own transaction (``executescript`` would commit it first).
@@ -429,6 +447,18 @@ def _row_to_hold(row: sqlite3.Row) -> ReviewHold:
         resolved_at=row["resolved_at"],
         resolved_by=row["resolved_by"],
         detail=row["detail"],
+    )
+
+
+def _row_to_schedule(row: sqlite3.Row) -> ScheduleRow:
+    return ScheduleRow(
+        name=str(row["name"]),
+        anchor=float(row["anchor"]),
+        last_due=None if row["last_due"] is None else float(row["last_due"]),
+        last_fired_at=None if row["last_fired_at"] is None else float(row["last_fired_at"]),
+        last_item=None if row["last_item"] is None else str(row["last_item"]),
+        paused_by=None if row["paused_by"] is None else str(row["paused_by"]),
+        paused_at=None if row["paused_at"] is None else float(row["paused_at"]),
     )
 
 
@@ -1043,7 +1073,7 @@ class DaemonStore:
             # Requester rows are the concierge's record of who asked for an
             # issue; a chat item carries its requester itself and writes none.
             for table, extra in (
-                ("daemon_work_items", f" AND {_NOT_CHAT}"),
+                ("daemon_work_items", f" AND {_NOT_LOCAL}"),
                 ("daemon_requesters", ""),
             ):
                 cur = self._conn.execute(
@@ -1074,7 +1104,7 @@ class DaemonStore:
         updated = 0
         with self._lock:
             rows = self._conn.execute(
-                f"SELECT item_id, url FROM daemon_work_items WHERE repo = '' AND {_NOT_CHAT}"  # nosec B608
+                f"SELECT item_id, url FROM daemon_work_items WHERE repo = '' AND {_NOT_LOCAL}"  # nosec B608
             ).fetchall()
             for row in rows:
                 repo = known.get((_repo_from_url(row["url"]) or "").casefold())
@@ -1120,7 +1150,7 @@ class DaemonStore:
         """
         where = (
             "WHERE repo = '' AND state = 'queued' AND claimed = 0 AND run_id IS NULL "
-            f"AND {_NOT_CHAT}"
+            f"AND {_NOT_LOCAL}"
         )
         with self._lock:
             rows = self._conn.execute(
@@ -2148,6 +2178,80 @@ class DaemonStore:
                     ids,
                 )
             ]
+
+    # -- schedules (#761) ---------------------------------------------------------
+
+    def schedule_row(self, name: str, now: float) -> ScheduleRow:
+        """The schedule's row, created at ``now`` on first sight — the
+        anchor of its grid."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR IGNORE INTO daemon_schedules (name, anchor) VALUES (?, ?)",
+                (name, now),
+            )
+            self._conn.commit()
+            row = self._conn.execute(
+                "SELECT * FROM daemon_schedules WHERE name = ?", (name,)
+            ).fetchone()
+            return _row_to_schedule(row)
+
+    def schedule_rows(self) -> dict[str, ScheduleRow]:
+        """Every schedule row by name, whether or not still configured."""
+        with self._lock:
+            return {
+                str(r["name"]): _row_to_schedule(r)
+                for r in self._conn.execute("SELECT * FROM daemon_schedules ORDER BY name")
+            }
+
+    def schedule_due_handled(self, name: str, due: float) -> None:
+        """Record that the tick due at ``due`` was dealt with without
+        queueing anything (skipped, or swallowed while paused)."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_schedules SET last_due = ? WHERE name = ?", (due, name)
+            )
+            self._conn.commit()
+
+    def schedule_fired(self, name: str, due: float, item_id: str, now: float) -> None:
+        """Record the fire for the tick due at ``due``: the item it queued
+        and when."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_schedules SET last_due = ?, last_fired_at = ?, last_item = ? "
+                "WHERE name = ?",
+                (due, now, item_id, name),
+            )
+            self._conn.commit()
+
+    def set_schedule_paused(self, name: str, by: str | None, now: float) -> bool:
+        """Park (``by`` a name) or release (``by`` None) the schedule.
+        False when it was already so."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT paused_by FROM daemon_schedules WHERE name = ?", (name,)
+            ).fetchone()
+            if row is None or (row["paused_by"] is None) == (by is None):
+                return False
+            self._conn.execute(
+                "UPDATE daemon_schedules SET paused_by = ?, paused_at = ? WHERE name = ?",
+                (by, now if by is not None else None, name),
+            )
+            self._conn.commit()
+            return True
+
+    def live_schedule_item(self, name: str) -> WorkItem | None:
+        """The tick of ``name`` still in flight — queued, running or parked
+        behind a gate or a review — None when the last one has finished."""
+        marks = ", ".join("?" for _ in TERMINAL_ITEM_STATES)
+        # `_` is a LIKE wildcard and a legal name character.
+        pattern = SCHED_PREFIX + name.replace("\\", "\\\\").replace("_", "\\_") + ":%"
+        with self._lock:
+            row = self._conn.execute(
+                f"SELECT * FROM daemon_work_items WHERE item_id LIKE ? ESCAPE '\\' "  # nosec B608
+                f"AND state NOT IN ({marks}) ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (pattern, *TERMINAL_ITEM_STATES),
+            ).fetchone()
+            return _row_to_item(row) if row else None
 
     # -- generic daemon state ---------------------------------------------------
 

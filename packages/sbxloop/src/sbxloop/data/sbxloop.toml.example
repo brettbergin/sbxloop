@@ -270,6 +270,24 @@ secret_strategy = "proxy"
 # tell the loop's results from the work it is asked to do.
 # result_label = "sbxloop:result"
 
+# Workloads the daemon asks for by itself, on a cadence. Each entry
+# is one schedule: `every` (a period — "24h", "90m", "1h30m" — on a grid
+# from the moment the daemon first saw the schedule) or `cron` (five
+# fields, read in `timezone`, `[daemon] run_cap_timezone` when unset),
+# never both. Each tick queues `ask` as a workload under `profile`, exactly
+# the run a chat ask gets; a tick whose previous run is still live is
+# skipped and said so in the control channel. A tick is recorded at its
+# due time — a late daemon catches up with one tick, never one per missed
+# tick. `!sbx schedules` lists them; `schedules pause <name>` parks one
+# without pausing the daemon.
+# [[schedules]]
+# name = "morning-brief"
+# profile = "research"
+# ask = "Summarise what changed on the watched sites overnight and post the digest in the thread."
+# every = "24h"
+# cron = "0 7 * * mon-fri"
+# timezone = "Europe/London"
+
 # [policy]
 # Bounds for plan-declared egress. At PLAN time the agent may declare extra
 # domains a task needs during EXECUTE (each with a justification); they are

@@ -2003,6 +2003,83 @@ class WorkloadConfig(_ConfigModel):
         return value.strip()
 
 
+_SCHEDULE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+
+
+class ScheduleConfig(_ConfigModel):
+    """One workload the daemon asks for by itself, on a cadence (#761).
+
+    ``every`` is a period (``"24h"``, ``"90m"``) on a grid from the
+    moment the daemon first saw the schedule; ``cron`` a five-field
+    expression read in ``timezone`` (`[daemon] run_cap_timezone` when
+    unset). Exactly one of the two. Each tick queues ``ask`` as a workload
+    under ``profile`` — the same run a chat ask or a labelled issue gets,
+    with the same grants and the same chronology — unless the previous
+    tick is still live, in which case the tick is skipped and said so. A
+    tick is recorded at its due time: a late daemon does not shift the
+    grid, and one down for several ticks catches up with one.
+    """
+
+    name: str
+    profile: str
+    ask: str
+    every: str | None = None
+    cron: str | None = None
+    timezone: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        # Echoed in item ids, status lines and `schedules pause <name>`:
+        # an identifier-ish token, the daemon hold grammar.
+        if not _SCHEDULE_NAME_RE.match(value):
+            raise ValueError(
+                f"schedules[].name must be letters, digits, '.', '_' or '-' (max 64), got {value!r}"
+            )
+        return value
+
+    @field_validator("ask")
+    @classmethod
+    def _ask_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("schedules[].ask must not be blank")
+        return value
+
+    @field_validator("timezone")
+    @classmethod
+    def _check_timezone(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            ZoneInfo(value)
+        except (ZoneInfoNotFoundError, ValueError, KeyError):
+            raise ValueError(
+                f"schedules[].timezone must be a valid IANA timezone, got {value!r}"
+            ) from None
+        return value
+
+    @model_validator(mode="after")
+    def _one_cadence(self) -> ScheduleConfig:
+        from sbxloop.daemon.schedule import Cadence
+
+        if (self.every is None) == (self.cron is None):
+            raise ValueError(
+                f"schedules.{self.name}: set exactly one of every / cron "
+                f"(every = {self.every!r}, cron = {self.cron!r})"
+            )
+        try:
+            Cadence.parse(self.every, self.cron)
+        except ValueError as exc:
+            raise ValueError(f"schedules.{self.name}: {exc}") from None
+        return self
+
+    @property
+    def cadence_text(self) -> str:
+        from sbxloop.daemon.schedule import Cadence
+
+        return Cadence.parse(self.every, self.cron).describe()
+
+
 class Config(_ConfigModel):
     model: str = "auto"
     agent: AgentConfig = Field(default_factory=AgentConfig)
@@ -2050,6 +2127,8 @@ class Config(_ConfigModel):
     # default; a code run ignores both.
     workloads: list[WorkloadProfile] = Field(default_factory=list)
     workload: WorkloadConfig = Field(default_factory=WorkloadConfig)
+    # Workloads the daemon asks for by itself, on a cadence (#761).
+    schedules: list[ScheduleConfig] = Field(default_factory=list)
 
     @field_validator("state_dir", mode="after")
     @classmethod
@@ -2146,6 +2225,28 @@ class Config(_ConfigModel):
                 f"(declared: {known})"
             )
         return self
+
+    @model_validator(mode="after")
+    def _schedules_are_sound(self) -> Config:
+        """Every schedule is distinct by name and runs under a profile that
+        exists: a tick that refused at dispatch would fire every cadence."""
+        seen: set[str] = set()
+        profiles = {p.name for p in self.workloads}
+        for schedule in self.schedules:
+            if schedule.name in seen:
+                raise ValueError(f"schedules: {schedule.name!r} is declared twice")
+            seen.add(schedule.name)
+            if schedule.profile not in profiles:
+                known = ", ".join(sorted(profiles)) or "none"
+                raise ValueError(
+                    f"schedules.{schedule.name}.profile = {schedule.profile!r} names no "
+                    f"[[workloads]] profile (declared: {known})"
+                )
+        return self
+
+    def schedule(self, name: str) -> ScheduleConfig | None:
+        """The `[[schedules]]` entry called ``name``, None when there is none."""
+        return next((s for s in self.schedules if s.name == name), None)
 
     def workload_profile(self, name: str | None = None) -> WorkloadProfile | None:
         """The `[[workloads]]` profile called ``name`` (the `[workload]`

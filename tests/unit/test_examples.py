@@ -373,7 +373,7 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             parsed = tomllib.loads(f"{key} = {value}")
         except tomllib.TOMLDecodeError:
             continue  # a multi-line value (the exclude list); covered below
-        if section in ("registries", "credentials", "workloads"):
+        if section in ("registries", "credentials", "workloads", "schedules"):
             continue  # array-of-tables entries load as whole blocks, below
         if section == "github.repos":
             doc: dict[str, Any] = {"github": {"repos": [{"repo": "you/your-repo", **parsed}]}}
@@ -446,6 +446,21 @@ def test_example_workload_profile_loads_with_its_credential() -> None:
     assert entry.credentials == [credential["name"]]
     assert entry.budgets.set_keys == sorted(profile["budgets"])
     assert config.workload_profile() is entry
+    # The commented `[[schedules]]` entry shows both cadences; either one
+    # alone, with the profile above, is a working schedule (#761).
+    schedule = block_after("[[schedules]]")
+    assert schedule["profile"] == profile["name"]
+    for drop in ("every", "cron"):
+        one = {k: v for k, v in schedule.items() if k != drop}
+        scheduled = Config.model_validate(
+            {"credentials": [credential], "workloads": [profile], "schedules": [one]}
+        )
+        (spec,) = scheduled.schedules
+        assert spec.name == schedule["name"] and spec.cadence_text
+    with pytest.raises(ValueError, match="exactly one of every / cron"):
+        Config.model_validate(
+            {"credentials": [credential], "workloads": [profile], "schedules": [schedule]}
+        )
 
 
 def test_example_credential_entry_loads() -> None:
