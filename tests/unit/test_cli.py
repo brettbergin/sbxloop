@@ -575,6 +575,21 @@ class TestDaemonCommand:
         off = Config.model_validate({"concierge": {"enabled": False}})
         assert not concierge_wanted(off, once=False)
 
+    def test_tui_help_and_a_missing_store_are_actionable(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`sbxloop tui` explains itself, and with no daemon state on the
+        host it says what to do rather than open an empty console."""
+        result = runner.invoke(app, ["tui", "--help"])
+        assert result.exit_code == 0, result.output
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "--run" in plain and "--read-only" in plain and "--state-dir" in plain
+        result = runner.invoke(
+            app, ["tui", "--state-dir", str(workdir / "nowhere")], env={"COLUMNS": "300"}
+        )
+        assert result.exit_code == 2
+        assert "does not exist" in result.output and "sbxloop daemon" in result.output
+
     def test_once_never_starts_the_version_check(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:

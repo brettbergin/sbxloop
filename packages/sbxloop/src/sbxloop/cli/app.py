@@ -2087,6 +2087,45 @@ def daemon(
         )
 
 
+@app.command()
+def tui(
+    run: Annotated[
+        str | None, typer.Option("--run", help="Open this run's screen straight away.")
+    ] = None,
+    read_only: Annotated[
+        bool, typer.Option("--read-only", help="Observe only: no daemon commands, no chat.")
+    ] = False,
+    state_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--state-dir", help="The daemon's state directory (default: the daemon's own rule)."
+        ),
+    ] = None,
+) -> None:
+    """The operator console: watch, steer and administer the daemon on this host.
+
+    Reads the daemon's state.db read-only, drives the daemon through the
+    same `ctl` queue `sbxloop daemon ctl` uses, and (from the chat screens)
+    speaks to the daemon's local chat bridge with the same experience a
+    Discord or Slack channel gets.
+    """
+    import getpass
+
+    from sbxloop.tui.app import build_app
+
+    config = load_config()
+    resolved = state_dir if state_dir is not None else _daemon_state_dir()
+    operator = config.tui.operator_id or getpass.getuser()
+    try:
+        console_app = build_app(
+            config, resolved, operator_id=operator, read_only=read_only, initial_run=run
+        )
+    except SbxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    console_app.run()
+
+
 def concierge_wanted(config: Config, *, once: bool) -> bool:
     """Whether this daemon builds the concierge: whenever it is enabled and
     the daemon is long-lived. The console's local bridge always exists, so

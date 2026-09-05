@@ -64,7 +64,11 @@ TEMPLATES = [
     *(SRC / "data" / "presets").glob("*.toml"),
     ROOT / ".env.example",
 ]
-CONSOLE_MODULES = [*(SRC / "cli").rglob("*.py"), SRC / "sbx" / "conformance.py"]
+CONSOLE_MODULES = [
+    *(SRC / "cli").rglob("*.py"),
+    *(SRC / "tui").rglob("*.py"),
+    SRC / "sbx" / "conformance.py",
+]
 
 # Where personal identifiers are allowed to live: operator-facing material
 # about sbxloop's own deployment, package metadata, and test fixtures.

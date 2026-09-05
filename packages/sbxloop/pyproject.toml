@@ -31,6 +31,7 @@ dependencies = [
     # `requires-python` is a PEP 440 specifier; the toolchain series a run
     # provisions is chosen against it (#627).
     "packaging>=24",
+    "textual>=8.2",
 ]
 
 [project.optional-dependencies]
