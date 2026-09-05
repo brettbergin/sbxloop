@@ -710,6 +710,31 @@ def test_operator_plan_shows_what_may_be_granted() -> None:
     assert "a need outside it is refused and the run ends before any task runs" in plain
 
 
+def test_operator_plan_never_narrows_the_ask() -> None:
+    """Field (#800): shown bounds it could not meet, the planner rewrote
+    the ask to fit them and declared no need at all, so the fail-closed
+    refusal — the signal the person needs — never fired. The plan declares
+    what the ask needs; a refusal is the right outcome for a need outside
+    the bounds; the title stays in the ask's own terms."""
+    text = render("operator_plan", **RENDER_CONTEXTS["operator_plan"])
+    plain = " ".join(text.split())
+    assert "**Declare what the ask needs, not what the bounds allow.**" in plain
+    assert "declare it anyway and let the run refuse it" in plain
+    assert "that refusal is the correct result of this stage" in plain
+    assert "**Never narrow the ask**" in plain
+    assert "so plan within it or plan around it" not in plain
+    assert "never qualified by what the bounds allow" in plain
+
+
+def test_operator_judge_holds_the_work_to_the_outcome() -> None:
+    """The other half of #800: criteria written to fit what could be done
+    rather than what was asked fail the task, named."""
+    text = render("operator_judge", **RENDER_CONTEXTS["operator_judge"])
+    plain = " ".join(text.split())
+    assert "**narrowed away from the outcome**" in plain
+    assert "naming the part of the outcome the criteria no longer cover" in plain
+
+
 def test_operator_plan_makes_criteria_the_exam() -> None:
     text = render("operator_plan", **RENDER_CONTEXTS["operator_plan"])
     assert "the judge's whole exam" in text

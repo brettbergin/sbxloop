@@ -31,6 +31,10 @@ Section rules:
 - Acceptance criteria are the task's whole exam ("the judge's whole exam"):
   the judge holds the work to them and nothing else
   (test_operator_plan_makes_criteria_the_exam).
+- The plan declares what the ask needs, never what the bounds allow
+  ("what the ask needs", "never narrow the ask"): reshaping the ask to
+  fit the profile is forbidden, and a refusal is the right outcome for
+  a need outside it (test_operator_plan_never_narrows_the_ask).
 -->
 
 # Plan a workload
@@ -96,10 +100,23 @@ lost when the sandbox is destroyed.
   cannot ask for a host or a credential mid-task. Use empty lists and
   `null` for a task with no needs (the common case). What this run may be
   granted is listed below: a need outside it is refused and the run ends
-  before any task runs, so plan within it or plan around it.
+  before any task runs, naming the setting that would have allowed it.
+- **Declare what the ask needs, not what the bounds allow.** The bounds
+  below tell you what will be granted; they do not change what was asked.
+  If the outcome needs a host, a credential or a sink the bounds do not
+  cover, declare it anyway and let the run refuse it — that refusal is
+  the correct result of this stage, not a failure of the plan, because it
+  tells the person exactly what to enable. **Never narrow the ask** to fit
+  the bounds: do not drop a requirement, substitute a source you can
+  reach for the one that was asked for, rewrite the outcome as "within
+  the constraint", or retitle the work around what you could not do. A
+  person who asked for X and receives an X shaped to fit the bounds
+  cannot tell the difference from the thread, and the judge holds the
+  work to the ask as written.
 - Tasks must form a DAG: no cycles, dependencies only on listed ids.
 - Also give `title`: one line naming the work, the way a colleague would
-  refer to it. Leave it `null` if the outcome already is that line.
+  refer to it — in the ask's own terms, never qualified by what the bounds
+  allow. Leave it `null` if the outcome already is that line.
 
 ## What this run may ask for
 
