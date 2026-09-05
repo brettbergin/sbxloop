@@ -26,7 +26,9 @@ from sbxloop.tui.commands import ConsoleCommands
 from sbxloop.tui.data import ConsoleState, CtlClient, build_state, probe_daemon
 from sbxloop.tui.runner import CommandRunner, SubprocessRunner
 from sbxloop.tui.screens.chat import ChatScreen
+from sbxloop.tui.screens.config import ConfigScreen
 from sbxloop.tui.screens.daemon import DaemonScreen
+from sbxloop.tui.screens.doctor import DoctorScreen
 from sbxloop.tui.screens.help import HelpScreen
 from sbxloop.tui.screens.items import ItemsScreen
 from sbxloop.tui.screens.modals import (
@@ -57,6 +59,8 @@ class SbxloopTui(App[None]):
         "chat": ChatScreen,
         "sandboxes": SandboxesScreen,
         "daemon": DaemonScreen,
+        "config": ConfigScreen,
+        "doctor": DoctorScreen,
         "help": HelpScreen,
     }
     COMMANDS: ClassVar[set[Any]] = App.COMMANDS | {ConsoleCommands}
@@ -67,6 +71,8 @@ class SbxloopTui(App[None]):
         Binding("4", "mode('chat')", "Chat"),
         Binding("5", "mode('sandboxes')", "Sandboxes"),
         Binding("6", "mode('daemon')", "Daemon"),
+        Binding("7", "mode('config')", "Config"),
+        Binding("8", "mode('doctor')", "Doctor"),
         Binding("question_mark", "mode('help')", "Help"),
         Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
@@ -197,11 +203,18 @@ class SbxloopTui(App[None]):
 
     # -- admin verbs -------------------------------------------------------------
 
-    def perform(self, action: Action, *, then: Callable[[], Any] | None = None) -> None:
+    def perform(
+        self,
+        action: Action,
+        *,
+        then: Callable[[], Any] | None = None,
+        on_success: Callable[[], Any] | None = None,
+    ) -> None:
         """Run one admin verb the way every verb runs: refused read-only,
         refused without a daemon when it needs one, confirmed by its tier,
         executed off the UI thread, reported as a toast or a screen, then
-        ``then`` (a screen's own re-poll) and a refresh."""
+        ``then`` (a screen's own re-poll, whatever the outcome),
+        ``on_success`` (only when it worked) and a refresh."""
         if self.read_only and action.mutating:
             self.notify(f"read-only console: {action.title} refused", severity="warning")
             return
@@ -216,9 +229,9 @@ class SbxloopTui(App[None]):
             if not confirmed:
                 return
             if action.interactive is not None:
-                self._interactive(action)
+                self._interactive(action, then, on_success)
                 return
-            self.execute(action, then)
+            self.execute(action, then, on_success)
 
         if action.confirm == "none":
             go(True)
@@ -228,15 +241,24 @@ class SbxloopTui(App[None]):
             self.push_screen(ConfirmScreen(action.title, action.prompt), go)
 
     @work(thread=True, group="action")
-    def execute(self, action: Action, then: Callable[[], Any] | None) -> None:
+    def execute(
+        self,
+        action: Action,
+        then: Callable[[], Any] | None,
+        on_success: Callable[[], Any] | None = None,
+    ) -> None:
         try:
             outcome = action.run()
         except Exception as exc:
             outcome = Outcome(False, f"{action.title} failed: {exc}")
-        self.call_from_thread(self.show_outcome, action, outcome, then)
+        self.call_from_thread(self.show_outcome, action, outcome, then, on_success)
 
     def show_outcome(
-        self, action: Action, outcome: Outcome, then: Callable[[], Any] | None = None
+        self,
+        action: Action,
+        outcome: Outcome,
+        then: Callable[[], Any] | None = None,
+        on_success: Callable[[], Any] | None = None,
     ) -> None:
         if outcome.long:
             self.push_screen(OutcomeScreen(action.title, outcome.text, ok=outcome.ok))
@@ -249,16 +271,30 @@ class SbxloopTui(App[None]):
             )
         if then is not None:
             then()
+        if outcome.ok and on_success is not None:
+            on_success()
         self.action_refresh()
 
-    def _interactive(self, action: Action) -> None:
-        """Hand the terminal to a process (a sandbox shell) and take it back."""
+    def _interactive(
+        self,
+        action: Action,
+        then: Callable[[], Any] | None = None,
+        on_success: Callable[[], Any] | None = None,
+    ) -> None:
+        """Hand the terminal to a process (a sandbox shell, an editor) and
+        take it back — then the same follow-up every verb gets, since the
+        process may have changed what the screen shows."""
         argv = action.interactive or ()
         with self.suspend():
             code = self.deps.runner.interactive(argv)
         self.notify(
             f"{action.title}: exit {code}", severity="information" if code == 0 else "warning"
         )
+        if then is not None:
+            then()
+        if code == 0 and on_success is not None:
+            on_success()
+        self.action_refresh()
 
     async def action_quit(self) -> None:
         """Quit — asking first about a daemon spawned from this console."""

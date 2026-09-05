@@ -37,7 +37,7 @@ opens that run's screen at once; `--read-only` removes every action.
 ├────────────────────────────────────────────────────────────────────────────┤
 │                            <active screen>                                 │
 ├────────────────────────────────────────────────────────────────────────────┤
-│ 1 Overview 2 Runs 3 Queue 4 Chat 5 Sandboxes 6 Daemon ? Help ^p r q        │
+│ 1 Overview 2 Runs 3 Queue 4 Chat 5 Sandboxes 6 Daemon 7 Config 8 Doctor ? │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -54,7 +54,7 @@ returns.
 
 | key               | where                       | what                                                               |
 | ----------------- | --------------------------- | ------------------------------------------------------------------ |
-| `1` … `6`         | anywhere                    | Overview, Runs, Queue, Chat, Sandboxes, Daemon                     |
+| `1` … `8`         | anywhere                    | Overview, Runs, Queue, Chat, Sandboxes, Daemon, Config, Doctor     |
 | `?`               | anywhere                    | Help                                                               |
 | `ctrl+p`          | anywhere                    | the command palette: screens and argument-less verbs by name       |
 | `r`               | anywhere                    | refresh now (store and `ctl status`)                               |
@@ -269,11 +269,59 @@ orphan verdicts (the prompt says so, and their kept marker is cleared).
   follow. The stream and the polls stop while another screen is shown. The `!sbx log` verb in chat is the on-demand
   twin from the daemon's own ring buffer.
 
+### Config (`7`)
+
+- **Resolved** — every key with its value and the layer that set it (user
+  config, `pyproject.toml`, `sbxloop.toml`, env, default), as
+  `sbxloop config show` prints; `/` filters keys, values and sources.
+- **Policy** — the effective per-phase egress policy `sbxloop config policy`
+  prints, from the same fold (`sbxloop.cli.policyview.policy_view`).
+- **Repos** — the configured repositories as `sbxloop config repos` lists
+  them.
+- **Edit** — the `sbxloop.toml` the daemon reads: the daemon says where it
+  loaded its configuration from (`status` carries its directory), and the
+  editor follows that, not the directory the console was started in (the
+  commented example when there is no file yet). `i` focuses it, `Esc`
+  hands focus back. `V` validates the draft with the real loader, in
+  place of that file at the same discovered root — the user,
+  `pyproject.toml` and environment layers still applied, and the project
+  cut-down too: a `sbxloop.toml` the repository carries (tracked by git)
+  may only set project keys, and the verdict names the keys the daemon
+  would ignore rather than saying "loads". It names what it refuses (an
+  unknown key, a bad value). `W` (or `ctrl+s`) validates and then saves,
+  typed `save`: the write is atomic, the previous file is kept beside it
+  as `sbxloop.toml.bak-<stamp>`, and a restart of the unit is offered
+  (typed, as on the Daemon screen), since the daemon reads the file only
+  at start. A draft the loader refuses is never written. `E` opens
+  `$EDITOR` on the file with the terminal handed over; `L` reloads from
+  disk. `--read-only` makes the editor read-only.
+
+### Doctor (`8`) and secrets
+
+`d` runs what `sbxloop doctor` runs — the host checks and the cheap sbx
+conformance probes — in the background with its progress line, and shows
+the two tables with the verdict (ready / not ready, warnings, drift) and
+the age of the check. `D` runs the live probes (boots a scratch sandbox)
+and `p` asks GitHub about each configured repository from a github-ops
+sandbox; both ask first. The data is `sbxloop.cli.doctor.doctor_report`,
+the same the CLI renders.
+
+`S` opens the **secret registrations**: the tracked custom secrets as
+`sbxloop secrets list` judges them (expected, actual, status, note). `x`
+cleans the stale ones — a dry run first, then typed `clean` — and `X`
+every sbxloop-owned one; `K` rotates the agent credential's registration
+from a hidden prompt (typed `rotate`): the sbx registration is replaced
+with a global one on the canonical host, live sandboxes that may still
+hold the old token are named, and the sandbox-booting visibility check
+stays with `sbxloop secrets rotate --verify`. The token is never an
+argument and never logged.
+
 ### The command palette
 
-`ctrl+p` lists every screen and every argument-less verb (pause, resume,
-cancel the current run, stop the daemon, start / stop / restart the unit,
-spawn a daemon, upgrade) by name. Verbs with a target live on their rows.
+`ctrl+p` lists every screen (Secrets included) and every argument-less
+verb (pause, resume, cancel the current run, stop the daemon, start / stop
+/ restart the unit, spawn a daemon, upgrade) by name. Verbs with a target
+live on their rows.
 
 ## Configuration
 
