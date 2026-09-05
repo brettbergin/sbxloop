@@ -85,11 +85,11 @@ class TestCredentialedRun:
         run_id = engine.store.list_runs()[0].run_id
         assert engine.store.get_run(run_id).credentials == ["weather"]
 
-        # Three sandboxes came up; none survive the run.
-        # (No [github].repo, so no github sandbox — the service one is the
-        # only extra.)
-        created = [c[1].removeprefix("--name=") for c in harness.fake_sbx.invocations("create")]
-        assert created == [f"sbxloop-{run_id}-agent", f"sbxloop-{run_id}-service"]
+        # Two sandboxes came up (no [github].repo, so no github sandbox —
+        # the service one is the only extra); they provision on parallel
+        # threads, so in no fixed order. None survive the run.
+        created = {c[1].removeprefix("--name=") for c in harness.fake_sbx.invocations("create")}
+        assert created == {f"sbxloop-{run_id}-agent", f"sbxloop-{run_id}-service"}
         assert harness.sandboxes_left() == []
 
         # The request left the service sandbox for the pinned host with the
