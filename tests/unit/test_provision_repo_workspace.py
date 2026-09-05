@@ -41,7 +41,7 @@ def _provisioner(fake_sbx: FakeSbx, config: Config) -> Provisioner:
 def _config(tmp_path: Path, repos: list[dict[str, object]], **sandbox: object) -> Config:
     return Config.model_validate(
         {
-            "state_dir": str(tmp_path / "state"),
+            "home": str(tmp_path / "state"),
             "github": {"repos": repos},
             "sandbox": {"workspace_isolation": "clone", **sandbox},
         }
@@ -100,7 +100,7 @@ def test_legacy_workspace_not_used_for_another_repo(
     assert "o/two" in str(excinfo.value)
     assert str(legacy) not in str(excinfo.value)
     # ...and nothing was cloned into the run dir.
-    assert not (config.state_dir / "runs" / "r1" / "workspace" / ".git").exists()
+    assert not (config.paths.runs / "r1" / "workspace" / ".git").exists()
 
 
 def test_no_workspace_no_credential_fails_explicitly(
@@ -264,7 +264,7 @@ def test_remote_clone_follows_api_url_and_clone_filter(
     upstream = _checkout(tmp_path / "upstream", "o/public")
     config = Config.model_validate(
         {
-            "state_dir": str(tmp_path / "state"),
+            "home": str(tmp_path / "state"),
             "github": {
                 "repos": [{"repo": "o/one", "workspace": str(legacy)}, {"repo": "o/public"}],
                 "api_url": "https://ghe.example.com/api/v3",
@@ -301,7 +301,7 @@ def test_single_repo_legacy_workspace_still_clones(fake_sbx: FakeSbx, tmp_path: 
     config = _config(tmp_path, [{"repo": "o/one"}], workspace=str(legacy))
     provisioner = _provisioner(fake_sbx, config)
     ws = provisioner._resolve_workspace("r1", "o/one")
-    assert ws == (config.state_dir / "runs" / "r1" / "workspace").resolve()
+    assert ws == (config.paths.runs / "r1" / "workspace").resolve()
     assert (ws / "README.md").read_text() == "# o/one\n"
 
 

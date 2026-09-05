@@ -12,7 +12,7 @@ Two manifests record what was baked:
 
 - **in-VM** (``~/.sbxloop/bake.json``, travels inside the template): read by
   provisioning to verify the baked worker version before trusting it.
-- **host** (``<state_dir>/bake.json``): read by ``sbxloop doctor`` to flag a
+- **host** (``<home>/state/bake.json``): read by ``sbxloop doctor`` to flag a
   stale template (host upgraded since the bake) without booting a microVM.
 
 Templates carry *software only* — the scratch sandbox gets no secrets, and
@@ -69,7 +69,7 @@ class BakeRecord(BaseModel):
 
 
 def bake_record_path(config: Config) -> Path:
-    return config.state_dir / "bake.json"
+    return config.paths.bake_json
 
 
 def load_bake_record(config: Config) -> BakeRecord | None:

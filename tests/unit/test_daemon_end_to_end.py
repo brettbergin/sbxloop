@@ -87,11 +87,9 @@ class FakeEngineRunner:
 def _daemon(
     tmp_path: Path, end: str
 ) -> tuple[DaemonLoop, FakeSource, RecordingFrontend, DaemonStore, StateStore]:
-    config = Config.model_validate(
-        {"state_dir": str(tmp_path / "state"), "github": {"repo": "o/r"}}
-    )
-    store = StateStore(config.state_dir / "state.db")
-    dstore = DaemonStore(config.state_dir / "state.db")
+    config = Config.model_validate({"home": str(tmp_path / "state"), "github": {"repo": "o/r"}})
+    store = StateStore(config.paths.state_db)
+    dstore = DaemonStore(config.paths.state_db)
     source = FakeSource([gh_item("12", requested_by="4242")])
     front = RecordingFrontend()
     loop = DaemonLoop(
@@ -225,13 +223,13 @@ class RestartHarness:
     def __init__(self, tmp_path: Path) -> None:
         self.config = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {"repo": "o/r"},
                 "daemon": {"max_attempts_per_item": 1, "refresh_workspace": False},
             }
         )
-        self.store = StateStore(self.config.state_dir / "state.db")
-        self.dstore = DaemonStore(self.config.state_dir / "state.db")
+        self.store = StateStore(self.config.paths.state_db)
+        self.dstore = DaemonStore(self.config.paths.state_db)
         self.ops = IssueOps({"12": issue(12, "sbxloop:run")})
         self.source = GitHubIssueSource(
             lambda: self.ops,  # type: ignore[arg-type,return-value]

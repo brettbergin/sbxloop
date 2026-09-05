@@ -14,6 +14,7 @@ from sbxloop.daemon.mailbox import MailboxClient
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.store import StateStore
 from sbxloop.ids import new_run_id
+from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.models import SandboxInfo
 from sbxloop.sbx.prune import SandboxVerdict
 from sbxloop.tui import actions
@@ -46,7 +47,7 @@ def sent(deps: actions.Deps) -> list[str]:
 
 
 def make_deps(
-    state_dir: Path,
+    state_dir: SbxloopHome,
     *,
     ctl: FakeCtl | None = None,
     runner: FakeRunner | None = None,
@@ -55,7 +56,7 @@ def make_deps(
     read_only: bool = False,
     **daemon_cfg: Any,
 ) -> actions.Deps:
-    config = Config.model_validate({"state_dir": str(state_dir), "daemon": daemon_cfg})
+    config = Config.model_validate({"home": str(state_dir.root), "daemon": daemon_cfg})
     ctl = ctl or FakeCtl(live_status())
     snapshot: DaemonSnapshot | None
     if daemon == "live":
@@ -66,16 +67,16 @@ def make_deps(
     return actions.Deps(
         ctl=ctl,
         runner=runner or FakeRunner(),
-        mailbox=MailboxClient(state_dir / "state.db", operator_id="brett"),
+        mailbox=MailboxClient(state_dir.state_db, operator_id="brett"),
         config=config,
-        state_dir=state_dir,
+        home=state_dir,
         unit="sbxloop-daemon",
         operator="brett",
         sbx=lambda: box,
         daemon=lambda: snapshot,
         read_only=read_only,
         clock=time.time,
-        cwd=state_dir,
+        cwd=state_dir.root,
     )
 
 
@@ -143,7 +144,7 @@ class TestItemVerbs:
         deps = make_deps(seeded, daemon=DOWN)
         out = actions.requeue(deps, "gh:issue:41").run()
         assert out.ok and "gh:issue:41: queued" in out.text and actions.ROW_ONLY_NOTE in out.text
-        store = DaemonStore(seeded / "state.db")
+        store = DaemonStore(seeded.state_db)
         try:
             item = store.get("gh:issue:41")
             assert item is not None and item.state == "queued" and item.run_id is None
@@ -187,7 +188,7 @@ class TestRunVerbs:
         assert not actions.cancel_run(idle, record, current=False, retry=True).run().ok
         assert actions.cancel_run(idle, record, current=False).run().ok
         assert sent(idle) == []
-        store = StateStore(seeded / "state.db")
+        store = StateStore(seeded.state_db)
         try:
             assert store.get_run("r_live").state == "cancelled"
         finally:
@@ -204,8 +205,8 @@ class TestRunVerbs:
         assert out.ok and "started pid" in out.text
         argv, cwd, log_path = runner.spawned[0]
         assert argv == (*sbxloop_argv(), "resume", "r_live", "--no-tui", "--no-chat")
-        assert cwd == seeded and log_path == seeded / "console" / "resume-r_live.log"
-        assert runner.spawn_env[0] == {"SBXLOOP_STATE_DIR": str(seeded)}, "the console's store"
+        assert cwd == seeded.root and log_path == seeded.console / "resume-r_live.log"
+        assert runner.spawn_env[0] == {"SBXLOOP_HOME": str(seeded.root)}, "the console's store"
         assert "resume r_live" in deps.children.alive()
         assert actions.run_text(deps, "--fix the spinner").run().ok
         assert runner.spawned[1][0][-4:] == ("--no-tui", "--no-chat", "--", "--fix the spinner")
@@ -269,7 +270,7 @@ class TestHostVerbs:
         deps = make_deps(seeded, runner=runner, daemon=DOWN)
         assert actions.spawn_daemon(deps).run().ok
         argv, _cwd, log_path = runner.spawned[0]
-        assert argv == (*sbxloop_argv(), "daemon") and log_path == seeded / "console" / "daemon.log"
+        assert argv == (*sbxloop_argv(), "daemon") and log_path == seeded.console / "daemon.log"
         assert "daemon" in deps.children.alive()
         stop = actions.stop_spawned_daemon(deps)
         assert "interrupted" in stop.prompt and stop.run().ok
@@ -287,7 +288,7 @@ class TestHostVerbs:
 class TestSandboxVerbs:
     def test_remove_stop_and_prune(self, seeded: Path) -> None:
         old = new_run_id()
-        store = StateStore(seeded / "state.db")
+        store = StateStore(seeded.state_db)
         try:
             store.create_run(old, "an old one")
             store.set_run_state(old, "failed")
@@ -330,7 +331,7 @@ class TestSandboxVerbs:
         """Between the poll and the typed word the run may have resumed
         (or been prodded): what the prompt listed is not what is removed."""
         old = new_run_id()
-        store = StateStore(seeded / "state.db")
+        store = StateStore(seeded.state_db)
         try:
             store.create_run(old, "resumed since")
             store.set_run_state(old, "failed")
@@ -350,14 +351,14 @@ class TestSandboxVerbs:
     def test_gc_removes_run_directories_past_retention(self, seeded: Path) -> None:
         deps = make_deps(seeded)
         run_id = new_run_id()
-        store = StateStore(seeded / "state.db")
+        store = StateStore(seeded.state_db)
         try:
             store.create_run(run_id, "an old one")
             store.set_run_state(run_id, "merged")
         finally:
             store.close()
         backdate(seeded, run_id, 3.0)
-        run_dir = seeded / "runs" / run_id
+        run_dir = seeded.runs / run_id
         run_dir.mkdir(parents=True)
         (run_dir / "workspace.txt").write_text("x" * 100)
         disabled = actions.gc_run_dirs(deps, 0.0).run()

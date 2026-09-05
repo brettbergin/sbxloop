@@ -108,16 +108,14 @@ def build(
     tmp_path: Path, scripts: list[dict[str, Any]]
 ) -> tuple[DiscordBridge, FakeDiscord, ScriptedWorker, FakeChannel]:
     """A real bridge in front of a real concierge, both on fakes."""
-    cfg = Config.model_validate(
-        {"state_dir": str(tmp_path / "state"), "discord": {"channel_id": 42}}
-    )
-    dstore = DaemonStore(cfg.state_dir / "state.db")
+    cfg = Config.model_validate({"home": str(tmp_path / "state"), "discord": {"channel_id": 42}})
+    dstore = DaemonStore(cfg.paths.state_db)
     worker = ScriptedWorker(scripts)
     concierge = Concierge(
         cfg,
         loop=LoopWithRuns(dstore),  # type: ignore[arg-type]
         dstore=dstore,
-        store_factory=lambda: StateStore(cfg.state_dir / "state.db"),
+        store_factory=lambda: StateStore(cfg.paths.state_db),
         github=None,
         host=FakeHost(worker),
         bus=EventBus(),

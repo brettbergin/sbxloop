@@ -83,7 +83,7 @@ class TestWorkloadRun:
         assert run.stage == "publishing", "the last non-terminal stage, for a resume"
         # The data directory: the per-run dir an unconfigured code run gets,
         # harvested rather than mounted as the work.
-        assert result.workspace == harness.state_dir / "runs" / result.run_id / "workspace"
+        assert result.workspace == harness.paths.runs / result.run_id / "workspace"
         (start,) = [e for e in harness.events if e.type == HostEventTypes.RUN_START]
         assert start.data["kind"] == "workload"
         assert start.data["workspace"] is None
@@ -140,7 +140,7 @@ class TestWorkloadRun:
         )
         result = engine.start("count the things", kind="workload")
         assert result.state == "completed"
-        assert result.workspace == harness.state_dir / "runs" / result.run_id / "workspace"
+        assert result.workspace == harness.paths.runs / result.run_id / "workspace"
         assert not (result.workspace / "README.md").exists()
 
     def test_setup_commands_are_a_checkouts(self, harness: Harness) -> None:
@@ -646,7 +646,7 @@ class TestWorkloadResume:
         assert start.data["resumed"] is True and start.data["kind"] == "workload"
         # Still one sandbox, still the same data directory.
         assert harness.sandboxes_left() == []
-        assert result.workspace == harness.state_dir / "runs" / run_id / "workspace"
+        assert result.workspace == harness.paths.runs / run_id / "workspace"
         phases = [r["phase"] for r in harness.engine().store.phase_attempts(run_id)]
         assert phases.count("plan") == 1 and phases.count("execute") == 1
         assert "decompose" not in phases and "build" not in phases
@@ -1014,7 +1014,7 @@ class TestNeeds:
         result = engine.start("read the docs", kind="workload")
         assert result.state == "completed", result.reason
         assert seen == [("https://github.com/o/docs", "gh_tok")], "the host's own credential"
-        checkout = harness.state_dir / "runs" / result.run_id / "workspace" / "docs"
+        checkout = harness.paths.runs / result.run_id / "workspace" / "docs"
         assert (checkout / "hello.txt").read_text() == "hi\n"
         (clone,) = [e for e in harness.events if e.type == "sandbox.workspace_clone"]
         assert clone.data["target"] == str(checkout)
@@ -1147,7 +1147,7 @@ class TestSinks:
         # #799: the chat sink stages the tasks' files on the host, the way
         # the artifact sink does, and the event carries their paths for the
         # bridge to attach — so `sbxloop artifacts` lists them too
-        target = harness.state_dir / "runs" / result.run_id / "artifacts"
+        target = harness.paths.runs / result.run_id / "artifacts"
         assert posted["paths"] == [str(target / "a.txt")]
         assert (target / "a.txt").read_text() == "a\n"
         report = [e for e in harness.events if e.type == HostEventTypes.RUN_ARTIFACTS][-1]
@@ -1424,13 +1424,13 @@ class TestSinks:
         result = engine.start("report", kind="workload")
         assert result.state == "completed", result.reason
         assert result.mounted is mounted
-        target = harness.state_dir / "runs" / result.run_id / "artifacts"
+        target = harness.paths.runs / result.run_id / "artifacts"
         assert sorted(
             p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_file()
         ) == ["out/report.csv", "scratch.txt"]
         assert (target / "out/report.csv").read_text() == "1,2\n"
         if not mounted:
-            salvage = harness.state_dir / "runs" / result.run_id / "data"
+            salvage = harness.paths.runs / result.run_id / "data"
             assert (salvage / "scratch.txt").read_text() == "x\n"
         delivered, posted = self.published(harness)
         assert (
@@ -1453,7 +1453,7 @@ class TestSinks:
         assert report.data["path"] == str(target) and report.data["files"] == 2
         from sbxloop.engine.model import artifacts_dir
 
-        assert artifacts_dir(result, harness.state_dir) == target
+        assert artifacts_dir(result, harness.paths) == target
 
     def test_a_resume_at_publishing_never_delivers_twice(
         self, harness: Harness, profiled: dict[str, Any]

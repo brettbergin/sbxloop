@@ -17,9 +17,9 @@ on:
 
 env:
   SBX_INSTALL_DIR: /home/runner/.docker/sbx
-  # state_dir defaults to ~/.sbxloop; the steps below read the run's
+  # The home defaults to ~/.sbxloop; the steps below read the run's
   # state.db / runs/ from the checkout, so pin state to the workspace.
-  SBXLOOP_STATE_DIR: .sbxloop
+  SBXLOOP_HOME: ${{ github.workspace }}/.sbxloop
 
 jobs:
   e2e:
@@ -162,7 +162,7 @@ jobs:
           uv run --no-project python - <<'EOF'
           import json, sqlite3, sys
 
-          db = sqlite3.connect(".sbxloop/state.db")
+          db = sqlite3.connect(".sbxloop/state/state.db")
           db.row_factory = sqlite3.Row
           run = db.execute(
               "SELECT run_id, kind, state, published FROM runs ORDER BY created_at DESC LIMIT 1"
@@ -215,7 +215,7 @@ jobs:
           uv run --no-project python - <<'EOF'
           import json, sqlite3, sys
 
-          db = sqlite3.connect(".sbxloop/state.db")
+          db = sqlite3.connect(".sbxloop/state/state.db")
           db.row_factory = sqlite3.Row
           run_id = db.execute(
               "SELECT run_id FROM runs ORDER BY created_at DESC LIMIT 1"
@@ -256,7 +256,7 @@ jobs:
           uv run --no-project python - <<'EOF'
           import json, sqlite3, pathlib
 
-          path = pathlib.Path(".sbxloop/state.db")
+          path = pathlib.Path(".sbxloop/state/state.db")
           captured = []
           if path.exists():
               db = sqlite3.connect(path)

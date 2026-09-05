@@ -19,6 +19,7 @@ from sbxloop import __version__
 from sbxloop.config import Config
 from sbxloop.daemon.control import ControlClient
 from sbxloop.daemon.mailbox import MailboxClient
+from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.tui.actions import Action, Deps, Outcome, stop_spawned_daemon
 from sbxloop.tui.chat import ChatSession
@@ -81,7 +82,7 @@ class SbxloopTui(App[None]):
     def __init__(
         self,
         config: Config,
-        state_dir: Path,
+        home: SbxloopHome,
         *,
         mailbox: MailboxClient,
         ctl: CtlClient | None = None,
@@ -95,11 +96,11 @@ class SbxloopTui(App[None]):
     ) -> None:
         super().__init__()
         self.config = config
-        self.state_dir = state_dir
+        self.home = home
         self.mailbox = mailbox
         operator = mailbox.operator_name
         self.ctl: CtlClient = (
-            ctl if ctl is not None else ControlClient(state_dir, by=f"{operator} via sbxloop tui")
+            ctl if ctl is not None else ControlClient(home, by=f"{operator} via sbxloop tui")
         )
         self.read_only = read_only
         self.initial_run = initial_run
@@ -114,7 +115,7 @@ class SbxloopTui(App[None]):
             runner=runner if runner is not None else SubprocessRunner(),
             mailbox=mailbox,
             config=config,
-            state_dir=state_dir,
+            home=home,
             unit=unit or config.tui.daemon_unit,
             operator=operator,
             sbx=sbx_factory or (lambda: SbxCLI(app_name=config.app_name or None)),
@@ -323,17 +324,17 @@ class SbxloopTui(App[None]):
 
 def build_app(
     config: Config,
-    state_dir: Path,
+    home: SbxloopHome,
     *,
     operator_id: str,
     read_only: bool = False,
     initial_run: str | None = None,
     unit: str | None = None,
 ) -> SbxloopTui:
-    mailbox = MailboxClient(state_dir / "state.db", operator_id=operator_id)
+    mailbox = MailboxClient(home.state_db, operator_id=operator_id)
     return SbxloopTui(
         config,
-        state_dir,
+        home,
         mailbox=mailbox,
         read_only=read_only,
         initial_run=initial_run,

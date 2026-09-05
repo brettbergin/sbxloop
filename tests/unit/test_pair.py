@@ -233,7 +233,7 @@ def test_tui_run_sigterm_removes_both_sandboxes(fake_sbx: FakeSbx, tmp_path: Pat
             "SBXLOOP_WORKER_PYTHON": sys.executable,
             "SBXLOOP_INSTALL_WORKERS": "false",
             "SBXLOOP_GITHUB__REPO": "owner/repo",  # so the pair has both roles
-            "SBXLOOP_STATE_DIR": str(workdir / ".sbxloop"),
+            "SBXLOOP_HOME": str(workdir / ".sbxloop"),
         }
     )
     log_path = workdir / "run.log"
@@ -249,7 +249,7 @@ def test_tui_run_sigterm_removes_both_sandboxes(fake_sbx: FakeSbx, tmp_path: Pat
     try:
         # wait until the run is inside `with pair:` (state moves past
         # provisioning), i.e. registered for cleanup with both sandboxes up
-        db = workdir / ".sbxloop" / "state.db"
+        db = workdir / ".sbxloop" / "state" / "state.db"
         deadline = time.monotonic() + 90
         state = None
         while time.monotonic() < deadline:

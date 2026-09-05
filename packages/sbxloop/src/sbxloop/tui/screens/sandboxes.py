@@ -113,7 +113,7 @@ class SandboxesScreen(ConsoleScreen):
             try:
                 with deps.mailbox.read_engine() as engine:
                     rundirs = classify_run_dirs(
-                        engine, deps.state_dir, older_than_s=days * 86400.0, now=deps.clock()
+                        engine, deps.home, older_than_s=days * 86400.0, now=deps.clock()
                     )
             except Exception as exc:
                 error = error or f"run directories: {exc}"

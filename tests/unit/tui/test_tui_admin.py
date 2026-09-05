@@ -4,7 +4,6 @@ run and item verbs, the confirmation tiers, read-only, the palette."""
 from __future__ import annotations
 
 import contextlib
-from pathlib import Path
 from typing import Any
 
 from textual.widgets import Input, RichLog
@@ -12,6 +11,7 @@ from textual.widgets import Input, RichLog
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.store import StateStore
 from sbxloop.ids import new_run_id
+from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.models import SandboxInfo
 from sbxloop.tui.commands import CATALOGUE
 from sbxloop.tui.screens.daemon import DaemonScreen
@@ -34,11 +34,11 @@ from tests.unit.tui.conftest import (
 REFRESH: dict[str, Any] = {"refresh_s": 3.0}
 
 
-def test_sandboxes_screen_classifies_and_prunes_behind_a_typed_word(seeded: Path) -> None:
+def test_sandboxes_screen_classifies_and_prunes_behind_a_typed_word(seeded: SbxloopHome) -> None:
     # A run id the sandbox naming scheme recognises (the seeded ids are
     # readable, not real), failed two days ago: its sandbox is an orphan.
     old = new_run_id()
-    store = StateStore(seeded / "state.db")
+    store = StateStore(seeded.state_db)
     try:
         store.create_run(old, "an old one")
         store.set_run_state(old, "failed")
@@ -97,7 +97,7 @@ def test_sandboxes_screen_classifies_and_prunes_behind_a_typed_word(seeded: Path
 
 
 def test_daemon_screen_shows_the_unit_streams_the_journal_and_drives_the_verbs(
-    seeded: Path,
+    seeded: SbxloopHome,
 ) -> None:
     runner = FakeRunner()
     runner.script(
@@ -165,7 +165,7 @@ def test_daemon_screen_shows_the_unit_streams_the_journal_and_drives_the_verbs(
 
 
 def test_daemon_screen_spawns_a_daemon_when_there_is_no_unit_and_asks_on_quit(
-    seeded: Path,
+    seeded: SbxloopHome,
 ) -> None:
     runner = FakeRunner()
     runner.script(
@@ -204,7 +204,7 @@ def test_daemon_screen_spawns_a_daemon_when_there_is_no_unit_and_asks_on_quit(
     drive(scenario)
 
 
-def test_run_verbs_go_through_confirmations_and_ctl(seeded: Path) -> None:
+def test_run_verbs_go_through_confirmations_and_ctl(seeded: SbxloopHome) -> None:
     ctl = FakeCtl(live_status())
 
     async def scenario() -> None:
@@ -252,7 +252,7 @@ def test_run_verbs_go_through_confirmations_and_ctl(seeded: Path) -> None:
     drive(scenario)
 
 
-def test_read_only_refuses_every_verb(seeded: Path) -> None:
+def test_read_only_refuses_every_verb(seeded: SbxloopHome) -> None:
     ctl = FakeCtl(live_status())
 
     async def scenario() -> None:
@@ -273,7 +273,7 @@ def test_read_only_refuses_every_verb(seeded: Path) -> None:
     drive(scenario)
 
 
-def test_queue_verbs_use_ctl_when_live_and_the_row_when_down(seeded: Path) -> None:
+def test_queue_verbs_use_ctl_when_live_and_the_row_when_down(seeded: SbxloopHome) -> None:
     ctl = FakeCtl(live_status())
 
     async def scenario() -> None:
@@ -307,7 +307,7 @@ def test_queue_verbs_use_ctl_when_live_and_the_row_when_down(seeded: Path) -> No
             await pilot.pause(0.3)
             await pilot.press("y")
             await pilot.pause(1.5)
-        store = DaemonStore(seeded / "state.db")
+        store = DaemonStore(seeded.state_db)
         try:
             item = store.get("gh:issue:41")
             assert item is not None and item.state == "queued" and item.run_id is None
@@ -317,8 +317,8 @@ def test_queue_verbs_use_ctl_when_live_and_the_row_when_down(seeded: Path) -> No
     drive(scenario)
 
 
-def test_phases_tab_folds_usage_per_persona(seeded: Path) -> None:
-    store = StateStore(seeded / "state.db")
+def test_phases_tab_folds_usage_per_persona(seeded: SbxloopHome) -> None:
+    store = StateStore(seeded.state_db)
     try:
         for who in ("builder", "builder", "critic"):
             store.append_event(

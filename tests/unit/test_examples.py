@@ -15,7 +15,7 @@ import pytest
 from pydantic import BaseModel
 
 from sbxloop.cli.app import DEFAULT_CONFIG_TOML, config_presets, render_config_template
-from sbxloop.config import Config, load_config, load_dotenv_file
+from sbxloop.config import Config, load_config, load_secrets_env
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE = REPO_ROOT / "sbxloop.toml.example"
@@ -173,7 +173,8 @@ class TestPresets:
 
 
 # Derived internals the engine sets on a narrowed config; never configured.
-INTERNAL_KEYS = {"github.enabled_repo_count", "workload.result_issue"}
+# `home` is SBXLOOP_HOME, never a file key (sbxloop.paths).
+INTERNAL_KEYS = {"github.enabled_repo_count", "workload.result_issue", "home"}
 
 
 def test_example_mentions_every_key_the_config_model_knows() -> None:
@@ -250,10 +251,11 @@ def test_env_example_documents_the_per_repo_token_pattern() -> None:
     assert re.search(r"^#?\s*GH_TOKEN_TWO\s*=", text, re.MULTILINE)
 
 
-def test_env_example_documents_the_daemon_host_layout() -> None:
+def test_env_example_documents_where_it_lives() -> None:
     text = ENV_EXAMPLE.read_text()
-    assert "~/.config/sbxloop/secrets.env" in text
+    assert "~/.sbxloop/config/secrets.env" in text
     assert "0600" in text
+    assert "~/.config/sbxloop" not in text
 
 
 def test_env_example_sbxloop_overrides_name_real_config_keys() -> None:
@@ -289,14 +291,18 @@ def _config_key_paths() -> set[str]:
     return paths
 
 
-def test_env_example_loads_with_the_cli_dotenv_loader(tmp_path: Path, monkeypatch: Any) -> None:
+def test_env_example_loads_with_the_cli_secrets_loader(tmp_path: Path, monkeypatch: Any) -> None:
     """The file parses with the same loader `sbxloop` uses, and — since every
     credential ships blank or commented — sets nothing that could shadow a
     real export."""
-    (tmp_path / ".env").write_text(ENV_EXAMPLE.read_text())
+    from sbxloop.paths import SbxloopHome
+
+    home = SbxloopHome(tmp_path / ".sbxloop")  # HOME is tmp_path (autouse fixture)
+    home.config.mkdir(parents=True, exist_ok=True)
+    home.secrets_env.write_text(ENV_EXAMPLE.read_text())
     for name in CREDENTIAL_ENVS:
         monkeypatch.delenv(name, raising=False)
-    assert load_dotenv_file(tmp_path) == tmp_path / ".env"
+    assert load_secrets_env() == home.secrets_env
     for name in CREDENTIAL_ENVS:
         assert not os.environ.get(name), f"{name} got a value from .env.example"
 
@@ -367,7 +373,6 @@ def test_example_ships_sections_commented_out() -> None:
     assert set(parsed) == {
         "model",
         "app_name",
-        "state_dir",
         "keep_sandboxes",
         "keep_on_failure",
         "worker_transport",

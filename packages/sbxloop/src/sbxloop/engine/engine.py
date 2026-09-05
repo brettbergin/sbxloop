@@ -71,7 +71,7 @@ from sbxloop.config import (
     VerifyMode,
     _flatten,
     load_config,
-    load_dotenv_file,
+    load_secrets_env,
 )
 from sbxloop.deliver import (
     conventional_title,
@@ -320,16 +320,17 @@ class LoopEngine:
         service_ops: ServiceOpsFactory | None = None,
         trigger_label: str | None = None,
     ) -> None:
-        # Library parity with the CLI: a ./.env supplies tokens/settings even
-        # when the caller passes a prebuilt Config (real env vars still win).
-        load_dotenv_file()
+        # Library parity with the CLI: the home's secrets.env supplies tokens
+        # and settings even when the caller passes a prebuilt Config (real
+        # env vars still win).
+        load_secrets_env()
         self.config = config or load_config()
         # The daemon's trigger label for this run's repository, set only when
         # a daemon dispatched the run (#631): follow-up issues then tell the
         # reader which label queues them. None under `sbxloop run`, where no
         # daemon watches the repository and the instruction would mislead.
         self.trigger_label = trigger_label
-        self.store = store or StateStore(self.config.state_dir / "state.db")
+        self.store = store or StateStore(self.config.paths.state_db)
         self.bus = bus or EventBus()
         self.sbx = sbx or SbxCLI(app_name=self.config.app_name or None)
         self.worker_python = (
@@ -627,7 +628,7 @@ class LoopEngine:
         from a different directory — in between.
 
         Tokens still come from the current environment (they are never
-        persisted), and ``state_dir`` stays the one that located the run: the
+        persisted), and ``home`` stays the one that located the run: the
         store is already open there. The debug/cleanup toggles
         (``keep_sandboxes``, ``keep_on_failure``) also stay resume-time
         choices — they are operator intent about THIS attempt, not run
@@ -656,7 +657,7 @@ class LoopEngine:
             return
         stored = stored.model_copy(
             update={
-                "state_dir": self.config.state_dir,
+                "home": self.config.home,
                 "keep_sandboxes": self.config.keep_sandboxes,
                 "keep_on_failure": self.config.keep_on_failure,
             }
@@ -1180,8 +1181,8 @@ class LoopEngine:
         """
         if pair.mounted:
             return
-        target = self.config.state_dir / "runs" / run_id
-        target /= "data" if kind == "workload" else "artifacts"
+        home = self.config.paths
+        target = home.run_data(run_id) if kind == "workload" else home.run_artifacts(run_id)
         target.mkdir(parents=True, exist_ok=True)
         exclude = self.config.artifacts.exclude
         # Build tar exclude flags: --exclude=<name> for each entry.
@@ -1230,13 +1231,9 @@ class LoopEngine:
         target: Path | None
         if kind == "workload":
             # What the artifact sink delivered (#759), when it did.
-            target = self.config.state_dir / "runs" / run_id / "artifacts"
+            target = self.config.paths.run_artifacts(run_id)
         else:
-            target = (
-                pair.workspace
-                if pair.mounted
-                else self.config.state_dir / "runs" / run_id / "artifacts"
-            )
+            target = pair.workspace if pair.mounted else self.config.paths.run_artifacts(run_id)
         return target if target is not None and target.is_dir() else None
 
     def _report_artifacts(self, run_id: str, pair: SandboxPair, kind: RunKind = "code") -> None:
@@ -2285,7 +2282,7 @@ class LoopEngine:
         ``runs/<run>/artifacts``: a host copy from a mounted workspace, a
         tar of the listed paths from an unmounted one. Returns the
         directory and the files' host paths, in declaration order."""
-        target = artifacts_dir(run, self.config.state_dir)
+        target = artifacts_dir(run, self.config.paths)
         assert target is not None
         files = sinks.declared_files(carried)
         target.mkdir(parents=True, exist_ok=True)

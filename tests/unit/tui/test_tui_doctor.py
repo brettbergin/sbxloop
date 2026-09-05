@@ -10,6 +10,7 @@ import pytest
 from textual.widgets import Input
 
 from sbxloop.cli.doctor import doctor_report
+from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.secretstate import (
     COPILOT_TOKEN_ENV,
@@ -31,14 +32,16 @@ REFRESH: dict[str, Any] = {"refresh_s": 3.0}
 
 
 @pytest.fixture
-def host(seeded: Path, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+def host(
+    seeded: SbxloopHome, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> Path:
     """A host whose config lives beside the seeded state dir, with tokens
     (set after the fake sbx fixture, which scrubs them)."""
     monkeypatch.chdir(seeded)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
     monkeypatch.setenv("GH_TOKEN", "tok")
-    (seeded / "sbxloop.toml").write_text(f'state_dir = "{seeded}"\n')
+    (seeded.root / "sbxloop.toml").write_text(f'state_dir = "{seeded}"\n')
     return seeded
 
 

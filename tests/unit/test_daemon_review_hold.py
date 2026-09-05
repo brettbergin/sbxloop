@@ -29,7 +29,7 @@ from tests.unit.test_daemon_merge_gate import FakeDaemonGithub
 
 def config(tmp_path: Path, **overrides: Any) -> Config:
     data: dict[str, Any] = {
-        "state_dir": str(tmp_path / "state"),
+        "home": str(tmp_path / "state"),
         "github": {"repo": "o/r", "reviewers": ["alice", "o/reviewers"]},
         "landing": {"review_poll_interval_s": 600, "review_wait_s": 3600, **overrides},
     }
@@ -126,7 +126,7 @@ class TestPark:
     def test_a_per_repo_override_replaces_reviewers_and_notify(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {
                     "repo": "o/r",
                     "reviewers": ["alice"],

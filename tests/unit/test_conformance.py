@@ -8,6 +8,7 @@ from pathlib import Path
 
 import pytest
 
+from sbxloop.paths import SbxloopHome
 from sbxloop.sbx import conformance
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import (
@@ -58,7 +59,7 @@ class TestCatalog:
 
 class TestDeepRun:
     def test_deep_run_matches_expected_verdicts(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
-        state = tmp_path / "state"
+        state = SbxloopHome(tmp_path / "state")
         report = run_conformance(make_cli(fake_sbx), state, deep=True)
         assert report.version == FAKE_VERSION
         outcomes = by_id(report)
@@ -84,7 +85,7 @@ class TestDeepRun:
         assert state["custom"] == {}
 
     def test_deep_run_writes_version_keyed_cache(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
-        state = tmp_path / "state"
+        state = SbxloopHome(tmp_path / "state")
         run_conformance(make_cli(fake_sbx), state, deep=True)
         cached = load_verdicts(state, FAKE_VERSION)
         assert set(cached) == {probe.id for probe in CATALOG}
@@ -251,7 +252,7 @@ class TestShallowRun:
         assert make_cli(fake_sbx).ls() == []
 
     def test_sandbox_probes_served_from_cache(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
-        state = tmp_path / "state"
+        state = SbxloopHome(tmp_path / "state")
         cli = make_cli(fake_sbx)
         run_conformance(cli, state, deep=True)
         report = run_conformance(cli, state, deep=False)
@@ -263,7 +264,7 @@ class TestShallowRun:
     def test_field_recorded_verdicts_render_as_field(
         self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
-        state = tmp_path / "state"
+        state = SbxloopHome(tmp_path / "state")
         record_field_verdict(
             state, FAKE_VERSION, PROBE_SECRET_ENV_VISIBILITY, "invisible-under-exec"
         )
@@ -313,7 +314,7 @@ class TestDrift:
         )
 
     def test_cross_version_flip_is_drift(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
-        state = tmp_path / "state"
+        state = SbxloopHome(tmp_path / "state")
         self.seed_old_version(state, PROBE_SECRET_ENV_VISIBILITY, "visible-under-exec")
         report = run_conformance(make_cli(fake_sbx), state, deep=True)
         outcome = by_id(report)[PROBE_SECRET_ENV_VISIBILITY]
@@ -324,7 +325,7 @@ class TestDrift:
     def test_expected_mismatch_names_dependent_behavior(
         self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
-        state = tmp_path / "state"
+        state = SbxloopHome(tmp_path / "state")
         # seed the CURRENT version's cache with a flipped verdict; a shallow
         # run must still alarm on the cached value. Any probe carrying an
         # `expected` will do — secret-env-visibility deliberately carries None
@@ -342,7 +343,7 @@ class TestDrift:
     def test_same_verdict_across_versions_is_not_drift(
         self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
-        state = tmp_path / "state"
+        state = SbxloopHome(tmp_path / "state")
         self.seed_old_version(state, PROBE_SECRET_ENV_VISIBILITY, "invisible-under-exec")
         report = run_conformance(make_cli(fake_sbx), state, deep=True)
         assert report.drifted == []
@@ -350,14 +351,14 @@ class TestDrift:
 
 class TestCache:
     def test_save_merges_instead_of_replacing(self, tmp_path: Path) -> None:
-        state = tmp_path / "state"
+        state = SbxloopHome(tmp_path / "state")
         save_verdicts(state, "0.35.0", {"a": ProbeRecord(verdict="x", checked_at=1.0)})
         save_verdicts(state, "0.35.0", {"b": ProbeRecord(verdict="y", checked_at=2.0)})
         cached = load_verdicts(state, "0.35.0")
         assert set(cached) == {"a", "b"}
 
     def test_versions_get_distinct_files(self, tmp_path: Path) -> None:
-        state = tmp_path / "state"
+        state = SbxloopHome(tmp_path / "state")
         save_verdicts(state, "0.35.0", {"a": ProbeRecord(verdict="x", checked_at=1.0)})
         save_verdicts(state, "0.36.0", {"a": ProbeRecord(verdict="y", checked_at=2.0)})
         assert cache_path(state, "0.35.0") != cache_path(state, "0.36.0")
@@ -365,7 +366,7 @@ class TestCache:
         assert load_verdicts(state, "0.36.0")["a"].verdict == "y"
 
     def test_corrupt_cache_treated_as_empty(self, tmp_path: Path) -> None:
-        state = tmp_path / "state"
+        state = SbxloopHome(tmp_path / "state")
         path = cache_path(state, "0.35.0")
         path.parent.mkdir(parents=True)
         path.write_text("{not json")
@@ -374,7 +375,7 @@ class TestCache:
     def test_record_field_verdict_swallows_unwritable_dir(self, tmp_path: Path) -> None:
         blocker = tmp_path / "state"
         blocker.write_text("a file where the state dir should be")
-        record_field_verdict(blocker, "0.35.0", "a", "x")  # must not raise
+        record_field_verdict(SbxloopHome(blocker), "0.35.0", "a", "x")  # must not raise
 
 
 class TestExecStdinEnvProbe:

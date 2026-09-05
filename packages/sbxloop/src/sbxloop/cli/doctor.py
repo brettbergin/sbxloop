@@ -41,6 +41,7 @@ from sbxloop.gh.permissions import (
     split_required,
 )
 from sbxloop.gh.protection import read_base_requirements
+from sbxloop.paths import SbxloopHome, describe, legacy_paths
 from sbxloop.sbx.bake import load_bake_record
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import ConformanceReport, run_conformance
@@ -157,17 +158,6 @@ def _login_name() -> str:
         return str(os.getuid()) if hasattr(os, "getuid") else "operator"
 
 
-def _daemon_state_path(config: Config, sources: dict[str, str], env: dict[str, str]) -> Path:
-    """Where `sbxloop daemon` keeps its state — the same rule the daemon
-    and `sbxloop tui` apply — falling back to the configured state dir."""
-    from sbxloop.daemon.paths import resolve_state_dir
-
-    try:
-        return resolve_state_dir(config, sources, cwd=Path.cwd(), env=env, home=Path.home()).path
-    except Exception:
-        return config.state_dir
-
-
 def daemon_repo_health(
     config: Config, sources: dict[str, str], env: dict[str, str]
 ) -> dict[str, dict[str, Any]]:
@@ -177,7 +167,7 @@ def daemon_repo_health(
     from sbxloop.daemon.sources import REPO_HEALTH_KEY
     from sbxloop.daemon.store import DaemonStore
 
-    db = _daemon_state_path(config, sources, env) / "state.db"
+    db = config.paths.state_db
     if not db.is_file():
         return {}
     out: dict[str, dict[str, Any]] = {}
@@ -931,7 +921,7 @@ def collect_checks(
         if logged_in:
             report("checking for orphaned sandboxes")
             try:
-                orphans = count_orphans(cli, StateStore(config.state_dir / "state.db"))
+                orphans = count_orphans(cli, StateStore(config.paths.state_db))
             except (SbxError, OSError, sqlite3.Error):
                 orphans = None
             if orphans is not None:
@@ -1231,13 +1221,12 @@ def collect_checks(
         )
     # The operator console's local bridge is always on: its mailbox lives in
     # the daemon's state.db and the console attaches as the login user.
-    tui_state = _daemon_state_path(config, sources, env)
     operator = config.tui.operator_id or _login_name()
     checks.append(
         Check(
             "operator console",
             True,
-            f"`sbxloop tui` attaches to {tui_state}/state.db as {operator}; "
+            f"`sbxloop tui` attaches to {config.paths.state_db} as {operator}; "
             f"unit {config.tui.daemon_unit}",
             hard=False,
         )
@@ -1281,44 +1270,75 @@ def collect_checks(
 
     checks.append(host_lfs_check(config))
 
-    # state dir writable
-    try:
-        config.state_dir.mkdir(parents=True, exist_ok=True)
-        probe = config.state_dir / ".doctor-probe"
-        probe.write_text("ok")
-        probe.unlink()
-        checks.append(Check("state dir", True, str(config.state_dir.resolve())))
-    except OSError as exc:
-        checks.append(Check("state dir", False, f"not writable: {exc}"))
-
-    legacy = _legacy_state_dir(config.state_dir, sources)
-    if legacy is not None:
-        checks.append(
-            Check(
-                "legacy state dir",
-                False,
-                f"{legacy} exists but state_dir is unconfigured, so runs, "
-                f"status and logs now use {config.state_dir}; set "
-                'state_dir = ".sbxloop" in sbxloop.toml to keep project-scoped '
-                "state, or move it to the new location",
-                hard=False,
-            )
-        )
+    checks.extend(home_checks(config.paths, env))
 
     return checks
 
 
-def _legacy_state_dir(state_dir: Path, sources: dict[str, str]) -> Path | None:
-    """A ``./.sbxloop`` left by the former relative default that
-    an unconfigured run would now silently ignore. Only reported when the
-    default is in effect and points elsewhere: an explicit relative
-    ``state_dir = ".sbxloop"`` is the supported project-scoped opt-in."""
-    if sources.get("state_dir") != "default":
-        return None
-    candidate = Path.cwd() / ".sbxloop"
-    if not candidate.is_dir() or candidate.resolve() == state_dir.resolve():
-        return None
-    return candidate
+def home_checks(home: SbxloopHome, env: dict[str, str]) -> list[Check]:
+    """The home (:mod:`sbxloop.paths`): laid out by ``sbxloop init``, whole,
+    writable, and the only layout on this host.
+
+    Leftovers of the layouts the home replaced are a *hard* failure. A host
+    with two layouts is misconfigured — which one a command reads would
+    depend on which rule it applied — and that is exactly what the home
+    ends; ``sbxloop init --migrate --purge`` moves and removes them.
+    """
+    checks: list[Check] = []
+    record = home.read_record()
+    if record is None:
+        checks.append(
+            Check(
+                "home",
+                False,
+                f"{home.root} is not an sbxloop home (no {home.record.name}); run `sbxloop init`",
+            )
+        )
+    else:
+        missing = home.missing_directories()
+        if missing:
+            listed = ", ".join(str(p.relative_to(home.root)) for p in missing)
+            checks.append(
+                Check("home", False, f"{home.root} is missing {listed}; run `sbxloop init`")
+            )
+        else:
+            try:
+                probe = home.state / ".doctor-probe"
+                probe.write_text("ok")
+                probe.unlink()
+                checks.append(
+                    Check(
+                        "home",
+                        True,
+                        f"{home.root} (layout v{record.layout_version}, "
+                        f"laid out by {record.created_by} at {record.created_at})",
+                    )
+                )
+            except OSError as exc:
+                checks.append(Check("home", False, f"{home.root} is not writable: {exc}"))
+    if home.secrets_env.exists():
+        mode = home.secrets_env.stat().st_mode & 0o777
+        checks.append(
+            Check(
+                "secrets file",
+                mode == 0o600,
+                f"{home.secrets_env} mode {mode:04o}"
+                + ("" if mode == 0o600 else "; run `chmod 600` on it"),
+            )
+        )
+    legacy = legacy_paths(home, env, cwd=Path.cwd())
+    if legacy:
+        checks.append(
+            Check(
+                "legacy layout",
+                False,
+                "found: "
+                + describe(legacy)
+                + "; run `sbxloop init --migrate --purge` to move them into the home "
+                "and remove the leftovers",
+            )
+        )
+    return checks
 
 
 def _clean(detail: str, limit: int = 300) -> str:
@@ -1446,7 +1466,7 @@ def doctor_report(
         try:
             conformance = run_conformance(
                 cli,
-                config.state_dir,
+                config.paths,
                 deep=deep,
                 template=config.sandbox.template,
                 progress=report,

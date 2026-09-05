@@ -74,7 +74,7 @@ OLD_MESSAGE_NO_MODEL = '{"agent": "executor", "content": "done"}'
 # A `runs` row from before config persistence at all...
 OLD_CONFIG_EMPTY = "{}"
 # ...and one that persisted a config but predates the `[agent]` section.
-OLD_CONFIG_NO_AGENT = '{"model": "gpt-5", "state_dir": "/var/lib/sbxloop"}'
+OLD_CONFIG_NO_AGENT = '{"model": "gpt-5", "home": "/var/lib/sbxloop"}'
 
 
 def legacy_store(tmp_path: Path, *, config_json: str = OLD_CONFIG_NO_AGENT) -> Path:

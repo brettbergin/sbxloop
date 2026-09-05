@@ -1078,8 +1078,8 @@ def gitignored_files(root: Path) -> frozenset[str] | None:
     ``ls-files`` consults can execute code (no hooks, filters, or pager
     with captured output).
 
-    ``root`` is made absolute first: unmounted artifact roots derive from
-    the relative default ``state_dir`` (``.sbxloop/runs/...``), and git
+    ``root`` is made absolute first: a caller may hand in a relative
+    artifact root (a test, an embedder), and git
     resolves ``GIT_WORK_TREE`` against its cwd -- which is ``root`` -- so
     a relative value would point at ``root/root`` and ignore nothing.
     """

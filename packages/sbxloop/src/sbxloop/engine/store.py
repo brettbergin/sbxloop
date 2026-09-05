@@ -1,6 +1,6 @@
 """SQLite state store: runs, tasks, phase attempts, events.
 
-One WAL-mode database at ``<state_dir>/state.db``. A checkpoint row is
+One WAL-mode database at ``<home>/state/state.db``. A checkpoint row is
 written after every state transition, which is what makes ``resume`` safe:
 a phase whose result was never committed is simply re-run from its start.
 """

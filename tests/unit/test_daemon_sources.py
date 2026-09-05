@@ -613,13 +613,13 @@ class TestDaemonGithubInstance:
         from sbxloop.daemon.github import SANDBOX_NAME_PREFIX, DaemonGithub, sandbox_name_for
         from sbxloop.events import EventBus
 
-        a = Config.model_validate({"state_dir": str(tmp_path / "a")})
-        b = Config.model_validate({"state_dir": str(tmp_path / "b")})
+        a = Config.model_validate({"home": str(tmp_path / "a")})
+        b = Config.model_validate({"home": str(tmp_path / "b")})
         gh_a = DaemonGithub(a, sbx=object(), bus=EventBus(), worker_python="python3")  # type: ignore[arg-type]
         gh_b = DaemonGithub(b, sbx=object(), bus=EventBus(), worker_python="python3")  # type: ignore[arg-type]
         assert gh_a.name != gh_b.name
         assert gh_a.name.startswith(SANDBOX_NAME_PREFIX + "-")
-        assert gh_a.name == sandbox_name_for(a.state_dir)  # stable across restarts
+        assert gh_a.name == sandbox_name_for(a.paths)  # stable across restarts
 
     def test_reprovision_is_rate_limited(self, tmp_path: Any) -> None:
         """A GitHub outage used to cost one microVM rebuild per failing
@@ -628,7 +628,7 @@ class TestDaemonGithubInstance:
         from sbxloop.daemon.github import REPROVISION_MIN_INTERVAL_S, DaemonGithub
         from sbxloop.events import EventBus
 
-        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        config = Config.model_validate({"home": str(tmp_path / "state")})
         now = [1000.0]
         gh_ = DaemonGithub(
             config,
@@ -666,7 +666,7 @@ class TestDaemonGithubInstance:
         from sbxloop.daemon.github import DaemonGithub
         from sbxloop.events import EventBus
 
-        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        config = Config.model_validate({"home": str(tmp_path / "state")})
         gh_ = DaemonGithub(
             config, sbx=object(), bus=EventBus(), worker_python="python3", clock=lambda: 0.0
         )  # type: ignore[arg-type]
@@ -694,7 +694,7 @@ class TestDaemonGithubProvisioning:
         from sbxloop.errors import DaemonError, ProvisionError
         from sbxloop.events import EventBus
 
-        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        config = Config.model_validate({"home": str(tmp_path / "state")})
         gh_ = DaemonGithub(config, sbx=object(), bus=EventBus(), worker_python="python3")  # type: ignore[arg-type]
 
         class Boom:

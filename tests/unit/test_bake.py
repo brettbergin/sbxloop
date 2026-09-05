@@ -32,7 +32,7 @@ VENV_PY = "/home/agent/.sbxloop/venv/bin/python"
 
 @pytest.fixture
 def config(tmp_path: Path) -> Config:
-    return Config(state_dir=tmp_path / "state")
+    return Config(home=tmp_path / "state")
 
 
 @pytest.fixture
@@ -121,7 +121,7 @@ class TestBakeHappyPath:
         # #616: the bake installs the configured toolchains, so their
         # installer hosts must be reachable in the scratch sandbox too.
         config = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "sandbox": {"languages": ["go"]}}
+            {"home": str(tmp_path / "state"), "sandbox": {"languages": ["go"]}}
         )
         script_install(fake_sbx, languages=["go"])
         bake_template(cli, config, name=BOX)
@@ -137,7 +137,7 @@ class TestBakeHappyPath:
         Go. The configured set is provisioned and recorded — in the host
         record for doctor and in the in-VM manifest for provisioning."""
         config = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "sandbox": {"languages": ["go"]}}
+            {"home": str(tmp_path / "state"), "sandbox": {"languages": ["go"]}}
         )
         script_install(fake_sbx, languages=["go"])
         record = bake_template(cli, config, name=BOX)
@@ -156,7 +156,7 @@ class TestBakeHappyPath:
         # not in the record, so doctor says the template lacks it rather
         # than trusting the attempt.
         config = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "sandbox": {"languages": ["python", "go"]}}
+            {"home": str(tmp_path / "state"), "sandbox": {"languages": ["python", "go"]}}
         )
         script_install(fake_sbx, languages=["python", "go"], missing=["go"])
         reports: list[str] = []

@@ -19,7 +19,6 @@ from typer.testing import CliRunner
 from sbxloop.cli.app import app
 from sbxloop.config import Config
 from sbxloop.daemon.control import (
-    CTL_SUBDIR,
     ITEM_COMMANDS,
     CommandReply,
     ControlClient,
@@ -36,6 +35,7 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import RunResult
 from sbxloop.engine.store import StateStore
 from sbxloop.events import EventBus
+from sbxloop.paths import SbxloopHome
 from tests.unit.test_daemon_discord import FakeLoop
 from tests.unit.test_daemon_loop import FakeSource, gh_item
 
@@ -45,23 +45,21 @@ runner = CliRunner()
 @pytest.fixture
 def workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.chdir(tmp_path)
-    # The daemon anchors its default state dir under XDG state home (#255);
-    # `ctl` must find the daemon there, not under the runner dir's `.sbxloop`.
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
     return tmp_path
 
 
-def daemon_state(workdir: Path) -> Path:
-    return workdir / "xdg-state" / "sbxloop" / workdir.name
+def daemon_state(workdir: Path) -> SbxloopHome:
+    """The home `ctl` and the daemon share: HOME is the test's tmp dir."""
+    return SbxloopHome(workdir / ".sbxloop")
 
 
-def _dstore(tmp_path: Path) -> DaemonStore:
-    return DaemonStore(tmp_path / "state" / "state.db")
+def _dstore(home: SbxloopHome) -> DaemonStore:
+    return DaemonStore(home.state_db)
 
 
 class TestDispatch:
     def test_every_verb_reaches_the_loop(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         status = dispatch(floop, "status")
         assert "**queued:** 2" in status.text and status.status == floop.status()
         assert dispatch(floop, "pause").ok and floop.paused
@@ -73,7 +71,7 @@ class TestDispatch:
     def test_cancel_and_retry_carry_the_operator(self, tmp_path: Path) -> None:
         """#246: whoever asked is what the source hears — Discord passes its
         author, ctl its OS user; the dispatcher must not drop it."""
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         floop.dstore.upsert_new(WorkItem(item_id="gh:issue:8", source_key="8", title="Eight"), 1.0)
         floop.dstore.mark_running("gh:issue:8", "r1", 1.0)
         floop.dstore.mark_cancelled("gh:issue:8", "cancelled by op", 2.0)
@@ -87,11 +85,11 @@ class TestDispatch:
     def test_a_client_names_its_operator_on_the_request(self, tmp_path: Path) -> None:
         """The console submits as "<user> via sbxloop tui": the request
         carries it, so the source's "cancelled by …" names the surface."""
-        floop = FakeLoop(_dstore(tmp_path))
-        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        server = ControlServer(floop, SbxloopHome(tmp_path), poll_s=0.02)
         server.start()
         try:
-            client = ControlClient(tmp_path, by="brett via sbxloop tui")
+            client = ControlClient(SbxloopHome(tmp_path), by="brett via sbxloop tui")
             reply = client.submit("cancel", timeout_s=5)
             assert reply is not None and reply.ok
             assert floop.cancel_calls == [("brett via sbxloop tui", False)]
@@ -99,7 +97,7 @@ class TestDispatch:
             server.close()
 
     def test_item_verbs_report_the_stores_reason(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         floop.dstore.upsert_new(WorkItem(item_id="gh:issue:9", source_key="9", title="Do A"), 1.0)
         floop.dstore.mark_running("gh:issue:9", "r1", 1.0)
         reply = dispatch(floop, "abandon")
@@ -117,7 +115,7 @@ class TestDispatch:
         """#508: both spellings reach the row; only the typed one is echoed."""
         import re as _re
 
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         floop.dstore.upsert_new(WorkItem(item_id="gh:issue:7", source_key="7", title="Seven"), 1.0)
         floop.dstore.mark_running("gh:issue:7", "r1", 1.0)
         reply = dispatch(floop, "requeue gh:7")  # legacy spelling
@@ -136,7 +134,7 @@ class TestDispatch:
         import sqlite3
 
         db = tmp_path / "state" / "state.db"
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         floop.dstore.upsert_new(WorkItem(item_id="gh:issue:7", source_key="7", title="Seven"), 1.0)
         floop.dstore.close()
         conn = sqlite3.connect(db)
@@ -149,7 +147,7 @@ class TestDispatch:
             assert "gh:issue:7" in text and not _re.search(r"gh:\d", text)
 
     def test_verbs_are_case_insensitive(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         assert dispatch(floop, "PAUSE").ok and floop.paused
         assert dispatch(floop, "Resume").ok and not floop.paused
 
@@ -157,7 +155,7 @@ class TestDispatch:
         """A mistyped `--hold` must not quietly become the operator's bare
         pause/resume: `resume --al` releasing the wrong hold is exactly the
         surprise named holds exist to prevent (#534)."""
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         for cmd in ("pause now please", "pause --hodl x", "pause --hold", "resume --al"):
             reply = dispatch(floop, cmd)
             assert not reply.ok and "usage:" in reply.text, cmd
@@ -171,7 +169,7 @@ class TestDispatch:
         logger = get_logger("sbxloop.test.ctl")
         logger.info("ctl.probe_one", n=1)
         logger.warning("ctl.probe_two", n=2)
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         reply = dispatch(floop, "log --tail 3")
         assert reply.ok and reply.preformatted and reply.text.startswith("showing")
         assert "```" not in reply.text, "the fence is the transport's, ctl prints it raw"
@@ -210,14 +208,14 @@ class TestDispatch:
         from sbxloop.log import get_logger, log_buffer
 
         get_logger("sbxloop.test.ctl").info("ctl.trace_probe")
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         before = len(log_buffer())
         dispatch(floop, "log --grep trace_probe")
         dispatch(floop, "log --grep trace_probe")
         assert len(log_buffer()) == before
 
     def test_stop_asks_the_loop_to_finish_and_exit(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         reply = dispatch(floop, "stop", by="ops")
         # The flag goes up through `after`, once the caller has sent the
         # reply — a chat bridge must not be torn down under its answer.
@@ -232,8 +230,8 @@ class TestDispatch:
         assert "stopping:" in dispatch(floop, "status").text
 
     def test_stop_over_ctl_takes_effect_after_the_reply_is_written(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
-        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        server = ControlServer(floop, SbxloopHome(tmp_path), poll_s=0.02)
         server.dir.mkdir(parents=True)
         (server.dir / f"{time.time():.6f}-stop.json").write_text(json.dumps({"cmd": "stop"}))
         assert server.serve_once() == 1
@@ -242,7 +240,9 @@ class TestDispatch:
         assert json.loads(reply_path.read_text())["ok"]
 
     def test_unknown_verb_returns_usage_with_the_callers_prefix(self, tmp_path: Path) -> None:
-        reply = dispatch(FakeLoop(_dstore(tmp_path)), "bogus", prefix="sbxloop daemon ctl")
+        reply = dispatch(
+            FakeLoop(_dstore(SbxloopHome(tmp_path))), "bogus", prefix="sbxloop daemon ctl"
+        )
         assert not reply.ok and not reply.known
         assert reply.text == usage("sbxloop daemon ctl")
         assert (
@@ -254,7 +254,7 @@ class TestDispatch:
     def test_cancel_rejects_unknown_arguments(self, tmp_path: Path) -> None:
         # A typo (`--rety`) must not silently become a terminal no-retry
         # cancel: the two outcomes differ materially.
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         reply = dispatch(floop, "cancel --rety", prefix="sbxloop daemon ctl")
         assert not reply.ok and reply.known
         assert "unknown cancel argument" in reply.text and "--rety" in reply.text
@@ -262,7 +262,7 @@ class TestDispatch:
         assert floop.cancel_calls == []
 
     def test_cancel_with_nothing_running_is_not_ok(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         floop.cancel_current = lambda *a, **k: False  # type: ignore[method-assign]
         reply = dispatch(floop, "cancel")
         assert not reply.ok and "nothing is running" in reply.text
@@ -273,22 +273,22 @@ class TestDispatch:
 
 class TestControlQueue:
     def test_client_request_is_answered_by_the_server(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
-        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        server = ControlServer(floop, SbxloopHome(tmp_path), poll_s=0.02)
         server.start()
         try:
-            reply = ControlClient(tmp_path).submit("pause", timeout_s=5)
+            reply = ControlClient(SbxloopHome(tmp_path)).submit("pause", timeout_s=5)
             assert reply is not None and reply.ok and "paused" in reply.text
             assert floop.paused
             # request and reply files are both gone: nothing to replay later
-            assert list((tmp_path / CTL_SUBDIR).iterdir()) == []
+            assert list((SbxloopHome(tmp_path).ctl).iterdir()) == []
         finally:
             server.close()
 
     def test_requests_are_served_in_submission_order(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
-        server = ControlServer(floop, tmp_path, poll_s=0.02)
-        client = ControlClient(tmp_path)
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        server = ControlServer(floop, SbxloopHome(tmp_path), poll_s=0.02)
+        client = ControlClient(SbxloopHome(tmp_path))
         # Submit both before the server runs, then serve once.
         server.dir.mkdir(parents=True)
         for cmd in ("pause", "resume"):
@@ -300,9 +300,9 @@ class TestControlQueue:
 
     def test_timeout_withdraws_the_request(self, tmp_path: Path) -> None:
         """A `cancel` nobody answered must not fire when a daemon starts later."""
-        client = ControlClient(tmp_path)
+        client = ControlClient(SbxloopHome(tmp_path))
         assert client.submit("cancel", timeout_s=0.1) is None
-        assert list((tmp_path / CTL_SUBDIR).iterdir()) == []
+        assert list((SbxloopHome(tmp_path).ctl).iterdir()) == []
 
     def test_slow_command_the_daemon_took_is_reported_pending_not_absent(
         self, tmp_path: Path
@@ -311,7 +311,7 @@ class TestControlQueue:
         while the daemon is mid-command must say so — the abandon still
         lands, so "no reply from the daemon" would send the operator to
         check whether the daemon is even running."""
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         entered = threading.Event()
         release = threading.Event()
 
@@ -321,10 +321,10 @@ class TestControlQueue:
             floop.paused = True
 
         floop.pause = slow_pause  # type: ignore[method-assign]
-        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        server = ControlServer(floop, SbxloopHome(tmp_path), poll_s=0.02)
         server.start()
         try:
-            reply = ControlClient(tmp_path).submit("pause", timeout_s=0.3)
+            reply = ControlClient(SbxloopHome(tmp_path)).submit("pause", timeout_s=0.3)
             assert entered.is_set()
             assert reply is not None and reply.pending and not reply.ok
             assert "still executing" in reply.text
@@ -341,18 +341,18 @@ class TestControlQueue:
     def test_withdrawn_request_is_never_claimed(self, tmp_path: Path) -> None:
         # The claim is an atomic rename, so a request the client already
         # withdrew cannot be half-executed; only a still-present one runs.
-        floop = FakeLoop(_dstore(tmp_path))
-        server = ControlServer(floop, tmp_path, poll_s=0.02)
-        client = ControlClient(tmp_path)
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        server = ControlServer(floop, SbxloopHome(tmp_path), poll_s=0.02)
+        client = ControlClient(SbxloopHome(tmp_path))
         assert client.submit("pause", timeout_s=0.05) is None
         assert server.serve_once() == 0 and not floop.paused
 
     def test_requests_predating_the_daemon_are_refused_not_executed(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
-        ctl_dir = tmp_path / CTL_SUBDIR
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        ctl_dir = SbxloopHome(tmp_path).ctl
         ctl_dir.mkdir(parents=True)
         (ctl_dir / "1.000000-stale.json").write_text(json.dumps({"cmd": "pause"}))
-        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        server = ControlServer(floop, SbxloopHome(tmp_path), poll_s=0.02)
         server.start()
         try:
             assert not floop.paused
@@ -367,11 +367,11 @@ class TestControlQueue:
         # The start-up scan cannot see a request whose client paused between
         # writing its temp file and the atomic rename; the timestamp is what
         # keeps a pre-start `pause`/`cancel` from firing at boot.
-        floop = FakeLoop(_dstore(tmp_path))
-        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        server = ControlServer(floop, SbxloopHome(tmp_path), poll_s=0.02)
         server.start()
         server.close()
-        ctl_dir = tmp_path / CTL_SUBDIR
+        ctl_dir = SbxloopHome(tmp_path).ctl
         (ctl_dir / "1.000000-late.json").write_text(
             json.dumps({"cmd": "pause", "submitted_at": server._started_at - 1})
         )
@@ -396,11 +396,13 @@ class TestControlQueue:
         is the state a restart creates — is swept as stale. The deploy's
         health check read that refusal as "the daemon never came up" and
         rolled back a daemon that was healthy. The client resends instead."""
-        floop = FakeLoop(_dstore(tmp_path))
-        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        server = ControlServer(floop, SbxloopHome(tmp_path), poll_s=0.02)
         replies: list[CommandReply | None] = []
         caller = threading.Thread(
-            target=lambda: replies.append(ControlClient(tmp_path).submit("pause", timeout_s=10))
+            target=lambda: replies.append(
+                ControlClient(SbxloopHome(tmp_path)).submit("pause", timeout_s=10)
+            )
         )
         caller.start()
         try:
@@ -417,7 +419,7 @@ class TestControlQueue:
         assert replies[0].ok and "paused" in replies[0].text
         assert floop.paused
         # Nothing left behind to be replayed by a later daemon.
-        assert list((tmp_path / CTL_SUBDIR).iterdir()) == []
+        assert list((SbxloopHome(tmp_path).ctl).iterdir()) == []
 
     def test_resending_is_bounded_and_answers_with_the_refusal(self, tmp_path: Path) -> None:
         """A daemon that never finishes starting must fail at the deadline
@@ -428,14 +430,14 @@ class TestControlQueue:
         operator the daemon is executing a command it refused every time.
         This test used to pass only when that race went the other way; it
         was flaky on CI and blocked a release."""
-        floop = FakeLoop(_dstore(tmp_path))
-        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        server = ControlServer(floop, SbxloopHome(tmp_path), poll_s=0.02)
         server.start()
         # Every request from here on looks pre-start, so each is refused.
         server._started_at = time.time() + 3600
         try:
             started = time.monotonic()
-            reply = ControlClient(tmp_path).submit("pause", timeout_s=0.5)
+            reply = ControlClient(SbxloopHome(tmp_path)).submit("pause", timeout_s=0.5)
             elapsed = time.monotonic() - started
         finally:
             server.close()
@@ -445,11 +447,11 @@ class TestControlQueue:
 
     def test_the_stale_verdict_rides_on_the_reply_file(self, tmp_path: Path) -> None:
         """Carried structurally so the client never has to match on prose."""
-        floop = FakeLoop(_dstore(tmp_path))
-        ctl_dir = tmp_path / CTL_SUBDIR
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        ctl_dir = SbxloopHome(tmp_path).ctl
         ctl_dir.mkdir(parents=True)
         (ctl_dir / "1.000000-stale.json").write_text(json.dumps({"cmd": "pause"}))
-        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        server = ControlServer(floop, SbxloopHome(tmp_path), poll_s=0.02)
         server.start()
         try:
             reply = json.loads((ctl_dir / "1.000000-stale.reply.json").read_text())
@@ -467,16 +469,16 @@ class TestControlQueue:
     def test_a_crashing_command_answers_with_an_error_and_keeps_serving(
         self, tmp_path: Path
     ) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
 
         def boom() -> dict[str, Any]:
             raise RuntimeError("status exploded")
 
         floop.status = boom  # type: ignore[method-assign]
-        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        server = ControlServer(floop, SbxloopHome(tmp_path), poll_s=0.02)
         server.start()
         try:
-            client = ControlClient(tmp_path)
+            client = ControlClient(SbxloopHome(tmp_path))
             reply = client.submit("status", timeout_s=5)
             assert reply is not None and not reply.ok and "status exploded" in reply.text
             assert client.submit("pause", timeout_s=5) is not None and floop.paused
@@ -487,9 +489,9 @@ class TestControlQueue:
         """tick() joins the engine thread for the whole run, so the control
         server must live on its own thread or `cancel` could never land
         mid-run — the field scenario that motivated the issue."""
-        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
-        store = StateStore(config.state_dir / "state.db")
-        dstore = DaemonStore(config.state_dir / "state.db")
+        config = Config.model_validate({"home": str(tmp_path / "state")})
+        store = StateStore(config.paths.state_db)
+        dstore = DaemonStore(config.paths.state_db)
         source = FakeSource([gh_item()])
         released = threading.Event()
         cancelled = threading.Event()
@@ -506,12 +508,12 @@ class TestControlQueue:
             return RunResult(run_id=run_id, state="cancelled")
 
         loop = DaemonLoop(config, store=store, dstore=dstore, source=source, runner=run)
-        server = ControlServer(loop, config.state_dir, poll_s=0.02)
+        server = ControlServer(loop, config.paths, poll_s=0.02)
         server.start()
         ticker = threading.Thread(target=loop.tick, daemon=True)
         ticker.start()
         try:
-            client = ControlClient(config.state_dir)
+            client = ControlClient(config.paths)
             deadline = time.time() + 5
             while loop.current is None and time.time() < deadline:
                 time.sleep(0.01)
@@ -658,7 +660,7 @@ class TestCommandAudit:
     ) -> None:
         import logging
 
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         with caplog.at_level(logging.INFO, logger="sbxloop.daemon.control"):
             dispatch(floop, "pause", by="brett", via="discord")
         (record,) = [r for r in caplog.records if "operator.command" in r.getMessage()]
@@ -672,7 +674,7 @@ class TestCommandAudit:
     ) -> None:
         import logging
 
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         with caplog.at_level(logging.DEBUG, logger="sbxloop.daemon.control"):
             dispatch(floop, "status")
         (record,) = [r for r in caplog.records if "operator.command" in r.getMessage()]
@@ -684,7 +686,7 @@ class TestCommandAudit:
         import logging
 
         with caplog.at_level(logging.INFO, logger="sbxloop.daemon.control"):
-            dispatch(FakeLoop(_dstore(tmp_path)), "bogus", by="x")
+            dispatch(FakeLoop(_dstore(SbxloopHome(tmp_path))), "bogus", by="x")
         (record,) = [r for r in caplog.records if "operator.command" in r.getMessage()]
         assert "'ok': False" in record.getMessage() and "'known': False" in record.getMessage()
 
@@ -694,7 +696,7 @@ class TestHolds:
     dispatcher, and the status lines the deploy pipeline greps."""
 
     def test_named_holds_reach_the_loop_with_the_operator(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         reply = dispatch(floop, "pause --hold deploy-9", by="github-actions")
         assert reply.ok and "hold `deploy-9`" in reply.text and floop.holds == {"deploy-9"}
         assert floop.hold_calls[-1] == ("pause", "deploy-9", "github-actions")
@@ -709,7 +711,7 @@ class TestHolds:
         assert floop.hold_calls[-1] == ("unpause", None, None) and floop.holds == set()
 
     def test_invalid_hold_name_is_refused(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
 
         def strict_pause(hold: str = "operator", *, by: str | None = None) -> list[str]:
             from sbxloop.daemon.holds import hold_name
@@ -722,7 +724,7 @@ class TestHolds:
         assert not reply.ok and "invalid hold name" in reply.text and not floop.paused
 
     def test_status_lines_carry_holds_and_the_claim_in_progress(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         text = plain(dispatch(floop, "status").text)
         assert "current: idle" in text and "holds: none" in text
         floop.holds = {"operator", "deploy-1"}
@@ -734,7 +736,7 @@ class TestHolds:
     def test_status_from_a_loop_without_holds_still_reads(self, tmp_path: Path) -> None:
         """A status dict from a fake (or older loop) that only knows the
         boolean: paused implies the operator's hold."""
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         floop.holds = {"operator"}
         status = floop.status()
         del status["holds"]
@@ -746,14 +748,14 @@ class TestGrantRounds:
     """`grant-rounds <run> <n>` (#523) through the dispatcher."""
 
     def test_grant_rounds_reaches_the_loop_with_the_operator(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         reply = dispatch(floop, "grant-rounds r_abc 2", by="brett")
         assert reply.ok and floop.granted == [("r_abc", 2, "brett")]
         assert "granted `r_abc` 2 more fix round(s)" in reply.text and "gh:issue:9" in reply.text
         assert "grant-rounds" in ITEM_COMMANDS, "talks to the source: off Discord's event loop"
 
     def test_grant_rounds_validates_its_arguments(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         for cmd in (
             "grant-rounds",
             "grant-rounds r_abc",
@@ -766,7 +768,7 @@ class TestGrantRounds:
         assert floop.granted == []
 
     def test_grant_rounds_reports_the_loops_refusal(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         reply = dispatch(floop, "grant-rounds r_unknown 1")
         assert not reply.ok and reply.text == "grant-rounds failed: unknown run r_unknown"
 
@@ -776,7 +778,7 @@ class TestRepoHealth:
     repository is not healthy."""
 
     def test_resume_repo_reaches_the_loop(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         reply = dispatch(floop, "resume-repo o/a", by="brett")
         assert reply.ok and "polling `o/a` again" in reply.text
         assert floop.resumed_repos == [("o/a", "brett")]
@@ -786,7 +788,7 @@ class TestRepoHealth:
         assert not reply.ok and reply.text.startswith("resume-repo failed: unknown repository")
 
     def test_status_names_only_unwell_repos(self, tmp_path: Path) -> None:
-        floop = FakeLoop(_dstore(tmp_path))
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
         floop.repos = [{"repo": "o/a", "state": "ok"}, {"repo": "o/b", "state": "ok"}]
         assert "repos:" not in plain(dispatch(floop, "status").text)
         floop.repos = [

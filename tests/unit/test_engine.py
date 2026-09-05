@@ -131,7 +131,7 @@ class Harness:
         self.tmp_path = tmp_path
         self.monkeypatch = monkeypatch
         self.script_path = tmp_path / "echo-script.json"
-        self.state_dir = tmp_path / "state"
+        self.home = tmp_path / "state"
         self.events: list[Event] = []
         monkeypatch.setenv("SBXLOOP_WORKER_BACKEND", "echo")
         monkeypatch.setenv("SBXLOOP_ECHO_SCRIPT", str(self.script_path))
@@ -163,7 +163,7 @@ class Harness:
         )
         config = Config.model_validate(
             {
-                "state_dir": str(self.state_dir),
+                "home": str(self.home),
                 "budgets": config_overrides.pop("budgets", {}),
                 "limits": limits,
             }
@@ -173,7 +173,7 @@ class Harness:
         bus.subscribe(self.events.append)
         return LoopEngine(
             config,
-            store=StateStore(self.state_dir / "state.db"),
+            store=StateStore(self.paths.state_db),
             bus=bus,
             sbx=SbxCLI(binary=str(self.fake_sbx.binary)),
             worker_python=sys.executable,
@@ -219,7 +219,7 @@ def new_run_id_for(engine: LoopEngine) -> str:
 
 def harness_rows(harness: Harness, run_id: str) -> list[Any]:
     """The run's phase rows, read back from the harness's state db."""
-    return list(StateStore(harness.state_dir / "state.db").phase_attempts(run_id))
+    return list(StateStore(harness.paths.state_db).phase_attempts(run_id))
 
 
 class TestHappyPath:
@@ -1121,7 +1121,7 @@ class TestWorkspaceExecution:
         # not mounted: nothing lands in the live workspace...
         assert not (result.workspace / "hello.txt").exists()
         # ...but the sbx cp harvest brought the work dir contents to the host
-        harvested = harness.state_dir / "runs" / result.run_id / "artifacts"
+        harvested = harness.paths.runs / result.run_id / "artifacts"
         assert (harvested / "hello.txt").read_text() == "hi\n"
         assert (harvested / "sub/deep.txt").read_text() == "d"
         assert not engine.store.get_run(result.run_id).mounted
@@ -1200,7 +1200,7 @@ class TestWorkspaceExecution:
         result = harness.engine().start("write files in harvest mode")
 
         assert result.state == "completed"
-        harvested = harness.state_dir / "runs" / result.run_id / "artifacts"
+        harvested = harness.paths.runs / result.run_id / "artifacts"
         # Regular file must arrive
         assert (harvested / "hello.txt").read_text() == "hi\n"
         # .git must be absent — tar excluded it before the copy
@@ -1226,7 +1226,7 @@ class TestWorkspaceExecution:
         result = harness.engine().start("build the app")
 
         assert result.state == "completed"
-        harvested = harness.state_dir / "runs" / result.run_id / "artifacts"
+        harvested = harness.paths.runs / result.run_id / "artifacts"
         assert (harvested / "package.json").exists()
         assert not (harvested / "node_modules").exists()
         assert not (harvested / "target").exists()
@@ -1245,7 +1245,7 @@ class TestWorkspaceExecution:
         result = engine.start("two-task harvest-final run")
 
         assert result.state == "completed"
-        harvested = harness.state_dir / "runs" / result.run_id / "artifacts"
+        harvested = harness.paths.runs / result.run_id / "artifacts"
         assert (harvested / "hello.txt").read_text() == "hi\n"
 
         # Per-task mode would run tar once per task + once at the end.
@@ -1721,7 +1721,7 @@ class TestPipeline:
         result = engine.start("write hello.txt")
         assert result.state == "merged"
 
-        reopened = StateStore(harness.state_dir / "state.db")
+        reopened = StateStore(harness.paths.state_db)
         rows = [
             r
             for r in reopened.phase_attempts(result.run_id)
@@ -1808,7 +1808,7 @@ class TestPipeline:
         assert first["review"]["id"] is not None
         assert [p["anchor"] for p in first["posted"]] == ["hello.txt:1"]
 
-        reopened = StateStore(harness.state_dir / "state.db")
+        reopened = StateStore(harness.paths.state_db)
         try:
             posted = reopened.posted_findings(result.run_id)
         finally:

@@ -329,7 +329,7 @@ class TestGithubOpsSandboxScoping:
         from sbxloop.sbx.provision import Provisioner
 
         config = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "github": {"repos": repos}}
+            {"home": str(tmp_path / "state"), "github": {"repos": repos}}
         )
         return Provisioner(SbxCLI(binary="/bin/true"), config, env=env)
 
@@ -399,7 +399,7 @@ class TestGithubOpsSandboxScoping:
 
         config = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {"repos": [{"repo": "o/a"}], "api_url": "https://ghe.example.com/api/v3"},
             }
         )
@@ -450,7 +450,7 @@ class TestGithubOpsSandboxProvisioning:
 
         config = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {
                     "repos": [
                         {"repo": "o/a", "token_env": "TOKEN_A"},

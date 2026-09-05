@@ -42,6 +42,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from sbxloop.errors import SbxError, SbxloopError, SbxNotFoundError
+from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.parse import _CELL_SPLIT, parse_version
@@ -539,20 +540,20 @@ CATALOG: tuple[Probe, ...] = (
 # -- version-keyed verdict cache ---------------------------------------------
 
 
-def _conformance_dir(state_dir: Path) -> Path:
-    return state_dir / "conformance"
+def _conformance_dir(home: SbxloopHome) -> Path:
+    return home.conformance
 
 
 def _version_slug(version: str | None) -> str:
     return re.sub(r"[^A-Za-z0-9._-]", "_", version or "unknown")
 
 
-def cache_path(state_dir: Path, version: str | None) -> Path:
-    return _conformance_dir(state_dir) / f"sbx-{_version_slug(version)}.json"
+def cache_path(home: SbxloopHome, version: str | None) -> Path:
+    return _conformance_dir(home) / f"sbx-{_version_slug(version)}.json"
 
 
-def load_verdicts(state_dir: Path, version: str | None) -> dict[str, ProbeRecord]:
-    path = cache_path(state_dir, version)
+def load_verdicts(home: SbxloopHome, version: str | None) -> dict[str, ProbeRecord]:
+    path = cache_path(home, version)
     try:
         data = json.loads(path.read_text())
     except (OSError, ValueError):
@@ -566,11 +567,11 @@ def load_verdicts(state_dir: Path, version: str | None) -> dict[str, ProbeRecord
     return records
 
 
-def save_verdicts(state_dir: Path, version: str | None, records: dict[str, ProbeRecord]) -> None:
+def save_verdicts(home: SbxloopHome, version: str | None, records: dict[str, ProbeRecord]) -> None:
     """Merge ``records`` into the cache file for ``version``."""
-    merged = load_verdicts(state_dir, version)
+    merged = load_verdicts(home, version)
     merged.update(records)
-    path = cache_path(state_dir, version)
+    path = cache_path(home, version)
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "sbx_version": version,
@@ -580,7 +581,7 @@ def save_verdicts(state_dir: Path, version: str | None, records: dict[str, Probe
 
 
 def record_field_verdict(
-    state_dir: Path,
+    home: SbxloopHome,
     version: str | None,
     probe_id: str,
     verdict: str,
@@ -594,14 +595,14 @@ def record_field_verdict(
         record = ProbeRecord(
             verdict=verdict, detail=detail, checked_at=time.time(), source="provision"
         )
-        save_verdicts(state_dir, version, {probe_id: record})
+        save_verdicts(home, version, {probe_id: record})
     except OSError:
         pass
 
 
-def cached_versions(state_dir: Path) -> list[str]:
+def cached_versions(home: SbxloopHome) -> list[str]:
     """Cached sbx versions, most recently written first."""
-    directory = _conformance_dir(state_dir)
+    directory = _conformance_dir(home)
     if not directory.is_dir():
         return []
     files = sorted(directory.glob("sbx-*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -705,11 +706,10 @@ def _apply_drift(
         )
 
 
-def _scratch_sandbox(cli: SbxCLI, state_dir: Path, template: str | None) -> tuple[Sandbox, Path]:
+def _scratch_sandbox(cli: SbxCLI, home: SbxloopHome, template: str | None) -> tuple[Sandbox, Path]:
     nonce = _secrets.token_hex(4)
-    # Resolve like provisioning does: sbx mounts the workspace by path, and a
-    # relative state dir would hand it a cwd-dependent reference.
-    workspace = _conformance_dir(state_dir) / f"scratch-{nonce}"
+    # Resolve like provisioning does: sbx mounts the workspace by path.
+    workspace = _conformance_dir(home) / f"scratch-{nonce}"
     workspace.mkdir(parents=True, exist_ok=True)
     workspace = workspace.resolve()
     spec = SandboxSpec(
@@ -721,7 +721,7 @@ def _scratch_sandbox(cli: SbxCLI, state_dir: Path, template: str | None) -> tupl
 
 def run_conformance(
     cli: SbxCLI,
-    state_dir: Path,
+    home: SbxloopHome,
     *,
     deep: bool = False,
     template: str | None = None,
@@ -736,9 +736,9 @@ def run_conformance(
     """
     report_progress = progress or (lambda _m: None)
     version = cli.version()
-    cached = load_verdicts(state_dir, version)
-    previous_version = next((v for v in cached_versions(state_dir) if v != version), None)
-    previous = load_verdicts(state_dir, previous_version) if previous_version else {}
+    cached = load_verdicts(home, version)
+    previous_version = next((v for v in cached_versions(home) if v != version), None)
+    previous = load_verdicts(home, previous_version) if previous_version else {}
 
     outcomes: list[ProbeOutcome] = []
     fresh: dict[str, ProbeRecord] = {}
@@ -758,7 +758,7 @@ def run_conformance(
     sandbox_probes = [p for p in CATALOG if p.tier == "sandbox"]
     if deep:
         report_progress("creating scratch sandbox for deep probes (first boot can be slow)")
-        sandbox, workspace = _scratch_sandbox(cli, state_dir, template)
+        sandbox, workspace = _scratch_sandbox(cli, home, template)
         try:
             ctx = ProbeContext(cli, sandbox=sandbox, workspace=workspace)
             for probe in sandbox_probes:
@@ -796,7 +796,7 @@ def run_conformance(
 
     if fresh:
         try:
-            save_verdicts(state_dir, version, fresh)
+            save_verdicts(home, version, fresh)
         except OSError:
             report_progress("could not write the conformance cache")
 

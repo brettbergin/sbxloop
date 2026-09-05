@@ -6,12 +6,12 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
 from textual.widgets import Button
 
 from sbxloop.daemon.mailbox import MailboxClient
 from sbxloop.daemon.store import DaemonStore
+from sbxloop.paths import SbxloopHome
 from sbxloop.tui.chat import ChannelTail, choice_spec, compose_outbound, is_addressed
 from sbxloop.tui.screens.chat import ChatScreen
 from sbxloop.tui.widgets.chat_input import ChatInput
@@ -31,8 +31,8 @@ def test_compose_outbound_mirrors_the_routing_rules() -> None:
     assert button.row_id == 12 and button.value == "timing" and button.id == "choice-12-2"
 
 
-def seed_chat(state_dir: Path) -> DaemonStore:
-    dstore = DaemonStore(state_dir / "state.db")
+def seed_chat(state_dir: SbxloopHome) -> DaemonStore:
+    dstore = DaemonStore(state_dir.state_db)
     now = time.time()
     dstore.local_post("control", "🚀 daemon started", now=now - 60)
     dstore.local_post(
@@ -55,7 +55,7 @@ def seed_chat(state_dir: Path) -> DaemonStore:
     return dstore
 
 
-def test_chat_screen_shows_rows_sends_addressed_text_and_clicks(seeded: Path) -> None:
+def test_chat_screen_shows_rows_sends_addressed_text_and_clicks(seeded: SbxloopHome) -> None:
     dstore = seed_chat(seeded)
 
     async def scenario() -> None:
@@ -124,7 +124,7 @@ def test_chat_screen_shows_rows_sends_addressed_text_and_clicks(seeded: Path) ->
     drive(scenario)
 
 
-def test_edits_reactions_and_gate_resolution_repaint_in_place(seeded: Path) -> None:
+def test_edits_reactions_and_gate_resolution_repaint_in_place(seeded: SbxloopHome) -> None:
     dstore = seed_chat(seeded)
     dstore.create_merge_gate("r_live", "gh:issue:41", "o/r", 172, "u", None, ["brett"], "tok", 1.0)
     prompt = dstore.local_post(
@@ -159,7 +159,7 @@ def test_edits_reactions_and_gate_resolution_repaint_in_place(seeded: Path) -> N
     drive(scenario)
 
 
-def test_read_only_console_sends_nothing(seeded: Path) -> None:
+def test_read_only_console_sends_nothing(seeded: SbxloopHome) -> None:
     seed_chat(seeded)
 
     async def scenario() -> None:
@@ -167,8 +167,8 @@ def test_read_only_console_sends_nothing(seeded: Path) -> None:
         from sbxloop.tui.app import SbxloopTui
         from tests.unit.tui.conftest import FakeCtl, live_status
 
-        config = Config.model_validate({"state_dir": str(seeded)})
-        mailbox = MailboxClient(seeded / "state.db", operator_id="brett")
+        config = Config.model_validate({"home": str(seeded)})
+        mailbox = MailboxClient(seeded.state_db, operator_id="brett")
         app = SbxloopTui(
             config, seeded, mailbox=mailbox, ctl=FakeCtl(live_status()), read_only=True
         )
@@ -183,9 +183,9 @@ def test_read_only_console_sends_nothing(seeded: Path) -> None:
     drive(scenario)
 
 
-def test_channel_tail_reports_new_then_changed(seeded: Path) -> None:
+def test_channel_tail_reports_new_then_changed(seeded: SbxloopHome) -> None:
     dstore = seed_chat(seeded)
-    client = MailboxClient(seeded / "state.db", operator_id="brett")
+    client = MailboxClient(seeded.state_db, operator_id="brett")
     tail = ChannelTail("control")
     new, changed = tail.pull(client, now=time.time())
     assert len(new) == 2 and changed == []

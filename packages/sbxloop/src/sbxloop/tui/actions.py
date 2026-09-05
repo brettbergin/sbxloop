@@ -25,6 +25,7 @@ from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxloopError
 from sbxloop.gc import format_bytes, prune_run_dirs
 from sbxloop.ghids import normalize_item_id
+from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import INTERACTIVE_SHELL_ARGV, SbxCLI
 from sbxloop.sbx.prune import (
     SandboxVerdict,
@@ -97,7 +98,7 @@ class Deps:
     runner: CommandRunner
     mailbox: MailboxClient
     config: Config
-    state_dir: Path
+    home: SbxloopHome
     unit: str
     operator: str
     sbx: Callable[[], SbxCLI]
@@ -109,7 +110,7 @@ class Deps:
 
     @property
     def db_path(self) -> Path:
-        return self.state_dir / "state.db"
+        return self.home.state_db
 
     def daemon_live(self) -> bool:
         snapshot = self.daemon()
@@ -122,7 +123,7 @@ class Deps:
     @property
     def console_dir(self) -> Path:
         """Where the console keeps the logs of what it spawned."""
-        return self.state_dir / "console"
+        return self.home.console
 
 
 # -- the daemon's own verbs, over ctl -------------------------------------------
@@ -139,8 +140,7 @@ def ctl_outcome(deps: Deps, cmd: str, *, timeout_s: float = CTL_TIMEOUT_S) -> Ou
     if reply is None:
         return Outcome(
             False,
-            f"no daemon took `{cmd}` within {timeout_s:g}s — is it running against "
-            f"{deps.state_dir}?",
+            f"no daemon took `{cmd}` within {timeout_s:g}s — is it running against {deps.home}?",
         )
     text = plain(reply.text)
     if reply.pending:
@@ -377,16 +377,16 @@ SPAWN_SETTLE_S = 0.5
 
 
 def _spawn(deps: Deps, name: str, argv: Sequence[str], *, log_name: str) -> Outcome:
-    """A detached ``sbxloop`` pointed at the console's own state dir (the
-    loader honours ``SBXLOOP_STATE_DIR``), reported started only once it
-    has outlived a usage error."""
+    """A detached ``sbxloop`` pointed at the console's own home (the
+    loader honours ``SBXLOOP_HOME``), reported started only once it has
+    outlived a usage error."""
     log_path = deps.console_dir / log_name
     try:
         child = deps.runner.spawn(
             argv,
             cwd=deps.cwd,
             log_path=log_path,
-            env={"SBXLOOP_STATE_DIR": str(deps.state_dir)},
+            env=deps.home.as_env(),
         )
     except OSError as exc:
         return Outcome(False, f"could not start {shlex.join(argv)}: {exc}")
@@ -635,7 +635,7 @@ def gc_run_dirs(deps: Deps, days: float) -> Action:
         try:
             result = prune_run_dirs(
                 store,
-                deps.state_dir,
+                deps.home,
                 older_than_s=days * 86400.0,
                 actor=f"{deps.operator} via sbxloop tui",
             )

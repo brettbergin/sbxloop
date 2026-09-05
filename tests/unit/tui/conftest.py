@@ -23,6 +23,7 @@ from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import TaskSpec
 from sbxloop.engine.store import StateStore
+from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import ExecResult, SandboxInfo
 from sbxloop.tui.app import SbxloopTui
@@ -167,9 +168,9 @@ class RecordingSbx(SbxCLI):
         return list(self.infos)
 
 
-def backdate(state_dir: Path, run_id: str, days: float) -> None:
+def backdate(state_dir: SbxloopHome, run_id: str, days: float) -> None:
     """Make a run look untouched for ``days`` (age drives orphan and gc verdicts)."""
-    conn = sqlite3.connect(state_dir / "state.db")
+    conn = sqlite3.connect(state_dir.state_db)
     try:
         conn.execute(
             "UPDATE runs SET updated_at = ? WHERE run_id = ?",
@@ -205,11 +206,11 @@ def live_status(**overrides: Any) -> dict[str, Any]:
 
 
 @pytest.fixture
-def seeded(tmp_path: Path) -> Path:
-    """A state dir with a live run, a merged run, a failed run, items, a gate."""
-    state_dir = tmp_path / "state"
-    state_dir.mkdir()
-    db = state_dir / "state.db"
+def seeded(tmp_path: Path) -> SbxloopHome:
+    """A home with a live run, a merged run, a failed run, items, a gate."""
+    state_dir = SbxloopHome(tmp_path / "state")
+    state_dir.ensure_tree()
+    db = state_dir.state_db
     store = StateStore(db)
     dstore = DaemonStore(db)
     store.create_run("r_live", "Add retries to the fetch client")
@@ -297,7 +298,7 @@ def seeded(tmp_path: Path) -> Path:
 
 
 def make_app(
-    state_dir: Path,
+    state_dir: SbxloopHome,
     *,
     ctl: FakeCtl | None = None,
     run: str | None = None,
@@ -308,9 +309,9 @@ def make_app(
     **tui: Any,
 ) -> SbxloopTui:
     config = Config.model_validate(
-        {"state_dir": str(state_dir), "tui": tui, "daemon": daemon or {}}
+        {"home": str(state_dir.root), "tui": tui, "daemon": daemon or {}}
     )
-    mailbox = MailboxClient(state_dir / "state.db", operator_id="brett")
+    mailbox = MailboxClient(state_dir.state_db, operator_id="brett")
     box = sbx or RecordingSbx()
     return SbxloopTui(
         config,
@@ -321,7 +322,7 @@ def make_app(
         runner=runner or FakeRunner(),
         sbx_factory=lambda: box,
         read_only=read_only,
-        cwd=state_dir,
+        cwd=state_dir.root,
     )
 
 

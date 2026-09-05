@@ -43,7 +43,7 @@ class Scheduler:
     def __init__(self, tmp_path: Path, specs: list[TaskSpec], lanes: int) -> None:
         config = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "budgets": {"max_parallel_tasks": lanes},
             }
         )

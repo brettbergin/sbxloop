@@ -1,7 +1,7 @@
 """Run-directory retention: the policy behind ``sbxloop gc`` and the
 daemon's periodic sweep.
 
-Every run leaves ``<state_dir>/runs/<run_id>/`` behind — a full clone of
+Every run leaves ``<home>/runs/<run_id>/`` behind — a full clone of
 the target checkout under workspace isolation (plus whatever the agent
 built in it) and, for unmounted runs, the harvested artifacts. Nothing else
 ever removes them, and an always-on daemon at the default 12 runs/day
@@ -23,7 +23,7 @@ of an agent's work until it is fetched or delivered:
 * only past the retention window, measured from the run's ``updated_at``.
 
 Directories that do not belong to a run this state DB knows are reported
-but left alone (another working copy's state_dir, a hand-made directory).
+but left alone (a hand-made directory, a run from another home).
 """
 
 from __future__ import annotations
@@ -40,6 +40,7 @@ from sbxloop.errors import StateError
 from sbxloop.events import HostEventTypes
 from sbxloop.ids import is_run_id
 from sbxloop.log import get_logger
+from sbxloop.paths import SbxloopHome
 from sbxloop_worker.protocol import Event
 
 log = get_logger(__name__)
@@ -125,16 +126,16 @@ def delivery_failed(store: StateStore, run_id: str) -> bool:
 
 def classify_run_dirs(
     store: StateStore,
-    state_dir: Path,
+    home: SbxloopHome,
     *,
     older_than_s: float,
     now: float | None = None,
 ) -> list[RunDirVerdict]:
-    """Classify every directory under ``<state_dir>/runs`` against the state
+    """Classify every directory under ``<home>/runs`` against the state
     DB. Only the directory's presence on disk matters — a run whose payload
     is already gone has nothing to prune and is not listed."""
     now = time.time() if now is None else now
-    runs_root = state_dir / "runs"
+    runs_root = home.runs
     if not runs_root.is_dir():
         return []
     verdicts: list[RunDirVerdict] = []
@@ -179,7 +180,7 @@ def classify_run_dirs(
 
 def prune_run_dirs(
     store: StateStore,
-    state_dir: Path,
+    home: SbxloopHome,
     *,
     older_than_s: float,
     dry_run: bool = False,
@@ -209,8 +210,8 @@ def prune_run_dirs(
     already past retention; the next sweep finishes the job.
     """
     now = time.time() if now is None else now
-    _remove_staged(state_dir)
-    verdicts = classify_run_dirs(store, state_dir, older_than_s=older_than_s, now=now)
+    _remove_staged(home)
+    verdicts = classify_run_dirs(store, home, older_than_s=older_than_s, now=now)
     pruned: list[str] = []
     failed: list[str] = []
     freed = 0
@@ -240,7 +241,7 @@ def prune_run_dirs(
                 reason="left the terminal states since classification",
             )
             continue
-        if not _remove(verdict.path, state_dir):
+        if not _remove(verdict.path, home):
             failed.append(verdict.run_id)
             store.append_event(
                 _gc_event(verdict.run_id, now, {**data, "error": "could not remove directory"})
@@ -265,11 +266,11 @@ def _gc_event(run_id: str, ts: float, data: dict[str, object]) -> Event:
     return Event(ts=ts, run_id=run_id, job_id=None, type=HostEventTypes.DAEMON_GC, data=data)
 
 
-def _staging_root(state_dir: Path) -> Path:
-    return state_dir / "gc-pending"
+def _staging_root(home: SbxloopHome) -> Path:
+    return home.gc_pending
 
 
-def _remove(path: Path, state_dir: Path) -> bool:
+def _remove(path: Path, home: SbxloopHome) -> bool:
     """Remove a run directory: rename it out of ``runs/`` first, then delete.
 
     A rename is all-or-nothing where ``rmtree`` is not, so once it succeeds
@@ -279,7 +280,7 @@ def _remove(path: Path, state_dir: Path) -> bool:
     ``runs/`` on another filesystem); the marker is already durable by then,
     so even a half-deletion can never be resumed into.
     """
-    staging = _staging_root(state_dir)
+    staging = _staging_root(home)
     try:
         staging.mkdir(parents=True, exist_ok=True)
         staged = staging / path.name
@@ -298,10 +299,10 @@ def _remove(path: Path, state_dir: Path) -> bool:
     return True
 
 
-def _remove_staged(state_dir: Path) -> None:
+def _remove_staged(home: SbxloopHome) -> None:
     """Finish what an interrupted sweep started: anything under gc-pending/
     was already marked and renamed away, so it is just disk to reclaim."""
-    staging = _staging_root(state_dir)
+    staging = _staging_root(home)
     if not staging.is_dir():
         return
     for leftover in staging.iterdir():

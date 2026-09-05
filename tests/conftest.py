@@ -180,16 +180,22 @@ def _cli_console_follows_columns() -> None:
 
 @pytest.fixture(autouse=True)
 def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """Point HOME at the test's tmp dir.
-
-    ``state_dir`` defaults to ``~/.sbxloop`` and config discovery reads
-    ``~/.config/sbxloop/sbxloop.toml``, so without this every CLI test that
-    relies on defaults would read (and write!) the operator's real state.
-    Tests that chdir into ``tmp_path`` get ``tmp_path/.sbxloop`` as the
-    default state dir — the same place the old relative default landed.
-    """
+    """Point HOME at the test's tmp dir, so the sbxloop home defaults to
+    ``tmp_path/.sbxloop`` and no test reads (or writes!) the operator's
+    real home. ``SBXLOOP_HOME`` is cleared for the same reason: a developer
+    shell that exports it must not redirect the suite."""
     monkeypatch.setenv("HOME", str(tmp_path))
     # Path.home() reads USERPROFILE on Windows, so pin it too.
     monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    monkeypatch.delenv("SBXLOOP_HOME", raising=False)
     monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    # Lay the home out the way `sbxloop init` leaves it, so commands that
+    # check the layout (doctor) see an initialised host; a test about an
+    # uninitialised host removes the record itself.
+    from sbxloop.paths import SbxloopHome
+
+    home = SbxloopHome(tmp_path / ".sbxloop")
+    home.ensure_tree()
+    home.write_record(sbxloop_version="test", created_by="tests/conftest.py")
     return tmp_path
