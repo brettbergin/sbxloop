@@ -575,6 +575,8 @@ def _print_retention_note(config: Config) -> None:
 def _finish(result: RunResult, config: Config) -> None:
     style = "green" if result.succeeded else ("yellow" if result.state == "blocked" else "red")
     console.print(f"\nrun [bold cyan]{result.run_id}[/] finished: [bold {style}]{result.state}[/]")
+    if result.kind != "code":
+        console.print(f"  kind: {result.kind}")
     if result.reason:
         console.print(f"  reason: {result.reason}")
     for task in result.tasks:
@@ -592,6 +594,15 @@ def _finish(result: RunResult, config: Config) -> None:
 @app.command()
 def run(
     outcome: Annotated[str, typer.Argument(help="The outcome to achieve.")],
+    kind: Annotated[
+        str,
+        typer.Option(
+            "--kind",
+            help="What the run is for: `code` (the developer loop: a task graph that "
+            "ends in a pull request) or `workload` (the operator persona: plan, "
+            "execute, judge, publish — in its own data directory, no repository).",
+        ),
+    ] = "code",
     repo: Annotated[
         str | None,
         typer.Option(
@@ -674,6 +685,46 @@ def run(
         keep_sandboxes=keep_sandboxes,
         keep_on_failure=keep_on_failure,
     )
+    if kind not in ("code", "workload"):
+        console.print(f"[bold red]invalid --kind:[/] {kind!r} (expected `code` or `workload`)")
+        raise typer.Exit(2)
+    if kind == "workload":
+        # A workload works in its own data directory on the agent sandbox
+        # alone (#755); a checkout or a repository is a code run's, and
+        # what a workload may do with either comes with its config (#758).
+        refused = [
+            flag
+            for flag, value in (
+                ("--repo", repo),
+                ("--deliver-base", deliver_base),
+                ("--create-repo", create_repo),
+                ("--create-public", create_public),
+                ("--workspace", workspace),
+            )
+            if value is not None
+        ]
+        if refused:
+            console.print(
+                f"[bold red]{', '.join(refused)} cannot be combined with --kind workload:[/] "
+                "a workload runs in its own data directory and delivers to no repository"
+            )
+            raise typer.Exit(2)
+        console.print(
+            "workspace: a per-run data directory — the agent starts from an empty "
+            "directory and the run's output is harvested as artifacts"
+        )
+        engine = LoopEngine(config)
+        try:
+            result = _drive_with_ui(
+                engine,
+                tui=tui,
+                chat=chat,
+                action=lambda: engine.start(outcome, kind="workload"),
+            )
+        except SbxloopError as exc:
+            console.print(f"[bold red]run failed:[/] {exc}")
+            raise typer.Exit(2) from exc
+        _finish(result, config)
     github_overrides = {
         key: value
         for key, value in (
@@ -811,6 +862,7 @@ def status(
     if run_id is None:
         table = Table(title="sbxloop runs")
         table.add_column("run")
+        table.add_column("kind")
         table.add_column("repo")
         table.add_column("state", max_width=60)
         table.add_column("outcome", max_width=60)
@@ -821,6 +873,7 @@ def status(
             state = f"{record.state} — [dim]{record.reason}[/]" if record.reason else record.state
             table.add_row(
                 record.run_id,
+                record.kind,
                 _run_repo(store, record.run_id) or "[dim]—[/]",
                 state,
                 record.outcome[:60],
@@ -835,6 +888,7 @@ def status(
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
     console.print(f"run [bold cyan]{record.run_id}[/]  state: [bold]{record.state}[/]")
+    console.print(f"kind: {record.kind}")
     repo = _run_repo(store, record.run_id)
     if repo:
         console.print(f"repo: [bold]{repo}[/]")
@@ -858,8 +912,11 @@ def status(
     # The pair names, so debugging a live run needs no by-hand
     # `sbxloop-<run>-agent` reconstruction.
     console.print("sandboxes:")
-    # The service sandbox (#765) exists only for a run granted credentials.
-    roles: tuple[SandboxRole, ...] = ("agent", "github")
+    # The service sandbox (#765) exists only for a run granted credentials;
+    # the github sandbox never for a workload (#755).
+    roles: tuple[SandboxRole, ...] = (
+        ("agent",) if record.kind == "workload" else ("agent", "github")
+    )
     if record.credentials:
         roles += ("service",)
     try:

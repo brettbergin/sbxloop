@@ -639,6 +639,29 @@ class TestPipelineColumns:
         store.set_run_title("old", "t")
         assert StateStore(db).get_run("old").pr_title == "t"
 
+    def test_pre_kind_database_reads_every_run_as_code(self, tmp_path: Path) -> None:
+        """#755: a state database from before there were two kinds of run
+        gains `kind`, and every row it held — whatever state it stopped in
+        — reads back as a `code` run; a workload written afterwards keeps
+        its kind beside them."""
+        db = engine_db(tmp_path, "pre_kind")
+        for run_id, state in (("done", "merged"), ("mid", "building"), ("dead", "failed")):
+            insert_run_row(db, run_id=run_id, outcome="legacy", state=state, updated_at=2.0)
+        store = StateStore(db)
+        assert {r.run_id: r.kind for r in store.list_runs()} == {
+            "done": "code",
+            "mid": "code",
+            "dead": "code",
+        }
+        assert store.create_run("w1", "count the things", kind="workload").kind == "workload"
+        reopened = StateStore(db)
+        assert reopened.get_run("w1").kind == "workload"
+        assert reopened.get_run("mid").kind == "code"
+
+    def test_a_run_is_code_unless_created_otherwise(self, store: StateStore) -> None:
+        assert store.create_run("r1", "x").kind == "code"
+        assert store.get_run("r1").kind == "code"
+
 
 class TestGrantRounds:
     def test_grant_accumulates_and_clears_exhaustion(self, store: StateStore) -> None:

@@ -1672,6 +1672,54 @@ class TestRunCommand:
         assert start["workspace"] == str(ws.resolve())
         assert start["workspace_source"] == "--workspace"
 
+    def test_run_kind_workload_is_one_box_in_a_data_dir(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--kind workload` (#755): the agent box alone, its own data
+        directory, the operator's stages, and the run says what it is."""
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        result = runner.invoke(app, ["run", "count the things", "--kind", "workload", "--no-tui"])
+        assert result.exit_code == 0, result.output
+        plain = result.output.replace("\n", "")
+        assert "workspace: a per-run data directory" in plain
+        assert "kind: workload" in plain
+        assert "completed" in result.output and "t1: done" in result.output
+        assert "run.state judging" in plain and "run.state publishing" in plain
+        created = [" ".join(map(str, c)) for c in fake_sbx.invocations("create")]
+        assert len(created) == 1 and "-agent" in created[0], created
+        store = StateStore(workdir / ".sbxloop" / "state.db")
+        (run,) = store.list_runs()
+        assert run.kind == "workload" and run.state == "completed"
+        assert run.workspace == (workdir / ".sbxloop" / "runs" / run.run_id / "workspace").resolve()
+        start = self._run_start(workdir)
+        assert start["kind"] == "workload" and start["workspace_source"] == "data-dir"
+        detail = runner.invoke(app, ["status", run.run_id])
+        assert detail.exit_code == 0, detail.output
+        assert "kind: workload" in re.sub(r"\x1b\[[0-9;]*m", "", detail.output)
+        listed = runner.invoke(app, ["status"])
+        assert listed.exit_code == 0, listed.output
+        assert "kind" in listed.output and "workload" in listed.output
+
+    def test_run_kind_workload_refuses_repository_flags(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        for flags in (["--repo", "o/r"], ["--workspace", "."], ["--create-repo"]):
+            result = runner.invoke(app, ["run", "x", "--kind", "workload", "--no-tui", *flags])
+            assert result.exit_code == 2, result.output
+            assert "cannot be combined with --kind workload" in result.output.replace("\n", "")
+            assert flags[0] in result.output
+        assert fake_sbx.invocations("create") == []
+
+    def test_run_kind_must_be_known(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        result = runner.invoke(app, ["run", "x", "--kind", "bogus", "--no-tui"])
+        assert result.exit_code == 2, result.output
+        assert "invalid --kind" in result.output
+        assert fake_sbx.invocations("create") == []
+
     def test_run_workspace_flag_must_be_a_directory(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:

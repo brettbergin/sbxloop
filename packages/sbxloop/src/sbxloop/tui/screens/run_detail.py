@@ -249,6 +249,8 @@ class RunDetailScreen(ConsoleScreen):
                 text.append(f" · {detail.item.repo}", style="dim")
         text.append(" · ")
         text.append_text(state_label(r.state, r.reason, emoji=emoji))
+        if r.kind != "code":
+            text.append(f" · {r.kind}", style="dim")
         if r.stage:
             text.append(f" · stage {r.stage}", style="dim")
         text.append("\n")
