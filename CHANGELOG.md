@@ -6,6 +6,27 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **Chat state is keyed by backend** (#768). The daemon is about to run
+  the operator console's local chat bridge beside Discord or Slack, and
+  the store assumed one bridge: `daemon_chat_threads` was keyed by run
+  alone, a run's watchers were one list that the first bridge to finish
+  drained, the merge gate's prompt location lived on the gate row, and
+  every bridge's clarification sweeper fired every backend's due asks.
+  Threads are now `(run, backend)` (the bare lookup prefers the external
+  backend's thread, what a link in prose points at), watches carry their
+  backend, gate prompts live in `daemon_gate_prompts` per backend, and a
+  sweep takes only its own backend's asks, and the clarification cap
+  counts one backend's asks. An existing store is rebuilt on open, once,
+  with the indexes recreated inside the rebuild's own transaction; a
+  pre-upgrade watch or gate prompt is filed under the backend that opened
+  the run's thread — a Slack daemon's under `slack` — and the gate row's
+  old prompt columns are cleared once carried, so the step is idempotent
+  through a rollback. Nothing changes for a one-bridge daemon.
+  `tests/fakes/legacy_db.py` freezes the shape before this as
+  `pre_local_bridge`.
+
 ### Fixed
 
 - **No bare sbxloop issue numbers reach users** (#635). A provisioning

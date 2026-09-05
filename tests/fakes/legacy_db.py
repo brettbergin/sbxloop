@@ -20,6 +20,11 @@ Daemon store (``daemon_work_items`` and friends):
 - ``pre_prior_attempt`` — before #600: ``claim_token`` but none of the
   ``prior_run_id`` / ``prior_branch`` / ``prior_pr_number`` columns a
   label-restart carries the previous attempt's pushed work in.
+- ``pre_local_bridge`` — before the operator console's local chat bridge:
+  the current item columns, but chat state keyed by run alone —
+  ``daemon_chat_threads`` with ``PRIMARY KEY (run_id)``,
+  ``daemon_run_watches`` without a ``backend`` column, and the gate's
+  prompt location on the ``daemon_merge_gates`` row itself.
 
 Engine store (``runs`` / ``phase_attempts``):
 
@@ -85,12 +90,45 @@ _DAEMON_ITEMS_CLAIM_TOKEN = _DAEMON_ITEMS_NOT_BEFORE.replace(
     "not_before REAL, ", "not_before REAL, claim_token TEXT, "
 )
 
+_DAEMON_ITEMS_PRIOR = _DAEMON_ITEMS_CLAIM_TOKEN.replace(
+    "claim_token TEXT, ",
+    "claim_token TEXT, prior_run_id TEXT, prior_branch TEXT, prior_pr_number INTEGER, ",
+)
+
+# The chat tables as every release before the local bridge wrote them:
+# one thread per run, one watcher list per run, the prompt on the gate.
+_DAEMON_CHAT_THREADS_RUN_KEYED = (
+    "CREATE TABLE daemon_chat_threads (run_id TEXT PRIMARY KEY, "
+    "backend TEXT NOT NULL DEFAULT 'discord', channel_id TEXT NOT NULL, "
+    "thread_id TEXT NOT NULL, headline_id TEXT, status_id TEXT)"
+)
+_DAEMON_RUN_WATCHES_NO_BACKEND = (
+    "CREATE TABLE daemon_run_watches (run_id TEXT NOT NULL, watcher_id TEXT NOT NULL, "
+    "created_at REAL NOT NULL, UNIQUE(run_id, watcher_id))"
+)
+_DAEMON_MERGE_GATES_PROMPT_ON_ROW = (
+    "CREATE TABLE daemon_merge_gates (run_id TEXT PRIMARY KEY, item_id TEXT NOT NULL, "
+    "repo TEXT NOT NULL, pr_number INTEGER NOT NULL, pr_url TEXT NOT NULL DEFAULT '', "
+    "branch TEXT, notify_ids TEXT NOT NULL DEFAULT '[]', custom_id TEXT NOT NULL, "
+    "state TEXT NOT NULL DEFAULT 'open', prompt_channel_id TEXT, prompt_message_id TEXT, "
+    "created_at REAL NOT NULL, resolved_at REAL, resolved_by TEXT, detail TEXT)"
+)
+_DAEMON_STATE = "CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)"
+
 DAEMON_SHAPES: dict[DaemonShape, tuple[str, ...]] = {
     "pre_typed_ids": (_DAEMON_ITEMS_NO_REPO, _DAEMON_REQUESTERS_NO_REPO),
     "pre_multirepo": (_DAEMON_ITEMS_NO_REPO, _DAEMON_REQUESTERS_NO_REPO),
     "pre_scheduled_retry": (_DAEMON_ITEMS_REPO, _DAEMON_REQUESTERS_REPO),
     "pre_claim_token": (_DAEMON_ITEMS_NOT_BEFORE, _DAEMON_REQUESTERS_REPO),
     "pre_prior_attempt": (_DAEMON_ITEMS_CLAIM_TOKEN, _DAEMON_REQUESTERS_REPO),
+    "pre_local_bridge": (
+        _DAEMON_ITEMS_PRIOR,
+        _DAEMON_REQUESTERS_REPO,
+        _DAEMON_CHAT_THREADS_RUN_KEYED,
+        _DAEMON_RUN_WATCHES_NO_BACKEND,
+        _DAEMON_MERGE_GATES_PROMPT_ON_ROW,
+        _DAEMON_STATE,
+    ),
 }
 
 # Every state a work-item row can be in, with the bookkeeping a deployed
@@ -130,6 +168,19 @@ def insert_daemon_row(path: Path, **fields: Any) -> None:
     conn.execute(
         f"INSERT INTO daemon_work_items ({columns}) VALUES ({marks})",  # nosec B608 - test SQL
         tuple(row.values()),
+    )
+    conn.commit()
+    conn.close()
+
+
+def insert_row(path: Path, table: str, **fields: Any) -> None:
+    """Insert one row into any table exactly as given."""
+    columns = ", ".join(fields)
+    marks = ", ".join("?" for _ in fields)
+    conn = sqlite3.connect(path)
+    conn.execute(
+        f"INSERT INTO {table} ({columns}) VALUES ({marks})",  # nosec B608 - test SQL
+        tuple(fields.values()),
     )
     conn.commit()
     conn.close()
