@@ -83,6 +83,7 @@ from sbxloop.engine.model import (
     workload_summary,
 )
 from sbxloop.engine.reconcile import acknowledge_human_threads
+from sbxloop.engine.sinks import published_line
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     ProvisionError,
@@ -93,7 +94,7 @@ from sbxloop.errors import (
 )
 from sbxloop.events import Event, EventBus
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
-from sbxloop.ghids import normalize_item_id, try_parse_gh_id
+from sbxloop.ghids import is_chat_id, normalize_item_id, try_parse_gh_id
 from sbxloop.ids import new_run_id
 from sbxloop.log import bind_run, clear_run, get_logger
 from sbxloop.sbx.cli import SbxCLI
@@ -564,7 +565,7 @@ class DaemonLoop:
         kind = item.pending_report
         if kind is None:
             return
-        if kind in ("merged", "blocked", "gated"):
+        if kind in ("merged", "blocked", "gated", "completed"):
             if self._report_outcome(item, kind):
                 self.dstore.take_pending_report(item.item_id)
             return
@@ -592,7 +593,27 @@ class DaemonLoop:
             )
 
     def _report_outcome(self, item: WorkItem, kind: str) -> bool:
-        """Pay a merged/blocked report; True when the source confirmed it."""
+        """Pay a merged/blocked/completed report; True when the source
+        confirmed it."""
+        if kind == "completed":
+            # A workload's result (#760): the source gets the report the
+            # finish card was built from, not a pull request.
+            if item.run_id is None:
+                return True
+            try:
+                report = self.report_for(item.run_id)
+            except (SbxloopError, StateError):
+                log.debug("report.no_run_record", item=item.item_id, run=item.run_id)
+                return True
+            delivered = self.source.report_completed(item, report)
+            if not delivered:
+                log.warning(
+                    "report.deferred",
+                    item=item.item_id,
+                    kind=kind,
+                    hint="the source did not confirm; retried on the next tick",
+                )
+            return delivered
         pr_number: int | None = None
         pr_url = ""
         if item.run_id is not None:
@@ -703,6 +724,8 @@ class DaemonLoop:
                 {**h.to_json(), "state": h.state}
                 for h in getattr(self.source, "repo_health", None) or []
             ],
+            # Where work comes from (#760): "github", "chat", or both.
+            "source": self.source.name,
         }
 
     # -- multi-repo polling health (#516) -----------------------------------------
@@ -1396,17 +1419,35 @@ class DaemonLoop:
                 None if state == "merged" else f"run ended {state}",
             )
         # Without a repository there is nothing to land: the engine ends
-        # `completed` after its gate, and that is the whole job.
-        landed = state == "merged" or (state == "completed" and not self.config.github.enabled)
+        # `completed` after its gate, and that is the whole job. A workload
+        # (#760) ends `completed` once its result is published, whatever
+        # `[github]` says — there is no pull request to merge.
+        workload = item.kind == "workload"
+        landed = state == "merged" or (
+            state == "completed" and (workload or not self.config.github.enabled)
+        )
         if landed:
             self.dstore.finish_ledger(run_id, "done", now)
             if self._consecutive_failures:
                 log.info("breaker.reset", after_failures=self._consecutive_failures)
             self._set_breaker(None, 0)
-            self.dstore.mark_done(item.item_id, now, pending_report="merged")
+            self.dstore.mark_done(
+                item.item_id, now, pending_report="completed" if workload else "merged"
+            )
             fresh = self.dstore.get(item.item_id) or item
             self._deliver_report(fresh)
             self._frontend_finished(item, report)
+            if workload:
+                self._notice(
+                    "run.done",
+                    f"✅ {item.item_id} completed ({report.summary or report.task_summary})",
+                    item=item.item_id,
+                    run=run_id,
+                    tasks=report.task_summary,
+                    published=[published_line(entry) for entry in report.published],
+                    attempt=item.attempts,
+                )
+                return "done"
             pr_text = f" · PR {report.pr[1]}" if report.pr and report.pr[1] else ""
             self._notice(
                 "run.done",
@@ -2352,6 +2393,13 @@ class DaemonLoop:
         # Narrow the section to the item's repository first, so the run's
         # per-repo deliver_base / token_env win over the global defaults.
         item_repo = self._item_repo(item)
+        # The issue that queued the item, if one did: a chat item's key is
+        # a message id, not an issue (#760).
+        issue = (
+            int(item.source_key)
+            if item.source_key.isdigit() and not is_chat_id(item.item_id)
+            else None
+        )
         gh = GithubConfig.model_validate(
             {
                 **self.config.github.for_repo(
@@ -2360,11 +2408,16 @@ class DaemonLoop:
                 "create_repo": False,
                 # "Closes #N" in the PR body: GitHub links issue and PR and
                 # closes the issue on merge even when the daemon is not
-                # running to do it.
-                "deliver_closes": int(item.source_key) if item.source_key.isdigit() else None,
+                # running to do it. A workload's issue closes when its
+                # result lands (`report_completed`), not with a PR.
+                "deliver_closes": issue if item.kind == "code" else None,
             }
         )
         update: dict[str, Any] = {"github": gh, "keep_on_failure": False}
+        if item.kind == "workload" and issue is not None:
+            # The workload's issue sink answers on the issue that asked
+            # (#760) rather than filing a new one.
+            update["workload"] = self.config.workload.model_copy(update={"result_issue": issue})
         sandbox = self.config.sandbox
         if (
             self._workspace_checkout(item_repo) is not None
@@ -2480,6 +2533,16 @@ class DaemonLoop:
         explicit line saying the discussion is missing — the run goes on
         with the ask itself rather than waiting on a GitHub read.
         """
+        if is_chat_id(item.item_id):
+            # A chat ask (#760): the message is the whole ask, and there is
+            # no issue discussion to fetch.
+            who = f"<@{item.requested_by}>" if item.requested_by else "an operator"
+            return "\n\n".join(
+                [
+                    _MARKER_RE.sub("", item.body).strip() or item.title.strip(),
+                    f"---\nThis work item came from: a chat ask by {who}.",
+                ]
+            )
         parts = [item.title.strip()]
         body = _MARKER_RE.sub("", item.body).strip()
         if body:
@@ -2560,6 +2623,10 @@ class DaemonLoop:
             repo=self._item_repo(item),
             prior_branch=prior.branch if prior else None,
             prior_pr=prior.pr_number if prior else None,
+            # A workload item (#760) runs the operator persona under its
+            # profile; a code item passes the defaults, as it always has.
+            kind=item.kind,
+            profile=item.profile,
         )
 
     # -- reporting -----------------------------------------------------------------------

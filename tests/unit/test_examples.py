@@ -150,7 +150,7 @@ class TestPresets:
 
 
 # Derived internals the engine sets on a narrowed config; never configured.
-INTERNAL_KEYS = {"github.enabled_repo_count"}
+INTERNAL_KEYS = {"github.enabled_repo_count", "workload.result_issue"}
 
 
 def test_example_mentions_every_key_the_config_model_knows() -> None:

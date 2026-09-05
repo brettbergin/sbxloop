@@ -85,13 +85,13 @@ class TestBuild:
         items = source.poll()
         # Byte-for-byte the pre-multi-repo behaviour.
         assert [i.item_id for i in items] == ["gh:issue:4"]
-        assert router.searched == ["o/a"]
+        assert list(dict.fromkeys(router.searched)) == ["o/a"]  # two labels per repo (#760)
 
     def test_only_enabled_repositories_are_polled(self, router: RouterOps) -> None:
         source = build(router, "o/a", "o/b", disabled=("o/b",))
         assert isinstance(source, GitHubIssueSource)
         source.poll()
-        assert router.searched == ["o/a"]
+        assert list(dict.fromkeys(router.searched)) == ["o/a"]  # two labels per repo (#760)
 
     def test_no_enabled_repository_is_an_error(self, router: RouterOps) -> None:
         with pytest.raises(ValueError, match="no enabled repository"):
@@ -166,7 +166,7 @@ class TestMultiRepoDiscovery:
         source = build(router, "o/a", "o/b")
         assert isinstance(source, MultiRepoIssueSource)
         items = source.poll()
-        assert router.searched == ["o/a", "o/b"]
+        assert list(dict.fromkeys(router.searched)) == ["o/a", "o/b"]  # two labels per repo (#760)
         # Deterministic across repos; ids are repo-qualified so the two
         # issue #4s cannot collide.
         assert [i.item_id for i in items] == [

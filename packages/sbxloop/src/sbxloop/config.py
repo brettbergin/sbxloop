@@ -671,10 +671,10 @@ def _check_login(value: str, key: str) -> str:
     return value
 
 
-# The six lifecycle labels, in the order `LabelSet` (and the daemon's
+# The seven lifecycle labels, in the order `LabelSet` (and the daemon's
 # `GitHubLabels`) take them. Each is a `[daemon] <kind>_label` with a
 # `[[github.repos]] <kind>_label` override.
-LABEL_KINDS = ("trigger", "in_progress", "failed", "completed", "blocked", "gated")
+LABEL_KINDS = ("trigger", "in_progress", "failed", "completed", "blocked", "gated", "workload")
 
 
 class LabelSet(NamedTuple):
@@ -684,7 +684,9 @@ class LabelSet(NamedTuple):
     marker; ``completed`` is the durable "sbxloop did this" mark applied when
     the pull request merges; ``failed`` and ``blocked`` say the loop gave up
     or was refused, both leaving the issue open for a human; ``gated`` marks
-    a run parked behind the opt-in merge gate.
+    a run parked behind the opt-in merge gate. ``workload`` queues an issue
+    as a workload run instead of a code run (#760): the issue body is the
+    ask, and the result comes back as a comment on it.
     """
 
     trigger: str
@@ -693,6 +695,7 @@ class LabelSet(NamedTuple):
     completed: str
     blocked: str
     gated: str
+    workload: str
 
 
 def _check_label_set(labels: Sequence[str], where: str) -> None:
@@ -725,7 +728,7 @@ class RepoConfig(_ConfigModel):
     # Environment variable holding the token for this repository; None → the
     # daemon-wide GH_TOKEN.
     token_env: str | None = None
-    # Per-repo overrides of the six lifecycle labels (#630); None → the
+    # Per-repo overrides of the seven lifecycle labels (#630); None → the
     # `[daemon]` value. `Config.labels_for` resolves the effective set.
     trigger_label: str | None = None
     in_progress_label: str | None = None
@@ -733,6 +736,7 @@ class RepoConfig(_ConfigModel):
     completed_label: str | None = None
     blocked_label: str | None = None
     gated_label: str | None = None
+    workload_label: str | None = None
     # Extra labels applied to issues/PRs for this repository.
     labels: list[str] = Field(default_factory=list)
     # Per-repo naming (#621); None → the `[github]` value.
@@ -1502,6 +1506,11 @@ class DaemonConfig(_ConfigModel):
     # The run parked behind the opt-in merge gate ([landing] merge_gate):
     # ready to merge, awaiting one human approval in chat (or `ctl merge`).
     gated_label: str = "sbxloop:awaiting-merge"
+    # An issue carrying this label is a workload ask (#760): the body is
+    # what the operator persona is asked for, and the result comes back as
+    # a comment on the issue. An issue carrying both this and
+    # `trigger_label` is refused, named.
+    workload_label: str = "sbxloop:workload"
     max_runs_per_day: int = 12
     # The day boundary for max_runs_per_day. An explicit IANA zone rather
     # than the process's ambient local time; the counter resets at 00:00 here.
@@ -1988,6 +1997,10 @@ class WorkloadConfig(_ConfigModel):
 
     default: str | None = None
     result_label: str = "sbxloop:result"
+    # The issue a run's `issue` sink comments on instead of filing a new
+    # one (#760): set by the daemon on a run that came from a labelled
+    # issue, never from TOML. Pinned into the run's config for its resume.
+    result_issue: int | None = None
 
     @field_validator("result_label")
     @classmethod
@@ -2054,7 +2067,7 @@ class Config(_ConfigModel):
 
     @model_validator(mode="after")
     def _repo_labels_are_distinct(self) -> Config:
-        """A repository's *effective* six labels must be distinct: an entry
+        """A repository's *effective* seven labels must be distinct: an entry
         that renames one onto another (`failed_label = "sbxloop:blocked"`)
         would mark two states with one label."""
         for entry in self.github.repos:

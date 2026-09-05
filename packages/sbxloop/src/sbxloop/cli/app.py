@@ -1719,7 +1719,7 @@ def init_repo_command(
 ) -> None:
     """Create the labels sbxloop relies on in a repository (idempotent).
 
-    The six lifecycle labels (with this repository's renames from
+    The seven lifecycle labels (with this repository's renames from
     `[[github.repos]]` applied) and the follow-up label, each with a color
     and a description; existing labels are left alone. Boots one github-ops
     sandbox for the writes, as `doctor --probe` does.
@@ -1798,8 +1798,11 @@ def daemon(
     from sbxloop.daemon.paths import resolve_state_dir
     from sbxloop.daemon.sources import (
         REPO_HEALTH_KEY,
+        ChatSource,
+        CompositeSource,
         GitHubLabels,
         MultiRepoIssueSource,
+        WorkSource,
         build_github_source,
     )
 
@@ -1872,14 +1875,21 @@ def daemon(
         raise typer.Exit(2) from exc
     configure_logging(config.daemon.log_level, fmt=config.daemon.log_format)
 
-    if not config.github.enabled:
+    # Work comes from the labelled issues of the configured repositories,
+    # or (#760) from workloads asked for in chat — a daemon with a chat
+    # backend and no `[github]` runs on those alone.
+    # (`--once` skips the concierge but still runs what one already queued.)
+    chat_intake = config.chat_backend is not None and bool(config.concierge.enabled)
+    if not config.github.enabled and not chat_intake:
         log.error(
             "daemon.no_repository",
             hint="set --repo owner/name (or [github] repo / [[github.repos]]): the "
-            "daemon's work is the labeled issues of the configured repositories",
+            "daemon's work is the labeled issues of the configured repositories — or "
+            "configure a chat backend with the concierge on, and workloads asked for "
+            "in chat are its work",
         )
         raise typer.Exit(2)
-    if not config.github.enabled_repos():
+    if config.github.enabled and not config.github.enabled_repos():
         log.error(
             "daemon.no_enabled_repository",
             hint="every configured repository is disabled — set enabled = true on at "
@@ -1961,38 +1971,48 @@ def daemon(
     sbx = SbxCLI(app_name=config.app_name or None)
     bus = EventBus()
     bus.subscribe(event_log_subscriber)
-    github = DaemonGithub(config, sbx, bus, worker_python=config.worker_python)
-    github.remove_stale()
-    labels = GitHubLabels(
-        config.daemon.trigger_label,
-        config.daemon.in_progress_label,
-        config.daemon.failed_label,
-        config.daemon.completed_label,
-        config.daemon.blocked_label,
-        config.daemon.gated_label,
-    )
-    # Every enabled configured repository is polled; the daemon-wide
-    # guardrails below (run cap, retry cap, breaker, one-run-at-a-time)
-    # stay global across all of them.
     # Per-repository polling health (#516) is persisted so `doctor` in
     # another process can show a suspended repository; a new daemon process
     # starts every repository fresh (a config edit is the usual reason for
     # the restart, and a still-broken repo re-suspends on its own).
     dstore.clear_prefix(REPO_HEALTH_KEY)
+    github: DaemonGithub | None = None
+    source: WorkSource
+    if config.github.enabled:
+        github = DaemonGithub(config, sbx, bus, worker_python=config.worker_python)
+        github.remove_stale()
+        labels = GitHubLabels(
+            config.daemon.trigger_label,
+            config.daemon.in_progress_label,
+            config.daemon.failed_label,
+            config.daemon.completed_label,
+            config.daemon.blocked_label,
+            config.daemon.gated_label,
+            config.daemon.workload_label,
+        )
 
-    def persist_repo_health(repo: str, data: dict[str, Any] | None) -> None:
-        dstore.set_value(f"{REPO_HEALTH_KEY}{repo}", json.dumps(data) if data else None)
+        def persist_repo_health(repo: str, data: dict[str, Any] | None) -> None:
+            dstore.set_value(f"{REPO_HEALTH_KEY}{repo}", json.dumps(data) if data else None)
 
-    source = build_github_source(
-        github.ops,
-        config.github.enabled_repos(),
-        labels,
-        on_failure=github.note_failure,
-        stale_after_s=config.daemon.claim_stale_after_s,
-        poll_interval_s=config.daemon.poll_interval_s,
-        suspend_after=config.daemon.repo_suspend_after,
-        persist=persist_repo_health,
-    )
+        # Every enabled configured repository is polled; the daemon-wide
+        # guardrails below (run cap, retry cap, breaker, one-run-at-a-time)
+        # stay global across all of them.
+        source = build_github_source(
+            github.ops,
+            config.github.enabled_repos(),
+            labels,
+            on_failure=github.note_failure,
+            stale_after_s=config.daemon.claim_stale_after_s,
+            poll_interval_s=config.daemon.poll_interval_s,
+            suspend_after=config.daemon.repo_suspend_after,
+            persist=persist_repo_health,
+        )
+        if chat_intake:
+            # Chat-started workloads (#760) ride the same queue; the
+            # composite routes each item back to where it came from.
+            source = CompositeSource(source, ChatSource())
+    else:
+        source = ChatSource()
 
     # One line an operator can read back from the journal to know exactly
     # what this daemon is: where its state went (with the anchored default,
@@ -2007,7 +2027,9 @@ def daemon(
         archived_state=str(archived) if archived else None,
         repo=config.github.repo,
         repos=[r.repo for r in config.github.enabled_repos()],
+        source=source.name,
         trigger_label=config.daemon.trigger_label,
+        workload_label=config.daemon.workload_label,
         poll_interval_s=config.daemon.poll_interval_s,
         max_runs_per_day=config.daemon.max_runs_per_day,
         max_attempts_per_item=config.daemon.max_attempts_per_item,
@@ -2054,12 +2076,14 @@ def daemon(
             log.error("daemon.poll_failed", error=str(exc), exc_info=True)
             code = 1
         finally:
-            github.close()
+            if github is not None:
+                github.close()
         raise typer.Exit(code)
 
     loop = DaemonLoop(config, store=store, dstore=dstore, source=source, sbx=sbx, github=github)
-    if isinstance(source, MultiRepoIssueSource):
-        source.notify = loop.source_notice
+    polled = source.github if isinstance(source, CompositeSource) else source
+    if isinstance(polled, MultiRepoIssueSource):
+        polled.notify = loop.source_notice
     # One probe, shared: the startup drift check below warms its PyPI memo, so
     # the concierge's first `version_status` answers without a network call.
     versions = VersionProbe(
@@ -2188,8 +2212,9 @@ def daemon(
             # the next daemon process (conversation memory lives in it).
             log.debug("daemon.shutdown", step="concierge")
             concierge.close()
-        log.debug("daemon.shutdown", step="github sandbox")
-        github.close()
+        if github is not None:
+            log.debug("daemon.shutdown", step="github sandbox")
+            github.close()
         dstore.close()
         log.info(
             "daemon.stopped",

@@ -6,8 +6,10 @@ import pytest
 
 from sbxloop.ghids import (
     GhId,
+    chat_item_id,
     format_gh_id,
     has_gh_prefix,
+    is_chat_id,
     is_gh_id,
     issue_item_id,
     normalize_item_id,
@@ -94,3 +96,18 @@ def test_predicates() -> None:
     assert is_gh_id("inbox:x.md") is False
     assert has_gh_prefix("gh:abc") is True
     assert has_gh_prefix("inbox:x.md") is False
+
+
+def test_chat_ids_are_keyed_by_the_message() -> None:
+    """A chat ask's item is `chat:<message id>` (#760): not a GitHub id,
+    untouched by normalisation, and never empty."""
+    assert chat_item_id("9001") == "chat:9001"
+    assert chat_item_id(" r7x2 ") == "chat:r7x2"
+    assert is_chat_id("chat:9001") is True
+    assert is_chat_id("chat:") is False
+    assert is_chat_id("gh:issue:4") is False
+    assert is_gh_id("chat:9001") is False
+    assert normalize_item_id("chat:9001") == "chat:9001"
+    for bad in ("", "  ", "a b"):
+        with pytest.raises(ValueError, match="malformed chat item key"):
+            chat_item_id(bad)

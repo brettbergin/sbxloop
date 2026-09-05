@@ -17,12 +17,14 @@ import pytest
 
 from sbxloop import hostgit
 from sbxloop.config import Config
+from sbxloop.daemon import loop as loop_mod
 from sbxloop.daemon.loop import DaemonLoop, RunHandle, day_window
 from sbxloop.daemon.model import DaemonNotice, RunReport, TaskOutcome, WorkItem
 from sbxloop.daemon.sources import IssueComment, IssueContext, LinkedIssue
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import (
     TERMINAL_RUN_STATES,
+    Published,
     RunResult,
     TaskOutput,
     TaskRecord,
@@ -100,6 +102,12 @@ class FakeSource:
         self.calls.append(("blocked", (reason, pr_number, pr_url)))
         return self.blocked_ok
 
+    completed_ok = True
+
+    def report_completed(self, item: WorkItem, report: RunReport) -> bool:
+        self.calls.append(("completed", report))
+        return self.completed_ok
+
 
 def gh_item(key: str = "1", **overrides: Any) -> WorkItem:
     fields: dict[str, Any] = {
@@ -160,7 +168,17 @@ class Harness:
             self.store.set_run_state(run_id, "decomposing")
             raise WorkerError("decompose produced invalid output twice")
         if not resume:
-            self.store.create_run(run_id, "outcome")
+            self.store.create_run(run_id, "outcome", kind=item.kind)
+        if item.kind == "workload" and kind == "completed":
+            # The engine's shape for a published workload (#759): tasks
+            # with outputs and one `Published` row per sink.
+            self.store.save_tasks(run_id, [TaskSpec(id="t1", title="Answer")])
+            (task,) = self.store.get_tasks(run_id)
+            task.state, task.output = "done", TaskOutput(summary="the answer is 42")
+            self.store.update_task(run_id, task)
+            self.store.add_run_published(
+                run_id, Published(sink="chat", location="chat", tasks=["t1"])
+            )
         reason = None
         if kind == "exhausted":
             # The engine's shape for a run one round short (#523): PR open,
@@ -2991,3 +3009,124 @@ class TestWorkloadReport:
         assert result.kind == "workload" and result.state == "completed"
         assert result.summary == h.loop._report("w1", None).summary
         assert [tid for tid, _ in result.outputs] == ["t1", "t2"]
+
+
+class TestWorkloadIntake:
+    """#760: a workload item runs the operator persona and settles as
+    `completed` — no PR to land, whatever `[github]` says — and a chat ask
+    is an item with no issue behind it."""
+
+    def test_a_workload_item_dispatches_its_kind_and_profile(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        h = Harness(tmp_path)
+        seen: list[tuple[Any, ...]] = []
+
+        class Engine:
+            def __init__(self, *a: Any, **kw: Any) -> None: ...
+
+            def start(self, outcome: str, **kw: Any) -> RunResult:
+                seen.append((outcome, kw.get("kind"), kw.get("profile"), kw.get("repo")))
+                run_id, kind = kw["run_id"], kw["kind"]
+                h.store.create_run(run_id, outcome, kind=kind)
+                state = "completed" if kind == "workload" else "merged"
+                if kind == "code":
+                    h.store.set_run_pr(
+                        run_id, number=9, url=PR_URL, branch=f"sbxloop/{run_id}", head_sha="abc"
+                    )
+                h.store.set_run_state(run_id, state)
+                return RunResult(run_id=run_id, state=state, kind=kind)
+
+        monkeypatch.setattr(loop_mod, "LoopEngine", Engine)
+        h.loop._runner = h.loop._default_runner  # type: ignore[method-assign]
+        h.source.items = [gh_item("6", kind="workload", profile="research")]
+        assert h.loop.tick().outcome == "done"
+        # a legacy `gh:<n>` id carries no repository of its own
+        assert seen == [(h.loop.outcome_text(gh_item("6")), "workload", "research", None)]
+        h.source.items = [gh_item("7", item_id="gh:o/r:7", repo="o/r")]
+        assert h.loop.tick().outcome == "done"
+        assert seen[-1][1:] == ("code", None, "o/r")
+
+    def test_a_completed_workload_is_done_with_a_repository_configured(
+        self, tmp_path: Path
+    ) -> None:
+        h = Harness(tmp_path)
+        front = RecordingFrontend()
+        h.loop.frontend = front  # type: ignore[assignment]
+        h.source.items = [gh_item("6", kind="workload")]
+        h.outcomes = ["completed"]
+        assert h.loop.tick().outcome == "done"
+        item = h.dstore.get("gh:issue:6")
+        assert item is not None and item.state == "done" and item.pending_report is None
+        kinds = [c[0] for c in h.source.calls]
+        assert kinds == ["claim", "started", "completed"]
+        report = h.source.calls[-1][1]
+        assert report.kind == "workload" and report.state == "completed"
+        assert "the answer is 42" in (report.summary or "")
+        assert [p.sink for p in report.published] == ["chat"]
+        (notice,) = [n for n in front.notices if n.kind == "run.done"]
+        assert notice.text.startswith("✅ gh:issue:6 completed (")
+        assert "the answer is 42" in notice.text
+        assert front.finished[0][1].state == "completed"
+
+    def test_a_completed_report_the_source_cannot_take_stays_pending(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [gh_item("6", kind="workload")]
+        h.outcomes = ["completed"]
+        h.source.completed_ok = False
+        assert h.loop.tick().outcome == "done"
+        item = h.dstore.get("gh:issue:6")
+        assert item is not None and item.state == "done"
+        assert item.pending_report == "completed"
+        h.source.completed_ok = True
+        h.loop.tick()
+        assert h.dstore.get("gh:issue:6").pending_report is None  # type: ignore[union-attr]
+        assert [c[0] for c in h.source.calls].count("completed") == 2
+
+    def test_a_workload_pins_the_asking_issue_as_its_result_issue(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        cfg = h.loop._item_config(gh_item("12", kind="workload"))
+        assert cfg.workload.result_issue == 12
+        # No pull request will close the issue: the completed report does.
+        assert cfg.github.deliver_closes is None
+        code = h.loop._item_config(gh_item("12"))
+        assert code.workload.result_issue is None and code.github.deliver_closes == 12
+
+    def test_a_chat_item_has_no_issue_and_no_repository(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        item = WorkItem(
+            item_id="chat:9001",
+            source_key="9001",
+            title="Summarise the deploys",
+            body="Summarise the deploys\n\nOne paragraph per day.",
+            kind="workload",
+            profile="research",
+            requested_by="777",
+        )
+        cfg = h.loop._item_config(item)
+        assert cfg.workload.result_issue is None and cfg.github.deliver_closes is None
+        text = h.loop.outcome_text(item)
+        assert text == (
+            "Summarise the deploys\n\nOne paragraph per day.\n\n"
+            "---\nThis work item came from: a chat ask by <@777>."
+        )
+        anonymous = h.loop.outcome_text(item.model_copy(update={"requested_by": None}))
+        assert anonymous.endswith("a chat ask by an operator.")
+
+    def test_a_chat_item_runs_to_done_without_github(self, tmp_path: Path) -> None:
+        cfg = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        h = Harness(tmp_path, cfg)
+        h.source.name = "chat"
+        h.source.items = [
+            WorkItem(item_id="chat:9001", source_key="9001", title="ask", kind="workload")
+        ]
+        h.outcomes = ["completed"]
+        assert h.loop.tick().outcome == "done"
+        item = h.dstore.get("chat:9001")
+        assert item is not None and item.state == "done" and item.pending_report is None
+        assert [c[0] for c in h.source.calls] == ["claim", "started", "completed"]
+        assert h.loop.status()["source"] == "chat"
+
+    def test_the_status_names_the_source(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        assert h.loop.status()["source"] == "github"

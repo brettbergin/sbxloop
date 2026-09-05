@@ -10,6 +10,10 @@ Rendering is strict — every id this module produces carries its kind. Parsing
 is lenient — the legacy bare form ``gh:<n>`` is accepted and normalised to
 ``gh:issue:<n>`` so checkpoints, watches and human-typed operator commands
 written before the migration keep resolving.
+
+Chat asks are work items too (#760): ``chat:<message>`` names the message
+that asked, on the surface the concierge answered — an opaque key with no
+grammar beyond its prefix, since the transport mints it.
 """
 
 from __future__ import annotations
@@ -21,6 +25,7 @@ from typing import Literal, get_args
 GhKind = Literal["issue", "pr"]
 
 GH_PREFIX = "gh:"
+CHAT_PREFIX = "chat:"
 
 _KINDS: tuple[GhKind, ...] = get_args(GhKind)
 _NUMBER_RE = re.compile(r"^[0-9]+$")
@@ -77,6 +82,19 @@ def issue_item_id(number: int, repo: str | None = None) -> str:
 def pr_item_id(number: int, repo: str | None = None) -> str:
     """The id for a GitHub pull request referenced as a work-item resource."""
     return format_gh_id("pr", number, repo=repo)
+
+
+def chat_item_id(key: str) -> str:
+    """The work item id for a chat ask, keyed by the message that made it."""
+    key = key.strip()
+    if not key or any(ch.isspace() for ch in key):
+        raise ValueError(f"malformed chat item key: {key!r}")
+    return f"{CHAT_PREFIX}{key}"
+
+
+def is_chat_id(value: str) -> bool:
+    """True when ``value`` is a chat ask's item id."""
+    return value.startswith(CHAT_PREFIX) and len(value) > len(CHAT_PREFIX)
 
 
 def is_gh_id(value: str) -> bool:
@@ -145,11 +163,14 @@ def normalize_item_id(value: str) -> str:
 
 
 __all__ = [
+    "CHAT_PREFIX",
     "GH_PREFIX",
     "GhId",
     "GhKind",
+    "chat_item_id",
     "format_gh_id",
     "has_gh_prefix",
+    "is_chat_id",
     "is_gh_id",
     "is_repo_slug",
     "issue_item_id",

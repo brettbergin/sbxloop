@@ -259,6 +259,8 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "tool_notes": "- `sbx_control` — run a verb",
         "daemon_notes": "- poll interval 60s",
         "trigger_label": "sbxloop:run",
+        "workload_label": "sbxloop:workload",
+        "workloads": "- `research`: sinks chat, issue",
     },
     # The workload's actors (#756): the operator plans and executes, the
     # judge decides.

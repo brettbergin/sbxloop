@@ -1012,6 +1012,9 @@ class ChatBridge(ABC):
                     author_id=msg.author_id,
                     on_tool=on_tool,
                     via=self.backend,
+                    # ...and the message id keys a workload the turn starts
+                    # (#760), so a retried turn queues one run, not two.
+                    message_id=msg.message_id or None,
                 )
                 reply = await asyncio.wrap_future(future)
         except asyncio.CancelledError:

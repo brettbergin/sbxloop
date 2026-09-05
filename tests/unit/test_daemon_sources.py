@@ -9,7 +9,15 @@ from urllib.parse import unquote
 import pytest
 
 from sbxloop.daemon.model import RunReport, WorkItem
-from sbxloop.daemon.sources import CLAIM_MARKER, STATUS_MARKER, GitHubIssueSource, GitHubLabels
+from sbxloop.daemon.sources import (
+    CLAIM_MARKER,
+    STATUS_MARKER,
+    ChatSource,
+    CompositeSource,
+    GitHubIssueSource,
+    GitHubLabels,
+)
+from sbxloop.engine.model import Published
 from sbxloop.errors import GithubOpsError
 from sbxloop.gh.ops import IssueRef
 
@@ -159,11 +167,15 @@ class TestGitHubSource:
             clock=lambda: FIXTURE_NOW,
         )
 
-    def test_poll_uses_the_one_trigger_label_query(self) -> None:
+    def test_poll_searches_the_two_queueing_labels(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:run"), "5": issue(5, "sbxloop:failed")})
         items = self.make(ops).poll()
-        assert ops.searches == ['repo:o/r is:issue is:open label:"sbxloop:run"']
+        assert ops.searches == [
+            'repo:o/r is:issue is:open label:"sbxloop:run"',
+            'repo:o/r is:issue is:open label:"sbxloop:workload"',
+        ]
         assert [i.item_id for i in items] == ["gh:issue:4"]
+        assert items[0].kind == "code" and items[0].profile is None
         assert items[0].url == "https://x/issues/4" and items[0].body == "please do it"
         assert items[0].requested_by is None
 
@@ -1183,3 +1195,196 @@ class TestIssueContext:
         claim_body, started_body = ops.comments[0][1], ops.comments[1][1]
         assert CLAIM_MARKER in claim_body and STATUS_MARKER not in claim_body
         assert started_body == f"Run `r1` started.\n\n{STATUS_MARKER}"
+
+
+class TestWorkloadIntake:
+    """The workload label queues an issue as a workload run (#760)."""
+
+    def make(self, ops: RecordingOps) -> GitHubIssueSource:
+        return GitHubIssueSource(
+            lambda: ops,  # type: ignore[arg-type]
+            "o/r",
+            LABELS,
+            host="db",
+            clock=lambda: FIXTURE_NOW,
+        )
+
+    def test_labels_default_the_workload_mark(self) -> None:
+        assert LABELS.workload == "sbxloop:workload"
+        assert LABELS.trigger_for(gh(kind="workload")) == "sbxloop:workload"
+        assert LABELS.trigger_for(gh()) == "sbxloop:run"
+
+    def test_a_workload_labelled_issue_polls_as_a_workload_item(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run"), "6": issue(6, "sbxloop:workload")})
+        items = self.make(ops).poll()
+        assert [(i.item_id, i.kind) for i in items] == [
+            ("gh:issue:4", "code"),
+            ("gh:issue:6", "workload"),
+        ]
+        assert items[1].body == "please do it" and items[1].repo == "o/r"
+
+    def test_an_issue_wearing_both_labels_is_refused_not_queued(self) -> None:
+        ops = RecordingOps({"4": issue(4, "sbxloop:run", "sbxloop:workload")})
+        items = self.make(ops).poll()
+        assert items == []
+        assert len(ops.comments) == 1
+        number, body = ops.comments[0]
+        assert number == 4 and "`sbxloop:run`" in body and "`sbxloop:workload`" in body
+        assert "re-add the one you meant" in body
+        assert [lb["name"] for lb in ops.issues["4"]["labels"]] == ["sbxloop:failed"]
+
+    def test_the_conflict_refusal_does_not_stop_the_poll(self) -> None:
+        ops = RecordingOps(
+            {
+                "4": issue(4, "sbxloop:run", "sbxloop:workload"),
+                "5": issue(5, "sbxloop:run"),
+                "6": issue(6, "sbxloop:workload"),
+            }
+        )
+        ops.fail_on.add("COMMENT")
+        items = self.make(ops).poll()
+        assert [i.item_id for i in items] == ["gh:issue:5", "gh:issue:6"]
+
+    def test_claim_swaps_the_workload_label(self) -> None:
+        ops = RecordingOps({"6": issue(6, "sbxloop:workload")})
+        src = self.make(ops)
+        item = src.poll()[0]
+        assert src.claim(item) is True
+        names = [lb["name"] for lb in ops.issues["6"]["labels"]]
+        assert names == ["sbxloop:in-progress"]
+        assert any(CLAIM_MARKER in body for _, body in ops.comments)
+
+    def test_claim_refuses_when_both_labels_arrived_since_the_poll(self) -> None:
+        ops = RecordingOps({"6": issue(6, "sbxloop:workload")})
+        src = self.make(ops)
+        item = src.poll()[0]
+        ops.issues["6"]["labels"].append({"name": "sbxloop:run"})
+        assert src.claim(item) is False
+        assert [lb["name"] for lb in ops.issues["6"]["labels"]] == ["sbxloop:failed"]
+        assert not any(CLAIM_MARKER in body for _, body in ops.comments)
+
+    def test_claim_refuses_when_the_workload_label_is_gone(self) -> None:
+        ops = RecordingOps({"6": issue(6, "sbxloop:workload")})
+        src = self.make(ops)
+        item = src.poll()[0]
+        ops.issues["6"]["labels"] = []
+        assert src.claim(item) is False
+
+    def test_abandon_names_the_workload_label_for_the_restart(self) -> None:
+        ops = RecordingOps({"6": issue(6, "sbxloop:in-progress")})
+        self.make(ops).report_abandoned(gh(6, kind="workload"), "boom")
+        assert "Re-add `sbxloop:workload`" in ops.comments[-1][1]
+        assert [lb["name"] for lb in ops.issues["6"]["labels"]] == ["sbxloop:failed"]
+
+    def test_report_completed_comments_labels_and_closes(self) -> None:
+        ops = RecordingOps({"6": issue(6, "sbxloop:in-progress")})
+        done = report(
+            state="completed",
+            pr=None,
+            kind="workload",
+            summary="1/1 tasks done: the answer is 42",
+            published=(
+                Published(sink="issue", location="https://x/issues/6#issuecomment-9", tasks=["t1"]),
+                Published(sink="artifact", location="/runs/r1/artifacts", tasks=["t1"], files=2),
+                Published(sink="chat", location="chat", tasks=["t1"]),
+            ),
+        )
+        assert self.make(ops).report_completed(gh(6, kind="workload"), done) is True
+        body = ops.comments[-1][1]
+        assert body.splitlines()[0] == "Run `r1` completed: 1/1 tasks done: the answer is 42"
+        assert "- result answered on the issue: https://x/issues/6#issuecomment-9" in body
+        assert "- 2 files delivered to /runs/r1/artifacts" in body
+        assert "- result posted to chat" in body
+        writes = [(m, p) for m, p, _ in ops.raw_calls if m in {"POST", "PATCH", "DELETE"}]
+        assert ("DELETE", "/repos/o/r/issues/6/labels/sbxloop%3Ain-progress") in writes
+        assert writes.index(("POST", "/repos/o/r/issues/6/labels")) < writes.index(
+            ("PATCH", "/repos/o/r/issues/6")
+        )
+        assert (
+            "PATCH",
+            "/repos/o/r/issues/6",
+            {"state": "closed", "state_reason": "completed"},
+        ) in ops.raw_calls
+        assert [lb["name"] for lb in ops.issues["6"]["labels"]] == ["sbxloop:completed"]
+
+    def test_report_completed_failure_returns_false_for_a_retry(self) -> None:
+        ops = RecordingOps({"6": issue(6, "sbxloop:in-progress")})
+        ops.fail_on.add("PATCH")
+        done = report(state="completed", pr=None, kind="workload", summary="done")
+        assert self.make(ops).report_completed(gh(6, kind="workload"), done) is False
+
+
+class TestChatSource:
+    """The concierge's queue: nothing to poll, nothing to report to (#760)."""
+
+    def test_polls_nothing_and_claims_everything(self) -> None:
+        src = ChatSource()
+        assert src.name == "chat"
+        assert src.poll() == []
+        item = WorkItem(item_id="chat:m1", source_key="m1", title="x", kind="workload")
+        assert src.claim(item) is True
+        assert src.settle_claim(item) is False
+
+    def test_every_report_is_a_log_line_that_counts_as_delivered(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        src = ChatSource()
+        item = WorkItem(item_id="chat:m1", source_key="m1", title="x", kind="workload")
+        done = report(state="completed", pr=None, kind="workload", summary="done")
+        with caplog.at_level(logging.INFO, logger="sbxloop"):
+            src.report_started(item, "r1")
+            assert src.report_completed(item, done) is True
+            assert src.report_merged(item, None, "") is True
+            assert src.report_blocked(item, "why", None, "") is True
+            assert src.report_gated(item, None, "") is True
+            src.report_retry(item, "boom", 1)
+            src.report_abandoned(item, "boom")
+            src.report_cancelled(item, done)
+            src.report_requeued(item, "brett")
+        assert "chat.completed" in caplog.text and "chat.abandoned" in caplog.text
+
+
+class TestCompositeSource:
+    """One queue over GitHub and chat, routed by the item id (#760)."""
+
+    def make(self, ops: RecordingOps) -> CompositeSource:
+        github = GitHubIssueSource(
+            lambda: ops,  # type: ignore[arg-type]
+            "o/r",
+            LABELS,
+            host="db",
+            clock=lambda: FIXTURE_NOW,
+        )
+        return CompositeSource(github, ChatSource())
+
+    def test_polling_is_githubs(self) -> None:
+        ops = RecordingOps({"6": issue(6, "sbxloop:workload")})
+        src = self.make(ops)
+        assert src.name == "github+chat"
+        assert [i.item_id for i in src.poll()] == ["gh:issue:6"]
+
+    def test_chat_items_never_reach_github(self) -> None:
+        ops = RecordingOps({"6": issue(6, "sbxloop:in-progress")})
+        src = self.make(ops)
+        chat_item = WorkItem(item_id="chat:m1", source_key="m1", title="x", kind="workload")
+        done = report(state="completed", pr=None, kind="workload", summary="done")
+        assert src.claim(chat_item) is True
+        assert src.settle_claim(chat_item) is False
+        src.report_started(chat_item, "r1")
+        assert src.report_completed(chat_item, done) is True
+        src.report_abandoned(chat_item, "boom")
+        assert ops.comments == [] and ops.raw_calls == []
+
+    def test_github_items_are_githubs(self) -> None:
+        ops = RecordingOps({"6": issue(6, "sbxloop:in-progress")})
+        src = self.make(ops)
+        done = report(state="completed", pr=None, kind="workload", summary="done")
+        assert src.report_completed(gh(6, kind="workload"), done) is True
+        assert len(ops.comments) == 1
+        assert [lb["name"] for lb in ops.issues["6"]["labels"]] == ["sbxloop:completed"]
+
+    def test_the_github_extras_are_reachable_by_name(self) -> None:
+        src = self.make(RecordingOps())
+        assert src.issue_context == src.github.issue_context  # type: ignore[attr-defined]
+        with pytest.raises(AttributeError):
+            _ = src._private  # type: ignore[attr-defined]

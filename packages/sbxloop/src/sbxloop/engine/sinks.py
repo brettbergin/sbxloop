@@ -97,6 +97,8 @@ def published_line(entry: Published) -> str:
     if entry.sink == "artifact":
         return f"{count} delivered to {entry.location}"
     if entry.sink == "issue":
+        if "issuecomment" in entry.location:
+            return f"result answered on the issue: {entry.location}"
         return f"result filed as {entry.location}"
     if entry.sink == "pr":
         return f"result delivered as {entry.location}"

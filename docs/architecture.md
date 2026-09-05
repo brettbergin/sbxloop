@@ -1207,6 +1207,34 @@ recovery: the calendar-day run cap, the circuit breaker, the resume cap,
 pause and cancel, startup and staleness reconciliation, run-directory
 retention.
 
+**Workload intake (#760)** rides the same machinery with a second label and
+a second source. `GitHubIssueSource.poll` runs two searches, the trigger
+label and `[daemon] workload_label` (`sbxloop:workload`, the seventh
+lifecycle label); an issue in both is `_refuse_conflict`ed — one comment,
+both labels off, `failed` on — before it is ever a `WorkItem`, and the claim
+re-checks the live labels for the same conflict. A workload item carries
+`kind = "workload"` (and an optional `profile`; the store persists both as
+`run_kind` / `profile`, with the legacy `kind` marker column left alone),
+`GitHubLabels.trigger_for(item)` picks which label the claim, settle and
+abandon paths swap, and `_default_runner` hands `kind`/`profile` to the
+engine. Settling treats `completed` as the workload's landed state:
+`report_completed` comments `Run <id> completed: <summary>` plus one
+`sinks.published_line` per delivery, swaps `in-progress` for `completed`
+and closes the issue; `_item_config` pins `[workload] result_issue` to the
+asking issue so the `issue` sink answers there as a comment (`_publish_issue`)
+instead of filing a fresh result issue, and `deliver_closes` stays unset —
+a workload has no PR to close the issue for it. The second source is
+`ChatSource`: it polls nothing and claims everything, because the concierge's
+`start_workload` tool writes the item straight into the store
+(`upsert_new`, id `chat:<message id>`, the ask as the body, `requested_by`
+the author) — one tool call, no issue, no label. `CompositeSource(github, chat)` routes every `report_*` by `is_chat_id`, so a chat item's reports are
+log lines and its outcome text is the ask plus a provenance footer rather
+than an issue rendering. A chat item has no repository, and the store's
+repo-attribution passes (`backfill_repo`, `attribute_repoless`,
+`drop_repoless`) skip `chat:` rows so a multi-repo restart never drops a
+queued ask. With `[chat]` configured and `[github]` absent the daemon runs on
+`ChatSource` alone.
+
 ### Repositories
 
 One daemon may tend several repositories. They are declared as an array of
@@ -1238,7 +1266,7 @@ The split is deliberate and worth stating plainly:
 
 - **Per repository** — base branch (`deliver_base`), repo creation
   (`create_repo`, `create_public`), every lifecycle label
-  (`trigger_label` … `gated_label`; `Config.labels_for(repo)` folds the
+  (`trigger_label` … `workload_label`; `Config.labels_for(repo)` folds the
   `[daemon]` defaults in and `sbxloop init-repo` creates them, #630),
   extra `labels`, the `enabled` switch, the token
   environment variable (`token_env`), and the **workspace** the repo's
@@ -1343,6 +1371,9 @@ The rules are asymmetric on purpose:
   and lookups by either form resolve to the same item.
 
 Ids from other sources (e.g. `inbox:<file>.md`) pass through unchanged.
+A workload the concierge queued is `chat:<message id>` (`ghids.chat_item_id`
+/ `is_chat_id`) — the Discord or Slack message that asked for it, so the
+id is stable across a re-ask and the thread can be found from the item.
 Operator commands that take an `<item>` argument — `items`, `queue`,
 `abandon`, `retry`, `requeue`, on both `sbxloop daemon` and `!sbx` — accept
 either form and always *print* the typed one.

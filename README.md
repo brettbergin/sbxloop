@@ -399,7 +399,29 @@ worked artifact → pr → issue → chat and each delivery is recorded on the r
 **Published** field) before the next, so a resume at `publishing` never
 files a second issue or opens a second pull request; a sink that cannot take
 the result — a checkout with nothing to deliver included — fails the run
-naming it. Scheduled intake lands on this base next.
+naming it.
+
+**How a workload is asked for** (#760) is the daemon's job, two ways in. A
+GitHub issue carrying the **workload label** (`[daemon] workload_label`,
+`sbxloop:workload` by default — the seventh lifecycle label, `init-repo`
+creates it) is claimed exactly like a `sbxloop:run` issue — same claim
+comment, same `in-progress` swap, same attempt and resume caps, same breaker
+— but dispatched as a **workload** under the `[workload] default` profile,
+with the issue's title, body and discussion as the ask. An issue carrying
+*both* labels is refused before it is claimed: a comment says which to keep,
+both come off, `sbxloop:failed` goes on. When the run finishes, the daemon
+comments `Run <id> completed: <summary>` with one line per sink that
+delivered, swaps `in-progress` for `sbxloop:completed` and closes the issue;
+a task that chose the `issue` sink **answers on the asking issue** as a
+comment rather than filing a result issue of its own. The other way in is
+the concierge: `@sbxloop` a description of the work (naming a profile or a
+sink if the default will not do) and it calls `start_workload`, queueing a
+`chat:<message id>` item — no issue, no label, one tool call — that the same
+poll picks up; the result comes back to the thread as usual, and an ask for
+the `issue` sink files a result issue as before, since there is no asking
+issue. A daemon with `[chat]` configured and no `[github]` at all is now a
+valid daemon: chat-asked workloads are its whole queue. `publish = "hold"`
+and `[[schedules]]` land on this base next.
 
 ## CLI reference
 
@@ -418,7 +440,7 @@ naming it. Scheduled intake lands on this base next.
 | `sbxloop artifacts RUN`                         | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).                                                                                                                                                                                                                                                 |
 | `sbxloop shell RUN`                             | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                                                                                                                                                                                                             |
 | `sbxloop init`                                  | Write a commented starter `sbxloop.toml` from `sbxloop.toml.example` (`--force` overwrites, `--stdout` prints, `--preset large-repo` appends the packaged budget preset).                                                                                                                                                                                  |
-| `sbxloop init-repo OWNER/NAME`                  | Create the labels the loop relies on in a repository — the six lifecycle labels (with that repository's renames applied) and the follow-up label, each colored and described. Idempotent; boots one github-ops sandbox; exits 1 when the token cannot write labels.                                                                                        |
+| `sbxloop init-repo OWNER/NAME`                  | Create the labels the loop relies on in a repository — the seven lifecycle labels (with that repository's renames applied) and the follow-up label, each colored and described. Idempotent; boots one github-ops sandbox; exits 1 when the token cannot write labels.                                                                                      |
 | `sbxloop bake`                                  | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                                                                                                                        |
 | `sbxloop doctor [--deep]`                       | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                                                                                                                                                                                |
 | `sbxloop sandbox ls\|rm\|prune`                 | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                                                                                                                                                                                                                         |
@@ -914,6 +936,7 @@ completed_label = "sbxloop:completed"     # the PR merged; the issue closes
 failed_label = "sbxloop:failed"           # the run gave up; re-trigger by hand
 blocked_label = "sbxloop:blocked"         # GitHub would not let the loop land the PR
 gated_label = "sbxloop:awaiting-merge"    # parked by [landing] merge_gate
+workload_label = "sbxloop:workload"       # queues an issue as a workload, not a code run
 max_runs_per_day = 12                     # calendar-day cap, persisted across restarts
 run_cap_timezone = "UTC"                  # day boundary for the cap (resets at 00:00 there)
 max_attempts_per_item = 2
@@ -1283,11 +1306,11 @@ labels = ["team:core"]      # extra labels for this repository
 ```
 
 Every lifecycle label — `trigger_label`, `in_progress_label`, `failed_label`,
-`completed_label`, `blocked_label`, `gated_label` — can be renamed on an
-entry; unset ones take the `[daemon]` value, and the six must stay distinct
+`completed_label`, `blocked_label`, `gated_label`, `workload_label` — can be renamed on an
+entry; unset ones take the `[daemon]` value, and the seven must stay distinct
 (case-insensitively) per repository. Nothing creates the trigger label a
 human is told to apply, and GitHub creates the lifecycle labels on first
-attach with a random color and no description: **`sbxloop init-repo owner/name`** creates the six (plus `[landing] followup_label`) with colors
+attach with a random color and no description: **`sbxloop init-repo owner/name`** creates the seven (plus `[landing] followup_label`) with colors
 and descriptions up front, idempotently, through one github-ops sandbox —
 run it again after renaming a label. `sbxloop doctor` reports missing labels and a
 repository whose Issues are disabled as advisory rows; it does not fix
@@ -2033,7 +2056,7 @@ The notable knobs:
 | `[artifacts] exclude`                                                          | see above                                       | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it).                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `[budgets]`                                                                    | see above                                       | `max_revisions_per_task`, `max_replans_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`, `max_parallel_tasks`, `repo_context_max_chars`, `outcome_max_chars`.                                                                                                                                                                                                                                                                                                                                                               |
 | `[limits]`                                                                     | `85` / `95` / `90`                              | `disk_warn`, `disk_abort`, `mem_warn` percentages (0 disables).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `[daemon] trigger_label` … `gated_label`                                       | `sbxloop:run` …                                 | The issue labels: `trigger_label`, `in_progress_label`, `completed_label`, `failed_label`, `blocked_label`, `gated_label`; each can be renamed per `[[github.repos]]` entry. `sbxloop init-repo` creates them.                                                                                                                                                                                                                                                                                                                                                         |
+| `[daemon] trigger_label` … `workload_label`                                    | `sbxloop:run` …                                 | The issue labels: `trigger_label`, `in_progress_label`, `completed_label`, `failed_label`, `blocked_label`, `gated_label`, `workload_label` (queues the issue as a workload); each can be renamed per `[[github.repos]]` entry. `sbxloop init-repo` creates them.                                                                                                                                                                                                                                                                                                      |
 | `[daemon] max_runs_per_day`                                                    | `12`                                            | Runs allowed per calendar day, counted by start time in `run_cap_timezone`; the count resets at 00:00 there.                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `[daemon] run_cap_timezone`                                                    | `UTC`                                           | IANA timezone defining the run cap's day boundary.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `[daemon] max_attempts_per_item` / `max_resumes_per_item`                      | `2` / `2`                                       | Per-item retry and resume caps; `retry_backoff_s`, `max_consecutive_failures`, `breaker_cooldown_s` beside them.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |

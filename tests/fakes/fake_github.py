@@ -219,6 +219,9 @@ class FakeGithub(GithubOps):
         # Follow-up issues filed after the merge (#517), and the labels the
         # engine made sure exist; `existing_issues` seeds the label listing.
         self.issues_created: list[tuple[str, str, list[str]]] = []
+        # Comments on an issue by number (the workload issue sink answering
+        # on the issue that asked, #760).
+        self.issue_answers: list[tuple[int, str]] = []
         # Whether the repository has Issues enabled (#631): False makes the
         # payload say so and ``issue_create`` answer GitHub's 410; None
         # leaves the payload silent (the 410 alone then decides).
@@ -552,6 +555,11 @@ class FakeGithub(GithubOps):
         self.issues_created.append((title, body, list(labels or [])))
         number = 900 + len(self.issues_created)
         return IssueRef(number=number, url=f"https://github.com/{repo}/issues/{number}")
+
+    def issue_comment(self, repo: str, number: int, body: str) -> str:
+        self._maybe_fail("issue_comment")
+        self.issue_answers.append((number, body))
+        return f"https://github.com/{repo}/issues/{number}#issuecomment-{len(self.issue_answers)}"
 
     def pr_get(self, repo: str, number: int) -> dict[str, Any]:
         self._maybe_fail("pr_get")

@@ -3,7 +3,7 @@
 Nothing creates the trigger label a human is told to apply, and GitHub
 creates the lifecycle labels on first attach with a random color and no
 description — a repository the daemon was pointed at but never set up
-shows the loop's states as unexplained colored noise. This creates the six
+shows the loop's states as unexplained colored noise. This creates the seven
 lifecycle labels (`[daemon] *_label`, with the repository's
 `[[github.repos]]` renames applied) and the follow-up label, each with a
 color and a description, and leaves existing ones alone.

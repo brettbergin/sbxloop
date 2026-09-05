@@ -37,7 +37,7 @@ from typing import Any, NamedTuple
 
 from sbxloop.daemon.model import ItemState, PendingReport, WorkItem
 from sbxloop.errors import DaemonError
-from sbxloop.ghids import GH_PREFIX, normalize_item_id, try_parse_gh_id
+from sbxloop.ghids import CHAT_PREFIX, GH_PREFIX, normalize_item_id, try_parse_gh_id
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -84,6 +84,11 @@ _WORK_ITEMS_BODY = """(
     prior_run_id    TEXT,
     prior_branch    TEXT,
     prior_pr_number INTEGER,
+    -- The run the item becomes (#760) and the workload profile it runs
+    -- under. Named run_kind: a bare `kind` column on this table is the
+    -- pre-1.0 lanes' marker the archive check looks for.
+    run_kind        TEXT NOT NULL DEFAULT 'code',
+    profile         TEXT,
     UNIQUE(source_key, repo)
 )"""
 
@@ -101,6 +106,10 @@ _REQUESTERS_BODY = """(
 )"""
 
 _REQUESTERS_COLUMNS = "source_key, requester_id, created_at"
+# The repo-less rows that are repo-less by design (#760): a chat-started
+# workload has no repository to backfill, attribute or drop it for. The
+# ids are literal-prefixed, so the clause is a constant, not a parameter.
+_NOT_CHAT = f"item_id NOT LIKE '{CHAT_PREFIX}%'"
 
 _CHAT_THREADS_BODY = (
     "(run_id TEXT NOT NULL, backend TEXT NOT NULL DEFAULT 'discord', "
@@ -629,6 +638,8 @@ def _row_to_item(row: sqlite3.Row) -> WorkItem:
         prior_run_id=_col(row, "prior_run_id"),
         prior_branch=_col(row, "prior_branch"),
         prior_pr_number=_col(row, "prior_pr_number"),
+        kind=_col(row, "run_kind") or "code",
+        profile=_col(row, "profile"),
     )
 
 
@@ -882,6 +893,16 @@ class DaemonStore:
             "held_by_draft",
             "ALTER TABLE daemon_review_holds ADD COLUMN held_by_draft INTEGER NOT NULL DEFAULT 0",
         ),
+        (
+            "daemon_work_items",
+            "run_kind",
+            "ALTER TABLE daemon_work_items ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'code'",
+        ),
+        (
+            "daemon_work_items",
+            "profile",
+            "ALTER TABLE daemon_work_items ADD COLUMN profile TEXT",
+        ),
     )
 
     def _migrate_added_columns(self) -> None:
@@ -1006,9 +1027,15 @@ class DaemonStore:
             return 0
         updated = 0
         with self._lock:
-            for table in ("daemon_work_items", "daemon_requesters"):
+            # A chat item (#760) has no repository by design, not by age.
+            # Requester rows are the concierge's record of who asked for an
+            # issue; a chat item carries its requester itself and writes none.
+            for table, extra in (
+                ("daemon_work_items", f" AND {_NOT_CHAT}"),
+                ("daemon_requesters", ""),
+            ):
                 cur = self._conn.execute(
-                    f"UPDATE OR IGNORE {table} SET repo = ? WHERE repo = ''",  # nosec B608
+                    f"UPDATE OR IGNORE {table} SET repo = ? WHERE repo = ''{extra}",  # nosec B608
                     (repo,),
                 )
                 updated += cur.rowcount or 0
@@ -1035,7 +1062,7 @@ class DaemonStore:
         updated = 0
         with self._lock:
             rows = self._conn.execute(
-                "SELECT item_id, url FROM daemon_work_items WHERE repo = ''"
+                f"SELECT item_id, url FROM daemon_work_items WHERE repo = '' AND {_NOT_CHAT}"  # nosec B608
             ).fetchall()
             for row in rows:
                 repo = known.get((_repo_from_url(row["url"]) or "").casefold())
@@ -1079,7 +1106,10 @@ class DaemonStore:
         repo-less fallback only for unqualified items, and are harmless
         otherwise. Returns the number of rows deleted.
         """
-        where = "WHERE repo = '' AND state = 'queued' AND claimed = 0 AND run_id IS NULL"
+        where = (
+            "WHERE repo = '' AND state = 'queued' AND claimed = 0 AND run_id IS NULL "
+            f"AND {_NOT_CHAT}"
+        )
         with self._lock:
             rows = self._conn.execute(
                 f"SELECT item_id FROM daemon_work_items {where}"  # nosec B608 - literal above
@@ -1192,13 +1222,13 @@ class DaemonStore:
             adopt_legacy = bool(repo) and (parsed is None or parsed.repo is None)
             if adopt_legacy:
                 row = self._conn.execute(
-                    "SELECT item_id, state, title, body, repo FROM daemon_work_items "
+                    "SELECT item_id, state, title, body, repo, run_kind FROM daemon_work_items "
                     "WHERE source_key = ? AND repo IN (?, '') ORDER BY repo = ? DESC LIMIT 1",
                     (item.source_key, repo, repo),
                 ).fetchone()
             else:
                 row = self._conn.execute(
-                    "SELECT item_id, state, title, body, repo FROM daemon_work_items "
+                    "SELECT item_id, state, title, body, repo, run_kind FROM daemon_work_items "
                     "WHERE source_key = ? AND repo = ? LIMIT 1",
                     (item.source_key, repo),
                 ).fetchone()
@@ -1211,7 +1241,13 @@ class DaemonStore:
                 self._conn.commit()
             if row is not None:
                 terminal = row["state"] in TERMINAL_ITEM_STATES
-                changed = (row["title"], row["body"]) != (item.title, item.body)
+                # An issue re-labelled for the other kind of run (#760) is
+                # new work, however familiar its words.
+                changed = (row["title"], row["body"], row["run_kind"] or "code") != (
+                    item.title,
+                    item.body,
+                    item.kind,
+                )
                 if not terminal:
                     return False
                 if not changed:
@@ -1259,8 +1295,8 @@ class DaemonStore:
             self._conn.execute(
                 "INSERT INTO daemon_work_items (item_id, source_key, title, body, url, state, "
                 "attempts, claimed, run_id, last_error, created_at, updated_at, requested_by, "
-                "repo, prior_run_id, prior_branch, prior_pr_number) "
-                "VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, ?)",
+                "repo, prior_run_id, prior_branch, prior_pr_number, run_kind, profile) "
+                "VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     item_id,
                     item.source_key,
@@ -1274,6 +1310,8 @@ class DaemonStore:
                     prior.run_id if prior else None,
                     prior.branch if prior else None,
                     prior.pr_number if prior else None,
+                    item.kind,
+                    item.profile,
                 ),
             )
             self._conn.commit()
