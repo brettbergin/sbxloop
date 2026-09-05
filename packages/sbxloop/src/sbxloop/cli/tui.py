@@ -226,7 +226,9 @@ def render_event(event: Event) -> RenderableType | None:
         style = "dim"
         if event.type == HostEventTypes.TASK_STATE:
             style = TASK_STATE_STYLES.get(str(data.get("state", "")), "dim")
-        elif event.type == HostEventTypes.PHASE_END and data.get("status") == "failed":
+        elif (
+            event.type == HostEventTypes.PHASE_END and data.get("status") == "failed"
+        ) or event.type == HostEventTypes.RUN_NEEDS_REFUSED:
             style = "red"
         elif (
             "fallback" in event.type

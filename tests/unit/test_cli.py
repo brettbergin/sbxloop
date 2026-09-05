@@ -348,6 +348,55 @@ class TestConfigAndInit:
         assert "sbxloop.toml" in result.output
         assert "env" in result.output
 
+    def test_config_show_lists_credentials_and_profiles_without_values(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`[[credentials]]` and `[[workloads]]` (#758) get their own tables:
+        a credential shows set/unset and its host, never the value; a
+        profile shows what it bounds and which one is the default."""
+        monkeypatch.setenv("WEATHER_API_KEY", "value_never_shown")
+        monkeypatch.delenv("MAIL_TOKEN", raising=False)
+        (workdir / "sbxloop.toml").write_text(
+            "[[credentials]]\n"
+            'name = "weather"\n'
+            'env = "WEATHER_API_KEY"\n'
+            'host = "api.weather.example.com"\n'
+            'description = "forecasts"\n'
+            "\n"
+            "[[credentials]]\n"
+            'name = "mail"\n'
+            'env = "MAIL_TOKEN"\n'
+            'host = "mail.example.com"\n'
+            "\n"
+            "[[workloads]]\n"
+            'name = "research"\n'
+            'egress = ["*.example.com"]\n'
+            'credentials = ["weather"]\n'
+            'sinks = ["chat", "artifact"]\n'
+            "budgets = { max_tasks = 4 }\n"
+            "\n"
+            "[[workloads]]\n"
+            'name = "bare"\n'
+            "\n"
+            "[workload]\n"
+            'default = "research"\n'
+        )
+        result = runner.invoke(app, ["config", "show"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0, result.output
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "credentials (values never shown)" in plain
+        assert "value_never_shown" not in plain
+        rows = [line for line in plain.splitlines() if "weather" in line or "mail" in line]
+        assert any("WEATHER_API_KEY" in r and "set" in r and "forecasts" in r for r in rows)
+        assert any("MAIL_TOKEN" in r and "unset" in r for r in rows)
+        assert "workload profiles" in plain
+        (research,) = [line for line in plain.splitlines() if "research (default)" in line]
+        assert "*.example.com" in research and "chat, artifact" in research
+        assert "max_tasks=4" in research and "weather" in research
+        assert any(line.strip("│ ").startswith("bare") for line in plain.splitlines())
+        # the flattened dump does not repeat the tables' rows
+        assert "workloads" not in [line.split()[0] for line in plain.splitlines() if line.strip()]
+
     def test_config_policy_defaults(self, workdir: Path) -> None:
         result = runner.invoke(app, ["config", "policy"])
         assert result.exit_code == 0
@@ -1129,6 +1178,34 @@ class TestDoctor:
         assert "set: weather" in result.output and "api.weather.example.com" in result.output
         assert "value_never_shown" not in result.output
 
+    def test_doctor_lists_workload_profiles(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`[[workloads]]` (#758) gets an informational row: each profile
+        and what it bounds, the default marked, and a note when no default
+        is set."""
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        (workdir / "sbxloop.toml").write_text(
+            '[[workloads]]\nname = "research"\negress = ["*.example.com"]\nsinks = ["chat"]\n'
+        )
+        result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0, result.output
+        assert "workload profiles" in result.output
+        assert "research: hosts *.example.com, credentials -, sinks chat, repo no" in result.output
+        assert "no [workload] default" in result.output
+        (workdir / "sbxloop.toml").write_text(
+            '[[workloads]]\nname = "research"\n\n[workload]\ndefault = "research"\n'
+        )
+        result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0, result.output
+        assert "research (default): hosts -" in result.output
+        assert "no [workload] default" not in result.output
+        # nothing declared, no row
+        (workdir / "sbxloop.toml").write_text("")
+        result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
+        assert "workload profiles" not in result.output
+
     def _bake_record(
         self,
         workdir: Path,
@@ -1735,6 +1812,59 @@ class TestRunCommand:
             assert result.exit_code == 2, result.output
             assert "cannot be combined with --kind workload" in result.output.replace("\n", "")
             assert flags[0] in result.output
+        assert fake_sbx.invocations("create") == []
+
+    def test_run_profile_chooses_the_workload_profile(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--profile` (#758) names a `[[workloads]]` profile for the run;
+        the run says which, and pins it into its config for a resume."""
+        execute = {"text": "on it\n\n## Result\n\ndone"}
+        verdict = {"json": {"passed": True, "unmet": [], "notes": ""}}
+        self.make_run_env(workdir, monkeypatch, [self.HAPPY_RUN[0], execute, verdict])
+        (workdir / "sbxloop.toml").write_text(
+            '[[workloads]]\nname = "research"\n\n'
+            '[[workloads]]\nname = "bare"\nbudgets = { max_tasks = 2 }\n\n'
+            '[workload]\ndefault = "research"\n'
+        )
+        result = runner.invoke(
+            app, ["run", "count", "--kind", "workload", "--profile", "bare", "--no-tui"]
+        )
+        assert result.exit_code == 0, result.output
+        plain = result.output.replace("\n", "")
+        assert "profile: bare" in plain
+        store = StateStore(workdir / ".sbxloop" / "state.db")
+        (run,) = store.list_runs()
+        stored = json.loads(store.get_run_config(run.run_id))
+        assert stored["workload"]["default"] == "bare"
+        assert stored["budgets"]["max_tasks"] == 2
+
+    def test_run_without_a_profile_says_so(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        execute = {"text": "on it\n\n## Result\n\ndone"}
+        verdict = {"json": {"passed": True, "unmet": [], "notes": ""}}
+        self.make_run_env(workdir, monkeypatch, [self.HAPPY_RUN[0], execute, verdict])
+        result = runner.invoke(app, ["run", "count", "--kind", "workload", "--no-tui"])
+        assert result.exit_code == 0, result.output
+        assert "profile: none (no needs can be granted)" in result.output.replace("\n", "")
+
+    def test_run_profile_refusals(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A profile on a code run, or one the config does not declare, is
+        a usage error before any sandbox."""
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        (workdir / "sbxloop.toml").write_text('[[workloads]]\nname = "research"\n')
+        result = runner.invoke(app, ["run", "x", "--profile", "research", "--no-tui"])
+        assert result.exit_code == 2, result.output
+        assert "--profile cannot be combined with --kind code" in result.output.replace("\n", "")
+        result = runner.invoke(
+            app, ["run", "x", "--kind", "workload", "--profile", "nope", "--no-tui"]
+        )
+        assert result.exit_code == 2, result.output
+        plain = result.output.replace("\n", "")
+        assert "'nope' is not declared" in plain and "research" in plain
         assert fake_sbx.invocations("create") == []
 
     def test_run_kind_must_be_known(

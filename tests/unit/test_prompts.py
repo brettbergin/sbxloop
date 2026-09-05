@@ -266,6 +266,7 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "outcome": "o",
         "max_tasks": "3",
         "work_dir": "/data",
+        "bounds": "Profile `p`:\n- hosts: none",
         "user_guidance": "(none)",
     },
     "operator_execute": {
@@ -688,6 +689,16 @@ def test_operator_plan_declares_needs_by_name() -> None:
     assert "Declare it here" in text
     assert '"needs": {"hosts": [], "credentials": [], "sink": null, "repo": null}' in text
     assert "At most 3 tasks" in text
+
+
+def test_operator_plan_shows_what_may_be_granted() -> None:
+    """The profile's bounds (#758) reach the planner as their own section,
+    with the rule that a need outside them ends the run before any task."""
+    text = render("operator_plan", **RENDER_CONTEXTS["operator_plan"])
+    assert "## What this run may ask for" in text
+    assert "Profile `p`:\n- hosts: none" in text
+    plain = " ".join(text.split())
+    assert "a need outside it is refused and the run ends before any task runs" in plain
 
 
 def test_operator_plan_makes_criteria_the_exam() -> None:

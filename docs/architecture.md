@@ -144,6 +144,28 @@ credential:
 | network    | balanced policy + copilot hosts + the `[github] api_url` hosts + plan-declared grants                                                                                   | balanced policy + the `[github] api_url` hosts (+ the dotcom storage hosts when that is github.com)                |
 | runs       | agent SDK sessions (Copilot SDK, or the Claude Agent SDK + Claude Code CLI with the claude backend), shell checks                                                       | `github.op` jobs (gh CLI or REST)                                                                                  |
 
+A workload run's needs (#758) are held to a **profile** before any task
+runs. `[[workloads]]` declares each profile (`egress` patterns, the
+`[[credentials]]` names it may grant, `sinks`, `repo`, `budgets` overrides)
+and `[workload] default` names the run's when `--profile` does not;
+`Config.for_workload_profile` pins the choice into the persisted run config
+(`workload.default`) with the overrides applied, so a resume compares like
+with like. `LoopEngine._grant_needs` runs right after the plan is saved: every
+task's `TaskNeeds` is answered — a host must be inside the profile's egress
+(`EgressGranter.extra_allow`; `[policy] deny` still wins) and is applied at
+the task's execute entry beside `task.egress`; a credential must be one the
+profile names and goes on the run row; a sink one it lists; a repository
+allowed by it, configured under `[github]`, and the data directory mounted,
+then `Provisioner.clone_repo_into_data_dir` cuts a single-branch checkout at
+`<data dir>/<name>` (reused on resume). Any refusal fails the run closed with
+every refusal emitted as `run.needs_refused` (need, value, task, the
+sbxloop.toml key that would allow it) and nothing granted; a grant emits
+`run.needs_granted`. A credential grant cannot be added to a running pair (the
+service box is stamped at creation), so the grant step raises `_Reprovision`:
+`_drive` tears the pair down (even under `keep_sandboxes`) and re-enters
+itself at the `executing` stage on a pair provisioned from the run row —
+agent box plus service box — exactly the resume path, one extra boot.
+
 The service sandbox (`sbxloop-<run>-service`, #765) is the github sandbox's
 pattern generalized to the operator's own credentials. `[[credentials]]`
 declares a catalogue — `name`, the daemon-environment `env` holding the value,
@@ -1274,7 +1296,10 @@ changes-requested review the merge goes over, #613), `land.human_ack` /
 the PR and why. A workload adds `judge.verdict` / `judge.degraded` (#756)
 and `task.output` (#757: the task, the attempt, the one-line summary and
 how many files the attempt left), emitted after each execute attempt and
-before the judge's word on it. `run.state` fires on every stage entry — the state *is* the
+before the judge's word on it, and `run.needs_granted` / `run.needs_refused`
+(#758: the plan's needs against the run's profile — what was granted by name,
+or each refusal with the sbxloop.toml key that would allow it — emitted
+between the plan and the first task). `run.state` fires on every stage entry — the state *is* the
 stage. These carry no information the agent's reply did not — they exist so
 a surface can show the decision without showing the agent's JSON, which is
 what the Discord bridge does.

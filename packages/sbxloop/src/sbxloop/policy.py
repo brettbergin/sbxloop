@@ -24,7 +24,7 @@ subdomain), or the operator-only ``*`` (covers everything).
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 from sbxloop.config import Config
 from sbxloop.errors import SbxError
@@ -241,6 +241,7 @@ class EgressGranter:
         run_id: str,
         sandbox: str,
         repo: str | None = None,
+        extra_allow: Sequence[str] = (),
     ):
         from sbxloop.sbx import registries
         from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS
@@ -250,6 +251,9 @@ class EgressGranter:
         self.run_id = run_id
         self.sandbox = sandbox
         self.allow, self.deny = effective_egress_bounds(config, repo)
+        # A workload profile's egress (#758) widens what its plan may ask
+        # for; `[policy] deny` still wins.
+        self.allow += [p.lower() for p in extra_allow]
         self._granted = {
             d.lower()
             for d in (

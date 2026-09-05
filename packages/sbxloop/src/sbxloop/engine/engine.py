@@ -42,6 +42,7 @@ Failure semantics:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import queue
 import shlex
@@ -161,6 +162,7 @@ from sbxloop.engine.service import ServiceOps
 from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import (
     BudgetExceededError,
+    ConfigError,
     GithubOpsError,
     InvalidOutputTwice,
     ProvisionError,
@@ -186,7 +188,7 @@ from sbxloop.gh.ops import (
 )
 from sbxloop.ids import branch_name, new_message_id, new_run_id
 from sbxloop.log import get_logger
-from sbxloop.policy import EgressGranter
+from sbxloop.policy import EgressGranter, egress_rejection
 from sbxloop.sbx import registries
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
@@ -199,6 +201,16 @@ log = get_logger(__name__)
 
 GithubOpsFactory = Callable[[WorkerClient, str], GithubOps]
 ServiceOpsFactory = Callable[..., ServiceOps]  # ServiceOps.__init__'s signature
+
+
+class _Reprovision(Exception):
+    """Internal: the run's grants changed what its sandboxes must be (a
+    workload's plan was granted a credential, #758) — leave this pair and
+    drive again from ``stage`` on a fresh one, the way a resume does."""
+
+    def __init__(self, stage: str) -> None:
+        super().__init__(stage)
+        self.stage = stage
 
 
 class ChatMessage(NamedTuple):
@@ -238,6 +250,12 @@ class Pipeline:
     # The service sandbox's ops (#765); None for a run granted no
     # credential, which then has no service sandbox at all.
     service: ServiceOps | None = None
+    # The provisioner the pair came from — a workload's plan may ask for a
+    # repository checkout after the pair is up (#758).
+    provisioner: Provisioner | None = None
+    # Why the workload's plan was refused (#758), when it was: the run's
+    # reason, in place of a task's failure.
+    needs_refused: str | None = None
     # The run's repository entry (per-repo deliver_base, token_env, …) with
     # the daemon-wide [github] defaults already folded in; None when the run
     # has no repository.
@@ -400,6 +418,7 @@ class LoopEngine:
         workspace_source: str | None = None,
         credentials: Sequence[str] = (),
         kind: RunKind = "code",
+        profile: str | None = None,
     ) -> RunResult:
         """Drive a fresh run all the way through.
 
@@ -436,9 +455,19 @@ class LoopEngine:
         the agent sandbox alone (no github sandbox, no clone). It is
         persisted with the run, so a resume re-enters the same stages
         whatever the on-disk config says by then.
+
+        ``profile`` names the ``[[workloads]]`` profile a workload runs
+        under (#758) — the `[workload] default` when None; a run with no
+        profile at all may declare no needs. It is pinned into the run's
+        persisted config with its budget overrides applied, so a resume
+        runs under the same bounds.
         """
         run_id = run_id or new_run_id()
+        if profile is not None and kind != "workload":
+            raise ConfigError("a workload profile applies to `--kind workload` runs only")
         self._select_repo(repo)
+        if kind == "workload":
+            self.config = self.config.for_workload_profile(profile)
         granted = [c.name for c in self.config.credentials_named(credentials)]
         self.store.create_run(
             run_id, outcome, self.config.model_dump_json(), credentials=granted, kind=kind
@@ -626,7 +655,14 @@ class LoopEngine:
                 "keep_on_failure": self.config.keep_on_failure,
             }
         )
-        drift = self._config_drift(stored, self.config)
+        current = self.config
+        if stored.workload.default is not None:
+            # The run was pinned to a profile (#758): the live config under
+            # that same profile is the fair comparison; a profile that is
+            # gone by now shows as drift, which it is.
+            with contextlib.suppress(ConfigError):
+                current = current.for_workload_profile(stored.workload.default)
+        drift = self._config_drift(stored, current)
         if drift:
             message = (
                 "resuming with the run's original config; the current config "
@@ -710,6 +746,7 @@ class LoopEngine:
             self.store.set_run_kept(run_id, "manual")
         state: RunState
         reason: str | None
+        again: _Reprovision | None = None
         try:
             with pair:
                 try:
@@ -835,6 +872,8 @@ class LoopEngine:
                             run_id,
                             pair.agent.name,
                             repo=self.config.github.repo,
+                            # A workload's profile bounds its hosts (#758).
+                            extra_allow=self._profile_egress(kind),
                         ),
                         deadline=deadline,
                         ops=ops,
@@ -847,10 +886,13 @@ class LoopEngine:
                             else None
                         ),
                         issues_enabled=issues_enabled,
+                        provisioner=provisioner,
                     )
                     try:
                         self._adopt_prior_artifacts(pipeline)
                         state, reason = self._run_pipeline(pipeline, stage)
+                    except _Reprovision as exc:
+                        again, state, reason = exc, "provisioning", None
                     finally:
                         # Harvest even when a stage raised: the sandbox is
                         # still alive here, and partial artifacts beat none.
@@ -861,11 +903,29 @@ class LoopEngine:
                     # gets diagnosed in-sandbox; decide keep before pair exit.
                     self._keep_on_failure(run_id, pair)
                     raise
-                if state not in ("merged", "completed", "gated", "awaiting_review"):
+                if again is None and state not in (
+                    "merged",
+                    "completed",
+                    "gated",
+                    "awaiting_review",
+                ):
                     self._keep_on_failure(run_id, pair)
         except SbxloopError:
             # State is already persisted; the exception is the kill signal.
             raise
+        if again is not None:
+            # The grants changed the sandbox set (#758): this pair held
+            # nothing worth keeping (a plan, persisted), so it goes even
+            # under keep_sandboxes, and the run re-enters on a pair
+            # provisioned from the run row — credentials included.
+            pair.cleanup()
+            return self._drive(
+                run_id,
+                outcome,
+                workspace=pair.workspace,
+                stage=again.stage,
+                expects_mount=pair.mounted,
+            )
         if reason:
             self.store.set_run_reason(run_id, reason)
         self._set_run_state(run_id, state)
@@ -1400,7 +1460,7 @@ class LoopEngine:
         if stage not in ("judging", "publishing"):
             failed = self._run_phases(p)
             if failed:
-                return "failed", self._failure_reason(p.run_id)
+                return "failed", p.needs_refused or self._failure_reason(p.run_id)
             stage = "judging"
         while True:
             self._check_cancelled_and_clock(p.run_id, p.deadline)
@@ -1616,6 +1676,8 @@ class LoopEngine:
                 turns=spend.turns,
             )
             tasks = self.store.get_tasks(run_id)
+            if p.kind == "workload" and self._grant_needs(p, tasks) is not None:
+                return True
 
         self._set_run_state(run_id, executing)
         self._announce_roster(run_id, tasks)
@@ -1624,6 +1686,170 @@ class LoopEngine:
         # (as steer_run — there is no task left to steer).
         self._process_chat(run_id, phases, None, stage="between the task graph and the gate")
         return bool(failed_ids or skipped_ids)
+
+    # -- a workload's needs (#758) -----------------------------------------
+
+    def _profile_egress(self, kind: RunKind) -> list[str]:
+        """The hosts a workload's profile lets its plan ask for; nothing for
+        a code run, whose bounds are `[policy]` alone."""
+        if kind != "workload":
+            return []
+        profile = self.config.workload_profile()
+        return list(profile.egress) if profile is not None else []
+
+    def _grant_needs(self, p: Pipeline, tasks: Sequence[TaskRecord]) -> str | None:
+        """Hold the plan's declared needs to the run's profile (#758).
+
+        Every need is answered before any task runs: a host must be inside
+        the profile's egress (or already in the operator's bounds) and not
+        denied; a credential must be one the profile names; a sink one it
+        lists; a repository allowed by it and configured under `[github]`.
+        The first need outside the profile fails the run closed — every
+        refusal is on the record as ``run.needs_refused`` naming the
+        sbxloop.toml key that would allow it, and nothing was granted.
+
+        Granted needs: hosts are applied at each task's execute entry (the
+        granter); a repository is cloned into the data directory now; a
+        credential goes on the run row, and since the service sandbox that
+        holds it is stamped at creation the run re-provisions from the
+        executing stage — one extra boot, only when a plan asked for one.
+        Returns the refusal reason, None when everything was granted (or
+        nothing was asked).
+        """
+        run_id = p.run_id
+        profile = self.config.workload_profile()
+        pname = profile.name if profile is not None else None
+        hosts: list[tuple[str, str]] = []
+        credentials: list[tuple[str, str]] = []
+        sinks: list[tuple[str, str]] = []
+        repos: list[tuple[str, str]] = []
+        for task in tasks:
+            needs = task.spec.needs
+            hosts += [(h, task.spec.id) for h in needs.hosts]
+            credentials += [(c, task.spec.id) for c in needs.credentials]
+            if needs.sink:
+                sinks.append((needs.sink, task.spec.id))
+            if needs.repo:
+                repos.append((needs.repo, task.spec.id))
+        if not (hosts or credentials or sinks or repos):
+            return None
+
+        refusals: list[str] = []
+
+        def refuse(need: str, value: str, task_id: str, key: str | None, why: str) -> None:
+            fix = f"; `{key}` in sbxloop.toml would allow it" if key else ""
+            message = f"task {task_id} needs {need} `{value}` — {why}{fix}"
+            refusals.append(message)
+            self.bus.emit(
+                HostEventTypes.RUN_NEEDS_REFUSED,
+                run_id,
+                profile=pname,
+                need=need,
+                value=value,
+                task_id=task_id,
+                key=key,
+                message=message,
+            )
+
+        no_profile = (
+            "the run has no workload profile" if pname is None else None,
+            "workload.default",
+        )
+        allow, deny = p.granter.allow, p.granter.deny
+        for host, task_id in hosts:
+            if no_profile[0]:
+                refuse("host", host, task_id, no_profile[1], no_profile[0])
+                continue
+            assert profile is not None
+            rejection = egress_rejection(host, allow, deny)
+            if rejection is not None and "deny" in rejection:
+                refuse("host", host, task_id, None, rejection)
+            elif rejection is not None and not profile.covers_host(host):
+                refuse(
+                    "host", host, task_id, f"workloads.{pname}.egress", f"outside profile {pname!r}"
+                )
+        for name, task_id in credentials:
+            if no_profile[0]:
+                refuse("credential", name, task_id, no_profile[1], no_profile[0])
+            elif name not in (profile.credentials if profile is not None else ()):
+                key = f"workloads.{pname}.credentials"
+                why = f"not granted by profile {pname!r}"
+                if self.config.credential(name) is None:
+                    key, why = "credentials", "not in the [[credentials]] catalogue"
+                refuse("credential", name, task_id, key, why)
+        for sink, task_id in sinks:
+            if no_profile[0]:
+                refuse("sink", sink, task_id, no_profile[1], no_profile[0])
+            elif sink not in (profile.sinks if profile is not None else ()):
+                refuse(
+                    "sink", sink, task_id, f"workloads.{pname}.sinks", f"not in profile {pname!r}"
+                )
+        for repo, task_id in repos:
+            if no_profile[0]:
+                refuse("repo", repo, task_id, no_profile[1], no_profile[0])
+            elif profile is not None and not profile.repo:
+                refuse(
+                    "repo",
+                    repo,
+                    task_id,
+                    f"workloads.{pname}.repo",
+                    f"profile {pname!r} allows none",
+                )
+            elif self.config.github.effective_repo(repo) is None:
+                refuse("repo", repo, task_id, "github.repos", "not a configured repository")
+            elif not p.pair.mounted:
+                refuse(
+                    "repo",
+                    repo,
+                    task_id,
+                    None,
+                    "the data directory is not mounted in the agent sandbox, so a checkout "
+                    "there would never be seen (see the sandbox row of `sbxloop doctor`)",
+                )
+        if refusals:
+            more = f" (+{len(refusals) - 1} more)" if len(refusals) > 1 else ""
+            p.needs_refused = f"the plan's needs were refused: {refusals[0]}{more}"
+            log.info("run.needs_refused", run=run_id, profile=pname, refusals=refusals)
+            return p.needs_refused
+
+        granted_hosts = list(dict.fromkeys(h for h, _ in hosts))
+        granted_creds = list(dict.fromkeys(c for c, _ in credentials))
+        granted_sinks = list(dict.fromkeys(s for s, _ in sinks))
+        granted_repos = list(dict.fromkeys(r for r, _ in repos))
+        run_row = self.store.get_run(run_id)
+        new_creds = [c for c in granted_creds if c not in run_row.credentials]
+        parts = [
+            f"{label} {', '.join(f'`{v}`' for v in values)}"
+            for label, values in (
+                ("hosts", granted_hosts),
+                ("credentials", granted_creds),
+                ("sinks", granted_sinks),
+                ("repos", granted_repos),
+            )
+            if values
+        ]
+        message = f"granted under profile {pname!r}: " + "; ".join(parts)
+        if new_creds:
+            message += " — re-provisioning with the service sandbox that holds the credentials"
+        self.bus.emit(
+            HostEventTypes.RUN_NEEDS_GRANTED,
+            run_id,
+            profile=pname,
+            hosts=granted_hosts,
+            credentials=granted_creds,
+            sinks=granted_sinks,
+            repos=granted_repos,
+            message=message,
+        )
+        log.info("run.needs_granted", run=run_id, profile=pname, message=message)
+        assert p.pair.workspace is not None
+        for repo in granted_repos:
+            assert p.provisioner is not None
+            p.provisioner.clone_repo_into_data_dir(run_id, p.pair.workspace, repo)
+        if new_creds:
+            self.store.set_run_credentials(run_id, [*run_row.credentials, *new_creds])
+            raise _Reprovision("executing")
+        return None
 
     @property
     def _verify_mode(self) -> VerifyMode:
@@ -3673,7 +3899,12 @@ class LoopEngine:
         """
         with self._sandbox_lock:
             granter.apply(
-                task.spec.id, [(egress.domain, egress.reason) for egress in task.spec.egress]
+                task.spec.id,
+                [(egress.domain, egress.reason) for egress in task.spec.egress]
+                # The plan's declared hosts (#758), checked against the
+                # profile after planning; applied here, at the tightest
+                # point sbx's grant-only policy model permits.
+                + [(host, "declared in the plan's needs") for host in task.spec.needs.hosts],
             )
         started = time.time()
         self._mark_task_start(run_id, pair, task)

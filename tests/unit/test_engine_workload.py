@@ -12,6 +12,7 @@ developer loop's own trail is gated separately (``test_code_run_trail.py``)."""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -205,25 +206,30 @@ class TestOperatorAndJudge:
         spec = task("t1")
         spec["needs"] = {
             "hosts": ["Api.Example.COM"],
-            "credentials": ["example-api"],
+            "credentials": [],
             "sink": "chat",
             "repo": None,
         }
         harness.script([plan(spec, title="Count the widgets"), BUILD, PASS])
-        engine = harness.engine(keep_sandboxes=True)
+        # A profile that grants the needs (#758); without one they are refused.
+        engine = harness.engine(
+            keep_sandboxes=True,
+            workloads=[{"name": "api", "egress": ["*.example.com"], "sinks": ["chat"]}],
+            workload={"default": "api"},
+        )
         result = engine.start("count the widgets from the api", kind="workload")
 
         assert result.state == "completed"
         assert engine.store.get_run(result.run_id).pr_title == "Count the widgets"
         (t1,) = engine.store.get_tasks(result.run_id)
         assert t1.spec.needs.hosts == ["api.example.com"]
-        assert t1.spec.needs.credentials == ["example-api"]
+        assert t1.spec.needs.credentials == []
         assert t1.spec.needs.sink == "chat" and t1.spec.needs.repo is None
         (row,) = [r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "plan"]
         assert row["task_id"] is None and "Count the widgets" in row["output_json"]
         # The operator's prompt carries the needs by name.
         (execute,) = jobs(harness, result.run_id, "execute")
-        assert "example-api" in execute["prompt"] and "api.example.com" in execute["prompt"]
+        assert "api.example.com" in execute["prompt"] and "sink: chat" in execute["prompt"]
 
     def test_the_judge_passes_a_task_it_read(self, harness: Harness) -> None:
         """The scripted run of the issue: plan → two tasks → execute → judge
@@ -695,3 +701,399 @@ class TestWorkloadResume:
 
     def test_every_workload_stage_is_resumable(self) -> None:
         assert set(WORKLOAD_STAGES) <= RESUMABLE_RUN_STATES
+
+
+# -- a workload's needs against its profile (#758) ---------------------------
+
+WEATHER = {
+    "name": "weather",
+    "env": "WEATHER_API_KEY",
+    "host": "api.weather.example.com",
+    "description": "forecasts",
+}
+RESEARCH = {
+    "name": "research",
+    "description": "reads the web",
+    "egress": ["*.example.com"],
+    "credentials": ["weather"],
+    "sinks": ["chat"],
+    "repo": False,
+    "budgets": {"max_tasks": 4},
+}
+CALL = {
+    "name": "call_service",
+    "arguments": {"credential": "weather", "method": "GET", "path": "/v1/forecast"},
+    "call_id": "c1",
+}
+
+
+def needing(id: str, **needs: Any) -> dict[str, Any]:
+    """A task that declares ``needs`` (hosts, credentials, sink, repo)."""
+    spec = task(id)
+    spec["needs"] = needs
+    return spec
+
+
+@pytest.fixture
+def profiled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
+    """Config overrides for a run under the `research` profile, with the
+    credential's value in the daemon's env and a scripted service."""
+    from sbxloop_worker.serviceops import FAKE_ENV
+
+    script = tmp_path / "service.json"
+    script.write_text(json.dumps({"responses": [{"status": 200, "body": {"temp": 3}}]}))
+    monkeypatch.setenv(FAKE_ENV, str(script))
+    monkeypatch.setenv("WEATHER_API_KEY", "wx-secret-value-9f8e7d")
+    return {
+        "credentials": [WEATHER],
+        "workloads": [RESEARCH],
+        "workload": {"default": "research"},
+    }
+
+
+class TestNeeds:
+    def refused(self, harness: Harness) -> list[dict[str, Any]]:
+        return [e.data for e in harness.events if e.type == HostEventTypes.RUN_NEEDS_REFUSED]
+
+    def granted(self, harness: Harness) -> list[dict[str, Any]]:
+        return [e.data for e in harness.events if e.type == HostEventTypes.RUN_NEEDS_GRANTED]
+
+    def assert_no_secret(self, harness: Harness) -> None:
+        for event in harness.events:
+            assert "wx-secret-value" not in json.dumps(event.data, default=str), event.type
+
+    def test_a_host_inside_the_profile_is_granted_at_execute(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        """The profile's egress widens what a plan may declare: the host is
+        allowed on the agent box at the task's execute entry, and the run
+        says what it granted."""
+        harness.script([plan(needing("t1", hosts=["data.example.com"])), BUILD, PASS])
+        result = harness.engine(**profiled).start("read the data", kind="workload")
+        assert result.state == "completed"
+        agent = f"sbxloop-{result.run_id}-agent"
+        assert ["allow", "network", "data.example.com", "--sandbox", agent] in (
+            harness.fake_sbx.policies()
+        )
+        (allowed,) = [e for e in harness.events if e.type == "policy.allow"]
+        assert allowed.data["domain"] == "data.example.com"
+        assert allowed.data["reason"] == "declared in the plan's needs"
+        assert allowed.data["task_id"] == "t1"
+        (grant,) = self.granted(harness)
+        assert grant["profile"] == "research"
+        assert grant["hosts"] == ["data.example.com"]
+        assert grant["credentials"] == [] and grant["repos"] == []
+        assert grant["message"] == "granted under profile 'research': hosts `data.example.com`"
+        assert self.refused(harness) == []
+        # the profile's budgets rode along into the run's config
+        stored = json.loads(harness.engine().store.get_run_config(result.run_id))
+        assert stored["budgets"]["max_tasks"] == 4
+
+    def test_a_host_outside_the_profile_fails_the_run_before_any_task(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        harness.script([plan(needing("t1", hosts=["other.example.org"]), task("t2")), BUILD, PASS])
+        engine = harness.engine(**profiled)
+        result = engine.start("read elsewhere", kind="workload")
+        assert result.state == "failed"
+        assert result.reason == (
+            "the plan's needs were refused: task t1 needs host `other.example.org` — outside "
+            "profile 'research'; `workloads.research.egress` in sbxloop.toml would allow it"
+        )
+        (refusal,) = self.refused(harness)
+        assert refusal["key"] == "workloads.research.egress"
+        assert (refusal["need"], refusal["value"], refusal["task_id"]) == (
+            "host",
+            "other.example.org",
+            "t1",
+        )
+        assert self.granted(harness) == []
+        assert [e for e in harness.events if e.type == "policy.allow"] == []
+        assert harness.run_states() == ["provisioning", "planning", "failed"]
+        assert all(t.state == "pending" for t in engine.store.get_tasks(result.run_id))
+        phases = [r["phase"] for r in engine.store.phase_attempts(result.run_id)]
+        assert phases == ["plan"], "no task ran"
+
+    def test_a_denied_host_is_refused_even_inside_the_profile(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        harness.script([plan(needing("t1", hosts=["bad.example.com"])), BUILD, PASS])
+        result = harness.engine(**profiled, policy={"deny": ["bad.example.com"]}).start(
+            "reach a denied host", kind="workload"
+        )
+        assert result.state == "failed"
+        (refusal,) = self.refused(harness)
+        assert refusal["key"] is None
+        assert "deny" in refusal["message"]
+
+    def test_every_need_is_answered_before_the_run_fails(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        """All refusals are on the record at once, and the reason counts
+        the rest — the operator fixes the config in one round."""
+        harness.script(
+            [
+                plan(
+                    needing("t1", hosts=["a.example.org"], credentials=["mail"]),
+                    needing("t2", sink="issue", repo="o/r"),
+                )
+            ]
+        )
+        result = harness.engine(**profiled).start("ask for everything", kind="workload")
+        assert result.state == "failed"
+        assert (result.reason or "").endswith("(+3 more)")
+        refusals = self.refused(harness)
+        assert [(r["need"], r["key"]) for r in refusals] == [
+            ("host", "workloads.research.egress"),
+            ("credential", "credentials"),
+            ("sink", "workloads.research.sinks"),
+            ("repo", "workloads.research.repo"),
+        ]
+        assert "not in the [[credentials]] catalogue" in refusals[1]["message"]
+
+    def test_a_catalogued_credential_the_profile_lacks_names_the_profile_key(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        other = {"name": "mail", "env": "MAIL_TOKEN", "host": "mail.example.com"}
+        harness.script([plan(needing("t1", credentials=["mail"]))])
+        result = harness.engine(**{**profiled, "credentials": [WEATHER, other]}).start(
+            "send mail", kind="workload"
+        )
+        assert result.state == "failed"
+        (refusal,) = self.refused(harness)
+        assert refusal["key"] == "workloads.research.credentials"
+        assert "not granted by profile 'research'" in refusal["message"]
+        assert harness.sandboxes_left() == []
+
+    def test_without_a_profile_every_need_is_refused(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        """`[[workloads]]` declared but no default and no --profile: the run
+        has no profile, and the refusal names `workload.default`."""
+        harness.script([plan(needing("t1", hosts=["data.example.com"]))])
+        result = harness.engine(**{**profiled, "workload": {}}).start("no profile", kind="workload")
+        assert result.state == "failed"
+        (refusal,) = self.refused(harness)
+        assert refusal["profile"] is None
+        assert refusal["key"] == "workload.default"
+        assert "the run has no workload profile" in refusal["message"]
+
+    def test_no_needs_no_grant_step(self, harness: Harness, profiled: dict[str, Any]) -> None:
+        harness.script([plan(task("t1")), BUILD, PASS])
+        result = harness.engine(**profiled).start("plain", kind="workload")
+        assert result.state == "completed"
+        assert self.granted(harness) == [] and self.refused(harness) == []
+        assert harness.run_states() == WORKLOAD_STATES
+
+    def test_a_granted_credential_re_provisions_with_the_service_box(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        """The plan asked for `weather`: the run row gains it, the pair is
+        rebuilt from executing with a service sandbox holding the value,
+        the agent's box never sees it, and the execute job carries the
+        tool that calls through."""
+        harness.script(
+            [
+                plan(needing("t1", credentials=["weather"])),
+                {"text": "checked the forecast", "host_tool_calls": [CALL]},
+                PASS,
+            ]
+        )
+        engine = harness.engine(**profiled, keep_sandboxes=True)
+        result = engine.start("what is the weather", kind="workload")
+        assert result.state == "completed", result.reason
+        run_id = result.run_id
+        assert harness.run_states() == [
+            "provisioning",
+            "planning",
+            "provisioning",
+            "executing",
+            "judging",
+            "publishing",
+            "completed",
+        ]
+        (grant,) = self.granted(harness)
+        assert grant["credentials"] == ["weather"]
+        assert "re-provisioning with the service sandbox" in grant["message"]
+        assert engine.store.get_run(run_id).credentials == ["weather"]
+        # Two boots of the agent box, one of the service box, all kept.
+        names = [
+            arg.removeprefix("--name=")
+            for argv in harness.fake_sbx.invocations("create")
+            for arg in argv
+            if arg.startswith("--name=")
+        ]
+        assert names.count(f"sbxloop-{run_id}-agent") == 2
+        assert names.count(f"sbxloop-{run_id}-service") == 1
+        assert harness.sandboxes_left() == [
+            f"sbxloop-{run_id}-agent",
+            f"sbxloop-{run_id}-service",
+        ]
+        # The value went to the service box alone.
+        (announce,) = [e for e in harness.events if e.type == "sandbox.service_credentials"]
+        assert announce.data["name"] == f"sbxloop-{run_id}-service"
+        assert announce.data["envs"] == ["WEATHER_API_KEY"]
+        agent_fs = harness.fake_sbx.sandbox_fs(f"sbxloop-{run_id}-agent")
+        for path in agent_fs.rglob("*"):
+            if path.is_file():
+                assert "wx-secret-value" not in path.read_bytes().decode("utf-8", "replace"), path
+        self.assert_no_secret(harness)
+        # The operator's execute job carries the tool; the plan did not.
+        (execute,) = jobs(harness, run_id, "execute")
+        assert [t["name"] for t in execute["host_tools"]] == ["call_service"]
+        assert "## Services you may call" in execute["prompt"]
+        # (the plan job's file went with the first agent box)
+        # The service box answered the one call.
+        service_fs = harness.fake_sbx.sandbox_fs(f"sbxloop-{run_id}-service")
+        kinds = {
+            json.loads(p.read_text())["kind"]
+            for p in (service_fs / "home/agent/.sbxloop/jobs").iterdir()
+        }
+        assert kinds == {"service.http"}
+        assert engine.store.get_run(run_id).state == "completed"
+        # planned once: the re-provision resumed at executing
+        phases = [r["phase"] for r in engine.store.phase_attempts(run_id)]
+        assert phases.count("plan") == 1 and phases.count("execute") == 1
+
+    def test_a_failed_re_provision_leaves_the_run_resumable(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        """The re-provision failing (the value is not in the daemon's env)
+        leaves the plan and the credential on the row; a resume provisions
+        the pair from the row and goes on from executing, planning nothing
+        twice."""
+        from sbxloop.errors import ProvisionError
+
+        harness.script([plan(needing("t1", credentials=["weather"]))])
+        harness.monkeypatch.delenv("WEATHER_API_KEY")
+        engine = harness.engine(**profiled)
+        with pytest.raises(ProvisionError, match="WEATHER_API_KEY"):
+            engine.start("what is the weather", kind="workload")
+        (run,) = engine.store.list_runs()
+        assert run.credentials == ["weather"]
+        assert run.state == "provisioning"
+        assert [t.spec.id for t in engine.store.get_tasks(run.run_id)] == ["t1"]
+        assert harness.sandboxes_left() == []
+
+        harness.monkeypatch.setenv("WEATHER_API_KEY", "wx-secret-value-9f8e7d")
+        harness.events.clear()
+        harness.script([{"text": "checked the forecast", "host_tool_calls": [CALL]}, PASS])
+        resumed = harness.engine(**profiled).resume(run.run_id)
+        assert resumed.state == "completed", resumed.reason
+        assert harness.run_states() == [
+            "provisioning",
+            "executing",
+            "judging",
+            "publishing",
+            "completed",
+        ]
+        assert self.granted(harness) == [], "granted once, on the first pass"
+        phases = [r["phase"] for r in engine.store.phase_attempts(run.run_id)]
+        assert phases.count("plan") == 1 and phases.count("execute") == 1
+        self.assert_no_secret(harness)
+
+    def test_a_repo_the_profile_allows_is_checked_out_into_the_data_dir(
+        self, harness: Harness, profiled: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop import hostgit
+        from tests.unit.test_hostgit import make_repo
+
+        upstream = make_repo(harness.tmp_path, "upstream")
+        seen: list[tuple[str, str]] = []
+
+        def fake_clone(url: str, target: Path, branch: str, **kwargs: object) -> str:
+            seen.append((url, str(kwargs.get("token"))))
+            return hostgit.clone_for_run(upstream, target, branch)
+
+        monkeypatch.setattr(hostgit, "clone_from_remote", fake_clone)
+        harness.script([plan(needing("t1", repo="o/docs")), BUILD, PASS])
+        engine = harness.engine(
+            **{**profiled, "workloads": [{**RESEARCH, "repo": True}]},
+            github={"repos": [{"repo": "o/docs"}]},
+        )
+        result = engine.start("read the docs", kind="workload")
+        assert result.state == "completed", result.reason
+        assert seen == [("https://github.com/o/docs", "gh_tok")], "the host's own credential"
+        checkout = harness.state_dir / "runs" / result.run_id / "workspace" / "docs"
+        assert (checkout / "hello.txt").read_text() == "hi\n"
+        (clone,) = [e for e in harness.events if e.type == "sandbox.workspace_clone"]
+        assert clone.data["target"] == str(checkout)
+        (grant,) = self.granted(harness)
+        assert grant["repos"] == ["o/docs"]
+        # still the one agent box; no github box, nothing delivered
+        assert harness.run_states() == WORKLOAD_STATES
+        assert [e for e in harness.events if e.type == "sandbox.service_credentials"] == []
+
+    def test_a_repo_not_configured_is_refused(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        harness.script([plan(needing("t1", repo="o/elsewhere"))])
+        result = harness.engine(
+            **{**profiled, "workloads": [{**RESEARCH, "repo": True}]},
+            github={"repos": [{"repo": "o/docs"}]},
+        ).start("read the docs", kind="workload")
+        assert result.state == "failed"
+        (refusal,) = self.refused(harness)
+        assert refusal["key"] == "github.repos"
+        assert "not a configured repository" in refusal["message"]
+
+    def test_a_repo_without_a_mount_is_refused(
+        self, harness: Harness, profiled: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A checkout in a data directory the agent box cannot see would
+        never be read: refused, with no key (nothing in sbxloop.toml fixes
+        the mount)."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        harness.script([plan(needing("t1", repo="o/docs"))])
+        result = harness.engine(
+            **{**profiled, "workloads": [{**RESEARCH, "repo": True}]},
+            github={"repos": [{"repo": "o/docs"}]},
+        ).start("read the docs", kind="workload")
+        assert result.state == "failed"
+        (refusal,) = self.refused(harness)
+        assert refusal["key"] is None
+        assert "not mounted" in refusal["message"]
+
+    def test_a_named_profile_is_pinned_for_the_resume(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        """`--profile` chooses; the choice and its budgets persist in the
+        run's config, so a resume under the same file sees no drift and a
+        code run ignores the sections entirely."""
+        bare = {"name": "bare", "budgets": {"max_tasks": 2}}
+        overrides = {**profiled, "workloads": [RESEARCH, bare]}
+        harness.script([plan(task("t1")), BUILD, PASS])
+        engine = harness.engine(**overrides)
+        result = engine.start("plain", kind="workload", profile="bare")
+        assert result.state == "completed"
+        stored = json.loads(engine.store.get_run_config(result.run_id))
+        assert stored["workload"]["default"] == "bare"
+        assert stored["budgets"]["max_tasks"] == 2
+        assert [p["name"] for p in stored["workloads"]] == ["research", "bare"]
+        # a resume under the same config file: no drift
+        engine.store.set_run_state(result.run_id, "judging")
+        harness.events.clear()
+        harness.script([PASS])
+        resumed = harness.engine(**overrides).resume(result.run_id)
+        assert resumed.state == "completed"
+        assert HostEventTypes.RUN_CONFIG_DRIFT not in harness.event_types()
+
+    def test_a_profile_on_a_code_run_is_refused(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        from sbxloop.errors import ConfigError
+
+        engine = harness.engine(**profiled)
+        with pytest.raises(ConfigError, match="--kind workload"):
+            engine.start("ship it", profile="research")
+        assert engine.store.list_runs() == []
+
+    def test_an_unknown_profile_is_refused_before_the_run_row(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        from sbxloop.errors import ConfigError
+
+        engine = harness.engine(**profiled)
+        with pytest.raises(ConfigError, match="'nope' is not declared"):
+            engine.start("plain", kind="workload", profile="nope")
+        assert engine.store.list_runs() == []

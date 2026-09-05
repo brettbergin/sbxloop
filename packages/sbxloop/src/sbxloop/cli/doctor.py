@@ -812,6 +812,29 @@ def credentials_checks(config: Config, env: dict[str, str]) -> list[Check]:
     ]
 
 
+def workload_profile_checks(config: Config) -> list[Check]:
+    """One row when `[[workloads]]` declares anything (#758): the profiles
+    by name with what each bounds, and which one runs by default. The
+    config loader already refused a profile naming an unknown credential
+    or a default naming no profile; this row is the at-a-glance view."""
+    if not config.workloads:
+        return []
+    listed = "; ".join(
+        f"{p.name}"
+        + (" (default)" if p.name == config.workload.default else "")
+        + f": hosts {', '.join(p.egress) or '-'}, credentials "
+        + f"{', '.join(p.credentials) or '-'}, sinks {', '.join(p.sinks) or '-'}, "
+        + f"repo {'yes' if p.repo else 'no'}"
+        for p in config.workloads
+    )
+    if config.workload.default is None:
+        listed += (
+            " — no \\[workload] default: a run names one with --profile or runs "
+            "without a profile (every declared need refused)"
+        )
+    return [Check("workload profiles", True, listed)]
+
+
 def collect_checks(
     env: dict[str, str],
     cli: SbxCLI | None = None,
@@ -1029,6 +1052,7 @@ def collect_checks(
     )
     checks.extend(registry_credential_checks(config, env))
     checks.extend(credentials_checks(config, env))
+    checks.extend(workload_profile_checks(config))
     # A github credential matters only when the GitHub integration is
     # configured; an unconfigured integration is a valid (GitHub-less)
     # setup, not a failure. A PAT or GitHub App credentials both satisfy it;

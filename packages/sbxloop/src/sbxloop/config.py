@@ -1861,6 +1861,123 @@ class AgentConfig(_ConfigModel):
     backend: Literal["copilot", "claude"] = "copilot"
 
 
+# Where a workload's result may go when the run publishes (#759 delivers
+# them; a profile names the ones its runs may ask for). ``chat`` is a reply
+# in the run's thread, ``issue`` a GitHub issue or issue comment, ``artifact``
+# a downloadable file, ``pr`` files in a repository via a pull request.
+SinkName = Literal["chat", "issue", "artifact", "pr"]
+SINK_NAMES: tuple[SinkName, ...] = ("chat", "issue", "artifact", "pr")
+WorkloadPublish = Literal["auto", "hold"]
+_PROFILE_NAME_RE = _CREDENTIAL_NAME_RE
+
+
+class BudgetOverrides(_ConfigModel):
+    """`[workloads.budgets]`: the `[budgets]` keys a profile overrides for
+    its runs, each unset by default. The same keys with the same bounds as
+    :class:`Budgets`; a key left None keeps the run on `[budgets]`.
+    (A separate model rather than a partial ``Budgets`` so a persisted
+    run config dumps the same shape the operator wrote — a resume compares
+    the two for drift.)"""
+
+    max_revisions_per_task: int | None = Field(default=None, ge=0)
+    max_replans_per_task: int | None = Field(default=None, ge=0)
+    max_tasks: int | None = Field(default=None, ge=1)
+    max_wall_clock_s: float | None = Field(default=None, gt=0)
+    per_job_timeout_s: float | None = Field(default=None, gt=0)
+    max_tool_calls_per_phase: int | None = Field(default=None, ge=0)
+    max_parallel_tasks: int | None = Field(default=None, ge=1)
+
+    def apply(self, base: Budgets) -> Budgets:
+        """``base`` with every key set here written over it."""
+        return base.model_copy(update=self.model_dump(exclude_none=True))
+
+    @property
+    def set_keys(self) -> list[str]:
+        return sorted(self.model_dump(exclude_none=True))
+
+
+class WorkloadProfile(_ConfigModel):
+    """One named bound for workload runs (#758): what a plan may ask for.
+
+    The operator's plan declares needs by name (hosts, credentials, a
+    sink, a repository — ``TaskNeeds``); the run's profile decides which
+    are granted. ``egress`` bounds the hosts the *agent* box may be
+    granted (patterns, as ``[policy] allow``; ``[policy] deny`` still wins
+    over it); ``credentials`` names the ``[[credentials]]`` a plan may ask
+    for — granted on the *service* box, never the agent's (#765);
+    ``sinks`` the places a result may go; ``repo`` whether a plan may ask
+    for a repository checkout in its data directory. ``budgets`` overrides
+    ``[budgets]`` for the run, key by key. Anything a plan asks for
+    outside the profile fails the run closed, naming the key here that
+    would have allowed it.
+
+    ``publish = "hold"`` will park a finished run at publishing until a
+    human releases it, on the daemon's merge-gate button; it arrives with
+    the daemon's workload intake (#760) and is refused until then.
+    """
+
+    name: str
+    egress: list[str] = Field(default_factory=list)
+    credentials: list[str] = Field(default_factory=list)
+    sinks: list[SinkName] = Field(default_factory=list)
+    repo: bool = False
+    publish: WorkloadPublish = "auto"
+    budgets: BudgetOverrides = Field(default_factory=BudgetOverrides)
+    description: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        if not _PROFILE_NAME_RE.match(value):
+            raise ValueError(
+                f"workloads[].name must be lowercase letters, digits, '-' or '_', got {value!r}"
+            )
+        return value
+
+    @field_validator("egress")
+    @classmethod
+    def _check_egress(cls, value: list[str]) -> list[str]:
+        from sbxloop.policy import valid_pattern
+
+        patterns = [p.strip().lower() for p in value]
+        bad = [p for p in patterns if not valid_pattern(p, operator=True)]
+        if bad:
+            raise ValueError(
+                "workloads[].egress patterns must be domains, *.domain wildcards or '*', "
+                f"got {bad!r}"
+            )
+        return patterns
+
+    @field_validator("credentials", "sinks")
+    @classmethod
+    def _dedupe(cls, value: list[Any]) -> list[Any]:
+        return list(dict.fromkeys(value))
+
+    @field_validator("publish")
+    @classmethod
+    def _hold_not_yet(cls, value: WorkloadPublish) -> WorkloadPublish:
+        if value == "hold":
+            raise ValueError(
+                'workloads[].publish = "hold" is not available yet: a held run needs the '
+                "daemon's release button, which arrives with the workload intake; "
+                'use "auto" (the default)'
+            )
+        return value
+
+    def covers_host(self, host: str) -> bool:
+        from sbxloop.policy import pattern_covers
+
+        return any(pattern_covers(pattern, host) for pattern in self.egress)
+
+
+class WorkloadConfig(_ConfigModel):
+    """The `[workload]` section: which `[[workloads]]` profile a run gets
+    when nothing names one. Unset, a workload runs without a profile —
+    fine for a plan that needs nothing, and every need is refused."""
+
+    default: str | None = None
+
+
 class Config(_ConfigModel):
     model: str = "auto"
     agent: AgentConfig = Field(default_factory=AgentConfig)
@@ -1904,6 +2021,10 @@ class Config(_ConfigModel):
     slack: SlackConfig = Field(default_factory=SlackConfig)
     tui: TuiConfig = Field(default_factory=TuiConfig)
     concierge: ConciergeConfig = Field(default_factory=ConciergeConfig)
+    # Named bounds for workload runs (#758) and the one a run gets by
+    # default; a code run ignores both.
+    workloads: list[WorkloadProfile] = Field(default_factory=list)
+    workload: WorkloadConfig = Field(default_factory=WorkloadConfig)
 
     @field_validator("state_dir", mode="after")
     @classmethod
@@ -1974,6 +2095,61 @@ class Config(_ConfigModel):
                 )
             entries.append(entry)
         return entries
+
+    @model_validator(mode="after")
+    def _workload_profiles_are_sound(self) -> Config:
+        """Every profile is distinct by name and names only catalogued
+        credentials; the default names a profile that exists — each an
+        operator's typo to fix before a run refuses on it."""
+        seen: set[str] = set()
+        for profile in self.workloads:
+            if profile.name in seen:
+                raise ValueError(f"workloads: profile {profile.name!r} is declared twice")
+            seen.add(profile.name)
+            for name in profile.credentials:
+                if self.credential(name) is None:
+                    known = ", ".join(c.name for c in self.credentials) or "none"
+                    raise ValueError(
+                        f"workloads.{profile.name}.credentials names {name!r}, which is not "
+                        f"declared under [[credentials]] (declared: {known})"
+                    )
+        default = self.workload.default
+        if default is not None and default not in seen:
+            known = ", ".join(sorted(seen)) or "none"
+            raise ValueError(
+                f"[workload] default = {default!r} names no [[workloads]] profile "
+                f"(declared: {known})"
+            )
+        return self
+
+    def workload_profile(self, name: str | None = None) -> WorkloadProfile | None:
+        """The `[[workloads]]` profile called ``name`` (the `[workload]`
+        default when None); None when the run has no profile. A name no
+        profile carries is a ``ConfigError`` naming it."""
+        name = name if name is not None else self.workload.default
+        if name is None:
+            return None
+        profile = next((p for p in self.workloads if p.name == name), None)
+        if profile is None:
+            known = ", ".join(p.name for p in self.workloads) or "none"
+            raise ConfigError(
+                f"workload profile {name!r} is not declared under [[workloads]] (declared: {known})"
+            )
+        return profile
+
+    def for_workload_profile(self, name: str | None) -> Config:
+        """This config narrowed to one workload run's profile (#758): the
+        profile pinned as the default (so the persisted config carries the
+        choice through a resume) and its budget overrides applied."""
+        profile = self.workload_profile(name)
+        if profile is None:
+            return self
+        return self.model_copy(
+            update={
+                "workload": WorkloadConfig(default=profile.name),
+                "budgets": profile.budgets.apply(self.budgets),
+            }
+        )
 
     def registries_for(self, repo: str | None = None) -> list[RegistryConfig]:
         """The private registries ``repo``'s run is configured for (#680):

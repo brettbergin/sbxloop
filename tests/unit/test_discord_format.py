@@ -970,6 +970,44 @@ class TestEmbeds:
             "(produced invalid output twice)"
         ]
         assert degraded[0].flush
+        # A workload's needs against its profile (#758): what was granted,
+        # by name and host only, or the first refusal with the key that
+        # would allow it.
+        granted = format_for_discord(
+            ev(
+                "run.needs_granted",
+                profile="research",
+                hosts=["data.example.com"],
+                credentials=["weather"],
+                sinks=[],
+                repos=["o/docs"],
+                message="granted under profile 'research': hosts `data.example.com`",
+            )
+        )
+        assert texts(granted) == [
+            "🔐 needs granted under profile `research`: hosts `data.example.com`; "
+            "credentials `weather`; repos `o/docs`"
+        ]
+        assert granted[0].flush
+        refused = format_for_discord(
+            ev(
+                "run.needs_refused",
+                profile="research",
+                need="host",
+                value="other.example.org",
+                task_id="t1",
+                key="workloads.research.egress",
+                message=(
+                    "task t1 needs host `other.example.org` — outside profile 'research'; "
+                    "`workloads.research.egress` in sbxloop.toml would allow it"
+                ),
+            )
+        )
+        assert texts(refused) == [
+            "🚫 need refused: task t1 needs host `other.example.org` — outside profile "
+            "'research'; `workloads.research.egress` in sbxloop.toml would allow it"
+        ]
+        assert refused[0].flush
         reconciled = format_for_discord(
             ev(
                 "review.reconciled",

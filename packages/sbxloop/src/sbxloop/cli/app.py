@@ -615,6 +615,14 @@ def run(
             "execute, judge, publish — in its own data directory, no repository).",
         ),
     ] = "code",
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            help="The [[workloads]] profile a `--kind workload` run is bounded by "
+            "(default: [workload] default; none at all lets the plan declare no needs).",
+        ),
+    ] = None,
     repo: Annotated[
         str | None,
         typer.Option(
@@ -700,6 +708,12 @@ def run(
     if kind not in ("code", "workload"):
         console.print(f"[bold red]invalid --kind:[/] {kind!r} (expected `code` or `workload`)")
         raise typer.Exit(2)
+    if profile is not None and kind != "workload":
+        console.print(
+            "[bold red]--profile cannot be combined with --kind code:[/] a workload "
+            "profile bounds what a workload's plan may ask for"
+        )
+        raise typer.Exit(2)
     if kind == "workload":
         # A workload works in its own data directory on the agent sandbox
         # alone (#755); a checkout or a repository is a code run's, and
@@ -725,13 +739,23 @@ def run(
             "workspace: a per-run data directory — the agent starts from an empty "
             "directory and the run's output is harvested as artifacts"
         )
+        try:
+            chosen_profile = config.workload_profile(profile)
+        except SbxloopError as exc:
+            console.print(f"[bold red]{exc}[/]")
+            raise typer.Exit(2) from exc
+        console.print(
+            f"profile: {chosen_profile.name}"
+            if chosen_profile is not None
+            else "profile: none (no needs can be granted)"
+        )
         engine = LoopEngine(config)
         try:
             result = _drive_with_ui(
                 engine,
                 tui=tui,
                 chat=chat,
-                action=lambda: engine.start(outcome, kind="workload"),
+                action=lambda: engine.start(outcome, kind="workload", profile=profile),
             )
         except SbxloopError as exc:
             console.print(f"[bold red]run failed:[/] {exc}")
@@ -1530,10 +1554,40 @@ def config_show() -> None:
             else:
                 flat[dotted] = value
 
-    flatten("", config.model_dump(mode="json"))
+    dumped = config.model_dump(mode="json")
+    # The catalogue and the profiles are lists of tables: shown by name
+    # below rather than as one repr each. A credential's value is never in
+    # the model — only whether its env var is set is worth showing.
+    dumped.pop("credentials", None)
+    dumped.pop("workloads", None)
+    flatten("", dumped)
     for dotted in sorted(flat):
         table.add_row(dotted, repr(flat[dotted]), sources.get(dotted, "default"))
     console.print(table)
+    if config.credentials:
+        creds = Table(title="credentials (values never shown)")
+        for col in ("name", "env", "present", "host", "description"):
+            creds.add_column(col)
+        for entry in config.credentials:
+            present = "set" if os.environ.get(entry.env) else "[yellow]unset[/]"
+            creds.add_row(entry.name, entry.env, present, entry.host, entry.description)
+        console.print(creds)
+    if config.workloads:
+        profiles = Table(title="workload profiles")
+        for col in ("name", "egress", "credentials", "sinks", "repo", "publish", "budgets"):
+            profiles.add_column(col)
+        for prof in config.workloads:
+            overrides = prof.budgets.model_dump(exclude_none=True)
+            profiles.add_row(
+                prof.name + (" (default)" if prof.name == config.workload.default else ""),
+                ", ".join(prof.egress) or "-",
+                ", ".join(prof.credentials) or "-",
+                ", ".join(prof.sinks) or "-",
+                "yes" if prof.repo else "no",
+                prof.publish,
+                ", ".join(f"{k}={v}" for k, v in overrides.items()) or "-",
+            )
+        console.print(profiles)
 
 
 @config_app.command("repos")
