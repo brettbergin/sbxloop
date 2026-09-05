@@ -23,8 +23,8 @@ security:
 test:
 	uv run pytest
 
-# The commit gate: everything that is not process-bound, ~2 min. `make test`
-# (or CI) before merging.
+# The commit gate: everything that is not process-bound, about a minute.
+# `make test` (or CI) before merging.
 test-fast:
 	uv run pytest -m "not slow"
 

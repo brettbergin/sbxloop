@@ -31,6 +31,9 @@ def _shard(spec: str) -> tuple[int, int]:
     return index, count
 
 
+# tryfirst: the marker must be on the item before pytest's own ``-m``
+# filter (a later-registered builtin hook) looks for it.
+@pytest.hookimpl(tryfirst=True)
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Every test on the fake sbx is process-bound: each ``sbx`` call is
     ``sh`` → interpreter → the fake, and a pipeline test makes ~50 of them
