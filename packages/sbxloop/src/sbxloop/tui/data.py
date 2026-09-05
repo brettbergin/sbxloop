@@ -14,6 +14,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
+from sbxloop.config import TUI_CONTROL_CHANNEL
 from sbxloop.daemon.control import CommandReply
 from sbxloop.daemon.mailbox import MailboxClient
 from sbxloop.daemon.model import WorkItem
@@ -237,6 +238,8 @@ class ConsoleState:
     read_only: bool = False
     refreshed_at: float = 0.0
     errors: list[str] = field(default_factory=list)
+    # Control-channel rows newer than the one the Chat screen last showed.
+    control_unread: int = 0
 
     @property
     def bridge_alive(self) -> bool:
@@ -244,7 +247,12 @@ class ConsoleState:
 
 
 def build_state(
-    mailbox: MailboxClient, previous: ConsoleState, *, now: float, retry_backoff_s: float = 900.0
+    mailbox: MailboxClient,
+    previous: ConsoleState,
+    *,
+    now: float,
+    retry_backoff_s: float = 900.0,
+    control_seen: int = 0,
 ) -> ConsoleState:
     """One refresh: every list the screens share, from one worker pass."""
     state = ConsoleState(
@@ -257,6 +265,7 @@ def build_state(
         state.items = build_items(mailbox, retry_backoff_s=retry_backoff_s)
         state.heartbeat = mailbox.heartbeat()
         state.daemon_started_at = mailbox.daemon_started_at()
+        state.control_unread = mailbox.count_after(TUI_CONTROL_CHANNEL, control_seen)
     except Exception as exc:
         state.errors.append(str(exc))
         state.runs = previous.runs

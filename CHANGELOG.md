@@ -8,6 +8,18 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **Console chat: the control channel and run threads** (#771). With the
+  shell alone an operator could watch a run but not speak to it. The Chat
+  screen and a run's Thread tab now show the daemon's local chat bridge —
+  the rows Discord or Slack would show — and the form under them writes
+  to it: `!sbx` verbs, concierge turns and steers by the bridge's own
+  routing rules (`@sbx`, the sticky `ctrl+t` address gesture, or `r` to
+  reply to the bot's latest row; plain text is left alone), a button per
+  clarifying-choice answer, the approve button on a merge gate. Edits,
+  reactions and resolved gates repaint in place; own rows show dimmed
+  until the daemon claims them; the bar counts unread control-channel
+  rows; `--read-only` disables the form.
+
 - **`sbxloop tui`: the operator console** (#770). A person on the daemon
   host had the CLI's one-shot commands and journald. `sbxloop tui` is a
   terminal console that reads the daemon's `state.db` read-only and asks
@@ -22,8 +34,6 @@ All notable changes to sbxloop are documented here. The project adheres to
   `docs/tui.md` documents the layout and keys; the docs' mention of a
   `sbxloop watch` TUI that never shipped now names this. The chat screens
   and the admin screens follow.
-
-### Added
 
 - **The daemon always runs a local chat bridge for the operator console**
   (#769). A person on the daemon host had the CLI and journald; everything
@@ -211,8 +221,6 @@ All notable changes to sbxloop are documented here. The project adheres to
   pin, `reset-failed` + restart) and mentions the workflow as optional
   automation; `github-runner.service` is marked as needed only for it. The
   1.0 cutover steps moved from `docs/deploy.md` to this file (below).
-
-### Added
 
 - **A gate against self-references in user-facing surfaces** (#645).
   `scripts/check_self_references.py` (stdlib only; run by `make lint` and
@@ -546,8 +554,6 @@ All notable changes to sbxloop are documented here. The project adheres to
   and tells the fixer to reproduce the failure with the project's own
   gate before changing anything. Every failing check's `details_url` /
   `target_url` is now in the brief.
-
-### Added
 
 - **The toolchain series a run provisions comes from the workspace** (#627).
   Every Python project got Python 3.13 and every Node project Node 24,
@@ -998,8 +1004,6 @@ All notable changes to sbxloop are documented here. The project adheres to
   removing the symptom is `request_changes` on the plan. Plain `body`
   filing still works.
 
-### Added
-
 - **Follow-up issues from a landed run** (#517). The reviewer's out-of-scope
   notes used to be prose in a review body nobody reads after the merge
   (run rfxja288b left two, both worth issues, both filed by hand).
@@ -1156,8 +1160,6 @@ All notable changes to sbxloop are documented here. The project adheres to
   only once the upgrade step has, and the Discord deploy notices say whether
   the restart was deferred behind a run and how long it waited.
 
-### Added
-
 - **Review findings are reconciled on the pull request** (#520): between a
   fix round's re-delivery and the next review, the engine now speaks the
   fixer's per-finding answer back onto the review's own threads. Each
@@ -1230,8 +1232,6 @@ All notable changes to sbxloop are documented here. The project adheres to
 ### Changed
 
 - **Reverted #525** ("Remove Discord embeds from daemon bridge output in favour of plain markdown", #519): the plain-markdown bridge output read worse in the field than the embeds it replaced. Embeds, the `[discord]` keys #525 removed, and the previous rendering tests are back exactly as they were.
-
-### Added
 
 - **One daemon can tend several GitHub repositories** (#511). `sbxloop.toml`
   accepts an array of `[[github.repos]]` entries, each carrying its own
@@ -1472,6 +1472,7 @@ deploy unattended, none of that may fail the restart:
   with empty tables. Engine run history goes with it — both stores share the
   file. Nothing is migrated; renaming the file back restores the old world
   for a 0.7.x rollback.
+
 - **Config.** The retired keys — `[daemon] inbox_dir, backlog*, audits, audit_dir, audit_label, backlog_label, delivered_label, postmortems*, review_deliveries, await_review, review_rounds, tool_repo, tracking_issue, close_on_success, auto_merge` and `[github] report, deliver` — are unknown keys since 1.0.0 and fail config loading like any
   other (`Extra inputs are not permitted`). The `deliver_draft`,
   `merge_method`, `delete_branch_on_merge` and `merge_update_attempts`
@@ -1481,13 +1482,12 @@ deploy unattended, none of that may fail the restart:
   them; a host that skipped those releases must edit `sbxloop.toml` before
   installing 1.0, or the daemon will not start (an automated deploy's
   health check then rolls back).
+
 - **Issues and labels.** The old loop's `sbxloop:backlog` / `sbxloop:audit`
   issues are closed by hand at cutover (`gh issue close --reason "not planned"`), those two labels and `sbxloop:delivered` deleted, and
   `sbxloop:blocked` created. Any of the old loop's PRs still open
   (`gh pr list --search "head:sbxloop/ is:open"`) are merged or closed by
   hand — their items went with the archived state.
-
-### Added
 
 - **The loop can land its own pull request (`[daemon] auto_merge`, default
   off).** *(Superseded above before release: landing is now unconditional
@@ -1501,6 +1501,7 @@ deploy unattended, none of that may fail the restart:
   `squash`), `delete_branch_on_merge` (default `true`), and
   `merge_update_attempts` (default 3, `0` disables branch updating).
   Details:
+
   - Off by default on purpose. Merging is the only irreversible thing
     sbxloop does to a repository, and on a repo whose merges publish — this
     one releases to PyPI and redeploys the daemon host on every merge to
@@ -1753,8 +1754,6 @@ deploy unattended, none of that may fail the restart:
   spending an engine run — the field case burned three items and four runs
   auditing a PR that had already landed.
 
-### Added
-
 - **Per-phase usage columns on `phase_attempts`.** Every phase attempt row
   now bills the tokens and model turns its agent sessions actually spent:
   `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`,
@@ -1889,8 +1888,6 @@ deploy unattended, none of that may fail the restart:
   the daemon's checkout, which fetched it but never checked it out. The clone
   therefore asks the source for that exact ref rather than mutating it.
 
-### Added
-
 - **A delivered item is not done until its PR is accepted.** `_settle` used to
   call `mark_done` the moment a run succeeded and a PR existed. Nothing looked
   at CI: PR #389 was settled as done with `mdformat` and `security` failing,
@@ -1953,8 +1950,6 @@ deploy unattended, none of that may fail the restart:
 
   The ordinary backlog lane is untouched: an item with no recorded review
   target files exactly as before.
-
-### Added
 
 - **The concierge can read the daemon's recent log lines in chat.** "Why is
   nothing running?" used to be answerable only over ssh — the state store
@@ -2074,8 +2069,6 @@ deploy unattended, none of that may fail the restart:
   definition current. A daemon that never starts still fails, at the deadline.
   The deploy's own `ctl status` budget goes 60s → 300s to cover a slow
   recovery.
-
-### Added
 
 - **Run cost is governed by turns, not jobs** — and four changes act on that.
   Field measurement of run `rews3ssdn` (7 tasks, 272 assistant turns across 25
@@ -2466,8 +2459,6 @@ deploy unattended, none of that may fail the restart:
   `git status | awk '{print $2}'` guard printed whole lines and failed every
   revision and the replan of a correct change. The plan prompt says so too.
 
-### Added
-
 - **Discovery lane for the daemon**: issues carrying `[daemon] audit_label`
   (`sbxloop:audit`) are charters — the run investigates and files findings
   as `sbxloop:backlog` issues (evidence / repro / proposal / size / kind
@@ -2477,6 +2468,7 @@ deploy unattended, none of that may fail the restart:
   contract in the outcome text, and an audit-success comment that names what
   it filed (`RunReport.filed`) and always closes the audit issue. Discord
   cards and `daemon items` show the kind. Promotion stays a human label swap.
+
 - **Post-mortems the daemon files itself** (`[daemon] postmortems`, default
   on): when a patch item is abandoned or completes without delivering, the
   daemon opens a `sbxloop:audit` issue carrying a dossier — plan and verify
@@ -2484,6 +2476,7 @@ deploy unattended, none of that may fail the restart:
   and the `SBXLOOP_STATE_DIR=… sbxloop logs <run>` line — so the discovery
   lane turns its own failures into evidenced findings. Once per run, never
   for audit items (no recursion), `postmortems_per_day` (3) cap.
+
 - **Scheduled area audits, charters versioned in the repo** (`[daemon] audits = true`, `audit_dir = ".github/sbxloop/audits"`): each
   `<name>.md` with front-matter `every: 7d` (and optional `enabled`) is a
   charter the daemon opens as an `audit: <name>` issue when due. GitHub is
@@ -2491,11 +2484,13 @@ deploy unattended, none of that may fail the restart:
   created within the interval counts), the store is a cache; broken charters
   are reported once and skipped. sbxloop's own repo ships four:
   verify-lint-vs-prompts, daemon-guardrails, e2e-markers, test-flakes.
+
 - **Delivery reviews** (`[daemon] review_deliveries`, default on): after a
   patch item delivers a PR, the daemon opens `review: PR #N` as an audit
   charter — the loop evaluating the code it just wrote (defects, missing
   edge cases, scope drift, unjustified claims) and filing findings for a
   human to promote. Once per run, `reviews_per_day` (5) cap.
+
 - **Findings about the tool are routed, never dumped on the project.** The
   audit contract asks the agent to put findings about sbxloop itself
   (planner, prompts, lint, delivery, daemon) under

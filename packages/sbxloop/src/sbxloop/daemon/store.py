@@ -520,6 +520,11 @@ LOCAL_MESSAGE_SELECT = (
     "SELECT m.*, r.direction AS reply_to_direction FROM daemon_local_messages m "
     "LEFT JOIN daemon_local_messages r ON r.id = m.reply_to_id"
 )
+#: The same read, pinned to the change-stamp index for the changed-since poll.
+LOCAL_MESSAGE_SELECT_BY_UPDATE = LOCAL_MESSAGE_SELECT.replace(
+    "FROM daemon_local_messages m ",
+    "FROM daemon_local_messages m INDEXED BY idx_local_messages_updated ",
+)
 
 
 class ChatThread(NamedTuple):
@@ -2963,10 +2968,12 @@ class DaemonStore:
         ``since`` — an edit, a reaction, a claim, a resolved gate — what a
         console repaints in place beside the rows it has not seen."""
         with self._lock:
+            # The (channel_id, updated_at) index answers this in the usual
+            # case of nothing changed; the id bound is checked per hit.
             rows = self._conn.execute(
-                f"{LOCAL_MESSAGE_SELECT} WHERE m.channel_id = ? AND m.id <= ? "
-                "AND m.updated_at > ? ORDER BY m.id",
-                (channel_id, after_id, since),
+                f"{LOCAL_MESSAGE_SELECT_BY_UPDATE} WHERE m.channel_id = ? AND m.updated_at > ? "
+                "AND m.id <= ? ORDER BY m.id",
+                (channel_id, since, after_id),
             ).fetchall()
             return [_row_to_local_message(r) for r in rows]
 
@@ -2977,6 +2984,15 @@ class DaemonStore:
                 "SELECT channel_id, MAX(id) AS id FROM daemon_local_messages GROUP BY channel_id"
             ).fetchall()
             return {str(r["channel_id"]): int(r["id"]) for r in rows}
+
+    def local_count_after(self, channel_id: str, after_id: int) -> int:
+        """How many rows the channel has beyond ``after_id`` (an unread count)."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM daemon_local_messages WHERE channel_id = ? AND id > ?",
+                (channel_id, after_id),
+            ).fetchone()
+            return int(row["n"])
 
     def local_taken(self, message_ids: Sequence[int]) -> set[int]:
         """Which of the given inbound rows the daemon has claimed."""

@@ -9,6 +9,7 @@ from textual.css.query import NoMatches
 from textual.screen import Screen
 from textual.widgets import Footer
 
+from sbxloop.tui.context import console_of
 from sbxloop.tui.data import ConsoleState
 from sbxloop.tui.widgets.statusbar import StatusBar
 
@@ -24,11 +25,7 @@ class ConsoleScreen(Screen[Any]):
 
     @property
     def console_app(self) -> SbxloopTui:
-        from sbxloop.tui.app import SbxloopTui
-
-        app = self.app
-        assert isinstance(app, SbxloopTui)
-        return app
+        return console_of(self)
 
     def compose_frame(self) -> Any:
         yield StatusBar(id="statusbar")
@@ -55,4 +52,4 @@ class ConsoleScreen(Screen[Any]):
     def refresh_data(self, state: ConsoleState) -> None:
         """Repaint from the given snapshot; the base repaints the bar."""
         bar = self.query_one("#statusbar", StatusBar)
-        bar.show(state, emoji=self.console_app.emoji)
+        bar.show(state, emoji=self.console_app.emoji, unread=self.console_app.unread())

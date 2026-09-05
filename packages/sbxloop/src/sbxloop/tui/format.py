@@ -108,6 +108,13 @@ def card(spec: EmbedSpec, *, names: dict[str, str] | None = None) -> Panel:
     return Panel(body, title=title, title_align="left", border_style=style, padding=(0, 1))
 
 
+def clock(ts: float | None, *, seconds: bool = True) -> str:
+    """A local wall-clock stamp, ``HH:MM:SS`` (or ``HH:MM``)."""
+    if ts is None:
+        return "—"
+    return time.strftime("%H:%M:%S" if seconds else "%H:%M", time.localtime(ts))
+
+
 def age(ts: float | None, now: float | None = None) -> str:
     """``3s`` / ``2m`` / ``4h`` / ``3d`` ago, or an em dash."""
     if ts is None:
@@ -169,6 +176,7 @@ __all__ = [
     "SPEND_NOT_REPORTED",
     "age",
     "card",
+    "clock",
     "duration",
     "run_title",
     "state_label",

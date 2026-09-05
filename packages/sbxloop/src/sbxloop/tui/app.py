@@ -18,7 +18,9 @@ from sbxloop import __version__
 from sbxloop.config import Config
 from sbxloop.daemon.control import ControlClient
 from sbxloop.daemon.mailbox import MailboxClient
+from sbxloop.tui.chat import ChatSession
 from sbxloop.tui.data import ConsoleState, CtlClient, build_state, probe_daemon
+from sbxloop.tui.screens.chat import ChatScreen
 from sbxloop.tui.screens.help import HelpScreen
 from sbxloop.tui.screens.items import ItemsScreen
 from sbxloop.tui.screens.overview import OverviewScreen
@@ -40,12 +42,14 @@ class SbxloopTui(App[None]):
         "overview": OverviewScreen,
         "runs": RunsScreen,
         "items": ItemsScreen,
+        "chat": ChatScreen,
         "help": HelpScreen,
     }
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("1", "mode('overview')", "Overview"),
         Binding("2", "mode('runs')", "Runs"),
         Binding("3", "mode('items')", "Queue"),
+        Binding("4", "mode('chat')", "Chat"),
         Binding("question_mark", "mode('help')", "Help"),
         Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
@@ -72,6 +76,12 @@ class SbxloopTui(App[None]):
         self.clock = clock
         self.emoji = bool(config.tui.emoji)
         self.state = ConsoleState(version=__version__, read_only=read_only)
+        self.chat = ChatSession(
+            mailbox, read_only=read_only, prefix=config.tui.command_prefix, clock=clock
+        )
+        # The newest control-channel row the Chat screen has shown, for the
+        # unread count in the bar.
+        self._control_seen = 0
 
     # -- lifecycle ---------------------------------------------------------------
 
@@ -93,6 +103,7 @@ class SbxloopTui(App[None]):
             self.state,
             now=self.clock(),
             retry_backoff_s=self.config.daemon.retry_backoff_s,
+            control_seen=self._control_seen,
         )
         if get_current_worker().is_cancelled:
             return  # superseded, or the app is shutting down
@@ -138,6 +149,13 @@ class SbxloopTui(App[None]):
 
     def open_run(self, run_id: str) -> None:
         self.push_screen(RunDetailScreen(run_id))
+
+    def chat_seen(self, row_id: int) -> None:
+        self._control_seen = max(self._control_seen, row_id)
+
+    def unread(self) -> int:
+        """Control-channel rows newer than the last one the Chat screen showed."""
+        return self.state.control_unread
 
 
 def build_app(
