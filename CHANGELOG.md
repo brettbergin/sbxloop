@@ -24,9 +24,15 @@ All notable changes to sbxloop are documented here. The project adheres to
   judges them, cleans the stale ones after a dry run (typed) and rotates
   the agent credential's registration from a hidden prompt (typed). The
   CLI and the console now render from one fold each:
-  `sbxloop.cli.doctor.doctor_report`, `sbxloop.cli.policyview.policy_view`,
-  and `secrets_context` / `secret_rows` / `clean_secrets` in
-  `sbxloop.sbx.secretstate`.
+  `sbxloop.cli.doctor.doctor_report` (which hands the host checks over
+  before the conformance suite runs, so `sbxloop doctor --deep` prints
+  its table before booting the sandbox), `sbxloop.cli.policyview.policy_view`,
+  and `secrets_context` / `secret_rows` / `clean_secrets` /
+  `rotate_registrations` in `sbxloop.sbx.secretstate`. A draft is
+  validated in place of the daemon's `sbxloop.toml` at the real discovered
+  root — the project cut-down included, so a repository-carried file's
+  ignored keys are named instead of "loads" — and the editor follows the
+  directory the daemon reports in `status` (`cwd`), not the console's.
 
 - **Console admin: sandboxes, daemon control, the journal, run operations,
   a command palette** (#773). The console could watch and chat but every

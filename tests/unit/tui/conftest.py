@@ -103,6 +103,8 @@ class FakeRunner:
         self.spawn_env: list[dict[str, str]] = []
         self.children: list[FakeChild] = []
         self.interactive_calls: list[tuple[str, ...]] = []
+        #: What "the editor" does with the terminal (a test's external edit).
+        self.on_interactive: Callable[[tuple[str, ...]], int] | None = None
 
     def script(self, *prefix: str, returncode: int = 0, stdout: str = "", stderr: str = "") -> None:
         self.scripts[prefix] = RunOutcome(prefix, returncode, stdout, stderr)
@@ -140,6 +142,8 @@ class FakeRunner:
 
     def interactive(self, argv: Sequence[str]) -> int:
         self.interactive_calls.append(tuple(argv))
+        if self.on_interactive is not None:
+            return self.on_interactive(tuple(argv))
         return 0
 
 

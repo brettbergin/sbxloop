@@ -62,10 +62,9 @@ from sbxloop.sbx.prune import (
 )
 from sbxloop.sbx.secretstate import (
     clean_secrets,
-    replace_registration,
+    rotate_registrations,
     secret_rows,
     secrets_context,
-    tracked_custom_secrets,
     verify_secret_visibility,
 )
 
@@ -1267,26 +1266,13 @@ def secrets_rotate(
                 )
                 raise typer.Exit(2)
         config, cli, live = _secrets_context(config)
-        for env, host in tracked_custom_secrets(config):
-            replace_registration(cli, env=env, host=host, token=token)
-            console.print(f"[green]rotated:[/] {env} registered @ {host} (global scope)")
-        if live:
-            console.print(
-                f"[yellow]live sbxloop sandboxes exist ({', '.join(sorted(live))})[/] — "
-                "they may still hold the old token in their in-VM env file; "
-                "remove them with `sbxloop sandbox rm --all`"
-            )
-        if prompt:
-            console.print(
-                f"[yellow]runs read {token_env} from the environment at "
-                "provision time[/] — update your export / ./.env with the new value too"
-            )
-        if config.secret_strategy == "plain-env":  # nosec B105 - strategy label
-            console.print(
-                "next run: [bold]plain-env[/] strategy (configured) — the token is "
-                "written to the in-VM env file from your environment"
-            )
-        elif verify:
+        styles = {"ok": "[green]{}[/]", "warn": "[yellow]{}[/]", "note": "{}"}
+        for kind, line in rotate_registrations(config, cli, live, token=token):
+            if kind == "warn" and "update your export" in line and not prompt:
+                continue  # the token came from the environment: it is current there
+            console.print(styles[kind].format(line))
+        # Under plain-env the strategy line above already says it all.
+        if config.secret_strategy != "plain-env" and verify:  # nosec B105 - strategy label
             workspace = config.state_dir / "secretcheck"
             workspace.mkdir(parents=True, exist_ok=True)
             visible = verify_secret_visibility(

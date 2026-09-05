@@ -11,7 +11,7 @@ from __future__ import annotations
 import os
 import shlex
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -32,12 +32,7 @@ from sbxloop.sbx.prune import (
     remove_run_sandbox,
     remove_sandbox,
 )
-from sbxloop.sbx.secretstate import (
-    clean_secrets,
-    replace_registration,
-    secrets_context,
-    tracked_custom_secrets,
-)
+from sbxloop.sbx.secretstate import clean_secrets, rotate_registrations, secrets_context
 from sbxloop.tui.configedit import save_text
 from sbxloop.tui.data import CtlClient, DaemonSnapshot, probe_daemon
 from sbxloop.tui.runner import ChildHandle, CommandRunner, sbxloop_argv
@@ -681,11 +676,21 @@ def save_config(deps: Deps, path: Path, text: str) -> Action:
     )
 
 
-def open_editor(deps: Deps, path: Path) -> Action:
-    editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi")
+def editor_argv(env: Mapping[str, str]) -> tuple[str, ...]:
+    """``$VISUAL``, else ``$EDITOR``, else ``vi`` — shell-split, and ``vi``
+    again when the value is blank or unbalanced."""
+    raw = env.get("VISUAL") or env.get("EDITOR") or ""
+    try:
+        words = shlex.split(raw)
+    except ValueError:
+        words = []
+    return tuple(words) or ("vi",)
+
+
+def open_editor(path: Path) -> Action:
+    editor = editor_argv(os.environ)
     return Action(
         f"edit {path.name} in {editor[0]}",
-        lambda: Outcome(True, ""),
         confirm="none",
         interactive=(*editor, str(path)),
     )
@@ -716,31 +721,21 @@ def clean_secret_registrations(deps: Deps, *, every: bool = False) -> Action:
 
 
 def rotate_secret_registrations(deps: Deps, token: str) -> Action:
-    """The registration half of ``sbxloop secrets rotate``: replace every
-    tracked secret's sbx registration with a global one bound to the
-    canonical host. The sandbox-booting visibility check stays with the
-    CLI (``--verify``)."""
+    """The registration half of ``sbxloop secrets rotate`` — the same
+    :func:`rotate_registrations` the CLI runs. The sandbox-booting
+    visibility check stays with the CLI (``--verify``)."""
 
     def run() -> Outcome:
         try:
             cli, live = secrets_context(deps.config, deps.sbx())
-            lines: list[str] = []
-            for env, host in tracked_custom_secrets(deps.config):
-                replace_registration(cli, env=env, host=host, token=token)
-                lines.append(f"rotated: {env} registered @ {host} (global scope)")
+            lines = rotate_registrations(deps.config, cli, live, token=token)
         except SbxloopError as exc:
             return Outcome(False, f"rotate failed: {exc}")
-        if live:
-            lines.append(
-                f"live sbxloop sandboxes exist ({', '.join(sorted(live))}): they may still "
-                "hold the old token; remove them from the Sandboxes screen"
-            )
-        lines.append(
-            "runs read the token from the environment at provision time: update your "
-            "export / .env too. `sbxloop secrets rotate --verify` reports which strategy "
-            "the next run will use."
+        texts = [text for _kind, text in lines]
+        texts.append(
+            "`sbxloop secrets rotate --verify` reports which strategy the next run will use."
         )
-        return Outcome(True, "\n".join(lines), long=True)
+        return Outcome(True, "\n".join(texts), long=True)
 
     return Action(
         "rotate the agent credential's registration",
@@ -768,6 +763,7 @@ __all__ = [
     "clean_secret_registrations",
     "ctl_action",
     "ctl_outcome",
+    "editor_argv",
     "gc_run_dirs",
     "grant_rounds",
     "merge",

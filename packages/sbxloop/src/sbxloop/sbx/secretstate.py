@@ -526,3 +526,45 @@ def clean_secrets(
                 )
             )
     return outcomes
+
+
+def rotate_registrations(
+    config: Config, cli: SbxCLI, live: set[str], *, token: str
+) -> list[tuple[str, str]]:
+    """Replace every tracked secret's registration with a global one bound
+    to the canonical host (the rm + set-custom dance provisioning would
+    otherwise perform mid-run), and say what else the operator must do.
+    Lines are ``(kind, text)`` with kind ``ok`` / ``warn`` / ``note``; the
+    token never appears in one."""
+    from sbxloop.backends import backend_for
+
+    lines: list[tuple[str, str]] = []
+    for env, host in tracked_custom_secrets(config):
+        replace_registration(cli, env=env, host=host, token=token)
+        lines.append(("ok", f"rotated: {env} registered @ {host} (global scope)"))
+    if live:
+        lines.append(
+            (
+                "warn",
+                f"live sbxloop sandboxes exist ({', '.join(sorted(live))}) — they may still "
+                "hold the old token in their in-VM env file; remove them "
+                "(`sbxloop sandbox rm --all`, or the console's Sandboxes screen)",
+            )
+        )
+    token_env = backend_for(config).token_env
+    lines.append(
+        (
+            "warn",
+            f"runs read {token_env} from the environment at provision time — update your "
+            "export / ./.env with the new value too",
+        )
+    )
+    if config.secret_strategy == "plain-env":  # nosec B105 - strategy label
+        lines.append(
+            (
+                "note",
+                "next run: plain-env strategy (configured) — the token is written to the "
+                "in-VM env file from your environment",
+            )
+        )
+    return lines

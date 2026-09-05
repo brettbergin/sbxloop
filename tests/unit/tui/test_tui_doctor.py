@@ -15,6 +15,7 @@ from sbxloop.sbx.secretstate import (
     COPILOT_TOKEN_ENV,
     COPILOT_TOKEN_HOST,
     clean_secrets,
+    rotate_registrations,
     secret_rows,
     secrets_context,
 )
@@ -75,6 +76,13 @@ def test_secret_helpers_judge_like_the_cli(host: Path, fake_sbx: FakeSbx) -> Non
     assert done[0].removed and not done[0].failed
     (row,) = secret_rows(config, cli, live)
     assert row.actual == "not registered" and row.judgement.status == "ok"
+    lines = rotate_registrations(config, cli, live, token="new-secret-value")
+    kinds = [k for k, _ in lines]
+    assert kinds[0] == "ok" and "rotated: COPILOT_GITHUB_TOKEN" in lines[0][1]
+    assert any("update your export" in text for _k, text in lines)
+    assert all("new-secret-value" not in text for _k, text in lines), "the token never appears"
+    (row,) = secret_rows(config, cli, live)
+    assert row.state.scope == "global" and row.judgement.status == "ok"
 
 
 def test_doctor_screen_runs_the_report_and_secrets_clean_behind_a_typed_word(

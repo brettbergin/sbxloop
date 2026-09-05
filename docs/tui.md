@@ -278,10 +278,16 @@ orphan verdicts (the prompt says so, and their kept marker is cleared).
   prints, from the same fold (`sbxloop.cli.policyview.policy_view`).
 - **Repos** — the configured repositories as `sbxloop config repos` lists
   them.
-- **Edit** — the discovered `sbxloop.toml` (the commented example when the
-  host has none yet) in an editor. `i` focuses it, `Esc` hands focus back.
-  `V` validates the draft with the real loader — a scratch copy, the user
-  and environment layers still applied — and names what it refuses (an
+- **Edit** — the `sbxloop.toml` the daemon reads: the daemon says where it
+  loaded its configuration from (`status` carries its directory), and the
+  editor follows that, not the directory the console was started in (the
+  commented example when there is no file yet). `i` focuses it, `Esc`
+  hands focus back. `V` validates the draft with the real loader, in
+  place of that file at the same discovered root — the user,
+  `pyproject.toml` and environment layers still applied, and the project
+  cut-down too: a `sbxloop.toml` the repository carries (tracked by git)
+  may only set project keys, and the verdict names the keys the daemon
+  would ignore rather than saying "loads". It names what it refuses (an
   unknown key, a bad value). `W` (or `ctrl+s`) validates and then saves,
   typed `save`: the write is atomic, the previous file is kept beside it
   as `sbxloop.toml.bak-<stamp>`, and a restart of the unit is offered

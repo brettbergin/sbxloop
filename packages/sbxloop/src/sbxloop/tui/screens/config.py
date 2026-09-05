@@ -21,7 +21,7 @@ from textual.worker import get_current_worker
 from sbxloop.cli.policyview import PolicyView, policy_view
 from sbxloop.config import Config, load_config_with_sources
 from sbxloop.tui import actions
-from sbxloop.tui.configedit import config_path, read_text, validate_text
+from sbxloop.tui.configedit import Verdict, config_path, read_text, validate_text
 from sbxloop.tui.data import ConsoleState
 from sbxloop.tui.screens.base import ConsoleScreen
 from sbxloop.tui.screens.modals import ConfirmScreen
@@ -83,6 +83,10 @@ class ConfigScreen(ConsoleScreen):
         self.error: str | None = None
         self.path: Path | None = None
         self.last_verdict: str = "not validated yet"
+        # What the editor was loaded with: a re-anchor or reload replaces
+        # the draft only while it is untouched.
+        self._loaded_text = ""
+        self._anchor_note = ""
 
     def compose(self) -> ComposeResult:
         yield from self.compose_frame()
@@ -106,11 +110,9 @@ class ConfigScreen(ConsoleScreen):
         self.query_one("#filter", Input).display = False
         self.query_one("#resolved", ConsoleTable).focus()
         deps = self.console_app.deps
-        self.path = config_path(deps.cwd)
-        self.query_one("#editor", ConfigEditor).load_text(read_text(self.path))
+        self._anchor(deps.cwd, "the console's directory")
         if deps.read_only:
             self.query_one("#editor", ConfigEditor).read_only = True
-        self._edit_status()
         self.load()
 
     def on_screen_resume(self) -> None:
@@ -152,6 +154,30 @@ class ConfigScreen(ConsoleScreen):
 
     def refresh_data(self, state: ConsoleState) -> None:
         super().refresh_data(state)
+        # The daemon says where it loaded its config from: that is the
+        # file to edit, whatever directory the console was started in.
+        status = (state.daemon.status if state.daemon and state.daemon.live else None) or {}
+        cwd = status.get("cwd")
+        if cwd and self.path is not None and config_path(Path(cwd)) != self.path:
+            self._anchor(Path(cwd), "the daemon's directory")
+
+    def _anchor(self, root: Path, origin: str) -> None:
+        """Point the editor at ``root``'s sbxloop.toml, loading it when the
+        draft is untouched (else the operator's edit stays)."""
+        path = config_path(root)
+        editor = self.query_one("#editor", ConfigEditor)
+        untouched = editor.text == self._loaded_text
+        self.path = path
+        self._anchor_note = f"({origin})"
+        if untouched:
+            text, note = read_text(path)
+            editor.load_text(text)
+            self._loaded_text = text
+            if note:
+                self.last_verdict = note
+        else:
+            self.last_verdict = f"the file moved to {path}; the draft is yours — L reloads"
+        self._edit_status()
 
     def render_resolved(self) -> None:
         needle = self.filter_text.lower()
@@ -214,6 +240,7 @@ class ConfigScreen(ConsoleScreen):
         path = self.path
         if path is not None:
             text.append(str(path), style="bold")
+            text.append(f"  {self._anchor_note}", style="dim")
             text.append("  (new file)" if not path.is_file() else "", style="dim")
         text.append(f"\n{self.last_verdict}")
         text.append(
@@ -262,25 +289,27 @@ class ConfigScreen(ConsoleScreen):
     @work(thread=True, exclusive=True, group="validate")
     def validate_draft(self, text: str, then_save: bool = False) -> None:
         deps = self.console_app.deps
-        verdict = validate_text(text, scratch=deps.console_dir / "validate", env=os.environ)
+        root = self.path.parent if self.path is not None else deps.cwd
+        verdict = validate_text(text, cwd=root, env=os.environ)
         if get_current_worker().is_cancelled:
             return
         self.app.call_from_thread(self._validated, verdict, text, then_save)
 
-    def _validated(self, verdict: str | None, text: str, then_save: bool) -> None:
-        if verdict is None:
-            self.last_verdict = "draft loads: the loader accepted it"
-            self._edit_status()
-            if then_save and self.path is not None:
-                self.console_app.perform(
-                    actions.save_config(self.console_app.deps, self.path, text), then=self._saved
-                )
-            else:
-                self.app.notify("the draft loads", title="validate")
-            return
-        self.last_verdict = f"draft refused: {verdict}"
+    def _validated(self, verdict: Verdict, text: str, then_save: bool) -> None:
+        self.last_verdict = verdict.text
         self._edit_status()
-        self.app.notify(verdict[:300], title="validate", severity="error", timeout=15)
+        if not verdict.ok:
+            self.app.notify(verdict.text[:300], title="validate", severity="error", timeout=15)
+            return
+        if verdict.dropped:
+            self.app.notify(verdict.text[:300], title="validate", severity="warning", timeout=15)
+        if then_save and self.path is not None:
+            self.console_app.perform(
+                actions.save_config(self.console_app.deps, self.path, text),
+                on_success=lambda: self._saved(text),
+            )
+        elif not verdict.dropped:
+            self.app.notify("the draft loads", title="validate")
 
     def action_save(self) -> None:
         if self.console_app.read_only:
@@ -290,7 +319,8 @@ class ConfigScreen(ConsoleScreen):
         # start would fail on it.
         self.validate_draft(self.draft(), then_save=True)
 
-    def _saved(self) -> None:
+    def _saved(self, text: str) -> None:
+        self._loaded_text = text
         self._edit_status()
         self.load()
 
@@ -310,15 +340,15 @@ class ConfigScreen(ConsoleScreen):
     def action_editor(self) -> None:
         if self.path is None:
             return
-        self.console_app.perform(
-            actions.open_editor(self.console_app.deps, self.path), then=self.action_reload
-        )
+        self.console_app.perform(actions.open_editor(self.path), then=self.action_reload)
 
     def action_reload(self) -> None:
         if self.path is None:
             return
-        self.query_one("#editor", ConfigEditor).load_text(read_text(self.path))
-        self.last_verdict = "reloaded from disk"
+        text, note = read_text(self.path)
+        self.query_one("#editor", ConfigEditor).load_text(text)
+        self._loaded_text = text
+        self.last_verdict = note or "reloaded from disk"
         self._edit_status()
         self.load()
 

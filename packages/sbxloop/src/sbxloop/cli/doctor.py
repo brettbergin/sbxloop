@@ -1334,11 +1334,14 @@ def doctor_report(
     deep: bool = False,
     probe: bool = False,
     progress: ProgressFn | None = None,
+    on_checks: Callable[[list[Check]], None] | None = None,
 ) -> DoctorReport:
     """Run the host checks and the conformance suite; the report, not the
     rendering. ``probe`` asks GitHub itself about each configured repository
     from a github-ops sandbox — one microVM per distinct credential (#515);
-    ``deep`` implies it, since that already boots a sandbox."""
+    ``deep`` implies it, since that already boots a sandbox. ``on_checks``
+    hears the host checks as soon as they are in — before a deep run boots
+    its sandbox, so a failing check is never withheld for minutes."""
     import os
 
     env = dict(os.environ) if env is None else env
@@ -1361,6 +1364,8 @@ def doctor_report(
     finally:
         for box in boxes.values():
             box.close()
+    if on_checks is not None:
+        on_checks(checks)
     conformance: ConformanceReport | None = None
     note: str | None = None
     sbx_present = any(check.name == "sbx binary" and check.ok for check in checks)
@@ -1407,17 +1412,21 @@ def run_doctor(
     def progress(message: str) -> None:
         console.print(f"[dim]\u2026 {message}[/dim]", highlight=False)
 
-    report = doctor_report(env, deep=deep, probe=probe, progress=progress)
-    table = Table(title="sbxloop doctor")
-    table.add_column("check", no_wrap=True)
-    table.add_column("status", no_wrap=True)
-    table.add_column("detail", overflow="fold")
-    for check in report.checks:
-        status = (
-            "[green]ok[/]" if check.ok else ("[red]FAIL[/]" if check.hard else "[yellow]warn[/]")
-        )
-        table.add_row(check.name, status, _clean(check.detail))
-    console.print(table)
+    def show_checks(checks: list[Check]) -> None:
+        table = Table(title="sbxloop doctor")
+        table.add_column("check", no_wrap=True)
+        table.add_column("status", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for check in checks:
+            status = (
+                "[green]ok[/]"
+                if check.ok
+                else ("[red]FAIL[/]" if check.hard else "[yellow]warn[/]")
+            )
+            table.add_row(check.name, status, _clean(check.detail))
+        console.print(table)
+
+    report = doctor_report(env, deep=deep, probe=probe, progress=progress, on_checks=show_checks)
     ready = report.ready
 
     if report.conformance is None:

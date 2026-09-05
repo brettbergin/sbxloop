@@ -15,8 +15,7 @@ from textual.containers import Vertical
 from textual.widgets import Static
 from textual.worker import get_current_worker
 
-from sbxloop.cli.doctor import DoctorReport, _clean, doctor_report
-from sbxloop.errors import SbxloopError
+from sbxloop.cli.doctor import Check, DoctorReport, _clean, doctor_report
 from sbxloop.tui.data import ConsoleState
 from sbxloop.tui.format import age
 from sbxloop.tui.screens.base import ConsoleScreen
@@ -60,22 +59,32 @@ class DoctorScreen(ConsoleScreen):
         super().on_mount()
         self.query_one("#checks", ConsoleTable).focus()
         if self.report is None and self.running is None:
-            self.run_report(deep=False, probe=False)
+            self.start(deep=False, probe=False)
 
     # -- data --------------------------------------------------------------------
 
+    def start(self, *, deep: bool, probe: bool) -> None:
+        """Mark the pass as running here, on the UI thread, before the
+        worker exists — the guards read the flag here too."""
+        self.running = "deep" if deep else ("probe" if probe else "plain")
+        self._summary()
+        self.run_report(deep=deep, probe=probe)
+
     @work(thread=True, exclusive=True, group="doctor")
     def run_report(self, *, deep: bool, probe: bool) -> None:
-        self.running = "deep" if deep else ("probe" if probe else "plain")
-        self.app.call_from_thread(self._summary)
-
         def progress(message: str) -> None:
             if not get_current_worker().is_cancelled:
                 self.app.call_from_thread(self._progress, message)
 
+        def checks_in(checks: list[Check]) -> None:
+            if not get_current_worker().is_cancelled:
+                self.app.call_from_thread(self._checks, checks)
+
         try:
-            report = doctor_report(dict(os.environ), deep=deep, probe=probe, progress=progress)
-        except (SbxloopError, OSError) as exc:
+            report = doctor_report(
+                dict(os.environ), deep=deep, probe=probe, progress=progress, on_checks=checks_in
+            )
+        except Exception as exc:
             if not get_current_worker().is_cancelled:
                 self.app.call_from_thread(self._failed, str(exc))
             return
@@ -91,6 +100,10 @@ class DoctorScreen(ConsoleScreen):
         self.running = None
         self.error = error
         self._summary()
+
+    def _checks(self, checks: list[Check]) -> None:
+        """The host checks land before the conformance suite finishes."""
+        self._render_checks(checks)
 
     def _apply(self, report: DoctorReport) -> None:
         self.running = None
@@ -134,13 +147,9 @@ class DoctorScreen(ConsoleScreen):
         text.append("\nd plain · D deep · p probe GitHub · S secrets", style="dim")
         self.query_one("#summary", TextPanel).update(text)
 
-    def render_report(self) -> None:
-        self._summary()
-        report = self.report
-        if report is None:
-            return
+    def _render_checks(self, checks: list[Check]) -> None:
         rows = []
-        for check in report.checks:
+        for check in checks:
             if check.ok:
                 status = Text("ok", style="green")
             elif check.hard:
@@ -149,6 +158,13 @@ class DoctorScreen(ConsoleScreen):
                 status = Text("warn", style="yellow")
             rows.append((check.name, (check.name, status, _clean(check.detail, 160))))
         self.query_one("#checks", ConsoleTable).replace_rows(rows)
+
+    def render_report(self) -> None:
+        self._summary()
+        report = self.report
+        if report is None:
+            return
+        self._render_checks(report.checks)
         conf_rows = []
         if report.conformance is not None:
             for outcome in report.conformance.outcomes:
@@ -183,7 +199,7 @@ class DoctorScreen(ConsoleScreen):
         if self.running:
             self.app.notify("doctor is already running", severity="warning")
             return
-        self.run_report(deep=False, probe=False)
+        self.start(deep=False, probe=False)
 
     def _confirmed_run(self, *, deep: bool, probe: bool, what: str) -> None:
         if self.running:
@@ -191,8 +207,8 @@ class DoctorScreen(ConsoleScreen):
             return
 
         def decided(ok: bool | None) -> None:
-            if ok:
-                self.run_report(deep=deep, probe=probe)
+            if ok and not self.running:
+                self.start(deep=deep, probe=probe)
 
         self.app.push_screen(ConfirmScreen(what, f"{what}? It boots a sandbox."), decided)
 

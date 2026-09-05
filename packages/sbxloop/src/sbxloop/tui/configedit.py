@@ -9,6 +9,7 @@ import os
 import shutil
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 
@@ -28,22 +29,56 @@ def template_text() -> str:
     return resources.files("sbxloop.data").joinpath("sbxloop.toml.example").read_text("utf-8")
 
 
-def read_text(path: Path) -> str:
-    return path.read_text(encoding="utf-8") if path.is_file() else template_text()
-
-
-def validate_text(text: str, *, scratch: Path, env: Mapping[str, str]) -> str | None:
-    """The loader's own verdict on a draft: None when it loads, else the
-    message ``sbxloop`` would print. The draft is written to ``scratch``
-    and loaded from there, so the file on disk is untouched and the user
-    config and environment layers still apply."""
-    scratch.mkdir(parents=True, exist_ok=True)
-    (scratch / CONFIG_FILENAME).write_text(text, encoding="utf-8")
+def read_text(path: Path) -> tuple[str, str | None]:
+    """The file's text, or the template with a note saying why (unreadable,
+    not UTF-8, gone between the check and the read)."""
     try:
-        load_config_with_sources(cwd=scratch, env=dict(env))
+        return path.read_text(encoding="utf-8"), None
+    except FileNotFoundError:
+        return template_text(), None
+    except (OSError, UnicodeDecodeError) as exc:
+        return template_text(), f"could not read {path}: {exc}; showing the template"
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """What the loader made of a draft."""
+
+    error: str | None
+    #: Keys a repository-carried ``sbxloop.toml`` may not set: the loader
+    #: ignores them with a warning, so a save would apply nothing for them.
+    dropped: tuple[str, ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.error is None
+
+    @property
+    def text(self) -> str:
+        if self.error is not None:
+            return f"draft refused: {self.error}"
+        if self.dropped:
+            return (
+                "draft loads, but this sbxloop.toml is the repository's (tracked by git): "
+                f"the daemon ignores {', '.join(self.dropped)} — operator settings belong "
+                "in ~/.config/sbxloop/sbxloop.toml or the environment"
+            )
+        return "draft loads: the loader accepted it"
+
+
+def validate_text(text: str, *, cwd: Path, env: Mapping[str, str]) -> Verdict:
+    """The loader's own verdict on a draft, in place of the ``sbxloop.toml``
+    at the root discovered from ``cwd`` — the same discovery, the same
+    user, ``pyproject.toml`` and environment layers, the same project
+    cut-down when the file is the repository's. Nothing is written."""
+    dropped: list[str] = []
+    try:
+        load_config_with_sources(
+            cwd=cwd, env=dict(env), sbxloop_toml_text=text, dropped_keys=dropped
+        )
     except Exception as exc:
-        return str(exc)
-    return None
+        return Verdict(str(exc))
+    return Verdict(None, tuple(sorted(set(dropped))))
 
 
 def save_text(path: Path, text: str, *, now: float | None = None) -> Path | None:
@@ -63,6 +98,7 @@ def save_text(path: Path, text: str, *, now: float | None = None) -> Path | None
 
 __all__ = [
     "CONFIG_FILENAME",
+    "Verdict",
     "config_path",
     "read_text",
     "save_text",

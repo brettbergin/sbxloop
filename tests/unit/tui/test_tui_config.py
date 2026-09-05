@@ -4,6 +4,7 @@ backup, the restart offered."""
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 from typing import Any
 
@@ -17,7 +18,7 @@ from sbxloop.tui.screens.config import ConfigEditor, ConfigScreen, flatten_confi
 from sbxloop.tui.screens.modals import ConfirmScreen, TypedConfirmScreen
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop.tui.widgets.tables import ConsoleTable
-from tests.unit.tui.conftest import drive, make_app
+from tests.unit.tui.conftest import FakeCtl, FakeRunner, drive, live_status, make_app
 
 REFRESH: dict[str, Any] = {"refresh_s": 3.0}
 
@@ -32,21 +33,38 @@ def hermetic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 def test_configedit_helpers(tmp_path: Path, hermetic: None) -> None:
     path = config_path(tmp_path)
     assert path == tmp_path / "sbxloop.toml"
-    assert "[daemon]" in read_text(path), "no file yet: the commented example"
+    assert "[daemon]" in read_text(path)[0], "no file yet: the commented example"
     env = {"XDG_CONFIG_HOME": str(tmp_path / "xdg-config"), "HOME": str(tmp_path)}
-    assert (
-        validate_text("[daemon]\npoll_interval_s = 7.0\n", scratch=tmp_path / "v", env=env) is None
-    )
-    broken = validate_text("[daemon\n", scratch=tmp_path / "v", env=env)
-    assert broken is not None
-    unknown = validate_text("[daemon]\nno_such_key = 1\n", scratch=tmp_path / "v", env=env)
-    assert unknown is not None and "no_such_key" in unknown
-    assert not path.exists()
+    assert validate_text("[daemon]\npoll_interval_s = 7.0\n", cwd=tmp_path, env=env).ok
+    broken = validate_text("[daemon\n", cwd=tmp_path, env=env)
+    assert not broken.ok and "draft refused" in broken.text
+    unknown = validate_text("[daemon]\nno_such_key = 1\n", cwd=tmp_path, env=env)
+    assert not unknown.ok and "no_such_key" in unknown.text
+    assert not path.exists(), "validation writes nothing"
+    (tmp_path / "unreadable.toml").write_bytes(b"\xff\xfe not utf-8")
+    text, note = read_text(tmp_path / "unreadable.toml")
+    assert "[daemon]" in text and note is not None and "could not read" in note
     assert save_text(path, "[tui]\nemoji = false\n", now=1_700_000_000.0) is None
     backup = save_text(path, "[tui]\nemoji = true\n", now=1_700_000_000.0)
     assert backup is not None and backup.name.startswith("sbxloop.toml.bak-")
     assert backup.read_text() == "[tui]\nemoji = false\n"
     assert path.read_text() == "[tui]\nemoji = true\n"
+
+
+def test_validate_sees_the_repositorys_cut_down(tmp_path: Path, hermetic: None) -> None:
+    """A tracked sbxloop.toml is the repository's: the loader keeps only
+    project keys from it. The verdict says so instead of "draft loads"."""
+    import subprocess
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / "sbxloop.toml").write_text("[daemon]\npoll_interval_s = 7.0\n")
+    subprocess.run(["git", "-C", str(repo), "add", "sbxloop.toml"], check=True)
+    env = {"XDG_CONFIG_HOME": str(tmp_path / "xdg-config"), "HOME": str(tmp_path)}
+    verdict = validate_text("[daemon]\npoll_interval_s = 9.0\n", cwd=repo, env=env)
+    assert verdict.ok and verdict.dropped == ("daemon.poll_interval_s",)
+    assert "repository's" in verdict.text and "ignores daemon.poll_interval_s" in verdict.text
 
 
 def test_flatten_and_policy_view_are_the_cli_folds() -> None:
@@ -93,6 +111,22 @@ def test_config_screen_resolves_filters_validates_and_saves(seeded: Path, hermet
             await pilot.pause(1.5)
             assert isinstance(app.screen, ConfigScreen), "save validates first: no dialog"
             assert "7.0" in (seeded / "sbxloop.toml").read_text()
+            # A save that fails offers no restart for a file never written.
+            editor.load_text("[daemon]\npoll_interval_s = 8.0\n")
+
+            def refuse(*_a: object, **_k: object) -> None:
+                raise OSError("read-only file system")
+
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr("sbxloop.tui.actions.save_text", refuse)
+                await pilot.press("W")
+                await pilot.pause(1.5)
+                assert isinstance(app.screen, TypedConfirmScreen)
+                app.screen.query_one("#typed", Input).value = "save"
+                await pilot.press("enter")
+                await pilot.pause(1.5)
+            assert isinstance(app.screen, ConfigScreen), "no restart prompt after a failed save"
+            assert "7.0" in (seeded / "sbxloop.toml").read_text()
             # A draft that loads is saved under the typed word, with a
             # backup, and the restart is offered.
             editor.load_text("[daemon]\npoll_interval_s = 9.0\n")
@@ -120,6 +154,45 @@ def test_config_screen_resolves_filters_validates_and_saves(seeded: Path, hermet
             await pilot.press("escape")
             await pilot.pause(0.3)
             assert app.focused is not editor
+            # E hands the file to $EDITOR; what it wrote is reloaded after.
+            runner = app.deps.runner
+            assert isinstance(runner, FakeRunner)
+
+            def external_edit(argv: tuple[str, ...]) -> int:
+                Path(argv[-1]).write_text("[daemon]\npoll_interval_s = 11.0\n")
+                return 0
+
+            runner.on_interactive = external_edit
+            app.suspend = contextlib.nullcontext  # type: ignore[assignment, method-assign]
+            await pilot.press("E")
+            await pilot.pause(1.0)
+            assert runner.interactive_calls and runner.interactive_calls[-1][-1].endswith(
+                "sbxloop.toml"
+            )
+            assert "11.0" in editor.text, "the draft is the file the editor wrote"
+
+    drive(scenario)
+
+
+def test_the_editor_follows_the_daemons_directory(
+    seeded: Path, hermetic: None, tmp_path: Path
+) -> None:
+    """The daemon says where it loaded its config: that file is edited,
+    not one in whatever directory the console was started from."""
+    daemon_dir = tmp_path / "runner"
+    daemon_dir.mkdir()
+    (daemon_dir / "sbxloop.toml").write_text("[daemon]\npoll_interval_s = 3.0\n")
+
+    async def scenario() -> None:
+        app = make_app(seeded, ctl=FakeCtl(live_status(cwd=str(daemon_dir))), **REFRESH)
+        async with app.run_test(size=(160, 50)) as pilot:
+            await pilot.press("7")
+            await pilot.pause(2.0)
+            screen = app.screen
+            assert isinstance(screen, ConfigScreen)
+            assert screen.path == daemon_dir / "sbxloop.toml"
+            assert "3.0" in screen.query_one("#editor", ConfigEditor).text
+            assert "daemon's directory" in screen.query_one("#edit-status", TextPanel).content_text
 
     drive(scenario)
 
