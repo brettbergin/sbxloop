@@ -528,8 +528,15 @@ def _operator() -> str:
 class ControlClient:
     """The ``sbxloop daemon ctl`` side: submit a request, wait for the reply."""
 
-    def __init__(self, state_dir: Path) -> None:
+    def __init__(
+        self, state_dir: Path, *, by: str | None = None, prefix: str | None = None
+    ) -> None:
         self.dir = state_dir / CTL_SUBDIR
+        # Who the daemon attributes the request to (the source hears
+        # "cancelled by brett via sbxloop tui"); the CLI's login-name
+        # default when unset. ``prefix`` only shapes usage lines.
+        self.by = by
+        self.prefix = prefix or "sbxloop daemon ctl"
 
     def submit(self, cmd: str, *, timeout_s: float = DEFAULT_TIMEOUT_S) -> CommandReply | None:
         """Returns None when no daemon *took* the request within
@@ -591,7 +598,7 @@ class ControlClient:
             {
                 "cmd": cmd,
                 "prefix": "sbxloop daemon ctl",
-                "by": _operator(),
+                "by": self.by or _operator(),
                 "submitted_at": time.time(),
             },
         )

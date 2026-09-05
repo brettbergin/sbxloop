@@ -39,7 +39,7 @@ from sbxloop.config import (
     load_dotenv_file,
 )
 from sbxloop.daemon.control import DEFAULT_TIMEOUT_S
-from sbxloop.daemon.store import DaemonStore
+from sbxloop.daemon.store import DaemonStore, apply_item_verb
 from sbxloop.daemon.versions import VersionProbe, start_drift_check
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, scan_artifacts
@@ -50,7 +50,7 @@ from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
 from sbxloop.ghids import normalize_item_id, try_parse_gh_id
 from sbxloop.log import configure_logging, get_logger
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
-from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.cli import INTERACTIVE_SHELL_ARGV, SbxCLI
 from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.pair import cleanup_registry
 from sbxloop.sbx.provision import sandbox_name
@@ -987,9 +987,6 @@ def logs(
 
 # Prefer bash when the template has it, fall back to POSIX sh. `sbx exec`
 # has no documented -it flags; terminal attachment is inherited stdio.
-_INTERACTIVE_SHELL = ("sh", "-c", "command -v bash >/dev/null && exec bash -l; exec sh -l")
-
-
 @app.command()
 def shell(
     run_id: Annotated[str, typer.Argument(help="Run id.")],
@@ -1032,7 +1029,7 @@ def shell(
             "pruned since."
         )
         raise typer.Exit(2)
-    argv = ("sh", "-lc", command) if command else _INTERACTIVE_SHELL
+    argv = ("sh", "-lc", command) if command else INTERACTIVE_SHELL_ARGV
     raise typer.Exit(cli.exec_interactive(name, argv))
 
 
@@ -2175,6 +2172,12 @@ def tui(
             "--state-dir", help="The daemon's state directory (default: the daemon's own rule)."
         ),
     ] = None,
+    unit: Annotated[
+        str | None,
+        typer.Option(
+            "--unit", help="The daemon's systemd --user unit (default: [tui] daemon_unit)."
+        ),
+    ] = None,
 ) -> None:
     """The operator console: watch, steer and administer the daemon on this host.
 
@@ -2195,7 +2198,12 @@ def tui(
     operator = config.tui.operator_id or getpass.getuser()
     try:
         console_app = build_app(
-            config, resolved, operator_id=operator, read_only=read_only, initial_run=run
+            config,
+            resolved,
+            operator_id=operator,
+            read_only=read_only,
+            initial_run=run,
+            unit=unit,
         )
     except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
@@ -2308,10 +2316,8 @@ def _item_control(action: str, item_id: str, reason: str | None) -> None:
         now = time.time()
         if action == "abandon":
             item = dstore.abandon(item_id, reason or "abandoned by operator", now)
-        elif action == "retry":
-            item = dstore.retry(item_id, now, "re-queued by operator (CLI)")
         else:
-            item = dstore.requeue(item_id, now)
+            item = apply_item_verb(dstore, action, item_id, now=now, by="operator (CLI)")
     except KeyError:
         console.print(f"[bold red]unknown work item:[/] {item_id}")
         raise typer.Exit(2) from None

@@ -3051,3 +3051,20 @@ def _text_or_none(value: object) -> str | None:
 
 def _int_or_none(value: str | None) -> int | None:
     return None if value is None else int(value)
+
+
+def apply_item_verb(
+    dstore: DaemonStore, verb: str, item_id: str, *, now: float, by: str
+) -> WorkItem:
+    """The operator's row-only ``abandon`` / ``retry`` / ``requeue`` — what
+    ``sbxloop daemon <verb>`` and the console do when no daemon is up to
+    take the ctl verb. ``KeyError`` for an unknown item, ``ValueError``
+    with the store's reason for a refused transition."""
+    item_id = normalize_item_id(item_id)
+    if verb == "abandon":
+        return dstore.abandon(item_id, f"abandoned by {by}", now)
+    if verb == "retry":
+        return dstore.retry(item_id, now, f"re-queued by {by}")
+    if verb == "requeue":
+        return dstore.requeue(item_id, now)
+    raise ValueError(f"unknown item verb {verb!r}")

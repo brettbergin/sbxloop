@@ -49,9 +49,16 @@ from sbxloop.daemon.chat_choices import (
     parse_pending_filing,
 )
 from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX, dispatch, format_log_tail, plain
-from sbxloop.daemon.discord_format import agent_model_label
 from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.store import ChatThread, DaemonStore
+from sbxloop.daemon.usage import (
+    SPEND_NOT_REPORTED,
+    RunUsage,
+    usage_for_run,
+    usage_lines,
+    usage_row,
+    usage_rows,
+)
 from sbxloop.daemon.versions import VersionProbe
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunState
 from sbxloop.engine.prompts import bullet_list, render
@@ -71,7 +78,6 @@ from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import (
-    EventTypes,
     HostToolCall,
     HostToolResponse,
     HostToolSpec,
@@ -1240,42 +1246,10 @@ class Concierge:
         except (WorkerError, SbxError, DaemonError) as exc:
             return f"reading versions failed: {_one_line(str(exc), 300)}"
 
-    def _usage_for_run(self, run_id: str, *, since: float = 0.0) -> _RunUsage:
-        """Fold a run's ``agent.usage`` events into a total and a per-persona
-        breakdown. ``since`` drops samples older than an epoch stamp, which is
-        how ``usage_today`` attributes tokens to the day they were spent
-        rather than to the day the run started."""
-        total = Usage()
-        by_agent: dict[str, Usage] = {}
-        models: list[str] = []
-        samples = 0
-        # One `agent.usage` event is one assistant turn, and turns — not
-        # jobs — are what a run is billed and timed by: every turn re-sends
-        # the whole session context. Counting them per persona is how "where
-        # did it go?" gets an actionable answer instead of a token total.
-        turns: dict[str, int] = {}
-        jobs: dict[str, set[str]] = {}
-        for _seq, event in self.store.events(run_id, type_prefix=EventTypes.AGENT_USAGE):
-            if event.ts < since:
-                continue
-            sample = _usage_from_event(event.data)
-            total = total.merged(sample)
-            who = str(event.data.get("agent") or "unknown")
-            by_agent[who] = by_agent.get(who, Usage()).merged(sample)
-            turns[who] = turns.get(who, 0) + 1
-            if event.job_id:
-                jobs.setdefault(who, set()).add(event.job_id)
-            # Backend + model, so a GPT model served through Copilot reads
-            # differently from a Claude model served from Claude. Events that
-            # predate backend stamping render as `unknown`.
-            if sample.model or sample.backend:
-                label = agent_model_label(sample.backend, sample.model)
-                if label not in models:
-                    models.append(label)
-            samples += 1
-        return _RunUsage(
-            total, by_agent, models, samples, turns, {k: len(v) for k, v in jobs.items()}
-        )
+    def _usage_for_run(self, run_id: str, *, since: float = 0.0) -> RunUsage:
+        """One run's folded ``agent.usage`` samples — :func:`usage_for_run`,
+        the fold the console's Phases tab shows too."""
+        return usage_for_run(self.store, run_id, since=since)
 
     def _tool_run_usage(self, args: dict[str, Any], by: str) -> str:
         run_id = str(args.get("run_id", "")).strip()
@@ -1295,9 +1269,7 @@ class Concierge:
                 "or its backend does not report it — this is not the same as zero spend."
             )
         lines = [f"run {run_id} · {usage.model_line} · {usage.samples} sample(s)"]
-        lines.extend(_usage_rows(usage.by_agent, usage.turns_by_agent, usage.jobs_by_agent))
-        lines.append(_usage_row("total", usage.total, turns=usage.samples))
-        lines.append(_SPEND_NOT_REPORTED)
+        lines.extend(usage_lines(usage))
         return "\n".join(lines)
 
     def _tool_usage_today(self, args: dict[str, Any], by: str) -> str:
@@ -1864,107 +1836,10 @@ def _int_arg(args: dict[str, Any], key: str, default: int, lo: int, hi: int) -> 
     return max(lo, min(hi, value))
 
 
-class _RunUsage(NamedTuple):
-    """One run's folded ``agent.usage`` samples."""
-
-    total: Usage
-    by_agent: dict[str, Usage]
-    models: list[str]
-    samples: int
-    # Turns and distinct jobs per persona. ``samples`` is the run's total
-    # turn count (one sample per turn); these break it down so a persona
-    # that is expensive because it takes many turns is distinguishable from
-    # one that is expensive because it runs many times. Required rather than
-    # defaulted: a shared mutable default on a NamedTuple is a trap, and the
-    # single producer always has both to hand.
-    turns_by_agent: dict[str, int]
-    jobs_by_agent: dict[str, int]
-
-    @property
-    def recorded(self) -> bool:
-        """Did the backend actually report anything? ``Usage.merged`` keeps
-        None as None, so an all-None total means "never reported" — which is
-        not the same as zero and must not be shown as it."""
-        return self.samples > 0 and (
-            self.total.input_tokens is not None or self.total.output_tokens is not None
-        )
-
-    @property
-    def model_line(self) -> str:
-        """Backend + model pairs for the run, or a plain "not reported"."""
-        return " + ".join(self.models) if self.models else "model not reported"
-
-
-# `agent.usage` payloads carry an `agent` key the host adds on the way through
-# (worker/client.py), and Usage forbids extras — so pick the fields out rather
-# than validating the whole dict.
-#
-# Spend is deliberately absent (#386, #439): the Copilot SDK reports it as a
-# per-turn constant (15.0 on every turn) of unknown unit, so lifting it out of
-# the event and folding it through `Usage.merged` made `run_usage` print
-# 147 x 15.0 = 2205.0 — a fabricated figure the concierge would repeat in
-# Discord as fact. `Usage` carries no such field at all now.
-_USAGE_FIELDS = (
-    "model",
-    "backend",
-    "input_tokens",
-    "output_tokens",
-    "cache_read_tokens",
-    "cache_write_tokens",
-)
-
-
-def _usage_from_event(data: dict[str, Any]) -> Usage:
-    return Usage(**{k: data[k] for k in _USAGE_FIELDS if k in data})
-
-
-def _tokens(value: int | None) -> str:
-    return f"{value:,}" if value is not None else "—"
-
-
-def _usage_row(
-    label: str, usage: Usage, *, turns: int | None = None, jobs: int | None = None
-) -> str:
-    """One spend line, with the turn/job and cache columns appended only when
-    they are known — a run that predates turn counting or a backend that
-    reports no cache figures must not grow empty columns."""
-    row = (
-        f"{label:<14} {_tokens(usage.input_tokens):>11} in · {_tokens(usage.output_tokens):>9} out"
-    )
-    if turns is not None:
-        row += f" · {turns} turn{'s' if turns != 1 else ''}"
-        if jobs:
-            row += f"/{jobs} job{'s' if jobs != 1 else ''}"
-    if usage.cache_read_tokens is not None:
-        row += f" · {_tokens(usage.cache_read_tokens)} cached"
-    return row
-
-
-def _usage_rows(
-    rows: dict[str, Usage],
-    turns: dict[str, int] | None = None,
-    jobs: dict[str, int] | None = None,
-) -> list[str]:
-    """Biggest spender first — the answer to "where did it go?" is the top line."""
-    ordered = sorted(
-        rows.items(), key=lambda kv: -((kv[1].input_tokens or 0) + (kv[1].output_tokens or 0))
-    )
-    return [
-        _usage_row(
-            label,
-            usage,
-            turns=None if turns is None else turns.get(label, 0),
-            jobs=None if jobs is None else jobs.get(label, 0),
-        )
-        for label, usage in ordered
-    ]
-
-
-# No backend reports a spend figure in a known unit, so every usage block ends
-# with the same plain statement rather than a number. The concierge repeats
-# this line in Discord as fact, and a zero or a fabricated figure would be
-# repeated just as confidently (#386, #439).
-_SPEND_NOT_REPORTED = "spend: not reported by the agent backend (tokens above are the whole record)"
+# The usage renderers live in daemon/usage.py, shared with the console.
+_usage_row = usage_row
+_usage_rows = usage_rows
+_SPEND_NOT_REPORTED = SPEND_NOT_REPORTED
 
 
 def _clip(text: str, limit: int) -> str:
