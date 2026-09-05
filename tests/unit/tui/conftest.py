@@ -10,7 +10,7 @@ import asyncio
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Coroutine, Iterator, Sequence
+from collections.abc import Callable, Coroutine, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -56,11 +56,13 @@ class FakeChild:
     """A process the fake runner "started"."""
 
     _next_pid = 5000
+    #: When set, every new child has already exited with this code.
+    exit_at_once: int | None = None
 
     def __init__(self) -> None:
         FakeChild._next_pid += 1
         self.pid = FakeChild._next_pid
-        self.code: int | None = None
+        self.code: int | None = FakeChild.exit_at_once
         self.terminated = False
 
     def poll(self) -> int | None:
@@ -98,6 +100,7 @@ class FakeRunner:
         self.stream_lines: list[str] = []
         self.streams: list[FakeStream] = []
         self.spawned: list[tuple[tuple[str, ...], Path | None, Path | None]] = []
+        self.spawn_env: list[dict[str, str]] = []
         self.children: list[FakeChild] = []
         self.interactive_calls: list[tuple[str, ...]] = []
 
@@ -114,10 +117,16 @@ class FakeRunner:
         return RunOutcome(argv, 127, stderr=f"{argv[0]}: not found on PATH")
 
     def spawn(
-        self, argv: Sequence[str], *, cwd: Path | None = None, log_path: Path | None = None
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        log_path: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> FakeChild:
         child = FakeChild()
         self.spawned.append((tuple(argv), cwd, log_path))
+        self.spawn_env.append(dict(env or {}))
         self.children.append(child)
         if log_path is not None:
             log_path.parent.mkdir(parents=True, exist_ok=True)

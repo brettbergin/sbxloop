@@ -4,7 +4,7 @@ be confirmed — against the seeded store, a fake ctl and a fake runner."""
 
 from __future__ import annotations
 
-import shlex
+import time
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +29,14 @@ from sbxloop.tui.system import (
     unit_argv,
     unit_state,
 )
-from tests.unit.tui.conftest import FakeCtl, FakeRunner, RecordingSbx, backdate, live_status
+from tests.unit.tui.conftest import (
+    FakeChild,
+    FakeCtl,
+    FakeRunner,
+    RecordingSbx,
+    backdate,
+    live_status,
+)
 
 
 def sent(deps: actions.Deps) -> list[str]:
@@ -67,7 +74,7 @@ def make_deps(
         sbx=lambda: box,
         daemon=lambda: snapshot,
         read_only=read_only,
-        clock=lambda: 100.0,
+        clock=time.time,
         cwd=state_dir,
     )
 
@@ -155,18 +162,31 @@ class TestItemVerbs:
 
 
 class TestRunVerbs:
-    def test_the_current_run_goes_through_ctl_any_other_through_the_store(
-        self, seeded: Path
-    ) -> None:
+    def test_cancel_is_decided_against_a_fresh_status(self, seeded: Path) -> None:
+        """The bar's last probe may be stale: the verb asks the daemon
+        again. Its current run goes through ctl; any other through the
+        store; a daemon that cannot say gets nothing."""
         deps = make_deps(seeded)
         record = deps.mailbox.run("r_live")
         assert record is not None
-        current = actions.cancel_run(deps, record, current=True, retry=True)
-        assert current.run().ok
-        assert sent(deps) == ["cancel --retry"]
-        other = actions.cancel_run(deps, record, current=False)
-        assert other.confirm == "yes" and "not the daemon's current run" in other.prompt
-        assert other.run().ok
+        # The bar said "not current" (current=False) but the daemon drives
+        # it: ctl, never the store write that would settle it as a failure.
+        stale = actions.cancel_run(deps, record, current=False)
+        assert stale.run().ok and sent(deps) == ["cancel"]
+        assert actions.cancel_run(deps, record, current=True, retry=True).run().ok
+        assert sent(deps)[-1] == "cancel --retry"
+
+        class Busy(FakeCtl):
+            def submit(self, cmd: str, *, timeout_s: float = 30.0) -> CommandReply | None:
+                return CommandReply("busy", ok=False, pending=True)
+
+        busy = make_deps(seeded, ctl=Busy())
+        out = actions.cancel_run(busy, record, current=True).run()
+        assert not out.ok and "did not say" in out.text
+        idle = make_deps(seeded, ctl=FakeCtl(live_status(current=None)))
+        assert not actions.cancel_run(idle, record, current=False, retry=True).run().ok
+        assert actions.cancel_run(idle, record, current=False).run().ok
+        assert sent(idle) == []
         store = StateStore(seeded / "state.db")
         try:
             assert store.get_run("r_live").state == "cancelled"
@@ -174,7 +194,7 @@ class TestRunVerbs:
             store.close()
         done = deps.mailbox.run("r_done")
         assert done is not None
-        refused = actions.cancel_run(deps, done, current=False).run()
+        refused = actions.cancel_run(idle, done, current=False).run()
         assert not refused.ok and "already merged" in refused.text
 
     def test_resume_and_run_spawn_detached_processes(self, seeded: Path) -> None:
@@ -185,9 +205,20 @@ class TestRunVerbs:
         argv, cwd, log_path = runner.spawned[0]
         assert argv == (*sbxloop_argv(), "resume", "r_live", "--no-tui", "--no-chat")
         assert cwd == seeded and log_path == seeded / "console" / "resume-r_live.log"
+        assert runner.spawn_env[0] == {"SBXLOOP_STATE_DIR": str(seeded)}, "the console's store"
         assert "resume r_live" in deps.children.alive()
-        assert actions.run_text(deps, "fix the spinner").run().ok
-        assert runner.spawned[1][0][-3:] == ("fix the spinner", "--no-tui", "--no-chat")
+        assert actions.run_text(deps, "--fix the spinner").run().ok
+        assert runner.spawned[1][0][-4:] == ("--no-tui", "--no-chat", "--", "--fix the spinner")
+        # A child that dies on its arguments is reported, not "started".
+        runner.children[-1].code = 2
+        dead = actions.run_text(deps, "again").run()
+        assert dead.ok, "the previous child's exit is not this one's"
+        FakeChild.exit_at_once = 2
+        try:
+            gone = actions.resume_run(deps, "r_done").run()
+        finally:
+            FakeChild.exit_at_once = None
+        assert not gone.ok and "exited 2 right away" in gone.text
 
     def test_a_new_run_the_daemons_way_asks_the_concierge(self, seeded: Path) -> None:
         deps = make_deps(seeded)
@@ -222,14 +253,16 @@ class TestHostVerbs:
         deps = make_deps(seeded, runner=runner)
         none = actions.upgrade(deps).run()
         assert not none.ok and "upgrade_command" in none.text and runner.calls == []
-        runner.script("uv", stdout="Installed sbxloop 9.9.9")
-        deps = make_deps(seeded, runner=runner, upgrade_command="uv tool upgrade sbxloop")
+        runner.script("sh", "-lc", stdout="Installed sbxloop 9.9.9")
+        command = "~/.venv/bin/pip install -U sbxloop && systemctl --user restart sbxloop-daemon"
+        deps = make_deps(seeded, runner=runner, upgrade_command=command)
         action = actions.upgrade(deps)
         assert action.confirm == "typed" and action.typed == "upgrade"
         out = action.run()
         assert out.ok and out.long and "Installed sbxloop 9.9.9" in out.text
         assert "restart the daemon" in out.text
-        assert runner.calls[-1] == tuple(shlex.split("uv tool upgrade sbxloop"))
+        # Shell text, verbatim: `~` and `&&` are the shell's to read.
+        assert runner.calls[-1] == ("sh", "-lc", command)
 
     def test_spawn_daemon_and_stop_it(self, seeded: Path) -> None:
         runner = FakeRunner()
@@ -238,37 +271,47 @@ class TestHostVerbs:
         argv, _cwd, log_path = runner.spawned[0]
         assert argv == (*sbxloop_argv(), "daemon") and log_path == seeded / "console" / "daemon.log"
         assert "daemon" in deps.children.alive()
-        assert actions.stop_child(deps, "daemon").ok
+        stop = actions.stop_spawned_daemon(deps)
+        assert "interrupted" in stop.prompt and stop.run().ok
         assert runner.children[0].terminated and deps.children.alive() == {}
         assert not actions.stop_child(deps, "daemon").ok
 
     def test_shell_hands_the_terminal_over(self, seeded: Path) -> None:
         deps = make_deps(seeded)
         action = actions.shell(deps, "sbxloop-r_live-agent")
-        assert action.interactive is not None and not action.mutating
+        assert action.interactive is not None and action.mutating, "read-only gets no shell"
         assert action.interactive[:3] == ("sbx", "exec", "sbxloop-r_live-agent")
         assert "exec bash -l" in action.interactive[-1]
 
 
 class TestSandboxVerbs:
     def test_remove_stop_and_prune(self, seeded: Path) -> None:
+        old = new_run_id()
+        store = StateStore(seeded / "state.db")
+        try:
+            store.create_run(old, "an old one")
+            store.set_run_state(old, "failed")
+        finally:
+            store.close()
+        backdate(seeded, old, 2.0)
         sbx = RecordingSbx(
             [
-                SandboxInfo(name="sbxloop-r_failed-agent", status="running"),
-                SandboxInfo(name="sbxloop-r_failed-github", status="running"),
+                SandboxInfo(name=f"sbxloop-{old}-agent", status="running"),
+                SandboxInfo(name=f"sbxloop-{old}-github", status="running"),
+                SandboxInfo(name="sbxloop-r_live-agent", status="running"),
             ]
         )
         deps = make_deps(seeded, sbx=sbx)
-        assert actions.stop_sandbox(deps, "sbxloop-r_failed-agent").run().ok
-        remove = actions.remove_one_sandbox(deps, "sbxloop-r_failed-github", "github")
-        assert remove.confirm == "typed" and remove.typed == "sbxloop-r_failed-github"
+        assert actions.stop_sandbox(deps, f"sbxloop-{old}-agent").run().ok
+        remove = actions.remove_one_sandbox(deps, f"sbxloop-{old}-github", "github")
+        assert remove.confirm == "typed" and remove.typed == f"sbxloop-{old}-github"
         assert remove.run().ok
-        assert ("stop", "sbxloop-r_failed-agent") in sbx.calls
-        assert ("rm", "--force", "sbxloop-r_failed-github") in sbx.calls
+        assert ("stop", f"sbxloop-{old}-agent") in sbx.calls
+        assert ("rm", "--force", f"sbxloop-{old}-github") in sbx.calls
         verdicts = [
             SandboxVerdict(
-                name="sbxloop-r_failed-agent",
-                run_id="r_failed",
+                name=f"sbxloop-{old}-agent",
+                run_id=old,
                 role="agent",
                 orphan=True,
                 reason="failed 2d ago",
@@ -280,8 +323,29 @@ class TestSandboxVerbs:
         prune = actions.prune_sandboxes(deps, verdicts)
         assert prune.typed == "prune" and "1 orphaned" in prune.title
         out = prune.run()
-        assert out.ok and out.text == "removed sbxloop-r_failed-agent"
+        assert out.ok and out.text == f"removed sbxloop-{old}-agent"
         assert ("rm", "--force", "sbxloop-r_live-agent") not in sbx.calls
+
+    def test_prune_classifies_again_when_it_runs(self, seeded: Path) -> None:
+        """Between the poll and the typed word the run may have resumed
+        (or been prodded): what the prompt listed is not what is removed."""
+        old = new_run_id()
+        store = StateStore(seeded / "state.db")
+        try:
+            store.create_run(old, "resumed since")
+            store.set_run_state(old, "failed")
+        finally:
+            store.close()
+        sbx = RecordingSbx([SandboxInfo(name=f"sbxloop-{old}-agent", status="running")])
+        deps = make_deps(seeded, sbx=sbx)
+        stale = [
+            SandboxVerdict(
+                name=f"sbxloop-{old}-agent", run_id=old, role="agent", orphan=True, reason="was"
+            )
+        ]
+        out = actions.prune_sandboxes(deps, stale).run()  # the run is active again: not orphaned
+        assert out.ok and "no longer an orphan" in out.text
+        assert not any(c[0] == "rm" for c in sbx.calls)
 
     def test_gc_removes_run_directories_past_retention(self, seeded: Path) -> None:
         deps = make_deps(seeded)
@@ -296,6 +360,8 @@ class TestSandboxVerbs:
         run_dir = seeded / "runs" / run_id
         run_dir.mkdir(parents=True)
         (run_dir / "workspace.txt").write_text("x" * 100)
+        disabled = actions.gc_run_dirs(deps, 0.0).run()
+        assert not disabled.ok and "disabled" in disabled.text and run_dir.exists()
         action = actions.gc_run_dirs(deps, 1.0)
         assert action.typed == "gc"
         out = action.run()
@@ -353,4 +419,6 @@ class TestSystem:
         assert passes(info, min_level="debug", grep="Y") and not passes(
             info, min_level="debug", grep="z"
         )
-        assert LEVELS[0] == "debug" and LEVELS[-1] == "critical"
+        assert LEVELS == ("debug", "info", "warning", "error"), "the daemon's own levels"
+        json_line = '{"event": "daemon.tick", "level": "warning"}'
+        assert passes(json_line, min_level="error", grep=""), "no bracket, no floor"

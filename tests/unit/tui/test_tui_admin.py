@@ -13,6 +13,7 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.store import StateStore
 from sbxloop.ids import new_run_id
 from sbxloop.sbx.models import SandboxInfo
+from sbxloop.tui.commands import CATALOGUE
 from sbxloop.tui.screens.daemon import DaemonScreen
 from sbxloop.tui.screens.modals import ConfirmScreen, TextPromptScreen, TypedConfirmScreen
 from sbxloop.tui.screens.run_detail import RunDetailScreen
@@ -151,6 +152,14 @@ def test_daemon_screen_shows_the_unit_streams_the_journal_and_drives_the_verbs(
             await pilot.pause(0.3)
             assert isinstance(app.screen, DaemonScreen)
             assert runner.spawned == []
+            # The palette's twin runs the same screen action: refused too.
+            spawn = next(c for c in CATALOGUE if c.title == "Start a daemon from this console")
+            await pilot.press("1")
+            await pilot.pause(0.3)
+            spawn.invoke(app)
+            await pilot.pause(1.0)
+            assert isinstance(app.screen, DaemonScreen)
+            assert runner.spawned == []
 
     drive(scenario)
 
@@ -256,6 +265,10 @@ def test_read_only_refuses_every_verb(seeded: Path) -> None:
             await pilot.pause(0.5)
             assert isinstance(app.screen, RunDetailScreen), "no dialog opens"
             assert "cancel" not in ctl.commands
+            await pilot.press("s")
+            await pilot.pause(0.5)
+            runner = app.deps.runner
+            assert isinstance(runner, FakeRunner) and runner.interactive_calls == []
 
     drive(scenario)
 

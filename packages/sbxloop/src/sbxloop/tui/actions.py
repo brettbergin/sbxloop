@@ -18,15 +18,20 @@ from typing import Literal
 from sbxloop.config import TUI_CONTROL_CHANNEL, Config
 from sbxloop.daemon.control import plain
 from sbxloop.daemon.mailbox import MailboxClient
-from sbxloop.daemon.store import DaemonStore
+from sbxloop.daemon.store import DaemonStore, apply_item_verb
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunRecord
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxloopError
 from sbxloop.gc import format_bytes, prune_run_dirs
 from sbxloop.ghids import normalize_item_id
 from sbxloop.sbx.cli import INTERACTIVE_SHELL_ARGV, SbxCLI
-from sbxloop.sbx.prune import SandboxVerdict, remove_run_sandbox, remove_sandbox
-from sbxloop.tui.data import CtlClient, DaemonSnapshot
+from sbxloop.sbx.prune import (
+    SandboxVerdict,
+    classify_sandboxes,
+    remove_run_sandbox,
+    remove_sandbox,
+)
+from sbxloop.tui.data import CtlClient, DaemonSnapshot, probe_daemon
 from sbxloop.tui.runner import ChildHandle, CommandRunner, sbxloop_argv
 from sbxloop.tui.system import unit_argv
 
@@ -242,18 +247,13 @@ def resume_repo(deps: Deps, repo: str) -> Action:
 
 
 def _row_only(deps: Deps, verb: str, item_id: str) -> Outcome:
-    item_id = normalize_item_id(item_id)
     dstore = DaemonStore(deps.db_path)
     try:
-        now = deps.clock()
-        if verb == "abandon":
-            item = dstore.abandon(item_id, f"abandoned by {deps.operator} via sbxloop tui", now)
-        elif verb == "retry":
-            item = dstore.retry(item_id, now, f"re-queued by {deps.operator} via sbxloop tui")
-        else:
-            item = dstore.requeue(item_id, now)
+        item = apply_item_verb(
+            dstore, verb, item_id, now=deps.clock(), by=f"{deps.operator} via sbxloop tui"
+        )
     except KeyError:
-        return Outcome(False, f"unknown work item: {item_id}")
+        return Outcome(False, f"unknown work item: {normalize_item_id(item_id)}")
     except ValueError as exc:
         return Outcome(False, f"{verb} refused: {exc}")
     finally:
@@ -320,28 +320,69 @@ def _store_cancel(deps: Deps, run_id: str) -> Outcome:
     return Outcome(True, f"run {run_id} cancelled (takes effect at the next phase boundary)")
 
 
+def _cancel_decided(deps: Deps, run_id: str, *, retry: bool) -> Outcome:
+    """Which cancel applies is decided now, against a fresh ``status``, not
+    the bar's last probe: a run the daemon drives must go through ``ctl``
+    (attributed, settled as cancelled on the item) — a store write on it
+    would be settled as an ordinary failure, attempt spent, breaker
+    counted. When the daemon answers but cannot say, nothing is done."""
+    snapshot = probe_daemon(deps.ctl, now=deps.clock())
+    if snapshot.live and snapshot.status is None:
+        return Outcome(
+            False,
+            "the daemon is busy and did not say whether it drives this run — retry in a moment",
+        )
+    if snapshot.starting:
+        return Outcome(False, "the daemon is starting; retry in a moment")
+    if snapshot.live and snapshot.current_run == run_id:
+        return ctl_outcome(deps, "cancel --retry" if retry else "cancel")
+    if retry:
+        return Outcome(False, "cancel + retry applies to the daemon's current run")
+    return _store_cancel(deps, run_id)
+
+
 def cancel_run(deps: Deps, record: RunRecord, *, current: bool, retry: bool = False) -> Action:
-    """The daemon's run goes through ``ctl cancel`` (attributed, settled on
-    the item); any other in-flight run is the ``sbxloop cancel`` store
-    write — a resume driven from a terminal, or a run the daemon lost."""
+    """``current`` is the bar's reading, for the prompt; the verb itself
+    re-asks the daemon when it runs (:func:`_cancel_decided`)."""
+    run_id = record.run_id
+    what = f"cancel {run_id} and queue a fresh run" if retry else f"cancel {run_id}"
     if current:
-        return cancel_current(deps, retry=retry)
+        how = f"The issue is told it was cancelled by {deps.operator}."
+    else:
+        how = (
+            "It is not the daemon's current run as last seen: the store row is marked cancelled "
+            "and whatever drives it stops at its next phase boundary (the daemon is asked again "
+            "first)."
+        )
     return Action(
-        f"cancel {record.run_id}",
-        lambda: _store_cancel(deps, record.run_id),
-        prompt=(
-            f"Cancel {record.run_id}? It is not the daemon's current run: the store row is "
-            "marked cancelled and whatever drives it stops at its next phase boundary."
-        ),
+        what,
+        lambda: _cancel_decided(deps, run_id, retry=retry),
+        prompt=f"{what.capitalize()}? {how}",
     )
 
 
+#: How long a spawned process gets to fail on its arguments before the
+#: console reports it as started.
+SPAWN_SETTLE_S = 0.5
+
+
 def _spawn(deps: Deps, name: str, argv: Sequence[str], *, log_name: str) -> Outcome:
+    """A detached ``sbxloop`` pointed at the console's own state dir (the
+    loader honours ``SBXLOOP_STATE_DIR``), reported started only once it
+    has outlived a usage error."""
     log_path = deps.console_dir / log_name
     try:
-        child = deps.runner.spawn(argv, cwd=deps.cwd, log_path=log_path)
+        child = deps.runner.spawn(
+            argv,
+            cwd=deps.cwd,
+            log_path=log_path,
+            env={"SBXLOOP_STATE_DIR": str(deps.state_dir)},
+        )
     except OSError as exc:
         return Outcome(False, f"could not start {shlex.join(argv)}: {exc}")
+    code = child.wait(SPAWN_SETTLE_S)
+    if code is not None:
+        return Outcome(False, f"{name} exited {code} right away — see {log_path}")
     deps.children.add(name, child)
     return Outcome(True, f"started pid {child.pid}: {shlex.join(argv[-3:])}\nlog: {log_path}")
 
@@ -361,7 +402,8 @@ def resume_run(deps: Deps, run_id: str) -> Action:
 
 
 def run_text(deps: Deps, text: str) -> Action:
-    argv = (*sbxloop_argv(), "run", text, "--no-tui", "--no-chat")
+    # `--` keeps an outcome that starts with a dash from reading as an option.
+    argv = (*sbxloop_argv(), "run", "--no-tui", "--no-chat", "--", text)
     return Action(
         "run this outcome here",
         lambda: _spawn(deps, "run", argv, log_name=f"run-{int(deps.clock())}.log"),
@@ -410,6 +452,8 @@ def unit_verb(deps: Deps, verb: str) -> Action:
 
 
 def upgrade(deps: Deps) -> Action:
+    """``[daemon] upgrade_command`` is what the drift notice tells the
+    operator to paste into a shell — so it runs in one, verbatim."""
     command = deps.config.daemon.upgrade_command
 
     def run() -> Outcome:
@@ -419,7 +463,7 @@ def upgrade(deps: Deps) -> Action:
                 "no [daemon] upgrade_command is configured; set it to what upgrades this "
                 "host (pip, pipx, uv tool …) and try again",
             )
-        outcome = deps.runner.run(shlex.split(command), timeout_s=UPGRADE_TIMEOUT_S)
+        outcome = deps.runner.run(("sh", "-lc", command), timeout_s=UPGRADE_TIMEOUT_S)
         head = f"$ {command}\nexit {outcome.returncode}\n"
         tail = "\nrestart the daemon to run the new version" if outcome.ok else ""
         return Outcome(outcome.ok, head + outcome.text + tail, long=True)
@@ -430,8 +474,9 @@ def upgrade(deps: Deps) -> Action:
         confirm="typed",
         typed="upgrade",
         prompt=(
-            f"Run `{command or '<no upgrade_command>'}` now? The daemon keeps running the "
-            "code it started with until it is restarted. Type upgrade to confirm."
+            f"Run `{command or '<no upgrade_command>'}` in a login shell now? The daemon "
+            "keeps running the code it started with until it is restarted. Type upgrade "
+            "to confirm."
         ),
     )
 
@@ -453,8 +498,25 @@ def stop_child(deps: Deps, name: str) -> Outcome:
     if child is None or child.poll() is not None:
         return Outcome(False, f"{name}: not running")
     child.terminate()
-    code = child.wait(30.0)
-    return Outcome(True, f"{name}: stopped" if code is not None else f"{name}: still stopping")
+    code = child.wait(deps.config.daemon.shutdown_grace_s)
+    if code is None:
+        return Outcome(False, f"{name}: still stopping (pid {child.pid}); it finishes on its own")
+    return Outcome(True, f"{name}: stopped")
+
+
+def stop_spawned_daemon(deps: Deps) -> Action:
+    """SIGTERM to the daemon this console spawned: it stops claiming, asks
+    the run in flight to cancel at its next boundary (the run stays
+    resumable; the next start recovers it) and exits."""
+    return Action(
+        "stop the daemon spawned here",
+        lambda: stop_child(deps, "daemon"),
+        prompt=(
+            "Stop the daemon this console spawned? It is signalled: nothing new is claimed, "
+            "the run in flight is interrupted at its next phase boundary (resumable; the "
+            "next start recovers it) and the process exits."
+        ),
+    )
 
 
 # -- sandboxes ----------------------------------------------------------------------
@@ -463,7 +525,9 @@ def stop_child(deps: Deps, name: str) -> Outcome:
 def shell(deps: Deps, name: str) -> Action:
     cli = deps.sbx()
     argv = tuple(cli.argv("exec", name, *INTERACTIVE_SHELL_ARGV))
-    return Action(f"shell into {name}", confirm="none", mutating=False, interactive=argv)
+    # Mutating: a shell inside the sandbox can change anything there, so a
+    # read-only console does not get one.
+    return Action(f"shell into {name}", confirm="none", interactive=argv)
 
 
 def stop_sandbox(deps: Deps, name: str) -> Action:
@@ -497,13 +561,24 @@ def remove_one_sandbox(deps: Deps, name: str, role: str | None) -> Action:
     )
 
 
-def prune_sandboxes(deps: Deps, verdicts: Sequence[SandboxVerdict]) -> Action:
-    orphans = [v for v in verdicts if v.orphan]
+def prune_sandboxes(
+    deps: Deps, verdicts: Sequence[SandboxVerdict], *, include_kept: bool = False
+) -> Action:
+    """The screen's verdicts shape the prompt; the removal re-classifies
+    against ``sbx ls`` and the store when it runs, as ``sandbox prune
+    --force`` does — a run resumed since the last poll keeps its boxes."""
+    shown = [v for v in verdicts if v.orphan]
 
     def run() -> Outcome:
         cli = deps.sbx()
+        with deps.mailbox.read_engine() as engine:
+            fresh = classify_sandboxes(
+                cli.ls(), engine, include_kept=include_kept, now=deps.clock()
+            )
+        orphans = [v for v in fresh if v.orphan]
+        skipped = {v.name for v in shown} - {v.name for v in orphans}
         store = StateStore(deps.db_path)
-        lines: list[str] = []
+        lines: list[str] = [f"kept {name}: no longer an orphan" for name in sorted(skipped)]
         failures = 0
         try:
             for v in orphans:
@@ -523,21 +598,29 @@ def prune_sandboxes(deps: Deps, verdicts: Sequence[SandboxVerdict]) -> Action:
             store.close()
         return Outcome(failures == 0, "\n".join(lines) or "nothing to prune", long=len(lines) > 6)
 
+    kept = sum(1 for v in shown if v.kept_reason is not None)
+    kept_note = (
+        f" — {kept} of them kept for debugging (their kept marker is cleared)" if kept else ""
+    )
     return Action(
-        f"prune {len(orphans)} orphaned sandbox(es)",
+        f"prune {len(shown)} orphaned sandbox(es)",
         run,
         confirm="typed",
         typed="prune",
         prompt=(
-            f"Remove {len(orphans)} orphaned sandbox(es): "
-            f"{', '.join(v.name for v in orphans[:6])}{' …' if len(orphans) > 6 else ''}? "
-            "Type prune to confirm."
+            f"Remove {len(shown)} orphaned sandbox(es): "
+            f"{', '.join(v.name for v in shown[:6])}{' …' if len(shown) > 6 else ''}{kept_note}? "
+            "They are classified again as this runs. Type prune to confirm."
         ),
     )
 
 
 def gc_run_dirs(deps: Deps, days: float) -> Action:
+    """``[daemon] prune_runs_after_days``; 0 disables the sweep, here too."""
+
     def run() -> Outcome:
+        if days <= 0:
+            return Outcome(False, "run directory retention is disabled (prune_runs_after_days = 0)")
         store = StateStore(deps.db_path)
         try:
             result = prune_run_dirs(
@@ -596,6 +679,7 @@ __all__ = [
     "stop_child",
     "stop_daemon",
     "stop_sandbox",
+    "stop_spawned_daemon",
     "unit_verb",
     "upgrade",
 ]

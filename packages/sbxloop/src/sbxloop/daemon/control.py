@@ -597,7 +597,7 @@ class ControlClient:
             request,
             {
                 "cmd": cmd,
-                "prefix": self.prefix,
+                "prefix": "sbxloop daemon ctl",
                 "by": self.by or _operator(),
                 "submitted_at": time.time(),
             },

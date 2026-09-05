@@ -168,10 +168,6 @@ def tokens(n: int | None) -> str:
     return str(n)
 
 
-#: Every usage rendering ends with this; the backend reports tokens, never
-#: money, and a figure of unknown unit must not be shown as one.
-
-
 __all__ = [
     "SPEND_NOT_REPORTED",
     "age",

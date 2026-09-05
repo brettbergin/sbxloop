@@ -20,7 +20,7 @@ from sbxloop.config import Config
 from sbxloop.daemon.control import ControlClient
 from sbxloop.daemon.mailbox import MailboxClient
 from sbxloop.sbx.cli import SbxCLI
-from sbxloop.tui.actions import Action, Deps, Outcome, stop_child
+from sbxloop.tui.actions import Action, Deps, Outcome, stop_spawned_daemon
 from sbxloop.tui.chat import ChatSession
 from sbxloop.tui.commands import ConsoleCommands
 from sbxloop.tui.data import ConsoleState, CtlClient, build_state, probe_daemon
@@ -59,7 +59,7 @@ class SbxloopTui(App[None]):
         "daemon": DaemonScreen,
         "help": HelpScreen,
     }
-    COMMANDS: ClassVar[set[Any]] = {ConsoleCommands}
+    COMMANDS: ClassVar[set[Any]] = App.COMMANDS | {ConsoleCommands}
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("1", "mode('overview')", "Overview"),
         Binding("2", "mode('runs')", "Runs"),
@@ -266,17 +266,20 @@ class SbxloopTui(App[None]):
         if "daemon" not in alive:
             self.exit()
             return
+        action = stop_spawned_daemon(self.deps)
 
         def decided(stop: bool | None) -> None:
-            if stop:
-                stop_child(self.deps, "daemon")
-            self.exit()
+            if not stop:
+                self.exit()
+                return
+            self.notify("stopping the spawned daemon…", title=action.title)
+            self.execute(action, self.exit)
 
         self.push_screen(
             ConfirmScreen(
                 "a daemon is still running",
                 f"The daemon spawned from this console is running (pid {alive['daemon'].pid}). "
-                "Stop it before quitting? y stops it; n leaves it running in its own session.",
+                f"{action.prompt} y stops it, then quits; n quits and leaves it running.",
             ),
             decided,
         )

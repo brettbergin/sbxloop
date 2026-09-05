@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from typing import ClassVar
+from typing import Any, ClassVar
 
 from rich.text import Text
 from textual import work
@@ -54,7 +54,7 @@ class SandboxesScreen(ConsoleScreen):
         self.rundirs: list[RunDirVerdict] = []
         self.include_kept = False
         self.error: str | None = None
-        self._poll_next = True
+        self._timer: Any = None
 
     def compose(self) -> ComposeResult:
         yield from self.compose_frame()
@@ -72,13 +72,21 @@ class SandboxesScreen(ConsoleScreen):
 
     def on_mount(self) -> None:
         super().on_mount()
-        self.set_interval(SANDBOX_POLL_S, self.poll)
+        self._timer = self.set_interval(SANDBOX_POLL_S, self.poll)
         self.query_one("#sandboxes", ConsoleTable).focus()
         self.poll()
 
     def on_screen_resume(self) -> None:
         super().on_screen_resume()
+        if self._timer is not None:
+            self._timer.resume()
         self.poll()
+
+    def on_screen_suspend(self) -> None:
+        # `sbx ls` forks and the run-dir scan walks disks: not behind a
+        # screen nobody looks at.
+        if self._timer is not None:
+            self._timer.pause()
 
     # -- data ----------------------------------------------------------------------
 
@@ -98,16 +106,17 @@ class SandboxesScreen(ConsoleScreen):
                 )
         except SbxloopError as exc:
             error = str(exc)
-        try:
-            with deps.mailbox.read_engine() as engine:
-                rundirs = classify_run_dirs(
-                    engine,
-                    deps.state_dir,
-                    older_than_s=config.daemon.prune_runs_after_days * 86400.0,
-                    now=deps.clock(),
-                )
-        except Exception as exc:
-            error = error or f"run directories: {exc}"
+        # `prune_runs_after_days = 0` disables the daemon's sweep: nothing
+        # is prunable then, whatever its age.
+        days = config.daemon.prune_runs_after_days
+        if days > 0:
+            try:
+                with deps.mailbox.read_engine() as engine:
+                    rundirs = classify_run_dirs(
+                        engine, deps.state_dir, older_than_s=days * 86400.0, now=deps.clock()
+                    )
+            except Exception as exc:
+                error = error or f"run directories: {exc}"
         if get_current_worker().is_cancelled:
             return
         self.app.call_from_thread(self._apply, infos, verdicts, rundirs, error)
@@ -163,11 +172,16 @@ class SandboxesScreen(ConsoleScreen):
         if self.error:
             summary.append(self.error, style="red")
             summary.append("\n")
+        days = self.console_app.deps.config.daemon.prune_runs_after_days
+        retention = (
+            f"{len(prunable)} run dir(s) past retention "
+            f"({format_bytes(sum(v.size_bytes for v in prunable))})"
+            if days > 0
+            else "run directory retention disabled (prune_runs_after_days = 0)"
+        )
         summary.append(
             f"{len(self.verdicts)} sbxloop sandbox(es) · {orphans} orphan(s)"
-            f"{' (kept included)' if self.include_kept else ''} · "
-            f"{len(prunable)} run dir(s) past retention "
-            f"({format_bytes(sum(v.size_bytes for v in prunable))})",
+            f"{' (kept included)' if self.include_kept else ''} · {retention}",
             style="bold",
         )
         summary.append(
@@ -211,14 +225,20 @@ class SandboxesScreen(ConsoleScreen):
             self.app.notify("nothing to prune: no orphaned sandbox", severity="information")
             return
         self.console_app.perform(
-            actions.prune_sandboxes(self.console_app.deps, self.verdicts), then=self.poll
+            actions.prune_sandboxes(
+                self.console_app.deps, self.verdicts, include_kept=self.include_kept
+            ),
+            then=self.poll,
         )
 
     def action_gc(self) -> None:
+        days = self.console_app.deps.config.daemon.prune_runs_after_days
+        if days <= 0:
+            self.app.notify("run directory retention is disabled (prune_runs_after_days = 0)")
+            return
         if not any(v.prunable for v in self.rundirs):
             self.app.notify("nothing to remove: no run directory past retention")
             return
-        days = self.console_app.deps.config.daemon.prune_runs_after_days
         self.console_app.perform(actions.gc_run_dirs(self.console_app.deps, days), then=self.poll)
 
     def action_toggle_kept(self) -> None:

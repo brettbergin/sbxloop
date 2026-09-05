@@ -54,8 +54,8 @@ from sbxloop.daemon.store import ChatThread, DaemonStore
 from sbxloop.daemon.usage import (
     SPEND_NOT_REPORTED,
     RunUsage,
-    tokens_text,
     usage_for_run,
+    usage_lines,
     usage_row,
     usage_rows,
 )
@@ -1268,9 +1268,7 @@ class Concierge:
                 "or its backend does not report it — this is not the same as zero spend."
             )
         lines = [f"run {run_id} · {usage.model_line} · {usage.samples} sample(s)"]
-        lines.extend(_usage_rows(usage.by_agent, usage.turns_by_agent, usage.jobs_by_agent))
-        lines.append(_usage_row("total", usage.total, turns=usage.samples))
-        lines.append(_SPEND_NOT_REPORTED)
+        lines.extend(usage_lines(usage))
         return "\n".join(lines)
 
     def _tool_usage_today(self, args: dict[str, Any], by: str) -> str:
@@ -1838,7 +1836,6 @@ def _int_arg(args: dict[str, Any], key: str, default: int, lo: int, hi: int) -> 
 
 
 # The usage renderers live in daemon/usage.py, shared with the console.
-_tokens = tokens_text
 _usage_row = usage_row
 _usage_rows = usage_rows
 _SPEND_NOT_REPORTED = SPEND_NOT_REPORTED

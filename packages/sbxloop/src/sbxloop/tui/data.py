@@ -166,7 +166,12 @@ class RunDetail:
     usage: RunUsage | None = None
 
 
-def build_run_detail(mailbox: MailboxClient, run_id: str) -> RunDetail | None:
+def build_run_detail(
+    mailbox: MailboxClient, run_id: str, *, previous: RunDetail | None = None
+) -> RunDetail | None:
+    """``previous`` is the last snapshot: its usage fold (a scan of every
+    ``agent.usage`` event) is reused while the run's event tail has not
+    moved, so a refresh tick costs a few indexed reads, not a scan."""
     record = mailbox.run(run_id)
     if record is None:
         return None
@@ -180,8 +185,16 @@ def build_run_detail(mailbox: MailboxClient, run_id: str) -> RunDetail | None:
         if last is not None:
             landing.append(last)
     landing.sort(key=lambda e: e.ts)
-    with mailbox.read_engine() as engine:
-        usage = usage_for_run(engine, run_id)
+    last_event_ts = mailbox.last_event_ts(run_id)
+    if (
+        previous is not None
+        and previous.usage is not None
+        and previous.last_event_ts == last_event_ts
+    ):
+        usage = previous.usage
+    else:
+        with mailbox.read_engine() as engine:
+            usage = usage_for_run(engine, run_id)
     return RunDetail(
         record=record,
         tasks=tuple(mailbox.tasks(run_id)),
@@ -190,7 +203,7 @@ def build_run_detail(mailbox: MailboxClient, run_id: str) -> RunDetail | None:
         gate=gate,
         hold=hold,
         thread=mailbox.thread_for_run(run_id),
-        last_event_ts=mailbox.last_event_ts(run_id),
+        last_event_ts=last_event_ts,
         landing_events=tuple(landing),
         usage=usage,
     )

@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from typing import get_args
 
+from sbxloop.log import LogLevel
 from sbxloop.tui.runner import CommandRunner, RunOutcome
 
 #: `systemctl show` properties the Daemon screen reads.
@@ -22,9 +24,11 @@ _SHOW_PROPERTIES = (
 )
 #: How many journal lines the tail opens with.
 JOURNAL_LINES = 200
-#: Log levels as the daemon's console renderer prints them.
-LEVELS: tuple[str, ...] = ("debug", "info", "warning", "error", "critical")
-_LEVEL_RE = re.compile(r"\[(debug|info|warning|error|critical)\s*\]", re.IGNORECASE)
+#: The daemon's own levels (``[daemon] log_level``), as its console
+#: renderer prints them in brackets. Under ``log_format = "json"`` no line
+#: carries a bracketed level and the floor lets every line through.
+LEVELS: tuple[str, ...] = tuple(level.lower() for level in get_args(LogLevel))
+_LEVEL_RE = re.compile(r"\[(" + "|".join(LEVELS) + r")\s*\]", re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -72,8 +76,8 @@ def unit_argv(verb: str, unit: str) -> tuple[str, ...]:
     return ("systemctl", "--user", verb, unit)
 
 
-def journal_argv(unit: str, *, lines: int = JOURNAL_LINES) -> tuple[str, ...]:
-    return ("journalctl", "--user", "-u", unit, "-n", str(lines), "-f", "-o", "short-iso")
+def journal_argv(unit: str) -> tuple[str, ...]:
+    return ("journalctl", "--user", "-u", unit, "-n", str(JOURNAL_LINES), "-f", "-o", "short-iso")
 
 
 def parse_show(text: str) -> dict[str, str]:

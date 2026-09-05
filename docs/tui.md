@@ -152,13 +152,16 @@ the bar counts unread control-channel rows while you are elsewhere.
 
 ## Administration
 
-Every admin verb goes through one path: refused under `--read-only`,
-refused without a live daemon when the daemon must execute it, confirmed
-by its tier, run off the UI thread, reported as a toast (or a screen when
-the output is long), then the screen re-polls. Two confirmation tiers:
+Every admin verb goes through one path: refused under `--read-only`
+(sandbox shells included), refused without a live daemon when the daemon
+must execute it, confirmed by its tier, run off the UI thread, reported as
+a toast (or a screen when the output is long), then the screen re-polls.
+Two confirmation tiers, and a few verbs that just run (resuming the
+daemon or a hold, re-checking a review, resuming a repository, asking the
+concierge):
 
-- **`y`/`n`** for a bounded verb — pause, resume, cancel, retry, requeue,
-  approve a merge, grant rounds, start the unit, stop a sandbox.
+- **`y`/`n`** for a bounded verb — pause, cancel, retry, requeue, approve
+  a merge, grant rounds, start the unit, stop a sandbox.
 - **Typed** for a destructive one — the target's name or the verb, exactly:
   `stop` (graceful daemon stop), the unit name (stop / restart the unit),
   the item id (abandon), the sandbox name (remove), `prune`, `gc`,
@@ -205,9 +208,12 @@ a dry run with sizes. `s` opens a shell in the selected sandbox (the
 console suspends, the shell gets the terminal, the console returns when it
 exits), `x` removes one (typed name; a run sandbox takes its secret
 registrations with it), `X` stops one, `P` prunes every orphan (typed
-`prune`), `G` removes the prunable run directories (typed `gc`; run rows
-stay — the audit trail is never removed), `k` includes kept-for-debugging
-sandboxes in the orphan verdicts.
+`prune`; the orphans are classified again as the removal runs, so a run
+resumed since the last poll keeps its boxes), `G` removes the prunable
+run directories (typed `gc`; run rows stay — the audit trail is never
+removed; `[daemon] prune_runs_after_days = 0` disables this as it does
+the daemon's sweep), `k` includes kept-for-debugging sandboxes in the
+orphan verdicts (the prompt says so, and their kept marker is cleared).
 
 ### Daemon (`6`)
 
@@ -244,18 +250,23 @@ sandboxes in the orphan verdicts.
 - **No unit? Spawn one.** `D` starts `sbxloop daemon` from the console in
   its own session, reading this directory's config, its output in
   `<state dir>/console/daemon.log` (which the journal pane then tails).
-  It outlives the console; `e` stops it, and quitting asks whether to.
+  It outlives the console, on the console's state dir. `e` stops it
+  (SIGTERM: nothing new is claimed, the run in flight is interrupted at
+  its next boundary and stays resumable, the process exits), and quitting
+  asks whether to.
 - **Versions.** The same report the concierge's `versions` tool gives
   (installed, latest on PyPI unless `[daemon] version_check = false`, the
-  sbx CLI), refreshed hourly. `U` runs `[daemon] upgrade_command` (typed
-  `upgrade`) and shows its output; the daemon keeps running the code it
-  started with until restarted.
+  sbx CLI), refreshed hourly. `U` runs `[daemon] upgrade_command` in a
+  login shell, verbatim — the text the drift notice tells an operator to
+  paste — (typed `upgrade`) and shows its output; the daemon keeps running
+  the code it started with until restarted.
 - **Repositories.** Per-repository polling health from `status`; `R`
   resumes a suspended one.
 - **The journal.** `journalctl --user -u <unit> -n 200 -f -o short-iso`,
   streamed, every line through the credential redactor. `/` greps, `l`
-  cycles the level floor (lines without a level — a traceback — always
-  pass), `f` toggles follow. The `!sbx log` verb in chat is the on-demand
+  cycles the level floor (lines without a level — a traceback, or every
+  line under `[daemon] log_format = "json"` — always pass), `f` toggles
+  follow. The stream and the polls stop while another screen is shown. The `!sbx log` verb in chat is the on-demand
   twin from the daemon's own ring buffer.
 
 ### The command palette

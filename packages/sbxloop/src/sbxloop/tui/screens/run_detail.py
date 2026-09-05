@@ -157,7 +157,7 @@ class RunDetailScreen(ConsoleScreen):
         scan = self._scan_artifacts_next
         self._scan_artifacts_next = False
         try:
-            detail = build_run_detail(mailbox, self.run_id)
+            detail = build_run_detail(mailbox, self.run_id, previous=self.detail)
             thread = (
                 self._thread_tail.pull() if self._thread_tail and self._thread_view is None else []
             )

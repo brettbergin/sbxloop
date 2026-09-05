@@ -9,11 +9,10 @@ scripted output; :class:`SubprocessRunner` is the real one."""
 from __future__ import annotations
 
 import os
-import shlex
 import subprocess  # nosec B404 - list argv only, never a shell
 import sys
 import threading
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Protocol
@@ -40,10 +39,6 @@ class RunOutcome:
         """The output an operator reads: stdout, else stderr, stripped."""
         return (self.stdout.strip() or self.stderr.strip()) or ""
 
-    @property
-    def command(self) -> str:
-        return shlex.join(self.argv)
-
 
 class ChildHandle(Protocol):
     """A process the console started and may still own."""
@@ -67,7 +62,12 @@ class CommandRunner(Protocol):
     def run(self, argv: Sequence[str], *, timeout_s: float = DEFAULT_TIMEOUT_S) -> RunOutcome: ...
 
     def spawn(
-        self, argv: Sequence[str], *, cwd: Path | None = None, log_path: Path | None = None
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        log_path: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> ChildHandle: ...
 
     def stream(self, argv: Sequence[str]) -> StreamHandle: ...
@@ -155,10 +155,16 @@ class SubprocessRunner:
         return RunOutcome(argv, proc.returncode, proc.stdout, proc.stderr)
 
     def spawn(
-        self, argv: Sequence[str], *, cwd: Path | None = None, log_path: Path | None = None
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path | None = None,
+        log_path: Path | None = None,
+        env: Mapping[str, str] | None = None,
     ) -> ChildHandle:
         """Start a process in its own session so it outlives the console,
-        its output appended to ``log_path`` (else discarded)."""
+        its output appended to ``log_path`` (else discarded); ``env`` adds
+        to the console's own environment."""
         log: IO[Any] | None = None
         if log_path is not None:
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -170,7 +176,7 @@ class SubprocessRunner:
             stdout=log if log is not None else subprocess.DEVNULL,
             stderr=subprocess.STDOUT,
             start_new_session=True,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
+            env={**os.environ, "PYTHONUNBUFFERED": "1", **(env or {})},
         )
         return _Child(proc, log)
 

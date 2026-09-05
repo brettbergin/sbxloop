@@ -39,7 +39,7 @@ from sbxloop.config import (
     load_dotenv_file,
 )
 from sbxloop.daemon.control import DEFAULT_TIMEOUT_S
-from sbxloop.daemon.store import DaemonStore
+from sbxloop.daemon.store import DaemonStore, apply_item_verb
 from sbxloop.daemon.versions import VersionProbe, start_drift_check
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, scan_artifacts
@@ -2259,10 +2259,8 @@ def _item_control(action: str, item_id: str, reason: str | None) -> None:
         now = time.time()
         if action == "abandon":
             item = dstore.abandon(item_id, reason or "abandoned by operator", now)
-        elif action == "retry":
-            item = dstore.retry(item_id, now, "re-queued by operator (CLI)")
         else:
-            item = dstore.requeue(item_id, now)
+            item = apply_item_verb(dstore, action, item_id, now=now, by="operator (CLI)")
     except KeyError:
         console.print(f"[bold red]unknown work item:[/] {item_id}")
         raise typer.Exit(2) from None

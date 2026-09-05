@@ -94,29 +94,29 @@ CATALOGUE: tuple[Command, ...] = (
     Command(
         "Start the unit",
         "systemctl --user start",
-        _act(partial(actions.unit_verb, verb="start")),
+        _on_daemon("unit_start"),
         True,
     ),
     Command(
         "Stop the unit",
         "systemctl --user stop",
-        _act(partial(actions.unit_verb, verb="stop")),
+        _on_daemon("unit_stop"),
         True,
     ),
     Command(
         "Restart the unit",
         "systemctl --user restart",
-        _act(partial(actions.unit_verb, verb="restart")),
+        _on_daemon("unit_restart"),
         True,
     ),
     Command(
         "Start a daemon from this console",
         "no unit? spawn sbxloop daemon in its own session",
-        _act(actions.spawn_daemon),
+        _on_daemon("spawn"),
         True,
     ),
     Command(
-        "Upgrade sbxloop", "run [daemon] upgrade_command on this host", _act(actions.upgrade), True
+        "Upgrade sbxloop", "run [daemon] upgrade_command on this host", _on_daemon("upgrade"), True
     ),
     Command("Quit", "leave the console", lambda a: a.call_next(a.action_quit)),
 )

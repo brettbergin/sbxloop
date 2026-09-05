@@ -5,6 +5,7 @@ daemon verbs on keys."""
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import deque
 from typing import Any, ClassVar
@@ -78,6 +79,8 @@ class DaemonScreen(ConsoleScreen):
         self._stream: StreamHandle | None = None
         self._stream_argv: tuple[str, ...] | None = None
         self._stream_generation = 0
+        self._active = True
+        self._pollers: tuple[Any, ...] = ()
 
     def compose(self) -> ComposeResult:
         yield from self.compose_frame()
@@ -105,18 +108,27 @@ class DaemonScreen(ConsoleScreen):
         # auto-focus lands on it and every key types instead of acting.
         self.query_one("#grep", Input).display = False
         self.query_one("#journal", RichLog).focus()
-        self.set_interval(UNIT_POLL_S, self.probe_unit)
-        self.set_interval(VERSIONS_POLL_S, self.probe_versions)
+        self._pollers = (
+            self.set_interval(UNIT_POLL_S, self.probe_unit),
+            self.set_interval(VERSIONS_POLL_S, self.probe_versions),
+        )
         self.probe_unit()
         self.probe_versions()
 
     def on_screen_resume(self) -> None:
         super().on_screen_resume()
+        self._active = True
+        for timer in self._pollers:
+            timer.resume()
         self.probe_unit()
 
     def on_screen_suspend(self) -> None:
-        # The journal stream is a process: not left running behind a
-        # screen nobody looks at.
+        # A mode screen stays mounted: its timers would keep forking
+        # systemctl and re-opening the journal behind a screen nobody looks
+        # at. The stream is a process: closed here, reopened on resume.
+        self._active = False
+        for timer in self._pollers:
+            timer.pause()
         self._close_stream()
 
     def on_unmount(self) -> None:
@@ -135,7 +147,8 @@ class DaemonScreen(ConsoleScreen):
     def _apply_unit(self, unit: UnitState) -> None:
         self.unit = unit
         self.repaint()
-        self._ensure_stream()
+        if self._active:
+            self._ensure_stream()
 
     @work(thread=True, exclusive=True, group="versions")
     def probe_versions(self) -> None:
@@ -316,9 +329,10 @@ class DaemonScreen(ConsoleScreen):
 
     def _close_stream(self) -> None:
         stream, self._stream = self._stream, None
-        if stream is not None:
-            stream.close()
         self._stream_argv = None
+        if stream is not None:
+            # terminate + wait: off the UI thread.
+            threading.Thread(target=stream.close, name="journal-close", daemon=True).start()
 
     @work(thread=True, group="journal")
     def tail_journal(self, argv: tuple[str, ...], generation: int) -> None:
@@ -327,6 +341,9 @@ class DaemonScreen(ConsoleScreen):
             stream = deps.runner.stream(argv)
         except OSError as exc:
             self.app.call_from_thread(self._journal_note, f"could not start {argv[0]}: {exc}")
+            return
+        if generation != self._stream_generation or not self._active:
+            stream.close()  # suspended or superseded while the process started
             return
         self._stream = stream
         try:

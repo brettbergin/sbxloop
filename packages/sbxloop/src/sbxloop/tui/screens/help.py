@@ -33,12 +33,14 @@ daemon through the same `ctl` queue `sbxloop daemon ctl` and chat's `!sbx` use.
 page, `/` filters a list, `Esc` clears a filter or closes a screen, `r`
 refreshes now, `q` quits.
 
-Every verb asks first: `y`/`n` for a bounded one, the target's name (or
-the verb) typed out for a destructive one — removing a sandbox, stopping
-or restarting the unit, abandoning an item, pruning, gc, upgrading. A verb
-the daemon executes (`pause`, `cancel`, `merge`, `retry` …) needs a live
-daemon; the item verbs fall back to the CLI's row-only twin when none is
-running. `--read-only` removes them all.
+A verb that changes something asks first: `y`/`n` for a bounded one, the
+target's name (or the verb) typed out for a destructive one — removing a
+sandbox, stopping or restarting the unit, abandoning an item, pruning,
+gc, upgrading. Releasing a hold, re-checking a review, resuming a
+repository and asking the concierge just run. A verb the daemon executes
+(`pause`, `cancel`, `merge`, `retry` …) needs a live daemon; the item
+verbs fall back to the CLI's row-only twin when none is running.
+`--read-only` removes them all, sandbox shells included.
 
 ## Chat
 
