@@ -110,8 +110,11 @@ class TestEngineShapes:
         assert (run.review_rounds, run.ci_rounds, run.granted_rounds) == (0, 0, 0)
         assert run.exhausted is None and run.stage is None and run.pr_number is None
         assert store.get_run_guidance("old") == []
+        assert run.credentials == []
         if shape == "pre_usage":
             assert store.phase_attempts("old")[0]["input_tokens"] is None
         # The new columns are writable, and a reopen does not re-apply the ALTERs.
         assert store.grant_rounds("old", 1) == 1
-        assert StateStore(path).get_run("old").granted_rounds == 1
+        store.set_run_credentials("old", ["weather"])
+        reopened = StateStore(path).get_run("old")
+        assert (reopened.granted_rounds, reopened.credentials) == (1, ["weather"])

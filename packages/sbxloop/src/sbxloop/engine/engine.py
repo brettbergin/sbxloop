@@ -63,6 +63,7 @@ from sbxloop import hostgit
 from sbxloop.config import (
     DEFAULT_PR_TITLE_TEMPLATE,
     Config,
+    CredentialConfig,
     RepoConfig,
     VerifyMode,
     _flatten,
@@ -150,6 +151,7 @@ from sbxloop.engine.review import (
     split_carried,
     unanswered_findings,
 )
+from sbxloop.engine.service import ServiceOps
 from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import (
     BudgetExceededError,
@@ -187,6 +189,7 @@ from sbxloop.worker.client import WorkerClient
 log = get_logger(__name__)
 
 GithubOpsFactory = Callable[[WorkerClient, str], GithubOps]
+ServiceOpsFactory = Callable[[WorkerClient, str, EventBus, Sequence[CredentialConfig]], ServiceOps]
 
 
 class ChatMessage(NamedTuple):
@@ -220,6 +223,9 @@ class Pipeline:
     # the gate, `completed`.
     ops: GithubOps | None
     repo: str | None
+    # The service sandbox's ops (#765); None for a run granted no
+    # credential, which then has no service sandbox at all.
+    service: ServiceOps | None = None
     # The run's repository entry (per-repo deliver_base, token_env, …) with
     # the daemon-wide [github] defaults already folded in; None when the run
     # has no repository.
@@ -275,6 +281,7 @@ class LoopEngine:
         install_workers: bool | None = None,
         clock: Callable[[], float] = time.monotonic,
         github_ops: GithubOpsFactory | None = None,
+        service_ops: ServiceOpsFactory | None = None,
         trigger_label: str | None = None,
     ) -> None:
         # Library parity with the CLI: a ./.env supplies tokens/settings even
@@ -305,6 +312,8 @@ class LoopEngine:
         # The seam a test uses to script GitHub: every github.op the run
         # makes goes through the ops this factory returns.
         self._github_ops: GithubOpsFactory = github_ops or GithubOps
+        # Same seam for the service sandbox's ops (#765).
+        self._service_ops: ServiceOpsFactory = service_ops or ServiceOps
         # In-process cancellation (Ctrl-C in the TUI): checked at the same
         # phase boundaries as the store's cancelled state, but leaves the
         # persisted run state alone so the run stays resumable.
@@ -377,6 +386,7 @@ class LoopEngine:
         prior_branch: str | None = None,
         prior_pr: int | None = None,
         workspace_source: str | None = None,
+        credentials: Sequence[str] = (),
     ) -> RunResult:
         """Drive a fresh run all the way through.
 
@@ -400,10 +410,17 @@ class LoopEngine:
         the git checkout around the command) says so; otherwise the config
         speaks for itself. The workspace path itself always rides along, so
         a run that is about to work on nothing announces it up front.
+
+        ``credentials`` names the ``[[credentials]]`` this run is granted
+        (#765): they are provisioned into a third, service sandbox, and the
+        build session gets the ``call_service`` tool for them. Every name
+        must be in the catalogue — checked here, before the run row exists.
+        Empty (every ``code`` run) changes nothing.
         """
         run_id = run_id or new_run_id()
         self._select_repo(repo)
-        self.store.create_run(run_id, outcome, self.config.model_dump_json())
+        granted = [c.name for c in self.config.credentials_named(credentials)]
+        self.store.create_run(run_id, outcome, self.config.model_dump_json(), credentials=granted)
         if tasks:
             self.store.save_tasks(run_id, list(tasks))
         workspace = self.config.workspace_for_repo(self.config.github.repo)
@@ -620,9 +637,16 @@ class LoopEngine:
         # A resumed run's workspace is pinned from the runs table — never
         # recomputed from config, which would silently relocate it (#60).
         # The run's repository (its config was narrowed to it in
-        # _select_repo) scopes the github sandbox's token and remote.
+        # _select_repo) scopes the github sandbox's token and remote. The
+        # credentials the run was granted (#765) are read back from the
+        # run row so a resume re-provisions the same service sandbox.
+        credentials = self.store.get_run(run_id).credentials
         pair = provisioner.ensure_pair(
-            run_id, workspace, self.config.github.repo, expects_mount=expects_mount
+            run_id,
+            workspace,
+            self.config.github.repo,
+            expects_mount=expects_mount,
+            credentials=credentials,
         )
         assert pair.workspace is not None
         self._confirm_prior_checkout(run_id, pair)
@@ -676,13 +700,41 @@ class LoopEngine:
                         if pair.github is not None
                         else None
                     )
+                    service_client = (
+                        WorkerClient(
+                            pair.service,
+                            self.bus,
+                            transport=self.config.worker_transport,
+                            python=self.worker_python,
+                            role="service",
+                            limits=self.config.limits,
+                            # The credentials ride the same non-proxy road
+                            # as GH_TOKEN (#765): per job over stdin when
+                            # this sbx passes it, else the in-VM env file.
+                            job_env=provisioner.job_env(
+                                "service", sandbox=pair.service, credentials=credentials
+                            ),
+                        )
+                        if pair.service is not None
+                        else None
+                    )
                     if self.install_workers:
-                        self._install_workers(run_id, pair, agent, github)
+                        self._install_workers(run_id, pair, agent, github, service_client)
                     self._run_setup_commands(run_id, pair, agent)
                     repo_config = self.config.github.effective_repo(None)
                     ops = (
                         self._github_ops(github, run_id)
                         if github is not None and repo_config is not None
+                        else None
+                    )
+                    service = (
+                        self._service_ops(
+                            service_client,
+                            run_id,
+                            self.bus,
+                            self.config.credentials_named(credentials),
+                        )
+                        if service_client is not None
                         else None
                     )
                     issues_enabled = self._ensure_delivery_repo(run_id, ops)
@@ -695,6 +747,12 @@ class LoopEngine:
                         workspace=pair.workspace,
                         languages=pair.languages.languages,
                         versions=pair.languages.versions,
+                        # The build session's `call_service` tool (#765),
+                        # answered on the host through the service sandbox.
+                        host_tools=(service.tool_spec(),) if service is not None else (),
+                        tool_handler=service.handler(phase="build")
+                        if service is not None
+                        else None,
                     )
                     # Replay persisted chat guidance (steer_run verdicts)
                     # so a resumed run keeps the direction the user set.
@@ -715,6 +773,7 @@ class LoopEngine:
                         ),
                         deadline=deadline,
                         ops=ops,
+                        service=service,
                         repo=repo_config.repo if ops is not None and repo_config else None,
                         repo_config=repo_config if ops is not None else None,
                         bot_login=(
@@ -775,22 +834,25 @@ class LoopEngine:
         pair: SandboxPair,
         agent: WorkerClient,
         github: WorkerClient | None,
+        service: WorkerClient | None = None,
     ) -> None:
-        """Install the worker into both sandboxes, concurrently when the pair
-        exists — the installs share nothing in-sandbox, and each is seconds
-        of exec round-trips that would otherwise stack serially (#127).
+        """Install the worker into every sandbox, concurrently when there is
+        more than one — the installs share nothing in-sandbox, and each is
+        seconds of exec round-trips that would otherwise stack serially
+        (#127).
 
         A configured template is expected to be prebaked (`sbxloop bake`):
         install() probes it and skips the ladder on success, falling back
         when stale. ensure_dev_tools is agent-only — the agent builds
         projects in its VM, so it gets the run's resolved toolchains
         (`[sandbox] languages`, or what the workspace declares); the github
-        sandbox only runs API ops. Both installs always run to
-        completion before any failure
-        propagates, so an error never unwinds into pair teardown while the
-        other install is still mid-exec.
+        sandbox only runs API ops, and so does the service sandbox (#765).
+        Every install always runs to completion before any failure
+        propagates, so an error never unwinds into pair teardown while
+        another install is still mid-exec.
         """
         prebaked_expected = bool(self.config.sandbox.template)
+        roles: list[str] = ["agent"]
         installs: list[Callable[[], None]] = [
             partial(
                 agent.install,
@@ -813,7 +875,11 @@ class LoopEngine:
             )
         ]
         if github is not None:
+            roles.append("github")
             installs.append(partial(github.install, extras="", expect_prebaked=prebaked_expected))
+        if service is not None:
+            roles.append("service")
+            installs.append(partial(service.install, extras="", expect_prebaked=prebaked_expected))
         if len(installs) == 1:
             installs[0]()
         else:
@@ -822,7 +888,7 @@ class LoopEngine:
             ) as pool:
                 futures = [pool.submit(fn) for fn in installs]
                 errors: list[Exception] = []
-                for role, future in zip(("agent", "github"), futures, strict=True):
+                for role, future in zip(roles, futures, strict=True):
                     try:
                         future.result()
                     except Exception as exc:
@@ -839,7 +905,7 @@ class LoopEngine:
                 if errors:
                     raise errors[0]
         if prebaked_expected:
-            self._emit_prebaked(run_id, pair, agent, github)
+            self._emit_prebaked(run_id, pair, agent, github, service)
         if agent.apt_installed:
             self.bus.emit(
                 HostEventTypes.SANDBOX_SETUP,
@@ -873,12 +939,15 @@ class LoopEngine:
         pair: SandboxPair,
         agent: WorkerClient,
         github: WorkerClient | None,
+        service: WorkerClient | None = None,
     ) -> None:
         """One event per sandbox saying whether the configured template's
         baked worker was used, or was stale and the install ladder ran."""
         clients = [(pair.agent.name, agent)]
         if github is not None and pair.github is not None:
             clients.append((pair.github.name, github))
+        if service is not None and pair.service is not None:
+            clients.append((pair.service.name, service))
         for name, client in clients:
             if not client.prebaked:
                 message = (
@@ -905,7 +974,7 @@ class LoopEngine:
 
     @staticmethod
     def _pair_names(pair: SandboxPair) -> list[str]:
-        return [s.name for s in (pair.agent, pair.github) if s is not None]
+        return [s.name for s in (pair.agent, pair.github, pair.service) if s is not None]
 
     def _keep_on_failure(self, run_id: str, pair: SandboxPair) -> None:
         """Flip the pair to kept when configured, so a failed run's evidence

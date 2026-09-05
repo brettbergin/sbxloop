@@ -55,7 +55,14 @@ from sbxloop.verifylint import (
     reviewer_gate_rule,
 )
 from sbxloop.worker.client import WorkerClient
-from sbxloop_worker.protocol import BatchCommandResult, JobRequest, JobResult, Usage
+from sbxloop.worker.hosttools import HostToolHandler
+from sbxloop_worker.protocol import (
+    BatchCommandResult,
+    HostToolSpec,
+    JobRequest,
+    JobResult,
+    Usage,
+)
 
 OUTPUT_CLIP = 6_000
 # Verify output keeps head + tail (#253): a pytest run over hundreds of
@@ -266,11 +273,22 @@ class PhaseRunner:
         workspace: Path | None = None,
         languages: Sequence[str] | None = None,
         versions: Mapping[str, toolchains.ToolchainVersion] | None = None,
+        host_tools: Sequence[HostToolSpec] = (),
+        tool_handler: HostToolHandler | None = None,
     ) -> None:
         self.agent = agent
         self.config = config
         self.run_id = run_id
         self.outcome = outcome
+        # Host tools the BUILD session gets (#765): the `call_service` tool
+        # when the run was granted credentials, answered by ``tool_handler``
+        # on the host — the agent asks, the service sandbox calls. Empty
+        # (no handler) is every run that has none, and the build job then
+        # carries no tools at all.
+        if bool(host_tools) != (tool_handler is not None):
+            raise ValueError("host_tools and tool_handler must be given together")
+        self.host_tools: tuple[HostToolSpec, ...] = tuple(host_tools)
+        self.tool_handler = tool_handler
         # Canonical in-VM working directory for every job in this run: the
         # discovered workspace mount, or the harvest dir. Evidence and verify
         # commands must run where the executor wrote its files.
@@ -327,6 +345,20 @@ class PhaseRunner:
     def _guidance(self) -> str:
         return bullet_list(self.user_guidance)
 
+    def _service_tools_section(self) -> str:
+        """The build prompt's credentials section (#765), or "" — with its
+        own leading blank lines, so the template stays byte-identical for
+        a run that has no host tools."""
+        if not self.host_tools:
+            return ""
+        lines = [f"- `{tool.name}`: {tool.description}" for tool in self.host_tools]
+        return (
+            "\n\n## Services you may call\n\n"
+            "You hold no credential and cannot reach these hosts yourself; the run's "
+            "service sandbox makes each request for you through these tools. Every "
+            "call is logged by name, method and path:\n\n" + "\n".join(lines)
+        )
+
     def _lint_verify_commands(self, commands: Sequence[str]) -> list[str]:
         """Verify-command lint under this run's toolchains and project shape.
 
@@ -355,6 +387,9 @@ class PhaseRunner:
         resume_session_id: str | None = None,
     ) -> JobResult:
         agent_name = AGENT_NAMES[phase]
+        # Only BUILD gets the host tools: the planner and the critic read
+        # and judge; the builder is the one whose work may need a service.
+        host_tools = self.host_tools if phase == "build" else ()
         job = JobRequest(
             job_id=new_job_id(),
             run_id=self.run_id,
@@ -369,6 +404,7 @@ class PhaseRunner:
             # Only BUILD ever passes one: a revision continues its own prior
             # attempt's session so the work already done is not re-derived.
             resume_session_id=resume_session_id,
+            host_tools=list(host_tools),
         )
         started = time.monotonic()
         log.info(
@@ -382,7 +418,13 @@ class PhaseRunner:
             prompt_chars=len(prompt),
             resumed=bool(resume_session_id),
         )
-        result = self.agent.submit(job, agent=agent_name)
+        # The handler rides along only when the job carries tools: a run
+        # without them submits exactly the call it always did.
+        result = (
+            self.agent.submit(job, agent=agent_name, tool_handler=self.tool_handler)
+            if host_tools
+            else self.agent.submit(job, agent=agent_name)
+        )
         usage = result.usage
         if usage is not None:
             self._spend_usage = self._spend_usage.merged(usage)
@@ -648,6 +690,7 @@ class PhaseRunner:
             repo_conventions=self.repo_conventions(),
             work_dir=f"`{self.workdir}`" if self.workdir else "the current working directory",
             toolchains=toolchains.describe(self.languages, self.versions),
+            service_tools=self._service_tools_section(),
         )
         return self._agent_job(
             prompt,

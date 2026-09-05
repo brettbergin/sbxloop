@@ -851,6 +851,98 @@ class TestConfigDiscovery:
         assert config.sandbox.languages == ["go"]
 
 
+class TestCredentials:
+    """`[[credentials]]` (#765): the catalogue a run's service sandbox may
+    hold — names the operator grants per run, never secrets themselves."""
+
+    def test_unset_by_default(self, tmp_path: Path) -> None:
+        config = load_config(cwd=tmp_path, env={})
+        assert config.credentials == []
+        assert config.credential("weather") is None
+        assert config.credentials_named([]) == []
+
+    def test_entries_parse_with_defaults_and_overrides(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[[credentials]]\n"
+            'name = "weather"\n'
+            'env = "WEATHER_API_KEY"\n'
+            'host = "API.Weather.Example.com"\n'
+            'description = "forecasts"\n'
+            "\n"
+            "[[credentials]]\n"
+            'name = "keyed"\n'
+            'env = "KEYED_TOKEN"\n'
+            'host = "keyed.example.com"\n'
+            'header = "X-Api-Key"\n'
+            'scheme = ""\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        weather, keyed = config.credentials
+        assert (weather.host, weather.header, weather.scheme) == (
+            "api.weather.example.com",
+            "Authorization",
+            "Bearer",
+        )
+        assert weather.description == "forecasts"
+        assert (keyed.header, keyed.scheme) == ("X-Api-Key", "")
+        assert weather.catalogue_entry() == {
+            "name": "weather",
+            "env": "WEATHER_API_KEY",
+            "host": "api.weather.example.com",
+            "header": "Authorization",
+            "scheme": "Bearer",
+        }
+        assert config.credential("keyed") is keyed
+
+    def test_credentials_named_keeps_order_and_dedupes(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            '[[credentials]]\nname = "a"\nenv = "A"\nhost = "a.example.com"\n\n'
+            '[[credentials]]\nname = "b"\nenv = "B"\nhost = "b.example.com"\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        assert [c.name for c in config.credentials_named(["b", "a", "b"])] == ["b", "a"]
+
+    def test_credentials_named_refuses_an_undeclared_name(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            '[[credentials]]\nname = "a"\nenv = "A"\nhost = "a.example.com"\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        with pytest.raises(
+            ConfigError, match=r"'zed' is not declared under \[\[credentials\]\].*a"
+        ):
+            config.credentials_named(["zed"])
+
+    @pytest.mark.parametrize(
+        ("field", "value", "problem"),
+        [
+            ("name", "Weather", "name"),
+            ("name", "", "name"),
+            ("env", "weather-key", r"credentials\[\]\.env"),
+            ("host", "https://api.example.com", "host"),
+            ("host", "api.example.com/v1", "host"),
+            ("header", "X Api Key", "header"),
+            ("scheme", "Bearer token", "scheme"),
+        ],
+    )
+    def test_malformed_entries_are_refused(
+        self, tmp_path: Path, field: str, value: str, problem: str
+    ) -> None:
+        entry = {"name": "weather", "env": "WEATHER_API_KEY", "host": "api.example.com"}
+        entry[field] = value
+        body = "[[credentials]]\n" + "".join(f'{k} = "{v}"\n' for k, v in entry.items())
+        (tmp_path / "sbxloop.toml").write_text(body)
+        with pytest.raises(ConfigError, match=problem):
+            load_config(cwd=tmp_path, env={})
+
+    def test_duplicate_names_are_refused(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            '[[credentials]]\nname = "a"\nenv = "A"\nhost = "a.example.com"\n\n'
+            '[[credentials]]\nname = "a"\nenv = "B"\nhost = "b.example.com"\n'
+        )
+        with pytest.raises(ConfigError, match="'a' is declared twice"):
+            load_config(cwd=tmp_path, env={})
+
+
 class TestRegistries:
     """`[[registries]]` (#680): private package registries, per repository."""
 

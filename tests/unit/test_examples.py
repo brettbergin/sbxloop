@@ -373,7 +373,7 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             parsed = tomllib.loads(f"{key} = {value}")
         except tomllib.TOMLDecodeError:
             continue  # a multi-line value (the exclude list); covered below
-        if section == "registries":
+        if section in ("registries", "credentials"):
             continue  # array-of-tables entries load as whole blocks, below
         if section == "github.repos":
             doc: dict[str, Any] = {"github": {"repos": [{"repo": "you/your-repo", **parsed}]}}
@@ -412,3 +412,26 @@ def test_example_registry_entries_load_together() -> None:
     assert {entry["kind"] for entry in entries} >= {"npm", "pypi", "cargo", "go"}
     config = Config.model_validate({"registries": entries})
     assert [r.kind for r in config.registries] == [entry["kind"] for entry in entries]
+
+
+def test_example_credential_entry_loads() -> None:
+    """The commented `[[credentials]]` entry loads as one block: its keys
+    are coupled (a bare `X-Api-Key` header wants `scheme = ""`), so it is
+    validated whole rather than key by key."""
+    block = ""
+    in_block = False
+    for line in EXAMPLE.read_text().splitlines():
+        stripped = re.sub(r"^#\s?", "", line)
+        if stripped == "[[credentials]]":
+            in_block = True
+        elif in_block and line.startswith("#") and re.match(r"^[a-z_]+ = ", stripped):
+            block += stripped + "\n"
+        elif in_block and not line.strip():
+            break
+    entry = tomllib.loads(block)
+    config = Config.model_validate({"credentials": [entry]})
+    (cred,) = config.credentials
+    assert cred.name == entry["name"]
+    assert cred.host == entry["host"]
+    assert cred.header == entry["header"]
+    assert cred.scheme == entry["scheme"]

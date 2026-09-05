@@ -107,6 +107,16 @@ class FakeSbx:
         self.script(prefix, returncode=returncode, stderr=stderr, once=True)
 
 
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--update-trail",
+        action="store_true",
+        default=False,
+        help="re-record tests/fixtures/code_run_trail/*.json from the current code "
+        "(tests/unit/test_code_run_trail.py); a deliberate act, read the diff",
+    )
+
+
 @pytest.fixture
 def fake_sbx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeSbx:
     state = tmp_path / "sbx-state"

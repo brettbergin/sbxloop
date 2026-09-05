@@ -36,6 +36,7 @@ doomed registration, no probe, no per-run warning — when either
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import shlex
@@ -50,7 +51,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple
 
 from sbxloop import backends, hostgit, toolchains
-from sbxloop.config import Config, RepoConfig
+from sbxloop.config import Config, CredentialConfig, RepoConfig
 from sbxloop.errors import GithubOpsError, ProvisionError, SbxError
 from sbxloop.events import EventBus
 from sbxloop.gh.appauth import (
@@ -94,6 +95,7 @@ from sbxloop.sbx.secretstate import (
     set_secret_replacing,
 )
 from sbxloop_worker.secrets import shell_sentinel_case, shell_token_case
+from sbxloop_worker.serviceops import CATALOGUE_ENV
 
 log = get_logger(__name__)
 
@@ -146,7 +148,10 @@ _PROXY_BROKEN_VERDICTS = ("invisible-under-exec", "sentinel-under-exec")
 
 # Why a sandbox's credentials are delivered via the in-VM env file rather
 # than the sbx secret proxy. ``None`` means the proxy path is attempted.
-EnvFileReason = Literal["strategy", "cached", "app"]
+# ``service``: the service sandbox's credentials (#765) are operator values
+# bound to hosts the sbx proxy has no service for; they only ever travel
+# the non-proxy road.
+EnvFileReason = Literal["strategy", "cached", "app", "service"]
 
 
 @dataclass(frozen=True)
@@ -342,6 +347,15 @@ def github_policy_allows(config: Config) -> list[str]:
             *config.sandbox.extra_allow_domains,
         ]
     )
+
+
+def service_policy_allows(credentials: Sequence[CredentialConfig]) -> list[str]:
+    """The service sandbox's network allowlist (#765): exactly the hosts its
+    credentials are good for, nothing baseline — the box runs no agent and
+    fetches no toolchain, so a host no credential names is a host it has
+    no reason to reach. (The worker install itself rides the sbx preset's
+    baseline, as the github sandbox's does.)"""
+    return dedupe_domains(cred.host for cred in credentials)
 
 
 class Provisioner:
@@ -704,6 +718,7 @@ class Provisioner:
         repo: str | None = None,
         *,
         expects_mount: bool | None = None,
+        credentials: Sequence[str] = (),
     ) -> SandboxPair:
         """Provision the run's sandbox pair around its workspace.
 
@@ -711,7 +726,10 @@ class Provisioner:
         workspace: None lets the workspace's origin decide (an explicit path
         is the work; an unconfigured per-run dir is not), a resume passes
         the verdict its first provisioning recorded so a harvest-mode run
-        stays one (#670).
+        stays one (#670). ``credentials`` names the ``[[credentials]]``
+        this run is granted (#765): when non-empty a third, *service*
+        sandbox holding their values is provisioned beside the pair; empty
+        (every run today) provisions exactly what it always did.
         """
         if workspace is not None:
             # An explicit workspace is authoritative: it is either the
@@ -754,7 +772,12 @@ class Provisioner:
                 constraint=version.constraint,
             )
         return self._provision_pair(
-            run_id, workspace, repo, languages=languages, expects_mount=expects_mount
+            run_id,
+            workspace,
+            repo,
+            languages=languages,
+            expects_mount=expects_mount,
+            credentials=credentials,
         )
 
     def _run_repo(self, repo: str | None) -> str | None:
@@ -1253,11 +1276,15 @@ class Provisioner:
         *,
         languages: toolchains.LanguageResolution | None = None,
         expects_mount: bool = True,
+        credentials: Sequence[str] = (),
     ) -> SandboxPair:
         # The github sandbox (and its token requirement) exists only when the
         # GitHub integration is configured; without [github].repo a run has
-        # no GitHub capability at all — and one less microVM to boot.
+        # no GitHub capability at all — and one less microVM to boot. The
+        # service sandbox (#765) likewise exists only for a run granted a
+        # credential.
         github_enabled = self.config.github.enabled
+        creds = self.config.credentials_named(credentials)
 
         # Fail fast on missing credentials before creating any microVM. In
         # App mode this mints the first installation token here.
@@ -1266,17 +1293,27 @@ class Provisioner:
         self.agent_secret_env(repo)
         if gh_cred is not None:
             tokens["github"] = gh_cred.token()
+        if creds:
+            self.service_secret_env(creds)
+            # The service sandbox has no token of its own: its credentials
+            # are the spec's secret_env, delivered whole.
+            tokens["service"] = ""
         # Decided once, before the parallel threads: a probe verdict recorded
         # by one thread must not flip the other thread's delivery mid-flight.
         env_file_reasons: dict[SandboxRole, EnvFileReason | None] = {
             "agent": self._env_file_reason("agent", None),
             "github": self._env_file_reason("github", gh_cred),
+            "service": self._env_file_reason("service", None),
         }
 
         agent_spec, github_spec = self.build_specs(
             run_id, workspace, repo, languages=languages.languages if languages else None
         )
-        specs = (agent_spec, github_spec) if github_enabled else (agent_spec,)
+        specs: tuple[SandboxSpec, ...] = (agent_spec,)
+        if github_enabled:
+            specs += (github_spec,)
+        if creds:
+            specs += (self.service_spec(run_id, workspace, creds),)
         created: list[Sandbox] = []
         registered_secret_rms: list[Callable[[], bool]] = []
         # Guards the two rollback lists: the sandboxes provision on parallel
@@ -1340,8 +1377,8 @@ class Provisioner:
             if len(specs) == 1:
                 sandboxes[specs[0].role] = provision_one(specs[0])
             else:
-                # The pair shares nothing but the host workspace dir, so the
-                # two microVMs boot and configure concurrently (#127). Every
+                # The sandboxes share nothing but the host workspace dir, so
+                # the microVMs boot and configure concurrently (#127). Every
                 # future is drained before any failure propagates: rollback
                 # must never race a thread still mid-provision.
                 with ThreadPoolExecutor(
@@ -1390,6 +1427,7 @@ class Provisioner:
                 run_id,
                 agent=sandboxes["agent"],
                 github=sandboxes.get("github"),
+                service=sandboxes.get("service"),
                 keep=self.config.keep_sandboxes,
                 workspace=workspace,
                 agent_workdir=agent_workdir,
@@ -1428,6 +1466,70 @@ class Provisioner:
             if isinstance(exc, ProvisionError):
                 raise
             raise ProvisionError(f"provisioning run {run_id} failed: {exc}") from exc
+
+    # -- the service sandbox (#765) ----------------------------------------
+
+    def service_spec(
+        self, run_id: str, workspace: Path, credentials: Sequence[CredentialConfig]
+    ) -> SandboxSpec:
+        """The run's service sandbox: the github sandbox's pattern
+        generalized to the operator's ``[[credentials]]``. No proxy
+        secrets, no agent, an allowlist of the credentials' hosts only;
+        the catalogue (names, env names, hosts — nothing secret) rides the
+        plain environment and the values ride the non-proxy road (per-job
+        stdin, or the 0600 env file), exactly as GH_TOKEN does."""
+        return SandboxSpec(
+            name=sandbox_name(run_id, "service"),
+            role="service",
+            workspace=workspace,
+            template=self.config.sandbox.template,
+            policy_allows=service_policy_allows(credentials),
+            persistent_env=self.service_persistent_env(credentials),
+            secret_env=self.service_secret_env(credentials),
+        )
+
+    @staticmethod
+    def service_persistent_env(credentials: Sequence[CredentialConfig]) -> dict[str, str]:
+        """The catalogue the service worker resolves a job's credential name
+        against: JSON, non-secret, one env variable."""
+        if not credentials:
+            return {}
+        return {CATALOGUE_ENV: json.dumps([cred.catalogue_entry() for cred in credentials])}
+
+    def service_secret_env(self, credentials: Sequence[CredentialConfig]) -> dict[str, str]:
+        """The credentials' values, read from the daemon's environment.
+
+        Every granted credential must be set: the run was granted it
+        because its work needs it, and a run without it would fail later,
+        inside the sandbox, for a reason no log line names. Raises
+        ProvisionError listing the unset variables — before any microVM
+        boots, when called from provisioning."""
+        missing = [cred.env for cred in credentials if not self.env.get(cred.env)]
+        if missing:
+            raise ProvisionError(
+                f"[[credentials]] env names {missing} are not set in the daemon's "
+                "environment (secrets.env / the service unit); set them or do not "
+                "grant those credentials"
+            )
+        return {cred.env: self.env[cred.env] for cred in credentials}
+
+    def ensure_service(
+        self,
+        run_id: str,
+        workspace: Path,
+        credentials: Sequence[str],
+        *,
+        post_create: PostCreate | None = None,
+    ) -> Sandbox:
+        """Provision a run's service sandbox on its own — for a grant made
+        after the pair exists (a plan that asks for a credential mid-run).
+        Same discipline as :meth:`ensure_pair`'s third sandbox: values
+        checked before any microVM, rollback on failure."""
+        creds = self.config.credentials_named(credentials)
+        spec = self.service_spec(run_id, workspace.resolve(), creds)
+        return self._ensure_single(
+            spec, "", reason="service", post_create=post_create, run_id=run_id
+        )
 
     def github_only_spec(self, name: str, workspace: Path, repo: str | None = None) -> SandboxSpec:
         """A github-role spec that is not tied to a run — the daemon's
@@ -1634,6 +1736,10 @@ class Provisioner:
     ) -> EnvFileReason | None:
         """Why ``role``'s credentials go to the in-VM env file (``None`` →
         try the sbx secret proxy)."""
+        if role == "service":
+            # Operator credentials for arbitrary hosts: the proxy has no
+            # service for them, and they are never an sbx argument (#765).
+            return "service"
         if self.config.secret_strategy == "plain-env":  # nosec B105 - strategy label
             return "strategy"
         if role == "github" and isinstance(gh_cred, GhApp):
@@ -1732,10 +1838,33 @@ class Provisioner:
         probe-driven downgrade emits — the semantic is identical, the
         decision just came from the conformance cache — but calmly (info
         log, ``cached=True``) rather than as a per-run warning. ``app``
-        announces the App identity once per sandbox.
+        announces the App identity once per sandbox. ``service`` says which
+        credentials (names only, never values) the service sandbox holds.
         """
         delivery = self._deliver_env(spec, sandbox, token)
         via_file = delivery == "env-file"
+        if spec.role == "service":
+            names = sorted(spec.secret_env)
+            road = (
+                "via the in-VM env file" if via_file else "per job over the worker launch's stdin"
+            )
+            message = f"service sandbox holds credentials {names}, delivered {road}"
+            log.info(
+                "sandbox.service_credentials",
+                run=run_id,
+                sandbox=spec.name,
+                envs=names,
+                delivery=delivery,
+            )
+            self.bus.emit(
+                "sandbox.service_credentials",
+                run_id,
+                name=spec.name,
+                envs=names,
+                delivery=delivery,
+                message=message,
+            )
+            return
         env_name = self.agent_token_env() if spec.role == "agent" else "GH_TOKEN"
         how = (
             "using the in-VM env file directly"
@@ -2155,9 +2284,10 @@ class Provisioner:
         exports: dict[str, str] = {**spec.persistent_env, **spec.secret_env}
         if spec.role == "agent":
             exports[self.agent_token_env()] = token
-        else:
+        elif spec.role == "github":
             exports["GH_TOKEN"] = token
             exports["GITHUB_TOKEN"] = token
+        # The service sandbox has no token: its credentials are secret_env.
         self._write_env_file(sandbox, exports)
 
     def gh_refresher(self, sandbox: Sandbox, repo: str | None = None) -> Callable[[], None] | None:
@@ -2198,6 +2328,7 @@ class Provisioner:
         repo: str | None = None,
         *,
         sandbox: Sandbox | None = None,
+        credentials: Sequence[str] = (),
     ) -> Callable[[], dict[str, str]] | None:
         """A per-job env provider for stdin delivery, or ``None`` (#592).
 
@@ -2214,7 +2345,9 @@ class Provisioner:
 
         The provider computes exports fresh per job — ``cred.token()``
         re-mints an App installation token inside its refresh margin — so
-        rotating credentials need nothing rewritten anywhere.
+        rotating credentials need nothing rewritten anywhere. For the
+        service role ``credentials`` names the run's grant (#765): the
+        provider carries the catalogue and the values.
         """
         gh_cred = self.gh_credential(repo) if role == "github" else None
         if self._env_file_reason(role, gh_cred) is None:
@@ -2231,6 +2364,12 @@ class Provisioner:
                 **self.agent_persistent_env(repo),
                 **self.agent_secret_env(repo),
                 self.agent_token_env(): self.agent_token(),
+            }
+        if role == "service":
+            creds = self.config.credentials_named(credentials)
+            return lambda: {
+                **self.service_persistent_env(creds),
+                **self.service_secret_env(creds),
             }
         cred = gh_cred
         assert cred is not None
