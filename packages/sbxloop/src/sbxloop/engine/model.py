@@ -296,6 +296,11 @@ class RunRecord(_Model):
     # the daemon grants `retry_rounds` once, an operator grants more.
     exhausted: str | None = None
     granted_rounds: int = 0
+    # The `[[credentials]]` names this run is granted (#765): what its
+    # service sandbox holds and what `call_service` may name. Persisted so
+    # a resume re-provisions the same sandbox; empty for every run that
+    # asked for none — which is every `code` run today.
+    credentials: list[str] = Field(default_factory=list)
 
 
 class RunResult(_Model):

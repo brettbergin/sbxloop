@@ -7,7 +7,7 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-SandboxRole = Literal["agent", "github"]
+SandboxRole = Literal["agent", "github", "service"]
 
 
 class SecretSpec(BaseModel):

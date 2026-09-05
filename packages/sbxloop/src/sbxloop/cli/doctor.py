@@ -793,6 +793,30 @@ def secret_env_checks(config: Config, env: dict[str, str]) -> list[Check]:
     ]
 
 
+def credentials_checks(config: Config, env: dict[str, str]) -> list[Check]:
+    """One row when `[[credentials]]` declares anything (#765): every
+    entry's `env` must be set in the daemon's environment, or a run
+    granted it fails at provisioning by name — this row says so before
+    the first run does. Values are never shown; the hosts are, since
+    they are what the service sandbox may reach."""
+    if not config.credentials:
+        return []
+    unset = [c for c in config.credentials if not env.get(c.env)]
+    listed = ", ".join(f"{c.name} → {c.host} ({c.env})" for c in config.credentials)
+    if not unset:
+        return [Check("service credentials", True, f"set: {listed}")]
+    missing = ", ".join(f"{c.name} ({c.env})" for c in unset)
+    return [
+        Check(
+            "service credentials",
+            False,
+            f"not set in the daemon's environment — {missing}; export them where the "
+            "daemon reads its secrets, or drop the entries (a run granted one fails "
+            "at provisioning)",
+        )
+    ]
+
+
 def collect_checks(
     env: dict[str, str],
     cli: SbxCLI | None = None,
@@ -1009,6 +1033,7 @@ def collect_checks(
         )
     )
     checks.extend(secret_env_checks(config, env))
+    checks.extend(credentials_checks(config, env))
     # A github credential matters only when the GitHub integration is
     # configured; an unconfigured integration is a valid (GitHub-less)
     # setup, not a failure. A PAT or GitHub App credentials both satisfy it;

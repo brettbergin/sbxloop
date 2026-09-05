@@ -205,6 +205,25 @@ secret_strategy = "proxy"
 # kind = "go"
 # host = "github.example.com"           # → GOPRIVATE=github.example.com
 
+# Service credentials. A catalogue of credentials a run may be GRANTED
+# by name; a granted run gets a third, "service" sandbox holding exactly
+# those values (never the agent sandbox — the only key in an agent sandbox
+# is its inference key) and the build session gets a `call_service` tool:
+# the agent names a credential, method and path, and the service sandbox
+# makes the one request to `https://<host><path>` with the credential
+# attached. `env` names the daemon-environment variable holding the value
+# (never in this file); `host` is the ONE host the credential is good for.
+# `header` / `scheme` say how it is attached — `Authorization: Bearer …` by
+# default; `scheme = ""` sends the bare value. Nothing grants a credential
+# to a `code` run today; `sbxloop doctor` checks every `env` is set.
+# [[credentials]]
+# name = "weather"
+# env = "WEATHER_API_KEY"
+# host = "api.weather.example.com"
+# header = "X-Api-Key"
+# scheme = ""
+# description = "read-only weather forecasts"
+
 # [policy]
 # Bounds for plan-declared egress. At PLAN time the agent may declare extra
 # domains a task needs during EXECUTE (each with a justification); they are

@@ -36,6 +36,18 @@ class TestRuns:
         store.set_run_state("r1", "building")
         assert store.get_run("r1").state == "building"
 
+    def test_credentials_round_trip(self, store: StateStore) -> None:
+        """The grant (#765) is part of the run row so a resume re-provisions
+        the same service sandbox; it is replaced whole, deduplicated."""
+        assert store.create_run("plain", "do things", "{}").credentials == []
+        record = store.create_run("r1", "do things", "{}", credentials=["weather", "mail"])
+        assert record.credentials == ["weather", "mail"]
+        assert store.get_run("r1").credentials == ["weather", "mail"]
+        store.set_run_credentials("r1", ["mail", "mail"])
+        assert store.get_run("r1").credentials == ["mail"]
+        with pytest.raises(StateError, match="unknown run"):
+            store.set_run_credentials("nope", ["mail"])
+
     def test_stage_tracks_non_terminal_states_and_survives_terminal_ones(
         self, store: StateStore
     ) -> None:

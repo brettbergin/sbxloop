@@ -473,6 +473,88 @@ class RegistryConfig(_ConfigModel):
         return (self.kind,)
 
 
+_CREDENTIAL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
+
+
+class CredentialConfig(_ConfigModel):
+    """One credential a run may be granted (#765) — held by the run's
+    *service* sandbox, never the agent's.
+
+    `name` is what a run asks for and what the ledger records; `env` names
+    the daemon-environment variable holding the value (the value is never
+    in TOML); `host` is the ONE host the credential is good for — every
+    `service.http` op with this credential goes to `https://<host>` and
+    nowhere else; `header` / `scheme` say how it is attached
+    (`Authorization: Bearer <value>` by default; `scheme = ""` sends the
+    bare value, for an `X-Api-Key` style header). The agent sandbox does
+    not need `host` on its own allowlist: the agent never speaks to it.
+    """
+
+    name: str
+    env: str
+    host: str
+    header: str = "Authorization"
+    scheme: str = "Bearer"
+    description: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        if not _CREDENTIAL_NAME_RE.match(value):
+            raise ValueError(
+                f"credentials[].name must be lowercase letters, digits, '-' or '_', got {value!r}"
+            )
+        return value
+
+    @field_validator("env")
+    @classmethod
+    def _check_env(cls, value: str) -> str:
+        _check_env_names([value], "credentials[].env")
+        return value
+
+    @field_validator("host")
+    @classmethod
+    def _check_host(cls, value: str) -> str:
+        value = value.strip().lower()
+        if not _HOST_RE.match(value):
+            raise ValueError(f"credentials[].host must be a bare hostname, got {value!r}")
+        return value
+
+    @field_validator("header")
+    @classmethod
+    def _check_header(cls, value: str) -> str:
+        if not _HEADER_NAME_RE.match(value):
+            raise ValueError(f"credentials[].header must be an HTTP header name, got {value!r}")
+        return value
+
+    @field_validator("scheme")
+    @classmethod
+    def _check_scheme(cls, value: str) -> str:
+        value = value.strip()
+        if any(c.isspace() for c in value):
+            raise ValueError(f"credentials[].scheme must be one word, got {value!r}")
+        return value
+
+    def catalogue_entry(self) -> dict[str, str]:
+        """The non-secret part, as the service sandbox's worker reads it."""
+        return {
+            "name": self.name,
+            "env": self.env,
+            "host": self.host,
+            "header": self.header,
+            "scheme": self.scheme,
+        }
+
+
+def _check_credentials(entries: Sequence[CredentialConfig], key: str) -> None:
+    seen: set[str] = set()
+    for entry in entries:
+        if entry.name in seen:
+            raise ValueError(f"{key}: credential {entry.name!r} is declared twice")
+        seen.add(entry.name)
+
+
 def _check_registries(entries: Sequence[RegistryConfig], key: str) -> None:
     seen: set[tuple[str, ...]] = set()
     for entry in entries:
@@ -1806,6 +1888,9 @@ class Config(_ConfigModel):
     # Private package registries every run's agent sandbox reaches and is
     # configured for (#680); a `[[github.repos]]` entry may replace the list.
     registries: list[RegistryConfig] = Field(default_factory=list)
+    # The credentials a run may be granted (#765): held by a per-run service
+    # sandbox and used through host-driven ops; never in the agent sandbox.
+    credentials: list[CredentialConfig] = Field(default_factory=list)
     github: GithubConfig = Field(default_factory=GithubConfig)
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     budgets: Budgets = Field(default_factory=Budgets)
@@ -1872,6 +1957,30 @@ class Config(_ConfigModel):
     def _check_registries(cls, value: list[RegistryConfig]) -> list[RegistryConfig]:
         _check_registries(value, "registries")
         return value
+
+    @field_validator("credentials")
+    @classmethod
+    def _check_credentials(cls, value: list[CredentialConfig]) -> list[CredentialConfig]:
+        _check_credentials(value, "credentials")
+        return value
+
+    def credential(self, name: str) -> CredentialConfig | None:
+        """The `[[credentials]]` entry called ``name``, or None."""
+        return next((c for c in self.credentials if c.name == name), None)
+
+    def credentials_named(self, names: Sequence[str]) -> list[CredentialConfig]:
+        """The catalogue entries for ``names``, in order and deduplicated;
+        a name the catalogue lacks is a ``ConfigError`` naming it."""
+        entries: list[CredentialConfig] = []
+        for name in dict.fromkeys(names):
+            entry = self.credential(name)
+            if entry is None:
+                known = ", ".join(c.name for c in self.credentials) or "none"
+                raise ConfigError(
+                    f"credential {name!r} is not declared under [[credentials]] (declared: {known})"
+                )
+            entries.append(entry)
+        return entries
 
     def registries_for(self, repo: str | None = None) -> list[RegistryConfig]:
         """The private registries ``repo``'s agent sandbox is configured for

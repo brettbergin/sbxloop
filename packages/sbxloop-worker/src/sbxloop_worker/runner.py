@@ -117,6 +117,8 @@ class JobRunner:
             return self._run_shell_check()
         if self.job.kind == "shell.batch":
             return self._run_shell_batch()
+        if self.job.kind == "service.http":
+            return self._run_service_http(writer)
         return self._run_github_op(writer)
 
     def _run_agent_session(self, writer: EventWriter) -> JobResult:
@@ -210,6 +212,20 @@ class JobRunner:
 
         output = execute_op(self.job.op, self.job.params, progress=progress)
         writer.emit(EventTypes.GH_OP_END, op=self.job.op)
+        return JobResult(job_id=self.job.job_id, status="ok", output_json=output)
+
+    def _run_service_http(self, writer: EventWriter) -> JobResult:
+        from sbxloop_worker.serviceops import execute_http
+
+        params = self.job.params
+        summary = {
+            "credential": params.get("credential"),
+            "method": str(params.get("method", "")).upper(),
+            "path": params.get("path"),
+        }
+        writer.emit(EventTypes.SERVICE_HTTP_START, **summary)
+        output = execute_http(params)
+        writer.emit(EventTypes.SERVICE_HTTP_END, status=output["status"], **summary)
         return JobResult(job_id=self.job.job_id, status="ok", output_json=output)
 
     # -- helpers -----------------------------------------------------------
