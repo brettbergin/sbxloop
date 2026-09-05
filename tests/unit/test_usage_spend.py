@@ -14,7 +14,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from sbxloop.daemon.concierge import _SPEND_NOT_REPORTED, _usage_from_event
+from sbxloop.daemon.concierge import _SPEND_NOT_REPORTED
+from sbxloop.daemon.usage import usage_from_event as _usage_from_event
 from sbxloop_worker.backends.copilot import usage_from_sdk_sample
 from sbxloop_worker.protocol import Usage
 

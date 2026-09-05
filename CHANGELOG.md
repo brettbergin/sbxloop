@@ -8,6 +8,35 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **Console admin: sandboxes, daemon control, the journal, run operations,
+  a command palette** (#773). The console could watch and chat but every
+  operator act still meant leaving it for the CLI, `systemctl` or
+  `journalctl`. Every admin verb now runs through one path — refused
+  read-only, refused without a live daemon when the daemon must execute
+  it, confirmed by tier (`y`/`n`, or the target's name typed for the
+  destructive ones), run off the UI thread, reported, re-polled. A run's
+  header offers cancel (the daemon's current run through `ctl`, any other
+  through the `sbxloop cancel` store write), retry / requeue / abandon /
+  check-review / approve-merge / grant-rounds on its item, a detached
+  `sbxloop resume` for a run with no item, and a shell in either sandbox
+  with the terminal handed over. The Queue screen carries the item verbs
+  (with the CLI's row-only twin when no daemon runs) and a new run the
+  daemon's way (the concierge files the issue) or a detached `sbxloop run`.
+  **Sandboxes** (`5`) is `sbx ls` classified as `sandbox prune` classifies
+  it plus the run directories `gc` would remove; shell, stop, remove,
+  prune and gc behind typed confirmations. **Daemon** (`6`) is the systemd
+  user unit (`[tui] daemon_unit`, `--unit`) with start / stop / restart,
+  the process behind `status`, pause / resume / cancel / graceful stop,
+  versions with `[daemon] upgrade_command`, per-repository health with
+  resume, and the journal streamed through the credential redactor with a
+  grep and a level floor; with no unit, `D` spawns a supervised
+  `sbxloop daemon` from the console. `ctrl+p` opens a command palette of
+  every screen and argument-less verb. `ControlClient` takes a `by` so the
+  source reads "cancelled by brett via sbxloop tui"; the concierge's
+  per-run usage fold is now `sbxloop.daemon.usage.usage_for_run`, shared
+  with the Phases tab's per-persona lines; the interactive shell argv is
+  `sbxloop.sbx.cli.INTERACTIVE_SHELL_ARGV`.
+
 - **`log` and `stop` operator commands** (#772). The daemon's recent log
   lines were reachable only through the concierge's tool or `journalctl`
   over ssh, and stopping the daemon gracefully was a signal. `!sbx log [--tail N] [--level L] [--grep TEXT]` and `sbxloop daemon ctl log` answer

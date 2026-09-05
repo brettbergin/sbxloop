@@ -1,6 +1,7 @@
 """The console application: modes for the shared screens, a pushed screen
 per run, two pollers (the store every ``[tui] refresh_s``, the daemon's
-``status`` every few seconds), and the bar every screen carries."""
+``status`` every few seconds), the bar every screen carries, and the one
+place an admin verb is confirmed, run and reported."""
 
 from __future__ import annotations
 
@@ -18,14 +19,25 @@ from sbxloop import __version__
 from sbxloop.config import Config
 from sbxloop.daemon.control import ControlClient
 from sbxloop.daemon.mailbox import MailboxClient
+from sbxloop.sbx.cli import SbxCLI
+from sbxloop.tui.actions import Action, Deps, Outcome, stop_child
 from sbxloop.tui.chat import ChatSession
+from sbxloop.tui.commands import ConsoleCommands
 from sbxloop.tui.data import ConsoleState, CtlClient, build_state, probe_daemon
+from sbxloop.tui.runner import CommandRunner, SubprocessRunner
 from sbxloop.tui.screens.chat import ChatScreen
+from sbxloop.tui.screens.daemon import DaemonScreen
 from sbxloop.tui.screens.help import HelpScreen
 from sbxloop.tui.screens.items import ItemsScreen
+from sbxloop.tui.screens.modals import (
+    ConfirmScreen,
+    OutcomeScreen,
+    TypedConfirmScreen,
+)
 from sbxloop.tui.screens.overview import OverviewScreen
 from sbxloop.tui.screens.run_detail import RunDetailScreen
 from sbxloop.tui.screens.runs import RunsScreen
+from sbxloop.tui.screens.sandboxes import SandboxesScreen
 
 #: How often the daemon is asked ``status`` (a read-only verb, but a
 #: ctl round trip; the store poll is the fast one).
@@ -43,13 +55,18 @@ class SbxloopTui(App[None]):
         "runs": RunsScreen,
         "items": ItemsScreen,
         "chat": ChatScreen,
+        "sandboxes": SandboxesScreen,
+        "daemon": DaemonScreen,
         "help": HelpScreen,
     }
+    COMMANDS: ClassVar[set[Any]] = {ConsoleCommands}
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("1", "mode('overview')", "Overview"),
         Binding("2", "mode('runs')", "Runs"),
         Binding("3", "mode('items')", "Queue"),
         Binding("4", "mode('chat')", "Chat"),
+        Binding("5", "mode('sandboxes')", "Sandboxes"),
+        Binding("6", "mode('daemon')", "Daemon"),
         Binding("question_mark", "mode('help')", "Help"),
         Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
@@ -65,12 +82,19 @@ class SbxloopTui(App[None]):
         read_only: bool = False,
         initial_run: str | None = None,
         clock: Callable[[], float] = time.time,
+        runner: CommandRunner | None = None,
+        unit: str | None = None,
+        sbx_factory: Callable[[], SbxCLI] | None = None,
+        cwd: Path | None = None,
     ) -> None:
         super().__init__()
         self.config = config
         self.state_dir = state_dir
         self.mailbox = mailbox
-        self.ctl: CtlClient = ctl if ctl is not None else ControlClient(state_dir)
+        operator = mailbox.operator_name
+        self.ctl: CtlClient = (
+            ctl if ctl is not None else ControlClient(state_dir, by=f"{operator} via sbxloop tui")
+        )
         self.read_only = read_only
         self.initial_run = initial_run
         self.clock = clock
@@ -78,6 +102,20 @@ class SbxloopTui(App[None]):
         self.state = ConsoleState(version=__version__, read_only=read_only)
         self.chat = ChatSession(
             mailbox, read_only=read_only, prefix=config.tui.command_prefix, clock=clock
+        )
+        self.deps = Deps(
+            ctl=self.ctl,
+            runner=runner if runner is not None else SubprocessRunner(),
+            mailbox=mailbox,
+            config=config,
+            state_dir=state_dir,
+            unit=unit or config.tui.daemon_unit,
+            operator=operator,
+            sbx=sbx_factory or (lambda: SbxCLI(app_name=config.app_name or None)),
+            daemon=lambda: self.state.daemon,
+            read_only=read_only,
+            clock=clock,
+            cwd=cwd or Path.cwd(),
         )
         # The newest control-channel row the Chat screen has shown, for the
         # unread count in the bar.
@@ -157,6 +195,92 @@ class SbxloopTui(App[None]):
         """Control-channel rows newer than the last one the Chat screen showed."""
         return self.state.control_unread
 
+    # -- admin verbs -------------------------------------------------------------
+
+    def perform(self, action: Action, *, then: Callable[[], Any] | None = None) -> None:
+        """Run one admin verb the way every verb runs: refused read-only,
+        refused without a daemon when it needs one, confirmed by its tier,
+        executed off the UI thread, reported as a toast or a screen, then
+        ``then`` (a screen's own re-poll) and a refresh."""
+        if self.read_only and action.mutating:
+            self.notify(f"read-only console: {action.title} refused", severity="warning")
+            return
+        if action.needs_live and not self.deps.daemon_live():
+            why = "starting" if self.deps.daemon_starting() else "not running"
+            self.notify(
+                f"the daemon is {why}: {action.title} needs a live daemon", severity="warning"
+            )
+            return
+
+        def go(confirmed: bool | None) -> None:
+            if not confirmed:
+                return
+            if action.interactive is not None:
+                self._interactive(action)
+                return
+            self.execute(action, then)
+
+        if action.confirm == "none":
+            go(True)
+        elif action.confirm == "typed":
+            self.push_screen(TypedConfirmScreen(action.title, action.prompt, action.typed), go)
+        else:
+            self.push_screen(ConfirmScreen(action.title, action.prompt), go)
+
+    @work(thread=True, group="action")
+    def execute(self, action: Action, then: Callable[[], Any] | None) -> None:
+        try:
+            outcome = action.run()
+        except Exception as exc:
+            outcome = Outcome(False, f"{action.title} failed: {exc}")
+        self.call_from_thread(self.show_outcome, action, outcome, then)
+
+    def show_outcome(
+        self, action: Action, outcome: Outcome, then: Callable[[], Any] | None = None
+    ) -> None:
+        if outcome.long:
+            self.push_screen(OutcomeScreen(action.title, outcome.text, ok=outcome.ok))
+        else:
+            self.notify(
+                outcome.text or "done",
+                title=action.title,
+                severity="information" if outcome.ok else "error",
+                timeout=8 if outcome.ok else 15,
+            )
+        if then is not None:
+            then()
+        self.action_refresh()
+
+    def _interactive(self, action: Action) -> None:
+        """Hand the terminal to a process (a sandbox shell) and take it back."""
+        argv = action.interactive or ()
+        with self.suspend():
+            code = self.deps.runner.interactive(argv)
+        self.notify(
+            f"{action.title}: exit {code}", severity="information" if code == 0 else "warning"
+        )
+
+    async def action_quit(self) -> None:
+        """Quit — asking first about a daemon spawned from this console."""
+        alive = self.deps.children.alive()
+        if "daemon" not in alive:
+            self.exit()
+            return
+
+        def decided(stop: bool | None) -> None:
+            if stop:
+                stop_child(self.deps, "daemon")
+            self.exit()
+
+        self.push_screen(
+            ConfirmScreen(
+                "a daemon is still running",
+                f"The daemon spawned from this console is running (pid {alive['daemon'].pid}). "
+                "Stop it before quitting? y stops it; n leaves it running in its own session.",
+            ),
+            decided,
+        )
+
 
 def build_app(
     config: Config,
@@ -165,10 +289,16 @@ def build_app(
     operator_id: str,
     read_only: bool = False,
     initial_run: str | None = None,
+    unit: str | None = None,
 ) -> SbxloopTui:
     mailbox = MailboxClient(state_dir / "state.db", operator_id=operator_id)
     return SbxloopTui(
-        config, state_dir, mailbox=mailbox, read_only=read_only, initial_run=initial_run
+        config,
+        state_dir,
+        mailbox=mailbox,
+        read_only=read_only,
+        initial_run=initial_run,
+        unit=unit,
     )
 
 

@@ -18,7 +18,8 @@ from __future__ import annotations
 
 import sqlite3
 import threading
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +65,14 @@ class MailboxClient:
             self.daemon.close()
             self.engine.close()
             self._rw.close()
+
+    @contextmanager
+    def read_engine(self) -> Iterator[StateStore]:
+        """The read-only engine store for a helper that takes a store
+        (`classify_sandboxes`, `usage_for_run`), under the client's lock:
+        the console's workers share these connections across threads."""
+        with self._lock:
+            yield self.engine
 
     # -- liveness ----------------------------------------------------------------
 

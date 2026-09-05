@@ -22,13 +22,23 @@ daemon through the same `ctl` queue `sbxloop daemon ctl` and chat's `!sbx` use.
 | `2` | Runs — every run; `Enter` opens one |
 | `3` | Queue — dispatch order and every work item |
 | `4` | Chat — the control channel: the concierge, `!sbx` verbs, daemon notices |
+| `5` | Sandboxes — `sbx ls` classified against the store; shell, remove, prune, gc |
+| `6` | Daemon — the unit, the process, versions, repositories, the journal |
 | `?` | this help |
+| `ctrl+p` | the command palette: every screen and every argument-less verb by name |
 
 ## Everywhere
 
 `j`/`k` or the arrows move, `g`/`G` jump to the ends, `ctrl+d`/`ctrl+u`
 page, `/` filters a list, `Esc` clears a filter or closes a screen, `r`
 refreshes now, `q` quits.
+
+Every verb asks first: `y`/`n` for a bounded one, the target's name (or
+the verb) typed out for a destructive one — removing a sandbox, stopping
+or restarting the unit, abandoning an item, pruning, gc, upgrading. A verb
+the daemon executes (`pause`, `cancel`, `merge`, `retry` …) needs a live
+daemon; the item verbs fall back to the CLI's row-only twin when none is
+running. `--read-only` removes them all.
 
 ## Chat
 
@@ -49,10 +59,40 @@ by typing the number. A merge gate shows **Approve merge**;
 ## A run
 
 Tabs: **Thread** (the transcript `sbxloop run` shows), **Tasks**,
-**Phases** (every attempt with its tokens and turns; spend is never a
-currency), **Landing** (the PR, the rounds, what CI and the reviewer last
-said), **Artifacts**, **Events** (the dense `sbxloop logs` lines; `/` sets
-a type prefix, `f` toggles follow).
+**Phases** (every attempt with its tokens and turns, per persona; spend is
+never a currency), **Landing** (the PR, the rounds, what CI and the
+reviewer last said), **Artifacts**, **Events** (the dense `sbxloop logs`
+lines; `/` sets a type prefix, `f` toggles follow).
+
+The header lists the verbs that apply: `c` cancel (the daemon's current
+run through `ctl cancel`; any other in-flight run as the `sbxloop cancel`
+store write), `C` cancel and retry, `R` retry the item (or, for a run with
+no item, resume it as a detached process here), `u` requeue, `A` abandon,
+`m` approve the merge gate, `w` check a review wait now, `+` grant fix
+rounds, `s`/`S` a shell in the agent / github sandbox (the console hands
+over the terminal and takes it back).
+
+## Queue
+
+`t` retry, `u` requeue, `A` abandon (typed), `w` check the review now,
+`m` approve the merge gate, `n` a new run the daemon's way (the concierge
+files the issue), `N` a detached `sbxloop run` on this host.
+
+## Sandboxes
+
+`s` shell, `x` remove (typed name), `X` stop, `P` prune the orphans
+(typed `prune`), `G` remove run directories past retention (typed `gc`),
+`k` include kept sandboxes in the orphan verdicts.
+
+## Daemon
+
+`p` pause, `u` resume, `a` release every hold, `c`/`C` cancel the current
+run (and retry), `g` graceful stop (typed `stop`), `S`/`T`/`B` start /
+stop / restart the systemd user unit (typed for stop and restart), `D`
+spawn a daemon from this console when there is no unit (`e` stops it),
+`U` run `[daemon] upgrade_command` (typed `upgrade`), `R` resume polling a
+suspended repository. The journal: `/` grep, `l` cycle the level floor,
+`f` follow.
 """
 
 

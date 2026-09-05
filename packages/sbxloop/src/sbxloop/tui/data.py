@@ -19,6 +19,7 @@ from sbxloop.daemon.control import CommandReply
 from sbxloop.daemon.mailbox import MailboxClient
 from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.store import ChatThread, MergeGate, ReviewHold, dispatch_eligible_at
+from sbxloop.daemon.usage import RunUsage, usage_for_run
 from sbxloop.engine.model import RunRecord, TaskRecord
 from sbxloop.events import HostEventTypes
 from sbxloop_worker.protocol import Event
@@ -162,6 +163,7 @@ class RunDetail:
     thread: ChatThread | None
     last_event_ts: float | None
     landing_events: tuple[Event, ...]
+    usage: RunUsage | None = None
 
 
 def build_run_detail(mailbox: MailboxClient, run_id: str) -> RunDetail | None:
@@ -178,6 +180,8 @@ def build_run_detail(mailbox: MailboxClient, run_id: str) -> RunDetail | None:
         if last is not None:
             landing.append(last)
     landing.sort(key=lambda e: e.ts)
+    with mailbox.read_engine() as engine:
+        usage = usage_for_run(engine, run_id)
     return RunDetail(
         record=record,
         tasks=tuple(mailbox.tasks(run_id)),
@@ -188,6 +192,7 @@ def build_run_detail(mailbox: MailboxClient, run_id: str) -> RunDetail | None:
         thread=mailbox.thread_for_run(run_id),
         last_event_ts=mailbox.last_event_ts(run_id),
         landing_events=tuple(landing),
+        usage=usage,
     )
 
 
