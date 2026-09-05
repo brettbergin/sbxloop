@@ -393,7 +393,7 @@ class TestConfigAndInit:
         assert "evil.example.com" in result.output
 
     def test_init_writes_and_refuses_overwrite(self, workdir: Path) -> None:
-        result = runner.invoke(app, ["init"])
+        result = runner.invoke(app, ["init", "--project"])
         assert result.exit_code == 0
         assert (workdir / "sbxloop.toml").is_file()
         # the generated file must itself be valid config
@@ -402,13 +402,13 @@ class TestConfigAndInit:
         config = load_config(cwd=workdir, env={})
         assert config.model == "auto"
 
-        again = runner.invoke(app, ["init"])
+        again = runner.invoke(app, ["init", "--project"])
         assert again.exit_code == 2
-        forced = runner.invoke(app, ["init", "--force"])
+        forced = runner.invoke(app, ["init", "--project", "--force"])
         assert forced.exit_code == 0
 
     def test_init_template_documents_landing_knobs(self, workdir: Path) -> None:
-        result = runner.invoke(app, ["init"])
+        result = runner.invoke(app, ["init", "--project"])
         assert result.exit_code == 0
         text = (workdir / "sbxloop.toml").read_text()
         # landing is always on; its budgets and the merge style are documented
@@ -656,10 +656,10 @@ class TestDaemonCommand:
         result = runner.invoke(app, ["tui", "--help"])
         assert result.exit_code == 0, result.output
         plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
-        assert "--run" in plain and "--read-only" in plain and "--state-dir" in plain
-        assert "--unit" in plain
+        assert "--run" in plain and "--read-only" in plain and "--unit" in plain
+        assert "--state-dir" not in plain  # the home is the home; SBXLOOP_HOME moves it
         result = runner.invoke(
-            app, ["tui", "--state-dir", str(workdir / "nowhere")], env={"COLUMNS": "300"}
+            app, ["tui"], env={"COLUMNS": "300", "SBXLOOP_HOME": str(workdir / "nowhere")}
         )
         assert result.exit_code == 2
         assert "does not exist" in result.output and "sbxloop daemon" in result.output

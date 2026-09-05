@@ -236,6 +236,32 @@ class SbxloopHome:
     def worker_wheels(self) -> Path:
         return self.cache / "worker-wheels"
 
+    @property
+    def uv(self) -> Path:
+        """The uv the home installs and updates itself with."""
+        return self.bin / "uv"
+
+    @property
+    def python(self) -> Path:
+        """Where uv keeps the interpreters it installs for this home."""
+        return self.root / "python"
+
+    @property
+    def sbx_prefix(self) -> Path:
+        """Docker's sbx, installed by its own installer with this PREFIX."""
+        return self.root / "sbx"
+
+    @property
+    def sbx_binary(self) -> Path:
+        return self.sbx_prefix / "bin" / "sbx"
+
+    @property
+    def sbx_version_file(self) -> Path:
+        return self.sbx_prefix / "VERSION"
+
+    def unit(self, name: str) -> Path:
+        return self.systemd / name
+
     def run_dir(self, run_id: str) -> Path:
         return self.runs / run_id
 

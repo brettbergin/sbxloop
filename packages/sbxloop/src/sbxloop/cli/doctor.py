@@ -1275,6 +1275,62 @@ def collect_checks(
     return checks
 
 
+def _launcher_checks(home: SbxloopHome, env: dict[str, str]) -> list[Check]:
+    """The launchers and units `sbxloop init` wrote: present, and the ones
+    this host resolves. Soft rows — a developer checkout running from `uv
+    run` has neither, and a Mac has no systemd."""
+    from sbxloop.homeinit import UNIT_NAMES
+
+    checks: list[Check] = []
+    if home.launcher.exists():
+        resolved = shutil.which("sbxloop", path=env.get("PATH"))
+        on_path = resolved is not None and Path(resolved).resolve() == home.launcher.resolve()
+        checks.append(
+            Check(
+                "launcher",
+                on_path,
+                f"{home.launcher}"
+                + (
+                    ""
+                    if on_path
+                    else f" is not what `sbxloop` resolves to ({resolved or 'nothing'})"
+                ),
+                hard=False,
+            )
+        )
+    else:
+        checks.append(
+            Check("launcher", False, f"no {home.launcher}; run `sbxloop init`", hard=False)
+        )
+    if home.sbx_binary.exists():
+        version = (
+            home.sbx_version_file.read_text().strip() if home.sbx_version_file.exists() else "?"
+        )
+        checks.append(Check("sbx in home", True, f"{home.sbx_binary} ({version})", hard=False))
+    if shutil.which("systemctl") is not None:
+        home_dir = Path(env.get("HOME") or Path.home())
+        user_units = home_dir / ".config" / "systemd" / "user"
+        problems: list[str] = []
+        for name in UNIT_NAMES:
+            rendered = home.unit(name)
+            link = user_units / name
+            if not rendered.exists():
+                problems.append(f"{name} not rendered")
+            elif not link.is_symlink() or link.resolve() != rendered.resolve():
+                problems.append(f"{name} not linked from {user_units}")
+        checks.append(
+            Check(
+                "units",
+                not problems,
+                "; ".join(problems) + "; run `sbxloop init --systemd`"
+                if problems
+                else f"linked from {home.systemd}",
+                hard=False,
+            )
+        )
+    return checks
+
+
 def home_checks(home: SbxloopHome, env: dict[str, str]) -> list[Check]:
     """The home (:mod:`sbxloop.paths`): laid out by ``sbxloop init``, whole,
     writable, and the only layout on this host.
@@ -1326,6 +1382,7 @@ def home_checks(home: SbxloopHome, env: dict[str, str]) -> list[Check]:
                 + ("" if mode == 0o600 else "; run `chmod 600` on it"),
             )
         )
+    checks.extend(_launcher_checks(home, env))
     legacy = legacy_paths(home, env, cwd=Path.cwd())
     if legacy:
         checks.append(

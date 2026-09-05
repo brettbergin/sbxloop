@@ -1,0 +1,33 @@
+# github-runner.service — rendered by `sbxloop init --systemd --runner DIR`.
+# Only needed for the automated upgrade workflow (docs/deploy.md): a
+# self-hosted Actions runner on the daemon host, as the daemon's user, which
+# is what lets a workflow `systemctl --user restart sbxloop-daemon`. A host
+# upgraded by hand does not need this unit.
+[Unit]
+Description=GitHub Actions runner (automated sbxloop upgrades)
+Documentation=https://github.com/brettbergin/sbxloop/blob/main/docs/deploy.md
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=@RUNNER@
+ExecStart=@RUNNER@/run.sh
+Restart=always
+RestartSec=10
+# A *user* unit, not GitHub's ./svc.sh system unit: a system service has no
+# XDG_RUNTIME_DIR or DBUS_SESSION_BUS_ADDRESS, so `systemctl --user restart
+# sbxloop-daemon` fails there with "Failed to connect to bus". Inside the user
+# manager it works natively — `sbxloop init --systemd` enables lingering.
+#
+# KillMode=process: run.sh finishes its in-flight job on SIGTERM, and stopping
+# the runner must never cut off a deploy that is mid-restart.
+KillMode=process
+KillSignal=SIGTERM
+TimeoutStopSec=300
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,32 @@
+# sbxloop-daemon.service — rendered by `sbxloop init --systemd` for the home
+# at @HOME@ and linked into ~/.config/systemd/user; edit the home's config,
+# not this file (a re-run of init rewrites it).
+[Unit]
+Description=sbxloop daemon — one run per ask, from build to merged PR
+Documentation=https://github.com/brettbergin/sbxloop
+After=network-online.target sbx-sandboxd.service
+Wants=network-online.target
+# The sandbox backend must be up first — a run cannot provision without it.
+Requires=sbx-sandboxd.service
+# Restart rate limiting is a [Unit] setting (under [Service] systemd ignores it).
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# The home is the working directory: config, secrets, state, runs, logs all
+# live under it, and every `sbxloop` command answers the same from anywhere.
+WorkingDirectory=@HOME@
+Environment=SBXLOOP_HOME=@HOME@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@HOME@/bin/sbxloop daemon
+Restart=always
+RestartSec=30
+# Must exceed [daemon].shutdown_grace_s (default 60) plus sandbox teardown.
+# An interrupted run is resumable by design; the daemon recovers it on the
+# next start, so a long stop wait buys nothing.
+TimeoutStopSec=120
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
