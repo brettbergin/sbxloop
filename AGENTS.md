@@ -92,7 +92,10 @@ Each of these has broken a real run when violated.
      gate)
   4. `uv run mypy`
   5. `make security` (bandit)
-  6. `uv run pytest -q -n 8` — the full suite, not a subset
+  6. `make test-fast` (`pytest -m "not slow"`, ~2 min) on every commit;
+     `make test` — the ~770 process-bound `slow` tests too, ~15 min — or
+     CI, which runs all of it sharded, before a merge. Never a hand-picked
+     subset in place of either.
 - `sbxloop.toml.example` at the root is a symlink into
   `packages/sbxloop/src/sbxloop/data/`. Edit the target; update
   `tests/unit/test_examples.py` when keys change.

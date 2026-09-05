@@ -1171,6 +1171,7 @@ def lib_v2(lib: Path, lib_bare: Path) -> str:
     return rev(lib)
 
 
+@pytest.mark.slow
 class TestSubmodules:
     """#692: a run clone's submodules are populated, from the host checkout
     when it can, and a moved gitlink surfaces as a ``160000`` change with
@@ -1492,6 +1493,7 @@ def is_pointer(path: Path) -> bool:
 
 
 @needs_git_lfs
+@pytest.mark.slow
 class TestLfs:
     """#693: a run clone is cut with pointer files and populated from the
     host checkout's store first, the repository's LFS endpoint second —
