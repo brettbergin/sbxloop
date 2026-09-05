@@ -553,14 +553,16 @@ class TestRunStates:
             "cancelled",
             "gated",
             "awaiting_review",
+            "held",
         } == TERMINAL_RUN_STATES
         # A finished run is finished; a stopped one may be picked up again.
         # `gated` is finished too: the approve path lands the PR with gh ops
         # alone, never by resuming an engine. `awaiting_review` is both: an
         # approval lands it with gh ops, a changes-requested review resumes
-        # it for a fix round (#675).
+        # it for a fix round (#675). `held` is both as well: a workload
+        # parked at publishing (#760) whose release *is* a resume.
         assert {"merged", "completed", "gated"}.isdisjoint(RESUMABLE_RUN_STATES)
-        assert {"failed", "blocked", "cancelled", "awaiting_review"} <= RESUMABLE_RUN_STATES
+        assert {"failed", "blocked", "cancelled", "awaiting_review", "held"} <= RESUMABLE_RUN_STATES
         assert {"created", "provisioning", "decomposing", "building"} <= RESUMABLE_RUN_STATES
 
     def test_legacy_state_names_are_gone(self) -> None:

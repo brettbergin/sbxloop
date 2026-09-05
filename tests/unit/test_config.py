@@ -972,6 +972,7 @@ class TestWorkloads:
             "\n"
             "[[workloads]]\n"
             'name = "bare"\n'
+            'publish = "hold"\n'
             "\n"
             "[workload]\n"
             'default = "research"\n'
@@ -989,6 +990,7 @@ class TestWorkloads:
         assert not research.covers_host("other.example.org")
         assert (bare.egress, bare.credentials, bare.sinks, bare.repo) == ([], [], [], False)
         assert bare.budgets.set_keys == []
+        assert bare.publish == "hold"  # a held profile parks at publishing (#760)
         assert config.workload_profile() is research
         assert config.workload_profile("bare") is bare
 
@@ -1055,8 +1057,8 @@ class TestWorkloads:
                 "sinks",
             ),
             (
-                '[[workloads]]\nname = "research"\npublish = "hold"\n',
-                'publish = "hold" is not available yet',
+                '[[workloads]]\nname = "research"\npublish = "later"\n',
+                "publish",
             ),
             (
                 '[[workloads]]\nname = "research"\nbudgets = { max_tasks = 0 }\n',

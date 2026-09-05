@@ -53,6 +53,7 @@ COMMANDS: tuple[str, ...] = (
     "retry <item>",
     "requeue <item>",
     "merge <item|run>",
+    "release <item|run>",
     "grant-rounds <run> <n>",
     "resume-repo <owner/name>",
     "log [--tail N] [--level LEVEL] [--grep TEXT]",
@@ -404,16 +405,18 @@ def _dispatch(
             "for good.",
             after=loop.request_stop,
         )
-    if word in ("merge", "approve"):
-        # The opt-in merge gate's approval ([landing] merge_gate). Fast:
-        # it only flips the store row and spawns the landing thread, so it
-        # is safe on a gateway event loop — the gh work happens elsewhere.
+    if word in ("merge", "approve", "release"):
+        # The opt-in merge gate's approval ([landing] merge_gate), or a
+        # held workload's release (#760) — one gate row either way. Fast:
+        # it only flips the store row (and spawns the landing thread for a
+        # merge), so it is safe on a gateway event loop — the gh work
+        # happens elsewhere.
         if len(args) != 1:
-            return CommandReply(f"usage: `{prefix} merge <item|run>`", ok=False)
+            return CommandReply(f"usage: `{prefix} {word} <item|run>`", ok=False)
         try:
             text = loop.approve_merge(args[0], by=by)
         except (KeyError, ValueError) as exc:
-            return CommandReply(f"merge failed: {exc.args[0] if exc.args else exc}", ok=False)
+            return CommandReply(f"{word} failed: {exc.args[0] if exc.args else exc}", ok=False)
         return CommandReply(text)
     if word in ITEM_COMMANDS:
         return _item_command(loop, word, args, by)

@@ -182,6 +182,7 @@ prints. While the daemon is *starting* they wait.
 | any other in-flight run         | `c` cancel                                               | the `sbxloop cancel` store write: cancelled at its next phase boundary                         |
 | a run pinned to an item         | `R` retry · `u` requeue · `A` abandon · `w` check review | `ctl retry / requeue / abandon / resume <item>` when live; the row-only twin when down         |
 | a gated run                     | `m` approve merge                                        | `ctl merge <item>`; the Thread tab's **Approve merge** button is the chat twin                 |
+| a held workload result          | `m` release                                              | `ctl release <item>`; the Thread tab's **Release result** button is the chat twin              |
 | a run that exhausted its rounds | `+` grant rounds                                         | `ctl grant-rounds <run> <n>`: more fix rounds, resumed now                                     |
 | an unfinished run with no item  | `R` resume here                                          | a detached `sbxloop resume RUN --no-tui --no-chat` in its own session, log under the state dir |
 | any run                         | `s` / `S` shell                                          | `sbx exec` into the agent / github sandbox with the terminal handed over                       |

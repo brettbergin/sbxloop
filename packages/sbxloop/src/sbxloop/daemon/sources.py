@@ -148,6 +148,7 @@ class WorkSource(Protocol):
     ) -> bool: ...
     def report_gated(self, item: WorkItem, pr_number: int | None, pr_url: str) -> bool: ...
     def report_completed(self, item: WorkItem, report: RunReport) -> bool: ...
+    def report_held(self, item: WorkItem) -> bool: ...
 
 
 def _cancel_lines(report: RunReport) -> list[str]:
@@ -940,6 +941,26 @@ class GitHubIssueSource:
 
         return bool(self._guard("completed report", go))
 
+    def report_held(self, item: WorkItem) -> bool:
+        """A workload parked at publishing by its profile's ``publish =
+        "hold"`` (#760): judged and kept, nothing delivered yet. The issue
+        stays open and in progress — no label speaks for a wait — and the
+        comment says how to release it."""
+
+        def go(ops: GithubOps) -> bool:
+            self._comment(
+                ops,
+                item.source_key,
+                "The result is ready and sbxloop is holding it (the profile's "
+                '`publish = "hold"`). Release it from the run\'s chat thread, with '
+                f"`!sbx release {item.item_id}` in chat, or with "
+                f"`sbxloop daemon ctl release {item.item_id}` on the daemon host; "
+                f"`!sbx abandon {item.item_id}` drops it unpublished. There is no deadline.",
+            )
+            return True
+
+        return bool(self._guard("held report", go))
+
     def report_retry(self, item: WorkItem, error: str, attempts_left: int) -> None:
         self._guard(
             "retry comment",
@@ -1320,6 +1341,9 @@ class MultiRepoIssueSource:
     def report_completed(self, item: WorkItem, report: RunReport) -> bool:
         return self.for_item(item).report_completed(item, report)
 
+    def report_held(self, item: WorkItem) -> bool:
+        return self.for_item(item).report_held(item)
+
 
 def build_github_source(
     ops: Callable[[], GithubOps],
@@ -1450,6 +1474,10 @@ class ChatSource:
         )
         return True
 
+    def report_held(self, item: WorkItem) -> bool:
+        log.info("chat.held", item=item.item_id, run_id=item.run_id)
+        return True
+
 
 class CompositeSource:
     """The GitHub source and the chat source behind one queue (#760).
@@ -1514,3 +1542,6 @@ class CompositeSource:
 
     def report_completed(self, item: WorkItem, report: RunReport) -> bool:
         return self.for_item(item).report_completed(item, report)
+
+    def report_held(self, item: WorkItem) -> bool:
+        return self.for_item(item).report_held(item)

@@ -914,6 +914,7 @@ class LoopEngine:
                     "completed",
                     "gated",
                     "awaiting_review",
+                    "held",
                 ):
                     self._keep_on_failure(run_id, pair)
         except SbxloopError:
@@ -1479,7 +1480,11 @@ class LoopEngine:
         task's declared checks over the finished workspace, the way the
         gate re-runs the project's; publish hands the result to its sinks.
         A red judgment ends the run named; so does a sink that could not
-        take the result (#759).
+        take the result (#759). A profile with ``publish = "hold"`` parks
+        the run ``held`` between the two (#760): the result is judged and
+        persisted, nothing is published, and the release is a resume at
+        the publishing stage — which is why a resume entering *at*
+        ``publishing`` never holds again.
         """
         if stage not in ("judging", "publishing"):
             failed = self._run_phases(p)
@@ -1493,6 +1498,9 @@ class LoopEngine:
                 if reason is not None:
                     return "failed", reason
                 stage = "publishing"
+                held = self._hold_before_publish(p)
+                if held is not None:
+                    return "held", held
             elif stage == "publishing":
                 reason = self._stage_publish(p)
                 if reason is not None:
@@ -1714,6 +1722,24 @@ class LoopEngine:
         return bool(failed_ids or skipped_ids)
 
     # -- a workload's needs (#758) -----------------------------------------
+
+    def _hold_before_publish(self, p: Pipeline) -> str | None:
+        """Park the run instead of publishing when its profile says
+        ``publish = "hold"``: the stage is stamped ``publishing`` first, so
+        the release — ``resume`` — re-enters exactly there. Returns the
+        reason the run stopped, None to publish now."""
+        profile = self.config.workload_profile()
+        if profile is None or profile.publish != "hold":
+            return None
+        tasks = self.store.get_tasks(p.run_id)
+        declared = sinks.sinks_declared(tasks)
+        self._set_run_state(p.run_id, "publishing")
+        log.info("run.held", run=p.run_id, profile=profile.name, sinks=declared)
+        self.bus.emit(HostEventTypes.RUN_HELD, p.run_id, profile=profile.name, sinks=declared)
+        return (
+            f'held at publishing by [[workloads]] {profile.name!r} publish = "hold" — '
+            "the result is judged and kept; release it to publish"
+        )
 
     def _profile_egress(self, kind: RunKind) -> list[str]:
         """The hosts a workload's profile lets its plan ask for; nothing for

@@ -210,7 +210,14 @@ def cancel_current(deps: Deps, *, retry: bool = False) -> Action:
     )
 
 
-def merge(deps: Deps, target: str) -> Action:
+def merge(deps: Deps, target: str, *, held: bool = False) -> Action:
+    if held:
+        return ctl_action(
+            deps,
+            f"release {target}",
+            title=f"release the held result of {target}",
+            prompt=f"Release {target}'s held result? The daemon publishes it on its next tick.",
+        )
     return ctl_action(
         deps,
         f"merge {target}",

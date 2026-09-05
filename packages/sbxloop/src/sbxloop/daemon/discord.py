@@ -706,7 +706,9 @@ GATE_CUSTOM_ID_PREFIX = "sbxgate:"
 
 
 class _GateHandler:
-    """The transport-free half of a merge-gate approve button.
+    """The transport-free half of a gate button — approve a parked merge,
+    or release a held workload result (#760); ``approve_merge`` tells them
+    apart by the gate's kind.
 
     A click is one call into ``DaemonLoop.approve_merge`` — store CAS plus
     a spawned gh-ops landing thread — run off the gateway's event loop and
@@ -721,6 +723,7 @@ class _GateHandler:
 
     async def on_click(self, interaction: Any) -> None:
         author = _interaction_author(interaction)
+        verb = "release" if getattr(self.gate, "kind", "merge") == "publish" else "merge"
         loop_ref = getattr(self.bridge, "loop_ref", None)
         if loop_ref is None:
             await _ack_interaction(interaction, "daemon loop not attached")
@@ -730,10 +733,10 @@ class _GateHandler:
                 None, functools.partial(loop_ref.approve_merge, self.gate.run_id, by=author)
             )
         except (KeyError, ValueError) as exc:
-            reply = f"merge failed: {exc.args[0] if exc.args else exc}"
+            reply = f"{verb} failed: {exc.args[0] if exc.args else exc}"
         except Exception:
             log.warning("discord.gate_click_failed", run=self.gate.run_id, exc_info=True)
-            reply = "something went wrong approving the merge — `!sbx merge` still works"
+            reply = f"something went wrong — `!sbx {verb}` still works"
         await _ack_interaction(interaction, str(reply))
 
 
@@ -764,7 +767,9 @@ def _build_gate_view(bridge: Any, gate: Any) -> Any:
     try:
         view = _GateView()
         button = button_cls(
-            label="Approve merge",
+            label="Release result"
+            if getattr(gate, "kind", "merge") == "publish"
+            else "Approve merge",
             style=style,
             custom_id=f"{GATE_CUSTOM_ID_PREFIX}{gate.custom_id}"[:100],
         )

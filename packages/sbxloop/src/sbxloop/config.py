@@ -1923,9 +1923,13 @@ class WorkloadProfile(_ConfigModel):
     outside the profile fails the run closed, naming the key here that
     would have allowed it.
 
-    ``publish = "hold"`` will park a finished run at publishing until a
-    human releases it, on the daemon's merge-gate button; it arrives with
-    the daemon's workload intake (#760) and is refused until then.
+    ``publish = "hold"`` parks a finished run at its publishing stage —
+    judged, persisted, nothing delivered — until a person releases it
+    (#760): the daemon posts a release prompt in the run's thread (a button
+    where the backend has one) and `!sbx release <item>` or
+    `sbxloop daemon ctl release <item>` work everywhere; a CLI run resumes
+    with `sbxloop resume <run>`. ``auto`` (the default) publishes as soon
+    as the judge passes.
     """
 
     name: str
@@ -1964,17 +1968,6 @@ class WorkloadProfile(_ConfigModel):
     @classmethod
     def _dedupe(cls, value: list[Any]) -> list[Any]:
         return list(dict.fromkeys(value))
-
-    @field_validator("publish")
-    @classmethod
-    def _hold_not_yet(cls, value: WorkloadPublish) -> WorkloadPublish:
-        if value == "hold":
-            raise ValueError(
-                'workloads[].publish = "hold" is not available yet: a held run needs the '
-                "daemon's release button, which arrives with the workload intake; "
-                'use "auto" (the default)'
-            )
-        return value
 
     def covers_host(self, host: str) -> bool:
         from sbxloop.policy import pattern_covers

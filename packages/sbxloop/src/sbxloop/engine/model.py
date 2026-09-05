@@ -46,6 +46,7 @@ RunState = Literal[
     "cancelled",
     "gated",
     "awaiting_review",
+    "held",
 ]
 
 # The post-build stages in order. `runs.stage` records the last non-terminal
@@ -98,8 +99,12 @@ TERMINAL_TASK_STATES: frozenset[str] = frozenset({"done", "failed", "skipped"})
 # is cleared, no sandbox is kept, and a person on GitHub ends the wait.
 # Terminal for liveness; resumable, because a reviewer's changes-requested
 # is a fix round the engine runs (`resume` re-enters the landing stage).
+# `held` is a workload parked at its publishing stage by a profile's
+# `publish = "hold"` (#760): the result is judged and persisted, no sandbox
+# is kept, and a person releases it. Terminal for liveness; resumable,
+# because the release IS a `resume` at the publishing stage.
 TERMINAL_RUN_STATES: frozenset[str] = frozenset(
-    {"merged", "completed", "failed", "blocked", "cancelled", "gated", "awaiting_review"}
+    {"merged", "completed", "failed", "blocked", "cancelled", "gated", "awaiting_review", "held"}
 )
 RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
     {
@@ -113,6 +118,7 @@ RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
         "blocked",
         "cancelled",
         "awaiting_review",
+        "held",
     }
 )
 

@@ -1475,6 +1475,41 @@ class TestSinks:
         assert [p.sink for p in resumed.published] == ["issue", "chat"]
         assert harness.run_states() == ["provisioning", "publishing", "completed"]
 
+    def test_a_hold_profile_parks_the_run_and_a_resume_releases_it(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        """`publish = "hold"` (#760): the run ends `held` at the publishing
+        stage with nothing delivered and no sandbox kept; the release is a
+        resume, which publishes once and never holds again."""
+        fake = FakeGithub()
+        held = {**PUBLISHING, "publish": "hold"}
+        harness.script([plan(needing("t1", sink="issue"), needing("t2")), BUILD, PASS, BUILD, PASS])
+        engine = harness.engine(
+            **{**profiled, "workloads": [held]}, ops=fake, github={"repo": fake.repo}
+        )
+        result = engine.start("file it", kind="workload")
+        assert result.state == "held"
+        assert result.reason is not None and 'publish = "hold"' in result.reason
+        assert result.published == [] and self.published(harness) == []
+        assert fake.issues_created == []
+        assert result.kept_sandboxes == [] and harness.sandboxes_left() == []
+        (parked,) = [e for e in harness.events if e.type == HostEventTypes.RUN_HELD]
+        assert parked.data == {"profile": "research", "sinks": ["issue", "chat"]}
+        record = engine.store.get_run(result.run_id)
+        assert (record.state, record.stage) == ("held", "publishing")
+        assert harness.run_states()[-2:] == ["publishing", "held"]
+
+        harness.events.clear()
+        harness.script([])
+        resumed = harness.engine(
+            **{**profiled, "workloads": [held]}, ops=fake, github={"repo": fake.repo}
+        ).resume(result.run_id)
+        assert resumed.state == "completed", resumed.reason
+        assert [p.sink for p in resumed.published] == ["issue", "chat"]
+        assert len(fake.issues_created) == 1
+        assert not [e for e in harness.events if e.type == HostEventTypes.RUN_HELD]
+        assert harness.run_states() == ["provisioning", "publishing", "completed"]
+
     def test_a_sink_that_fails_fails_the_run_named(
         self, harness: Harness, profiled: dict[str, Any]
     ) -> None:

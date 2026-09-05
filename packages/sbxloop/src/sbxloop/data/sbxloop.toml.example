@@ -247,10 +247,12 @@ secret_strategy = "proxy"
 # request — delivery is the whole publish; needs `repo`). `repo`: whether a
 # plan may ask for a checkout of a configured repository in its data
 # directory. `budgets`: `[budgets]` keys
-# overridden for this profile's runs. `publish = "hold"` (park a finished
-# run for a human release) arrives with the daemon's workload intake and is
-# refused until then. A workload run with no profile at all may declare no
-# needs.
+# overridden for this profile's runs. `publish`: "auto" (the default)
+# publishes as soon as the judge passes; "hold" parks the finished run —
+# judged, kept, nothing delivered — until a person releases it (the run's
+# chat thread, `!sbx release <item>`, `sbxloop daemon ctl release <item>`,
+# or `sbxloop resume <run>` for a CLI run). A workload run with no profile
+# at all may declare no needs.
 # [[workloads]]
 # name = "research"
 # description = "read the web, call the weather API, report in the thread"

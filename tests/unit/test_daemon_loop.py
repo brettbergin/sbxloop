@@ -169,16 +169,21 @@ class Harness:
             raise WorkerError("decompose produced invalid output twice")
         if not resume:
             self.store.create_run(run_id, "outcome", kind=item.kind)
-        if item.kind == "workload" and kind == "completed":
+        if item.kind == "workload" and kind in ("completed", "held"):
             # The engine's shape for a published workload (#759): tasks
-            # with outputs and one `Published` row per sink.
+            # with outputs and one `Published` row per sink — or, `held`,
+            # the same tasks parked at publishing with nothing delivered
+            # (#760).
             self.store.save_tasks(run_id, [TaskSpec(id="t1", title="Answer")])
             (task,) = self.store.get_tasks(run_id)
             task.state, task.output = "done", TaskOutput(summary="the answer is 42")
             self.store.update_task(run_id, task)
-            self.store.add_run_published(
-                run_id, Published(sink="chat", location="chat", tasks=["t1"])
-            )
+            if kind == "held":
+                self.store.set_run_state(run_id, "publishing")
+            else:
+                self.store.add_run_published(
+                    run_id, Published(sink="chat", location="chat", tasks=["t1"])
+                )
         reason = None
         if kind == "exhausted":
             # The engine's shape for a run one round short (#523): PR open,

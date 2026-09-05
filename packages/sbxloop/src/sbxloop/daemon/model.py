@@ -19,7 +19,10 @@ from sbxloop.ghids import normalize_item_id
 # is the opt-in merge gate (``[landing] merge_gate``): the run cleared every
 # bar and parked awaiting one merge approval — a *waiting* state, not a
 # terminal one (never superseded by rediscovery, invisible to dispatch),
-# resolved by ``approve_merge`` or ``abandon``. ``awaiting_review`` (#675)
+# resolved by ``approve_merge`` or ``abandon`` — and the same row state
+# holds a workload parked at publishing by `publish = "hold"` (#760), its
+# gate row of kind ``publish``, released by ``approve_merge`` re-queueing
+# the item with its run pinned. ``awaiting_review`` (#675)
 # is the same shape for a base that requires an approving review the loop
 # cannot give: the run stays pinned, the daemon polls the PR slowly, and a
 # person on GitHub ends it. ``paused_review`` is that wait past
@@ -43,8 +46,9 @@ ItemState = Literal[
 # ``gated`` is the park announcement: the issue gets the awaiting-merge
 # label and the how-to-approve comment.
 # ``completed`` is a workload's outcome (#760): its result published, the
-# source told where it went.
-PendingReport = Literal["abandoned", "requeued", "merged", "blocked", "gated", "completed"]
+# source told where it went. ``held`` is a workload parked at publishing by
+# its profile's `publish = "hold"`: the source hears how to release it.
+PendingReport = Literal["abandoned", "requeued", "merged", "blocked", "gated", "completed", "held"]
 
 
 class WorkItem(BaseModel):
@@ -180,6 +184,7 @@ TickOutcome = Literal[
     "blocked",
     "gated",
     "awaiting_review",
+    "held",
     "interrupted",
     "cancelled",
     "requeued",
@@ -244,6 +249,8 @@ NoticeKind = Literal[
     "run.blocked",
     "run.gated",
     "run.awaiting_review",
+    "run.held",
+    "run.released",
     "run.review_paused",
     "run.review_resumed",
     "run.cancelled",
@@ -278,6 +285,7 @@ TERMINAL_NOTICE_KINDS: frozenset[str] = frozenset(
         "run.blocked",
         "run.gated",
         "run.awaiting_review",
+        "run.held",
         "run.review_paused",
         "run.cancelled",
         "run.requeued",
