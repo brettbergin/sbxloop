@@ -612,7 +612,7 @@ secret_strategy = "proxy"
 # tool_batch_lines = 8             # verbose: consecutive tool calls per code block
 # tool_output_lines = 0            # tail output lines echoed for a successful call (0 = none)
 # tool_fail_output_lines = 20      # head+tail output lines echoed for a failed call
-# max_attachment_bytes = 10000000  # named by host path on Slack (uploads: #763)
+# max_attachment_bytes = 10000000  # named by host path on Slack (uploads are a follow-on)
 # max_attachment_bytes = 10000000  # a workload result's files ride the thread as
 #                                  # uploads up to this size (Discord's unboosted cap);
 #                                  # larger ones are named by host path. 0 = name all
