@@ -573,13 +573,28 @@ secret_strategy = "proxy"
 # tool_output_lines = 0
 # tool_fail_output_lines = 20
 
+# [tui]
+# The operator console, `sbxloop tui`, run on the daemon host — always on,
+# no channel or token to configure. The daemon keeps a local chat mailbox
+# in state.db with the same headline, thread, steering, concierge and
+# merge-gate experience [discord] / [slack] give, and the console attaches
+# to it. The rendering knobs are the ones [discord] / [slack] share
+# (command_prefix, thread_per_run, chronology_level, max_message_chars,
+# embeds, status_line, tool_batch_lines, tool_output_lines,
+# tool_fail_output_lines); these are the terminal's own.
+# operator_id = ""                 # who the console speaks as; "" = the login name
+# emoji = true                     # glyph markers in the console (false: ASCII)
+# daemon_unit = "sbxloop-daemon"   # the systemd --user unit it tails and can restart
+# refresh_s = 0.5                  # how often a live screen re-reads the store
+# retention_days = 14              # mailbox rows pruned past this (0 keeps them)
+
 # [concierge]
 # The control channel's agent: @mention the bot (or reply to it) to ask
 # about runs, PRs and diffs, operate the daemon (every !sbx verb) or queue
 # new work in plain language. Runs as a Copilot session in a long-lived
 # agent sandbox and reaches the daemon only through host tools; needs
 # COPILOT_GITHUB_TOKEN on the daemon host. Acts with the same authority as
-# !sbx. Effective only when a [chat] backend ([discord] or [slack]) is on.
+# !sbx. Answers the operator console too, so it runs whenever enabled.
 # enabled = true
 # model = ""                       # empty = the top-level model
 # timeout_s = 180                  # one message's wall-clock budget

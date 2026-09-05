@@ -1694,9 +1694,9 @@ def daemon(
     if ctx.invoked_subcommand is not None:
         return
     from sbxloop.daemon.agentbox import DaemonAgent
-    from sbxloop.daemon.chat import ChatBridge, build_bridge
     from sbxloop.daemon.concierge import Concierge
     from sbxloop.daemon.control import ControlServer
+    from sbxloop.daemon.fanout import FanoutFrontend, build_frontend
     from sbxloop.daemon.github import DaemonGithub
     from sbxloop.daemon.logsink import event_log_subscriber
     from sbxloop.daemon.loop import DaemonLoop
@@ -1930,7 +1930,8 @@ def daemon(
         merge_gate=config.landing.merge_gate,
         chat=config.chat_backend or "off",
         chat_channel=(config.chat_settings.channel_ref if config.chat_settings else None),
-        concierge=("on" if config.chat_backend and config.concierge.enabled else "off"),
+        tui="on",
+        concierge=("on" if concierge_wanted(config, once=once) else "off"),
         log_level=config.daemon.log_level,
         log_format=config.daemon.log_format,
         once=once,
@@ -1972,61 +1973,63 @@ def daemon(
         check_pypi=config.daemon.version_check,
         upgrade_command=config.daemon.upgrade_command,
     )
-    bridge: ChatBridge | None = None
     concierge: Concierge | None = None
-    bridge = build_bridge(config, dstore, loop_ref=loop)
-    if bridge is not None:
-        try:
-            bridge.start()
-        except SbxloopError as exc:
-            log.error("chat.bridge_failed", backend=bridge.backend, error=str(exc), exc_info=True)
-            raise typer.Exit(2) from exc
-        loop.frontend = bridge
-        if archived is not None:
-            bridge.daemon_notice(
-                DaemonNotice(
-                    kind="daemon.state_archived",
-                    text=f"pre-1.0 daemon state moved aside to {archived}; starting fresh",
-                    level="warning",
-                )
+    # Every bridge at once: the [chat] backend's when one is configured, and
+    # always the operator console's local one (`sbxloop tui`).
+    frontend: FanoutFrontend = build_frontend(config, dstore, loop_ref=loop)
+    try:
+        frontend.start()
+    except SbxloopError as exc:
+        log.error("chat.bridge_failed", error=str(exc), exc_info=True)
+        raise typer.Exit(2) from exc
+    loop.frontend = frontend
+    if archived is not None:
+        frontend.daemon_notice(
+            DaemonNotice(
+                kind="daemon.state_archived",
+                text=f"pre-1.0 daemon state moved aside to {archived}; starting fresh",
+                level="warning",
             )
-        if stranded:
-            listed = "\n".join(f"- {i.item_id} {i.url}".rstrip() for i in stranded)
-            bridge.daemon_notice(
-                DaemonNotice(
-                    kind="daemon.repoless_items_stranded",
-                    text=(
-                        f"{len(stranded)} in-flight work item(s) could not be "
-                        "attributed to a configured repository after the multi-repo "
-                        "upgrade and were failed. Their issues still carry the "
-                        "in-progress label and will not be rediscovered — clear it "
-                        f"by hand:\n{listed}"
-                    ),
-                    level="warning",
-                )
+        )
+    if stranded:
+        listed = "\n".join(f"- {i.item_id} {i.url}".rstrip() for i in stranded)
+        frontend.daemon_notice(
+            DaemonNotice(
+                kind="daemon.repoless_items_stranded",
+                text=(
+                    f"{len(stranded)} in-flight work item(s) could not be "
+                    "attributed to a configured repository after the multi-repo "
+                    "upgrade and were failed. Their issues still carry the "
+                    "in-progress label and will not be rediscovered — clear it "
+                    f"by hand:\n{listed}"
+                ),
+                level="warning",
             )
-        if config.concierge.enabled and not once:
-            # The control channel's agent: its own event bus (the log sink
-            # sees its turns like any agent session) and a long-lived agent
-            # sandbox provisioned in the background, so the first mention
-            # does not pay the microVM boot. Built after the bridge so a
-            # missing bot token exits before any sandbox work starts.
-            concierge_bus = EventBus()
-            concierge_bus.subscribe(event_log_subscriber)
-            concierge = Concierge(
-                config,
-                loop=loop,
-                dstore=dstore,
-                store_factory=lambda: _store(config),
-                github=github,
-                host=DaemonAgent(config, sbx, concierge_bus, worker_python=config.worker_python),
-                bus=concierge_bus,
-                versions=versions,
-                on_watch=bridge.on_watch,
-                thread_link=bridge.thread_link,
-            )
-            bridge.concierge = concierge
-            concierge.warm_up()
+        )
+    if concierge_wanted(config, once=once):
+        # The control channel's agent: its own event bus (the log sink
+        # sees its turns like any agent session) and a long-lived agent
+        # sandbox provisioned in the background, so the first mention
+        # does not pay the microVM boot. Built after the bridges so a
+        # missing bot token exits before any sandbox work starts. It is
+        # built whenever it is enabled: the local bridge always exists,
+        # so a headless daemon's console can talk to it too.
+        concierge_bus = EventBus()
+        concierge_bus.subscribe(event_log_subscriber)
+        concierge = Concierge(
+            config,
+            loop=loop,
+            dstore=dstore,
+            store_factory=lambda: _store(config),
+            github=github,
+            host=DaemonAgent(config, sbx, concierge_bus, worker_python=config.worker_python),
+            bus=concierge_bus,
+            versions=versions,
+            on_watch=frontend.on_watch,
+            thread_link=frontend.thread_link,
+        )
+        frontend.set_concierge(concierge)
+        concierge.warm_up()
 
     if not once and not config.daemon.version_check:
         # #641: the operator switched the PyPI half off — no request leaves
@@ -2043,14 +2046,8 @@ def daemon(
         # question on demand.
         start_drift_check(
             versions,
-            (
-                (
-                    lambda text: bridge.daemon_notice(
-                        DaemonNotice(kind="daemon.version_drift", text=text, level="warning")
-                    )
-                )
-                if bridge is not None
-                else None
+            lambda text: frontend.daemon_notice(
+                DaemonNotice(kind="daemon.version_drift", text=text, level="warning")
             ),
         )
 
@@ -2090,9 +2087,8 @@ def daemon(
         cleanup_registry.set_quiesce(None)
         log.debug("daemon.shutdown", step="control server")
         ctl.close()
-        if bridge is not None:
-            log.debug("daemon.shutdown", step="chat bridge")
-            bridge.close()
+        log.debug("daemon.shutdown", step="chat bridges")
+        frontend.close()
         if concierge is not None:
             # Forgets the handle; the concierge sandbox itself is kept for
             # the next daemon process (conversation memory lives in it).
@@ -2106,6 +2102,57 @@ def daemon(
             reason=stop_reason,
             uptime_s=round(time.monotonic() - started_at, 1),
         )
+
+
+@app.command()
+def tui(
+    run: Annotated[
+        str | None, typer.Option("--run", help="Open this run's screen straight away.")
+    ] = None,
+    read_only: Annotated[
+        bool, typer.Option("--read-only", help="Observe only: no daemon commands, no chat.")
+    ] = False,
+    state_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--state-dir", help="The daemon's state directory (default: the daemon's own rule)."
+        ),
+    ] = None,
+) -> None:
+    """The operator console: watch, steer and administer the daemon on this host.
+
+    Reads the daemon's state.db read-only, drives the daemon through the
+    same `ctl` queue `sbxloop daemon ctl` uses, and (from the chat screens)
+    speaks to the daemon's local chat bridge with the same experience a
+    Discord or Slack channel gets.
+    """
+    import getpass
+
+    from sbxloop.tui.app import build_app
+
+    config = load_config()
+    resolved = state_dir if state_dir is not None else _daemon_state_dir()
+    # The daemon stamps its resolved state dir on its config before it
+    # harvests; the console reads artifacts through the same value.
+    config = config.model_copy(update={"state_dir": resolved})
+    operator = config.tui.operator_id or getpass.getuser()
+    try:
+        console_app = build_app(
+            config, resolved, operator_id=operator, read_only=read_only, initial_run=run
+        )
+    except SbxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    console_app.run()
+
+
+def concierge_wanted(config: Config, *, once: bool) -> bool:
+    """Whether this daemon builds the concierge: whenever it is enabled and
+    the daemon is long-lived. The console's local bridge always exists, so
+    a headless daemon has a surface for it too — a host without a chat
+    service now boots the concierge sandbox at start and needs the agent
+    credential (`sbxloop doctor` shows the row)."""
+    return bool(config.concierge.enabled) and not once
 
 
 def _daemon_state_dir() -> Path:

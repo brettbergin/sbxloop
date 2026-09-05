@@ -10,7 +10,9 @@ for the full suite and refreshes the version-keyed verdict cache.
 
 from __future__ import annotations
 
+import getpass
 import json
+import os
 import shutil
 import sqlite3
 import time
@@ -146,23 +148,36 @@ def _repo_token_status(entry: RepoConfig, env: dict[str, str]) -> tuple[bool, st
     return status.ok, status.detail
 
 
+def _login_name() -> str:
+    """Who runs the console by default; a uid where no login name resolves
+    (a container running as an arbitrary user), never an exception."""
+    try:
+        return getpass.getuser()
+    except (OSError, KeyError, ImportError):
+        return str(os.getuid()) if hasattr(os, "getuid") else "operator"
+
+
+def _daemon_state_path(config: Config, sources: dict[str, str], env: dict[str, str]) -> Path:
+    """Where `sbxloop daemon` keeps its state — the same rule the daemon
+    and `sbxloop tui` apply — falling back to the configured state dir."""
+    from sbxloop.daemon.paths import resolve_state_dir
+
+    try:
+        return resolve_state_dir(config, sources, cwd=Path.cwd(), env=env, home=Path.home()).path
+    except Exception:
+        return config.state_dir
+
+
 def daemon_repo_health(
     config: Config, sources: dict[str, str], env: dict[str, str]
 ) -> dict[str, dict[str, Any]]:
     """Per-repository polling health the running daemon persisted (#516),
     by repository, from the daemon's own state db — read only when that
     file exists, so doctor never creates one."""
-    from sbxloop.daemon.paths import resolve_state_dir
     from sbxloop.daemon.sources import REPO_HEALTH_KEY
     from sbxloop.daemon.store import DaemonStore
 
-    try:
-        state_dir = resolve_state_dir(
-            config, sources, cwd=Path.cwd(), env=env, home=Path.home()
-        ).path
-    except Exception:
-        return {}
-    db = state_dir / "state.db"
+    db = _daemon_state_path(config, sources, env) / "state.db"
     if not db.is_file():
         return {}
     out: dict[str, dict[str, Any]] = {}
@@ -1143,30 +1158,44 @@ def collect_checks(
                 hard=False,
             )
         )
-        # ...and its concierge: an agent session on the daemon host's behalf,
-        # so the agent token must be here (the run pair needs it too, but a
-        # chat-only operator may not have noticed). *Which* token follows
-        # [agent] backend, exactly like the credential row above (#533): the
-        # concierge box authenticates with ANTHROPIC_API_KEY under the claude
-        # backend, so naming COPILOT_GITHUB_TOKEN here warned that "mentions
-        # will fail" on a host where nothing was wrong.
-        if config.concierge.enabled:
-            token_env = agent.token_env
-            has_token = agent.has_token(env)
-            checks.append(
-                Check(
-                    "chat concierge",
-                    has_token,
-                    f"model {config.concierge.model or config.model}, "
-                    f"{config.concierge.timeout_s:.0f}s per message: "
-                    + (
-                        f"{token_env} present"
-                        if has_token
-                        else f"{token_env} not set (mentions will fail)"
-                    ),
-                    hard=False,
-                )
+    # The operator console's local bridge is always on: its mailbox lives in
+    # the daemon's state.db and the console attaches as the login user.
+    tui_state = _daemon_state_path(config, sources, env)
+    operator = config.tui.operator_id or _login_name()
+    checks.append(
+        Check(
+            "operator console",
+            True,
+            f"`sbxloop tui` attaches to {tui_state}/state.db as {operator}; "
+            f"unit {config.tui.daemon_unit}",
+            hard=False,
+        )
+    )
+    # ...and the concierge: an agent session on the daemon host's behalf,
+    # so the agent token must be here (the run pair needs it too, but a
+    # chat-only operator may not have noticed). *Which* token follows
+    # [agent] backend, exactly like the credential row above (#533): the
+    # concierge box authenticates with ANTHROPIC_API_KEY under the claude
+    # backend, so naming COPILOT_GITHUB_TOKEN here warned that "mentions
+    # will fail" on a host where nothing was wrong. It answers the console
+    # too, so the row is not gated on a chat backend.
+    if config.concierge.enabled:
+        token_env = agent.token_env
+        has_token = agent.has_token(env)
+        checks.append(
+            Check(
+                "chat concierge",
+                has_token,
+                f"model {config.concierge.model or config.model}, "
+                f"{config.concierge.timeout_s:.0f}s per message: "
+                + (
+                    f"{token_env} present"
+                    if has_token
+                    else f"{token_env} not set (mentions will fail)"
+                ),
+                hard=False,
             )
+        )
 
     # worker wheel
     wheel = resolve_worker_wheel()

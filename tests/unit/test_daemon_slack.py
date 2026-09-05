@@ -670,3 +670,9 @@ class TestAgentBackendLabel:
             assert any(t.strip().startswith("*builder*") and "·" not in t for t in texts)
         finally:
             bridge.close()
+
+
+def test_slack_owns_only_member_ids(tmp_path: Path) -> None:
+    bridge, _, _ = make_bridge(tmp_path)
+    assert bridge._owns_user_id("U0123ABCDEF") and bridge._owns_user_id("W1")
+    assert not bridge._owns_user_id("brett") and not bridge._owns_user_id("123456789012345678")

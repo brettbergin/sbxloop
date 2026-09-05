@@ -50,11 +50,11 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
-from sbxloop.config import ChatBackend, ChatBridgeConfig, Config
+from sbxloop.config import BridgeBackend, ChatBridgeConfig, Config
 from sbxloop.daemon.chat_choices import (
     Choice,
     ChoiceQuestion,
@@ -289,7 +289,7 @@ class ChatBridge(ABC):
     """
 
     #: The ``[chat] backend`` name this bridge serves.
-    backend: ClassVar[ChatBackend]
+    backend: ClassVar[BridgeBackend]
     #: The service's proper name, for attribution ("Discord user `x`") and logs.
     label: ClassVar[str]
     #: How this service spells a user mention in message text.
@@ -486,6 +486,17 @@ class ChatBridge(ABC):
         """``<@id>`` — the same on both services."""
         return f"<@{user_id}>"
 
+    def _owns_user_id(self, user_id: str) -> bool:
+        """Whether ``user_id`` is one this service can address. Requester
+        and watcher ids are backend-less in the store (a work item carries
+        whoever asked, whichever bridge they asked on), so with several
+        bridges running each renders only the ids that are its own rather
+        than a foreign id as a broken mention."""
+        return True
+
+    def _mentions(self, user_ids: Iterable[str]) -> str:
+        return " ".join(self.mention_user(uid) for uid in user_ids if self._owns_user_id(uid))
+
     def _typing(self, channel: Any) -> Any:
         """A "typing…" indicator context while the concierge thinks; a no-op
         where the service has none."""
@@ -636,9 +647,10 @@ class ChatBridge(ABC):
             self._engine = engine
             # Non-blocking subscriber: just enqueue; the pump renders + sends.
             self._unsubscribe = bus.subscribe(lambda ev: self._events.put((run_id, ev)))
-        if item.requested_by:
+        if item.requested_by and self._owns_user_id(item.requested_by):
             # Whoever asked for the work through the concierge is pinged with
-            # the outcome without having to ask for a watch.
+            # the outcome without having to ask for a watch — by the bridge
+            # whose id it is.
             with self._watch_lock:
                 watchers = self._watchers.setdefault(run_id, [])
                 if item.requested_by not in watchers:
@@ -715,7 +727,7 @@ class ChatBridge(ABC):
         point query, the same lookup ``_steer`` already makes for it."""
         if channel_id is None or channel_id == self.chat.channel_ref:
             return False
-        return self.dstore.run_for_thread(channel_id) is not None
+        return self.dstore.run_for_thread(channel_id, self.backend) is not None
 
     def _author_name(self, msg: Inbound) -> str:
         """Who sent a control-channel command, for attribution on the source
@@ -728,7 +740,7 @@ class ChatBridge(ABC):
     def _steer(self, msg: Inbound, text: str) -> None:
         """A message in a run's thread: relay it to the running agent."""
         thread_id = msg.channel_id or ""
-        run_id = self.dstore.run_for_thread(thread_id)
+        run_id = self.dstore.run_for_thread(thread_id, self.backend)
         if run_id is None:
             # Routing already confirmed this thread; losing the row between
             # then and now is a race (state reset mid-message), not traffic.
@@ -792,7 +804,7 @@ class ChatBridge(ABC):
         if store is None:
             return
         try:
-            watches = store.all_run_watches()
+            watches = store.all_run_watches(self.backend)
         except Exception as exc:  # pragma: no cover - defensive
             self.log.warning("chat.watch_reload_failed", error=str(exc), exc_info=True)
             return
@@ -871,7 +883,7 @@ class ChatBridge(ABC):
         if store is None:
             return
         try:
-            store.add_run_watch(run_id, user_id, time.time())
+            store.add_run_watch(run_id, user_id, time.time(), backend=self.backend)
         except Exception as exc:  # pragma: no cover - defensive
             self.log.warning("chat.watch_persist_failed", run=run_id, error=str(exc), exc_info=True)
 
@@ -886,7 +898,7 @@ class ChatBridge(ABC):
         if store is None:
             return
         try:
-            store.clear_run_watch(run_id)
+            store.clear_run_watch(run_id, self.backend)
         except Exception as exc:  # pragma: no cover - defensive
             self.log.warning("chat.watch_evict_failed", run=run_id, error=str(exc), exc_info=True)
 
@@ -901,7 +913,7 @@ class ChatBridge(ABC):
             store = getattr(self, "dstore", None)
             if store is not None:
                 try:
-                    watchers.extend(store.take_run_watchers(run_id))
+                    watchers.extend(store.take_run_watchers(run_id, self.backend))
                 except Exception as exc:  # pragma: no cover - defensive
                     self.log.warning(
                         "chat.watch_take_failed", run=run_id, error=str(exc), exc_info=True
@@ -916,8 +928,8 @@ class ChatBridge(ABC):
         report: RunReport,
         thread: ChatThread | None,
     ) -> str:
-        mentions = " ".join(self.mention_user(uid) for uid in watchers)
-        lines = [f"{mentions} run `{run_id}` finished: **{state}**"]
+        mentions = self._mentions(watchers)
+        lines = [f"{mentions} run `{run_id}` finished: **{state}**".strip()]
         if report.task_summary:
             lines.append(f"tasks: {_one_line(report.task_summary, 200)}")
         if report.pr:
@@ -947,7 +959,7 @@ class ChatBridge(ABC):
         if not watchers:
             return
         try:
-            thread = self.dstore.chat_thread(run_id)
+            thread = self.dstore.chat_thread(run_id, self.backend)
             await self._send_channel(
                 self._watch_notice(run_id, watchers, state, report, thread),
                 mentions=True,
@@ -993,11 +1005,13 @@ class ChatBridge(ABC):
             async with self._typing(channel):
                 future = self.concierge.submit_turn(
                     # author_id is what records the requester on a filed
-                    # issue, so the run's finish can ping them.
+                    # issue, so the run's finish can ping them; via is the
+                    # surface the reply is worded for.
                     text,
                     author=author,
                     author_id=msg.author_id,
                     on_tool=on_tool,
+                    via=self.backend,
                 )
                 reply = await asyncio.wrap_future(future)
         except asyncio.CancelledError:
@@ -1207,7 +1221,7 @@ class ChatBridge(ABC):
     async def _sweep_clarifications_once(self, now: float | None = None) -> None:
         """One sweep: claim (CAS) and fire every ask past its deadline.
         ``now`` is injectable so tests drive expiry without waiting."""
-        due = self.dstore.take_due_clarifications(time.time() if now is None else now)
+        due = self.dstore.take_due_clarifications(time.time() if now is None else now, self.backend)
         for row in due:
             try:
                 await self._fire_clarification(row)
@@ -1777,7 +1791,7 @@ class ChatBridge(ABC):
         """The approval prompt: who it pings, what stands ready, and the
         typed commands that work on every backend (a component backend adds
         its button on top, never instead)."""
-        mentions = " ".join(self.mention_user(uid) for uid in gate.notify_ids)
+        mentions = self._mentions(gate.notify_ids)
         item = normalize_item_id(gate.item_id)
         prefix = self.chat.command_prefix
         head = "⏸ **ready to merge — waiting for your approval**"
@@ -1805,14 +1819,23 @@ class ChatBridge(ABC):
         await self._edit(message, text)
 
     async def _gate_prompt_message(self, gate: MergeGate) -> Any:
-        """The live prompt message, or None when it cannot be fetched."""
-        if not gate.prompt_channel_id or not gate.prompt_message_id:
+        """The live prompt message this bridge posted, or None when it
+        cannot be fetched."""
+        try:
+            where = self.dstore.gate_prompt(gate.run_id, self.backend)
+        except Exception:
+            self.log.debug("chat.gate_prompt_lookup_failed", run=gate.run_id, exc_info=True)
+            return None
+        if where is None:
+            return None
+        channel_id, message_id = where
+        if not channel_id:
             return None
         try:
-            channel = await self._thread_handle(gate.prompt_channel_id)
+            channel = await self._thread_handle(channel_id)
             if channel is None:
                 return None
-            return await self._fetch_message(channel, gate.prompt_message_id)
+            return await self._fetch_message(channel, message_id)
         except Exception:
             self.log.debug("chat.gate_prompt_lost", run=gate.run_id, exc_info=True)
             return None
@@ -1830,7 +1853,10 @@ class ChatBridge(ABC):
             return
         try:
             self.dstore.set_gate_prompt(
-                gate.run_id, self._handle_id(target), self._message_id(posted)
+                gate.run_id,
+                self._handle_id(target),
+                self._message_id(posted) or None,
+                backend=self.backend,
             )
         except Exception:
             self.log.debug("chat.gate_prompt_record_failed", run=gate.run_id, exc_info=True)
@@ -1851,7 +1877,7 @@ class ChatBridge(ABC):
                 f" — {_one_line(str(detail), 200)}" if detail else ""
             )
         else:
-            mentions = " ".join(self.mention_user(uid) for uid in fresh.notify_ids)
+            mentions = self._mentions(fresh.notify_ids)
             text = (
                 "⚠ approval by "
                 + str(who)
@@ -1898,10 +1924,10 @@ class ChatBridge(ABC):
         control-channel line."""
         known: ChatThread | None = None
         if notice.run_id and self.chat.thread_per_run:
-            known = self.dstore.chat_thread(notice.run_id)
+            known = self.dstore.chat_thread(notice.run_id, self.backend)
         # A notice with people to address (#675: a PR waiting for their
         # review) pings them where it lands — the ask has to reach them.
-        prefix = " ".join(self.mention_user(uid) for uid in notice.mention_ids)
+        prefix = self._mentions(notice.mention_ids)
         pings = bool(prefix)
         text = f"{prefix} {daemon_notice(notice)}" if pings else daemon_notice(notice)
         if known is not None:
@@ -2016,7 +2042,7 @@ class ChatBridge(ABC):
                 thread = await self._ensure_thread(run_id)
                 if thread is None:
                     return
-                known = self.dstore.chat_thread(run_id)
+                known = self.dstore.chat_thread(run_id, self.backend)
                 if known is not None and known.status_id:
                     try:
                         msg = await self._fetch_message(thread, known.status_id)
@@ -2026,7 +2052,9 @@ class ChatBridge(ABC):
                     msg = await self._send(thread, text)
                     if msg is None:
                         return
-                    self.dstore.set_chat_status_id(run_id, self._message_id(msg) or None)
+                    self.dstore.set_chat_status_id(
+                        run_id, self._message_id(msg) or None, backend=self.backend
+                    )
                     self._status_msg[run_id] = msg
                     self._status_last_edit[run_id] = asyncio.get_event_loop().time()
                     return
@@ -2207,7 +2235,7 @@ class ChatBridge(ABC):
     async def _ensure_thread(self, run_id: str) -> Any:
         """The run's thread, creating headline + thread on first sight;
         re-attaches to a persisted thread after a daemon restart."""
-        known = self.dstore.chat_thread(run_id)
+        known = self.dstore.chat_thread(run_id, self.backend)
         if known is not None:
             try:
                 return await self._thread_handle(known.thread_id)
@@ -2288,7 +2316,7 @@ class ChatBridge(ABC):
     async def _edit_headline(
         self, run_id: str, text: str, *, embed: EmbedSpec | None = None
     ) -> None:
-        known = self.dstore.chat_thread(run_id)
+        known = self.dstore.chat_thread(run_id, self.backend)
         if known is None or known.headline_id is None:
             return
         try:

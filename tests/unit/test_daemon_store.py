@@ -443,6 +443,65 @@ class TestLedgerAndThreads:
         assert store.run_for_thread(ts) == "r1"
         assert store.run_for_thread("1724968573.123457") is None
 
+    def test_one_run_has_a_thread_per_backend(self, tmp_path: Path) -> None:
+        """The daemon runs the operator console's local bridge beside the
+        external one, so a run has one thread row per backend; the bare
+        lookup prefers the external row (what the concierge links), the
+        keyed lookup is exact, and thread ids resolve within their backend."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.record_chat_thread("r1", "control", "thread:5", "5", backend="local")
+        store.record_chat_thread("r1", "42", "4242", "100", backend="discord")
+        assert store.chat_thread("r1", "local") == ("control", "thread:5", "5", None, "local")
+        assert store.chat_thread("r1", "discord") == ("42", "4242", "100", None, "discord")
+        assert store.chat_thread("r1") == ("42", "4242", "100", None, "discord")
+        assert store.chat_thread("r1", "slack") is None
+        store.set_chat_status_id("r1", "6", backend="local")
+        store.set_chat_status_id("r1", "101", backend="discord")
+        assert store.chat_thread("r1", "local").status_id == "6"  # type: ignore[union-attr]
+        assert store.chat_thread("r1", "discord").status_id == "101"  # type: ignore[union-attr]
+        assert store.run_for_thread("thread:5", "local") == "r1"
+        assert store.run_for_thread("thread:5", "discord") is None
+        assert store.run_for_thread("4242") == "r1"
+
+    def test_the_bare_lookup_never_answers_with_the_local_thread(self, tmp_path: Path) -> None:
+        """An external bridge cannot spell a pointer to the console's
+        thread, so prose that asks bare gets none rather than a dead link."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.record_chat_thread("r1", "control", "thread:5", "5", backend="local")
+        assert store.chat_thread("r1") is None
+        assert store.chat_thread("r1", "local") is not None
+
+    def test_single_keyed_thread_table_is_rekeyed_per_backend(self, tmp_path: Path) -> None:
+        """A store written before the local bridge keys threads by run
+        alone; opening it rebuilds the table on (run, backend) with the
+        rows intact, once."""
+        path = tmp_path / "state.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE daemon_chat_threads (
+                run_id TEXT PRIMARY KEY, backend TEXT NOT NULL DEFAULT 'discord',
+                channel_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+                headline_id TEXT, status_id TEXT);
+            INSERT INTO daemon_chat_threads VALUES ('r1', 'discord', '42', '4242', '100', NULL);
+            INSERT INTO daemon_chat_threads VALUES ('r2', 'slack', 'C1', '17.5', '17.5', '18.0');
+            """
+        )
+        conn.commit()
+        conn.close()
+        store = DaemonStore(path)
+        assert store.chat_thread("r1") == ("42", "4242", "100", None, "discord")
+        assert store.chat_thread("r2", "slack") == ("C1", "17.5", "17.5", "18.0", "slack")
+        store.record_chat_thread("r1", "control", "thread:9", "9", backend="local")
+        assert store.chat_thread("r1", "discord") is not None
+        assert store.chat_thread("r1", "local") is not None
+        pk = [
+            r[1] for r in store._conn.execute("PRAGMA table_info(daemon_chat_threads)") if r[5] > 0
+        ]
+        assert pk == ["run_id", "backend"]
+        store.close()
+        assert DaemonStore(path).chat_thread("r2", "slack") is not None
+
     def test_pre_slack_discord_threads_table_is_migrated(self, tmp_path: Path) -> None:
         """A store written before [chat] existed carries the rows in
         ``daemon_discord_threads`` with INTEGER ids; opening it folds them
@@ -1190,6 +1249,90 @@ class TestClaimPersistence:
         assert prior is not None and prior.run_id == "r_old"
 
 
+class TestGatePrompts:
+    """Where each backend posted a gate's approval prompt: one row per
+    (run, backend), so the console's prompt and Discord's button are
+    both found after a restart."""
+
+    def _gate(self, store: DaemonStore, run_id: str = "r1") -> None:
+        store.create_merge_gate(run_id, "gh:issue:1", "o/r", 9, "u", None, [], f"t-{run_id}", 1.0)
+
+    def test_prompt_per_backend(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        self._gate(store)
+        assert store.gate_prompt("r1", "discord") is None
+        store.set_gate_prompt("r1", "42", "555", backend="discord")
+        store.set_gate_prompt("r1", "thread:5", "77", backend="local")
+        store.set_gate_prompt("r2", "42", "", backend="discord")
+        assert store.gate_prompt("r2", "discord") is None, "an empty id is no prompt"
+        assert store.gate_prompt("r1", "discord") == ("42", "555")
+        assert store.gate_prompt("r1", "local") == ("thread:5", "77")
+        assert store.gate_prompt("r1", "slack") is None
+        store.set_gate_prompt("r1", None, None, backend="local")
+        assert store.gate_prompt("r1", "local") is None
+        # The gate row itself no longer carries the prompt.
+        gate = store.merge_gate_for("r1")
+        assert gate is not None and gate.prompt_message_id is None
+
+    def test_legacy_prompt_columns_are_carried_and_cleared(self, tmp_path: Path) -> None:
+        """A gate parked before the prompt table existed recorded the
+        prompt on the gate row; it is read into the new table under the
+        backend the run's thread used — a Slack daemon's under slack — and
+        the row is cleared, so a cleared prompt never comes back and an
+        older daemon writing the row again (a rollback) is carried again."""
+        path = tmp_path / "state.db"
+        store = DaemonStore(path)
+        self._gate(store)
+        self._gate(store, "r_slack")
+        self._gate(store, "r_bare")
+        store.record_chat_thread("r1", "42", "4242", "100", backend="discord")
+        store.record_chat_thread("r_slack", "C1", "17.5", "17.5", backend="slack")
+        for run in ("r1", "r_slack", "r_bare"):
+            store._conn.execute(
+                "UPDATE daemon_merge_gates SET prompt_channel_id = '42', prompt_message_id = '555' "
+                "WHERE run_id = ?",
+                (run,),
+            )
+        store._conn.execute("DELETE FROM daemon_gate_prompts")
+        store._conn.commit()
+        store.close()
+        again = DaemonStore(path)
+        assert again.gate_prompt("r1", "discord") == ("42", "555")
+        assert again.gate_prompt("r_slack", "slack") == ("42", "555")
+        assert again.gate_prompt("r_slack", "discord") is None
+        # No thread of its own and two backends seen: Discord is the default.
+        assert again.gate_prompt("r_bare", "discord") == ("42", "555")
+        gate = again.merge_gate_for("r1")
+        assert gate is not None and gate.prompt_message_id is None, "the row is cleared"
+        again.set_gate_prompt("r1", None, None, backend="discord")
+        again.close()
+        assert DaemonStore(path).gate_prompt("r1", "discord") is None
+
+    def test_pre_upgrade_watches_follow_the_daemons_backend(self, tmp_path: Path) -> None:
+        """A Slack daemon's persisted watches must come back as Slack's,
+        not Discord's, or nobody is pinged and the rows leak."""
+        path = tmp_path / "state.db"
+        conn = sqlite3.connect(path)
+        conn.executescript(
+            """
+            CREATE TABLE daemon_run_watches (run_id TEXT NOT NULL, watcher_id TEXT NOT NULL,
+                created_at REAL NOT NULL, UNIQUE(run_id, watcher_id));
+            INSERT INTO daemon_run_watches VALUES ('r1', 'U1', 1.0);
+            INSERT INTO daemon_run_watches VALUES ('r2', 'U2', 2.0);
+            CREATE TABLE daemon_chat_threads (
+                run_id TEXT PRIMARY KEY, backend TEXT NOT NULL DEFAULT 'discord',
+                channel_id TEXT NOT NULL, thread_id TEXT NOT NULL,
+                headline_id TEXT, status_id TEXT);
+            INSERT INTO daemon_chat_threads VALUES ('r1', 'slack', 'C1', '17.5', '17.5', NULL);
+            """
+        )
+        conn.commit()
+        conn.close()
+        store = DaemonStore(path)
+        assert store.all_run_watches("slack") == {"r1": ["U1"], "r2": ["U2"]}
+        assert store.all_run_watches("discord") == {}
+
+
 class TestPendingClarifications:
     """The persisted half of ask-never-block: a filing-blocking question's
     fallback survives a restart and fires exactly once."""
@@ -1222,6 +1365,31 @@ class TestPendingClarifications:
         taken = store.take_due_clarifications(now=200.0)
         assert [r.asker_id for r in taken] == ["u1"], "only the due row is claimed"
         assert store.take_due_clarifications(now=200.0) == [], "a second sweep gets nothing"
+
+    def test_sweeps_are_scoped_to_a_backend(self, tmp_path: Path) -> None:
+        """Every bridge runs its own sweeper; a Slack ask must not be fired
+        by the Discord bridge (which cannot ping the asker) — a sweep with a
+        backend takes only its own rows, a bare sweep takes them all."""
+        store = DaemonStore(tmp_path / "state.db")
+        self._create(store, asker="d1", deadline=10.0)
+        assert (
+            store.create_pending_clarification(
+                backend="slack",
+                channel_id="C1",
+                asker_id="s1",
+                asker_name="s",
+                question="q",
+                assumption="a",
+                deadline=10.0,
+                now=1.0,
+            )
+            is not None
+        )
+        assert [r.asker_id for r in store.open_clarifications("slack")] == ["s1"]
+        assert [r.asker_id for r in store.take_due_clarifications(now=20.0, backend="slack")] == [
+            "s1"
+        ]
+        assert [r.asker_id for r in store.take_due_clarifications(now=20.0)] == ["d1"]
 
     def test_any_engagement_from_the_asker_resolves_their_rows(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")

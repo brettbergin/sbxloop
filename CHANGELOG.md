@@ -6,6 +6,75 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **`sbxloop tui`: the operator console** (#770). A person on the daemon
+  host had the CLI's one-shot commands and journald. `sbxloop tui` is a
+  terminal console that reads the daemon's `state.db` read-only and asks
+  the daemon `status` through the `ctl` queue every few seconds: an
+  Overview (the run in flight, the queue, who waits on a human, recent
+  runs), Runs with a per-run screen (the `sbxloop run` transcript tailed
+  from the store, tasks, every phase attempt with its tokens and turns —
+  never a currency, landing state and the newest landing events,
+  artifacts, the dense event lines with a type filter), the Queue, and
+  Help. `--run` opens a run at once, `--read-only` removes every action,
+  `--state-dir` overrides the daemon's rule. Textual is a core dependency.
+  `docs/tui.md` documents the layout and keys; the docs' mention of a
+  `sbxloop watch` TUI that never shipped now names this. The chat screens
+  and the admin screens follow.
+
+### Added
+
+- **The daemon always runs a local chat bridge for the operator console**
+  (#769). A person on the daemon host had the CLI and journald; everything
+  a run *shows* — the headline, the thread, the status line and tool digest
+  edited in place, steering, the concierge, clarifying-choice buttons, the
+  merge-gate approve button — existed only on Discord or Slack, and a
+  headless daemon had no concierge at all. The daemon now runs a
+  `LocalBridge` beside whatever `[chat] backend` names, through one
+  fan-out frontend: a third `ChatBridge` whose transport is a mailbox in
+  the daemon's own `state.db` (`daemon_local_messages`) — every message
+  the bridge would post becomes a row, edits rewrite it, reactions
+  decorate it, and what an operator types in `sbxloop tui` arrives as a
+  row the bridge claims, the same file-drop shape as the ctl queue. A row
+  typed before the daemon started is refused with a note, never executed.
+  The concierge is built whenever `[concierge] enabled`, headless
+  included — a headless host now boots the concierge sandbox at start and
+  needs the agent credential. `[tui]` carries the console's knobs
+  (`operator_id`, `emoji`, `daemon_unit`, `refresh_s`, `retention_days`)
+  beside the shared rendering ones; `[chat] backend` still names only the
+  external service. `sbxloop.daemon.mailbox.MailboxClient` is the
+  console's handle: read-only for state, one kind of write, no schema
+  statement — so a console never migrates a store under a running daemon.
+  Both stores open read-only for it (`readonly=True`: a `mode=ro` URI,
+  no schema statement). With two bridges up, each renders only the
+  requester and watcher ids it owns (a snowflake is Discord's, a member
+  id Slack's, a login name the console's), and the concierge words each
+  reply for the surface the message came in on. `ctl status` reports
+  `pid`, `started_at` and `version`; `sbxloop doctor` shows an `operator console` row and its concierge row no longer needs a chat backend. The
+  console itself (`sbxloop tui`) follows.
+
+### Changed
+
+- **Chat state is keyed by backend** (#768). The daemon is about to run
+  the operator console's local chat bridge beside Discord or Slack, and
+  the store assumed one bridge: `daemon_chat_threads` was keyed by run
+  alone, a run's watchers were one list that the first bridge to finish
+  drained, the merge gate's prompt location lived on the gate row, and
+  every bridge's clarification sweeper fired every backend's due asks.
+  Threads are now `(run, backend)` (the bare lookup prefers the external
+  backend's thread, what a link in prose points at), watches carry their
+  backend, gate prompts live in `daemon_gate_prompts` per backend, and a
+  sweep takes only its own backend's asks, and the clarification cap
+  counts one backend's asks. An existing store is rebuilt on open, once,
+  with the indexes recreated inside the rebuild's own transaction; a
+  pre-upgrade watch or gate prompt is filed under the backend that opened
+  the run's thread — a Slack daemon's under `slack` — and the gate row's
+  old prompt columns are cleared once carried, so the step is idempotent
+  through a rollback. Nothing changes for a one-bridge daemon.
+  `tests/fakes/legacy_db.py` freezes the shape before this as
+  `pre_local_bridge`.
+
 ### Fixed
 
 - **No bare sbxloop issue numbers reach users** (#635). A provisioning
