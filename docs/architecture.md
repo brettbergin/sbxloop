@@ -168,8 +168,8 @@ agent box plus service box — exactly the resume path, one extra boot.
 
 The `publishing` stage (#759) hands the judged result to its **sinks**,
 `engine/sinks.py` composing what each carries and `LoopEngine._stage_publish`
-driving them in `PUBLISH_ORDER` (artifact → issue → chat) so the chat line can
-name what the others delivered. A task's sink is `needs.sink` or `chat`; only
+driving them in `PUBLISH_ORDER` (artifact → pr → issue → chat) so the chat line
+can name what the others delivered. A task's sink is `needs.sink` or `chat`; only
 `chat` needs no profile (`_grant_needs` skips it), `issue`/`pr` need the
 profile to name them and a github box — `Provisioner` boots one for a workload
 only when the pinned profile's `needs_github` says so — and `issue` is also
@@ -178,7 +178,14 @@ refused when `_ensure_delivery_repo` found Issues disabled. `artifact` copies
 `PublishError`) to `runs/<run>/artifacts` — `shutil` from a mounted workspace,
 `_copy_out` (a `tar` of the listed paths) from an unmounted one; a workload's
 harvest goes to `runs/<run>/data` so `artifacts_dir` reads only what the sink
-delivered. `issue` files one issue in `[github] repo` under `[workload] result_label` (`ensure_label` first). `chat` is the `run.published` event
+delivered. `issue` files one issue in `[github] repo` under `[workload] result_label` (`ensure_label` first). `pr` (`_publish_pr`) hands the task's data-directory
+checkout (`needs.repo`; `_grant_needs` refuses a pr task without one) to
+`deliver_workspace` — the same call `_stage_deliver` makes, on the run's branch
+with `_naming_for` (the repo-parametrised half of `_naming`) — labels the pull
+request with the result label best-effort, and records only a `Published`
+entry: the run row gets no `pr_number`, so nothing downstream (settle,
+landing, the daemon's PR tracking) ever treats a workload's result as a run
+to land. `chat` is the `run.published` event
 itself: its `message` is the reply, rendered whole by the Discord bridge (📣
 blocks) and the TUI. Each delivery is persisted as a `Published` row on the run
 (`runs.published`, `StateStore.add_run_published`) before the next sink runs,

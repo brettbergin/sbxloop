@@ -89,8 +89,10 @@ lost when the sandbox is destroyed.
   (one issue filed in the configured repository, carrying every task that
   chose it), `artifact` (the files the task reports, copied out for
   download; the report's file list is exactly what is delivered), `pr`
-  (files delivered to a repository); `repo` — a repository the task
-  needs, as `owner/name`. Declare it here or do without it: an executor
+  (the task's changes to its checkout, opened as one pull request on that
+  repository — the task must also declare `repo`); `repo` — a repository
+  the task needs, as `owner/name`, checked out under the data directory
+  by its bare name. Declare it here or do without it: an executor
   cannot ask for a host or a credential mid-task. Use empty lists and
   `null` for a task with no needs (the common case). What this run may be
   granted is listed below: a need outside it is refused and the run ends

@@ -168,6 +168,7 @@ from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import (
     BudgetExceededError,
     ConfigError,
+    DeliveryError,
     GithubOpsError,
     InvalidOutputTwice,
     ProvisionError,
@@ -1728,8 +1729,9 @@ class LoopEngine:
         Every need is answered before any task runs: a host must be inside
         the profile's egress (or already in the operator's bounds) and not
         denied; a credential must be one the profile names; a sink one it
-        lists (the `chat` sink is the default and needs no granting, #759);
-        a repository allowed by it and configured under `[github]`.
+        lists (the `chat` sink is the default and needs no granting, #759;
+        the `pr` sink also needs the task's `repo`); a repository allowed
+        by it and configured under `[github]`.
         The first need outside the profile fails the run closed — every
         refusal is on the record as ``run.needs_refused`` naming the
         sbxloop.toml key that would allow it, and nothing was granted.
@@ -1749,6 +1751,7 @@ class LoopEngine:
         credentials: list[tuple[str, str]] = []
         sink_needs: list[tuple[str, str]] = []
         repos: list[tuple[str, str]] = []
+        repo_of_task: dict[str, str | None] = {}
         for task in tasks:
             needs = task.spec.needs
             hosts += [(h, task.spec.id) for h in needs.hosts]
@@ -1757,6 +1760,7 @@ class LoopEngine:
                 sink_needs.append((needs.sink, task.spec.id))
             if needs.repo:
                 repos.append((needs.repo, task.spec.id))
+            repo_of_task[task.spec.id] = needs.repo
         if not (hosts or credentials or sink_needs or repos):
             return None
 
@@ -1810,8 +1814,6 @@ class LoopEngine:
                 refuse(
                     "sink", sink, task_id, f"workloads.{pname}.sinks", f"not in profile {pname!r}"
                 )
-            elif sink == "pr":
-                refuse("sink", sink, task_id, None, "the pr sink is not available yet")
             elif sink in GITHUB_SINKS and p.ops is None:
                 refuse(
                     "sink",
@@ -1827,6 +1829,14 @@ class LoopEngine:
                     task_id,
                     None,
                     f"{self.config.github.repo} has Issues disabled",
+                )
+            elif sink == "pr" and repo_of_task[task_id] is None:
+                refuse(
+                    "sink",
+                    sink,
+                    task_id,
+                    None,
+                    "the pr sink delivers the task's own checkout: declare `repo` on the task",
                 )
         for repo, task_id in repos:
             if no_profile[0]:
@@ -2183,9 +2193,10 @@ class LoopEngine:
         """Hand the result to its sinks (#759).
 
         Each task's output goes to the sink its plan declared — the
-        ``artifact`` directory, a result issue in the delivery repository,
-        the chat reply — in that order, so the chat line can name what the
-        others delivered. Every delivery is recorded on the run row
+        ``artifact`` directory, a pull request on the checkout the task
+        asked for, a result issue in the delivery repository, the chat
+        reply — in that order, so the chat line can name what the others
+        delivered. Every delivery is recorded on the run row
         (``published``) before the next begins, so a resume at
         ``publishing`` skips what already landed: one issue per run,
         however many times the stage is entered. A sink that cannot take
@@ -2205,11 +2216,19 @@ class LoopEngine:
             try:
                 if sink == "artifact":
                     entry = self._publish_artifact(p, run, carried)
+                elif sink == "pr":
+                    entry = self._publish_pr(p, run, tasks, carried)
                 elif sink == "issue":
                     entry = self._publish_issue(p, run, tasks, carried)
                 else:
                     entry = self._publish_chat(run, tasks, carried)
-            except (SbxError, GithubOpsError, OSError, sinks.PublishError) as exc:
+            except (
+                SbxError,
+                GithubOpsError,
+                DeliveryError,
+                OSError,
+                sinks.PublishError,
+            ) as exc:
                 log.warning("run.publish_failed", run=run_id, sink=sink, exc_info=True)
                 return f"publishing to {sink} failed: {exc}"
             self.store.add_run_published(run_id, entry)
@@ -2254,6 +2273,68 @@ class LoopEngine:
             files=len(files),
         )
 
+    def _publish_pr(
+        self,
+        p: Pipeline,
+        run: RunRecord,
+        tasks: Sequence[TaskRecord],
+        carried: Sequence[TaskRecord],
+    ) -> Published:
+        """Deliver the checkout the tasks worked in as one pull request:
+        the working tree's diff against the base, committed on the run's
+        branch and opened under the `[workload] result_label` — through
+        `deliver_workspace`, the way a code run's `_stage_deliver` does,
+        and nothing after it: no gate, no review, no CI wait. Delivery
+        is the whole publish (#759); whoever owns the repository merges.
+        The run row keeps no `pr_number`: a workload's pull request is a
+        result on the record (``published``), not a run the daemon
+        settles."""
+        assert p.ops is not None and p.pair.workspace is not None
+        repo = sinks.repo_of(carried)
+        if repo is None:
+            raise sinks.PublishError("the pr sink needs one repository declared on its tasks")
+        checkout = p.pair.workspace / repo.split("/", 1)[1]
+        if not (checkout / ".git").exists():
+            raise sinks.PublishError(f"no checkout of {repo} in the data directory")
+        gh = self.config.github
+        entry = gh.effective_repo(repo)
+        title = sinks.result_title(run.pr_title, p.outcome)
+        pr_title, commit_message = self._naming_for(p, repo, entry, title, checkout)
+        branch = branch_name(run.run_id, gh.branch_prefix_for(repo))
+        pr = deliver_workspace(
+            p.ops,
+            repo,
+            run_id=run.run_id,
+            outcome=p.outcome,
+            source_dir=checkout,
+            base=entry.deliver_base if entry is not None else gh.deliver_base,
+            exclude=self.config.artifacts.exclude,
+            branch=branch,
+            title=pr_title,
+            commit_message=commit_message,
+            authored_body=sinks.pr_body(tasks, run.pr_title, carried),
+        )
+        label = sinks.result_label(self.config.workload.result_label)
+        try:
+            ensure_label(p.ops, repo, label)
+            p.ops.raw("POST", f"/repos/{repo}/issues/{pr.number}/labels", {"labels": [label.name]})
+        except GithubOpsError:
+            # The result is delivered; a label it could not carry is not a
+            # reason to fail the run (the same rule as `_label_pr`).
+            log.warning(
+                "deliver.pr_labels_failed",
+                run=run.run_id,
+                pr=pr.number,
+                labels=[label.name],
+                exc_info=True,
+            )
+        return Published(
+            sink="pr",
+            location=pr.url,
+            tasks=[t.spec.id for t in carried],
+            files=sum(t.output.file_count for t in carried if t.output is not None),
+        )
+
     def _publish_issue(
         self,
         p: Pipeline,
@@ -2269,7 +2350,7 @@ class LoopEngine:
         ensure_label(p.ops, p.repo, label)
         ref = p.ops.issue_create(
             p.repo,
-            sinks.issue_title(run.pr_title, p.outcome),
+            sinks.result_title(run.pr_title, p.outcome),
             sinks.issue_body(tasks, run.pr_title, carried, run_id=run.run_id, outcome=p.outcome),
             labels=[label.name],
         )
@@ -2488,8 +2569,19 @@ class LoopEngine:
         `sbxloop: {title}`, which no such lint accepts; a template the
         operator wrote is theirs and stands."""
         assert p.repo is not None
+        return self._naming_for(p, p.repo, p.repo_config, title, source)
+
+    def _naming_for(
+        self,
+        p: Pipeline,
+        repo: str,
+        entry: RepoConfig | None,
+        title: str | None,
+        source: Path,
+    ) -> tuple[str, str]:
+        """:meth:`_naming` for any repository — the run's own, or the one a
+        workload's pr sink delivers to (#759)."""
         gh = self.config.github
-        entry = p.repo_config
         title_template = (entry.pr_title_template if entry else None) or gh.pr_title_template
         message_template = (
             entry.commit_message_template if entry else None
@@ -2497,7 +2589,7 @@ class LoopEngine:
 
         def render(template: str) -> str:
             return render_naming(
-                template, title=title, outcome=p.outcome, run_id=p.run_id, repo=str(p.repo)
+                template, title=title, outcome=p.outcome, run_id=p.run_id, repo=repo
             )
 
         pr_title = render(title_template)

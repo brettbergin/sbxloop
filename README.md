@@ -386,14 +386,20 @@ chose it, under the `[workload] result_label` (`sbxloop:result` by default,
 created if missing); `artifact` copies the files a task reported — exactly
 those, mounted or not — to `runs/<run>/artifacts`, where `sbxloop artifacts <run>` lists them (a workload's whole data directory is salvaged to
 `runs/<run>/data` instead, so the listing is the result and not the working
-state around it); `pr` (files delivered to a repository) arrives next. A
-profile that names `issue` or `pr` gives the run a github box; `issue` is
-refused at grant time when there is no repository (`github.repo`) or it has
-Issues disabled. Sinks are worked artifact → issue → chat and each delivery
-is recorded on the run (`run.published`, `status <run>` and `--json`, the
-finish card's **Published** field) before the next, so a resume at
-`publishing` never files a second issue; a sink that cannot take the result
-fails the run naming it. Scheduled intake lands on this base next.
+state around it); `pr` delivers the checkout a task asked for (`needs.repo`,
+under a profile with `repo = true`) as **one** pull request — the working
+tree's diff against the base, committed on the run's branch, titled from the
+plan under the same result label — and that is the whole publish: no gate,
+no review, no CI wait, and no run to settle (whoever owns the repository
+merges). A profile that names `issue` or `pr` gives the run a github box;
+`issue` is refused at grant time when there is no repository (`github.repo`)
+or it has Issues disabled, `pr` when the task declared no `repo`. Sinks are
+worked artifact → pr → issue → chat and each delivery is recorded on the run
+(`run.published`, `status <run>` and `--json`, the finish card's
+**Published** field) before the next, so a resume at `publishing` never
+files a second issue or opens a second pull request; a sink that cannot take
+the result — a checkout with nothing to deliver included — fails the run
+naming it. Scheduled intake lands on this base next.
 
 ## CLI reference
 
