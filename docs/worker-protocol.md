@@ -54,6 +54,7 @@ delivery tier provisioning chose (see docs/architecture.md):
 | `shell.check`   | `argv`, `cwd?`                                                                                                        | `exit_code` + captured output. A nonzero exit is an **ok** result — the host owns the verification decision                                                                    |
 | `shell.batch`   | `commands`, `command_timeout_s?`, `cwd?`                                                                              | `output_json`: list of `{command, exit_code, output}` (one per command, in order); job `exit_code` is the first nonzero. Nonzero exits are still **ok** results                |
 | `github.op`     | `op`, `params`                                                                                                        | op-specific JSON (see below)                                                                                                                                                   |
+| `service.http`  | `params: {credential, method, path, query?, headers?, body?, timeout_s?}`                                             | `{credential, method, path, status, headers, body (clipped, credential value redacted), truncated, elapsed_s}` — see "Service ops"                                             |
 
 `permission_mode="auto"` approves every Copilot SDK permission request — the
 microVM is the security boundary. `read_only` allows only `read`, `url`, and
@@ -132,9 +133,9 @@ Envelope: `{v, ts, run_id, job_id?, type, data}` — one JSON object per line.
 - Worker: `worker.start|heartbeat|result|error|end`, `agent.message`,
   `agent.message_delta`, `agent.tool_start|tool_end`, `agent.usage`,
   `agent.permission_denied`, `gh.op_start|op_end`,
-  `sandbox.resources|resources_warning`
+  `service.http_start|http_end`, `sandbox.resources|resources_warning`
 - Host: `run.start|state|end`, `task.start|state|end`, `phase.start|end`,
-  `sandbox.provision_start|ready|cleanup`, `worker.stdout`
+  `sandbox.provision_start|ready|cleanup`, `service.call`, `worker.stdout`
 
 ### Tool calls
 
@@ -199,6 +200,31 @@ for `ref.get` also the 409 GitHub returns for an empty repository) is an **ok**
 result of
 `{"missing": true, "http_status": N}` rather than a failed job — so the
 transcript shows no error event for a question whose answer was "no".
+
+## Service ops
+
+`service.http` jobs execute in the service sandbox only (#765) — the box a
+run granted `[[credentials]]` gets, holding exactly those values. The job
+names a credential; the worker resolves it against the catalogue the host
+put in `SBXLOOP_SERVICE_CREDENTIALS` (a JSON list of `{name, env, host, header, scheme}` — no values) and sends one request to
+`https://<host><path>` with `<header>: <scheme> <value>` attached. The job
+carries no host, so neither a model nor a mis-built job can point a
+credential elsewhere. A header the op owns (`Host`, `Authorization`, the
+credential's own header, `Content-Length`) is refused; redirects are not
+followed (a 3xx is returned as its status with `location`); a non-2xx answer
+is an **ok** result carrying that status — the host decides. The response
+body is clipped head+tail and the credential's value replaced with `***`
+wherever an API echoed it; request headers are never returned. Events:
+`service.http_start {credential, method, path}` and `service.http_end {status, elapsed_s}`.
+
+On the host, the build session's `call_service` host tool is answered by
+`ServiceOps`: the credential name is checked against the run's grant before
+any job is built, and each call is one `service.call` host event
+(`credential`, `method`, `path`, `status` or `error`, `duration_s`).
+
+`SBXLOOP_SERVICE_FAKE=<path>` (tests) swaps the HTTPS transport for scripted
+responses from that JSON file, each request appended to
+`<path>.requests.jsonl`.
 
 ## Worker installation
 

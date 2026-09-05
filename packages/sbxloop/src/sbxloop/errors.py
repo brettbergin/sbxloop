@@ -69,6 +69,12 @@ class ProtocolError(SbxloopError):
     """Host/worker protocol violation (bad event line, missing result, ...)."""
 
 
+class ServiceOpsError(SbxloopError):
+    """A service op the run's service sandbox could not carry out (#765):
+    a credential the run was not granted, a request the op refuses, or a
+    transport failure. Never carries a credential value."""
+
+
 class GithubOpsError(SbxloopError):
     """A GitHub operation failed in the github-ops sandbox.
 

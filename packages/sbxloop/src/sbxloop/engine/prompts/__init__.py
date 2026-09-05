@@ -65,6 +65,11 @@ def render(name: str, **context: str) -> str:
     # What the sandbox's verification did not decide (#682): advisory
     # failures, or that nothing ran under `ci-only`. Empty under `full`.
     context.setdefault("verification", "")
+    # The run's service credentials (#765): a section naming the
+    # `call_service` tool and the granted names when the run has any,
+    # rendered by the build phase; nothing — not even a blank line — for
+    # the runs that have none, which is every `code` run.
+    context.setdefault("service_tools", "")
     context.setdefault("baseline_registries", _domain_list(BASELINE_REGISTRY_DOMAINS))
     context.setdefault("declarable_registries", _domain_list(WELL_KNOWN_REGISTRY_DOMAINS))
     return _template(name).substitute(context)
