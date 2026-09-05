@@ -48,13 +48,22 @@ delivery tier provisioning chose (see docs/architecture.md):
 
 ## Job kinds
 
-| kind            | fields                                                                                                                | result                                                                                                                                                                         |
-| --------------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `agent.session` | `prompt`, `system_message?`, `model?`, `resume_session_id?`, `permission_mode: auto\|read_only`, `expect: text\|json` | `output_text`, `output_json` (extracted from the last \`\`\`json fence when `expect=json`; missing JSON ⇒ typed `ExpectedJsonMissing` error), `session_id`, `usage`, `health?` |
-| `shell.check`   | `argv`, `cwd?`                                                                                                        | `exit_code` + captured output. A nonzero exit is an **ok** result — the host owns the verification decision                                                                    |
-| `shell.batch`   | `commands`, `command_timeout_s?`, `cwd?`                                                                              | `output_json`: list of `{command, exit_code, output}` (one per command, in order); job `exit_code` is the first nonzero. Nonzero exits are still **ok** results                |
-| `github.op`     | `op`, `params`                                                                                                        | op-specific JSON (see below)                                                                                                                                                   |
-| `service.http`  | `params: {credential, method, path, query?, headers?, body?, timeout_s?}`                                             | `{credential, method, path, status, headers, body (clipped, credential value redacted), truncated, elapsed_s}` — see "Service ops"                                             |
+| kind            | fields                                                                                                                                       | result                                                                                                                                                                         |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `agent.session` | `prompt`, `system_message?`, `system_preset: true`, `model?`, `resume_session_id?`, `permission_mode: auto\|read_only`, `expect: text\|json` | `output_text`, `output_json` (extracted from the last \`\`\`json fence when `expect=json`; missing JSON ⇒ typed `ExpectedJsonMissing` error), `session_id`, `usage`, `health?` |
+| `shell.check`   | `argv`, `cwd?`                                                                                                                               | `exit_code` + captured output. A nonzero exit is an **ok** result — the host owns the verification decision                                                                    |
+| `shell.batch`   | `commands`, `command_timeout_s?`, `cwd?`                                                                                                     | `output_json`: list of `{command, exit_code, output}` (one per command, in order); job `exit_code` is the first nonzero. Nonzero exits are still **ok** results                |
+| `github.op`     | `op`, `params`                                                                                                                               | op-specific JSON (see below)                                                                                                                                                   |
+| `service.http`  | `params: {credential, method, path, query?, headers?, body?, timeout_s?}`                                                                    | `{credential, method, path, status, headers, body (clipped, credential value redacted), truncated, elapsed_s}` — see "Service ops"                                             |
+| `service.fetch` | `argv`, `cwd`, `params: {ecosystem, verb, scrub_env}`                                                                                        | `exit_code` + captured output with every `scrub_env` variable's value blanked — see "Service ops"; a nonzero exit is an **ok** result                                          |
+
+`system_preset` (default `true`) keeps the backend's own coding-agent system
+prompt under `system_message`; a workload's operator and judge sessions send
+`false`, so an operator does not present as a coding agent and a judge does
+not present as an operator. The Claude backend then passes the message alone
+in place of its `claude_code` preset; the Copilot backend's SDK takes a system
+message in `append` mode only, so the flag has no effect there —
+the operator prompts are written to hold up under a coding-agent preamble.
 
 `permission_mode="auto"` approves every Copilot SDK permission request — the
 microVM is the security boundary. `read_only` allows only `read`, `url`, and
@@ -217,10 +226,21 @@ body is clipped head+tail and the credential's value replaced with `***`
 wherever an API echoed it; request headers are never returned. Events:
 `service.http_start {credential, method, path}` and `service.http_end {status, elapsed_s}`.
 
+`service.fetch` jobs execute in the same box for a run whose repository has a
+credentialed `[[registries]]` entry (#766): the package manager's argv exactly
+as the host composed it from the ecosystem's fixed recipe (`npm ci --ignore-scripts`, `pip download -d <cache>`, `go mod download`, …), run in
+the workspace mount the box shares with the agent box — never a shell, never
+an argv the model wrote. `params.ecosystem` and `params.verb` name the fetch
+for the events; `params.scrub_env` lists the registry credential variables
+whose values the worker blanks out of the output before it leaves the box.
+Events: `service.fetch_start {ecosystem, verb}` and `service.fetch_end {exit_code, elapsed_s}`.
+
 On the host, the build session's `call_service` host tool is answered by
 `ServiceOps`: the credential name is checked against the run's grant before
 any job is built, and each call is one `service.call` host event
-(`credential`, `method`, `path`, `status` or `error`, `duration_s`).
+(`credential`, `method`, `path`, `status` or `error`, `duration_s`); its
+`fetch_dependencies` tool the same way, each fetch — refused on the host or
+run — one `sandbox.fetch` event (`ecosystem`, `verb`, `argv`, `exit_code`).
 
 `SBXLOOP_SERVICE_FAKE=<path>` (tests) swaps the HTTPS transport for scripted
 responses from that JSON file, each request appended to

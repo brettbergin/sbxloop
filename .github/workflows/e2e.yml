@@ -119,6 +119,77 @@ jobs:
           test -f "$artifacts_dir/hello.txt"
           grep -q "hello sbxloop" "$artifacts_dir/hello.txt"
 
+      # First real-sbx confirmation of a `workload` run (#754): the operator
+      # persona plans and executes in its own data directory, the judge
+      # holds the result to the task's criteria, and the publishing stage
+      # hands it to the `artifact` and `chat` sinks. No GitHub, no
+      # credentials — the profile grants one public host and two sinks, so
+      # the run is the same shape a schedule tick or a chat ask gets. The
+      # step's name is what a `TODO(e2e "...")` marker in the source may
+      # cite (tests/unit/test_e2e_markers.py).
+      - name: Workload run
+        if: ${{ vars.E2E_SMOKE_ENABLED == 'true' }}
+        env:
+          SBXLOOP_APP_NAME: sbxloop-e2e
+          COPILOT_GITHUB_TOKEN: ${{ secrets.E2E_COPILOT_GITHUB_TOKEN }}
+          SBXLOOP_BUDGETS__MAX_TASKS: "3"
+          SBXLOOP_BUDGETS__MAX_WALL_CLOCK_S: "1800"
+        run: |
+          set -euo pipefail
+          # The profile lives in a config file the earlier steps did not
+          # need; removed again below so the delivery smoke sees none.
+          cat > sbxloop.toml <<'TOML'
+          [[workloads]]
+          name = "e2e"
+          description = "read one public page, write one file, report"
+          egress = ["*.wikipedia.org"]
+          sinks = ["chat", "artifact"]
+          repo = false
+
+          [workload]
+          default = "e2e"
+          TOML
+          uv run sbxloop run --kind workload --no-tui \
+            "Write a file named brief.md in your data directory containing the heading '# sbxloop e2e' and one sentence naming today's date. Report the file as your output."
+          uv run sbxloop status
+
+      - name: Assert the workload completed and its artifact landed
+        if: ${{ vars.E2E_SMOKE_ENABLED == 'true' }}
+        env:
+          SBXLOOP_APP_NAME: sbxloop-e2e
+        run: |
+          set -euo pipefail
+          uv run --no-project python - <<'EOF'
+          import json, sqlite3, sys
+
+          db = sqlite3.connect(".sbxloop/state.db")
+          db.row_factory = sqlite3.Row
+          run = db.execute(
+              "SELECT run_id, kind, state, published FROM runs ORDER BY created_at DESC LIMIT 1"
+          ).fetchone()
+          assert run["kind"] == "workload", f"latest run {run['run_id']} is a {run['kind']} run"
+          if run["state"] != "completed":
+              sys.exit(f"workload {run['run_id']} ended {run['state']}, expected completed")
+          published = json.loads(run["published"])
+          sinks = sorted(p["sink"] for p in published)
+          assert sinks == ["artifact", "chat"], f"published to {sinks}, expected artifact + chat"
+          events = [
+              json.loads(e["data_json"])
+              for e in db.execute(
+                  "SELECT data_json FROM events WHERE run_id = ? AND type = 'judge.verdict'",
+                  (run["run_id"],),
+              )
+          ]
+          assert events, f"no judge.verdict event for {run['run_id']}"
+          print(f"workload {run['run_id']} completed; judged {len(events)} task(s); published {sinks}")
+          print(run["run_id"])
+          EOF
+          run_id=$(basename "$(ls -dt .sbxloop/runs/* | head -1)")
+          uv run sbxloop artifacts "$run_id" --tree
+          test -f ".sbxloop/runs/$run_id/artifacts/brief.md"
+          grep -q "# sbxloop e2e" ".sbxloop/runs/$run_id/artifacts/brief.md"
+          rm -f sbxloop.toml
+
       # Multi-file delivery smoke (#66): a 50-file workspace must deliver as
       # O(1) batched blob jobs, visibly (gh.op_progress) and under a time
       # budget — the per-file-job regression this guards against took minutes.

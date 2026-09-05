@@ -1,0 +1,56 @@
+# sbxloop preset for agentic workloads: runs that end in a result, not a
+# pull request.
+#
+# `sbxloop init --preset workload` appends these sections to a fresh
+# sbxloop.toml; on an existing file, copy the ones you want as written. They
+# declare one credential, one profile bounded to it, that profile as the
+# default, and one schedule that asks for it every morning — rename each to
+# what you actually run. `sbxloop run --kind workload "…"` starts one from
+# the CLI; a chat mention asking for work, or an issue carrying the
+# `[daemon] workload_label`, starts one through the daemon.
+#
+# What holds by construction, whatever you put here:
+# - the agent box holds ONLY its inference credential. A `[[credentials]]`
+#   value lives in the run's separate service box and is used through the
+#   `call_service` tool — the agent dispatches a request, the host carries
+#   it, the box makes it, and the agent reads the redacted answer. The
+#   credential's host is not on the agent box's allowlist at all.
+# - a need the profile does not name fails the run closed before any task
+#   runs (`run.needs_refused` names the key here that would allow it).
+# - `every` is a grid from the moment the daemon first saw the schedule;
+#   `cron` runs on the stated minutes in `timezone`. Exactly one of the two.
+#
+# Not yet exercised against a live sandbox (the field test follows the
+# stack): a workload run end to end, and within it the service box's first
+# real `call_service`, offline dependency fetches per ecosystem, a mid-run
+# egress grant, and the `pr` sink on a configured repository. The test
+# suite covers all of it against fakes; only `code` runs have field time.
+
+[[credentials]]
+name = "weather"
+env = "WEATHER_API_KEY"            # read from the daemon's environment
+host = "api.weather.example.com"   # the ONE host this credential is good for
+header = "X-Api-Key"
+scheme = ""
+description = "read-only weather forecasts"
+
+[[workloads]]
+name = "research"
+description = "read the web, call the weather API, report in the thread"
+egress = ["*.example.com"]         # hosts the AGENT box may be granted
+credentials = ["weather"]          # held by the service box, never the agent's
+sinks = ["chat", "artifact"]       # add "issue" / "pr" for a github box
+repo = false
+publish = "auto"                   # "hold" parks the result until released
+budgets = { max_tasks = 8, max_wall_clock_s = 3600.0 }
+
+[workload]
+default = "research"
+result_label = "sbxloop:result"
+
+[[schedules]]
+name = "morning-brief"
+profile = "research"
+ask = "Summarise what changed on the watched sites overnight and post the digest in the thread."
+cron = "0 7 * * mon-fri"
+timezone = "Europe/London"
