@@ -100,7 +100,7 @@ def _check_env_names(names: Sequence[str], key: str) -> None:
             )
 
 
-_SECRET_ENV_GUIDANCE = (
+_REMOVED_KEY_GUIDANCE = (
     "{where} secret_env is no longer supported (#766): the only credential in the "
     "agent sandbox is the agent's own. A registry credential belongs on its "
     "[[registries]] entry as auth_env (used in the service sandbox, which fetches "
@@ -115,7 +115,7 @@ def _refuse_secret_env(data: Any, where: str) -> Any:
     "Extra inputs are not permitted": the operator is told where each kind
     of secret goes now."""
     if isinstance(data, Mapping) and "secret_env" in data:
-        raise ValueError(_SECRET_ENV_GUIDANCE.format(where=where))
+        raise ValueError(_REMOVED_KEY_GUIDANCE.format(where=where))
     return data
 
 
