@@ -95,6 +95,18 @@ _REQUESTERS_BODY = """(
 
 _REQUESTERS_COLUMNS = "source_key, requester_id, created_at"
 
+_CHAT_THREADS_BODY = (
+    "(run_id TEXT NOT NULL, backend TEXT NOT NULL DEFAULT 'discord', "
+    "channel_id TEXT NOT NULL, thread_id TEXT NOT NULL, headline_id TEXT, status_id TEXT, "
+    "PRIMARY KEY (run_id, backend))"
+)
+_CHAT_THREADS_COLUMNS = "run_id, backend, channel_id, thread_id, headline_id, status_id"
+_RUN_WATCHES_BODY = (
+    "(run_id TEXT NOT NULL, watcher_id TEXT NOT NULL, created_at REAL NOT NULL, "
+    "backend TEXT NOT NULL DEFAULT 'discord', UNIQUE(run_id, watcher_id, backend))"
+)
+_RUN_WATCHES_COLUMNS = "run_id, watcher_id, created_at"
+
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS daemon_work_items {_WORK_ITEMS_BODY};
 CREATE INDEX IF NOT EXISTS idx_daemon_items_state ON daemon_work_items(state, created_at);
@@ -126,12 +138,7 @@ CREATE TABLE IF NOT EXISTS daemon_state (
 -- is in-memory, so without this a daemon restart silently drops every
 -- pending watch — and runs last minutes to hours, exactly the window in
 -- which a restart happens.
-CREATE TABLE IF NOT EXISTS daemon_run_watches (
-    run_id     TEXT NOT NULL,
-    watcher_id TEXT NOT NULL,
-    created_at REAL NOT NULL,
-    UNIQUE(run_id, watcher_id)
-);
+CREATE TABLE IF NOT EXISTS daemon_run_watches {_RUN_WATCHES_BODY};
 CREATE INDEX IF NOT EXISTS idx_daemon_run_watches_run ON daemon_run_watches(run_id);
 
 -- Who asked for an issue through the concierge, keyed by the issue number
@@ -158,18 +165,13 @@ CREATE TABLE IF NOT EXISTS daemon_prior_attempts (
     PRIMARY KEY (source_key, repo)
 );
 
--- Where each run lives on the chat backend (Discord or Slack), so a
--- restart re-attaches. Ids are TEXT: Discord's are integer snowflakes,
--- Slack's are message timestamps ("1724968573.123456") that INTEGER
--- affinity would silently turn into a rounded REAL.
-CREATE TABLE IF NOT EXISTS daemon_chat_threads (
-    run_id      TEXT PRIMARY KEY,
-    backend     TEXT NOT NULL DEFAULT 'discord',
-    channel_id  TEXT NOT NULL,
-    thread_id   TEXT NOT NULL,
-    headline_id TEXT,
-    status_id   TEXT
-);
+-- Where each run lives on each chat backend, so a restart re-attaches.
+-- One row per (run, backend): the daemon runs the operator console's
+-- local bridge beside the external one, and both open a thread for the
+-- same run. Ids are TEXT: Discord's are integer snowflakes, Slack's are
+-- message timestamps ("1724968573.123456") that INTEGER affinity would
+-- silently turn into a rounded REAL, the local bridge's are row ids.
+CREATE TABLE IF NOT EXISTS daemon_chat_threads {_CHAT_THREADS_BODY};
 
 -- run_for_thread() runs per inbound chat message in a non-control
 -- channel; without this it scans a row per run the daemon has ever done.
@@ -180,7 +182,9 @@ CREATE INDEX IF NOT EXISTS idx_chat_threads_thread
 -- bar, parked awaiting one human approval. The row is the durable state —
 -- prompts and buttons are re-armed from it after a restart. notify_ids is
 -- a JSON list of chat user ids to @mention; custom_id is the stable token
--- a persistent Discord button carries.
+-- a persistent Discord button carries. prompt_channel_id/prompt_message_id
+-- are where a one-bridge daemon recorded the prompt; they are read once
+-- into daemon_gate_prompts and never written again.
 CREATE TABLE IF NOT EXISTS daemon_merge_gates (
     run_id            TEXT PRIMARY KEY,
     item_id           TEXT NOT NULL,
@@ -200,6 +204,16 @@ CREATE TABLE IF NOT EXISTS daemon_merge_gates (
 );
 CREATE INDEX IF NOT EXISTS idx_merge_gates_state ON daemon_merge_gates(state);
 CREATE INDEX IF NOT EXISTS idx_merge_gates_item  ON daemon_merge_gates(item_id);
+
+-- Where each backend posted a gate's approval prompt, so a restart can
+-- find (or replace) the prompt on every surface that carries one.
+CREATE TABLE IF NOT EXISTS daemon_gate_prompts (
+    run_id     TEXT NOT NULL,
+    backend    TEXT NOT NULL,
+    channel_id TEXT,
+    message_id TEXT,
+    PRIMARY KEY (run_id, backend)
+);
 
 -- A run parked on a base that requires an approving review the loop
 -- cannot give its own PR (#675). The row is the wait: the daemon polls
@@ -258,6 +272,15 @@ CREATE TABLE IF NOT EXISTS daemon_pending_clarifications (
 CREATE INDEX IF NOT EXISTS idx_pending_clarify_due
     ON daemon_pending_clarifications(state, deadline);
 """
+#: The schema's index statements alone, for a rebuild to recreate inside
+#: its own transaction (``executescript`` would commit it first).
+_INDEX_DDL: tuple[str, ...] = tuple(
+    stmt.strip()
+    for stmt in "\n".join(
+        line for line in _SCHEMA.splitlines() if not line.lstrip().startswith("--")
+    ).split(";")
+    if "CREATE INDEX" in stmt
+)
 
 # States from which nothing more happens on its own. A row in one of
 # these is *finished*: re-adding the trigger label to its issue re-queues
@@ -501,6 +524,12 @@ def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
     return {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})")}  # nosec B608
 
 
+def _pk_columns(conn: sqlite3.Connection, table: str) -> list[str]:
+    """The table's primary-key columns in key order (``pk`` is 1-based)."""
+    rows = conn.execute(f"PRAGMA table_info({table})").fetchall()  # nosec B608
+    return [str(row[1]) for row in sorted((r for r in rows if r[5] > 0), key=lambda r: r[5])]
+
+
 class DaemonStore:
     @classmethod
     def archive_legacy(cls, path: Path, *, clock: Callable[[], float] = time.time) -> Path | None:
@@ -566,6 +595,7 @@ class DaemonStore:
         self._migrate_repo_columns()
         self._migrate_added_columns()
         self._migrate_discord_threads()
+        self._migrate_backend_keys()
         self._conn.execute(
             "INSERT OR REPLACE INTO daemon_state (key, value) VALUES ('schema_version', ?)",
             (SCHEMA_VERSION,),
@@ -606,23 +636,37 @@ class DaemonStore:
             ("daemon_work_items", _WORK_ITEMS_BODY, _WORK_ITEMS_COLUMNS),
             ("daemon_requesters", _REQUESTERS_BODY, _REQUESTERS_COLUMNS),
         )
-        todo = [r for r in rebuilds if "repo" not in _columns(self._conn, r[0])]
+        todo = [
+            (table, body, f"{columns}, repo", f"{columns}, ''")
+            for table, body, columns in rebuilds
+            if "repo" not in _columns(self._conn, table)
+        ]
+        self._rebuild_tables(todo, rebuilt_for="repo")
+
+    def _rebuild_tables(self, todo: list[tuple[str, str, str, str]], *, rebuilt_for: str) -> None:
+        """Rebuild each ``(table, body, insert_columns, select_expr)`` in one
+        transaction: new shape, rows copied, drop, rename, indexes recreated.
+
+        The indexes are issued statement by statement: ``executescript``
+        commits the open transaction first, which would leave a rebuilt
+        table with no indexes if the recreation failed."""
         if not todo:
             return
         self._conn.execute("BEGIN IMMEDIATE")
         try:
-            for table, body, columns in todo:
+            for table, body, insert_columns, select_expr in todo:
                 tmp = f"{table}__new"
                 self._conn.execute(f"CREATE TABLE {tmp} {body}")  # nosec B608 - literals above
                 self._conn.execute(
-                    f"INSERT INTO {tmp} ({columns}, repo) "  # nosec B608 - literals above
-                    f"SELECT {columns}, '' FROM {table}"
+                    f"INSERT INTO {tmp} ({insert_columns}) "  # nosec B608 - literals above
+                    f"SELECT {select_expr} FROM {table}"
                 )
                 self._conn.execute(f"DROP TABLE {table}")  # nosec B608 - literal above
                 self._conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")  # nosec B608
-                log.info("store.migrated", table=table, rebuilt_for="repo")
+                log.info("store.migrated", table=table, rebuilt_for=rebuilt_for)
             # Dropping the old table took its indexes with it.
-            self._conn.executescript(_SCHEMA)
+            for ddl in _INDEX_DDL:
+                self._conn.execute(ddl)
             self._conn.commit()
         except Exception:
             self._conn.rollback()
@@ -695,6 +739,80 @@ class DaemonStore:
             self._conn.rollback()
             raise
         log.info("store.migrated", table="daemon_chat_threads", moved=moved)
+
+    def _migrate_backend_keys(self) -> None:
+        """Key the chat state by backend, once.
+
+        A one-bridge daemon kept one thread and one watcher list per run,
+        and the gate's prompt on the gate row. The operator console's local
+        bridge runs beside the external one and opens its own thread for
+        the same run, so ``daemon_chat_threads`` is rebuilt on
+        ``(run_id, backend)`` and ``daemon_run_watches`` gains a ``backend``
+        column in its UNIQUE key (SQLite cannot widen a key with ALTER —
+        same rebuild as :meth:`_migrate_repo_columns`). The prompt location
+        moves into ``daemon_gate_prompts`` under the backend the run's
+        thread used; the old columns stay readable and are never written
+        again. Each step is guarded by the shape it changes, so a store
+        already migrated is left alone.
+        """
+        rebuilds: list[tuple[str, str, str, str]] = []
+        if _pk_columns(self._conn, "daemon_chat_threads") == ["run_id"]:
+            rebuilds.append(
+                (
+                    "daemon_chat_threads",
+                    _CHAT_THREADS_BODY,
+                    _CHAT_THREADS_COLUMNS,
+                    _CHAT_THREADS_COLUMNS,
+                )
+            )
+        watches_rebuilt = "backend" not in _columns(self._conn, "daemon_run_watches")
+        if watches_rebuilt:
+            rebuilds.append(
+                (
+                    "daemon_run_watches",
+                    _RUN_WATCHES_BODY,
+                    _RUN_WATCHES_COLUMNS,
+                    _RUN_WATCHES_COLUMNS,
+                )
+            )
+        self._rebuild_tables(rebuilds, rebuilt_for="backend")
+        # The backend a pre-upgrade row belongs to is the one that opened the
+        # run's thread, else the one external backend the store has seen at
+        # all (a daemon runs one), else Discord — never 'local', which no
+        # released daemon ran.
+        external = (
+            "(SELECT t.backend FROM daemon_chat_threads t WHERE t.run_id = %s "
+            "AND t.backend != 'local' LIMIT 1)"
+        )
+        sole = (
+            "(SELECT backend FROM daemon_chat_threads WHERE backend != 'local' "
+            "GROUP BY backend HAVING COUNT(*) = (SELECT COUNT(*) FROM daemon_chat_threads "
+            "WHERE backend != 'local') LIMIT 1)"
+        )
+        fallback = f"COALESCE({external}, {sole}, 'discord')"
+        if watches_rebuilt:
+            watch_backend = fallback % "daemon_run_watches.run_id"  # nosec B608 - literals only
+            self._conn.execute("UPDATE daemon_run_watches SET backend = " + watch_backend)  # nosec
+            self._conn.commit()
+        # The prompt location a one-bridge daemon kept on the gate row is
+        # carried into the prompt table and cleared from the row, so an
+        # older daemon writing it again (a rollback window) is carried again
+        # on the next start — a shape-based step, not a one-shot marker.
+        gate_backend = fallback % "g.run_id"  # nosec B608 - literals only
+        carry = (
+            "INSERT OR IGNORE INTO daemon_gate_prompts (run_id, backend, channel_id, message_id) "  # nosec B608
+            "SELECT g.run_id, {backend}, g.prompt_channel_id, g.prompt_message_id "
+            "FROM daemon_merge_gates g "
+            "WHERE g.prompt_message_id IS NOT NULL AND g.prompt_message_id != ''"
+        ).replace("{backend}", gate_backend)
+        moved = self._conn.execute(carry).rowcount
+        self._conn.execute(
+            "UPDATE daemon_merge_gates SET prompt_channel_id = NULL, prompt_message_id = NULL "
+            "WHERE prompt_message_id IS NOT NULL"
+        )
+        self._conn.commit()
+        if moved:
+            log.info("store.migrated", table="daemon_gate_prompts", moved=moved)
 
     def backfill_repo(self, repo: str | None) -> int:
         """Give repo-less rows the daemon's sole configured repository.
@@ -1830,8 +1948,13 @@ class DaemonStore:
         """Persist one filing-blocking ask's fallback; None over the cap
         (the question still posts — only the auto-file is shed)."""
         with self._lock:
+            # The cap bounds what one bridge's sweeper will ever fire; rows a
+            # backend nobody runs any more left behind do not count against
+            # the one that does.
             open_count = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM daemon_pending_clarifications WHERE state = 'open'"
+                "SELECT COUNT(*) AS n FROM daemon_pending_clarifications "
+                "WHERE state = 'open' AND backend = ?",
+                (backend,),
             ).fetchone()["n"]
             if int(open_count) >= PENDING_CLARIFICATION_CAP:
                 log.warning("store.clarification_cap", cap=PENDING_CLARIFICATION_CAP)
@@ -1854,16 +1977,26 @@ class DaemonStore:
             self._conn.commit()
             return int(cur.lastrowid or 0)
 
-    def take_due_clarifications(self, now: float) -> list[PendingClarification]:
+    def take_due_clarifications(
+        self, now: float, backend: str | None = None
+    ) -> list[PendingClarification]:
         """Claim every open ask past its deadline (CAS ``open`` -> ``firing``
         per row), so two sweepers — or a sweep racing a restart — never fire
-        the same ask twice."""
+        the same ask twice. Every bridge sweeps its own ``backend``; a bare
+        sweep takes them all."""
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM daemon_pending_clarifications "
-                "WHERE state = 'open' AND deadline <= ? ORDER BY deadline",
-                (now,),
-            ).fetchall()
+            if backend is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM daemon_pending_clarifications "
+                    "WHERE state = 'open' AND deadline <= ? ORDER BY deadline",
+                    (now,),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM daemon_pending_clarifications "
+                    "WHERE state = 'open' AND deadline <= ? AND backend = ? ORDER BY deadline",
+                    (now, backend),
+                ).fetchall()
             taken: list[PendingClarification] = []
             for row in rows:
                 cur = self._conn.execute(
@@ -1909,11 +2042,19 @@ class DaemonStore:
             self._conn.commit()
             return int(cur.rowcount)
 
-    def open_clarifications(self) -> list[PendingClarification]:
+    def open_clarifications(self, backend: str | None = None) -> list[PendingClarification]:
         with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM daemon_pending_clarifications WHERE state = 'open' ORDER BY deadline"
-            ).fetchall()
+            if backend is None:
+                rows = self._conn.execute(
+                    "SELECT * FROM daemon_pending_clarifications WHERE state = 'open' "
+                    "ORDER BY deadline"
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    "SELECT * FROM daemon_pending_clarifications "
+                    "WHERE state = 'open' AND backend = ? ORDER BY deadline",
+                    (backend,),
+                ).fetchall()
             return [self._clarification(row) for row in rows]
 
     def values_with_prefix(self, prefix: str) -> dict[str, str]:
@@ -2050,15 +2191,41 @@ class DaemonStore:
             self._conn.commit()
         log.info("store.merge_gate_resolved", run=run_id, state=state, by=by)
 
-    def set_gate_prompt(self, run_id: str, channel_id: str | None, message_id: str | None) -> None:
-        """Where the prompt lives, so a restart can find/refresh it."""
+    def set_gate_prompt(
+        self,
+        run_id: str,
+        channel_id: str | None,
+        message_id: str | None,
+        *,
+        backend: str,
+    ) -> None:
+        """Where ``backend``'s prompt lives, so a restart can find/refresh
+        it; an empty message id forgets it."""
         with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_merge_gates SET prompt_channel_id = ?, prompt_message_id = ? "
-                "WHERE run_id = ?",
-                (_text_or_none(channel_id), _text_or_none(message_id), run_id),
-            )
+            if not message_id:
+                self._conn.execute(
+                    "DELETE FROM daemon_gate_prompts WHERE run_id = ? AND backend = ?",
+                    (run_id, backend),
+                )
+            else:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO daemon_gate_prompts "
+                    "(run_id, backend, channel_id, message_id) VALUES (?, ?, ?, ?)",
+                    (run_id, backend, _text_or_none(channel_id), str(message_id)),
+                )
             self._conn.commit()
+
+    def gate_prompt(self, run_id: str, backend: str) -> tuple[str | None, str] | None:
+        """``(channel_id, message_id)`` of ``backend``'s prompt for the gate."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT channel_id, message_id FROM daemon_gate_prompts "
+                "WHERE run_id = ? AND backend = ?",
+                (run_id, backend),
+            ).fetchone()
+            if row is None or not row["message_id"]:
+                return None
+            return (_text_or_none(row["channel_id"]), str(row["message_id"]))
 
     # -- review holds (#675) -----------------------------------------------------
 
@@ -2277,13 +2444,25 @@ class DaemonStore:
 
     # -- chat threads ----------------------------------------------------------
 
-    def chat_thread(self, run_id: str) -> ChatThread | None:
+    def chat_thread(self, run_id: str, backend: str | None = None) -> ChatThread | None:
+        """The run's thread on ``backend``; with none named, the external
+        backend's — what a link in prose points at. A bridge names its
+        own backend; the local console's thread is never the bare answer,
+        since an external bridge cannot spell a pointer to it."""
         with self._lock:
-            row = self._conn.execute(
-                "SELECT backend, channel_id, thread_id, headline_id, status_id "
-                "FROM daemon_chat_threads WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
+            if backend is None:
+                row = self._conn.execute(
+                    "SELECT backend, channel_id, thread_id, headline_id, status_id "
+                    "FROM daemon_chat_threads WHERE run_id = ? AND backend != 'local' "
+                    "ORDER BY backend LIMIT 1",
+                    (run_id,),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT backend, channel_id, thread_id, headline_id, status_id "
+                    "FROM daemon_chat_threads WHERE run_id = ? AND backend = ?",
+                    (run_id, backend),
+                ).fetchone()
             if row is None:
                 return None
             return ChatThread(
@@ -2294,19 +2473,37 @@ class DaemonStore:
                 str(row["backend"] or "discord"),
             )
 
-    def set_chat_status_id(self, run_id: str, status_id: str | None) -> None:
+    def set_chat_status_id(
+        self, run_id: str, status_id: str | None, *, backend: str | None = None
+    ) -> None:
+        """Record the status line's message on ``backend``'s thread — with
+        none named, on the thread :meth:`chat_thread` would return."""
         with self._lock:
+            if backend is None:
+                known = self.chat_thread(run_id)
+                if known is None:
+                    return
+                backend = known.backend
             self._conn.execute(
-                "UPDATE daemon_chat_threads SET status_id = ? WHERE run_id = ?",
-                (_text_or_none(status_id), run_id),
+                "UPDATE daemon_chat_threads SET status_id = ? WHERE run_id = ? AND backend = ?",
+                (_text_or_none(status_id), run_id, backend),
             )
             self._conn.commit()
 
-    def run_for_thread(self, thread_id: str | int) -> str | None:
+    def run_for_thread(self, thread_id: str | int, backend: str | None = None) -> str | None:
+        """The run whose thread this is; scoped to ``backend`` when given,
+        since the local bridge's ids and a snowflake share no namespace."""
         with self._lock:
-            row = self._conn.execute(
-                "SELECT run_id FROM daemon_chat_threads WHERE thread_id = ?", (str(thread_id),)
-            ).fetchone()
+            if backend is None:
+                row = self._conn.execute(
+                    "SELECT run_id FROM daemon_chat_threads WHERE thread_id = ?",
+                    (str(thread_id),),
+                ).fetchone()
+            else:
+                row = self._conn.execute(
+                    "SELECT run_id FROM daemon_chat_threads WHERE thread_id = ? AND backend = ?",
+                    (str(thread_id), backend),
+                ).fetchone()
             return str(row["run_id"]) if row else None
 
     def record_chat_thread(
@@ -2356,58 +2553,82 @@ class DaemonStore:
 
     # -- run watches -----------------------------------------------------------
 
-    def add_run_watch(self, run_id: str, watcher_id: str, now: float) -> None:
+    # Watches belong to the bridge that registered them: only that bridge
+    # can @mention the watcher, so each keeps its own rows per run.
+
+    def add_run_watch(self, run_id: str, watcher_id: str, now: float, *, backend: str) -> None:
         """Register interest in a run's completion; idempotent per watcher."""
         with self._lock:
             self._conn.execute(
-                "INSERT OR IGNORE INTO daemon_run_watches (run_id, watcher_id, created_at) "
-                "VALUES (?, ?, ?)",
-                (run_id, watcher_id, now),
+                "INSERT OR IGNORE INTO daemon_run_watches "
+                "(run_id, watcher_id, created_at, backend) VALUES (?, ?, ?, ?)",
+                (run_id, watcher_id, now, backend),
             )
             self._conn.commit()
 
-    def run_watchers(self, run_id: str) -> list[str]:
+    def run_watchers(self, run_id: str, backend: str | None = None) -> list[str]:
+        """The run's watchers on ``backend`` — every backend's when none is
+        named (a gate's or hold's notify list addresses them all)."""
         with self._lock:
-            return [
-                str(r["watcher_id"])
-                for r in self._conn.execute(
+            if backend is None:
+                rows = self._conn.execute(
                     "SELECT watcher_id FROM daemon_run_watches WHERE run_id = ? ORDER BY rowid",
                     (run_id,),
                 )
-            ]
+            else:
+                rows = self._conn.execute(
+                    "SELECT watcher_id FROM daemon_run_watches "
+                    "WHERE run_id = ? AND backend = ? ORDER BY rowid",
+                    (run_id, backend),
+                )
+            return [str(r["watcher_id"]) for r in rows]
 
-    def take_run_watchers(self, run_id: str) -> list[str]:
-        """Return the run's watchers and clear them in one transaction."""
+    def take_run_watchers(self, run_id: str, backend: str) -> list[str]:
+        """Return the run's watchers on ``backend`` and clear them in one
+        transaction."""
         with self._lock:
             watchers = [
                 str(r["watcher_id"])
                 for r in self._conn.execute(
-                    "SELECT watcher_id FROM daemon_run_watches WHERE run_id = ? ORDER BY rowid",
-                    (run_id,),
+                    "SELECT watcher_id FROM daemon_run_watches "
+                    "WHERE run_id = ? AND backend = ? ORDER BY rowid",
+                    (run_id, backend),
                 )
             ]
-            self._conn.execute("DELETE FROM daemon_run_watches WHERE run_id = ?", (run_id,))
+            self._conn.execute(
+                "DELETE FROM daemon_run_watches WHERE run_id = ? AND backend = ?",
+                (run_id, backend),
+            )
             self._conn.commit()
             return watchers
 
-    def all_run_watches(self) -> dict[str, list[str]]:
-        """Every pending watch, for reloading the bridge registry at startup."""
+    def all_run_watches(self, backend: str) -> dict[str, list[str]]:
+        """Every pending watch on ``backend``, for reloading the bridge
+        registry at startup."""
         with self._lock:
             watches: dict[str, list[str]] = {}
             for r in self._conn.execute(
-                "SELECT run_id, watcher_id FROM daemon_run_watches ORDER BY rowid"
+                "SELECT run_id, watcher_id FROM daemon_run_watches WHERE backend = ? "
+                "ORDER BY rowid",
+                (backend,),
             ):
                 watches.setdefault(str(r["run_id"]), []).append(str(r["watcher_id"]))
             return watches
 
-    def clear_run_watch(self, run_id: str) -> None:
+    def clear_run_watch(self, run_id: str, backend: str | None = None) -> None:
         """Drop a run's watch row without returning it — used by the bridge's
         `_evict_watch` when an entry is dropped for a reason other than a
         normal finish (a `WATCHERS_CAP` trim, or reconciling a reload
         against a run that already finished while the daemon was down),
         where `take_run_watchers`'s return value would just be discarded."""
         with self._lock:
-            self._conn.execute("DELETE FROM daemon_run_watches WHERE run_id = ?", (run_id,))
+            if backend is None:
+                self._conn.execute("DELETE FROM daemon_run_watches WHERE run_id = ?", (run_id,))
+            else:
+                self._conn.execute(
+                    "DELETE FROM daemon_run_watches WHERE run_id = ? AND backend = ?",
+                    (run_id, backend),
+                )
             self._conn.commit()
 
 

@@ -414,8 +414,9 @@ class DiscordBridge(ChatBridge):
             if view is None:
                 return
             try:
-                if gate.prompt_message_id:
-                    add_view(view, message_id=int(gate.prompt_message_id))
+                where = self.dstore.gate_prompt(gate.run_id, self.backend)
+                if where is not None and where[1].isdigit():
+                    add_view(view, message_id=int(where[1]))
                 else:
                     add_view(view)
                 armed.add(gate.custom_id)

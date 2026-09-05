@@ -1490,10 +1490,12 @@ class TestRunWatches:
         release_persist = threading.Event()
         real_add = bridge.dstore.add_run_watch
 
-        def slow_add_run_watch(run_id: str, watcher_id: str, now: float) -> None:
+        def slow_add_run_watch(
+            run_id: str, watcher_id: str, now: float, *, backend: str = "discord"
+        ) -> None:
             entered_persist.set()
             assert release_persist.wait(timeout=5.0)
-            real_add(run_id, watcher_id, now)
+            real_add(run_id, watcher_id, now, backend=backend)
 
         bridge.dstore.add_run_watch = slow_add_run_watch  # type: ignore[method-assign]
 
@@ -2438,10 +2440,9 @@ class TestGatePrompt:
         assert "<@1>" in prompt
         assert "!sbx merge gh:issue:7" in prompt
         assert "abandon gh:issue:7" in prompt
-        stored = bridge.dstore.merge_gate_for("r77")
-        assert stored is not None
-        assert stored.prompt_channel_id == "421"
-        assert stored.prompt_message_id, "the prompt id is persisted for restarts"
+        stored = bridge.dstore.gate_prompt("r77", "discord")
+        assert stored is not None, "the prompt id is persisted for restarts"
+        assert stored[0] == "421" and stored[1]
 
     def test_resolution_edits_the_prompt_in_place(self, tmp_path: Path) -> None:
         bridge, client, _ = make_bridge(tmp_path)
@@ -2451,7 +2452,7 @@ class TestGatePrompt:
         bridge.dstore.create_merge_gate(
             "r77", "gh:issue:7", "o/r", 9, "https://x/pull/9", None, ["1"], "tok77", 1.0
         )
-        bridge.dstore.set_gate_prompt("r77", "42", str(msg.id))
+        bridge.dstore.set_gate_prompt("r77", "42", str(msg.id), backend="discord")
         gate = bridge.dstore.merge_gate_for("r77")
         assert gate is not None
         asyncio.run(bridge._update_gate_prompt(gate, "merged", "brett", "abc123def456"))
@@ -2468,7 +2469,7 @@ class TestGatePrompt:
         bridge.dstore.create_merge_gate(
             "r77", "gh:issue:7", "o/r", 9, "https://x/pull/9", None, ["1"], "tok77", 1.0
         )
-        bridge.dstore.set_gate_prompt("r77", "42", str(msg.id))
+        bridge.dstore.set_gate_prompt("r77", "42", str(msg.id), backend="discord")
         gate = bridge.dstore.merge_gate_for("r77")
         assert gate is not None
         asyncio.run(bridge._update_gate_prompt(gate, "failed", "brett", "CI went red"))
@@ -2542,7 +2543,7 @@ class TestGateViewRearm:
         armed: list[Any] = []
         client.add_view = lambda view, message_id=None: armed.append(message_id)  # type: ignore[attr-defined]
         bridge.dstore.create_merge_gate("r1", "gh:issue:1", "o/r", 9, "u", None, [], "t1", 1.0)
-        bridge.dstore.set_gate_prompt("r1", "42", "555")
+        bridge.dstore.set_gate_prompt("r1", "42", "555", backend="discord")
         bridge.dstore.create_merge_gate("r2", "gh:issue:2", "o/r", 9, "u", None, [], "t2", 1.0)
         assert bridge.dstore.claim_merge_gate("r2")  # approving: armed anyway
         bridge._register_gate_views(client)
