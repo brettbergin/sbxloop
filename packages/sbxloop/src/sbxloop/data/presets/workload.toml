@@ -21,9 +21,10 @@
 #   `cron` runs on the stated minutes in `timezone`. Exactly one of the two.
 #
 # Not yet exercised against a live sandbox (the field test follows the
-# stack): the service box's first real `call_service`, offline dependency
-# fetches per ecosystem, a mid-run egress grant, and the `pr` sink on a
-# configured repository. Everything else here has been run for real.
+# stack): a workload run end to end, and within it the service box's first
+# real `call_service`, offline dependency fetches per ecosystem, a mid-run
+# egress grant, and the `pr` sink on a configured repository. The test
+# suite covers all of it against fakes; only `code` runs have field time.
 
 [[credentials]]
 name = "weather"
