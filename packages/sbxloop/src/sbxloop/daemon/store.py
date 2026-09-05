@@ -43,6 +43,13 @@ from sbxloop.log import get_logger
 log = get_logger(__name__)
 
 SCHEMA_VERSION = "2"
+#: The ``daemon_state`` key the version lives under.
+SCHEMA_VERSION_KEY = "schema_version"
+#: ``daemon_state`` keys the local bridge stamps.
+LOCAL_HEARTBEAT_KEY = "local_bridge_alive_at"
+LOCAL_STARTED_KEY = "local_bridge_started_at"
+#: The merge-gate states a prompt is still offered for.
+OPEN_GATE_STATES: tuple[str, ...] = ("open", "approving")
 LEGACY_SUFFIX = ".pre-1.0"
 
 _WORK_ITEMS_BODY = """(
@@ -271,6 +278,41 @@ CREATE TABLE IF NOT EXISTS daemon_pending_clarifications (
 );
 CREATE INDEX IF NOT EXISTS idx_pending_clarify_due
     ON daemon_pending_clarifications(state, deadline);
+
+-- The local chat bridge's mailbox: what the daemon said (direction 'out')
+-- and what an operator typed in `sbxloop tui` (direction 'in'), one id
+-- space so a transcript is one ORDER BY id and a reaction or an edit can
+-- address either side. The rows are the console's chronology — a detached
+-- console catches up by id — and the daemon claims inbound rows by CAS on
+-- taken_at, exactly as the ctl queue claims a request file. edited_at is
+-- when the text changed (the "(edited)" mark); updated_at moves on every
+-- change to a row — an edit, a reaction, a resolved gate, a claim — and is
+-- what a console polls to repaint what it already shows.
+CREATE TABLE IF NOT EXISTS daemon_local_messages (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    direction      TEXT NOT NULL,
+    channel_id     TEXT NOT NULL,
+    kind           TEXT NOT NULL DEFAULT 'message',
+    text           TEXT NOT NULL DEFAULT '',
+    embed_json     TEXT,
+    choices_json   TEXT,
+    gate_run_id    TEXT,
+    reply_to_id    INTEGER,
+    mention_users  INTEGER NOT NULL DEFAULT 0,
+    author_id      TEXT NOT NULL DEFAULT 'sbx',
+    author_name    TEXT NOT NULL DEFAULT 'sbx',
+    reactions_json TEXT NOT NULL DEFAULT '[]',
+    created_at     REAL NOT NULL,
+    edited_at      REAL,
+    updated_at     REAL NOT NULL DEFAULT 0,
+    taken_at       REAL
+);
+CREATE INDEX IF NOT EXISTS idx_local_messages_channel
+    ON daemon_local_messages(channel_id, id);
+CREATE INDEX IF NOT EXISTS idx_local_messages_updated
+    ON daemon_local_messages(channel_id, updated_at);
+CREATE INDEX IF NOT EXISTS idx_local_messages_pending
+    ON daemon_local_messages(id) WHERE direction = 'in' AND taken_at IS NULL;
 """
 #: The schema's index statements alone, for a rebuild to recreate inside
 #: its own transaction (``executescript`` would commit it first).
@@ -420,6 +462,66 @@ class PendingClarification(NamedTuple):
     state: str
 
 
+class LocalMessage(NamedTuple):
+    """One row of the local bridge's mailbox (either direction)."""
+
+    id: int
+    direction: str
+    channel_id: str
+    kind: str
+    text: str
+    embed_json: str | None
+    choices_json: str | None
+    gate_run_id: str | None
+    reply_to_id: int | None
+    mention_users: bool
+    author_id: str
+    author_name: str
+    reactions: tuple[str, ...]
+    created_at: float
+    edited_at: float | None
+    updated_at: float
+    taken_at: float | None
+    # The direction of the row this one replies to, when it has one —
+    # what tells an inbound "reply to the bot" from a reply to a person.
+    reply_to_direction: str | None = None
+
+
+def _row_to_local_message(row: sqlite3.Row) -> LocalMessage:
+    try:
+        reactions = tuple(str(r) for r in json.loads(row["reactions_json"] or "[]"))
+    except ValueError:
+        reactions = ()
+    return LocalMessage(
+        id=int(row["id"]),
+        direction=str(row["direction"]),
+        channel_id=str(row["channel_id"]),
+        kind=str(row["kind"]),
+        text=str(row["text"] or ""),
+        embed_json=_text_or_none(row["embed_json"]),
+        choices_json=_text_or_none(row["choices_json"]),
+        gate_run_id=_text_or_none(row["gate_run_id"]),
+        reply_to_id=None if row["reply_to_id"] is None else int(row["reply_to_id"]),
+        mention_users=bool(row["mention_users"]),
+        author_id=str(row["author_id"]),
+        author_name=str(row["author_name"]),
+        reactions=reactions,
+        created_at=float(row["created_at"]),
+        edited_at=None if row["edited_at"] is None else float(row["edited_at"]),
+        updated_at=float(row["updated_at"] or 0.0),
+        taken_at=None if row["taken_at"] is None else float(row["taken_at"]),
+        reply_to_direction=_text_or_none(row["reply_to_direction"]),
+    )
+
+
+#: Everything the mailbox reads select, joined to the replied-to row's
+#: direction; shared by the store and the console's read-only handle.
+LOCAL_MESSAGE_SELECT = (
+    "SELECT m.*, r.direction AS reply_to_direction FROM daemon_local_messages m "
+    "LEFT JOIN daemon_local_messages r ON r.id = m.reply_to_id"
+)
+
+
 class ChatThread(NamedTuple):
     """Where a run lives on the chat backend (persisted so a restart
     re-attaches). Ids are the backend's own text form: a Discord snowflake
@@ -430,6 +532,22 @@ class ChatThread(NamedTuple):
     headline_id: str | None
     status_id: str | None
     backend: str = "discord"
+
+
+def _row_to_chat_thread(row: sqlite3.Row) -> ChatThread:
+    return ChatThread(
+        str(row["channel_id"]),
+        str(row["thread_id"]),
+        _text_or_none(row["headline_id"]),
+        _text_or_none(row["status_id"]),
+        str(row["backend"] or "discord"),
+    )
+
+
+def parse_breaker(opened: str | None, failures: str | None) -> tuple[float | None, int]:
+    """The two ``daemon_state`` breaker values as the loop keeps them."""
+    opened_at = float(opened) if opened not in (None, "") else None
+    return opened_at, int(failures) if failures not in (None, "") else 0
 
 
 class DiscordThread(NamedTuple):
@@ -514,6 +632,12 @@ def _repo_from_url(url: object) -> str | None:
     return f"{match.group(1)}/{match.group(2)}" if match else None
 
 
+def readonly_uri(path: Path) -> str:
+    """A ``mode=ro`` SQLite URI for ``path`` — percent-encoded, so a
+    directory name with ``?``, ``#`` or ``%`` still names this file."""
+    return f"{path.resolve().as_uri()}?mode=ro"
+
+
 def _tables(conn: sqlite3.Connection) -> set[str]:
     return {
         str(row[0]) for row in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
@@ -544,7 +668,7 @@ class DaemonStore:
         """
         if not path.is_file():
             return None
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        conn = sqlite3.connect(readonly_uri(path), uri=True)
         try:
             tables = _tables(conn)
             if "daemon_work_items" not in tables:
@@ -572,12 +696,52 @@ class DaemonStore:
         )
         return target
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, readonly: bool = False) -> None:
+        """Open the store. ``readonly`` opens the file through a read-only
+        URI and runs no schema statement — what a second process on the
+        daemon host (the operator console) uses, so it never migrates a
+        store under a running daemon; every write then fails in SQLite. A
+        read-only store must already carry the current schema."""
         self.path = path
+        self.readonly = readonly
+        # One connection shared by the daemon, bridge and CLI threads:
+        # sqlite3 rejects concurrent use of a connection from two threads
+        # ("bad parameter or other API misuse"), so EVERY statement — reads
+        # included — runs under this lock.
+        self._lock = threading.RLock()
+        if readonly:
+            if not path.exists():
+                raise DaemonError(
+                    f"{path} does not exist; start `sbxloop daemon` once to create it"
+                )
+            self._conn = sqlite3.connect(readonly_uri(path), uri=True, check_same_thread=False)
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            tables = _tables(self._conn)
+            if "daemon_local_messages" not in tables or "daemon_state" not in tables:
+                self._conn.close()
+                raise DaemonError(
+                    f"{path} predates the operator console; start (or upgrade and restart) "
+                    "`sbxloop daemon` so the store is migrated"
+                )
+            version = self.get_value(SCHEMA_VERSION_KEY)
+            if version is not None and version != SCHEMA_VERSION:
+                self._conn.close()
+                raise DaemonError(
+                    f"{path} is at daemon schema {version}; this sbxloop expects "
+                    f"{SCHEMA_VERSION} — upgrade the daemon and the console together"
+                )
+            log.debug("store.opened", db=str(path), readonly=True)
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
+        # WAL + NORMAL, as the engine store: a commit no longer fsyncs, and a
+        # crash can only lose the tail of the WAL. The mailbox commits on
+        # every chronology flush, so this is the difference between an
+        # fsync per status-line edit and none.
+        self._conn.execute("PRAGMA synchronous=NORMAL")
         # The engine commits per event on the same file while a run is in
         # flight; wait for it instead of failing on SQLITE_BUSY.
         self._conn.execute("PRAGMA busy_timeout=5000")
@@ -597,16 +761,11 @@ class DaemonStore:
         self._migrate_discord_threads()
         self._migrate_backend_keys()
         self._conn.execute(
-            "INSERT OR REPLACE INTO daemon_state (key, value) VALUES ('schema_version', ?)",
-            (SCHEMA_VERSION,),
+            "INSERT OR REPLACE INTO daemon_state (key, value) VALUES (?, ?)",
+            (SCHEMA_VERSION_KEY, SCHEMA_VERSION),
         )
         self._conn.commit()
         log.debug("store.opened", db=str(path), schema=SCHEMA_VERSION)
-        # One connection shared by the daemon, bridge and CLI threads:
-        # sqlite3 rejects concurrent use of a connection from two threads
-        # ("bad parameter or other API misuse"), so EVERY statement — reads
-        # included — runs under this lock.
-        self._lock = threading.RLock()
 
     def close(self) -> None:
         self._conn.close()
@@ -2419,12 +2578,7 @@ class DaemonStore:
                     "('breaker_opened_at', 'consecutive_failures')"
                 )
             }
-        opened = rows.get("breaker_opened_at")
-        failures = rows.get("consecutive_failures")
-        return (
-            float(opened) if opened not in (None, "") else None,
-            int(failures) if failures not in (None, "") else 0,
-        )
+        return parse_breaker(rows.get("breaker_opened_at"), rows.get("consecutive_failures"))
 
     def set_breaker(self, opened_at: float | None, consecutive_failures: int) -> None:
         log.debug(
@@ -2463,15 +2617,18 @@ class DaemonStore:
                     "FROM daemon_chat_threads WHERE run_id = ? AND backend = ?",
                     (run_id, backend),
                 ).fetchone()
-            if row is None:
-                return None
-            return ChatThread(
-                str(row["channel_id"]),
-                str(row["thread_id"]),
-                _text_or_none(row["headline_id"]),
-                _text_or_none(row["status_id"]),
-                str(row["backend"] or "discord"),
-            )
+            return _row_to_chat_thread(row) if row else None
+
+    def chat_threads(self, backend: str) -> list[tuple[str, ChatThread]]:
+        """Every run's thread on ``backend``, newest headline first."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT run_id, backend, channel_id, thread_id, headline_id, status_id "
+                "FROM daemon_chat_threads WHERE backend = ? "
+                "ORDER BY CAST(headline_id AS INTEGER) DESC, run_id",
+                (backend,),
+            ).fetchall()
+            return [(str(r["run_id"]), _row_to_chat_thread(r)) for r in rows]
 
     def set_chat_status_id(
         self, run_id: str, status_id: str | None, *, backend: str | None = None
@@ -2630,6 +2787,224 @@ class DaemonStore:
                     (run_id, backend),
                 )
             self._conn.commit()
+
+    # -- the local bridge's mailbox ---------------------------------------------
+
+    def local_post(
+        self,
+        channel_id: str,
+        text: str,
+        *,
+        now: float,
+        direction: str = "out",
+        kind: str = "message",
+        embed_json: str | None = None,
+        choices_json: str | None = None,
+        gate_run_id: str | None = None,
+        reply_to_id: int | None = None,
+        mention_users: bool = False,
+        author_id: str = "sbx",
+        author_name: str = "sbx",
+    ) -> int:
+        """Append one row and return its id — the daemon's own posts, and
+        (``direction="in"``) what a console typed or clicked."""
+        with self._lock:
+            cur = self._conn.execute(
+                "INSERT INTO daemon_local_messages (direction, channel_id, kind, text, "
+                "embed_json, choices_json, gate_run_id, reply_to_id, mention_users, "
+                "author_id, author_name, created_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    direction,
+                    channel_id,
+                    kind,
+                    text,
+                    embed_json,
+                    choices_json,
+                    gate_run_id,
+                    reply_to_id,
+                    int(mention_users),
+                    author_id,
+                    author_name,
+                    now,
+                    now,
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def local_edit(
+        self,
+        message_id: int,
+        text: str,
+        *,
+        now: float,
+        embed_json: str | None = None,
+        choices_json: str | None = None,
+    ) -> bool:
+        """Rewrite one of the daemon's rows in place; False when there is no
+        such outbound row. ``embed_json`` / ``choices_json`` replace the
+        stored ones only when given."""
+        with self._lock:
+            sets = ["text = ?", "edited_at = ?", "updated_at = ?"]
+            params: list[object] = [text, now, now]
+            if embed_json is not None:
+                sets.append("embed_json = ?")
+                params.append(embed_json)
+            if choices_json is not None:
+                sets.append("choices_json = ?")
+                params.append(choices_json)
+            params.append(message_id)
+            cur = self._conn.execute(
+                f"UPDATE daemon_local_messages SET {', '.join(sets)} "  # nosec B608 - literals
+                "WHERE id = ? AND direction = 'out'",
+                params,
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
+
+    def local_react(self, message_id: int, emoji: str, *, now: float) -> bool:
+        """Add the daemon's reaction to a row (idempotent); False when the
+        row does not exist."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT reactions_json FROM daemon_local_messages WHERE id = ?", (message_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            try:
+                reactions = [str(r) for r in json.loads(row["reactions_json"] or "[]")]
+            except ValueError:
+                reactions = []
+            if emoji not in reactions:
+                reactions.append(emoji)
+                self._conn.execute(
+                    "UPDATE daemon_local_messages SET reactions_json = ?, updated_at = ? "
+                    "WHERE id = ?",
+                    (json.dumps(reactions), now, message_id),
+                )
+                self._conn.commit()
+            return True
+
+    def local_clear_gate(self, message_id: int, *, now: float) -> None:
+        """The gate prompt is resolved: the row no longer offers approval."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE daemon_local_messages SET gate_run_id = NULL, updated_at = ? WHERE id = ?",
+                (now, message_id),
+            )
+            self._conn.commit()
+
+    def local_message(self, message_id: int) -> LocalMessage | None:
+        with self._lock:
+            row = self._conn.execute(
+                f"{LOCAL_MESSAGE_SELECT} WHERE m.id = ?", (message_id,)
+            ).fetchone()
+            return _row_to_local_message(row) if row else None
+
+    def local_messages(
+        self, channel_id: str, *, after_id: int = 0, limit: int = 500
+    ) -> list[LocalMessage]:
+        """A channel's transcript after ``after_id``, oldest first."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"{LOCAL_MESSAGE_SELECT} WHERE m.channel_id = ? AND m.id > ? ORDER BY m.id LIMIT ?",
+                (channel_id, after_id, limit),
+            ).fetchall()
+            return [_row_to_local_message(r) for r in rows]
+
+    def take_local_inbound(self, now: float, *, limit: int = 50) -> list[LocalMessage]:
+        """Claim the oldest unclaimed inbound rows (CAS on ``taken_at`` per
+        row, so a restart racing a poll never handles one twice)."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"{LOCAL_MESSAGE_SELECT} WHERE m.direction = 'in' AND m.taken_at IS NULL "
+                "ORDER BY m.id LIMIT ?",
+                (limit,),
+            ).fetchall()
+            taken: list[LocalMessage] = []
+            for row in rows:
+                cur = self._conn.execute(
+                    "UPDATE daemon_local_messages SET taken_at = ?, updated_at = ? "
+                    "WHERE id = ? AND taken_at IS NULL",
+                    (now, now, int(row["id"])),
+                )
+                if cur.rowcount == 1:
+                    taken.append(_row_to_local_message(row))
+            self._conn.commit()
+            return taken
+
+    def local_changed_since(
+        self, channel_id: str, *, after_id: int, since: float
+    ) -> list[LocalMessage]:
+        """Rows in the channel up to ``after_id`` that changed since
+        ``since`` — an edit, a reaction, a claim, a resolved gate — what a
+        console repaints in place beside the rows it has not seen."""
+        with self._lock:
+            rows = self._conn.execute(
+                f"{LOCAL_MESSAGE_SELECT} WHERE m.channel_id = ? AND m.id <= ? "
+                "AND m.updated_at > ? ORDER BY m.id",
+                (channel_id, after_id, since),
+            ).fetchall()
+            return [_row_to_local_message(r) for r in rows]
+
+    def local_latest_ids(self) -> dict[str, int]:
+        """The newest row id per channel (unread counts)."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT channel_id, MAX(id) AS id FROM daemon_local_messages GROUP BY channel_id"
+            ).fetchall()
+            return {str(r["channel_id"]): int(r["id"]) for r in rows}
+
+    def local_taken(self, message_ids: Sequence[int]) -> set[int]:
+        """Which of the given inbound rows the daemon has claimed."""
+        if not message_ids:
+            return set()
+        marks = ",".join("?" for _ in message_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT id FROM daemon_local_messages WHERE id IN ({marks}) "  # nosec B608
+                "AND taken_at IS NOT NULL",
+                tuple(message_ids),
+            ).fetchall()
+            return {int(r[0]) for r in rows}
+
+    def prune_local_messages(self, older_than: float) -> int:
+        """Drop rows created before ``older_than``, keeping every prompt of
+        a gate still open — it has no deadline, and the console's approve
+        button is that row — and every row a thread is anchored on (its
+        headline and status line), which the bridge still edits."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM daemon_local_messages WHERE created_at < ? "
+                "AND (gate_run_id IS NULL OR gate_run_id NOT IN "
+                "(SELECT run_id FROM daemon_merge_gates WHERE state IN ('open', 'approving'))) "
+                "AND CAST(id AS TEXT) NOT IN (SELECT headline_id FROM daemon_chat_threads "
+                "WHERE backend = 'local' AND headline_id IS NOT NULL) "
+                "AND CAST(id AS TEXT) NOT IN (SELECT status_id FROM daemon_chat_threads "
+                "WHERE backend = 'local' AND status_id IS NOT NULL)",
+                (older_than,),
+            )
+            self._conn.commit()
+            return int(cur.rowcount)
+
+    def set_local_heartbeat(self, now: float) -> None:
+        """The local bridge is alive: what the console reads to say whether
+        a daemon is listening without a ctl round trip."""
+        with self._lock:
+            self._conn.execute(
+                "INSERT OR REPLACE INTO daemon_state (key, value) VALUES (?, ?)",
+                (LOCAL_HEARTBEAT_KEY, repr(float(now))),
+            )
+            self._conn.commit()
+
+
+#: Public names for the row shapers the console's read-only handle reuses
+#: (`sbxloop.daemon.mailbox`), so it never re-derives a row's fields.
+row_to_item = _row_to_item
+row_to_gate = _row_to_gate
+row_to_hold = _row_to_hold
+row_to_local_message = _row_to_local_message
 
 
 def _text_or_none(value: object) -> str | None:

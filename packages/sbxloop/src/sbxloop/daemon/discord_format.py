@@ -32,6 +32,7 @@ upstream missed. It is idempotent, so already-masked text is unchanged.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import socket
@@ -317,6 +318,30 @@ class EmbedSpec:
         if self.footer:
             lines.append(f"_{self.footer}_")
         return "\n".join(lines)
+
+
+def embed_to_json(spec: EmbedSpec) -> str:
+    """The card as JSON, for a transport that stores rather than posts —
+    the dataclass's own fields, so a field added to :class:`EmbedSpec`
+    rides along."""
+    return json.dumps(dataclasses.asdict(spec))
+
+
+def embed_from_json(text: str) -> EmbedSpec | None:
+    """The card back from :func:`embed_to_json`; None for anything else."""
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    known = {f.name for f in dataclasses.fields(EmbedSpec)}
+    fields = data.get("fields") or ()
+    try:
+        data["fields"] = tuple((str(n), str(v), bool(i)) for n, v, i in fields)
+        return EmbedSpec(**{k: v for k, v in data.items() if k in known})
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)

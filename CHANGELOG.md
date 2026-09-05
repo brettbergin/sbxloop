@@ -6,6 +6,37 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **The daemon always runs a local chat bridge for the operator console**
+  (#769). A person on the daemon host had the CLI and journald; everything
+  a run *shows* — the headline, the thread, the status line and tool digest
+  edited in place, steering, the concierge, clarifying-choice buttons, the
+  merge-gate approve button — existed only on Discord or Slack, and a
+  headless daemon had no concierge at all. The daemon now runs a
+  `LocalBridge` beside whatever `[chat] backend` names, through one
+  fan-out frontend: a third `ChatBridge` whose transport is a mailbox in
+  the daemon's own `state.db` (`daemon_local_messages`) — every message
+  the bridge would post becomes a row, edits rewrite it, reactions
+  decorate it, and what an operator types in `sbxloop tui` arrives as a
+  row the bridge claims, the same file-drop shape as the ctl queue. A row
+  typed before the daemon started is refused with a note, never executed.
+  The concierge is built whenever `[concierge] enabled`, headless
+  included — a headless host now boots the concierge sandbox at start and
+  needs the agent credential. `[tui]` carries the console's knobs
+  (`operator_id`, `emoji`, `daemon_unit`, `refresh_s`, `retention_days`)
+  beside the shared rendering ones; `[chat] backend` still names only the
+  external service. `sbxloop.daemon.mailbox.MailboxClient` is the
+  console's handle: read-only for state, one kind of write, no schema
+  statement — so a console never migrates a store under a running daemon.
+  Both stores open read-only for it (`readonly=True`: a `mode=ro` URI,
+  no schema statement). With two bridges up, each renders only the
+  requester and watcher ids it owns (a snowflake is Discord's, a member
+  id Slack's, a login name the console's), and the concierge words each
+  reply for the surface the message came in on. `ctl status` reports
+  `pid`, `started_at` and `version`; `sbxloop doctor` shows an `operator console` row and its concierge row no longer needs a chat backend. The
+  console itself (`sbxloop tui`) follows.
+
 ### Changed
 
 - **Chat state is keyed by backend** (#768). The daemon is about to run

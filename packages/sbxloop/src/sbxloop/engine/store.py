@@ -206,9 +206,12 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
 
 
 class StateStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, readonly: bool = False) -> None:
+        """Open the store. ``readonly`` opens the file through a read-only
+        URI and runs no schema statement (the operator console's handle; a
+        write then fails in SQLite); the file must already exist."""
         self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self.readonly = readonly
         # One connection is shared by every caller (check_same_thread=False),
         # so writers serialise here rather than relying on SQLite's own
         # per-statement mutex: `append_event_if_state` holds an explicit
@@ -216,6 +219,16 @@ class StateStore:
         # thread committing mid-transaction would end it early. Reentrant
         # so a guarded method may call another.
         self._lock = threading.RLock()
+        if readonly:
+            if not path.exists():
+                raise StateError(f"{path} does not exist")
+            self._conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro", uri=True, check_same_thread=False
+            )
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -617,21 +630,20 @@ class StateStore:
         rows = self._conn.execute(
             "SELECT * FROM tasks WHERE run_id = ? ORDER BY order_idx", (run_id,)
         ).fetchall()
-        records: list[TaskRecord] = []
-        for row in rows:
-            records.append(
-                TaskRecord(
-                    spec=TaskSpec.model_validate_json(row["spec_json"]),
-                    state=row["state"],
-                    revisions=row["revisions"],
-                    replans=row["replans"],
-                    last_feedback=row["last_feedback"],
-                    session_id=row["session_id"],
-                    verify_fingerprints=json.loads(row["verify_fingerprints"] or "[]"),
-                    verify_suspect=bool(row["verify_suspect"]),
-                )
-            )
-        return records
+        return [self._task_record(row) for row in rows]
+
+    @staticmethod
+    def _task_record(row: sqlite3.Row) -> TaskRecord:
+        return TaskRecord(
+            spec=TaskSpec.model_validate_json(row["spec_json"]),
+            state=row["state"],
+            revisions=row["revisions"],
+            replans=row["replans"],
+            last_feedback=row["last_feedback"],
+            session_id=row["session_id"],
+            verify_fingerprints=json.loads(row["verify_fingerprints"] or "[]"),
+            verify_suspect=bool(row["verify_suspect"]),
+        )
 
     # -- phase attempts ----------------------------------------------------
 
@@ -931,14 +943,17 @@ class StateStore:
             query += " AND type LIKE ?"
             params.append(type_prefix + "%")
         query += " ORDER BY seq"
-        for row in self._conn.execute(query, params):
-            yield (
-                row["seq"],
-                Event(
-                    ts=row["ts"],
-                    run_id=row["run_id"],
-                    job_id=row["job_id"],
-                    type=row["type"],
-                    data=json.loads(row["data_json"]),
-                ),
-            )
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        for row in rows:
+            yield (row["seq"], self._event_record(row))
+
+    @staticmethod
+    def _event_record(row: sqlite3.Row) -> Event:
+        return Event(
+            ts=row["ts"],
+            run_id=row["run_id"],
+            job_id=row["job_id"],
+            type=row["type"],
+            data=json.loads(row["data_json"]),
+        )

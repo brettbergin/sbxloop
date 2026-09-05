@@ -543,6 +543,38 @@ class TestDaemonCommand:
         assert "tick:" in result.output and "no_work" in result.output
         assert "daemon.tick" in result.output  # and the structured record
 
+    def test_once_runs_the_local_bridge_and_names_it_in_the_summary(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A headless daemon still has the operator console's bridge: the
+        startup summary says so, the store gains the mailbox, and the
+        liveness stamp lands before the tick."""
+        from sbxloop.daemon.store import LOCAL_STARTED_KEY, DaemonStore
+
+        self.offline(monkeypatch)
+        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
+        assert result.exit_code == 0, result.output
+        assert "tui=on" in result.output
+        assert "chat=off" in result.output
+        # The daemon's anchored XDG state dir (#255), as the item controls use.
+        state = workdir / "xdg-state" / "sbxloop" / workdir.name
+        dstore = DaemonStore(state / "state.db")
+        try:
+            assert dstore.get_value(LOCAL_STARTED_KEY) is not None
+        finally:
+            dstore.close()
+
+    def test_the_concierge_is_wanted_headless(self) -> None:
+        """The change that un-gated the concierge from a chat backend: a
+        headless long-lived daemon builds it; `--once` never does."""
+        from sbxloop.cli.app import concierge_wanted
+
+        headless = Config.model_validate({})
+        assert concierge_wanted(headless, once=False)
+        assert not concierge_wanted(headless, once=True)
+        off = Config.model_validate({"concierge": {"enabled": False}})
+        assert not concierge_wanted(off, once=False)
+
     def test_once_never_starts_the_version_check(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -894,6 +926,37 @@ class TestDoctor:
             "[discord]\nchannel_id = 42\n[concierge]\nenabled = false\n"
         )
         assert not [c for c in collect_checks(env) if c.name == "chat concierge"]
+
+    def test_doctor_reports_the_console_and_the_concierge_headless(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No chat backend at all: the operator console's row is there, and
+        the concierge row is too — it answers the console."""
+        from sbxloop.cli.doctor import collect_checks
+
+        env = {"GH_TOKEN": "tok", "COPILOT_GITHUB_TOKEN": "tok"}
+        checks = collect_checks(env)
+        (console,) = [c for c in checks if c.name == "operator console"]
+        assert console.ok and not console.hard
+        assert "sbxloop tui" in console.detail and "sbxloop-daemon" in console.detail
+        (row,) = [c for c in checks if c.name == "chat concierge"]
+        assert row.ok
+        assert not [c for c in checks if c.name.startswith("chat bridge")]
+
+    def test_doctor_survives_a_host_without_a_login_name(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import getpass
+
+        from sbxloop.cli.doctor import collect_checks
+
+        def no_user() -> str:
+            raise OSError("No username set in the environment")
+
+        monkeypatch.setattr(getpass, "getuser", no_user)
+        env = {"GH_TOKEN": "tok", "COPILOT_GITHUB_TOKEN": "tok"}
+        (console,) = [c for c in collect_checks(env) if c.name == "operator console"]
+        assert console.ok
 
     def test_concierge_row_names_the_configured_backends_credential(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
