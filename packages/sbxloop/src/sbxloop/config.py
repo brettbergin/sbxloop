@@ -2245,18 +2245,34 @@ def _project_layer(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     return kept, dropped
 
 
-def _file_layers(discovery: ConfigDiscovery) -> list[tuple[str, dict[str, Any]]]:
+def _file_layers(
+    discovery: ConfigDiscovery,
+    *,
+    sbxloop_toml_text: str | None = None,
+    dropped_keys: list[str] | None = None,
+) -> list[tuple[str, dict[str, Any]]]:
     """The two file layers at the discovered root, each cut down to project
-    config when the repository carries it (see ``PROJECT_LAYER_KEYS``)."""
+    config when the repository carries it (see ``PROJECT_LAYER_KEYS``).
+    ``sbxloop_toml_text`` stands in for the root's ``sbxloop.toml`` — a
+    draft validated exactly as the file would load, the cut-down included;
+    ``dropped_keys`` collects what the cut-down ignored."""
     layers: list[tuple[str, dict[str, Any]]] = []
     for name, read in (
         ("pyproject.toml", _pyproject_layer),
         ("sbxloop.toml", _sbxloop_toml_layer),
     ):
-        raw = read(discovery.root)
         path = discovery.root / name
+        if name == "sbxloop.toml" and sbxloop_toml_text is not None:
+            try:
+                raw = tomllib.loads(sbxloop_toml_text)
+            except tomllib.TOMLDecodeError as exc:
+                raise ConfigError(f"invalid TOML in the draft of {path}: {exc}") from exc
+        else:
+            raw = read(discovery.root)
         if raw and discovery.is_project_file(path):
             raw, dropped = _project_layer(raw)
+            if dropped_keys is not None:
+                dropped_keys.extend(dropped)
             if dropped:
                 log.warning(
                     "config.project_layer.ignored",
@@ -2376,8 +2392,14 @@ def load_dotenv_file(cwd: Path | None = None, env: Mapping[str, str] | None = No
 def load_config_with_sources(
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
+    *,
+    sbxloop_toml_text: str | None = None,
+    dropped_keys: list[str] | None = None,
 ) -> tuple[Config, dict[str, str]]:
-    """Load config and report, per dotted key, which layer supplied it."""
+    """Load config and report, per dotted key, which layer supplied it.
+    ``sbxloop_toml_text`` replaces the discovered root's ``sbxloop.toml``
+    (the console validating a draft); ``dropped_keys`` receives the keys a
+    repository-carried layer may not set."""
     cwd = cwd or Path.cwd()
     if env is None:
         # Only consult .env when reading the real environment; explicit env
@@ -2388,7 +2410,7 @@ def load_config_with_sources(
     discovery = discover_config(cwd)
     layers: list[tuple[str, dict[str, Any]]] = [
         ("user config", _user_config_layer(env)),
-        *_file_layers(discovery),
+        *_file_layers(discovery, sbxloop_toml_text=sbxloop_toml_text, dropped_keys=dropped_keys),
         ("env", _env_layer(env)),
     ]
 

@@ -695,6 +695,9 @@ class DaemonLoop:
             "pid": os.getpid(),
             "started_at": self.started_at,
             "version": __version__,
+            # Where it loaded its configuration from: the console anchors
+            # its editor there rather than on its own working directory.
+            "cwd": str(Path.cwd()),
             # Per-repository polling health (#516); [] for a single-repo daemon.
             "repos": [
                 {**h.to_json(), "state": h.state}

@@ -68,12 +68,10 @@ from sbxloop.sbx.prune import (
     remove_sandbox,
 )
 from sbxloop.sbx.secretstate import (
-    SANDBOX_SCOPE_PREFIX,
-    assess,
-    inspect_custom_secret,
-    removal_ladder,
-    replace_registration,
-    tracked_custom_secrets,
+    clean_secrets,
+    rotate_registrations,
+    secret_rows,
+    secrets_context,
     verify_secret_visibility,
 )
 
@@ -1187,8 +1185,7 @@ def _secrets_context(config: Config | None = None) -> tuple[Config, SbxCLI, set[
     """Config, an sbx handle, and the live sbxloop sandbox names (for
     telling in-use registration scopes from stale ones)."""
     config = load_config() if config is None else config
-    cli = SbxCLI(app_name=config.app_name or None)
-    live = {i.name for i in cli.ls() if i.name.startswith(SANDBOX_SCOPE_PREFIX)}
+    cli, live = secrets_context(config)
     return config, cli, live
 
 
@@ -1217,24 +1214,14 @@ def secrets_list(
         for column in ("env", "expected", "actual", "status", "note"):
             table.add_column(column)
         warned = False
-        for env, host in tracked_custom_secrets(config):
-            state = inspect_custom_secret(cli, env, host=host, probe=probe)
-            judgement = assess(state, canonical_host=host, live_sandboxes=live)
-            warned = warned or judgement.status == "warn"
-            if state.exists:
-                actual = f"scope {state.scope or '(unknown)'}"
-                if state.hosts:
-                    actual += f" @ {', '.join(state.hosts)}"
-            elif state.exists is None:
-                actual = "(undetermined)"
-            else:
-                actual = "not registered"
+        for row in secret_rows(config, cli, live, probe=probe):
+            warned = warned or row.judgement.status == "warn"
             table.add_row(
-                env,
-                f"custom @ {host} (per-run scope)",
-                actual,
-                _STATUS_STYLES[judgement.status],
-                judgement.note,
+                row.env,
+                row.expected,
+                row.actual,
+                _STATUS_STYLES[row.judgement.status],
+                row.judgement.note,
             )
         console.print(table)
         console.print(
@@ -1275,23 +1262,16 @@ def secrets_clean(
         config, cli, live = _secrets_context()
         failed = False
         removed_any = False
-        for env, host in tracked_custom_secrets(config):
-            state = inspect_custom_secret(cli, env, host=host)
-            judgement = assess(state, canonical_host=host, live_sandboxes=live)
-            if not (judgement.stale or (all_ and judgement.owned)):
-                console.print(f"{env}: nothing to clean ({judgement.note})")
-                continue
-            where = f"scope {state.scope or '(unknown)'}"
-            if not apply:
-                console.print(f"{env}: would remove the registration in {where} — {judgement.note}")
-                removed_any = True
-                continue
-            if any(rm() for rm in removal_ladder(cli, state, host=host)):
-                console.print(f"[green]{env}: removed the registration in {where}[/]")
+        for outcome in clean_secrets(config, cli, live, apply=apply, all_=all_):
+            if outcome.failed:
+                console.print(f"[bold red]{outcome.env}: {outcome.message}[/]")
+                failed = True
+            elif outcome.removed and apply:
+                console.print(f"[green]{outcome.env}: {outcome.message}[/]")
                 removed_any = True
             else:
-                console.print(f"[bold red]{env}: sbx rejected every removal for {where}[/]")
-                failed = True
+                console.print(f"{outcome.env}: {outcome.message}")
+                removed_any = removed_any or outcome.removed
         if not apply and removed_any:
             console.print("\ndry run — re-run with [cyan]--apply[/] to remove")
         if failed:
@@ -1345,26 +1325,13 @@ def secrets_rotate(
                 )
                 raise typer.Exit(2)
         config, cli, live = _secrets_context(config)
-        for env, host in tracked_custom_secrets(config):
-            replace_registration(cli, env=env, host=host, token=token)
-            console.print(f"[green]rotated:[/] {env} registered @ {host} (global scope)")
-        if live:
-            console.print(
-                f"[yellow]live sbxloop sandboxes exist ({', '.join(sorted(live))})[/] — "
-                "they may still hold the old token in their in-VM env file; "
-                "remove them with `sbxloop sandbox rm --all`"
-            )
-        if prompt:
-            console.print(
-                f"[yellow]runs read {token_env} from the environment at "
-                "provision time[/] — update your export / ./.env with the new value too"
-            )
-        if config.secret_strategy == "plain-env":  # nosec B105 - strategy label
-            console.print(
-                "next run: [bold]plain-env[/] strategy (configured) — the token is "
-                "written to the in-VM env file from your environment"
-            )
-        elif verify:
+        styles = {"ok": "[green]{}[/]", "warn": "[yellow]{}[/]", "note": "{}"}
+        for kind, line in rotate_registrations(config, cli, live, token=token):
+            if kind == "warn" and "update your export" in line and not prompt:
+                continue  # the token came from the environment: it is current there
+            console.print(styles[kind].format(line))
+        # Under plain-env the strategy line above already says it all.
+        if config.secret_strategy != "plain-env" and verify:  # nosec B105 - strategy label
             workspace = config.state_dir / "secretcheck"
             workspace.mkdir(parents=True, exist_ok=True)
             visible = verify_secret_visibility(
@@ -1603,89 +1570,43 @@ def config_repos(
 @config_app.command("policy")
 def config_policy() -> None:
     """Show the effective per-phase network egress policy."""
-    from sbxloop.policy import (
-        APT_MIRROR_DOMAINS,
-        BASELINE_REGISTRY_DOMAINS,
-        WELL_KNOWN_REGISTRY_DOMAINS,
-        baseline_allows,
-    )
-    from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS, github_policy_allows
-    from sbxloop.sbx.registries import domains as registry_domains
+    from sbxloop.cli.policyview import policy_view
 
     try:
         config = load_config()
     except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
-
-    extra = [
-        *registry_domains(config.open_registries_for()),
-        *config.sandbox.extra_allow_domains,
-    ]
-    baseline = ", ".join(
-        dict.fromkeys([*AGENT_ALLOW_DOMAINS, *config.github.allow_domains, *extra])
-    )
-    # What provisioning actually seeds, deny applied — an operator reading
-    # this needs the effective set, not the constant.
-    registries = ", ".join(baseline_allows(BASELINE_REGISTRY_DOMAINS, config.policy.deny))
-    mirrors = ", ".join(baseline_allows(APT_MIRROR_DOMAINS, config.policy.deny))
+    view = policy_view(config)
 
     table = Table(title="agent sandbox: effective egress per phase")
     table.add_column("phase", no_wrap=True)
     table.add_column("policy", overflow="fold")
-    table.add_row("decompose", "baseline")
-    table.add_row(
-        "build",
-        "baseline + task-declared grants (auto-granted just before build, "
-        "within the [policy] bounds below; every grant/refusal is event-logged)",
-    )
-    table.add_row(
-        "verify",
-        "baseline + grants already made — sbx has no policy revocation, so "
-        "grants persist for the sandbox's lifetime (sandboxes are removed at "
-        "run end; grants never outlive a run)",
-    )
+    for phase, policy in view.phases:
+        table.add_row(phase, policy)
     console.print(table)
-    console.print(f"baseline (provisioned per-sandbox): {baseline}")
-    console.print(f"language registry baseline (always reachable, no declaration): {registries}")
-    console.print(f"distro mirrors (always reachable, no declaration): {mirrors}")
+    console.print(f"baseline (provisioned per-sandbox): {view.baseline}")
     console.print(
-        "well-known registries (declarable without [policy] allow): "
-        + (
-            ", ".join(WELL_KNOWN_REGISTRY_DOMAINS)
-            or "(none — every supported language's registry is in the baseline above)"
-        )
+        f"language registry baseline (always reachable, no declaration): {view.registries}"
     )
+    console.print(f"distro mirrors (always reachable, no declaration): {view.mirrors}")
+    console.print(f"well-known registries (declarable without [policy] allow): {view.well_known}")
 
     bounds = Table(title="[policy] bounds for task-declared grants")
     bounds.add_column("bound", no_wrap=True)
     bounds.add_column("patterns", overflow="fold")
-    bounds.add_row(
-        "allow",
-        ", ".join(config.policy.allow)
-        or "(empty — tasks may only use the baseline and well-known registries)",
-    )
-    bounds.add_row("deny", ", ".join(config.policy.deny) or "(none)")
+    bounds.add_row("allow", view.allow)
+    bounds.add_row("deny", view.deny)
     console.print(bounds)
 
-    if config.github.enabled:
-        gh_domains = ", ".join(github_policy_allows(config))
-        console.print(f"github sandbox (all phases, no task grants): {gh_domains}")
-    credentialed = config.credentialed_registries_for()
-    if credentialed:
-        from sbxloop.sbx.provision import service_policy_allows
-        from sbxloop.sbx.registries import languages as registry_languages
-
-        svc_domains = ", ".join(
-            service_policy_allows(
-                (), credentialed, registry_languages(credentialed), config.policy.deny
-            )
-        )
+    if view.github is not None:
+        console.print(f"github sandbox (all phases, no task grants): {view.github}")
+    if view.service is not None:
         console.print(
             "service sandbox (fetches from the credentialed registries; the agent "
-            f"reaches none of them): {svc_domains}"
+            f"reaches none of them): {view.service}"
         )
-    console.print("audit trail: [cyan]sbxloop logs RUN_ID --type policy.[/]")
+    console.print(f"audit trail: [cyan]{view.audit}[/]")
 
 
 @app.command()

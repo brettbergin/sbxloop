@@ -6,7 +6,41 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Fixed
+
+- **Console chat: one line per short message.** Every message was drawn
+  as a header line (time, author, reactions) with its text on the line
+  below, so a channel of one-liners read at half density. A short message
+  now reads as one line, as the design and Discord do; cards, code and
+  multi-line bodies still drop below their header.
+
 ### Added
+
+- **Console config, secrets and doctor screens** (#774). The last
+  operator acts outside the console were editing the configuration,
+  judging the secret registrations and running the doctor. **Config**
+  (`7`) shows the resolved configuration with the layer that set each key,
+  the effective egress policy and the repositories, and edits
+  `sbxloop.toml`: a draft is validated by the real loader (against a
+  scratch copy, the user and environment layers applied) before it is
+  saved atomically with a timestamped backup, a restart is offered, and a
+  draft the loader refuses is never written; `$EDITOR` is a key away.
+  **Doctor** (`8`) runs the host checks and the sbx conformance probes in
+  the background with their progress, cached with their age; the live
+  probes and the GitHub probe ask first. **Secrets** (`S` from Doctor, or
+  the palette) lists the tracked registrations as `sbxloop secrets list`
+  judges them, cleans the stale ones after a dry run (typed) and rotates
+  the agent credential's registration from a hidden prompt (typed). The
+  CLI and the console now render from one fold each:
+  `sbxloop.cli.doctor.doctor_report` (which hands the host checks over
+  before the conformance suite runs, so `sbxloop doctor --deep` prints
+  its table before booting the sandbox), `sbxloop.cli.policyview.policy_view`,
+  and `secrets_context` / `secret_rows` / `clean_secrets` /
+  `rotate_registrations` in `sbxloop.sbx.secretstate`. A draft is
+  validated in place of the daemon's `sbxloop.toml` at the real discovered
+  root — the project cut-down included, so a repository-carried file's
+  ignored keys are named instead of "loads" — and the editor follows the
+  directory the daemon reports in `status` (`cwd`), not the console's.
 
 - **Console admin: sandboxes, daemon control, the journal, run operations,
   a command palette** (#773). The console could watch and chat but every

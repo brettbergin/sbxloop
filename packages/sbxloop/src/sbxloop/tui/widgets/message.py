@@ -122,7 +122,11 @@ class MessageWidget(Vertical):
                     Panel(Markdown(to_commonmark(text)), border_style=border, padding=(0, 1))
                 )
             else:
-                parts.append(to_rich(text))
+                # A short message reads as one line, chat-style: the header
+                # and the text together; only cards and long bodies drop
+                # below it.
+                title.append("  ")
+                title.append_text(to_rich(text))
         return Group(*parts)
 
 

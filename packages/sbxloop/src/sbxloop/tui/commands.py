@@ -33,6 +33,12 @@ def _mode(name: str) -> Callable[[SbxloopTui], None]:
     return go
 
 
+def _secrets(app: SbxloopTui) -> None:
+    from sbxloop.tui.screens.secrets import SecretsScreen
+
+    app.push_screen(SecretsScreen())
+
+
 def _on_daemon(action: str) -> Callable[[SbxloopTui], None]:
     """A verb the Daemon screen guards (the unit's state, a daemon already
     answering, its own re-poll): the palette runs the screen's action, so
@@ -59,6 +65,11 @@ CATALOGUE: tuple[Command, ...] = (
     Command("Chat", "the control channel: concierge, !sbx verbs, notices", _mode("chat")),
     Command("Sandboxes", "sbx ls against the store; shell, remove, prune, gc", _mode("sandboxes")),
     Command("Daemon", "the unit, the process, versions, repos, the journal", _mode("daemon")),
+    Command(
+        "Config", "the resolved configuration, the policy, the repos, the editor", _mode("config")
+    ),
+    Command("Doctor", "the host checks and the sbx conformance verdicts", _mode("doctor")),
+    Command("Secrets", "the tracked secret registrations; clean, rotate", _secrets),
     Command("Help", "the keys, screen by screen", _mode("help")),
     Command(
         "Refresh now", "re-read the store and ask the daemon status", lambda a: a.action_refresh()
