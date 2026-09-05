@@ -387,7 +387,10 @@ chat task's result text; `issue` files **one** result issue per run in the
 configured `[github] repo`, titled from the plan and carrying every task that
 chose it, under the `[workload] result_label` (`sbxloop:result` by default,
 created if missing); `artifact` copies the files a task reported — exactly
-those, mounted or not — to `runs/<run>/artifacts`, where `sbxloop artifacts <run>` lists them (a workload's whole data directory is salvaged to
+those, mounted or not — to `runs/<run>/artifacts`, where `sbxloop artifacts <run>` lists them
+(the chat sink stages its tasks' files there too, and both sinks post them
+into the thread as attachments up to `max_attachment_bytes`, naming larger
+ones by host path) (a workload's whole data directory is salvaged to
 `runs/<run>/data` instead, so the listing is the result and not the working
 state around it); `pr` delivers the checkout a task asked for (`needs.repo`,
 under a profile with `repo = true`) as **one** pull request — the working

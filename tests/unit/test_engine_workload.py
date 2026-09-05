@@ -1144,8 +1144,14 @@ class TestSinks:
         assert [p.sink for p in result.published] == ["chat"]
         assert [p.sink for p in engine.store.get_run(result.run_id).published] == ["chat"]
         assert [e for e in harness.events if e.type == HostEventTypes.RUN_NEEDS_GRANTED] == []
-        # a workload's artifacts are what the artifact sink delivered: nothing
-        assert [e for e in harness.events if e.type == HostEventTypes.RUN_ARTIFACTS] == []
+        # #799: the chat sink stages the tasks' files on the host, the way
+        # the artifact sink does, and the event carries their paths for the
+        # bridge to attach — so `sbxloop artifacts` lists them too
+        target = harness.state_dir / "runs" / result.run_id / "artifacts"
+        assert posted["paths"] == [str(target / "a.txt")]
+        assert (target / "a.txt").read_text() == "a\n"
+        report = [e for e in harness.events if e.type == HostEventTypes.RUN_ARTIFACTS][-1]
+        assert report.data["path"] == str(target) and report.data["files"] == 1
 
     def test_the_issue_sink_files_one_result_issue(
         self, harness: Harness, profiled: dict[str, Any]
@@ -1398,10 +1404,11 @@ class TestSinks:
         monkeypatch: pytest.MonkeyPatch,
         mounted: bool,
     ) -> None:
-        """Two tasks write; the artifact directory holds the artifact
-        task's files and nothing of the other's — mounted (a host copy)
-        or not (a tar of the listed paths, beside the data directory's
-        salvage)."""
+        """Two tasks write; the artifact directory holds what the sinks
+        delivered — the artifact task's files, and the chat task's, which
+        the chat sink stages the same way (#799) — mounted (a host copy) or
+        not (a tar of the listed paths, beside the data directory's
+        salvage). Each sink's record counts only its own."""
         if not mounted:
             monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
         harness.script(
@@ -1420,7 +1427,7 @@ class TestSinks:
         target = harness.state_dir / "runs" / result.run_id / "artifacts"
         assert sorted(
             p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_file()
-        ) == ["out/report.csv"]
+        ) == ["out/report.csv", "scratch.txt"]
         assert (target / "out/report.csv").read_text() == "1,2\n"
         if not mounted:
             salvage = harness.state_dir / "runs" / result.run_id / "data"
@@ -1438,10 +1445,12 @@ class TestSinks:
             1,
         )
         assert delivered["message"] == f"1 file delivered to {target}"
+        assert delivered["paths"] == [str(target / "out/report.csv")]
         assert posted["sink"] == "chat" and posted["tasks"] == ["t2"]
-        # `sbxloop artifacts` reads what the sink delivered, not the data dir
+        assert posted["paths"] == [str(target / "scratch.txt")] and posted["files"] == 1
+        # `sbxloop artifacts` reads what the sinks delivered, not the data dir
         report = [e for e in harness.events if e.type == HostEventTypes.RUN_ARTIFACTS][-1]
-        assert report.data["path"] == str(target) and report.data["files"] == 1
+        assert report.data["path"] == str(target) and report.data["files"] == 2
         from sbxloop.engine.model import artifacts_dir
 
         assert artifacts_dir(result, harness.state_dir) == target

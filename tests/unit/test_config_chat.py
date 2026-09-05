@@ -98,6 +98,7 @@ class TestSlackSection:
             "tool_batch_lines",
             "tool_output_lines",
             "tool_fail_output_lines",
+            "max_attachment_bytes",
         ):
             assert getattr(slack, name) == getattr(discord, name), name
 

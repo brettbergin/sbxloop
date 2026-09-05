@@ -216,9 +216,15 @@ def render_event(event: Event) -> RenderableType | None:
 
     if event.type == HostEventTypes.RUN_PUBLISHED and data.get("sink") == "chat":
         # The chat sink's reply (#759) is the result itself: rendered like
-        # the agent's reply to a steer, not as a lifecycle line.
+        # the agent's reply to a steer, not as a lifecycle line. The files
+        # it carried are named by host path (#799) — the terminal is on
+        # the host, so a path is the file.
+        body = str(data.get("message", "")).strip() or "*(no result reported)*"
+        paths = data.get("paths")
+        if isinstance(paths, list) and paths:
+            body += "\n\n" + "\n".join(f"📎 `{path}`" for path in paths)
         return Panel(
-            Markdown(str(data.get("message", "")).strip() or "*(no result reported)*"),
+            Markdown(body),
             title=f"[bold cyan]result[/] [dim]{_stamp(event)}[/]",
             title_align="left",
             border_style="cyan",

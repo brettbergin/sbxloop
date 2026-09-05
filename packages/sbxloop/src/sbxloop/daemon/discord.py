@@ -18,6 +18,8 @@ from __future__ import annotations
 import asyncio
 import functools
 import os
+from collections.abc import Sequence
+from pathlib import Path
 from typing import Any, ClassVar
 
 from sbxloop.config import ChatBackend, Config, DiscordConfig
@@ -207,6 +209,7 @@ class DiscordBridge(ChatBridge):
         embed: EmbedSpec | None = None,
         reply_to: Any = None,
         mention_users: bool = False,
+        files: Sequence[str] = (),
     ) -> Any:
         """The single send seam: content is clipped, mentions are always
         disabled (agent prose can contain @everyone), embeds are converted
@@ -219,8 +222,27 @@ class DiscordBridge(ChatBridge):
         one of our own embeds, ``suppress_embeds=True`` is always set so
         Discord renders no auto-generated unfurl. When one of our embeds
         *is* attached the flag would hide it too, so the text body is run
-        through ``no_unfurl`` instead."""
+        through ``no_unfurl`` instead.
+
+        ``files`` (#799) become ``discord.File`` uploads on the same
+        message — those under the attachment cap; the rest are named in
+        the text with their host path. If Discord rejects the upload the
+        message is retried without it, the files named instead."""
         kwargs: dict[str, Any] = {}
+        attach, notes = self._split_files(files) if files else ([], [])
+        if len(attach) > MAX_ATTACHMENTS:
+            # Discord takes ten uploads per message; the rest are named.
+            attach, rest = attach[:MAX_ATTACHMENTS], attach[MAX_ATTACHMENTS:]
+            notes = [*notes, self._files_note([str(f) for f in rest])]
+        uploads = _to_files(attach)
+        if attach and not uploads:
+            # discord.py absent (tests, a host without the extra): name them.
+            notes = [*notes, self._files_note([str(f) for f in attach])]
+            attach = []
+        if notes:
+            text = "\n".join(part for part in (text, *notes) if part)
+        if uploads:
+            kwargs["files"] = uploads
         if reply_to is not None:
             kwargs["reference"] = reply_to
             kwargs["mention_author"] = False
@@ -242,6 +264,28 @@ class DiscordBridge(ChatBridge):
             return await target.send(content, **kwargs)
         except Exception:
             target_id = getattr(target, "id", None)
+            if "files" in kwargs:
+                # An upload Discord refused (size, a closed thread's cap, a
+                # transient error): the result still goes out, the files
+                # named by path so nothing is lost silently.
+                log.warning(
+                    "discord.attachment_send_failed",
+                    target=target_id,
+                    files=len(kwargs["files"]),
+                    action="retrying without attachments",
+                    exc_info=True,
+                )
+                kwargs.pop("files")
+                named = self._files_note([str(f) for f in attach])
+                content = _clip(
+                    "\n".join(part for part in (content or "", named) if part),
+                    self.discord.max_message_chars,
+                )
+                try:
+                    return await target.send(content, **kwargs)
+                except Exception:
+                    log.warning("discord.send_failed", target=target_id, exc_info=True)
+                    return None
             if "reference" in kwargs:
                 # A deleted/unknown message reference fails the send outright;
                 # answer in the channel instead of not at all.
@@ -829,6 +873,22 @@ def _build_choice_view(
 
 
 # -- discord.py adapters (the only place the optional extra is touched) ------------------
+
+
+# Discord's per-message upload limit.
+MAX_ATTACHMENTS = 10
+
+
+def _to_files(paths: Sequence[Path]) -> list[Any]:
+    """``discord.File`` for each path, or an empty list when discord.py is
+    unavailable (the caller names the files instead)."""
+    if not paths:
+        return []
+    try:
+        import discord as discordpy
+    except ImportError:
+        return []
+    return [discordpy.File(str(path), filename=path.name) for path in paths]
 
 
 def _to_embed(spec: EmbedSpec) -> Any:

@@ -242,7 +242,12 @@ refused when `_ensure_delivery_repo` found Issues disabled. `artifact` copies
 `PublishError`) to `runs/<run>/artifacts` — `shutil` from a mounted workspace,
 `_copy_out` (a `tar` of the listed paths) from an unmounted one; a workload's
 harvest goes to `runs/<run>/data` so `artifacts_dir` reads only what the sink
-delivered. `issue` files one issue in `[github] repo` under `[workload] result_label` (`ensure_label` first). `pr` (`_publish_pr`) hands the task's data-directory
+delivered. `chat` stages its tasks' files the same way (`_stage_files` serves
+both) and the `run.published` event carries every staged file's host path as
+`paths` (#799): the bridge attaches those under `max_attachment_bytes` to the
+result message (`ChatBridge._split_files`, `discord.File` uploads) and names the
+rest — too large, missing, or a backend with no upload — by path, so a file a
+task produced always reaches the person or is at least named. `issue` files one issue in `[github] repo` under `[workload] result_label` (`ensure_label` first). `pr` (`_publish_pr`) hands the task's data-directory
 checkout (`needs.repo`; `_grant_needs` refuses a pr task without one) to
 `deliver_workspace` — the same call `_stage_deliver` makes, on the run's branch
 with `_naming_for` (the repo-parametrised half of `_naming`) — labels the pull
@@ -943,7 +948,8 @@ ask ─▶ PLAN (task DAG, needs declared) ─▶ grant needs against the profil
   host; the service box's carries nothing else.
 - **Sinks.** The judged result goes where the plan said (`needs.sink`):
   `chat` — the asking thread, or the terminal — needs no profile and is the
-  default; `artifact` (`runs/<run>/artifacts`), `issue` (one result issue,
+  default, and carries the tasks' files as attachments where the backend
+  can (#799); `artifact` (`runs/<run>/artifacts`), `issue` (one result issue,
   or a comment on the asking one) and `pr` (a pull request on the
   task's data-directory checkout, never a run to land) need the profile to
   name them. `publish = "hold"` parks the judged result `held`, and the

@@ -16,6 +16,14 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **A workload's files reach the thread.** The chat sink stages the files
+  its tasks produced beside the artifact sink's (`runs/<run>/artifacts`) and
+  the result message carries them as attachments — Discord uploads those
+  under the new `max_attachment_bytes` (10 MB by default) and names the
+  rest by host path; the console and Slack name every file by path. Field
+  finding #799: two workloads produced files and the thread got a path on
+  the daemon host.
+
 - **Console config, secrets and doctor screens** (#774). The last
   operator acts outside the console were editing the configuration,
   judging the secret registrations and running the doctor. **Config**
