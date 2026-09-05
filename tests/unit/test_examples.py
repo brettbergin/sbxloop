@@ -15,7 +15,7 @@ import pytest
 from pydantic import BaseModel
 
 from sbxloop.cli.app import DEFAULT_CONFIG_TOML, config_presets, render_config_template
-from sbxloop.config import Config, load_dotenv_file
+from sbxloop.config import Config, load_config, load_dotenv_file
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE = REPO_ROOT / "sbxloop.toml.example"
@@ -81,11 +81,12 @@ class TestPresets:
     they work from a wheel and nothing `init` writes points at a checkout."""
 
     def test_presets_ship_as_package_data_and_the_contrib_path_is_an_alias(self) -> None:
-        assert (PRESETS_DIR / "large-repo.toml").is_file()
-        assert config_presets().keys() == {"large-repo"}
-        alias = REPO_ROOT / "contrib" / "presets" / "large-repo.toml"
-        assert alias.is_symlink()
-        assert alias.resolve() == (PRESETS_DIR / "large-repo.toml").resolve()
+        assert config_presets().keys() == {"large-repo", "workload"}
+        for name in config_presets():
+            assert (PRESETS_DIR / f"{name}.toml").is_file()
+            alias = REPO_ROOT / "contrib" / "presets" / f"{name}.toml"
+            assert alias.is_symlink()
+            assert alias.resolve() == (PRESETS_DIR / f"{name}.toml").resolve()
 
     def test_every_preset_is_a_valid_config_on_its_own_and_appended(self) -> None:
         for name, fragment in config_presets().items():
@@ -105,6 +106,28 @@ class TestPresets:
         header = config_presets()["large-repo"]
         assert "two minutes or more" in header  # framed by measured gate duration
         assert "sbxloop init --preset large-repo" in header
+
+    def test_workload_preset_declares_one_of_everything_a_workload_needs(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        """#762: `sbxloop init --preset workload` is a config `load_config`
+        accepts with the example variable set — a credential, a profile
+        bounded to it and named the default, and a schedule asking for it."""
+        (tmp_path / "sbxloop.toml").write_text(render_config_template("workload"))
+        monkeypatch.setenv("WEATHER_API_KEY", "value_never_shown")
+        config = load_config(tmp_path)
+        assert [c.name for c in config.credentials] == ["weather"]
+        (profile,) = config.workloads
+        assert profile.name == "research" and profile.credentials == ["weather"]
+        assert profile.sinks == ["chat", "artifact"] and profile.repo is False
+        assert config.workload.default == "research"
+        (schedule,) = config.schedules
+        assert schedule.profile == "research" and schedule.cadence_text == "cron 0 7 * * mon-fri"
+        assert schedule.timezone == "Europe/London"
+        header = config_presets()["workload"]
+        assert "sbxloop init --preset workload" in header
+        assert "ONLY its inference credential" in header  # the separation, stated
+        assert "Not yet exercised against a live sandbox" in header  # the caveats
 
     def test_nothing_init_writes_references_a_path_outside_the_project(self) -> None:
         for name in (None, *config_presets()):

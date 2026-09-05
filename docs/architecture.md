@@ -888,6 +888,97 @@ default, which loads no filesystem settings), so a target repository's
 `.claude/settings.json` cannot reconfigure an unattended session and
 CLAUDE.md costs its tokens once, through the prompt.
 
+## Workloads
+
+A run has a **kind** (`RunKind`: `code` or `workload`, `runs.kind`), and the
+kind decides which stages the engine walks after the task graph — nothing
+else in the run shape depends on it. `code` is the developer loop above; a
+`workload` is any finite ask whose result is not a pull request on the
+customer's repository: a brief, a report, a set of files, an answer. Both
+kinds share one intake, one store, one pair of sandboxes, one task graph and
+one revision budget; the trail fixture (`tests/unit/test_code_run_trail.py`)
+holds a `code` run byte-identical across every change the workload kind
+brought, which is the mechanical form of the rule that nothing in the
+codebase may assume the task ends in code.
+
+```
+ask ─▶ PLAN (task DAG, needs declared) ─▶ grant needs against the profile
+        ─▶ per task: EXECUTE (operator) ─▶ JUDGE ─▶ done
+                        ▲                    │red (≤ max_revisions)
+                        └────────────────────┘
+        ─▶ JUDGING (every task's checks, once more) ─▶ [held] ─▶ PUBLISHING ─▶ completed
+                                                        (publish = "hold": release = resume)
+```
+
+- **Persona.** The model runs as an *operator*, not a developer:
+  operator_plan.md, operator_execute.md and operator_judge.md replace
+  decompose/build/verify and are the whole system prompt
+  (`JobRequest.system_preset = False`), so the coding agent's preset never
+  frames the session (see [Prompt templates](#prompt-templates)). The judge
+  reads the operator's `## Result` as a claim and checks it against the
+  data directory and the ledger; a red verdict is the verify failure of the
+  developer loop, and the revision budget applies unchanged. Only
+  `build` and `operator_execute` carry tools (`TOOLED_PHASES`).
+- **Needs, held to a profile.** The plan declares what each task needs by
+  *name* — a host, a credential, a sink, a repository — never a value. A
+  `[[workloads]]` profile bounds what a run may be granted, and
+  `_grant_needs` answers every need before the first task runs, **failing
+  closed**: one need the profile does not cover fails the run with every
+  refusal named (`run.needs_refused`) and nothing granted. The profile is
+  pinned into the run row so a resume compares like with like. The detail —
+  egress grants, the reprovision a credential grant forces, sinks — is in
+  [the sandbox chapter](#the-security-primitive-one-run--two-sandboxes-three-with-credentials).
+- **Credentials.** A workload's operator credentials (`[[credentials]]`)
+  live in the run's **service sandbox**, the github box's pattern
+  generalized: one host per credential, a closed vocabulary of typed jobs
+  (`service.http`, `service.fetch`), no model in it. The agent box holds
+  **only its inference credential** — a workload adds nothing to it, not
+  even for a build. The agent *dispatches* an authenticated call and
+  *receives* its result through two host tools on the execute session,
+  `call_service(credential, method, path, …)` and
+  `fetch_dependencies(ecosystem, packages?)`: the request is a typed event
+  in the ledger the host already tails, the host checks it against the
+  run's grant, submits the job to the service box, and copies the redacted
+  answer back in. The agent box's allowlist never carries a credential's
+  host; the service box's carries nothing else.
+- **Sinks.** The judged result goes where the plan said (`needs.sink`):
+  `chat` — the asking thread, or the terminal — needs no profile and is the
+  default; `artifact` (`runs/<run>/artifacts`), `issue` (one result issue,
+  or a comment on the asking one) and `pr` (a pull request on the
+  task's data-directory checkout, never a run to land) need the profile to
+  name them. `publish = "hold"` parks the judged result `held`, and the
+  release is a resume at the publishing stage — the daemon's publish gate,
+  a *Release result* button in chat, `sbxloop resume` from the CLI.
+- **Intake.** Three sources, one item shape: a `[daemon] workload_label`
+  issue, a chat ask the concierge turns into a `chat:<message>` item
+  through its `start_workload` tool, and `[[schedules]]` ticks
+  (`sched:<name>:<due minute>`) the daemon fires by itself on an `every`
+  or `cron` cadence. `sbxloop run --kind workload` is the same run from the
+  CLI; `sbxloop init --preset workload` writes a config with one of each
+  section, and `sbxloop doctor` lists the profiles, schedules and where
+  the daemon would get its work. See [The daemon](#the-daemon) for the
+  label, chat and schedule paths.
+
+The two [design principles](#design-principles) hold for a workload exactly
+as for a code run, and the workload cases are the ones that test them:
+
+1. **Host-initiated directionality.** `call_service` and
+   `fetch_dependencies` are the concierge's host-tool shape again: the VM
+   appends a typed request to a log, the host chooses whether to answer with
+   a file. A schedule tick is host-originated by definition — nothing in
+   any VM knows the cadence. A workload adds no listener, no socket, no
+   route to any box.
+2. **Host mediation between the sandboxes.** The operator's credentials
+   are the second thing, after the GitHub token, that the model's arbitrary
+   commands must never execute beside. The service box is a third VM for
+   exactly that reason — not a convenience — and it speaks only the fixed
+   ops the host submits. A profile that "just needs the API key in the
+   build" is the proposal the second principle exists to refuse: the
+   credential goes to the service box, the agent gets a tool that dispatches
+   a call and reads its redacted result, and the same holds for a private
+   registry — the service box fetches, the agent box installs offline from
+   the shared mount.
+
 ## Persistence and resume
 
 `StateStore` is a WAL-mode SQLite database at `<state_dir>/state.db` with

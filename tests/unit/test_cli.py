@@ -1254,6 +1254,41 @@ class TestDoctor:
         result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
         assert "workload profiles" not in result.output
 
+    def test_doctor_lists_schedules_and_where_the_daemon_gets_its_work(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#761/#762: `[[schedules]]` gets an informational row, and a
+        `daemon intake` row says what would be work — a config with no
+        repository, no chat intake and no schedules is told the daemon
+        would refuse to start (soft: a CLI-only host never starts one)."""
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        (workdir / "sbxloop.toml").write_text(
+            '[[workloads]]\nname = "brief"\n\n'
+            '[[schedules]]\nname = "daily"\nprofile = "brief"\nask = "Summarise"\n'
+            'cron = "0 7 * * mon-fri"\ntimezone = "Europe/London"\n\n'
+            '[[schedules]]\nname = "hourly"\nprofile = "brief"\nask = "Check"\nevery = "1h"\n'
+        )
+        result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0, result.output
+        assert "daily: cron 0 7 * * mon-fri (Europe/London) → profile brief" in result.output
+        assert "hourly: every 1h (UTC) → profile brief" in result.output
+        assert "daemon intake" in result.output and "2 schedules" in result.output
+        # the repository and chat asks are named too
+        (workdir / "sbxloop.toml").write_text(
+            '[github]\nrepo = "o/r"\n\n[discord]\nchannel_id = 42\n'
+        )
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
+        result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
+        assert "labeled issues of o/r; chat asks (discord, concierge on)" in result.output
+        assert "schedules" not in result.output.split("daemon intake")[1].splitlines()[0]
+        # nothing would be work: a soft failure naming the three ways
+        (workdir / "sbxloop.toml").write_text("")
+        result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0, result.output  # soft
+        assert "nothing would be work" in result.output
+        assert "[[schedules]]" in result.output
+
     def _bake_record(
         self,
         workdir: Path,

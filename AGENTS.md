@@ -10,11 +10,15 @@ request on a repository that is **not this one**, executed inside a sandbox,
 unattended, with a human able to watch and steer from chat at every step.
 
 The target repository is the customer. Developer work (plan, build, verify,
-deliver, land) is the first workload kind; the same run shape carries
-non-developer workloads too, and nothing in this codebase should assume the
-task ends in code. sbxloop's own shape — Python, one maintainer with admin,
-an unprotected default branch, no services — is an edge case, not the default
-to design for.
+deliver, land) is the first run kind, `code`; the second, `workload` (plan,
+execute, judge, publish — a brief, a report, a set of files, delivered to a
+sink rather than landed as a pull request), is real and rides the same run
+shape. Nothing in this codebase may assume the task ends in code, and the
+trail fixture `tests/unit/test_code_run_trail.py` holds a `code` run
+byte-identical across every change the workload kind brings — read
+`docs/architecture.md` "Workloads" before touching either. sbxloop's own
+shape — Python, one maintainer with admin, an unprotected default branch, no
+services — is an edge case, not the default to design for.
 
 ## Goals, in priority order
 

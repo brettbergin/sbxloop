@@ -835,6 +835,51 @@ def workload_profile_checks(config: Config) -> list[Check]:
     return [Check("workload profiles", True, listed)]
 
 
+def schedule_checks(config: Config) -> list[Check]:
+    """One row when `[[schedules]]` declares anything (#761): each schedule
+    with its cadence, zone and profile. The loader already refused a
+    schedule naming no profile or a cadence it cannot read; this row is
+    the at-a-glance view, and a reminder that the ticks are the daemon's."""
+    if not config.schedules:
+        return []
+    listed = "; ".join(
+        f"{s.name}: {s.cadence_text} ({s.timezone or config.daemon.run_cap_timezone}) "
+        f"→ profile {s.profile}"
+        for s in config.schedules
+    )
+    return [Check("schedules", True, f"{listed} — fired by `sbxloop daemon`", hard=False)]
+
+
+def daemon_intake_checks(config: Config) -> list[Check]:
+    """Where the daemon's work would come from (#762): the configured
+    repositories' labeled issues, chat asks (a backend with the concierge
+    on), the schedules' ticks. A daemon with none refuses to start
+    (`daemon.no_repository`); that is a soft row, since a CLI-only host
+    never starts one."""
+    sources: list[str] = []
+    if config.github.enabled:
+        repos = ", ".join(r.repo for r in config.github.repo_list()) or str(config.github.repo)
+        sources.append(f"labeled issues of {repos}")
+    backend = config.chat_backend
+    if backend is not None and config.concierge.enabled:
+        sources.append(f"chat asks ({backend}, concierge on)")
+    if config.schedules:
+        count = len(config.schedules)
+        sources.append(f"{count} schedule{'s' if count != 1 else ''}")
+    if not sources:
+        return [
+            Check(
+                "daemon intake",
+                False,
+                "nothing would be work: set \\[github] repo (labeled issues), a chat "
+                "backend with the concierge on (asks in chat), or \\[\\[schedules]] "
+                "(ticks) — `sbxloop daemon` refuses to start without one",
+                hard=False,
+            )
+        ]
+    return [Check("daemon intake", True, "; ".join(sources), hard=False)]
+
+
 def collect_checks(
     env: dict[str, str],
     cli: SbxCLI | None = None,
@@ -1053,6 +1098,7 @@ def collect_checks(
     checks.extend(registry_credential_checks(config, env))
     checks.extend(credentials_checks(config, env))
     checks.extend(workload_profile_checks(config))
+    checks.extend(schedule_checks(config))
     # A github credential matters only when the GitHub integration is
     # configured; an unconfigured integration is a valid (GitHub-less)
     # setup, not a failure. A PAT or GitHub App credentials both satisfy it;
@@ -1151,6 +1197,7 @@ def collect_checks(
             )
         )
 
+    checks.extend(daemon_intake_checks(config))
     # daemon's chat bridge (only when a backend is configured)
     backend = config.chat_backend
     if backend is not None:
