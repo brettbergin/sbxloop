@@ -584,6 +584,7 @@ class TestDaemonCommand:
         assert result.exit_code == 0, result.output
         plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
         assert "--run" in plain and "--read-only" in plain and "--state-dir" in plain
+        assert "--unit" in plain
         result = runner.invoke(
             app, ["tui", "--state-dir", str(workdir / "nowhere")], env={"COLUMNS": "300"}
         )

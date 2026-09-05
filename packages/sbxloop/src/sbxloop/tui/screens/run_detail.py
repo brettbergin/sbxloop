@@ -19,7 +19,10 @@ from textual.worker import get_current_worker
 
 from sbxloop.cli.tui import TASK_STATE_STYLES
 from sbxloop.config import TUI_CONTROL_CHANNEL
-from sbxloop.engine.model import artifacts_dir, scan_artifacts
+from sbxloop.daemon.usage import usage_lines
+from sbxloop.engine.model import TERMINAL_RUN_STATES, artifacts_dir, scan_artifacts
+from sbxloop.sbx.provision import sandbox_name
+from sbxloop.tui import actions
 from sbxloop.tui.data import ConsoleState, EventTail, RunDetail, build_run_detail
 from sbxloop.tui.format import (
     SPEND_NOT_REPORTED,
@@ -32,6 +35,7 @@ from sbxloop.tui.format import (
     tokens,
 )
 from sbxloop.tui.screens.base import ConsoleScreen
+from sbxloop.tui.screens.modals import TextPromptScreen
 from sbxloop.tui.widgets.chat_input import ChatInput
 from sbxloop.tui.widgets.chronology import ChronologyLog
 from sbxloop.tui.widgets.panel import TextPanel
@@ -50,6 +54,16 @@ class RunDetailScreen(ConsoleScreen):
         Binding("v", "toggle_view", "Transcript/lines", show=False),
         Binding("r", "reply_or_refresh", "Reply / refresh", show=False),
         Binding("i", "compose", "Type", show=False),
+        Binding("c", "cancel", "Cancel"),
+        Binding("C", "cancel_retry", "Cancel + retry", show=False),
+        Binding("R", "resume", "Resume / retry"),
+        Binding("u", "requeue", "Requeue", show=False),
+        Binding("A", "abandon", "Abandon", show=False),
+        Binding("m", "merge", "Approve merge", show=False),
+        Binding("w", "resume_review", "Check review now", show=False),
+        Binding("plus", "grant_rounds", "Grant rounds", show=False),
+        Binding("s", "shell_agent", "Shell (agent)"),
+        Binding("S", "shell_github", "Shell (github)", show=False),
     ]
     DEFAULT_CSS = """
     RunDetailScreen #header { height: auto; max-height: 8; padding: 0 1; border: round $primary; }
@@ -143,7 +157,7 @@ class RunDetailScreen(ConsoleScreen):
         scan = self._scan_artifacts_next
         self._scan_artifacts_next = False
         try:
-            detail = build_run_detail(mailbox, self.run_id)
+            detail = build_run_detail(mailbox, self.run_id, previous=self.detail)
             thread = (
                 self._thread_tail.pull() if self._thread_tail and self._thread_view is None else []
             )
@@ -262,7 +276,40 @@ class RunDetailScreen(ConsoleScreen):
         if detail.hold is not None:
             mark = "👀 " if emoji else ""
             text.append(f"\n{mark}{detail.hold.state}: waiting on a reviewer", style="yellow")
+        if not self.console_app.read_only:
+            text.append("\n" + " · ".join(self._offers(detail)), style="dim")
         return text
+
+    def _is_current(self, detail: RunDetail) -> bool:
+        daemon = self.console_app.state.daemon
+        return daemon is not None and daemon.live and daemon.current_run == detail.record.run_id
+
+    def _offers(self, detail: RunDetail) -> list[str]:
+        """The verbs that apply to this run, as the header's key hints —
+        the resume/cancel table docs/tui.md carries."""
+        r = detail.record
+        offers: list[str] = []
+        if self._is_current(detail):
+            offers += ["c cancel", "C cancel+retry"]
+        elif r.state not in TERMINAL_RUN_STATES:
+            offers.append("c cancel")
+        if detail.item is not None:
+            if detail.item.state in ("failed", "blocked", "cancelled", "queued"):
+                offers.append("R retry")
+            if detail.item.state in ("running", "queued"):
+                offers.append("u requeue")
+            if detail.item.state not in ("done", "failed", "cancelled"):
+                offers.append("A abandon")
+            if detail.gate is not None:
+                offers.append("m approve merge")
+            if detail.hold is not None:
+                offers.append("w check review now")
+            if r.exhausted:
+                offers.append("+ grant rounds")
+        elif r.state not in TERMINAL_RUN_STATES and not self._is_current(detail):
+            offers.append("R resume here")
+        offers += ["s shell", "S github shell"]
+        return offers
 
     def _tasks(self, detail: RunDetail) -> None:
         rows = []
@@ -324,7 +371,12 @@ class RunDetailScreen(ConsoleScreen):
             f"cache {tokens(totals['cr'])} read / {tokens(totals['cw'])} write\n",
             style="bold",
         )
-        usage.append(SPEND_NOT_REPORTED, style="dim")
+        if detail.usage is not None and detail.usage.recorded:
+            # The block the concierge's run_usage tool prints, verbatim.
+            usage.append(f"models: {detail.usage.model_line}\n", style="dim")
+            usage.append("\n".join(usage_lines(detail.usage)))
+        else:
+            usage.append(SPEND_NOT_REPORTED, style="dim")
         self.query_one("#usage", TextPanel).update(usage)
 
     def _landing(self, detail: RunDetail) -> Any:
@@ -411,6 +463,110 @@ class RunDetailScreen(ConsoleScreen):
         tree.root.expand()
 
     # -- actions -----------------------------------------------------------------
+
+    # -- run verbs ---------------------------------------------------------------
+
+    def action_cancel(self) -> None:
+        detail = self.detail
+        if detail is None:
+            return
+        if detail.record.state in TERMINAL_RUN_STATES and not self._is_current(detail):
+            self.app.notify(f"run is already {detail.record.state}", severity="warning")
+            return
+        self.console_app.perform(
+            actions.cancel_run(
+                self.console_app.deps, detail.record, current=self._is_current(detail)
+            )
+        )
+
+    def action_cancel_retry(self) -> None:
+        detail = self.detail
+        if detail is None:
+            return
+        if not self._is_current(detail):
+            self.app.notify(
+                "cancel + retry applies to the daemon's current run", severity="warning"
+            )
+            return
+        self.console_app.perform(
+            actions.cancel_run(self.console_app.deps, detail.record, current=True, retry=True)
+        )
+
+    def action_resume(self) -> None:
+        """An item's run is retried through the daemon; a run with no item
+        resumes as a detached process on this host."""
+        detail = self.detail
+        if detail is None:
+            return
+        deps = self.console_app.deps
+        if detail.item is not None:
+            self.console_app.perform(actions.retry(deps, detail.item.item_id))
+            return
+        if detail.record.state in TERMINAL_RUN_STATES:
+            self.app.notify(f"run is {detail.record.state}; nothing to resume", severity="warning")
+            return
+        self.console_app.perform(actions.resume_run(deps, detail.record.run_id))
+
+    def action_requeue(self) -> None:
+        detail = self.detail
+        if detail is None or detail.item is None:
+            self.app.notify("this run has no work item", severity="warning")
+            return
+        self.console_app.perform(actions.requeue(self.console_app.deps, detail.item.item_id))
+
+    def action_abandon(self) -> None:
+        detail = self.detail
+        if detail is None or detail.item is None:
+            self.app.notify("this run has no work item", severity="warning")
+            return
+        self.console_app.perform(actions.abandon(self.console_app.deps, detail.item.item_id))
+
+    def action_merge(self) -> None:
+        detail = self.detail
+        if detail is None or detail.gate is None:
+            self.app.notify("no open merge gate on this run", severity="warning")
+            return
+        self.console_app.perform(actions.merge(self.console_app.deps, detail.gate.item_id))
+
+    def action_resume_review(self) -> None:
+        detail = self.detail
+        if detail is None or detail.hold is None:
+            self.app.notify("this run is not waiting for a review", severity="warning")
+            return
+        self.console_app.perform(actions.resume_review(self.console_app.deps, detail.hold.item_id))
+
+    def action_grant_rounds(self) -> None:
+        detail = self.detail
+        if detail is None:
+            return
+        run_id = detail.record.run_id
+
+        def submitted(value: str | None) -> None:
+            if not value:
+                return
+            if not value.isdigit() or int(value) < 1:
+                self.app.notify("a whole number of rounds, 1 or more", severity="warning")
+                return
+            self.console_app.perform(
+                actions.grant_rounds(self.console_app.deps, run_id, int(value))
+            )
+
+        self.app.push_screen(
+            TextPromptScreen(
+                "grant rounds", f"How many more fix rounds for {run_id}?", placeholder="2"
+            ),
+            submitted,
+        )
+
+    def _shell(self, role: str) -> None:
+        name = sandbox_name(self.run_id, "agent" if role == "agent" else "github")
+        self.console_app.perform(actions.shell(self.console_app.deps, name))
+
+    def action_shell_agent(self) -> None:
+        self._shell("agent")
+
+    def action_shell_github(self) -> None:
+        self._shell("github")
 
     def action_back(self) -> None:
         """``Esc``: clear an open event filter first; then leave the run."""

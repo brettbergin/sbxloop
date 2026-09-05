@@ -84,6 +84,20 @@ class TestDispatch:
         assert dispatch(floop, "retry gh:issue:8", by="ops").ok
         assert floop.retried == [("gh:issue:8", "ops")]
 
+    def test_a_client_names_its_operator_on_the_request(self, tmp_path: Path) -> None:
+        """The console submits as "<user> via sbxloop tui": the request
+        carries it, so the source's "cancelled by …" names the surface."""
+        floop = FakeLoop(_dstore(tmp_path))
+        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        server.start()
+        try:
+            client = ControlClient(tmp_path, by="brett via sbxloop tui")
+            reply = client.submit("cancel", timeout_s=5)
+            assert reply is not None and reply.ok
+            assert floop.cancel_calls == [("brett via sbxloop tui", False)]
+        finally:
+            server.close()
+
     def test_item_verbs_report_the_stores_reason(self, tmp_path: Path) -> None:
         floop = FakeLoop(_dstore(tmp_path))
         floop.dstore.upsert_new(WorkItem(item_id="gh:issue:9", source_key="9", title="Do A"), 1.0)

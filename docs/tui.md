@@ -37,7 +37,7 @@ opens that run's screen at once; `--read-only` removes every action.
 ├────────────────────────────────────────────────────────────────────────────┤
 │                            <active screen>                                 │
 ├────────────────────────────────────────────────────────────────────────────┤
-│ 1 Overview  2 Runs  3 Queue  ? Help  r Refresh  q Quit                     │
+│ 1 Overview 2 Runs 3 Queue 4 Chat 5 Sandboxes 6 Daemon ? Help ^p r q        │
 └────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -54,8 +54,9 @@ returns.
 
 | key               | where                       | what                                                               |
 | ----------------- | --------------------------- | ------------------------------------------------------------------ |
-| `1` `2` `3`       | anywhere                    | Overview, Runs, Queue                                              |
+| `1` … `6`         | anywhere                    | Overview, Runs, Queue, Chat, Sandboxes, Daemon                     |
 | `?`               | anywhere                    | Help                                                               |
+| `ctrl+p`          | anywhere                    | the command palette: screens and argument-less verbs by name       |
 | `r`               | anywhere                    | refresh now (store and `ctl status`)                               |
 | `q`               | anywhere                    | quit                                                               |
 | `j`/`k`, arrows   | any list                    | move                                                               |
@@ -151,9 +152,128 @@ the bar counts unread control-channel rows while you are elsewhere.
 
 ## Administration
 
-*Lands with the console's admin screens.* Sandboxes, daemon process
-control (the systemd user unit named by `[tui] daemon_unit`), the journal,
-run operations, config editing with validation, secrets and doctor.
+Every admin verb goes through one path: refused under `--read-only`
+(sandbox shells included), refused without a live daemon when the daemon
+must execute it, confirmed by its tier, run off the UI thread, reported as
+a toast (or a screen when the output is long), then the screen re-polls.
+Two confirmation tiers, and a few verbs that just run (resuming the
+daemon or a hold, re-checking a review, resuming a repository, asking the
+concierge):
+
+- **`y`/`n`** for a bounded verb — pause, cancel, retry, requeue, approve
+  a merge, grant rounds, start the unit, stop a sandbox.
+- **Typed** for a destructive one — the target's name or the verb, exactly:
+  `stop` (graceful daemon stop), the unit name (stop / restart the unit),
+  the item id (abandon), the sandbox name (remove), `prune`, `gc`,
+  `upgrade`.
+
+What the daemon executes travels over the `ctl` queue, attributed as
+`<operator> via sbxloop tui` (the issue reads "cancelled by brett via
+sbxloop tui"). The item verbs have the CLI's row-only twin when no daemon
+is running: the store row changes, and the next daemon start reports it to
+the source and closes the dead run — the same note `sbxloop daemon retry`
+prints. While the daemon is *starting* they wait.
+
+### A run's verbs
+
+| situation                       | offered                                                  | mechanism                                                                                      |
+| ------------------------------- | -------------------------------------------------------- | ---------------------------------------------------------------------------------------------- |
+| the daemon's current run        | `c` cancel · `C` cancel and retry                        | `ctl cancel [--retry]`: settled on the item, the issue told                                    |
+| any other in-flight run         | `c` cancel                                               | the `sbxloop cancel` store write: cancelled at its next phase boundary                         |
+| a run pinned to an item         | `R` retry · `u` requeue · `A` abandon · `w` check review | `ctl retry / requeue / abandon / resume <item>` when live; the row-only twin when down         |
+| a gated run                     | `m` approve merge                                        | `ctl merge <item>`; the Thread tab's **Approve merge** button is the chat twin                 |
+| a run that exhausted its rounds | `+` grant rounds                                         | `ctl grant-rounds <run> <n>`: more fix rounds, resumed now                                     |
+| an unfinished run with no item  | `R` resume here                                          | a detached `sbxloop resume RUN --no-tui --no-chat` in its own session, log under the state dir |
+| any run                         | `s` / `S` shell                                          | `sbx exec` into the agent / github sandbox with the terminal handed over                       |
+
+A run is never resumed *inside* the console: that would tie it to the
+console's lifetime.
+
+### A new run
+
+On the Queue screen `n` asks for an outcome and posts it to the control
+channel addressed to the concierge, which files the issue with the trigger
+label; the daemon claims it like any labeled issue. That is the daemon's
+way to a run — a human asks, the daemon never files work for itself. `N`
+instead starts a detached `sbxloop run "…" --no-tui --no-chat` on this
+host, outside the daemon.
+
+### Sandboxes (`5`)
+
+`sbx ls`, every `sbxloop-*` sandbox classified against this store the way
+`sbxloop sandbox prune` classifies it (role, run, run state, age, verdict;
+the daemon's own github-ops and concierge boxes as role `daemon`, never
+pruned), and the run directories the daemon's daily sweep would remove, as
+a dry run with sizes. `s` opens a shell in the selected sandbox (the
+console suspends, the shell gets the terminal, the console returns when it
+exits), `x` removes one (typed name; a run sandbox takes its secret
+registrations with it), `X` stops one, `P` prunes every orphan (typed
+`prune`; the orphans are classified again as the removal runs, so a run
+resumed since the last poll keeps its boxes), `G` removes the prunable
+run directories (typed `gc`; run rows stay — the audit trail is never
+removed; `[daemon] prune_runs_after_days = 0` disables this as it does
+the daemon's sweep), `k` includes kept-for-debugging sandboxes in the
+orphan verdicts (the prompt says so, and their kept marker is cleared).
+
+### Daemon (`6`)
+
+```
+┌ process ─────────────────────────────┐┌ versions ─────────────────────────┐
+│ unit     active (running) · pid 4242 ││ sbxloop   1.4.2 installed · 1.4.5 │
+│ daemon   pid 4242 · up 2d · 1.4.2    ││ on PyPI · BEHIND by 3 releases    │
+│ current  r7ab3kq2m — Add retries     ││ sbxloop-worker 1.4.2 …            │
+│ holds    none · breaker closed       ││ sbx CLI   0.38.1                  │
+│ cap      4/12 runs today (UTC)       ││ checked 12m ago                   │
+└──────────────────────────────────────┘└───────────────────────────────────┘
+┌ repositories ────────────────────────┐┌ waiting on a human ───────────────┐
+│ o/r         ok                       ││ ⏸ gh:issue:39 ready to merge · 2h │
+│ o/other     suspended  token expired ││ 👀 gh:issue:37 awaiting_review    │
+└──────────────────────────────────────┘└───────────────────────────────────┘
+┌ journalctl --user -u sbxloop-daemon · level ≥ info · grep '' · follow on ─┐
+│ 2026-09-05T14:01:58+0000 … [info     ] daemon.tick queued=2 …              │
+└───────────────────────────────────────────────────────────────────────────┘
+```
+
+- **The unit.** `systemctl --user show` on `[tui] daemon_unit` (default
+  `sbxloop-daemon`, the name `contrib/systemd/` ships; `--unit` overrides)
+  every 15 s. `S` starts it, `T` stops it and `B` restarts it (typed unit
+  name: the run in flight is interrupted, resumable by design). A host
+  without systemd, or without a user bus in this session (a bare ssh
+  login — see [deploy.md](deploy.md)), reads as "no systemd here"; a host
+  without the unit reads as "no unit".
+- **The process.** What `ctl status` says: pid, uptime, version, the
+  current run, holds, the breaker, the day cap, and whether a graceful
+  stop is under way. `p` pauses, `u` resumes, `a` releases every hold,
+  `c`/`C` cancel the current run (and retry), `g` asks for a graceful stop
+  (typed `stop`: claim nothing new, finish the run, exit — under systemd
+  the unit restarts it; `T` stops it for good).
+- **No unit? Spawn one.** `D` starts `sbxloop daemon` from the console in
+  its own session, reading this directory's config, its output in
+  `<state dir>/console/daemon.log` (which the journal pane then tails).
+  It outlives the console, on the console's state dir. `e` stops it
+  (SIGTERM: nothing new is claimed, the run in flight is interrupted at
+  its next boundary and stays resumable, the process exits), and quitting
+  asks whether to.
+- **Versions.** The same report the concierge's `versions` tool gives
+  (installed, latest on PyPI unless `[daemon] version_check = false`, the
+  sbx CLI), refreshed hourly. `U` runs `[daemon] upgrade_command` in a
+  login shell, verbatim — the text the drift notice tells an operator to
+  paste — (typed `upgrade`) and shows its output; the daemon keeps running
+  the code it started with until restarted.
+- **Repositories.** Per-repository polling health from `status`; `R`
+  resumes a suspended one.
+- **The journal.** `journalctl --user -u <unit> -n 200 -f -o short-iso`,
+  streamed, every line through the credential redactor. `/` greps, `l`
+  cycles the level floor (lines without a level — a traceback, or every
+  line under `[daemon] log_format = "json"` — always pass), `f` toggles
+  follow. The stream and the polls stop while another screen is shown. The `!sbx log` verb in chat is the on-demand
+  twin from the daemon's own ring buffer.
+
+### The command palette
+
+`ctrl+p` lists every screen and every argument-less verb (pause, resume,
+cancel the current run, stop the daemon, start / stop / restart the unit,
+spawn a daemon, upgrade) by name. Verbs with a target live on their rows.
 
 ## Configuration
 

@@ -244,3 +244,10 @@ configured repository, so a broken repo is visible without masking the rest.
 If a deploy fails *and* its rollback fails, the job says `ROLLBACK ALSO FAILED — <host> needs a human`. Fix by hand: the two commands under [Upgrading by hand](#upgrading-by-hand)
 with the last good version, then `journalctl --user -u sbxloop-daemon -n 200` for why the
 new one would not start.
+
+## From the console
+
+`sbxloop tui` on the host does the same from its Daemon screen: the unit's
+state, start / stop / restart (typed), the journal streamed with a grep and
+a level floor, versions and the upgrade command, and a graceful `stop`
+through the daemon's own `ctl` queue. See [tui.md](tui.md#daemon-6).
