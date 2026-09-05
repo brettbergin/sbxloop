@@ -17,6 +17,7 @@ from typing import NamedTuple
 
 from sbxloop.engine.model import (
     TERMINAL_RUN_STATES,
+    RunKind,
     RunRecord,
     RunState,
     TaskRecord,
@@ -90,7 +91,8 @@ CREATE TABLE IF NOT EXISTS runs (
     exhausted  TEXT,
     granted_rounds INTEGER NOT NULL DEFAULT 0,
     pr_title   TEXT,
-    credentials TEXT NOT NULL DEFAULT '[]'
+    credentials TEXT NOT NULL DEFAULT '[]',
+    kind       TEXT NOT NULL DEFAULT 'code'
 );
 CREATE TABLE IF NOT EXISTS tasks (
     run_id     TEXT NOT NULL,
@@ -178,6 +180,9 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
             "ALTER TABLE runs ADD COLUMN granted_rounds INTEGER NOT NULL DEFAULT 0",
         ),
         ("credentials", "ALTER TABLE runs ADD COLUMN credentials TEXT NOT NULL DEFAULT '[]'"),
+        # Every run before #755 was a developer run: the default IS the
+        # migration, so a legacy row reads back as `code` untouched.
+        ("kind", "ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'code'"),
     ),
     "phase_attempts": (
         ("input_tokens", "ALTER TABLE phase_attempts ADD COLUMN input_tokens INTEGER"),
@@ -255,6 +260,7 @@ class StateStore:
         config_json: str = "{}",
         *,
         credentials: Sequence[str] = (),
+        kind: RunKind = "code",
     ) -> RunRecord:
         names = list(dict.fromkeys(credentials))
         with self._lock:
@@ -262,8 +268,8 @@ class StateStore:
             try:
                 self._conn.execute(
                     "INSERT INTO runs (run_id, outcome, state, config_json, created_at,"
-                    " updated_at, credentials) VALUES (?, ?, 'created', ?, ?, ?, ?)",
-                    (run_id, outcome, config_json, now, now, json.dumps(names)),
+                    " updated_at, credentials, kind) VALUES (?, ?, 'created', ?, ?, ?, ?, ?)",
+                    (run_id, outcome, config_json, now, now, json.dumps(names), kind),
                 )
             except sqlite3.IntegrityError as exc:
                 raise StateError(f"run {run_id} already exists") from exc
@@ -272,6 +278,7 @@ class StateStore:
                 run_id=run_id,
                 outcome=outcome,
                 state="created",
+                kind=kind,
                 created_at=now,
                 updated_at=now,
                 credentials=names,
@@ -504,6 +511,7 @@ class StateStore:
             run_id=row["run_id"],
             outcome=row["outcome"],
             state=_LEGACY_RUN_STATES.get(row["state"], row["state"]),
+            kind=row["kind"] or "code",
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             workspace=Path(row["workspace"]) if row["workspace"] else None,

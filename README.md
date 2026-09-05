@@ -316,11 +316,23 @@ env.
 95 % disk), so a runaway task fails with "sandbox disk exhausted" instead of
 letting in-VM tooling fail confusingly on a full disk.
 
+**Workloads.** `sbxloop run "…" --kind workload` starts the other kind of
+run: an outcome that is not a change to a repository. It has the same shape
+— a persisted run, a task graph, a resumable stage list — but boots the
+agent sandbox alone (no repository, no GitHub box, no delivery), works in a
+per-run data directory that is harvested as artifacts, and walks the
+operator's stages instead of the developer's: `planning`, `executing`,
+`judging` (every task's declared check re-run on the finished workspace; one
+red check fails the run naming it), `publishing`. `status` shows a run's
+kind; a code run's trail is byte-identical with the flag absent. The
+operator persona, an LLM judge, output sinks, workload profiles and
+scheduled intake land on this base in later pull requests.
+
 ## CLI reference
 
 | Command                                         | What it does                                                                                                                                                                                                                                                                                                                                   |
 | ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sbxloop run "OUTCOME"`                         | Start a run; with a repository it carries the work through to the merge. Options: `--workspace`, `--repo`, `--deliver-base`, `--create-repo`, `--create-public`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`, `--no-chat`.                                                                                                  |
+| `sbxloop run "OUTCOME"`                         | Start a run; with a repository it carries the work through to the merge. Options: `--kind code\|workload`, `--workspace`, `--repo`, `--deliver-base`, `--create-repo`, `--create-public`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`, `--no-chat`.                                                                         |
 | `sbxloop daemon`                                | The always-on outer loop: claim labeled issues, run each one through to a merged PR, settle the issue, mirror to chat (Discord or Slack). Options: `--repo`, `--max-runs-per-day`, `--poll-interval`, `--discord-channel`, `--slack-channel`, `--once`, `--dry-run`, `--log-level`, `--log-format`.                                            |
 | `sbxloop daemon items\|abandon\|retry\|requeue` | Inspect and steer individual work items from another shell without stopping the daemon (see below).                                                                                                                                                                                                                                            |
 | `sbxloop daemon ctl CMD`                        | Drive the running daemon from a script or cron: `status` (`--json` for one machine-readable object), `pause`, `resume`, `cancel`, `queue` — the same verbs as chat's `!sbx`, over a file queue in `state_dir/daemon/ctl/`.                                                                                                                     |
