@@ -26,6 +26,7 @@ from sbxloop.daemon.control import (
     ControlServer,
     _reply_from,
     dispatch,
+    format_log_tail,
     plain,
     usage,
 )
@@ -148,6 +149,36 @@ class TestDispatch:
             assert not reply.ok and "usage:" in reply.text, cmd
         assert not floop.paused and floop.hold_calls == []
 
+    def test_log_answers_from_the_ring_buffer_with_filters(self, tmp_path: Path) -> None:
+        """`!sbx log` / `ctl log`: the journal without ssh, the same rendering
+        the concierge's tool returns."""
+        from sbxloop.log import get_logger
+
+        logger = get_logger("sbxloop.test.ctl")
+        logger.info("ctl.probe_one", n=1)
+        logger.warning("ctl.probe_two", n=2)
+        floop = FakeLoop(_dstore(tmp_path))
+        reply = dispatch(floop, "log --tail 3")
+        assert reply.ok and reply.text.startswith("```\nshowing")
+        assert "ctl.probe_two" in reply.text
+        only_warn = dispatch(floop, "log --tail 50 --level WARNING --grep probe")
+        assert "ctl.probe_two" in only_warn.text and "ctl.probe_one" not in only_warn.text
+        assert "level=WARNING" in only_warn.text and "grep='probe'" in only_warn.text
+        bad = dispatch(floop, "log --level LOUD")
+        assert bad.ok and "unknown log level 'LOUD'" in bad.text
+        usage_reply = dispatch(floop, "log --nope")
+        assert not usage_reply.ok and usage_reply.text.startswith("usage: log")
+        assert format_log_tail(tail=1, grep="no-such-line-anywhere").startswith(
+            "no matching log records"
+        )
+
+    def test_stop_asks_the_loop_to_finish_and_exit(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(tmp_path))
+        reply = dispatch(floop, "stop", by="ops")
+        assert reply.ok and getattr(floop, "stopped", False)
+        assert "current run finishes" in reply.text
+        assert not dispatch(floop, "stop now").ok
+
     def test_unknown_verb_returns_usage_with_the_callers_prefix(self, tmp_path: Path) -> None:
         reply = dispatch(FakeLoop(_dstore(tmp_path)), "bogus", prefix="sbxloop daemon ctl")
         assert not reply.ok and not reply.known
@@ -156,6 +187,8 @@ class TestDispatch:
             "sbxloop daemon ctl status|pause [--hold NAME]|resume [<item|run>|--hold NAME|--all]|"
             "cancel [--retry]|queue|items|" in reply.text
         )
+        assert "log [--tail N] [--level LEVEL] [--grep TEXT]|stop" in reply.text
+        assert True
 
     def test_cancel_rejects_unknown_arguments(self, tmp_path: Path) -> None:
         # A typo (`--rety`) must not silently become a terminal no-retry

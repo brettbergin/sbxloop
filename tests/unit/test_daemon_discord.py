@@ -262,6 +262,9 @@ class FakeLoop:
         self.cancel_calls.append((requester, retry))
         return True
 
+    def request_stop(self) -> None:
+        self.stopped = True
+
     # #229 item controls: the real loop wraps DaemonStore; the fake exposes
     # the store's own transitions so error text flows through unchanged.
     def abandon_item(self, item_id: str, reason: str | None = None) -> WorkItem:

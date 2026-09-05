@@ -34,7 +34,7 @@ from typing import Any, NamedTuple
 from sbxloop.daemon.discord_format import code, items_lines, queue_lines
 from sbxloop.daemon.holds import OPERATOR_HOLD
 from sbxloop.ghids import normalize_item_id
-from sbxloop.log import get_logger
+from sbxloop.log import get_logger, log_buffer
 
 log = get_logger(__name__)
 
@@ -54,6 +54,8 @@ COMMANDS: tuple[str, ...] = (
     "merge <item|run>",
     "grant-rounds <run> <n>",
     "resume-repo <owner/name>",
+    "log [--tail N] [--level LEVEL] [--grep TEXT]",
+    "stop",
 )
 # Verbs that may talk to the source (GitHub through the ops sandbox —
 # seconds, not milliseconds); a surface with an event loop to protect runs
@@ -102,7 +104,71 @@ def usage(prefix: str) -> str:
 
 # Read-only commands: answered constantly by dashboards and humans checking
 # in, so they trace at DEBUG; every mutating command is an INFO audit line.
-_READ_ONLY_COMMANDS = frozenset({"status", "queue", "items"})
+_READ_ONLY_COMMANDS = frozenset({"status", "queue", "items", "log"})
+
+#: The daemon's log levels, as ``log`` accepts them.
+LOG_LEVELS: tuple[str, ...] = ("DEBUG", "INFO", "WARNING", "ERROR")
+#: ``log`` returns at most this many records; the ring buffer holds 2000.
+LOG_TAIL_MAX = 500
+
+
+def format_log_tail(
+    *, tail: int = 50, level: str | None = None, grep: str | None = None, line_clip: int = 400
+) -> str:
+    """The daemon's recent log records from the in-process ring buffer,
+    rendered for an operator — the journal without ssh. One implementation
+    for `!sbx log`, `ctl log` and the concierge's `daemon_log` tool.
+
+    ``tail`` is clamped to ``LOG_TAIL_MAX``; ``level`` keeps records at or
+    above it (an unknown name is a message, not an exception); ``grep`` is
+    a plain case-insensitive substring, never a pattern.
+    """
+    tail = max(1, min(LOG_TAIL_MAX, tail))
+    level = (level or "").strip().upper() or None
+    buffer = log_buffer()
+    size = len(buffer)
+    try:
+        records = buffer.tail(tail, level=level, grep=grep or None)
+    except ValueError:
+        return f"unknown log level {level!r} — use one of {', '.join(LOG_LEVELS)}"
+    filters: list[str] = []
+    if level:
+        filters.append(f"level={level}")
+    if grep:
+        filters.append(f"grep={grep!r}")
+    suffix = f" ({', '.join(filters)})" if filters else ""
+    if not records:
+        return f"no matching log records{suffix}; the buffer holds {size} lines"
+    head = f"showing {len(records)} of {size} buffered log records{suffix}"
+    lines = [f"{r.timestamp} {r.level} {r.logger} {_one_line(r.line, line_clip)}" for r in records]
+    return "\n".join([head, *lines])
+
+
+def _one_line(text: str, limit: int) -> str:
+    flat = " ".join(text.split())
+    return flat if len(flat) <= limit else flat[: limit - 1] + "…"
+
+
+def _log_args(args: list[str]) -> tuple[int, str | None, str | None] | str:
+    """``--tail N``, ``--level L``, ``--grep TEXT…`` (the rest of the line);
+    a usage message for anything else."""
+    tail, level, grep = 50, None, None
+    i = 0
+    while i < len(args):
+        flag = args[i]
+        if flag == "--tail" and i + 1 < len(args) and args[i + 1].isdigit():
+            tail = int(args[i + 1])
+            i += 2
+        elif flag == "--level" and i + 1 < len(args):
+            level = args[i + 1]
+            i += 2
+        elif flag == "--grep" and i + 1 < len(args):
+            grep = " ".join(args[i + 1 :])
+            break
+        else:
+            return f"usage: log [--tail N] [--level {'|'.join(LOG_LEVELS)}] [--grep TEXT]"
+        i += 0
+    return tail, level, grep
 
 
 def dispatch(
@@ -260,6 +326,23 @@ def _dispatch(
         except (KeyError, ValueError) as exc:
             return CommandReply(f"resume-repo failed: {exc.args[0] if exc.args else exc}", ok=False)
         return CommandReply(f"polling {code(health['repo'])} again from the next tick.")
+    if word == "log":
+        parsed = _log_args(args)
+        if isinstance(parsed, str):
+            return CommandReply(parsed, ok=False)
+        tail, level, grep = parsed
+        return CommandReply("```\n" + format_log_tail(tail=tail, level=level, grep=grep) + "\n```")
+    if word == "stop":
+        if args:
+            return CommandReply(
+                "usage: stop — no arguments (use `cancel` to stop the run)", ok=False
+            )
+        loop.request_stop()
+        return CommandReply(
+            "stopping: nothing new is claimed and the daemon exits once the current run "
+            "finishes (`cancel` first to stop that run now; whether it comes back is the "
+            "service manager's call)"
+        )
     if word in ("merge", "approve"):
         # The opt-in merge gate's approval ([landing] merge_gate). Fast:
         # it only flips the store row and spawns the landing thread, so it

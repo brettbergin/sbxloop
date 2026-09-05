@@ -48,7 +48,7 @@ from sbxloop.daemon.chat_choices import (
     parse_choice_question,
     parse_pending_filing,
 )
-from sbxloop.daemon.control import dispatch, plain
+from sbxloop.daemon.control import dispatch, format_log_tail, plain
 from sbxloop.daemon.discord_format import agent_model_label
 from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.store import ChatThread, DaemonStore
@@ -68,7 +68,7 @@ from sbxloop.errors import (
 from sbxloop.events import EventBus
 from sbxloop.ghids import issue_item_id, normalize_item_id
 from sbxloop.ids import new_job_id
-from sbxloop.log import get_logger, log_buffer
+from sbxloop.log import get_logger
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import (
     EventTypes,
@@ -1332,26 +1332,11 @@ class Concierge:
         return "\n".join(lines)
 
     def _tool_daemon_log(self, args: dict[str, Any], by: str) -> str:
-        tail = _int_arg(args, "tail", 50, 1, 500)
-        level = str(args.get("level") or "").strip().upper() or None
-        grep = str(args.get("grep") or "")
-        buffer = log_buffer()
-        size = len(buffer)
-        try:
-            records = buffer.tail(tail, level=level, grep=grep or None)
-        except ValueError:
-            return f"unknown log level {level!r} — use one of {', '.join(_LOG_LEVELS)}"
-        filters: list[str] = []
-        if level:
-            filters.append(f"level={level}")
-        if grep:
-            filters.append(f"grep={grep!r}")
-        suffix = f" ({', '.join(filters)})" if filters else ""
-        if not records:
-            return f"no matching log records{suffix}; the buffer holds {size} lines"
-        head = f"showing {len(records)} of {size} buffered log records{suffix}"
-        lines = [f"{r.timestamp} {r.level} {r.logger} {_one_line(r.line, 400)}" for r in records]
-        return "\n".join([head, *lines])
+        return format_log_tail(
+            tail=_int_arg(args, "tail", 50, 1, 500),
+            level=str(args.get("level") or "").strip().upper() or None,
+            grep=str(args.get("grep") or "") or None,
+        )
 
     def _tool_list_repos(self, args: dict[str, Any], by: str) -> str:
         entries = self.config.github.repo_list()

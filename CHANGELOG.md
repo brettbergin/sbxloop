@@ -8,6 +8,17 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **`log` and `stop` operator commands** (#772). The daemon's recent log
+  lines were reachable only through the concierge's tool or `journalctl`
+  over ssh, and stopping the daemon gracefully was a signal. `!sbx log [--tail N] [--level L] [--grep TEXT]` and `sbxloop daemon ctl log` answer
+  from the in-process ring buffer — one rendering shared with the
+  concierge's `daemon_log` tool, so the three cannot drift — and `stop`
+  asks the daemon to claim nothing new and exit once the current run
+  finishes (`cancel` first to stop that run now); like every ctl request
+  it is served only by a live daemon, refused when stale, and audited.
+
+### Added
+
 - **Console chat: the control channel and run threads** (#771). With the
   shell alone an operator could watch a run but not speak to it. The Chat
   screen and a run's Thread tab now show the daemon's local chat bridge —
