@@ -858,7 +858,10 @@ def status(
     # The pair names, so debugging a live run needs no by-hand
     # `sbxloop-<run>-agent` reconstruction.
     console.print("sandboxes:")
+    # The service sandbox (#765) exists only for a run granted credentials.
     roles: tuple[SandboxRole, ...] = ("agent", "github")
+    if record.credentials:
+        roles += ("service",)
     try:
         live = {info.name for info in SbxCLI(app_name=config.app_name or None).ls()}
     except SbxloopError:
@@ -948,8 +951,8 @@ def shell(
     Attaching to an in-flight run is meant as observation: the worker owns
     its env files and workspace, so avoid mutating them mid-phase.
     """
-    if role not in ("agent", "github"):
-        console.print(f"[bold red]invalid --role {role!r}:[/] must be agent or github")
+    if role not in ("agent", "github", "service"):
+        console.print(f"[bold red]invalid --role {role!r}:[/] must be agent, github or service")
         raise typer.Exit(2)
     config = _run_config()
     store = _store(config)
@@ -1338,7 +1341,7 @@ def sandbox_prune(
     failures = 0
     for v in orphans:
         try:
-            if v.role in ("agent", "github"):
+            if v.role in ("agent", "github", "service"):
                 # A pruned run sandbox takes its secret registrations with
                 # it; otherwise a later run under the same name (resume)
                 # cannot replace them and comes up with the proxy sentinel.

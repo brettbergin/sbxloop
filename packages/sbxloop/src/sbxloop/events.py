@@ -226,6 +226,10 @@ class HostEventTypes:
     RUN_BLOCKED = "run.blocked"
     # A non-terminal run closed out by daemon startup/staleness reconciliation.
     RUN_RECONCILED = "run.reconciled"
+    # One authenticated request the service sandbox made on the agent's
+    # behalf (#765): `credential`, `method`, `path`, `status` (or `error`),
+    # `duration_s`, `phase`, `task_id`. Never the body, never a header.
+    SERVICE_CALL = "service.call"
     # The task roster as the run will work it (also re-announced on resume,
     # with each task's persisted state).
     RUN_TASKS = "run.tasks"

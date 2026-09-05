@@ -68,20 +68,28 @@ versioned envelopes" — nothing more.
 
 ### 2. Host mediation between the sandboxes
 
-The agent box and the github box never communicate. All traffic between them
-passes through the host.
+The agent box and the credential-bearing boxes — the github box, and the
+service box a run granted `[[credentials]]` gets (#765) — never communicate.
+All traffic between them passes through the host.
 
-*Why it holds.* The model-driven side produces a tree; the host harvests that
-tree and then speaks to the credential-bearing side only in a closed vocabulary
-of typed `github.op` jobs. Neither box has an address for, or a route to, the
-other — the split is enforced by the same directionality invariant above.
+*Why it holds.* The model-driven side produces a tree and asks questions; the
+host harvests that tree and speaks to the credential-bearing side only in a
+closed vocabulary of typed jobs (`github.op`, `service.http`). Neither box has
+an address for, or a route to, the other — the split is enforced by the same
+directionality invariant above. Stated as the property every design is held
+to: **the model's arbitrary commands never execute where a secret other than
+its own inference credential is readable.** The only key in the agent box is
+the inference key; everything else that needs a secret happens in a separate
+sandbox that runs no model and only the fixed ops the host submits.
 
-*What it forbids.* Any direct agent-box ↔ github-box channel: shared sockets,
-box-to-box networking, forwarded credentials, or a "convenience" pipe between
-the halves. The credential split is valuable because of what *stands between*
-the halves, not because the secret lives in a different VM. A direct channel
-would keep the ceremony while losing the control — a confused deputy with a
-private line to its credential.
+*What it forbids.* Any direct agent-box ↔ credential-box channel: shared
+sockets, box-to-box networking, forwarded credentials, or a "convenience"
+pipe between the halves. The credential split is valuable because of what
+*stands between* the halves, not because the secret lives in a different VM. A
+direct channel would keep the ceremony while losing the control — a confused
+deputy with a private line to its credential. The same rule refuses an
+operator secret in the agent box "for the build": a credential the model can
+read is a credential the model can exfiltrate.
 
 ### Evaluating future proposals
 
@@ -92,9 +100,11 @@ that lets the two boxes talk directly, is rejected on these grounds regardless o
 how much plumbing it removes. See [docs/worker-protocol.md](worker-protocol.md)
 for the transport-level statement of the same rules.
 
-## The security primitive: one run = two sandboxes
+## The security primitive: one run = two sandboxes (three, with credentials)
 
-Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pair`.
+Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pair`
+— and a run granted `[[credentials]]` a third, the *service* sandbox (#765),
+provisioned in the same parallel step.
 Before either exists, the provisioner decides what the agent sandbox is *for*:
 `toolchains.resolve_languages` reads the workspace once — which toolchains
 (`[sandbox] languages`, else the manifests, else Python; `sandbox.languages`)
@@ -132,6 +142,26 @@ credential:
 | injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows) | built-in `github` service secret (PAT), or the in-VM env file carrying a host-minted App installation token (#568) |
 | network    | balanced policy + copilot hosts + the `[github] api_url` hosts + plan-declared grants                                                                                   | balanced policy + the `[github] api_url` hosts (+ the dotcom storage hosts when that is github.com)                |
 | runs       | agent SDK sessions (Copilot SDK, or the Claude Agent SDK + Claude Code CLI with the claude backend), shell checks                                                       | `github.op` jobs (gh CLI or REST)                                                                                  |
+
+The service sandbox (`sbxloop-<run>-service`, #765) is the github sandbox's
+pattern generalized to the operator's own credentials. `[[credentials]]`
+declares a catalogue — `name`, the daemon-environment `env` holding the value,
+the ONE `host` the credential is good for, and how it is attached (`header`,
+`scheme`) — and a run is granted a subset by name (`Engine.start(credentials=…)`,
+persisted on the run row so a resume re-provisions the same box; no `code`
+run is granted any today). The box holds exactly the granted values, delivered
+the way `GH_TOKEN` is on the non-proxy road (per-job stdin, else the 0600 env
+file; never an `sbx` argument), plus the non-secret catalogue in
+`SBXLOOP_SERVICE_CREDENTIALS`; its allowlist is the credentials' hosts and
+nothing else; it runs only `service.http` jobs — one request to
+`https://<catalogue host><path>` with the named credential attached,
+redirects not followed, the credential's own header un-overridable. The agent
+reaches it through one host tool, `call_service(credential, method, path, query?, headers?, body?)`, attached to the build session only: the host checks
+the name against the run's grant, submits the job, and hands back the status,
+headers and clipped body with the credential's value redacted wherever the API
+echoed it. Each call is one `service.call` ledger event — credential name,
+method, path, status, duration; never a body or a header. The agent sandbox's
+allowlist does not carry the credential hosts: the agent never speaks to them.
 
 What the agent credential *is* — its env var, the host sbx binds it to, the
 hosts it must reach, how doctor names it when missing, where its model ids

@@ -22,7 +22,7 @@ PROTOCOL_VERSION = 1
 # they are kept to a conservative identifier alphabet.
 HOST_TOOL_NAME_RE = r"^[A-Za-z0-9_-]{1,64}$"
 
-JobKind = Literal["agent.session", "shell.check", "shell.batch", "github.op"]
+JobKind = Literal["agent.session", "shell.check", "shell.batch", "github.op", "service.http"]
 JobStatus = Literal["ok", "error", "timeout"]
 PermissionMode = Literal["auto", "read_only"]
 ExpectMode = Literal["text", "json"]
@@ -225,7 +225,10 @@ class JobRequest(ProtocolModel):
     # run in the run's canonical workspace.
     cwd: str | None = None
 
-    # kind == "github.op"
+    # kind == "github.op": the op name and its parameters.
+    # kind == "service.http": ``params`` only — credential (a catalogue name
+    # the service sandbox resolves to an env variable and ONE host), method,
+    # path, and optional query/headers/body; see ``sbxloop_worker.serviceops``.
     op: str | None = None
     params: dict[str, Any] = Field(default_factory=dict)
 
@@ -271,6 +274,14 @@ class JobRequest(ProtocolModel):
                 raise ValueError("github.op requires an op name")
             if self.prompt is not None or self.argv is not None or self.commands is not None:
                 raise ValueError("github.op must not set prompt, argv, or commands")
+        elif self.kind == "service.http":
+            missing = [k for k in ("credential", "method", "path") if not self.params.get(k)]
+            if missing:
+                raise ValueError(f"service.http requires params {missing}")
+            if self.op is not None:
+                raise ValueError("service.http must not set op")
+            if self.prompt is not None or self.argv is not None or self.commands is not None:
+                raise ValueError("service.http must not set prompt, argv, or commands")
         return self
 
 
@@ -373,6 +384,11 @@ class EventTypes:
     GH_OP_START = "gh.op_start"
     GH_OP_PROGRESS = "gh.op_progress"
     GH_OP_END = "gh.op_end"
+
+    # A service.http job in the service sandbox: which credential (by name)
+    # and where it went (method, path, status) — never the header it sent.
+    SERVICE_HTTP_START = "service.http_start"
+    SERVICE_HTTP_END = "service.http_end"
 
     # Resource telemetry sampled on the heartbeat cadence. Worker-emitted,
     # but sandbox-scoped: the host enriches these with the sandbox role.

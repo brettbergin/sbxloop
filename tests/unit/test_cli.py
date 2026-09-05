@@ -449,7 +449,7 @@ class TestShellCommand:
     def test_invalid_role_errors(self, workdir: Path) -> None:
         result = runner.invoke(app, ["shell", "rseeded11", "--role", "bogus"])
         assert result.exit_code == 2
-        assert "agent or github" in result.output
+        assert "agent, github or service" in result.output
 
     def test_missing_sandbox_errors_with_keep_hint(self, workdir: Path, fake_sbx: FakeSbx) -> None:
         seed_store(workdir)
@@ -1110,6 +1110,31 @@ class TestDoctor:
         result = runner.invoke(app, ["doctor"])
         assert result.exit_code == 0, result.output
         assert "set: ARTIFACTORY_TOKEN" in result.output
+        assert "value_never_shown" not in result.output
+
+    def test_doctor_names_an_unset_service_credential(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `[[credentials]]` env (#765) is a secret only the service
+        sandbox ever holds; its own row names the unset ones, and the hosts
+        those credentials may reach, never a value."""
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        monkeypatch.delenv("WEATHER_API_KEY", raising=False)
+        (workdir / "sbxloop.toml").write_text(
+            "[[credentials]]\n"
+            'name = "weather"\n'
+            'env = "WEATHER_API_KEY"\n'
+            'host = "api.weather.example.com"\n'
+        )
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 1
+        assert "service credentials" in result.output
+        assert "weather (WEATHER_API_KEY)" in result.output
+        monkeypatch.setenv("WEATHER_API_KEY", "value_never_shown")
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert "set: weather" in result.output and "api.weather.example.com" in result.output
         assert "value_never_shown" not in result.output
 
     def _bake_record(
