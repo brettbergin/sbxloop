@@ -272,7 +272,12 @@ class RunDetailScreen(ConsoleScreen):
         text.append(" · ".join(bits), style="dim")
         if detail.gate is not None:
             mark = "⏸ " if emoji else ""
-            text.append(f"\n{mark}ready to merge — waiting for approval", style="bold yellow")
+            waiting = (
+                "result held — waiting for release"
+                if detail.gate.kind == "publish"
+                else "ready to merge — waiting for approval"
+            )
+            text.append(f"\n{mark}{waiting}", style="bold yellow")
         if detail.hold is not None:
             mark = "👀 " if emoji else ""
             text.append(f"\n{mark}{detail.hold.state}: waiting on a reviewer", style="yellow")
@@ -301,7 +306,7 @@ class RunDetailScreen(ConsoleScreen):
             if detail.item.state not in ("done", "failed", "cancelled"):
                 offers.append("A abandon")
             if detail.gate is not None:
-                offers.append("m approve merge")
+                offers.append("m release" if detail.gate.kind == "publish" else "m approve merge")
             if detail.hold is not None:
                 offers.append("w check review now")
             if r.exhausted:
@@ -403,9 +408,10 @@ class RunDetailScreen(ConsoleScreen):
             )
         if detail.gate is not None:
             g = detail.gate
+            where = "" if g.kind == "publish" else f" · PR #{g.pr_number}"
             table.add_row(
-                "merge gate",
-                Text(f"{g.state} since {age(g.created_at)} · PR #{g.pr_number}", style="yellow"),
+                "publish hold" if g.kind == "publish" else "merge gate",
+                Text(f"{g.state} since {age(g.created_at)}{where}", style="yellow"),
             )
         if detail.hold is not None:
             h = detail.hold
@@ -526,7 +532,11 @@ class RunDetailScreen(ConsoleScreen):
         if detail is None or detail.gate is None:
             self.app.notify("no open merge gate on this run", severity="warning")
             return
-        self.console_app.perform(actions.merge(self.console_app.deps, detail.gate.item_id))
+        self.console_app.perform(
+            actions.merge(
+                self.console_app.deps, detail.gate.item_id, held=detail.gate.kind == "publish"
+            )
+        )
 
     def action_resume_review(self) -> None:
         detail = self.detail

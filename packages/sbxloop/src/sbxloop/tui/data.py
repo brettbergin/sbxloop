@@ -49,6 +49,7 @@ LANDING_KINDS: tuple[str, ...] = (
     HostEventTypes.LAND_BOT_STANDING,
     HostEventTypes.RUN_GATED,
     HostEventTypes.RUN_AWAITING_REVIEW,
+    HostEventTypes.RUN_HELD,
     HostEventTypes.RUN_MERGED,
     HostEventTypes.RUN_FOLLOWUPS,
     HostEventTypes.RUN_BLOCKED,

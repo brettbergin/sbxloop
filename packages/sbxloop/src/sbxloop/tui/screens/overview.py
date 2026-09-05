@@ -130,10 +130,12 @@ class OverviewScreen(ConsoleScreen):
         gate_mark = "⏸ " if emoji else ""
         hold_mark = "👀 " if emoji else ""
         for gate in items.gates:
-            line = (
-                f"{gate_mark}**{gate.item_id}** ready to merge · PR #{gate.pr_number} "
-                f"· run `{gate.run_id}`"
+            what = (
+                "result held — release?"
+                if gate.kind == "publish"
+                else f"ready to merge · PR #{gate.pr_number}"
             )
+            line = f"{gate_mark}**{gate.item_id}** {what} · run `{gate.run_id}`"
             text.append_text(to_rich(line))
             text.append("\n")
         for hold in items.holds:

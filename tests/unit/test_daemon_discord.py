@@ -2410,15 +2410,17 @@ def make_gate(
     prompt_channel: str | None = None,
     prompt_message: str | None = None,
     state: str = "open",
+    kind: str = "merge",
 ) -> Any:
     from sbxloop.daemon.store import MergeGate
 
+    held = kind == "publish"
     return MergeGate(
         run_id=run_id,
         item_id="gh:issue:7",
         repo="o/r",
-        pr_number=9,
-        pr_url="https://x/pull/9",
+        pr_number=0 if held else 9,
+        pr_url="" if held else "https://x/pull/9",
         branch=None,
         notify_ids=notify,
         custom_id=custom,
@@ -2429,6 +2431,7 @@ def make_gate(
         resolved_at=None,
         resolved_by=None,
         detail=None,
+        kind=kind,
     )
 
 
@@ -2455,6 +2458,41 @@ class TestGatePrompt:
         stored = bridge.dstore.gate_prompt("r77", "discord")
         assert stored is not None, "the prompt id is persisted for restarts"
         assert stored[0] == "421" and stored[1]
+
+    def test_a_publish_hold_prompts_for_a_release_not_a_merge(self, tmp_path: Path) -> None:
+        """`publish = "hold"` (#760): the same prompt path, worded for a
+        held result — release, not merge; no PR, no deadline."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.client = client
+        item = WorkItem(item_id="gh:issue:7", source_key="7", title="Seven", kind="workload")
+        with bridge._lock:
+            bridge._items["r77"] = item
+        bridge.dstore.create_merge_gate(
+            "r77", "gh:issue:7", "", 0, "", None, ["1"], "tok77", 1.0, kind="publish"
+        )
+        asyncio.run(bridge._post_gate_prompt(make_gate(kind="publish")))
+        prompt = client.channels[421].sent[-1]
+        assert "result held" in prompt and "<@1>" in prompt
+        assert "!sbx release gh:issue:7" in prompt
+        assert "abandon gh:issue:7" in prompt
+        assert "merge" not in prompt and "pull/9" not in prompt
+        assert "no deadline" in prompt
+
+    def test_a_release_edits_the_hold_prompt_in_place(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.client = client
+        control = client.channels[42]
+        msg = asyncio.run(control.send("⏸ prompt"))
+        bridge.dstore.create_merge_gate(
+            "r77", "gh:issue:7", "", 0, "", None, ["1"], "tok77", 1.0, kind="publish"
+        )
+        bridge.dstore.set_gate_prompt("r77", "42", str(msg.id), backend="discord")
+        gate = bridge.dstore.merge_gate_for("r77")
+        assert gate is not None and gate.kind == "publish"
+        asyncio.run(bridge._update_gate_prompt(gate, "released", "brett", None))
+        assert "released by brett" in msg.content and "published" in msg.content
+        asyncio.run(bridge._update_gate_prompt(gate, "dismissed", None, "not wanted"))
+        assert "held result dropped" in msg.content
 
     def test_resolution_edits_the_prompt_in_place(self, tmp_path: Path) -> None:
         bridge, client, _ = make_bridge(tmp_path)
@@ -2537,6 +2575,20 @@ class TestGateButtonHandler:
         asyncio.run(_GateHandler(bridge, make_gate()).on_click(interaction))
         ((note, _),) = interaction.response.sent
         assert "merge failed" in note and "no merge gate" in note
+
+    def test_a_hold_button_speaks_of_releasing(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.discord import _GateHandler
+
+        bridge, _, floop = make_bridge(tmp_path)
+
+        def approve_merge(target: str, by: str | None = None) -> str:
+            raise ValueError("held result was dropped")
+
+        floop.approve_merge = approve_merge  # type: ignore[attr-defined]
+        interaction = self._interaction()
+        asyncio.run(_GateHandler(bridge, make_gate(kind="publish")).on_click(interaction))
+        ((note, _),) = interaction.response.sent
+        assert note.startswith("release failed") and "dropped" in note
 
 
 class TestGateViewRearm:

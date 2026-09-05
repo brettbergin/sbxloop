@@ -257,6 +257,27 @@ and the stage skips sinks already there — a resume at `publishing` is
 idempotent. A sink that raises (`SbxError`, `GithubOpsError`, `OSError`,
 `PublishError`) fails the run with `publishing to <sink> failed: …`.
 
+A profile with `publish = "hold"` (#760) parks the run between the two
+stages instead: `_hold_before_publish` stamps the stage `publishing`, emits
+`run.held` (profile, declared sinks) and the run ends `held` — terminal for
+liveness (the pair is freed, nothing kept) and resumable, because the release
+*is* `resume` at the publishing stage: `_workload_stages` only asks the
+profile at the judging→publishing transition, so a run re-entering at
+`publishing` never holds again. From the CLI that is `sbxloop resume <run>`.
+The daemon's `_settle_held` is the merge gate's shape with no PR: a
+`daemon_merge_gates` row of `kind = 'publish'` (`pr_number` 0), the item in
+`gated` owing a `held` report (the issue gets a how-to-release comment, no
+label), the same prompt in the run's thread — the Discord button reads
+*Release result*. `!sbx release <item>` (or `merge`/`approve`, one
+`approve_merge` either way, the gate's kind deciding) wins the store CAS
+and `resume_for_release` re-queues the item with its run pinned; the next
+tick's `_resume` sees the `approving` publish gate and dispatches
+`engine.resume`, which publishes on a fresh pair. `_settle` then closes the
+gate `released` (or `dismissed` when the resumed run ended some other way —
+the retry that follows is a fresh run). `_reconcile_gates` leaves publish
+gates alone at boot: a released hold is a queued item, and the tick resumes
+it. `!sbx abandon <item>` drops the held result unpublished.
+
 The service sandbox (`sbxloop-<run>-service`, #765) is the github sandbox's
 pattern generalized to the operator's own credentials. `[[credentials]]`
 declares a catalogue — `name`, the daemon-environment `env` holding the value,

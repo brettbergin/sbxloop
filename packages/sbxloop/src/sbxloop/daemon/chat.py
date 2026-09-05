@@ -1815,6 +1815,16 @@ class ChatBridge(ABC):
         mentions = self._mentions(gate.notify_ids)
         item = normalize_item_id(gate.item_id)
         prefix = self.chat.command_prefix
+        if gate.kind == "publish":
+            head = "⏸ **result held — waiting for your release**"
+            lines = [
+                f"{mentions} {head}" if mentions else head,
+                'The result is judged and kept; the profile says `publish = "hold"`.',
+                f"✅ release: `{prefix} release {item}` — here or in the control channel",
+                f"🚫 drop: `{prefix} abandon {item} [reason]` — nothing is published",
+                "no deadline — it waits until someone acts",
+            ]
+            return "\n".join(lines)
         head = "⏸ **ready to merge — waiting for your approval**"
         lines = [
             f"{mentions} {head}" if mentions else head,
@@ -1891,12 +1901,15 @@ class ChatBridge(ABC):
         people."""
         who = by or "an operator"
         fresh = self.dstore.merge_gate_for(gate.run_id) or gate
+        final = outcome in ("merged", "released", "dismissed")
         if outcome == "merged":
             text = f"✅ approved by {who} — merged" + (f" `{str(detail)[:12]}`" if detail else "")
+        elif outcome == "released":
+            text = f"✅ released by {who} — published"
         elif outcome == "dismissed":
-            text = "🚫 merge gate dismissed" + (
-                f" — {_one_line(str(detail), 200)}" if detail else ""
-            )
+            text = (
+                "🚫 held result dropped" if fresh.kind == "publish" else "🚫 merge gate dismissed"
+            ) + (f" — {_one_line(str(detail), 200)}" if detail else "")
         else:
             mentions = self._mentions(fresh.notify_ids)
             text = (
@@ -1908,7 +1921,7 @@ class ChatBridge(ABC):
             )
             if mentions:
                 text = f"{mentions} {text}"
-        if outcome in ("merged", "dismissed"):
+        if final:
             message = await self._gate_prompt_message(fresh)
             if message is not None:
                 try:
@@ -1918,7 +1931,7 @@ class ChatBridge(ABC):
                     self.log.debug("chat.gate_prompt_edit_failed", run=gate.run_id, exc_info=True)
         thread = await self._ensure_thread(gate.run_id)
         if thread is not None:
-            await self._send(thread, text, mention_users=outcome not in ("merged", "dismissed"))
+            await self._send(thread, text, mention_users=not final)
 
     async def _reattach_gates(self) -> None:
         """Standing gates survive a restart in the store; make sure each

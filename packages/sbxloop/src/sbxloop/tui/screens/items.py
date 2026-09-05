@@ -163,10 +163,13 @@ class ItemsScreen(ConsoleScreen):
             return
         items = self.console_app.state.items
         gates = items.gates if items else ()
-        if not any(g.item_id == item.item_id for g in gates):
+        gate = next((g for g in gates if g.item_id == item.item_id), None)
+        if gate is None:
             self.app.notify(f"{item.item_id} has no open merge gate", severity="warning")
             return
-        self.console_app.perform(actions.merge(self.console_app.deps, item.item_id))
+        self.console_app.perform(
+            actions.merge(self.console_app.deps, item.item_id, held=gate.kind == "publish")
+        )
 
     def action_new_run(self) -> None:
         """A run the daemon's way: ask the concierge to file the issue."""

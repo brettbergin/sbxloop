@@ -427,7 +427,9 @@ class DaemonLoop:
                 self._frontend_gate_resolved(fresh, before.run_id, gate, "dismissed", None, why)
                 self._notice(
                     "gate.dismissed",
-                    f"🚪 {item_id}: merge gate dismissed ({why}); the PR stays open",
+                    f"🚪 {item_id}: held result dropped unpublished ({why})"
+                    if gate.kind == "publish"
+                    else f"🚪 {item_id}: merge gate dismissed ({why}); the PR stays open",
                     item=item_id,
                     run=before.run_id,
                 )
@@ -565,7 +567,7 @@ class DaemonLoop:
         kind = item.pending_report
         if kind is None:
             return
-        if kind in ("merged", "blocked", "gated", "completed"):
+        if kind in ("merged", "blocked", "gated", "completed", "held"):
             if self._report_outcome(item, kind):
                 self.dstore.take_pending_report(item.item_id)
             return
@@ -593,8 +595,13 @@ class DaemonLoop:
             )
 
     def _report_outcome(self, item: WorkItem, kind: str) -> bool:
-        """Pay a merged/blocked/completed report; True when the source
+        """Pay a merged/blocked/completed/held report; True when the source
         confirmed it."""
+        if kind == "held":
+            delivered = self.source.report_held(item)
+            if not delivered:
+                log.warning("report.deferred", item=item.item_id, kind=kind)
+            return delivered
         if kind == "completed":
             # A workload's result (#760): the source gets the report the
             # finish card was built from, not a pull request.
@@ -903,6 +910,19 @@ class DaemonLoop:
         forever (#234)."""
         run_id = item.run_id
         assert run_id is not None
+        gate = self.dstore.merge_gate_for(run_id)
+        if gate is not None and gate.kind == "publish" and gate.state == "approving":
+            # Not an interruption (#760): a held result was released and
+            # the run resumes at its publishing stage. One stage, then done.
+            self._remove_stale_run_sandboxes(run_id)
+            self._notice(
+                "run.resuming",
+                f"resuming {run_id} for {item.item_id} at publishing — released by "
+                f"{gate.resolved_by or 'an operator'}",
+                item=item.item_id,
+                run=run_id,
+            )
+            return self._dispatch(item, resume_run_id=run_id)
         hold = self.dstore.review_hold_for(run_id)
         if hold is not None and hold.state == "fixing":
             # Not an interruption either (#675): a reviewer asked for
@@ -1405,6 +1425,8 @@ class DaemonLoop:
         state = result.state if result is not None else None
         if state == "gated":
             return self._settle_gated(item, run_id, report, now)
+        if state == "held":
+            return self._settle_held(item, run_id, report, now)
         if state == "awaiting_review":
             return self._settle_awaiting_review(item, run_id, report, now)
         hold = self.dstore.review_hold_for(run_id)
@@ -1426,6 +1448,7 @@ class DaemonLoop:
         landed = state == "merged" or (
             state == "completed" and (workload or not self.config.github.enabled)
         )
+        self._resolve_publish_gate(item, run_id, released=landed, now=now, state=state)
         if landed:
             self.dstore.finish_ledger(run_id, "done", now)
             if self._consecutive_failures:
@@ -1661,6 +1684,71 @@ class DaemonLoop:
             pr=pr_number,
         )
         return "gated"
+
+    def _settle_held(
+        self, item: WorkItem, run_id: str, report: RunReport, now: float
+    ) -> TickOutcome:
+        """A workload parked at publishing by its profile's ``publish =
+        "hold"`` (#760): judged and kept, nothing delivered. The same
+        shape as the merge gate — the machinery is freed, a gate row of
+        kind ``publish`` is the durable state, the humans are asked — and
+        the release is ``approve_merge`` re-queueing the item with its run
+        pinned, so the next tick resumes it at the publishing stage."""
+        self.dstore.finish_ledger(run_id, "held", now)
+        if self._consecutive_failures:
+            log.info("breaker.reset", after_failures=self._consecutive_failures)
+        self._set_breaker(None, 0)
+        notify: list[str] = []
+        for who in [item.requested_by, *self.dstore.run_watchers(run_id)]:
+            if who and who not in notify:
+                notify.append(who)
+        self.dstore.create_merge_gate(
+            run_id,
+            item.item_id,
+            item.repo or "",
+            0,
+            "",
+            None,
+            notify,
+            uuid.uuid4().hex,
+            now,
+            kind="publish",
+        )
+        self.dstore.mark_gated(item.item_id, now, pending_report="held")
+        fresh = self.dstore.get(item.item_id) or item
+        self._deliver_report(fresh)
+        self._frontend_finished(item, report)
+        gate = self.dstore.merge_gate_for(run_id)
+        if gate is not None:
+            self._frontend_gate_opened(item, run_id, gate)
+        self._notice(
+            "run.held",
+            f"⏸ {item.item_id} result held ({report.summary or report.task_summary}) — "
+            f"release in the run's thread or `!sbx release {item.item_id}` (no deadline)",
+            item=item.item_id,
+            run=run_id,
+            tasks=report.task_summary,
+        )
+        return "held"
+
+    def _resolve_publish_gate(
+        self, item: WorkItem, run_id: str, *, released: bool, now: float, state: str | None
+    ) -> None:
+        """A released workload's gate closes with its run (#760):
+        ``released`` when the result published, ``dismissed`` when the
+        resumed run ended any other way — the retry that follows is a
+        fresh run, not this hold."""
+        gate = self.dstore.merge_gate_for(run_id)
+        if gate is None or gate.kind != "publish" or gate.state not in ("open", "approving"):
+            return
+        by = gate.resolved_by
+        if released:
+            self.dstore.resolve_merge_gate(run_id, "released", by, now)
+            self._frontend_gate_resolved(item, run_id, gate, "released", by)
+            return
+        why = f"run ended {state}" if state else "run interrupted"
+        self.dstore.resolve_merge_gate(run_id, "dismissed", by, now, detail=why)
+        self._frontend_gate_resolved(item, run_id, gate, "dismissed", by, why)
 
     def _settle_awaiting_review(
         self, item: WorkItem, run_id: str, report: RunReport, now: float
@@ -2092,6 +2180,8 @@ class DaemonLoop:
         gate = self.dstore.merge_gate_for(target.strip())
         if gate is None:
             raise ValueError(f"no merge gate for {target!r} — nothing is awaiting approval")
+        if gate.kind == "publish":
+            return self._release_hold(gate, by)
         if gate.state == "merged":
             raise ValueError(f"{gate.item_id} already merged (PR #{gate.pr_number})")
         if gate.state == "dismissed":
@@ -2101,9 +2191,9 @@ class DaemonLoop:
             )
         if self.github is None:
             raise ValueError("this daemon has no github handle to merge with")
-        if not self.dstore.claim_merge_gate(gate.run_id):
-            return f"{gate.item_id} is already being merged — hold on."
         who = by or "operator"
+        if not self.dstore.claim_merge_gate(gate.run_id, who):
+            return f"{gate.item_id} is already being merged — hold on."
         thread = threading.Thread(
             target=self._complete_landing,
             args=(gate, who),
@@ -2116,6 +2206,37 @@ class DaemonLoop:
             f"✅ approved by {who} — completing the landing of PR #{gate.pr_number} "
             "(update if behind → checks → merge); I'll report in the run's thread."
         )
+
+    def _release_hold(self, gate: MergeGate, by: str | None) -> str:
+        """Release a workload held at publishing (#760): win the CAS, put
+        the item back in the queue with its run pinned, and let the next
+        tick resume the run at its publishing stage — the engine's own
+        publish, on a fresh pair, idempotent over what already went out.
+        No thread: the tick is the executor."""
+        if gate.state == "released":
+            raise ValueError(f"{gate.item_id} already released and published")
+        if gate.state == "dismissed":
+            raise ValueError(
+                f"{gate.item_id}'s held result was dropped; `retry {gate.item_id}` "
+                "runs the item again from scratch"
+            )
+        who = by or "operator"
+        if not self.dstore.claim_merge_gate(gate.run_id, who):
+            return f"{gate.item_id} is already being released — hold on."
+        now = self.clock()
+        try:
+            self.dstore.resume_for_release(gate.item_id, gate.run_id, now, who)
+        except ValueError as exc:
+            self.dstore.reopen_merge_gate(gate.run_id, str(exc))
+            raise
+        self._notice(
+            "run.released",
+            f"▶ {gate.item_id} released by {who} — publishing on the next tick",
+            item=gate.item_id,
+            run=gate.run_id,
+            by=who,
+        )
+        return f"✅ released by {who} — {gate.item_id} publishes on the next tick."
 
     def _merge_tick(self, waiting: str) -> None:
         """The approve thread's wait between GitHub polls: bounded sleeps,
@@ -2305,7 +2426,9 @@ class DaemonLoop:
         command works again. (`land()` is idempotent against a PR that did
         merge: the next approval sees ``merged`` and settles ``Landed``.)"""
         for gate in self.dstore.open_merge_gates():
-            if gate.state != "approving":
+            if gate.state != "approving" or gate.kind == "publish":
+                # A released hold (#760) is a queued item with its run
+                # pinned: the next tick resumes it, nothing to put back up.
                 continue
             self.dstore.reopen_merge_gate(
                 gate.run_id, "approval interrupted by a restart — approve again"

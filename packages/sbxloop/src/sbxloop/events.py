@@ -221,6 +221,10 @@ class HostEventTypes:
     # daemon waits for a person on GitHub (`pr`, `url`, `sha`,
     # `approvals_required`, `approvals_have`, `code_owners`).
     RUN_AWAITING_REVIEW = "run.awaiting_review"
+    # A workload parked at its publishing stage by its profile's
+    # `publish = "hold"` (#760): judged and persisted, nothing published;
+    # a person releases it (`profile`, `sinks` the plan declared).
+    RUN_HELD = "run.held"
     # Follow-up issues filed (or listed on the PR) after the merge (#517):
     # `pr`, `mode`, `filed` [{number, url, title}], `listed` (titles).
     RUN_FOLLOWUPS = "run.followups"

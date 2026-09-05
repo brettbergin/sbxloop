@@ -99,6 +99,7 @@ STATE_MARKER = {
     "cancelled": "⏹",
     "gated": "⏸",
     "awaiting_review": "👀",
+    "held": "⏸",
 }
 STATE_COLOR = {
     "merged": COLOR_OK,
@@ -108,6 +109,7 @@ STATE_COLOR = {
     "cancelled": COLOR_DIM,
     "gated": COLOR_WARN,
     "awaiting_review": COLOR_WARN,
+    "held": COLOR_WARN,
 }
 # How a post-build stage reads in the chronology when the run enters it.
 STAGE_MARKER = {
@@ -1545,6 +1547,16 @@ def format_for_discord(
             line(
                 f"⏸ **ready to merge** PR {link(label, data.get('url'))} — parked by "
                 "`[landing] merge_gate`, waiting for human approval",
+                flush=True,
+            )
+        ]
+    if t == HostEventTypes.RUN_HELD:
+        declared = ", ".join(str(name) for name in _list(data, "sinks"))
+        where = f" — sinks: {declared}" if declared else ""
+        return [
+            line(
+                f"⏸ **result held** — the `{data.get('profile')}` profile says "
+                f'`publish = "hold"`; judged and kept, waiting for release{where}',
                 flush=True,
             )
         ]
