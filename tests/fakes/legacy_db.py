@@ -246,6 +246,15 @@ _PHASE_ATTEMPTS_PRE_USAGE = (
     " started_at REAL NOT NULL, ended_at REAL NOT NULL)"
 )
 
+_TASKS_PRE_OUTPUT = (
+    "CREATE TABLE tasks (run_id TEXT NOT NULL, task_id TEXT NOT NULL,"
+    " order_idx INTEGER NOT NULL, state TEXT NOT NULL, spec_json TEXT NOT NULL,"
+    " revisions INTEGER NOT NULL DEFAULT 0, replans INTEGER NOT NULL DEFAULT 0,"
+    " last_feedback TEXT NOT NULL DEFAULT '', session_id TEXT,"
+    " verify_fingerprints TEXT NOT NULL DEFAULT '[]',"
+    " verify_suspect INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (run_id, task_id))"
+)
+
 ENGINE_SHAPES: dict[EngineShape, tuple[str, ...]] = {
     "pre_workspace": (_RUNS_BASE + ")",),
     "pre_guidance": (
@@ -288,6 +297,7 @@ ENGINE_SHAPES: dict[EngineShape, tuple[str, ...]] = {
         " exhausted TEXT, granted_rounds INTEGER NOT NULL DEFAULT 0, pr_title TEXT,"
         " credentials TEXT NOT NULL DEFAULT '[]')",
     ),
+    "pre_task_output": (_RUNS_BASE + ", kind TEXT NOT NULL DEFAULT 'code')", _TASKS_PRE_OUTPUT),
 }
 
 

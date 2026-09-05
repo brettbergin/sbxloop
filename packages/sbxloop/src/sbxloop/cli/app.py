@@ -42,7 +42,14 @@ from sbxloop.daemon.control import DEFAULT_TIMEOUT_S
 from sbxloop.daemon.store import DaemonStore, apply_item_verb
 from sbxloop.daemon.versions import VersionProbe, start_drift_check
 from sbxloop.engine.engine import LoopEngine
-from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, scan_artifacts
+from sbxloop.engine.model import (
+    TERMINAL_RUN_STATES,
+    RunResult,
+    TaskRecord,
+    artifacts_dir,
+    scan_artifacts,
+    workload_summary,
+)
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxloopError
 from sbxloop.events import Event, EventBus, HostEventTypes
@@ -579,8 +586,15 @@ def _finish(result: RunResult, config: Config) -> None:
         console.print(f"  kind: {result.kind}")
     if result.reason:
         console.print(f"  reason: {result.reason}")
+    if result.summary:
+        # A workload's closing line (#757); the per-task lines follow.
+        console.print(f"  summary: {rich_escape(result.summary.splitlines()[0])}")
     for task in result.tasks:
-        console.print(f"  {task.spec.id}: {task.state}  ({task.spec.title})")
+        line = f"  {task.spec.id}: {task.state}  ({rich_escape(task.spec.title)})"
+        if task.output is not None:
+            # A workload task's own result line (#757).
+            line += f"\n      {_output_cell(task)}"
+        console.print(line)
     _print_github_summary(result, config)
     _print_artifacts_summary(result, config)
     _print_workspace_clone_summary(result, config)
@@ -852,14 +866,35 @@ def cancel(run_id: Annotated[str, typer.Argument()]) -> None:
     console.print(f"run {run_id} cancelled")
 
 
+def _output_cell(task: TaskRecord) -> str:
+    """One task's output as the status table shows it (#757)."""
+    if task.output is None:
+        return "[dim]—[/]"
+    cell = rich_escape(task.output.summary) or "[dim](no result reported)[/]"
+    if count := task.output.file_count:
+        cell += f" [dim]({count} file{'s' if count != 1 else ''})[/]"
+    return cell
+
+
 @app.command()
 def status(
     run_id: Annotated[str | None, typer.Argument(help="Run id for details.")] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="With a run id: the run, its tasks and their outputs as one JSON "
+            "object on stdout, for scripts.",
+        ),
+    ] = False,
 ) -> None:
-    """List runs, or show one run's tasks and phase history."""
+    """List runs, or show one run's tasks, outputs and phase history."""
     config = _run_config()
     store = _store(config)
     if run_id is None:
+        if json_output:
+            console.print("[bold red]--json needs a run id.[/]")
+            raise typer.Exit(2)
         table = Table(title="sbxloop runs")
         table.add_column("run")
         table.add_column("kind")
@@ -887,6 +922,24 @@ def status(
     except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
+    tasks = store.get_tasks(run_id)
+    if json_output:
+        # Bare JSON on stdout, nothing else — `sbxloop status <run> --json | jq`.
+        # A workload's tasks carry their outputs (#757); a code run's are null.
+        typer.echo(
+            json.dumps(
+                {
+                    "run": record.model_dump(mode="json"),
+                    "summary": (
+                        workload_summary(tasks, record.pr_title)
+                        if record.kind == "workload"
+                        else None
+                    ),
+                    "tasks": [task.model_dump(mode="json") for task in tasks],
+                }
+            )
+        )
+        return
     console.print(f"run [bold cyan]{record.run_id}[/]  state: [bold]{record.state}[/]")
     console.print(f"kind: {record.kind}")
     repo = _run_repo(store, record.run_id)
@@ -896,16 +949,22 @@ def status(
         console.print(f"reason: {record.reason}")
     console.print(f"outcome: {record.outcome}")
     table = Table(title="tasks")
-    for column in ("task", "title", "state", "revisions", "replans"):
+    columns: tuple[str, ...] = ("task", "title", "state", "revisions", "replans")
+    if record.kind == "workload":
+        columns += ("output",)
+    for column in columns:
         table.add_column(column)
-    for task in store.get_tasks(run_id):
-        table.add_row(
+    for task in tasks:
+        row = [
             task.spec.id,
             task.spec.title,
             task.state,
             str(task.revisions),
             str(task.replans),
-        )
+        ]
+        if record.kind == "workload":
+            row.append(_output_cell(task))
+        table.add_row(*row)
     console.print(table)
     attempts = store.phase_attempts(run_id)
     console.print(f"{len(attempts)} phase attempts recorded")

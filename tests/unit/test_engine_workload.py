@@ -445,6 +445,142 @@ class TestOperatorAndJudge:
         assert [e.data.get("agent") for e in tools] == ["operator", "operator"]
 
 
+class TestTaskOutputs:
+    """What a task leaves behind is persisted with it (#757): the report's
+    result section and the data-directory files its attempts touched."""
+
+    def test_each_task_persists_its_output(self, harness: Harness) -> None:
+        harness.script(
+            [
+                taskgraph(task("t1"), task("t2", deps=["t1"])),
+                {
+                    "text": "Set up, then wrote.\n\n## Result\n\nwrote `hello.txt` with one line\n",
+                    "files": {"hello.txt": "hi\n"},
+                },
+                PASS,
+                {"text": "## Result\nread hello.txt; nothing written"},
+                PASS,
+            ]
+        )
+        engine = harness.engine()
+        result = engine.start("two things", kind="workload")
+
+        assert result.state == "completed"
+        t1, t2 = result.tasks
+        assert t1.output is not None and t2.output is not None
+        assert t1.output.summary == "wrote `hello.txt` with one line"
+        assert t1.output.text == "wrote `hello.txt` with one line"
+        assert t1.output.files == ["hello.txt"] and t1.output.more_files == 0
+        # t2 touched nothing: a file an earlier task wrote is not its output.
+        assert (t2.output.summary, t2.output.files) == ("read hello.txt; nothing written", [])
+        outputs = [
+            (e.data["task_id"], e.data["attempt"], e.data["summary"], e.data["files"])
+            for e in harness.events
+            if e.type == HostEventTypes.TASK_OUTPUT
+        ]
+        assert outputs == [
+            ("t1", 1, "wrote `hello.txt` with one line", 1),
+            ("t2", 1, "read hello.txt; nothing written", 0),
+        ]
+        # Read back from the store, as a resume or `status` would.
+        stored = harness.engine().store.get_tasks(result.run_id)
+        assert [t.output for t in stored] == [t1.output, t2.output]
+        assert [tid for tid, _ in result.outputs] == ["t1", "t2"]
+        assert result.summary == (
+            "2/2 task(s) passed the judge\n"
+            "t1: wrote `hello.txt` with one line (1 file)\n"
+            "t2: read hello.txt; nothing written"
+        )
+
+    def test_a_revision_keeps_the_earlier_attempts_files(self, harness: Harness) -> None:
+        """The marker is set once, before the first attempt: the output of
+        a revised task lists what every attempt left, under the latest
+        report."""
+        harness.script(
+            [
+                taskgraph(task("t1")),
+                {"text": "## Result\nwrote a", "files": {"a.txt": "a\n"}},
+                fail("t1 works — b is missing"),
+                {"text": "## Result\nwrote b as well", "files": {"b.txt": "b\n"}},
+                PASS,
+            ]
+        )
+        result = harness.engine().start("one thing", kind="workload")
+        assert result.state == "completed"
+        (t1,) = result.tasks
+        assert t1.output is not None
+        assert t1.output.files == ["a.txt", "b.txt"]
+        assert t1.output.summary == "wrote b as well"
+
+    def test_a_resumed_run_keeps_the_files_an_earlier_sandbox_listed(
+        self, harness: Harness
+    ) -> None:
+        """A resume boots a fresh sandbox with a fresh marker; the earlier
+        attempt's files come from the persisted output, and only the ones
+        still in the data directory."""
+        harness.script(
+            [
+                taskgraph(task("t1")),
+                {
+                    "text": "## Result\nwrote a and gone",
+                    "files": {"a.txt": "a\n", "gone.txt": "x\n"},
+                },
+                fail("t1 works — b is missing"),
+                {"fail": "sandbox exploded"},
+            ]
+        )
+        engine = harness.engine()
+        with pytest.raises(WorkerError, match="sandbox exploded"):
+            engine.start("one thing", kind="workload")
+        (run,) = engine.store.list_runs()
+        (t1,) = engine.store.get_tasks(run.run_id)
+        assert t1.output is not None and t1.output.files == ["a.txt", "gone.txt"]
+        (run.workspace / "gone.txt").unlink()  # type: ignore[union-attr]
+        harness.script([{"text": "## Result\nwrote b", "files": {"b.txt": "b\n"}}, PASS])
+        result = harness.engine().resume(run.run_id)
+        assert result.state == "completed"
+        (t1,) = result.tasks
+        assert t1.output is not None
+        assert t1.output.files == ["a.txt", "b.txt"]
+
+    def test_excluded_trees_are_not_outputs(self, harness: Harness) -> None:
+        """The harvest's excludes apply to the listing: a task's `.git` or
+        dependency tree is never its result."""
+        harness.script(
+            [
+                taskgraph(task("t1")),
+                {
+                    "text": "## Result\nbuilt it",
+                    "files": {
+                        "out/report.md": "# r\n",
+                        ".git/config": "[core]\n",
+                        "node_modules/x/index.js": "0\n",
+                        "__pycache__/m.pyc": "0",
+                    },
+                },
+                PASS,
+            ]
+        )
+        result = harness.engine().start("one thing", kind="workload")
+        (t1,) = result.tasks
+        assert t1.output is not None
+        assert t1.output.files == ["out/report.md"]
+
+    def test_a_report_without_a_result_section_is_the_output_whole(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), {"text": "  did the thing\nand more  "}, PASS])
+        result = harness.engine().start("one thing", kind="workload")
+        (t1,) = result.tasks
+        assert t1.output is not None
+        assert (t1.output.summary, t1.output.text) == ("did the thing", "did the thing\nand more")
+
+    def test_a_code_run_has_no_outputs(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), FILES_BUILD])
+        result = harness.engine().start("one thing")
+        assert [t.output for t in result.tasks] == [None]
+        assert result.summary is None and result.outputs == []
+        assert not [e for e in harness.events if e.type == HostEventTypes.TASK_OUTPUT]
+
+
 def _event(type: str, **data: Any) -> Any:
     from sbxloop_worker.protocol import Event
 

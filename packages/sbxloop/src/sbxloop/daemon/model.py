@@ -7,7 +7,7 @@ from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from sbxloop.engine.model import RunState
+from sbxloop.engine.model import RunKind, RunState
 from sbxloop.ghids import normalize_item_id
 
 # ``cancelled`` is an operator's decision (``!sbx cancel``), not a failure:
@@ -114,9 +114,24 @@ class WorkItem(BaseModel):
         return normalize_item_id(value)
 
 
+class TaskOutcome(NamedTuple):
+    """One workload task on the finish card (#757): what it produced and
+    what the judge made of it."""
+
+    task_id: str
+    title: str
+    state: str
+    summary: str
+    files: int
+    # ``passed`` / ``failed — unmet: …`` from the judge's last verdict, or
+    # None for a task that was never judged (skipped, or the run died first).
+    verdict: str | None
+
+
 class RunReport(NamedTuple):
     """What the daemon tells the source and the humans about a finished
-    run — read from the engine's run record, which carries the PR."""
+    run — read from the engine's run record, which carries the PR (a
+    ``code`` run) or the tasks' outputs (a ``workload``)."""
 
     run_id: str
     state: RunState
@@ -135,6 +150,12 @@ class RunReport(NamedTuple):
     cancelled_by: str | None = None
     # ``!sbx cancel --retry``: the item went straight back to the queue.
     requeued: bool = False
+    # Which run shape the cards render (#757): a workload's finish card
+    # shows its tasks' outputs and verdicts where a code run's shows the PR.
+    kind: RunKind = "code"
+    outputs: tuple[TaskOutcome, ...] = ()
+    # A workload's closing line (`engine.model.workload_summary`).
+    summary: str | None = None
 
     @property
     def succeeded(self) -> bool:

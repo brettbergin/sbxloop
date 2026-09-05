@@ -1677,9 +1677,14 @@ class TestRunCommand:
     ) -> None:
         """`--kind workload` (#755): the agent box alone, its own data
         directory, the operator's stages, and the run says what it is."""
-        # A workload's task is executed, then judged (#756).
+        # A workload's task is executed, then judged (#756); the executor's
+        # report and what it left in the data directory are its output (#757).
+        execute = {
+            "text": "on it\n\n## Result\n\nwrote `hello.txt` with one line",
+            "files": {"hello.txt": "hi\n"},
+        }
         verdict = {"json": {"passed": True, "unmet": [], "notes": ""}}
-        self.make_run_env(workdir, monkeypatch, [*self.HAPPY_RUN, verdict])
+        self.make_run_env(workdir, monkeypatch, [self.HAPPY_RUN[0], execute, verdict])
         result = runner.invoke(app, ["run", "count the things", "--kind", "workload", "--no-tui"])
         assert result.exit_code == 0, result.output
         plain = result.output.replace("\n", "")
@@ -1695,12 +1700,31 @@ class TestRunCommand:
         assert run.workspace == (workdir / ".sbxloop" / "runs" / run.run_id / "workspace").resolve()
         start = self._run_start(workdir)
         assert start["kind"] == "workload" and start["workspace_source"] == "data-dir"
+        # The run's closing summary and each task's output line, at the end
+        # of the run and again under `status` (#757).
+        assert "1/1 task(s) passed the judge" in plain
+        assert "wrote `hello.txt` with one line" in plain and "(1 file)" in plain
         detail = runner.invoke(app, ["status", run.run_id])
         assert detail.exit_code == 0, detail.output
-        assert "kind: workload" in re.sub(r"\x1b\[[0-9;]*m", "", detail.output)
+        detail_plain = re.sub(r"\x1b\[[0-9;]*m", "", detail.output)
+        assert "kind: workload" in detail_plain
+        assert "output" in detail_plain and "wrote `hello.txt`" in detail_plain
+        as_json = runner.invoke(app, ["status", run.run_id, "--json"])
+        assert as_json.exit_code == 0, as_json.output
+        doc = json.loads(as_json.output)
+        assert doc["run"]["run_id"] == run.run_id and doc["run"]["kind"] == "workload"
+        assert doc["summary"] == (
+            "1/1 task(s) passed the judge\nt1: wrote `hello.txt` with one line (1 file)"
+        )
+        (task,) = doc["tasks"]
+        assert task["state"] == "done"
+        assert task["output"]["summary"] == "wrote `hello.txt` with one line"
+        assert task["output"]["files"] == ["hello.txt"]
         listed = runner.invoke(app, ["status"])
         assert listed.exit_code == 0, listed.output
         assert "kind" in listed.output and "workload" in listed.output
+        no_id = runner.invoke(app, ["status", "--json"])
+        assert no_id.exit_code == 2 and "needs a run id" in no_id.output
 
     def test_run_kind_workload_refuses_repository_flags(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch

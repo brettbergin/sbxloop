@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -345,6 +346,57 @@ class SteerVerdict(_Model):
         return self
 
 
+# How many of a task's files an output lists by path; the rest are counted.
+MAX_OUTPUT_FILES = 200
+MAX_SUMMARY_CHARS = 200
+# The heading operator_execute.md asks the report to end with; matched as a
+# line so a "## Result" the prose mentions inline does not cut the text.
+_RESULT_HEADING = re.compile(r"^#{1,6}\s*results?\b[^\n]*\n", re.IGNORECASE | re.MULTILINE)
+
+
+class TaskOutput(_Model):
+    """What one workload task produced (#757): the operator's own account
+    of the result and the files it left in the data directory.
+
+    ``text`` is the report's ``## Result`` section (the whole report when
+    the operator wrote none), ``summary`` its first line; ``files`` are the
+    data-directory paths the task's attempts touched, listed mechanically
+    rather than as the report names them, so the sinks (#759) publish what
+    is there and not what was claimed. Replaced on every attempt: the task
+    holds one output, its latest.
+    """
+
+    summary: str = ""
+    text: str = ""
+    files: list[str] = Field(default_factory=list)
+    # Files past MAX_OUTPUT_FILES: counted, never silently dropped (#67).
+    more_files: int = 0
+    # Reserved for structured results a sink can carry whole (#759).
+    data: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def file_count(self) -> int:
+        return len(self.files) + self.more_files
+
+    @classmethod
+    def from_report(
+        cls, report: str, *, files: Sequence[str] = (), more_files: int = 0
+    ) -> TaskOutput:
+        """Cut the output from the operator's report: the text under its
+        last ``## Result`` heading (the whole report when it wrote none —
+        the judge decides what that is worth, not the parser), the first
+        non-empty line of that as the summary."""
+        text = report.strip()
+        match = _RESULT_HEADING.split(text)
+        if len(match) > 1:
+            text = match[-1].strip()
+        first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        summary = " ".join(first.split())
+        if len(summary) > MAX_SUMMARY_CHARS:
+            summary = summary[: MAX_SUMMARY_CHARS - 1] + "…"
+        return cls(summary=summary, text=text, files=list(files), more_files=more_files)
+
+
 class TaskRecord(_Model):
     """Persisted per-task state."""
 
@@ -361,6 +413,9 @@ class TaskRecord(_Model):
     # Set once a fingerprint repeats: the check, not the code, is the thing
     # to change, and no further identical revision is spent.
     verify_suspect: bool = False
+    # A workload task's result (#757); None for a code run's tasks, whose
+    # result is the tree the build left behind.
+    output: TaskOutput | None = None
 
     @property
     def terminal(self) -> bool:
@@ -444,10 +499,38 @@ class RunResult(_Model):
     reason: str | None = None
     # The fix-round budget that ran out, when that is why the run failed.
     exhausted: str | None = None
+    # A workload's closing line (#757), composed from its tasks' outputs;
+    # None for a code run, whose result is the pull request.
+    summary: str | None = None
 
     @property
     def succeeded(self) -> bool:
         return self.state in ("merged", "completed")
+
+    @property
+    def outputs(self) -> list[tuple[str, TaskOutput]]:
+        """(task id, output) for every task that produced one."""
+        return [(t.spec.id, t.output) for t in self.tasks if t.output is not None]
+
+
+def workload_summary(tasks: Sequence[TaskRecord], title: str | None = None) -> str:
+    """A workload's closing line (#757): what was asked, how many tasks
+    the judge passed, and what each produced — composed from the tasks'
+    persisted outputs so the engine's result and the daemon's report read
+    the same store row the same way, with no extra model turn."""
+    done = sum(1 for t in tasks if t.state == "done")
+    head = f"{done}/{len(tasks)} task(s) passed the judge" if tasks else "no tasks ran"
+    if title:
+        head = f"{title} — {head}"
+    lines = [head]
+    for t in tasks:
+        if t.output is None:
+            continue
+        line = f"{t.spec.id}: {t.output.summary or '(no result reported)'}"
+        if count := t.output.file_count:
+            line += f" ({count} file{'s' if count != 1 else ''})"
+        lines.append(line)
+    return "\n".join(lines)
 
 
 # Where the agent leaves the pull request's description (#678): under the

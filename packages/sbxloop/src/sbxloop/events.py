@@ -96,6 +96,7 @@ SUMMARY_KEYS: tuple[str, ...] = (
     "op",
     "line",
     "message",
+    "summary",
     "outcome",
     "error",
     "url",
@@ -234,6 +235,11 @@ class HostEventTypes:
     # `ecosystem`, `verb`, `argv`, `exit_code` (or `error`), `duration_s`,
     # `phase`, `task_id`. The output tail rides `detail` only on failure.
     SANDBOX_FETCH = "sandbox.fetch"
+    # What one workload task produced (#757), after each execute attempt:
+    # `task_id`, `attempt`, `summary` (the report's result line), `files`
+    # (how many data-directory files the task touched). The full output
+    # lives on the task row, never on the wire.
+    TASK_OUTPUT = "task.output"
     # The judge's verdict on one workload task (#756): `task_id`,
     # `attempt`, `passed`, `unmet`, `notes`.
     JUDGE_VERDICT = "judge.verdict"
