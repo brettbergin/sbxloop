@@ -189,6 +189,11 @@ class JobRequest(ProtocolModel):
     # kind == "agent.session"
     prompt: str | None = None
     system_message: str | None = None
+    # Whether the backend's coding-agent system prompt (the Claude Code
+    # preset) frames the session, with ``system_message`` appended to it.
+    # False sends ``system_message`` as the whole system prompt: an operator
+    # session that is not a coding agent and must not present as one.
+    system_preset: bool = True
     model: str | None = None
     resume_session_id: str | None = None
     permission_mode: PermissionMode = "auto"

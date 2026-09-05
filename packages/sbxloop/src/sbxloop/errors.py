@@ -61,6 +61,13 @@ class WorkerError(SbxloopError):
     """The in-sandbox worker failed or returned an invalid result."""
 
 
+class InvalidOutputTwice(WorkerError):
+    """A JSON-expecting agent job produced no valid output on either of its
+    two attempts. Its own class so a phase that must fail closed on a
+    model that cannot answer — the workload judge — can tell it from a
+    broken worker."""
+
+
 class WorkerTimeoutError(WorkerError):
     """The worker exceeded its job timeout and was killed."""
 

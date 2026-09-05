@@ -1218,6 +1218,11 @@ _STATE_PHASE = {
     "executing": "build",
     "verifying": "verify",
 }
+# A workload's tasks walk the same states under different names (#756).
+_WORKLOAD_STATE_PHASE = {
+    "executing": "execute",
+    "verifying": "judge",
+}
 _PHASE_STATES = frozenset(_STATE_PHASE)
 # What the run is doing in each post-build stage, for the steer note.
 _STAGE_DOING = {
@@ -1251,6 +1256,7 @@ class SteerProgress:
         self.stage: str | None = None
         self.tool_calls = 0
         self.capped = False
+        self.kind = "code"
         self._dirty = False
 
     @property
@@ -1261,7 +1267,9 @@ class SteerProgress:
         d = event.data
         t = event.type
         tid = str(d.get("task_id") or "")
-        if t == "task.start" and tid:
+        if t == "run.start":
+            self.kind = str(d.get("kind") or "code")
+        elif t == "task.start" and tid:
             # The engine emits ``task.state=executing`` (and, on resume, the
             # persisted phase) *before* ``task.start``, so a start for the
             # task already being tracked only supplies the title — the
@@ -1274,7 +1282,8 @@ class SteerProgress:
             # Every state change is a checkpoint: the per-phase job (and its
             # tool-call ceiling) restarts, so the count restarts with it.
             self.task_id = tid
-            self.phase = _STATE_PHASE[str(d["state"])]
+            names = _WORKLOAD_STATE_PHASE if self.kind == "workload" else _STATE_PHASE
+            self.phase = names[str(d["state"])]
             self.tool_calls, self.capped = 0, False
             self._dirty = True
         elif t == "task.end" and tid == self.task_id:
@@ -1394,6 +1403,28 @@ def format_for_discord(
         if data.get("url"):
             text += f" · {link('review', data['url'])}"
         return [line(text, flush=True)]
+    if t == HostEventTypes.JUDGE_VERDICT:
+        # The judge's answer to the operator's report (#756): the unmet
+        # criteria are the next attempt's brief, so the first one is quoted.
+        where = f" task {code(data.get('task_id'))}"
+        attempt = data.get("attempt")
+        tail = f" (attempt {attempt})" if isinstance(attempt, int) and attempt > 1 else ""
+        if data.get("passed"):
+            return [line(f"⚖️ judge:{where} **passed**{tail}", flush=True)]
+        unmet = [str(item) for item in _list(data, "unmet")]
+        text = f"⚖️ judge:{where} **failed**{tail} · {len(unmet)} unmet"
+        if unmet:
+            text += f" — {_one_line(unmet[0], 200)}"
+        return [line(text, flush=True)]
+    if t == HostEventTypes.JUDGE_DEGRADED:
+        err = _one_line(data.get("error") or "", 300)
+        return [
+            line(
+                f"🛑 judge: task {code(data.get('task_id'))} — no usable verdict twice; "
+                f"the task fails closed" + (f" ({err})" if err else ""),
+                flush=True,
+            )
+        ]
     if t == HostEventTypes.REVIEW_RECONCILED:
         parts = [
             f"{data.get('addressed', 0)} addressed",
@@ -1578,6 +1609,10 @@ def format_for_discord(
             # the attempt did — the plan card's replacement now that the
             # approach is narrated in prose instead of structured JSON.
             return [line(f"🔨 **build**{where} — {msg}")]
+        if status == "ok" and phase == "execute" and msg:
+            # The operator's report excerpt (#756): the same record for a
+            # workload task, which the judge's verdict line then answers.
+            return [line(f"🛠 **execute**{where} — {msg}")]
         if verbose and msg:
             return [line(f"· {phase}{where} — {msg}")]
         return []
@@ -1896,7 +1931,7 @@ class RunStats:
                 self.revisions[tid] = int(d["revisions"] or 0)
         elif t == HostEventTypes.PHASE_END:
             phase = str(d.get("phase") or "?")
-            if phase == "verify" and str(d.get("status") or "") == "failed":
+            if phase in ("verify", "judge") and str(d.get("status") or "") == "failed":
                 self.rework.append(
                     (str(d.get("task_id") or "?"), phase, "failed", str(d.get("message") or ""))
                 )

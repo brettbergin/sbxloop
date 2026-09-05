@@ -38,12 +38,13 @@ from pydantic import BaseModel
 from sbxloop import toolchains
 from sbxloop.config import Config
 from sbxloop.deliver import pr_conventions
-from sbxloop.engine.model import SteerVerdict, TaskGraph, TaskRecord
+from sbxloop.engine.model import JudgeVerdict, SteerVerdict, TaskGraph, TaskRecord, WorkloadPlan
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.repocontext import repo_conventions
 from sbxloop.engine.review import ReviewGuard, ReviewVerdict
 from sbxloop.engine.service import FETCH_TOOL_NAME
-from sbxloop.errors import WorkerError
+from sbxloop.errors import InvalidOutputTwice, WorkerError
+from sbxloop.events import EventBus
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
 from sbxloop.verifylint import (
@@ -59,6 +60,8 @@ from sbxloop.worker.client import WorkerClient
 from sbxloop.worker.hosttools import HostToolHandler
 from sbxloop_worker.protocol import (
     BatchCommandResult,
+    Event,
+    EventTypes,
     HostToolSpec,
     JobRequest,
     JobResult,
@@ -185,7 +188,35 @@ AGENT_NAMES = {
     "build": "builder",
     "steer": "steering",
     "review": "reviewer",
+    # A workload's two actors (#756): the operator plans and executes, the
+    # judge holds the work to the plan's criteria.
+    "operator_plan": "operator",
+    "operator_execute": "operator",
+    "operator_judge": "judge",
 }
+# The phases whose session gets the run's host tools: the one doing the
+# work that may need a service. Planners and critics read and judge.
+TOOLED_PHASES = frozenset({"build", "operator_execute"})
+# System prompts for the workload's sessions. Both decline the backend's
+# coding-agent preset (`system_preset=False`): an operator is not a coding
+# agent and must not present as one, and the judge is not an operator.
+OPERATOR_SYSTEM_MESSAGE = (
+    "You are the operator of an automated workload running inside an isolated "
+    "sandbox: you get a piece of work done — research, data handling, calling "
+    "services, producing documents, whatever the outcome needs — following the "
+    "brief you are given, and you report what you actually did."
+)
+JUDGE_SYSTEM_MESSAGE = (
+    "You are the judge of an automated workload: you hold one task's result to "
+    "its acceptance criteria, reading the operator's report as a claim to be "
+    "checked against the data directory and the record of tool calls. You "
+    "inspect; you never modify anything, and you never pass work you could not "
+    "see meet its criteria."
+)
+# How many tool calls the judge's digest lists in full before it only
+# counts: the digest is evidence for one verdict, not a transcript.
+TOOL_DIGEST_MAX_CALLS = 80
+TOOL_DIGEST_ARGS_CHARS = 160
 # The review prompt carries the PR's diff inline; past this it is clipped
 # head+tail (the reviewer still has the tree). Overridden by
 # `[landing] review_diff_max_chars`.
@@ -205,6 +236,43 @@ class VerifyOutcome(NamedTuple):
     feedback: str
     results: str
     failures: tuple[VerifyFailure, ...] = ()
+
+
+class ToolDigest:
+    """The tool calls one agent job made, as the judge reads them (#756):
+    what ran, in order, and whether it succeeded — collected from the
+    job's own ``agent.tool_end`` events, so a report describing work the
+    record does not show can be seen for what it is."""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, bool | None]] = []
+        self.total = 0
+
+    def record(self, event: Event) -> None:
+        if event.type != EventTypes.AGENT_TOOL_END:
+            return
+        self.total += 1
+        if len(self.calls) >= TOOL_DIGEST_MAX_CALLS:
+            return
+        data = event.data
+        args = " ".join(str(data.get("args") or "").split())
+        if len(args) > TOOL_DIGEST_ARGS_CHARS:
+            args = args[: TOOL_DIGEST_ARGS_CHARS - 1] + "…"
+        success = data.get("success")
+        self.calls.append(
+            (str(data.get("tool") or "?"), args, success if isinstance(success, bool) else None)
+        )
+
+    def render(self) -> str:
+        if not self.total:
+            return "(no tool calls were made)"
+        lines = []
+        for index, (tool, args, success) in enumerate(self.calls, start=1):
+            mark = "ok" if success else ("failed" if success is False else "?")
+            lines.append(f"{index}. `{tool}` {args} — {mark}".rstrip())
+        if self.total > len(self.calls):
+            lines.append(f"… and {self.total - len(self.calls)} more call(s)")
+        return "\n".join(lines)
 
 
 class PhaseSpend(NamedTuple):
@@ -276,11 +344,16 @@ class PhaseRunner:
         versions: Mapping[str, toolchains.ToolchainVersion] | None = None,
         host_tools: Sequence[HostToolSpec] = (),
         tool_handler: HostToolHandler | None = None,
+        bus: EventBus | None = None,
     ) -> None:
         self.agent = agent
         self.config = config
         self.run_id = run_id
         self.outcome = outcome
+        # The run's event bus, when the caller has one: where a job's tool
+        # calls are read back from for the judge's digest (#756). None
+        # (embedders, tests) leaves the digest empty.
+        self.bus = bus
         # Host tools the BUILD session gets (#765): the `call_service` tool
         # when the run was granted credentials, answered by ``tool_handler``
         # on the host — the agent asks, the service sandbox calls. Empty
@@ -401,16 +474,22 @@ class PhaseRunner:
         permission_mode: Literal["auto", "read_only"],
         expect: Literal["text", "json"],
         resume_session_id: str | None = None,
+        system_message: str | None = None,
+        system_preset: bool = True,
+        digest: ToolDigest | None = None,
     ) -> JobResult:
         agent_name = AGENT_NAMES[phase]
-        # Only BUILD gets the host tools: the planner and the critic read
-        # and judge; the builder is the one whose work may need a service.
-        host_tools = self.host_tools if phase == "build" else ()
+        # Only the working phases get the host tools: the planners and the
+        # critics read and judge; the builder and the operator's executor
+        # are the ones whose work may need a service.
+        host_tools = self.host_tools if phase in TOOLED_PHASES else ()
         job = JobRequest(
             job_id=new_job_id(),
             run_id=self.run_id,
             kind="agent.session",
             prompt=prompt,
+            system_message=system_message,
+            system_preset=system_preset,
             model=self.config.model,
             permission_mode=permission_mode,
             expect=expect,
@@ -434,13 +513,17 @@ class PhaseRunner:
             prompt_chars=len(prompt),
             resumed=bool(resume_session_id),
         )
-        # The handler rides along only when the job carries tools: a run
-        # without them submits exactly the call it always did.
-        result = (
-            self.agent.submit(job, agent=agent_name, tool_handler=self.tool_handler)
-            if host_tools
-            else self.agent.submit(job, agent=agent_name)
-        )
+        unsubscribe = self._watch_tools(job.job_id, digest)
+        try:
+            # The handler rides along only when the job carries tools: a run
+            # without them submits exactly the call it always did.
+            result = (
+                self.agent.submit(job, agent=agent_name, tool_handler=self.tool_handler)
+                if host_tools
+                else self.agent.submit(job, agent=agent_name)
+            )
+        finally:
+            unsubscribe()
         usage = result.usage
         if usage is not None:
             self._spend_usage = self._spend_usage.merged(usage)
@@ -462,6 +545,18 @@ class PhaseRunner:
             raise WorkerError(f"agent job failed ({result.error.type}): {result.error.message}")
         return result
 
+    def _watch_tools(self, job_id: str, digest: ToolDigest | None) -> Callable[[], None]:
+        """Feed one job's tool events to ``digest`` while it runs; a no-op
+        unsubscribe when there is no digest to fill or no bus to read."""
+        if digest is None or self.bus is None:
+            return lambda: None
+
+        def record(event: Event) -> None:
+            if event.job_id == job_id:
+                digest.record(event)
+
+        return self.bus.subscribe(record)
+
     def _agent_json(
         self,
         model_cls: type[ModelT],
@@ -470,6 +565,8 @@ class PhaseRunner:
         *,
         permission_mode: Literal["auto", "read_only"] = "auto",
         check: Callable[[ModelT], None] | None = None,
+        system_message: str | None = None,
+        system_preset: bool = True,
     ) -> tuple[ModelT, JobResult]:
         """Run a JSON-expecting agent job; one retry with what went wrong.
 
@@ -493,6 +590,8 @@ class PhaseRunner:
                     phase=prompt_name,
                     permission_mode=permission_mode,
                     expect="json",
+                    system_message=system_message,
+                    system_preset=system_preset,
                 )
             except WorkerError as exc:
                 if "ExpectedJsonMissing" not in str(exc):
@@ -533,7 +632,7 @@ class PhaseRunner:
         log.warning(
             "phase.invalid_twice", run=self.run_id, prompt=prompt_name, error=str(last_error)[:300]
         )
-        raise WorkerError(f"{prompt_name} produced invalid output twice: {last_error}")
+        raise InvalidOutputTwice(f"{prompt_name} produced invalid output twice: {last_error}")
 
     def shell_batch(
         self, commands: Sequence[str], *, cwd: str | None = None
@@ -704,7 +803,7 @@ class PhaseRunner:
             prior_attempt=clip(prior_report) or "(none — this is the first attempt)",
             user_guidance=self._guidance(),
             repo_conventions=self.repo_conventions(),
-            work_dir=f"`{self.workdir}`" if self.workdir else "the current working directory",
+            work_dir=self._work_dir(),
             toolchains=toolchains.describe(self.languages, self.versions),
             service_tools=self._service_tools_section(),
         )
@@ -816,6 +915,118 @@ class PhaseRunner:
             permission_mode="read_only",
         )
         return verdict
+
+    # -- the workload's phases (#756) ----------------------------------------
+
+    def plan_workload(self) -> WorkloadPlan:
+        """The operator's plan: the outcome as ordered tasks, each with the
+        criteria the judge will hold it to and the needs it declares."""
+        plan, _ = self._agent_json(
+            WorkloadPlan,
+            "operator_plan",
+            {
+                "outcome": self.outcome,
+                "max_tasks": str(self.config.budgets.max_tasks),
+                "work_dir": self._work_dir(),
+                "user_guidance": self._guidance(),
+            },
+            system_message=OPERATOR_SYSTEM_MESSAGE,
+            system_preset=False,
+        )
+        return plan
+
+    def execute(
+        self,
+        task: TaskRecord,
+        *,
+        prior_report: str = "",
+        resume_session_id: str | None = None,
+        digest: ToolDigest | None = None,
+    ) -> JobResult:
+        """Do one workload task in one operator session; ``digest`` collects
+        the session's tool calls for the judge. Prior report and session
+        resume serve a revision the way they serve a build's."""
+        prompt = render(
+            "operator_execute",
+            outcome=self.outcome,
+            task_id=task.spec.id,
+            task_title=task.spec.title,
+            task_description=task.spec.description or "(no further description)",
+            acceptance_criteria=bullet_list(task.spec.acceptance_criteria),
+            verify_commands=bullet_list(task.spec.verify_commands, empty="(none)"),
+            needs=self._needs_section(task),
+            work_dir=self._work_dir(),
+            prior_attempt=clip(prior_report) or "(none — this is the first attempt)",
+            feedback=task.last_feedback or "(none — first attempt)",
+            user_guidance=self._guidance(),
+            service_tools=self._service_tools_section(),
+        )
+        return self._agent_job(
+            prompt,
+            phase="operator_execute",
+            permission_mode="auto",
+            expect="text",
+            resume_session_id=resume_session_id,
+            system_message=OPERATOR_SYSTEM_MESSAGE,
+            system_preset=False,
+            digest=digest,
+        )
+
+    def judge(
+        self,
+        task: TaskRecord,
+        *,
+        attempt: int,
+        report: str,
+        tool_digest: str,
+        evidence: str,
+    ) -> JudgeVerdict:
+        """The verdict on one executed task, read-only, against its
+        criteria. Raises :class:`InvalidOutputTwice` when the judge could
+        not produce a verdict on either attempt — the engine fails the run
+        closed on it rather than treating silence as a pass."""
+        verdict, _ = self._agent_json(
+            JudgeVerdict,
+            "operator_judge",
+            {
+                "outcome": self.outcome,
+                "task_id": task.spec.id,
+                "task_title": task.spec.title,
+                "task_description": task.spec.description or "(no further description)",
+                "acceptance_criteria": bullet_list(task.spec.acceptance_criteria),
+                "work_dir": self._work_dir(),
+                "attempt": str(attempt),
+                "report": clip(report) or "(the operator produced no report)",
+                "tool_digest": tool_digest or "(no tool calls were recorded)",
+                "evidence": evidence or "(no mechanical checks declared)",
+            },
+            permission_mode="read_only",
+            system_message=JUDGE_SYSTEM_MESSAGE,
+            system_preset=False,
+        )
+        return verdict
+
+    def _work_dir(self) -> str:
+        return f"`{self.workdir}`" if self.workdir else "the current working directory"
+
+    @staticmethod
+    def _needs_section(task: TaskRecord) -> str:
+        needs = task.spec.needs
+        if needs.empty:
+            return "(none declared)"
+        lines = []
+        if needs.hosts:
+            lines.append("hosts: " + ", ".join(f"`{host}`" for host in needs.hosts))
+        if needs.credentials:
+            lines.append(
+                "credentials (by name, called on your behalf): "
+                + ", ".join(f"`{name}`" for name in needs.credentials)
+            )
+        if needs.sink:
+            lines.append(f"sink: {needs.sink}")
+        if needs.repo:
+            lines.append(f"repo: `{needs.repo}`")
+        return bullet_list(lines)
 
     def verify(self, task: TaskRecord) -> VerifyOutcome:
         """Run the task's decomposer-authored verify commands; the transcript

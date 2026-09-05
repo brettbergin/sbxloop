@@ -110,6 +110,7 @@ from sbxloop.engine.model import (
     RunResult,
     RunState,
     SteerVerdict,
+    TaskGraph,
     TaskRecord,
     TaskSpec,
     TaskState,
@@ -118,6 +119,7 @@ from sbxloop.engine.model import (
 from sbxloop.engine.phases import (
     VERIFY_FAILURE_PREFIX,
     PhaseRunner,
+    ToolDigest,
     VerifyFailure,
     clip,
     clip_head_tail,
@@ -156,6 +158,7 @@ from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import (
     BudgetExceededError,
     GithubOpsError,
+    InvalidOutputTwice,
     ProvisionError,
     RunCancelledError,
     SbxError,
@@ -804,9 +807,12 @@ class LoopEngine:
                         # `fetch_dependencies` (#766) tools, answered on the
                         # host through the service sandbox.
                         host_tools=service.tool_specs() if service is not None else (),
-                        tool_handler=service.handler(phase="build")
+                        tool_handler=service.handler(phase="build" if kind == "code" else "execute")
                         if service is not None
                         else None,
+                        # The judge's tool digest is read off the bus (#756);
+                        # a code run's phases never ask for one.
+                        bus=self.bus if kind == "workload" else None,
                     )
                     # Replay persisted chat guidance (steer_run verdicts)
                     # so a resumed run keeps the direction the user set.
@@ -1377,14 +1383,14 @@ class LoopEngine:
     def _workload_stages(self, p: Pipeline, stage: str | None) -> tuple[RunState, str | None]:
         """A ``workload`` run's life (#755): plan → execute → judge → publish.
 
-        Plan and execute are the task graph — the same decomposition and
-        per-task build/verify a code run gets, under the operator's stage
-        names — so the revision and replan budgets apply unchanged. Judge
-        re-runs every task's checks over the finished workspace, the way
-        the gate re-runs the project's; publish hands the result to its
-        sinks. Neither has its persona yet: the LLM judge is #756 and the
-        sinks are #759, and until then a red judgment ends the run named
-        and publish is the no-op that keeps the stage on the record.
+        Plan and execute are the task graph — the same shape a code run
+        walks, with the operator's prompts in place of the developer's and
+        the judge's verdict in place of the verify phase (#756) — so the
+        revision budget applies unchanged. The judging stage re-runs every
+        task's declared checks over the finished workspace, the way the
+        gate re-runs the project's; publish hands the result to its sinks.
+        The sinks are #759, and until then a red judgment ends the run
+        named and publish is the no-op that keeps the stage on the record.
         """
         if stage not in ("judging", "publishing"):
             failed = self._run_phases(p)
@@ -1529,7 +1535,34 @@ class LoopEngine:
                 f"its result across attempts — the check looks unpassable and "
                 f"needs re-authoring: {commands}"
             )
+        judged = self._judged_failure_reason(run_id)
+        if judged is not None:
+            return judged
         return "a task failed or was skipped"
+
+    def _judged_failure_reason(self, run_id: str) -> str | None:
+        """A workload task the judge failed (#756): the last verdict, or the
+        judge's own failure to reach one, is the reason a human reads."""
+        for task in self.store.get_tasks(run_id):
+            if task.state != "failed":
+                continue
+            output = self.store.latest_phase_output(run_id, task.spec.id, "judge")
+            if output is None:
+                continue
+            verdict = json.loads(output)
+            if verdict.get("degraded"):
+                return (
+                    f"the judge could not reach a verdict on task {task.spec.id} "
+                    f"({verdict.get('error') or 'no usable verdict'}); the run fails closed"
+                )
+            unmet = [str(item) for item in verdict.get("unmet") or []]
+            if unmet:
+                attempts = int(verdict.get("attempt") or task.revisions or 1)
+                return (
+                    f"task {task.spec.id} failed the judgment after {attempts} attempt(s) — "
+                    f"unmet: {unmet[0]}" + (f" (+{len(unmet) - 1} more)" if len(unmet) > 1 else "")
+                )
+        return None
 
     def _run_phases(self, p: Pipeline) -> bool:
         """DECOMPOSE (unless seeded or resumed) and the task graph; True when
@@ -1545,9 +1578,17 @@ class LoopEngine:
         tasks = [t for t in self.store.get_tasks(run_id) if not is_fix_task(t.spec.id)]
         if not tasks:
             self._set_run_state(run_id, planning)
-            self._hint_services(run_id, phases.workspace)
             started = time.time()
-            graph = phases.decompose()
+            graph: TaskGraph
+            if p.kind == "workload":
+                # The operator's plan (#756): the same graph, under the
+                # judge's criteria rather than a repository's checks.
+                plan = phases.plan_workload()
+                graph, title, phase = plan, plan.title, "plan"
+            else:
+                self._hint_services(run_id, phases.workspace)
+                graph = phases.decompose()
+                title, phase = graph.pr_title, "decompose"
             if len(graph.tasks) > self.config.budgets.max_tasks:
                 raise BudgetExceededError(
                     f"decomposition produced {len(graph.tasks)} tasks "
@@ -1555,12 +1596,12 @@ class LoopEngine:
                 )
             ordered = graph.topo_order()
             self.store.save_tasks(run_id, ordered)
-            if graph.pr_title:
-                self.store.set_run_title(run_id, graph.pr_title)
+            if title:
+                self.store.set_run_title(run_id, title)
             spend = phases.drain_spend()
             self.store.record_phase(
                 run_id,
-                "decompose",
+                phase,
                 task_id=None,
                 attempt=1,
                 status="ok",
@@ -1784,12 +1825,12 @@ class LoopEngine:
     def _stage_judge(self, p: Pipeline) -> str | None:
         """Re-run every task's checks over the finished workspace.
 
-        Each task proved its own checks as it finished; a later task can
-        undo an earlier one's proof, so the judgment is taken once more on
-        the tree as it stands. Returns the reason the run failed, or None
-        to publish. Until the LLM judge lands (#756) this is the whole
-        judgment, and a red check ends the run rather than spending a fix
-        round: a workload's rounds are that PR's to define.
+        Each task was judged as it finished (#756), its declared checks
+        among the evidence; a later task can undo an earlier one's proof,
+        so the mechanical part of that judgment is taken once more on the
+        tree as it stands. Returns the reason the run failed, or None to
+        publish. A red check here ends the run rather than spending a fix
+        round: the per-task revisions are where the work gets its retries.
         """
         run_id, phases = p.run_id, p.phases
         self._set_run_state(run_id, "judging")
@@ -1801,7 +1842,13 @@ class LoopEngine:
                 for c in t.spec.verify_commands
             )
         )
-        attempt = 1 + sum(1 for row in self.store.phase_attempts(run_id) if row["phase"] == "judge")
+        # The run's own judge rows carry no task; the per-task verdicts
+        # (#756) are the judge's, under the same phase name.
+        attempt = 1 + sum(
+            1
+            for row in self.store.phase_attempts(run_id)
+            if row["phase"] == "judge" and row["task_id"] is None
+        )
         started = time.time()
         results = phases.shell_batch(commands) if commands else []
         failed = [
@@ -3470,7 +3517,16 @@ class LoopEngine:
                 task.last_feedback = abort_reason
                 self._set_task_state(run_id, task, "failed")
                 break
-            if task.state == "executing":
+            if p.kind == "workload":
+                # The operator executes and the judge decides (#756); the
+                # task walks the same two states a code run's does.
+                if task.state == "executing":
+                    self._phase_execute(run_id, phases, task, granter)
+                elif task.state == "verifying":
+                    self._phase_judge(run_id, phases, task)
+                else:  # pragma: no cover - defensive
+                    raise StateError(f"task {task.spec.id} in unexpected state {task.state}")
+            elif task.state == "executing":
                 self._phase_build(run_id, phases, task, granter)
             elif task.state == "verifying":
                 self._phase_verify(run_id, phases, task)
@@ -3592,6 +3648,181 @@ class LoopEngine:
         )
         task.last_feedback = ""
         self._set_task_state(run_id, task, "verifying")
+
+    def _phase_execute(
+        self,
+        run_id: str,
+        phases: PhaseRunner,
+        task: TaskRecord,
+        granter: EgressGranter,
+    ) -> None:
+        """One operator session on one workload task (#756): the build
+        phase's shape — grants, session resume, the prior report — with the
+        session's tool calls digested for the judge and persisted beside
+        the report, so a resumed run judges the same evidence."""
+        with self._sandbox_lock:
+            granter.apply(
+                task.spec.id, [(egress.domain, egress.reason) for egress in task.spec.egress]
+            )
+        started = time.time()
+        resume = task.session_id if task.session_id in self._live_sessions else None
+        digest = ToolDigest()
+        result = phases.execute(
+            task,
+            prior_report=self._prior_attempt_report(run_id, task, phase="execute"),
+            resume_session_id=resume,
+            digest=digest,
+        )
+        if resume and result.session_id != resume:
+            log.info(
+                "phase.resume_missed",
+                run=run_id,
+                task=task.spec.id,
+                requested=resume,
+                got=result.session_id,
+                hint="the SDK could not resume; the prior report still carried the context",
+            )
+        task.session_id = result.session_id
+        if result.session_id:
+            self._live_sessions.add(result.session_id)
+        report = clip(result.output_text)
+        spend = phases.drain_spend()
+        self.store.record_phase(
+            run_id,
+            "execute",
+            task_id=task.spec.id,
+            attempt=task.revisions + 1,
+            status="ok",
+            output_json=json.dumps(
+                {
+                    "report": report,
+                    "session_id": result.session_id,
+                    "tools": digest.render(),
+                    "tool_calls": digest.total,
+                }
+            ),
+            started_at=started,
+            usage=spend.usage,
+            turns=spend.turns,
+        )
+        headline = " ".join((result.output_text or "").split())
+        self.bus.emit(
+            HostEventTypes.PHASE_END,
+            run_id,
+            task_id=task.spec.id,
+            phase="execute",
+            status="ok",
+            attempt=task.revisions + 1,
+            message=headline[:300] or "(the operator produced no report)",
+        )
+        task.last_feedback = ""
+        self._set_task_state(run_id, task, "verifying")
+
+    def _phase_judge(self, run_id: str, phases: PhaseRunner, task: TaskRecord) -> None:
+        """The judge's verdict on the task's last execute attempt (#756).
+
+        Passed → done. Failed → the unmet criteria are the next attempt's
+        feedback, under ``max_revisions_per_task``; past it the task fails
+        and the verdict becomes the run's reason. A judge that produced no
+        usable verdict twice running is a degraded judge: the task fails
+        closed, named as such — silence is never a pass.
+        """
+        started = time.time()
+        attempt = task.revisions + 1
+        output = self.store.latest_phase_output(run_id, task.spec.id, "execute")
+        executed = json.loads(output) if output else {}
+        report = executed.get("report")
+        tools = executed.get("tools")
+        report = report if isinstance(report, str) else ""
+        tools = tools if isinstance(tools, str) else ""
+        evidence = phases.verify(task).results if task.spec.verify_commands else ""
+        try:
+            verdict = phases.judge(
+                task, attempt=attempt, report=report, tool_digest=tools, evidence=evidence
+            )
+        except InvalidOutputTwice as exc:
+            spend = phases.drain_spend()
+            self.store.record_phase(
+                run_id,
+                "judge",
+                task_id=task.spec.id,
+                attempt=attempt,
+                status="failed",
+                output_json=json.dumps({"degraded": True, "error": str(exc)}),
+                started_at=started,
+                usage=spend.usage,
+                turns=spend.turns,
+            )
+            log.warning("judge.degraded", run=run_id, task=task.spec.id, error=str(exc)[:300])
+            self.bus.emit(
+                HostEventTypes.JUDGE_DEGRADED,
+                run_id,
+                task_id=task.spec.id,
+                attempt=attempt,
+                error=str(exc),
+            )
+            self.bus.emit(
+                HostEventTypes.PHASE_END,
+                run_id,
+                task_id=task.spec.id,
+                phase="judge",
+                status="failed",
+                attempt=attempt,
+                message="the judge produced no usable verdict twice; failing closed",
+            )
+            task.last_feedback = f"the judge could not reach a verdict: {exc}"
+            self._set_task_state(run_id, task, "failed")
+            return
+        spend = phases.drain_spend()
+        self.store.record_phase(
+            run_id,
+            "judge",
+            task_id=task.spec.id,
+            attempt=attempt,
+            status="ok" if verdict.passed else "failed",
+            output_json=json.dumps({"degraded": False, "attempt": attempt, **verdict.model_dump()}),
+            started_at=started,
+            usage=spend.usage,
+            turns=spend.turns,
+        )
+        self.bus.emit(
+            HostEventTypes.JUDGE_VERDICT,
+            run_id,
+            task_id=task.spec.id,
+            attempt=attempt,
+            passed=verdict.passed,
+            unmet=list(verdict.unmet),
+            notes=verdict.notes,
+        )
+        if verdict.passed:
+            self.bus.emit(
+                HostEventTypes.PHASE_END,
+                run_id,
+                task_id=task.spec.id,
+                phase="judge",
+                status="ok",
+                attempt=attempt,
+                message=" ".join(verdict.notes.split())[:300] or "every criterion met",
+            )
+            self._set_task_state(run_id, task, "done")
+            return
+        first = verdict.unmet[0]
+        more = len(verdict.unmet) - 1
+        self.bus.emit(
+            HostEventTypes.PHASE_END,
+            run_id,
+            task_id=task.spec.id,
+            phase="judge",
+            status="failed",
+            attempt=attempt,
+            message=f"unmet: {first}" + (f" (+{more} more)" if more else ""),
+        )
+        feedback = "the judge found these acceptance criteria unmet:\n" + "\n".join(
+            f"- {item}" for item in verdict.unmet
+        )
+        if verdict.notes:
+            feedback += f"\n\nJudge's notes: {verdict.notes}"
+        self._register_revision(run_id, task, feedback)
 
     def _phase_verify(
         self,
@@ -3776,7 +4007,7 @@ class LoopEngine:
         task.revisions = 0
         task.session_id = None
 
-    def _prior_attempt_report(self, run_id: str, task: TaskRecord) -> str:
+    def _prior_attempt_report(self, run_id: str, task: TaskRecord, *, phase: str = "build") -> str:
         """What the previous BUILD attempt on this task said it did.
 
         Field failure (run rrhb28j7n, task t5): five executor sessions each
@@ -3791,7 +4022,7 @@ class LoopEngine:
         Read from the store rather than kept in memory so a resumed run's
         revision gets the same context a fresh one would.
         """
-        output = self.store.latest_phase_output(run_id, task.spec.id, "build")
+        output = self.store.latest_phase_output(run_id, task.spec.id, phase)
         if output is None:
             return ""
         report = json.loads(output).get("report")

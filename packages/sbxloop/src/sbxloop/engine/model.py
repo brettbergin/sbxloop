@@ -115,7 +115,22 @@ RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
     }
 )
 
-Phase = Literal["decompose", "build", "verify", "gate", "review", "steer", "followup", "judge"]
+Phase = Literal[
+    "decompose",
+    "build",
+    "verify",
+    "gate",
+    "review",
+    "steer",
+    "followup",
+    # A workload's own phases: the operator's plan and execute rows, and
+    # the judge — per task (with a task_id) as the LLM verdict on one
+    # task's work, and once at the end (task_id None) as the mechanical
+    # re-check over the finished workspace.
+    "plan",
+    "execute",
+    "judge",
+]
 
 # What a fix round is for. `review` rounds are charged to the review budget;
 # everything else — a red gate, red CI, a base conflict, a human objecting on
@@ -154,6 +169,42 @@ class EgressSpec(_Model):
         return value
 
 
+class TaskNeeds(_Model):
+    """What a workload task declares it will need, by name — the operator's
+    plan asking, never taking.
+
+    ``hosts`` are domains the task will reach (the shape of ``egress``);
+    ``credentials`` are catalogue names, each a request for a grant on the
+    service sandbox — a credential is never a value in the agent's box;
+    ``sink`` names where the result should go and ``repo`` a repository it
+    needs. The plan records the needs; whether they are met is decided by
+    the run's profile, which is a later concern than the plan.
+    """
+
+    hosts: list[str] = Field(default_factory=list)
+    credentials: list[str] = Field(default_factory=list)
+    sink: str | None = None
+    repo: str | None = None
+
+    @field_validator("hosts")
+    @classmethod
+    def _check_hosts(cls, value: list[str]) -> list[str]:
+        from sbxloop.policy import valid_pattern
+
+        hosts = [host.strip().lower() for host in value]
+        bad = [host for host in hosts if not valid_pattern(host)]
+        if bad:
+            raise ValueError(
+                f"needs.hosts must be domains or *.domain wildcards (no scheme/path/port), "
+                f"got {bad!r}"
+            )
+        return hosts
+
+    @property
+    def empty(self) -> bool:
+        return not (self.hosts or self.credentials or self.sink or self.repo)
+
+
 class TaskSpec(_Model):
     """One unit of the decomposed outcome (agent-authored, engine-validated)."""
 
@@ -166,6 +217,9 @@ class TaskSpec(_Model):
     # External domains this task's BUILD needs beyond the baseline, with
     # justification. Decomposer-authored, like the verify commands.
     egress: list[EgressSpec] = Field(default_factory=list)
+    # A workload task's declared needs (operator-authored); a code run's
+    # tasks leave it empty.
+    needs: TaskNeeds = Field(default_factory=TaskNeeds)
 
 
 class TaskGraph(_Model):
@@ -219,6 +273,45 @@ class TaskGraph(_Model):
         if not task.depends_on:
             return 0
         return 1 + max(self._depth(by_id[d], by_id) for d in task.depends_on)
+
+
+class WorkloadPlan(TaskGraph):
+    """The operator's plan: the same task graph the engine schedules, under
+    a run title instead of a pull request's, each task carrying its
+    acceptance criteria as the judge's whole exam and its declared needs."""
+
+    title: str | None = None
+
+    @field_validator("title")
+    @classmethod
+    def _fold_run_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        folded = " ".join(str(value).split())
+        return folded or None
+
+
+class JudgeVerdict(_Model):
+    """The judge's answer on one task: whether every acceptance criterion
+    is met, the ones that are not (quoted, so the next attempt knows what
+    to fix), and its notes. ``unmet`` empty with ``passed`` false is a
+    verdict that names nothing to fix — rejected, so a judge cannot fail
+    work without saying why."""
+
+    passed: bool
+    unmet: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+    @field_validator("unmet")
+    @classmethod
+    def _strip_unmet(cls, value: list[str]) -> list[str]:
+        return [" ".join(str(item).split()) for item in value if str(item).strip()]
+
+    @model_validator(mode="after")
+    def _check_verdict(self) -> JudgeVerdict:
+        if not self.passed and not self.unmet:
+            raise ValueError("a failing verdict must name at least one unmet criterion")
+        return self
 
 
 SteerAction = Literal["continue", "steer_task", "steer_run"]

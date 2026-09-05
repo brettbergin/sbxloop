@@ -234,6 +234,13 @@ class HostEventTypes:
     # `ecosystem`, `verb`, `argv`, `exit_code` (or `error`), `duration_s`,
     # `phase`, `task_id`. The output tail rides `detail` only on failure.
     SANDBOX_FETCH = "sandbox.fetch"
+    # The judge's verdict on one workload task (#756): `task_id`,
+    # `attempt`, `passed`, `unmet`, `notes`.
+    JUDGE_VERDICT = "judge.verdict"
+    # The judge produced no usable verdict twice running (#756): `task_id`,
+    # `attempt`, `error`. The run fails closed — a judge that cannot judge
+    # never passes work.
+    JUDGE_DEGRADED = "judge.degraded"
     # The task roster as the run will work it (also re-announced on resume,
     # with each task's persisted state).
     RUN_TASKS = "run.tasks"
