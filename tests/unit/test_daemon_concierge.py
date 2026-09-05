@@ -2583,3 +2583,7 @@ class TestStartWorkload:
         (tool,) = [t for t in job.host_tools if t.name == "start_workload"]
         assert tool.parameters["properties"]["sink"]["enum"] == ["chat", "issue", "artifact", "pr"]
         assert tool.parameters["required"] == ["ask"]
+        # #797: the description says the subject is unbounded and the call is
+        # never gated on a "want me to queue it?" question
+        assert "any subject, whether or not it concerns sbxloop" in tool.description
+        assert "never ask whether to queue it" in tool.description
