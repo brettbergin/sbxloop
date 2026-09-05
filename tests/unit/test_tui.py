@@ -144,6 +144,17 @@ class TestChatRendering:
             )
         )
         assert "result filed as https://x/issues/1" in render_to_text(filed)
+        # #799: the files the result carried, by host path
+        with_files = render_event(
+            make_event(
+                HostEventTypes.RUN_PUBLISHED,
+                sink="chat",
+                location="chat",
+                message="1/1 task(s) passed the judge",
+                paths=["/state/runs/r1/artifacts/a.csv"],
+            )
+        )
+        assert "/state/runs/r1/artifacts/a.csv" in render_to_text(with_files)
 
     def test_chat_action_renders_one_liner(self) -> None:
         rendered = render_event(

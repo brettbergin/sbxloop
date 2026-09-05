@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -289,12 +290,17 @@ class SlackBridge(ChatBridge):
         embed: EmbedSpec | None = None,
         reply_to: Any = None,
         mention_users: bool = False,
+        files: Sequence[str] = (),
     ) -> Any:
         """The single send seam: the text is clipped and re-dialected to
         mrkdwn (user mentions escaped unless asked for), link unfurls are
         off, a card becomes one coloured attachment and is dropped —
         text-only retry — if Slack rejects it. ``reply_to`` is accepted for
-        the shared signature and ignored (see the module docstring)."""
+        the shared signature and ignored (see the module docstring).
+        ``files`` are named by host path (#799): Slack uploads are a
+        follow-on (#763)."""
+        if files:
+            text = "\n".join(part for part in (text, self._files_note(files)) if part)
         limit = self.slack.max_message_chars
         body = to_mrkdwn(_clip(text, limit), mentions=mention_users) if text else ""
         kwargs: dict[str, Any] = {

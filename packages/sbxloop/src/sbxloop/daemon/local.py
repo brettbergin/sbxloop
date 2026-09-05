@@ -47,6 +47,7 @@ import functools
 import json
 import re
 import time
+from collections.abc import Sequence
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any, ClassVar
@@ -334,7 +335,11 @@ class LocalBridge(ChatBridge):
         embed: EmbedSpec | None = None,
         reply_to: Any = None,
         mention_users: bool = False,
+        files: Sequence[str] = (),
     ) -> Any:
+        if files:
+            # The console runs on the daemon host: a path is the file (#799).
+            text = "\n".join(part for part in (text, self._files_note(files)) if part)
         return await self._io_call(
             self._post, target, text, embed=embed, reply_to=reply_to, mention_users=mention_users
         )

@@ -612,6 +612,10 @@ secret_strategy = "proxy"
 # tool_batch_lines = 8             # verbose: consecutive tool calls per code block
 # tool_output_lines = 0            # tail output lines echoed for a successful call (0 = none)
 # tool_fail_output_lines = 20      # head+tail output lines echoed for a failed call
+# max_attachment_bytes = 10000000  # named by host path on Slack (uploads are a follow-on)
+# max_attachment_bytes = 10000000  # a workload result's files ride the thread as
+#                                  # uploads up to this size (Discord's unboosted cap);
+#                                  # larger ones are named by host path. 0 = name all
 
 # [slack]
 # The Slack backend: the same channel, threads, commands and steering over a
@@ -640,7 +644,7 @@ secret_strategy = "proxy"
 # to it. The rendering knobs are the ones [discord] / [slack] share
 # (command_prefix, thread_per_run, chronology_level, max_message_chars,
 # embeds, status_line, tool_batch_lines, tool_output_lines,
-# tool_fail_output_lines); these are the terminal's own.
+# tool_fail_output_lines, max_attachment_bytes); these are the terminal's own.
 # operator_id = ""                 # who the console speaks as; "" = the login name
 # emoji = true                     # glyph markers in the console (false: ASCII)
 # daemon_unit = "sbxloop-daemon"   # the systemd --user unit it tails and can restart

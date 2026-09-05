@@ -1663,6 +1663,11 @@ class ChatBridgeConfig(_ConfigModel):
     # and clamps the message to the 2000-character limit.
     tool_output_lines: int = Field(default=0, ge=0, le=20)
     tool_fail_output_lines: int = Field(default=20, ge=0, le=60)
+    # A workload result's files ride into the thread as attachments where
+    # the backend can carry them (#799); a file over this many bytes is
+    # named by its host path instead (Discord's cap for an unboosted server
+    # is 10 MB). 0 attaches nothing and names every file.
+    max_attachment_bytes: int = Field(default=10_000_000, ge=0, le=100_000_000)
 
     @property
     def enabled(self) -> bool:  # pragma: no cover - overridden

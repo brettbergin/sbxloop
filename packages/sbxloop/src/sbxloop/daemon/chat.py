@@ -50,8 +50,9 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 from sbxloop.config import BridgeBackend, ChatBridgeConfig, Config
@@ -280,6 +281,16 @@ class _NoTyping:
 # -- bridge ---------------------------------------------------------------------------
 
 
+def _human_size(size: int) -> str:
+    """``12.3 MB`` for a byte count, the way a person reads it."""
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB"):
+        if value < 1000 or unit == "GB":
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= 1000
+    return f"{size} B"  # pragma: no cover - unreachable
+
+
 class ChatBridge(ABC):
     """Runs a chat client on its own thread; the daemon loop calls the
     ``Frontend`` methods from its threads and never blocks on the service.
@@ -425,9 +436,41 @@ class ChatBridge(ABC):
         embed: EmbedSpec | None = None,
         reply_to: Any = None,
         mention_users: bool = False,
+        files: Sequence[str] = (),
     ) -> Any:
         """The single send seam: clip, disable mentions unless asked,
-        convert the card, fall back to text; never raise — return None."""
+        convert the card, fall back to text; never raise — return None.
+        ``files`` are host paths a result carries (#799): a backend that
+        can upload attaches those under ``max_attachment_bytes`` and names
+        the rest (``_split_files``); one that cannot names them all
+        (``_files_note``). A named file is never silently dropped."""
+
+    def _split_files(self, files: Sequence[str]) -> tuple[list[Path], list[str]]:
+        """(attachable, notes): the files under the attachment cap that
+        exist on the host, and one line for each of the others saying why
+        it is named rather than attached and where it is."""
+        cap = self.chat.max_attachment_bytes
+        attach: list[Path] = []
+        notes: list[str] = []
+        for raw in files:
+            path = Path(raw)
+            try:
+                size = path.stat().st_size
+            except OSError:
+                notes.append(f"📎 `{path.name}` — not found on the daemon host at `{path}`")
+                continue
+            if cap and size <= cap:
+                attach.append(path)
+            else:
+                notes.append(
+                    f"📎 `{path.name}` ({_human_size(size)}) — too large to attach, "
+                    f"kept on the daemon host at `{path}`"
+                )
+        return attach, notes
+
+    def _files_note(self, files: Sequence[str]) -> str:
+        """Every file named by host path, for a backend with no upload."""
+        return "\n".join(f"📎 `{Path(raw).name}` — on the daemon host at `{raw}`" for raw in files)
 
     async def _send_choices(
         self,
@@ -1805,7 +1848,7 @@ class ChatBridge(ABC):
                 size += len(chunk.text) + 1
                 continue
             await send_group()
-            await self._send(thread, chunk.text, embed=chunk.embed)
+            await self._send(thread, chunk.text, embed=chunk.embed, files=chunk.files)
         await send_group()
 
     def _gate_prompt_text(self, gate: MergeGate) -> str:
