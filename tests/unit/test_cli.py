@@ -613,6 +613,37 @@ class TestDaemonCommand:
         finally:
             dstore.close()
 
+    def test_a_chat_daemon_runs_without_a_repository(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#760: a chat backend with the concierge on is intake enough — the
+        daemon starts on chat-asked workloads alone, its source named
+        `chat`, and `--once` still runs what a concierge already queued."""
+        from sbxloop.daemon.discord import DiscordBridge
+
+        (workdir / "sbxloop.toml").write_text("[discord]\nchannel_id = 42\n")
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
+        monkeypatch.setattr(DiscordBridge, "start", lambda self, **kw: None)
+        monkeypatch.setattr(DiscordBridge, "close", lambda self, **kw: None)
+        self.offline(monkeypatch)
+        result = runner.invoke(app, ["daemon", "--once"])
+        assert result.exit_code == 0, result.output
+        assert "daemon.no_repository" not in result.output
+        assert "source=chat" in result.output and "chat=discord" in result.output
+        assert "tick:" in result.output and "no_work" in result.output
+
+    def test_a_chat_daemon_with_the_concierge_off_needs_a_repository(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # nothing can queue a workload from chat, so nothing would ever be work
+        (workdir / "sbxloop.toml").write_text(
+            "[discord]\nchannel_id = 42\n[concierge]\nenabled = false\n"
+        )
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
+        result = runner.invoke(app, ["daemon", "--once"])
+        assert result.exit_code == 2
+        assert "daemon.no_repository" in result.output
+
     def test_the_concierge_is_wanted_headless(self) -> None:
         """The change that un-gated the concierge from a chat backend: a
         headless long-lived daemon builds it; `--once` never does."""
@@ -3635,6 +3666,7 @@ class TestDoctorBranchProtection:
             "sbxloop:failed",
             "sbxloop:blocked",
             "sbxloop:awaiting-merge",
+            "sbxloop:workload",
             "sbxloop:follow-up",
         )
 
@@ -3985,6 +4017,7 @@ class TestInitRepo:
             "loop:done",
             "sbxloop:blocked",
             "sbxloop:awaiting-merge",
+            "sbxloop:workload",
             "sbxloop:follow-up",
         ]
         created = [
@@ -3998,9 +4031,10 @@ class TestInitRepo:
             "e99695",
             "1d76db",
             "c5def5",
+            "0052cc",
         }
         plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
-        assert "6 label(s) created, 1 already present" in plain
+        assert "7 label(s) created, 1 already present" in plain
         assert closed == ["acme/alpha"], "the sandbox is torn down"
 
     def test_a_second_run_creates_nothing(self, workdir: Path) -> None:
@@ -4010,12 +4044,12 @@ class TestInitRepo:
             self._patch_box(mp, fake)
             first = runner.invoke(app, ["init-repo", "acme/alpha"])
             assert first.exit_code == 0, first.output
-            assert len(fake.labels_created) == 7
+            assert len(fake.labels_created) == 8
             second = runner.invoke(app, ["init-repo", "acme/alpha"])
         assert second.exit_code == 0, second.output
-        assert len(fake.labels_created) == 7
+        assert len(fake.labels_created) == 8
         plain = re.sub(r"\x1b\[[0-9;]*m", "", second.output)
-        assert "0 label(s) created, 7 already present" in plain
+        assert "0 label(s) created, 8 already present" in plain
 
     def test_a_repository_outside_the_config_gets_the_daemon_wide_labels(
         self, workdir: Path
@@ -4046,7 +4080,7 @@ class TestInitRepo:
             result = runner.invoke(app, ["init-repo", "acme/alpha"])
         assert result.exit_code == 1
         plain = " ".join(re.sub(r"\x1b\[[0-9;]*m", "", result.output).split())
-        assert "7 label(s) could not be created" in plain
+        assert "8 label(s) could not be created" in plain
         assert "permission to write issue labels" in plain
 
     def test_a_malformed_repository_is_rejected(self, workdir: Path) -> None:

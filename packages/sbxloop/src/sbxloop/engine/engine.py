@@ -2344,19 +2344,23 @@ class LoopEngine:
     ) -> Published:
         """File the result as one issue in the delivery repository, under
         the `[workload] result_label` (ensured best-effort, like the
-        follow-up label: an issue GitHub cannot label is still filed)."""
+        follow-up label: an issue GitHub cannot label is still filed) — or,
+        when the run was asked for on an issue (`[workload] result_issue`,
+        set by the daemon, #760), answer on that issue instead."""
         assert p.ops is not None and p.repo is not None
-        label = sinks.result_label(self.config.workload.result_label)
-        ensure_label(p.ops, p.repo, label)
-        ref = p.ops.issue_create(
-            p.repo,
-            sinks.result_title(run.pr_title, p.outcome),
-            sinks.issue_body(tasks, run.pr_title, carried, run_id=run.run_id, outcome=p.outcome),
-            labels=[label.name],
-        )
+        body = sinks.issue_body(tasks, run.pr_title, carried, run_id=run.run_id, outcome=p.outcome)
+        asked_on = self.config.workload.result_issue
+        if asked_on is not None:
+            url = p.ops.issue_comment(p.repo, asked_on, body)
+        else:
+            label = sinks.result_label(self.config.workload.result_label)
+            ensure_label(p.ops, p.repo, label)
+            url = p.ops.issue_create(
+                p.repo, sinks.result_title(run.pr_title, p.outcome), body, labels=[label.name]
+            ).url
         return Published(
             sink="issue",
-            location=ref.url,
+            location=url,
             tasks=[t.spec.id for t in carried],
             files=sum(t.output.file_count for t in carried if t.output is not None),
         )

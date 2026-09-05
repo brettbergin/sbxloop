@@ -1,12 +1,17 @@
 """Work sources: where the daemon finds work and reports back.
 
-One implementation today. ``GitHubIssueSource`` polls the target repo for
-issues carrying the trigger label and drives their lifecycle with labels
-and comments — every mutation goes through the daemon's github-ops sandbox
-via :class:`GithubOps`, using ``raw.api`` for label add/remove and issue
-close, so no new worker ops are needed. The source never files work of its
-own: an issue enters the queue only because a human labelled it (directly,
-or through the Discord concierge).
+``GitHubIssueSource`` polls the target repo for issues carrying the trigger
+label (a code run) or the workload label (#760, a workload run whose result
+comes back as a comment) and drives their lifecycle with labels and
+comments — every mutation goes through the daemon's github-ops sandbox via
+:class:`GithubOps`, using ``raw.api`` for label add/remove and issue close,
+so no new worker ops are needed. The source never files work of its own:
+an issue enters the queue only because a human labelled it (directly, or
+through the Discord concierge). ``ChatSource`` is the queue the concierge
+feeds directly — a workload asked for in chat has no issue to label, so it
+is claimed by construction and reported only to the log; the run's chat
+thread carries its chronology. ``CompositeSource`` routes between the two
+by item id.
 
 Reporting is best-effort by construction: a GitHub hiccup while posting a
 comment must never fail the daemon or lose an item, so every ``report_*``
@@ -33,9 +38,11 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 from urllib.parse import quote
 
 from sbxloop.daemon.model import RunReport, WorkItem
+from sbxloop.engine.model import RunKind
+from sbxloop.engine.sinks import published_line
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
 from sbxloop.gh.ops import GithubOps, Identity, identities_match, raw_pages, user_identity
-from sbxloop.ghids import issue_item_id, try_parse_gh_id
+from sbxloop.ghids import is_chat_id, issue_item_id, try_parse_gh_id
 from sbxloop.log import get_logger
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -140,6 +147,7 @@ class WorkSource(Protocol):
         self, item: WorkItem, reason: str, pr_number: int | None, pr_url: str
     ) -> bool: ...
     def report_gated(self, item: WorkItem, pr_number: int | None, pr_url: str) -> bool: ...
+    def report_completed(self, item: WorkItem, report: RunReport) -> bool: ...
 
 
 def _cancel_lines(report: RunReport) -> list[str]:
@@ -157,6 +165,15 @@ def _cancel_lines(report: RunReport) -> list[str]:
     return lines
 
 
+def _completed_body(report: RunReport) -> str:
+    """The comment a workload's source issue gets when its result lands:
+    the run's closing line, then one line per sink it published to. The
+    issue sink's own comment carries the result itself, just above."""
+    lines = [f"Run `{report.run_id}` completed: {report.summary or report.task_summary}"]
+    lines.extend(f"- {published_line(entry)}" for entry in report.published)
+    return "\n".join(lines)
+
+
 def _pr_ref(pr_number: int | None, pr_url: str) -> str:
     if pr_number is None:
         return "its pull request"
@@ -167,10 +184,11 @@ def _pr_ref(pr_number: int | None, pr_url: str) -> str:
 
 
 class GitHubLabels:
-    """The six lifecycle labels. ``trigger`` puts an issue in the queue;
-    ``in_progress`` is the claim marker; ``completed`` is the durable
-    "sbxloop did this" mark applied when the PR merges; ``failed`` and
-    ``blocked`` say the loop gave up or was refused, and both leave the
+    """The seven lifecycle labels. ``trigger`` puts an issue in the queue as
+    a code run and ``workload`` as a workload run (#760); ``in_progress`` is
+    the claim marker; ``completed`` is the durable "sbxloop did this" mark
+    applied when the PR merges or the workload's result lands; ``failed``
+    and ``blocked`` say the loop gave up or was refused, and both leave the
     issue open for a human; ``gated`` marks a run parked behind the opt-in
     merge gate — ready to merge, awaiting one approval."""
 
@@ -182,6 +200,7 @@ class GitHubLabels:
         completed: str = "sbxloop:completed",
         blocked: str = "sbxloop:blocked",
         gated: str = "sbxloop:awaiting-merge",
+        workload: str = "sbxloop:workload",
     ) -> None:
         self.trigger = trigger
         self.in_progress = in_progress
@@ -189,6 +208,12 @@ class GitHubLabels:
         self.completed = completed
         self.blocked = blocked
         self.gated = gated
+        self.workload = workload
+
+    def trigger_for(self, item: WorkItem) -> str:
+        """The label that queued this item — what a restart re-adds and
+        what the claim swaps off."""
+        return self.workload if item.kind == "workload" else self.trigger
 
 
 class GitHubIssueSource:
@@ -414,9 +439,49 @@ class GitHubIssueSource:
         # Unlike the report_* paths this RAISES on failure: the loop backs
         # off a failing source (#254), which it cannot do if a GitHub outage
         # looks like an empty queue.
-        label = self.labels.trigger
-        query = f'repo:{self.repo} is:issue is:open label:"{label}"'
+        # One search per queueing label (#760): the trigger label's issues
+        # become code runs, the workload label's workload runs. An issue in
+        # both is refused, named, rather than guessed at.
         started = time.monotonic()
+        code = self._search(self.labels.trigger, started)
+        workload = self._search(self.labels.workload, started)
+        both = set(code) & set(workload)
+        for number in sorted(both, key=int):
+            self._guard("label conflict", partial(self._refuse_conflict, number=number))
+        items: list[WorkItem] = []
+        kinds: tuple[tuple[dict[str, dict[str, Any]], RunKind], ...] = (
+            (code, "code"),
+            (workload, "workload"),
+        )
+        for rows, kind in kinds:
+            for number, issue in rows.items():
+                if number in both:
+                    continue
+                items.append(
+                    WorkItem(
+                        item_id=issue_item_id(
+                            int(number), repo=self.repo if self.qualify_ids else None
+                        ),
+                        source_key=number,
+                        title=str(issue.get("title") or f"issue #{number}"),
+                        body=str(issue.get("body") or ""),
+                        url=str(issue.get("html_url") or ""),
+                        repo=self.repo,
+                        kind=kind,
+                    )
+                )
+        log.debug(
+            "github.polled",
+            repo=self.repo,
+            issues=len(items),
+            workloads=len(workload) - len(both),
+            duration_s=round(time.monotonic() - started, 2),
+        )
+        return items
+
+    def _search(self, label: str, started: float) -> dict[str, dict[str, Any]]:
+        """The open issues carrying ``label``, by number, in search order."""
+        query = f'repo:{self.repo} is:issue is:open label:"{label}"'
         log.debug("github.poll_start", repo=self.repo, label=label)
         try:
             found = self._ops().search_issues(query, per_page=50)
@@ -430,32 +495,37 @@ class GitHubIssueSource:
             )
             self._failed(exc)
             raise
-        items: list[WorkItem] = []
-        seen: set[str] = set()
+        rows: dict[str, dict[str, Any]] = {}
         for issue in found:
             number = issue.get("number")
-            if not number or str(number) in seen:
-                continue
-            seen.add(str(number))
-            items.append(
-                WorkItem(
-                    item_id=issue_item_id(
-                        int(number), repo=self.repo if self.qualify_ids else None
-                    ),
-                    source_key=str(number),
-                    title=str(issue.get("title") or f"issue #{number}"),
-                    body=str(issue.get("body") or ""),
-                    url=str(issue.get("html_url") or ""),
-                    repo=self.repo,
-                )
-            )
-        log.debug(
-            "github.polled",
+            if number and str(number) not in rows:
+                rows[str(number)] = issue
+        return rows
+
+    def _refuse_conflict(self, ops: GithubOps, number: str) -> None:
+        """An issue wearing both queueing labels asks for two different
+        runs; neither starts. Both labels come off so the human's fix (re-add
+        the one they meant) fires an event, and the failed label marks the
+        refusal the way an abandoned run's would."""
+        log.warning(
+            "github.label_conflict",
             repo=self.repo,
-            issues=len(items),
-            duration_s=round(time.monotonic() - started, 2),
+            issue=number,
+            trigger=self.labels.trigger,
+            workload=self.labels.workload,
+            hint="refused; re-add exactly one of the two labels",
         )
-        return items
+        self._comment(
+            ops,
+            number,
+            f"sbxloop refused this issue: it carries both `{self.labels.trigger}` (a code "
+            f"run) and `{self.labels.workload}` (a workload run), and the loop will not "
+            "guess which was meant. Both labels have been removed — re-add the one you "
+            "meant to queue it.",
+        )
+        self._remove_label(ops, number, self.labels.trigger)
+        self._remove_label(ops, number, self.labels.workload)
+        self._add_label(ops, number, self.labels.failed)
 
     def claim(self, item: WorkItem) -> bool:
         """Re-verify (search lags), take the comment lock, then swap
@@ -479,7 +549,7 @@ class GitHubIssueSource:
         comment are rolled back so a later claimer is not locked out.
         """
         number = item.source_key
-        trigger = self.labels.trigger
+        trigger = self.labels.trigger_for(item)
         added_in_progress = False
         stale: list[str] = []
         comment_id: int | None = None
@@ -507,6 +577,11 @@ class GitHubIssueSource:
                     trigger=trigger,
                     labels=sorted(str(n) for n in names if n),
                 )
+                return False
+            if self.labels.trigger in names and self.labels.workload in names:
+                # Labelled the other way too since the poll (#760): refuse
+                # rather than start whichever run the poll happened to see.
+                self._refuse_conflict(ops, number)
                 return False
             epoch = self._trigger_epoch(ops, number, trigger)
             # The daemon persisted the token before calling (#530), so a
@@ -631,7 +706,7 @@ class GitHubIssueSource:
         # this claim cleared.
         if item is not None and item.restarted:
             lines.append(
-                f"Restarted by re-adding `{self.labels.trigger}`"
+                f"Restarted by re-adding `{self.labels.trigger_for(item)}`"
                 + (f" (clearing {marks} from the previous attempt)" if marks else "")
                 + "; the issue did not need to be edited."
             )
@@ -726,7 +801,8 @@ class GitHubIssueSource:
         number = item.source_key
         try:
             ops = self._ops()
-            epoch = self._trigger_epoch(ops, number)
+            trigger = self.labels.trigger_for(item)
+            epoch = self._trigger_epoch(ops, number, trigger)
             claims = self._claims(ops, number, epoch)
             if not any(c.token == token for c in claims):
                 # Also look outside the cycle window: a claim from before a
@@ -740,8 +816,8 @@ class GitHubIssueSource:
             }
             if self.labels.in_progress not in names:
                 self._add_labels(ops, number, [self.labels.in_progress, *self.extra_labels])
-            if self.labels.trigger in names:
-                self._remove_label(ops, number, self.labels.trigger)
+            if trigger in names:
+                self._remove_label(ops, number, trigger)
         except (GithubOpsError, WorkerError, SbxError) as exc:
             log.warning("github.claim_settle_failed", item=item.item_id, exc_info=True)
             self._failed(exc)
@@ -810,16 +886,16 @@ class GitHubIssueSource:
                 f"sbxloop could not finish: {reason}\n\n{_pr_ref(pr_number, pr_url)} passed "
                 "the loop's own review and checks but GitHub would not let the loop land it. "
                 "A human needs to look: merge or fix it by hand and close this issue, or "
-                f"re-add `{self.labels.trigger}` once the cause is dealt with — the issue "
-                f"does not need to be edited and `{self.labels.blocked}` does not need "
-                "removing by hand (the claim clears it), and the restart continues on this "
-                "branch and pull request.",
+                f"re-add `{self.labels.trigger_for(item)}` once the cause is dealt with — "
+                f"the issue does not need to be edited and `{self.labels.blocked}` does not "
+                "need removing by hand (the claim clears it), and the restart continues on "
+                "this branch and pull request.",
             )
             self._remove_label(ops, n, self.labels.in_progress)
             # A trigger label still on the issue would make the human's
             # re-add a no-op — GitHub fires no event for a label already
             # there, which is how the label went inert (#596).
-            self._remove_label(ops, n, self.labels.trigger)
+            self._remove_label(ops, n, self.labels.trigger_for(item))
             self._add_label(ops, n, self.labels.blocked)
             return True
 
@@ -848,6 +924,22 @@ class GitHubIssueSource:
 
         return bool(self._guard("gated report", go))
 
+    def report_completed(self, item: WorkItem, report: RunReport) -> bool:
+        """A workload delivered its result (#760): the issue that asked for
+        it gets the closing line and where each sink put it, the completed
+        label as the durable mark, and is closed. Same contract as
+        :meth:`report_merged` — True only when every step landed."""
+
+        def go(ops: GithubOps) -> bool:
+            n = item.source_key
+            self._comment(ops, n, _completed_body(report))
+            self._remove_label(ops, n, self.labels.in_progress)
+            self._add_label(ops, n, self.labels.completed)
+            ops.raw("PATCH", self._issue_path(n), {"state": "closed", "state_reason": "completed"})
+            return True
+
+        return bool(self._guard("completed report", go))
+
     def report_retry(self, item: WorkItem, error: str, attempts_left: int) -> None:
         self._guard(
             "retry comment",
@@ -865,8 +957,8 @@ class GitHubIssueSource:
                 ops,
                 n,
                 f"Abandoned after retries: {error}\n\nRe-add "
-                f"`{self.labels.trigger}` to run it again — the issue does not need to be "
-                f"edited and `{self.labels.failed}` does not need to be removed by hand "
+                f"`{self.labels.trigger_for(item)}` to run it again — the issue does not need "
+                f"to be edited and `{self.labels.failed}` does not need to be removed by hand "
                 "(the claim clears it), and the restart continues from any branch or "
                 "PR a previous attempt pushed.",
             )
@@ -875,7 +967,7 @@ class GitHubIssueSource:
             # keeps the item polling as work, and it makes the human's
             # re-add a no-op — GitHub fires no event for a label already
             # there, which is exactly how the label went inert (#596).
-            self._remove_label(ops, n, self.labels.trigger)
+            self._remove_label(ops, n, self.labels.trigger_for(item))
             self._add_label(ops, n, self.labels.failed)
 
         self._guard("abandon report", go)
@@ -892,8 +984,8 @@ class GitHubIssueSource:
                 # changed (#600) and the restart continues on whatever
                 # branch/PR this attempt already pushed.
                 lines.append(
-                    f"To continue it: re-add `{self.labels.trigger}` — the next poll picks "
-                    "the issue back up and resumes from the branch and PR this run already "
+                    f"To continue it: re-add `{self.labels.trigger_for(item)}` — the next poll "
+                    "picks the issue back up and resumes from the branch and PR this run already "
                     f"pushed. `!sbx retry {item.item_id}` in Discord restarts it from scratch "
                     "instead."
                 )
@@ -905,7 +997,7 @@ class GitHubIssueSource:
                 # human's re-add a no-op — GitHub does not re-fire an event
                 # for a label that is already there (#596). Clear it so the
                 # documented restart gesture actually works.
-                self._remove_label(ops, n, self.labels.trigger)
+                self._remove_label(ops, n, self.labels.trigger_for(item))
 
         self._guard("cancel report", go)
 
@@ -1225,6 +1317,9 @@ class MultiRepoIssueSource:
     def report_gated(self, item: WorkItem, pr_number: int | None, pr_url: str) -> bool:
         return self.for_item(item).report_gated(item, pr_number, pr_url)
 
+    def report_completed(self, item: WorkItem, report: RunReport) -> bool:
+        return self.for_item(item).report_completed(item, report)
+
 
 def build_github_source(
     ops: Callable[[], GithubOps],
@@ -1277,7 +1372,7 @@ def build_github_source(
 
 def _repo_labels(labels: GitHubLabels, entry: RepoConfig) -> GitHubLabels:
     """The daemon labels with the repository's overrides applied — a
-    straight merge of the entry's six ``<kind>_label`` fields over the
+    straight merge of the entry's seven ``<kind>_label`` fields over the
     daemon-wide set (#630)."""
     return GitHubLabels(
         entry.trigger_label or labels.trigger,
@@ -1286,4 +1381,136 @@ def _repo_labels(labels: GitHubLabels, entry: RepoConfig) -> GitHubLabels:
         entry.completed_label or labels.completed,
         entry.blocked_label or labels.blocked,
         entry.gated_label or labels.gated,
+        entry.workload_label or labels.workload,
     )
+
+
+# -- chat ---------------------------------------------------------------------------
+
+
+class ChatSource:
+    """The queue the concierge feeds directly (#760).
+
+    A workload asked for in chat has no issue to poll or label: the
+    concierge's ``start_workload`` tool writes the item straight into the
+    store, so ``poll`` finds nothing, ``claim`` is a formality and every
+    report is a log line — the run's own chat thread (opened at dispatch,
+    as for any run) carries the chronology, and the chat sink posts the
+    result there. ``settle_claim`` is False because a chat item never holds
+    a claim token: the daemon clears it and claims again, which is free.
+    """
+
+    name = "chat"
+
+    def poll(self) -> list[WorkItem]:
+        return []
+
+    def claim(self, item: WorkItem) -> bool:
+        log.info("chat.claimed", item=item.item_id, kind=item.kind, profile=item.profile)
+        return True
+
+    def settle_claim(self, item: WorkItem) -> bool:
+        return False
+
+    def report_started(self, item: WorkItem, run_id: str) -> None:
+        log.info("chat.run_started", item=item.item_id, run_id=run_id)
+
+    def report_retry(self, item: WorkItem, error: str, attempts_left: int) -> None:
+        log.info("chat.retry", item=item.item_id, error=error, attempts_left=attempts_left)
+
+    def report_abandoned(self, item: WorkItem, error: str) -> None:
+        log.warning("chat.abandoned", item=item.item_id, error=error)
+
+    def report_cancelled(self, item: WorkItem, report: RunReport) -> None:
+        log.info("chat.cancelled", item=item.item_id, run_id=report.run_id, by=report.cancelled_by)
+
+    def report_requeued(self, item: WorkItem, by: str) -> None:
+        log.info("chat.requeued", item=item.item_id, by=by)
+
+    def report_merged(self, item: WorkItem, pr_number: int | None, pr_url: str) -> bool:
+        log.info("chat.merged", item=item.item_id, pr=pr_number)
+        return True
+
+    def report_blocked(
+        self, item: WorkItem, reason: str, pr_number: int | None, pr_url: str
+    ) -> bool:
+        log.warning("chat.blocked", item=item.item_id, reason=reason, pr=pr_number)
+        return True
+
+    def report_gated(self, item: WorkItem, pr_number: int | None, pr_url: str) -> bool:
+        log.info("chat.gated", item=item.item_id, pr=pr_number)
+        return True
+
+    def report_completed(self, item: WorkItem, report: RunReport) -> bool:
+        log.info(
+            "chat.completed",
+            item=item.item_id,
+            run_id=report.run_id,
+            published=[entry.sink for entry in report.published],
+        )
+        return True
+
+
+class CompositeSource:
+    """The GitHub source and the chat source behind one queue (#760).
+
+    Polling is GitHub's; everything keyed on an item goes to the source its
+    id names — ``chat:`` ids to the chat source, the rest to GitHub. The
+    multi-repo extras the loop and the CLI reach for by name
+    (``repo_health``, ``resume_repo``, ``issue_context``, ``notify``) are
+    GitHub's, and only there when GitHub provides them.
+    """
+
+    name = "github+chat"
+
+    def __init__(self, github: WorkSource, chat: WorkSource) -> None:
+        self.github = github
+        self.chat = chat
+
+    def for_item(self, item: WorkItem) -> WorkSource:
+        return self.chat if is_chat_id(item.item_id) else self.github
+
+    def __getattr__(self, name: str) -> Any:
+        # `repo_health`, `resume_repo`, `issue_context`, `notify`, … —
+        # whatever the GitHub source offers beyond the protocol.
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self.github, name)
+
+    def poll(self) -> list[WorkItem]:
+        return [*self.github.poll(), *self.chat.poll()]
+
+    def claim(self, item: WorkItem) -> bool:
+        return self.for_item(item).claim(item)
+
+    def settle_claim(self, item: WorkItem) -> bool:
+        return self.for_item(item).settle_claim(item)
+
+    def report_started(self, item: WorkItem, run_id: str) -> None:
+        self.for_item(item).report_started(item, run_id)
+
+    def report_retry(self, item: WorkItem, error: str, attempts_left: int) -> None:
+        self.for_item(item).report_retry(item, error, attempts_left)
+
+    def report_abandoned(self, item: WorkItem, error: str) -> None:
+        self.for_item(item).report_abandoned(item, error)
+
+    def report_cancelled(self, item: WorkItem, report: RunReport) -> None:
+        self.for_item(item).report_cancelled(item, report)
+
+    def report_requeued(self, item: WorkItem, by: str) -> None:
+        self.for_item(item).report_requeued(item, by)
+
+    def report_merged(self, item: WorkItem, pr_number: int | None, pr_url: str) -> bool:
+        return self.for_item(item).report_merged(item, pr_number, pr_url)
+
+    def report_blocked(
+        self, item: WorkItem, reason: str, pr_number: int | None, pr_url: str
+    ) -> bool:
+        return self.for_item(item).report_blocked(item, reason, pr_number, pr_url)
+
+    def report_gated(self, item: WorkItem, pr_number: int | None, pr_url: str) -> bool:
+        return self.for_item(item).report_gated(item, pr_number, pr_url)
+
+    def report_completed(self, item: WorkItem, report: RunReport) -> bool:
+        return self.for_item(item).report_completed(item, report)

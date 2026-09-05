@@ -42,7 +42,9 @@ ItemState = Literal[
 # owed until the issue close / label actually landed on GitHub.
 # ``gated`` is the park announcement: the issue gets the awaiting-merge
 # label and the how-to-approve comment.
-PendingReport = Literal["abandoned", "requeued", "merged", "blocked", "gated"]
+# ``completed`` is a workload's outcome (#760): its result published, the
+# source told where it went.
+PendingReport = Literal["abandoned", "requeued", "merged", "blocked", "gated", "completed"]
 
 
 class WorkItem(BaseModel):
@@ -62,6 +64,11 @@ class WorkItem(BaseModel):
     finish can ping them. ``repo`` is the ``owner/name`` the item came from;
     it is optional so items persisted before multi-repo support still load,
     and readers fall back to the daemon's sole configured repository.
+    ``kind`` is the run the item becomes (#760): a ``code`` run for a
+    labelled issue, a ``workload`` for a chat ask or an issue carrying the
+    workload label, under ``profile`` (a ``[[workloads]]`` name, or None
+    for the configured default). Rows written before there were two kinds
+    read as ``code``.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -96,6 +103,8 @@ class WorkItem(BaseModel):
     prior_run_id: str | None = None
     prior_branch: str | None = None
     prior_pr_number: int | None = None
+    kind: RunKind = "code"
+    profile: str | None = None
 
     @property
     def restarted(self) -> bool:

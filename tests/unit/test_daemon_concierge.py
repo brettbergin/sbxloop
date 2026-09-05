@@ -263,6 +263,7 @@ class TestJobShape:
             "run_usage",
             "usage_today",
             "daemon_log",
+            "start_workload",
         ]  # no github_get: no repo configured; the rest need nothing
         assert job.host_tools_dir is None  # the WorkerClient fills it in
         assert job.system_message and "sbxloop concierge" in job.system_message
@@ -2446,3 +2447,139 @@ class TestSurface:
         assert concierge.config.chat_backend is None
         assert concierge._chat is concierge.config.tui
         assert concierge._chat_name == "the operator console"
+
+
+class TestStartWorkload:
+    """#760: the concierge queues a workload straight into the daemon's
+    store — one tool call, no issue, no label — keyed on the message that
+    asked, under a profile the config declares and a sink it allows."""
+
+    PROFILES: ClassVar[dict[str, Any]] = {
+        "workloads": [
+            {
+                "name": "research",
+                "sinks": ["issue", "artifact"],
+                "description": "reads the web, writes a report",
+            },
+            {"name": "quiet"},
+        ],
+        "workload": {"default": "research"},
+    }
+
+    def _call(
+        self, tmp_path: Path, args: dict[str, Any], *, config: dict[str, Any] | None = None
+    ) -> tuple[str, DaemonStore, Any]:
+        concierge, client, _, loop, dstore = make(
+            tmp_path,
+            [{"calls": [("start_workload", args)], "text": "queued"}],
+            config=self.PROFILES if config is None else config,
+        )
+        future = concierge.submit_turn(
+            "please", author="Discord user `ana`", author_id="777", message_id="9001"
+        )
+        future.result(timeout=10)
+        (response,) = client.responses
+        assert response.ok
+        return response.text or "", dstore, loop
+
+    def test_queues_a_chat_item_under_the_default_profile(self, tmp_path: Path) -> None:
+        text, dstore, _ = self._call(
+            tmp_path, {"ask": "Summarise last week's deploys\n\nOne paragraph per day."}
+        )
+        assert text.startswith("queued workload `chat:9001` under profile `research`")
+        assert "within 60s" in text and "run thread will appear here" in text
+        item = dstore.get("chat:9001")
+        assert item is not None
+        assert item.kind == "workload" and item.profile == "research"
+        assert item.source_key == "9001" and item.state == "queued"
+        assert item.title == "Summarise last week's deploys"
+        assert item.body.startswith("Summarise last week's deploys\n\nOne paragraph per day.")
+        assert item.requested_by == "777" and item.repo is None and item.url == ""
+
+    def test_a_named_profile_and_an_allowed_sink_are_carried(self, tmp_path: Path) -> None:
+        text, dstore, _ = self._call(
+            tmp_path, {"ask": "Write the report", "profile": "research", "sink": "issue"}
+        )
+        assert "under profile `research`" in text
+        item = dstore.get("chat:9001")
+        assert item is not None and item.profile == "research"
+        assert item.body.endswith("Deliver the result through the `issue` sink.")
+
+    def test_the_chat_sink_adds_nothing_to_the_ask(self, tmp_path: Path) -> None:
+        _, dstore, _ = self._call(tmp_path, {"ask": "Just answer", "sink": "chat"})
+        assert dstore.get("chat:9001").body == "Just answer"  # type: ignore[union-attr]
+
+    def test_a_sink_the_profile_does_not_allow_is_refused(self, tmp_path: Path) -> None:
+        text, dstore, _ = self._call(tmp_path, {"ask": "x", "profile": "quiet", "sink": "issue"})
+        assert text.startswith("sink `issue` is not one profile `quiet` allows (chat)")
+        assert dstore.get("chat:9001") is None
+
+    def test_an_unknown_sink_or_profile_is_refused_by_name(self, tmp_path: Path) -> None:
+        text, dstore, _ = self._call(tmp_path, {"ask": "x", "sink": "carrier-pigeon"})
+        assert text.startswith("unknown sink 'carrier-pigeon'; one of chat, issue, artifact, pr")
+        text, _, _ = self._call(tmp_path / "b", {"ask": "x", "profile": "nope"})
+        assert "workload profile 'nope' is not declared" in text
+        assert "declared: research, quiet" in text
+        assert dstore.get("chat:9001") is None
+
+    def test_an_empty_ask_is_refused(self, tmp_path: Path) -> None:
+        text, dstore, _ = self._call(tmp_path, {"ask": "  "})
+        assert text == "an ask is required"
+        assert dstore.get("chat:9001") is None
+
+    def test_no_profiles_means_no_profile_and_chat_only(self, tmp_path: Path) -> None:
+        text, dstore, _ = self._call(tmp_path, {"ask": "count to ten"}, config={})
+        assert "under no profile" in text
+        item = dstore.get("chat:9001")
+        assert item is not None and item.profile is None and item.kind == "workload"
+        text, _, _ = self._call(tmp_path / "b", {"ask": "x", "sink": "artifact"}, config={})
+        assert "is not one a run with no profile allows (chat)" in text
+
+    def test_the_same_message_queues_one_run(self, tmp_path: Path) -> None:
+        concierge, client, _, _, dstore = make(
+            tmp_path,
+            [
+                {"calls": [("start_workload", {"ask": "once"})]},
+                {"calls": [("start_workload", {"ask": "once"})]},
+            ],
+            config=self.PROFILES,
+        )
+        for _ in range(2):
+            concierge.submit_turn("once", author="a", message_id="5").result(timeout=10)
+        first, second = client.responses
+        assert first.text and first.text.startswith("queued workload `chat:5`")
+        assert second.text == "`chat:5` is already queued or running (profile `research`)."
+        assert dstore.get("chat:5") is not None
+
+    def test_a_turn_without_a_message_id_gets_a_fresh_key(self, tmp_path: Path) -> None:
+        concierge, client, _, _, dstore = make(
+            tmp_path,
+            [{"calls": [("start_workload", {"ask": "from the console"})]}],
+            config=self.PROFILES,
+        )
+        turn(concierge, "go")
+        (response,) = client.responses
+        assert response.text and response.text.startswith("queued workload `chat:")
+        (item,) = dstore.items()
+        assert item.item_id.startswith("chat:") and item.item_id != "chat:"
+        assert item.requested_by is None
+
+    def test_mentions_a_paused_daemon_or_an_open_breaker(self, tmp_path: Path) -> None:
+        concierge, client, _, loop, _ = make(
+            tmp_path, [{"calls": [("start_workload", {"ask": "x"})]}], config=self.PROFILES
+        )
+        loop.paused = True
+        turn(concierge)
+        assert "PAUSED" in (client.responses[0].text or "")
+
+    def test_the_prompt_lists_the_profiles(self, tmp_path: Path) -> None:
+        concierge, client, _, _, _ = make(tmp_path, [{"text": "hi"}], config=self.PROFILES)
+        turn(concierge)
+        (job,) = client.jobs
+        assert job.system_message is not None
+        assert "`research` (default): sinks issue, artifact — reads the web" in job.system_message
+        assert "`quiet`: sinks chat only" in job.system_message
+        assert "sbxloop:workload" in job.system_message
+        (tool,) = [t for t in job.host_tools if t.name == "start_workload"]
+        assert tool.parameters["properties"]["sink"]["enum"] == ["chat", "issue", "artifact", "pr"]
+        assert tool.parameters["required"] == ["ask"]

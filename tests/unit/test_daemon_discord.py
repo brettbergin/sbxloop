@@ -331,6 +331,7 @@ class FakeConcierge:
         author_id: str | None = None,
         on_tool: Any = None,
         via: str | None = None,
+        message_id: str | None = None,
     ) -> Any:
         import concurrent.futures
 
@@ -339,6 +340,7 @@ class FakeConcierge:
         self.turns.append((text, author))
         self.author_ids = [*getattr(self, "author_ids", []), author_id]
         self.vias = [*getattr(self, "vias", []), via]
+        self.message_ids = [*getattr(self, "message_ids", []), message_id]
         future: concurrent.futures.Future[Any] = concurrent.futures.Future()
 
         def run() -> None:

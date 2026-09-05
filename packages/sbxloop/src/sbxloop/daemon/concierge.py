@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
 from urllib.parse import quote
 
 from sbxloop.cli.tui import format_event
-from sbxloop.config import BridgeBackend, Config
+from sbxloop.config import SINK_NAMES, BridgeBackend, Config
 from sbxloop.daemon.chat_choices import (
     ChoiceQuestion,
     PendingFiling,
@@ -50,6 +50,7 @@ from sbxloop.daemon.chat_choices import (
 )
 from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX, dispatch, format_log_tail, plain
 from sbxloop.daemon.loop import day_window
+from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.store import ChatThread, DaemonStore
 from sbxloop.daemon.usage import (
     SPEND_NOT_REPORTED,
@@ -64,6 +65,7 @@ from sbxloop.engine.model import TERMINAL_RUN_STATES, RunState
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
+    ConfigError,
     DaemonError,
     GithubOpsError,
     ProvisionError,
@@ -73,8 +75,8 @@ from sbxloop.errors import (
     WorkerTimeoutError,
 )
 from sbxloop.events import EventBus
-from sbxloop.ghids import issue_item_id, normalize_item_id
-from sbxloop.ids import new_job_id
+from sbxloop.ghids import chat_item_id, issue_item_id, normalize_item_id
+from sbxloop.ids import new_job_id, new_run_id
 from sbxloop.log import get_logger
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import (
@@ -262,6 +264,7 @@ class Concierge:
         # an issue they ask for records them as its requester. Turns run one
         # at a time on the executor, so one slot is enough.
         self._turn_author_id: str | None = None
+        self._turn_message_id: str | None = None
 
         self.host = host
         self.bus = bus
@@ -329,11 +332,14 @@ class Concierge:
         author_id: str | None = None,
         on_tool: ToolCallback | None = None,
         via: str | None = None,
+        message_id: str | None = None,
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
         recorded as the requester of any issue this turn files; ``via`` is
-        the bridge the message came in on, so the reply is worded for it."""
+        the bridge the message came in on, so the reply is worded for it;
+        ``message_id`` is the transport's id for the message, the key of a
+        workload this turn starts (#760) so asking twice queues once."""
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("concierge is closed")
@@ -344,11 +350,13 @@ class Concierge:
                 self._pending -= 1
             self._turn_author_id = author_id
             self._turn_via = via
+            self._turn_message_id = message_id
             try:
                 return self._run_turn(text, author=author, on_tool=on_tool)
             finally:
                 self._turn_author_id = None
                 self._turn_via = None
+                self._turn_message_id = None
 
         return self._executor.submit(run)
 
@@ -560,6 +568,9 @@ class Concierge:
             f"{self._chat_name}: one thread per run"
             if self._chat.thread_per_run
             else f"{self._chat_name}: runs post in the control channel",
+            "a workload run (`start_workload`, or an issue carrying the "
+            f"`{daemon.workload_label}` label) ends `completed` once its result is "
+            "published; it never opens a pull request unless a task asked for the `pr` sink",
         ]
         return render(
             "concierge",
@@ -569,6 +580,10 @@ class Concierge:
             repos=bullet_list(self._repo_lines()) or "(no GitHub repository configured)",
             model=self.config.concierge.model or self.config.model,
             trigger_label=self.config.daemon.trigger_label,
+            workload_label=daemon.workload_label,
+            workloads=bullet_list(self._workload_lines())
+            or "(no `[[workloads]]` profile declared: a workload runs with no profile and "
+            "may declare no needs — chat is its only sink)",
             tool_notes=bullet_list(
                 [f"`{t.spec.name}` — {t.spec.description}" for t in self._tools.values()]
             ),
@@ -794,6 +809,35 @@ class Concierge:
                     ),
                 ),
                 self._tool_daemon_log,
+            ),
+            HostTool(
+                HostToolSpec(
+                    name="start_workload",
+                    description=(
+                        "Queue a WORKLOAD run (#760): the operator persona takes `ask` — "
+                        "the person's request, in their words, with whatever detail they "
+                        "gave — plans it into tasks, does them in its own data directory, "
+                        "judges the result against the ask and publishes it. Use it for "
+                        "anything that is not a change to a repository: research, a "
+                        "report, a data pull, a document, a check against a service. One "
+                        "call, no confirmation. `profile` names a `[[workloads]]` profile "
+                        "(what the run may reach, use and publish to); omit it for the "
+                        "daemon's default. `sink` says where the result should go — "
+                        "`chat` (the run's thread, the default), `issue`, `artifact` or "
+                        "`pr` — and must be one the profile allows, or the run refuses it. "
+                        "The reply names the queued item; a run thread appears here when "
+                        "it starts and the person is pinged when it finishes."
+                    ),
+                    parameters=_schema(
+                        {
+                            "ask": {"type": "string"},
+                            "profile": {"type": "string"},
+                            "sink": {"type": "string", "enum": list(SINK_NAMES)},
+                        },
+                        ["ask"],
+                    ),
+                ),
+                self._tool_start_workload,
             ),
         ]
         if self.config.github.repo_list():
@@ -1320,6 +1364,81 @@ class Concierge:
             tail=_int_arg(args, "tail", 50, 1, LOG_TAIL_MAX),
             level=str(args.get("level") or "").strip().upper() or None,
             grep=str(args.get("grep") or "") or None,
+        )
+
+    def _workload_lines(self) -> list[str]:
+        """One line per `[[workloads]]` profile, for the prompt."""
+        lines = []
+        for profile in self.config.workloads:
+            default = " (default)" if profile.name == self.config.workload.default else ""
+            sinks = ", ".join(profile.sinks) or "chat only"
+            about = f" — {profile.description}" if profile.description else ""
+            lines.append(f"`{profile.name}`{default}: sinks {sinks}{about}")
+        return lines
+
+    def _tool_start_workload(self, args: dict[str, Any], by: str) -> str:
+        ask = str(args.get("ask", "")).strip()
+        if not ask:
+            return "an ask is required"
+        wanted = str(args.get("profile") or "").strip() or None
+        try:
+            profile = self.config.workload_profile(wanted)
+        except ConfigError as exc:
+            return str(exc)
+        sink = str(args.get("sink") or "").strip() or None
+        if sink is not None and sink not in SINK_NAMES:
+            return f"unknown sink {sink!r}; one of {', '.join(SINK_NAMES)}"
+        allowed = ("chat", *(profile.sinks if profile is not None else ()))
+        if sink is not None and sink not in allowed:
+            who = f"profile `{profile.name}`" if profile is not None else "a run with no profile"
+            return (
+                f"sink `{sink}` is not one {who} allows ({', '.join(allowed)}); "
+                "the run would refuse it. Pick an allowed sink or a profile that names it."
+            )
+        if sink is not None and sink != "chat":
+            ask = f"{ask}\n\nDeliver the result through the `{sink}` sink."
+        # The message id keys the item, so the same ask reaching the tool
+        # twice (a retried turn) queues one run; a turn with no id (the
+        # operator console) gets a fresh key.
+        key = self._turn_message_id or new_run_id()
+        title = next((ln.strip() for ln in ask.splitlines() if ln.strip()), "workload")
+        item = WorkItem(
+            item_id=chat_item_id(key),
+            source_key=key,
+            title=title if len(title) <= 120 else title[:119] + "…",
+            body=ask,
+            url="",
+            kind="workload",
+            profile=profile.name if profile is not None else None,
+            requested_by=self._turn_author_id,
+        )
+        try:
+            queued = self.dstore.upsert_new(item, self.clock())
+        except DaemonError as exc:
+            return f"queueing the workload failed: {_one_line(str(exc), 300)}"
+        log.info(
+            "concierge.workload_queued",
+            item=item.item_id,
+            profile=item.profile,
+            sink=sink,
+            by=by,
+            fresh=queued,
+            title=item.title[:80],
+        )
+        profile_text = f"profile `{profile.name}`" if profile is not None else "no profile"
+        if not queued:
+            return f"`{item.item_id}` is already queued or running ({profile_text})."
+        status = self.loop.status()
+        note = ""
+        if status.get("paused"):
+            note = " The daemon is PAUSED — nothing runs until `resume`."
+        elif status.get("breaker_open"):
+            note = " The breaker is OPEN — nothing runs until it resets."
+        return (
+            f"queued workload `{item.item_id}` under {profile_text} — the daemon starts it "
+            f"within {self.config.daemon.poll_interval_s:g}s, after anything already queued; "
+            "a run thread will appear here and the person will be pinged when the result "
+            f"is published.{note}"
         )
 
     def _tool_list_repos(self, args: dict[str, Any], by: str) -> str:

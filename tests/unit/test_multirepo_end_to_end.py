@@ -121,7 +121,10 @@ def multi(tmp_path: Path) -> Wiring:
 class TestMultiRepoDaemon:
     def test_discovery_spans_both_repos_with_qualified_ids(self, multi: Wiring) -> None:
         items = multi.source.poll()
-        assert multi.router.searched == ["o/a", "o/b"]
+        assert list(dict.fromkeys(multi.router.searched)) == [
+            "o/a",
+            "o/b",
+        ]  # two labels per repo (#760)
         assert [i.item_id for i in items] == ["gh:o/a:issue:4", "gh:o/b:issue:7"]
         assert [i.repo for i in items] == ["o/a", "o/b"]
 
@@ -186,7 +189,7 @@ class TestSingleRepoBackCompat:
     def test_ids_stay_unqualified_and_only_that_repo_is_polled(self, single: Wiring) -> None:
         items = single.source.poll()
         assert [i.item_id for i in items] == ["gh:issue:4"]
-        assert single.router.searched == ["o/a"]
+        assert list(dict.fromkeys(single.router.searched)) == ["o/a"]  # two labels per repo (#760)
 
     def test_a_run_merges_and_closes_the_issue_as_before(self, single: Wiring) -> None:
         assert single.loop.tick().dispatched == "gh:issue:4"

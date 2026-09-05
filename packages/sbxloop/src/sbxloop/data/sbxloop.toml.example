@@ -515,7 +515,9 @@ secret_strategy = "proxy"
 # completed_label = "sbxloop:completed"  # applied when the PR merges
 # blocked_label = "sbxloop:blocked"      # the loop could not land the PR; a human looks
 # gated_label = "sbxloop:awaiting-merge"  # parked by merge_gate; awaiting approval
-# `sbxloop init-repo owner/name` creates all six (plus [landing] followup_label)
+# workload_label = "sbxloop:workload"    # queues the issue as a workload (an issue
+#                                        # carrying trigger_label too is refused)
+# `sbxloop init-repo owner/name` creates all seven (plus [landing] followup_label)
 # on a repository, with colors and descriptions; `doctor` reports missing ones.
 # max_runs_per_day = 12           # calendar-day cap, persisted across restarts
 # run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)

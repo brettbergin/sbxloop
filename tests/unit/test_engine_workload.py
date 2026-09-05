@@ -1194,6 +1194,38 @@ class TestSinks:
         (grant,) = [e for e in harness.events if e.type == HostEventTypes.RUN_NEEDS_GRANTED]
         assert grant.data["sinks"] == ["issue"]
 
+    def test_the_issue_sink_answers_on_the_asking_issue(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        """A workload queued by an issue (#760): the daemon pins
+        `[workload] result_issue`, and the issue sink comments there
+        instead of filing a result issue of its own."""
+        fake = FakeGithub()
+        harness.script([plan(needing("t1", sink="issue"), title="Digest"), BUILD, PASS])
+        engine = harness.engine(
+            **{
+                **profiled,
+                "workloads": [PUBLISHING],
+                "workload": {"default": "research", "result_issue": 12},
+            },
+            ops=fake,
+            github={"repo": fake.repo},
+        )
+        result = engine.start("write the digest", kind="workload")
+        assert result.state == "completed", result.reason
+        assert fake.issues_created == [] and fake.labels_created == []
+        ((number, body),) = fake.issue_answers
+        assert number == 12
+        assert body.startswith("Digest — 1/1 task(s) passed the judge\n")
+        assert body.endswith(
+            f"---\n*sbxloop run `{result.run_id}`*\n\n**Asked:** write the digest\n"
+        )
+        url = f"https://github.com/{fake.repo}/issues/12#issuecomment-1"
+        (posted,) = self.published(harness)
+        assert (posted["sink"], posted["location"]) == ("issue", url)
+        assert posted["message"] == f"result answered on the issue: {url}"
+        assert [(p.sink, p.location) for p in result.published] == [("issue", url)]
+
     def test_a_custom_result_label(self, harness: Harness, profiled: dict[str, Any]) -> None:
         fake = FakeGithub()
         harness.script([plan(needing("t1", sink="issue")), BUILD, PASS])

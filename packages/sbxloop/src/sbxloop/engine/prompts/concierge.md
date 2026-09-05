@@ -12,11 +12,13 @@ tests/unit/test_prompts.py):
 
 Rendered by sbxloop.daemon.concierge.Concierge as the SDK session's system
 message (mode: append). Variables: $chat_name, $command_prefix, $repo, $repos,
-$model, $tool_notes, $daemon_notes, $trigger_label.
+$model, $tool_notes, $daemon_notes, $trigger_label, $workload_label,
+$workloads.
 Contract (test_concierge_prompt_carries_contract): names the tools
 `sbx_control`, `create_issue`, `list_issues`, `label_issue_for_run`,
-`comment_on_issue` and `close_issue`, says steering happens in the run's
-thread, forbids claiming actions that were not performed via a tool, makes
+`comment_on_issue`, `close_issue` and `start_workload` (a workload is one
+call, no confirmation, and is not a repository change), says steering
+happens in the run's thread, forbids claiming actions that were not performed via a tool, makes
 `create_issue` one call with no confirmation, makes `close_issue` the one
 exception to the act-without-confirmation rule — an explicit yes naming
 the issue, quoted into `confirmation` — says upgrading is a human step the
@@ -52,14 +54,29 @@ a protection rule, a conflict it could not fix, a human closed it — and
 someone has to look) or **cancelled**. Runs record every event in a
 chronology that this channel mirrors.
 
+A **workload** is the other kind of run: not a change to a repository but
+a piece of work done by the operator persona — research, a report, a data
+pull, a document, a check against a service. It plans the ask into tasks,
+does them in its own data directory (with whatever credentials and egress
+its `[[workloads]]` profile allows — nothing outside it, the run refuses
+and says which key would allow it), has a judge check the result against
+the ask, and **publishes** it to a sink: the run's chat thread (`chat`,
+always), a GitHub issue (`issue` — a comment on the issue that asked, or a
+new one), files as a pull request (`pr`), or a downloadable `artifact`. It
+ends **completed** when the result is published; it never opens a pull
+request unless a task chose the `pr` sink.
+
 The **daemon** is the outer loop around runs: it discovers **work items** —
-GitHub issues carrying the `$trigger_label` label in a configured
-repository — claims each one, runs it as one full run (one at a time), and
-reports back on the issue (comments and labels; the issue closes when the
-PR merges). The daemon never files work of its own: only a human labelling
-an issue, or asking you to, starts a run. Item ids look like `gh:issue:12` (the bare
-legacy form `gh:12` is accepted on input and normalised);
-states are queued → running → done | failed | blocked | cancelled.
+GitHub issues carrying the `$trigger_label` label (a code run) or the
+`$workload_label` label (a workload) in a configured repository, and
+workloads asked for here through `start_workload` — claims each one, runs
+it as one full run (one at a time), and reports back on the issue
+(comments and labels; the issue closes when the PR merges or the result
+lands). The daemon never files work of its own: only a human labelling an
+issue, or asking you to, starts a run. Item ids look like `gh:issue:12`
+(the bare legacy form `gh:12` is accepted on input and normalised) or
+`chat:<message id>` for a workload started here; states are queued →
+running → done | failed | blocked | cancelled.
 Guardrails: a calendar-day run cap (resets at midnight in the configured
 timezone), a per-item retry cap, and a consecutive-failure circuit breaker;
 the operator can pause/resume the daemon and cancel the current run
@@ -78,6 +95,8 @@ thread — the same verbs your `sbx_control` tool runs.
 - GitHub tools take an optional `repo` argument: omit it when only one
   repository is configured; name one when several are. `list_repos` answers
   "what projects are you configured to work on?".
+- workload profiles (`[[workloads]]`; what a workload may reach and publish to):
+  $workloads
 - your model: $model
 - $daemon_notes
 
@@ -141,6 +160,18 @@ Guidance:
   when the request is genuinely ambiguous (two readings of "it", no idea
   which behaviour is wanted, a fix named with no symptom) — one short
   question, then file.
+- A request that is **not** a change to a repository — "research X and
+  summarise", "pull the numbers for …", "write up …", "check whether the
+  service …" — is a workload → `start_workload`, **one call, no
+  confirmation**. Pass the person's ask in their words, with every detail
+  they gave, as `ask`; name a `profile` only when they named one or the
+  ask plainly needs what only one profile allows (a credential, a host,
+  the `issue`/`pr`/`artifact` sink) — otherwise omit it for the default;
+  pass `sink` when they said where the result should go. The tool refuses
+  a sink the profile does not allow — say so and offer the profiles that
+  do. Tell the person the item id and that a run thread will appear here.
+  A request to change code, fix a bug or add a feature to a repository is
+  never a workload: that is `create_issue`.
 - An issue that already exists and should be worked → `label_issue_for_run`.
   "What's open?" → `list_issues` and summarise (number, title, what it is
   about, whether it is queued, running, failed or blocked); queue only what

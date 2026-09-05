@@ -1,7 +1,7 @@
 """The repository labels sbxloop relies on, and the one place that creates
 them (#630).
 
-The daemon's six lifecycle labels (`[daemon] *_label`, per-repo overrides
+The daemon's seven lifecycle labels (`[daemon] *_label`, per-repo overrides
 on `[[github.repos]]`) and the follow-up label (`[landing] followup_label`)
 are ordinary repository labels: GitHub attaches an unknown label name to an
 issue without creating it, so a repository that was never set up shows the
@@ -42,6 +42,7 @@ LIFECYCLE_DESCRIPTORS: dict[str, tuple[str, str]] = {
     "completed": ("6f42c1", "sbxloop landed this: its pull request merged"),
     "blocked": ("e99695", "sbxloop could not land this; a human needs to look"),
     "gated": ("1d76db", "sbxloop is ready to merge this; awaiting one approval"),
+    "workload": ("0052cc", "queued for sbxloop as a workload: the result comes back as a comment"),
 }
 FOLLOWUP_DESCRIPTOR = ("c5def5", "filed by sbxloop after a merge")
 
@@ -49,7 +50,7 @@ EnsureResult = Literal["created", "present", "failed"]
 
 
 def lifecycle_specs(labels: LabelSet, followup: str | None = None) -> list[LabelSpec]:
-    """The labels ``init-repo`` creates for one repository: the six
+    """The labels ``init-repo`` creates for one repository: the seven
     lifecycle labels and, when given, the follow-up label."""
     specs = [LabelSpec(getattr(labels, kind), *LIFECYCLE_DESCRIPTORS[kind]) for kind in LABEL_KINDS]
     if followup:

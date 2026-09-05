@@ -1451,3 +1451,74 @@ class TestPendingClarifications:
         self._create(store)
         assert len(store.open_clarifications()) == 1
         assert store.get_value("k") == "v", "pre-change rows are intact"
+
+
+class TestWorkloadItems:
+    """#760: an item carries the run it becomes and its profile; a chat ask
+    has no repository by design and survives the repo-attribution passes."""
+
+    def test_kind_and_profile_round_trip(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("6", item_id="gh:issue:6", kind="workload", profile="research"), 1.0)
+        store.upsert_new(item("7"), 1.0)
+        workload, code = store.get("gh:issue:6"), store.get("gh:issue:7")
+        assert workload is not None and workload.kind == "workload"
+        assert workload.profile == "research"
+        assert code is not None and code.kind == "code" and code.profile is None
+        assert sorted(i.kind for i in store.items()) == ["code", "workload"]
+
+    def test_relabelling_a_finished_issue_for_the_other_kind_supersedes(
+        self, tmp_path: Path
+    ) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item(), now=1.0)
+        store.mark_running("gh:issue:7", "r1", now=2.0)
+        store.mark_done("gh:issue:7", now=3.0)
+        assert store.upsert_new(item(kind="workload"), now=4.0) is True
+        got = store.get("gh:issue:7")
+        assert got is not None and got.state == "queued" and got.kind == "workload"
+        # ...but never a live one: the run in flight keeps its kind.
+        store.mark_running("gh:issue:7", "r2", now=5.0)
+        assert store.upsert_new(item(), now=6.0) is False
+        assert store.get("gh:issue:7").kind == "workload"  # type: ignore[union-attr]
+
+    def test_a_pre_workload_database_gains_the_columns_in_place(self, tmp_path: Path) -> None:
+        path = daemon_db(tmp_path, "pre_local_bridge")
+        insert_daemon_row(
+            path,
+            item_id="gh:o/r:issue:3",
+            source_key="3",
+            title="Three",
+            state="queued",
+            attempts=0,
+            claimed=0,
+            created_at=1.0,
+            updated_at=2.0,
+            repo="o/r",
+        )
+        store = DaemonStore(path)
+        got = store.get("gh:o/r:issue:3")
+        assert got is not None and got.kind == "code" and got.profile is None
+        store.upsert_new(item("9", item_id="chat:9", kind="workload", profile="p"), now=3.0)
+        assert store.get("chat:9").profile == "p"  # type: ignore[union-attr]
+        columns = {
+            row[1] for row in sqlite3.connect(path).execute("PRAGMA table_info(daemon_work_items)")
+        }
+        assert {"run_kind", "profile"} <= columns
+
+    def test_chat_items_survive_backfill_attribution_and_drop(self, tmp_path: Path) -> None:
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("9001", item_id="chat:9001", kind="workload", url=""), now=1.0)
+        store.upsert_new(item("4", item_id="gh:issue:4"), now=1.0)
+        # A single-repo daemon names its repository: the chat ask stays repo-less.
+        assert store.backfill_repo("o/a") == 1
+        assert store.get("chat:9001").repo is None  # type: ignore[union-attr]
+        assert store.get("gh:issue:4").repo == "o/a"  # type: ignore[union-attr]
+        # A multi-repo daemon attributes by URL then drops the rest: the chat
+        # ask has no URL and is not the rest.
+        store.upsert_new(item("5", item_id="gh:issue:5"), now=1.0)
+        assert store.attribute_repoless(["o/a", "o/b"]) == 0
+        assert store.drop_repoless() == 1
+        assert store.get("gh:issue:5") is None
+        queued = store.get("chat:9001")
+        assert queued is not None and queued.state == "queued" and queued.repo is None
