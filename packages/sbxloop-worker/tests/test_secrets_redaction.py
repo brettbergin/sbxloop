@@ -70,3 +70,31 @@ class TestRedactSecrets:
             out = redact_secrets(text)
             assert literal not in out
             assert REDACTED in out
+
+
+class TestRedactionIsLinear:
+    def test_long_alphanumeric_run_is_not_quadratic(self) -> None:
+        # ``_MAPPING`` had no left anchor, so a 50 KB alphanumeric line made
+        # the engine retry the greedy name group from every offset: 33 s for
+        # this input, an hour for a minified bundle (#749). The anchor keeps
+        # it linear; the bound is generous so a loaded CI runner cannot flake.
+        import time
+
+        text = "BEGIN" + "x" * 50_000 + "END"
+        start = time.perf_counter()
+        out = redact_secrets(text)
+        assert time.perf_counter() - start < 0.5
+        assert out == text
+
+    def test_anchor_keeps_the_mapping_contract(self) -> None:
+        # The anchor must not cost any of the shapes ``_MAPPING`` exists for:
+        # quoted JSON keys, bare YAML keys, dotted names, and a leading indent.
+        for text, literal in (
+            ('{"api_key": "k3y"}', "k3y"),
+            ("token: abc", "abc"),
+            ("  my.secret: v", "v"),
+            ('"aws.credentials": "/root/.aws"', "/root/.aws"),
+        ):
+            out = redact_secrets(text)
+            assert literal not in out
+            assert REDACTED in out

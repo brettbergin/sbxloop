@@ -110,8 +110,13 @@ _ASSIGNMENT = re.compile(rf"\b({_SECRET_NAME})(\s*=\s*)(\"[^\"]*\"|'[^']*'|\S+)"
 # "key": "value" / key: value (JSON/YAML style).
 # The value is left alone when it is already a masked ``Bearer ***`` header,
 # so an Authorization line keeps its scheme visible.
+# The lookbehind is the left anchor ``_ASSIGNMENT`` gets from ``\b``: without
+# it the engine retries the greedy name group from every offset of a long
+# alphanumeric run, which is quadratic — a 50 KB single line took 33 s and a
+# minified bundle would stall the worker for an hour (#749). Mirrors the
+# ``(?<![\w.-])`` form of ``sbxloop.log._ASSIGN_RE``, allowing for the quote.
 _MAPPING = re.compile(
-    rf"(\"?{_SECRET_NAME}\"?\s*:\s*)"
+    rf"(?<![A-Za-z0-9_.\-\"])(\"?{_SECRET_NAME}\"?\s*:\s*)"
     rf"(?!(?:Bearer|Basic|token)\b)"
     rf"(\"[^\"]*\"|'[^']*'|[^,;\s}}]+)",
     re.IGNORECASE,
