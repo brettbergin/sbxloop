@@ -2053,21 +2053,17 @@ class TestClaudeAgentBackend:
 
 
 class TestOperatorSandboxEnv:
-    """`[sandbox] env` / `secret_env` reach the agent sandbox (#679): plain
-    values as given, secret values from the daemon's environment — and the
-    secret only ever travels the way the credential does."""
-
-    SECRET = "npm_secret_value_9f3a"  # nosec B105 - test fixture
+    """`[sandbox] env` reaches the agent sandbox (#679): plain values as
+    given. Its old secret counterpart is gone (#766) — the only credential
+    in the agent sandbox is the agent's own, and nothing here can put
+    another beside it."""
 
     def _config(self, tmp_path: Path, **repo_overrides: object) -> Config:
         entry: dict[str, object] = {"repo": "owner/repo", **repo_overrides}
         return Config.model_validate(
             {
                 "state_dir": str(tmp_path / "state"),
-                "sandbox": {
-                    "env": {"RAILS_ENV": "test", "GREETING": "hello world"},
-                    "secret_env": ["NPM_TOKEN"],
-                },
+                "sandbox": {"env": {"RAILS_ENV": "test", "GREETING": "hello world"}},
                 "github": {"repos": [entry]},
             }
         )
@@ -2078,119 +2074,59 @@ class TestOperatorSandboxEnv:
         tmp_path: Path,
         *,
         config: Config | None = None,
-        with_secret: bool = True,
         bus: EventBus | None = None,
     ) -> Provisioner:
-        env = dict(TOKENS)
-        if with_secret:
-            env["NPM_TOKEN"] = self.SECRET
         return make_provisioner(
-            fake_sbx, tmp_path, config=config or self._config(tmp_path), env=env, bus=bus
+            fake_sbx, tmp_path, config=config or self._config(tmp_path), bus=bus
         )
 
-    def test_the_agent_spec_carries_both_and_the_github_spec_neither(
+    def test_the_agent_spec_carries_the_env_and_no_secrets(
         self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
         provisioner = self._provisioner(fake_sbx, tmp_path)
         agent, github = provisioner.build_specs("r1", tmp_path, "owner/repo")
         assert agent.persistent_env == {"RAILS_ENV": "test", "GREETING": "hello world"}
-        assert agent.secret_env == {"NPM_TOKEN": self.SECRET}
+        assert agent.secret_env == {}
         assert "RAILS_ENV" not in github.persistent_env
         assert github.secret_env == {}
 
-    def test_env_file_delivery_writes_both_and_argv_and_events_hold_neither(
-        self,
-        fake_sbx: FakeSbx,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
+    def test_env_file_delivery_writes_the_plain_values(
+        self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
-        """The fake's default: proxy secrets invisible, no stdin passthrough,
-        so the 0600 env file is the delivery. The secret's VALUE appears in
-        that file and nowhere else — not in an `sbx` argument, an event, or
-        a log line."""
-        bus = EventBus()
-        events: list[Event] = []
-        bus.subscribe(events.append)
-        provisioner = self._provisioner(fake_sbx, tmp_path, bus=bus)
-        with caplog.at_level(logging.DEBUG):
-            provisioner.ensure_pair("r1", repo="owner/repo")
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        provisioner.ensure_pair("r1", repo="owner/repo")
         env_sh = (
             fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
         ).read_text()
         assert "export RAILS_ENV=test\n" in env_sh
         assert "export GREETING='hello world'\n" in env_sh
-        assert f"export NPM_TOKEN={self.SECRET}\n" in env_sh
         github_sh = fake_sbx.sandbox_fs("sbxloop-r1-github") / "home/agent/.sbxloop/env.sh"
         if github_sh.exists():
-            assert "NPM_TOKEN" not in github_sh.read_text()
-        for call in fake_sbx.invocations():
-            assert all(self.SECRET not in arg for arg in call), call
-        for event in events:
-            assert self.SECRET not in repr(event.data), event
-        assert all(self.SECRET not in record.getMessage() for record in caplog.records)
+            assert "RAILS_ENV" not in github_sh.read_text()
 
-    def test_stdin_delivery_pipes_both_per_job_and_writes_nothing(
+    def test_stdin_delivery_pipes_the_env_per_job(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("SBX_FAKE_EXEC_STDIN", "1")
         provisioner = self._provisioner(fake_sbx, tmp_path)
         provisioner.ensure_pair("r1", repo="owner/repo")
-        # The plain env was written before the visibility verdict; the
-        # secret waited for it and now rides stdin only.
         env_sh = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
         assert "export RAILS_ENV=test\n" in env_sh.read_text()
-        assert self.SECRET not in env_sh.read_text()
         provider = provisioner.job_env("agent", "owner/repo")
         assert provider is not None
         exports = provider()
         assert exports["RAILS_ENV"] == "test"
-        assert exports["NPM_TOKEN"] == self.SECRET
         assert exports["COPILOT_GITHUB_TOKEN"] == TOKENS["COPILOT_GITHUB_TOKEN"]
-        for call in fake_sbx.invocations():
-            assert all(self.SECRET not in arg for arg in call), call
-
-    def test_a_working_proxy_still_puts_the_secret_in_the_env_file(
-        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """When the sbx proxy carries the agent's credential nothing else
-        rewrites the env file, and the proxy is no road for an operator
-        secret (no single host to bind it to) — so it is written there
-        once the visibility verdict is in, beside the plain env."""
-        monkeypatch.setenv("SBX_FAKE_EXEC_STDIN", "1")
-        # the fake's exec inherits the host env: a real-looking token here
-        # is what a visible proxy secret looks like to the probe
-        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "github_pat_visible")
-        monkeypatch.setenv("GH_TOKEN", "github_pat_visible")
-        provisioner = self._provisioner(fake_sbx, tmp_path)
-        provisioner.ensure_pair("r1", repo="owner/repo")
-        assert provisioner.job_env("agent", "owner/repo") is None
-        env_sh = (
-            fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
-        ).read_text()
-        assert "export RAILS_ENV=test\n" in env_sh
-        assert f"export NPM_TOKEN={self.SECRET}\n" in env_sh
-        assert "COPILOT_GITHUB_TOKEN" not in env_sh
-        for call in fake_sbx.invocations():
-            assert all(self.SECRET not in arg for arg in call), call
-
-    def test_an_unset_secret_fails_provisioning_by_name_before_any_sandbox(
-        self, fake_sbx: FakeSbx, tmp_path: Path
-    ) -> None:
-        provisioner = self._provisioner(fake_sbx, tmp_path, with_secret=False)
-        with pytest.raises(ProvisionError, match=r"auth_env names \['NPM_TOKEN'\] are not set"):
-            provisioner.ensure_pair("r1", repo="owner/repo")
-        assert fake_sbx.invocations("create") == []
+        # The agent's own credential is the only secret in its job env.
+        assert set(exports) == {"RAILS_ENV", "GREETING", "COPILOT_GITHUB_TOKEN"}
 
     def test_a_repository_override_replaces_the_global_setting(
         self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
-        config = self._config(tmp_path, env={"GOFLAGS": "-mod=vendor"}, secret_env=[])
-        # NPM_TOKEN deliberately absent from the daemon env: the override
-        # dropped it, so nothing may ask for it.
-        provisioner = self._provisioner(fake_sbx, tmp_path, config=config, with_secret=False)
+        config = self._config(tmp_path, env={"GOFLAGS": "-mod=vendor"})
+        provisioner = self._provisioner(fake_sbx, tmp_path, config=config)
         agent, _github = provisioner.build_specs("r1", tmp_path, "owner/repo")
         assert agent.persistent_env == {"GOFLAGS": "-mod=vendor"}
-        assert agent.secret_env == {}
         provisioner.ensure_pair("r1", repo="owner/repo")
         env_sh = (
             fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
@@ -2216,9 +2152,13 @@ class TestOperatorSandboxEnv:
 
 
 class TestPrivateRegistries:
-    """`[[registries]]` (#680): the host joins the agent sandbox's allowlist,
-    the client config lands in the VM, and the credential travels only the
-    way `secret_env` does."""
+    """`[[registries]]` (#680, #766): an OPEN registry (no `auth_env`) is
+    the agent sandbox's — its host joins the allowlist and its client env
+    lands in the VM, as before. A CREDENTIALED registry is the service
+    sandbox's: the credential, the client files and the host go there, the
+    dependencies are fetched there into a cache both sandboxes see, and the
+    agent sandbox gets the offline environment for that ecosystem and
+    nothing that names the credential."""
 
     SECRET = "artifactory-token-7c1e"  # nosec B105 - test fixture
     REGISTRIES: ClassVar[list[dict[str, object]]] = [
@@ -2266,57 +2206,112 @@ class TestPrivateRegistries:
             fake_sbx, tmp_path, config=config or self._config(tmp_path), env=env, bus=bus
         )
 
-    def test_registry_hosts_join_the_agent_allowlist_beside_extra_allow_domains(
+    def _workspace(self, tmp_path: Path) -> Path:
+        from tests.unit.test_hostgit import make_repo
+
+        return make_repo(tmp_path)
+
+    def test_open_registry_hosts_join_the_agent_allowlist_and_credentialed_ones_do_not(
         self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
         provisioner = self._provisioner(fake_sbx, tmp_path)
         agent, github = provisioner.build_specs("r1", tmp_path, "owner/repo")
-        assert "artifactory.example.com" in agent.policy_allows
-        assert "github.example.com" in agent.policy_allows
+        assert "github.example.com" in agent.policy_allows  # open: the agent's
+        assert "artifactory.example.com" not in agent.policy_allows  # credentialed: not
         assert "mirror.example.com" in agent.policy_allows  # extra_allow_domains keeps working
         assert len(agent.policy_allows) == len(set(agent.policy_allows))  # one rule per host
         assert "artifactory.example.com" not in github.policy_allows
-        provisioner.ensure_pair("r1", repo="owner/repo")
-        (allow_call,) = [
-            call
-            for call in fake_sbx.invocations("policy")
-            if call[1:3] == ["allow", "network"] and "sbxloop-r1-agent" in call
-        ]
-        assert "artifactory.example.com" in allow_call[3].split(",")
+        service = provisioner.service_spec("r1", tmp_path, [], "owner/repo")
+        assert "artifactory.example.com" in service.policy_allows
+        assert "github.example.com" not in service.policy_allows
+        # The fetch needs the toolchains' own install sources (node, pip).
+        assert "registry.npmjs.org" in service.policy_allows
+        assert "pypi.org" in service.policy_allows
+        assert len(service.policy_allows) == len(set(service.policy_allows))
 
-    def test_client_files_and_env_land_in_the_vm_and_the_token_never_hits_argv(
+    def test_the_credential_and_client_files_land_in_the_service_sandbox_only(
         self, fake_sbx: FakeSbx, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         bus = EventBus()
         events: list[Event] = []
         bus.subscribe(events.append)
         provisioner = self._provisioner(fake_sbx, tmp_path, bus=bus)
+        workspace = self._workspace(tmp_path)
         with caplog.at_level(logging.DEBUG):
-            provisioner.ensure_pair("r1", repo="owner/repo")
-        home = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent"
-        npmrc = (home / ".npmrc").read_text()
+            pair = provisioner.ensure_pair("r1", workspace, repo="owner/repo")
+        assert pair.service is not None and pair.service_workdir is not None
+
+        service_home = fake_sbx.sandbox_fs("sbxloop-r1-service") / "home/agent"
+        npmrc = (service_home / ".npmrc").read_text()
         assert "@example:registry=https://artifactory.example.com/api/npm/npm-virtual/\n" in npmrc
         assert "//artifactory.example.com/api/npm/npm-virtual/:_authToken=${NPM_TOKEN}\n" in npmrc
         assert self.SECRET not in npmrc
-        assert (home / ".netrc").read_text() == (
+        assert (service_home / ".netrc").read_text() == (
             f"machine artifactory.example.com login svc-ci password {self.SECRET}\n"
         )
-        env_sh = (home / ".sbxloop/env.sh").read_text()
-        assert "export GOPRIVATE=github.example.com\n" in env_sh
+        service_sh = (service_home / ".sbxloop/env.sh").read_text()
+        assert f"export NPM_TOKEN={self.SECRET}\n" in service_sh
         assert (
             "export PIP_INDEX_URL=https://artifactory.example.com/api/pypi/pypi-virtual/simple\n"
-            in env_sh
+            in service_sh
         )
-        assert f"export NPM_TOKEN={self.SECRET}\n" in env_sh
+        assert "GOPRIVATE" not in service_sh  # the open registry is not its business
         # the files were staged with cp and locked down, never passed inline
         chmods = [c for c in fake_sbx.invocations("exec") if "chmod" in c and ".netrc" in c[-1]]
         assert chmods and chmods[0][-2:] == ["600", "/home/agent/.netrc"]
+
+        agent_home = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent"
+        assert not (agent_home / ".npmrc").exists()
+        assert not (agent_home / ".netrc").exists()
+        agent_sh = (agent_home / ".sbxloop/env.sh").read_text()
+        assert "NPM_TOKEN" not in agent_sh
+        assert "PIP_INDEX_URL" not in agent_sh
+        assert "artifactory.example.com" not in agent_sh
+        assert "export GOPRIVATE=github.example.com\n" in agent_sh  # open: as before
+        # …and instead the offline environment pointing at the shared cache.
+        assert "export npm_config_offline=true\n" in agent_sh
+        assert "export PIP_NO_INDEX=1\n" in agent_sh
+        assert "export PIP_FIND_LINKS=/home/agent/.sbxloop/deps/pypi\n" in agent_sh
+        assert "export npm_config_cache=/home/agent/.sbxloop/deps/npm\n" in agent_sh
+
         for call in fake_sbx.invocations():
             assert all(self.SECRET not in arg for arg in call), call
         for event in events:
             assert self.SECRET not in repr(event.data), event
         assert all(self.SECRET not in record.getMessage() for record in caplog.records)
         assert not (fake_sbx.sandbox_fs("sbxloop-r1-github") / "home/agent/.netrc").exists()
+
+    def test_the_cache_is_one_directory_in_both_sandboxes_and_never_committed(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = self._provisioner(fake_sbx, tmp_path, bus=bus)
+        workspace = self._workspace(tmp_path)
+        pair = provisioner.ensure_pair("r1", workspace, repo="owner/repo")
+        cache = workspace / ".sbxloop" / "deps"
+        assert cache.is_dir()
+        for name in ("sbxloop-r1-agent", "sbxloop-r1-service"):
+            link = fake_sbx.sandbox_fs(name) / "home/agent/.sbxloop/deps"
+            assert link.is_symlink(), name
+            assert Path(link.readlink()).resolve() == cache.resolve(), name
+        assert ".sbxloop/" in (workspace / ".git/info/exclude").read_text().splitlines()
+        (event,) = [e for e in events if e.type == "sandbox.deps_cache"]
+        assert event.data["name"] == "sbxloop-r1-service"
+        assert event.data["workdir"] == pair.service_workdir
+
+    def test_a_service_sandbox_that_cannot_see_the_workspace_fails_closed(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fetch lands in the service sandbox's view of the workspace;
+        with no view there is nowhere the agent would find it — not a
+        harvest-mode fallback, a provisioning failure naming the probe."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        workspace = self._workspace(tmp_path)
+        with pytest.raises(ProvisionError, match="workspace-mount"):
+            provisioner.ensure_pair("r1", workspace, repo="owner/repo")
 
     def test_an_unset_credential_fails_provisioning_by_name_before_any_sandbox(
         self, fake_sbx: FakeSbx, tmp_path: Path
@@ -2337,6 +2332,23 @@ class TestPrivateRegistries:
         assert provisioner.agent_persistent_env("owner/repo")["GOPRIVATE"] == (
             "github.example.com,gitlab.example.com"
         )
+
+    def test_open_registries_alone_need_no_service_sandbox(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """Byte-for-byte the pre-#766 run: no credential, no third sandbox,
+        the registry's env and host in the agent's as before."""
+        config = self._config(tmp_path, registries=[self.REGISTRIES[2]])
+        provisioner = self._provisioner(fake_sbx, tmp_path, config=config, with_secret=False)
+        pair = provisioner.ensure_pair("r1", repo="owner/repo")
+        assert pair.service is None
+        created = {c[1].removeprefix("--name=") for c in fake_sbx.invocations("create")}
+        assert created == {"sbxloop-r1-agent", "sbxloop-r1-github"}
+        agent_sh = (
+            fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+        ).read_text()
+        assert "export GOPRIVATE=github.example.com\n" in agent_sh
+        assert "GOPROXY=off" not in agent_sh
 
     def test_a_repository_override_replaces_the_global_list(
         self, fake_sbx: FakeSbx, tmp_path: Path

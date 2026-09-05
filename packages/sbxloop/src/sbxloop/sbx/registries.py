@@ -1,22 +1,36 @@
-"""What each ``[[registries]]`` entry writes into the agent sandbox (#680).
+"""What each ``[[registries]]`` entry writes into a sandbox (#680, #766).
 
 A private registry needs three things before a dependency install can
-succeed: the host must be reachable (it joins the sandbox's allowlist in
-``sbx.provision.agent_policy_allows``), the ecosystem's client must be told
-to use it, and the credential must be where that client looks. This module
-answers the second and third per kind, as data the provisioner delivers:
+succeed: the host must be reachable (it joins a sandbox's allowlist), the
+ecosystem's client must be told to use it, and the credential must be where
+that client looks. This module answers the second and third per kind, as
+data the provisioner delivers — and, since #766, says WHICH sandbox:
+
+* A registry without ``auth_env`` is the agent sandbox's own: there is no
+  secret to keep from the agent, so :func:`plain_env` and
+  :func:`client_files` land there as they always did.
+* A registry with ``auth_env`` belongs to the SERVICE sandbox. The
+  credential (:func:`secret_env`), the client files and the host go there;
+  the agent sandbox — the one running the model's commands — gets none of
+  them. Instead the service sandbox FETCHES the dependencies into a cache
+  inside the shared workspace (:func:`fetch_argv`, one fixed recipe per
+  kind, package code disabled) and the agent sandbox builds offline from
+  that cache (:func:`offline_env`).
 
 * :func:`plain_env` — non-secret environment (``PIP_INDEX_URL``,
-  ``GOPRIVATE``), folded into the agent's persistent env.
+  ``GOPRIVATE``), folded into the persistent env of whichever sandbox
+  owns the registry.
 * :func:`secret_env` — environment carrying the credential
   (``CARGO_REGISTRIES_<NAME>_TOKEN``, ``BUNDLE_<HOST>``, and the
-  ``auth_env`` variable itself), delivered the way ``[sandbox] secret_env``
-  is: per-job stdin or the 0600 env file, never an ``sbx`` argument.
+  ``auth_env`` variable itself), delivered the way the loop delivers its
+  own credentials: per-job stdin or the 0600 env file, never an ``sbx``
+  argument.
 * :func:`client_files` — the client files, written with ``sbx cp`` and
   chmod 600. Wherever the ecosystem expands environment variables in its
   config (npm ``${VAR}``, Maven ``${env.VAR}``, NuGet ``%VAR%``) the file
   names the variable and holds no secret; the ``.netrc`` kinds (pypi, go,
-  generic) have no such form, so ``~/.netrc`` holds the value at rest.
+  generic) have no such form, so ``~/.netrc`` holds the value at rest —
+  in the service sandbox, where nothing the model writes runs.
 
 Per kind:
 
@@ -43,6 +57,37 @@ gem         ``BUNDLE_<HOST>=user:token`` for bundler; with ``url``, also
             ``~/.gemrc`` listing it as the gem source.
 generic     host only, plus a ``~/.netrc`` entry when ``auth_env`` is set.
 ==========  =================================================================
+
+The fetch recipes (service sandbox → cache → agent sandbox), all with the
+package manager's own hooks off so a private package's install script never
+runs beside the token that fetched it:
+
+==========  ======================================  ==========================
+kind        service sandbox (``fetch`` / ``add``)   agent sandbox (offline)
+==========  ======================================  ==========================
+npm         ``npm ci|install --ignore-scripts``     ``npm_config_offline=true``
+            into ``npm_config_cache``               (``npm rebuild`` runs the
+                                                    scripts)
+pypi        ``pip download -d <cache>``             ``PIP_NO_INDEX`` +
+            (``-r requirements.txt`` / ``.``)       ``PIP_FIND_LINKS``, the
+                                                    ``UV_*`` twins
+go          ``go mod download``                     ``GOPROXY=off``
+            (``GOMODCACHE=<cache>``)
+cargo       ``cargo fetch`` (``CARGO_HOME=<cache>``)  ``CARGO_NET_OFFLINE=true``
+maven       ``mvn dependency:go-offline``           ``MAVEN_ARGS=-o``
+            (``-Dmaven.repo.local=<cache>``)
+nuget       ``dotnet restore --packages <cache>``   ``NUGET_PACKAGES=<cache>``
+gem         ``bundle cache --all --no-install``     ``BUNDLE_LOCAL=true``
+            (into ``vendor/cache``)
+generic     no fetch — host only
+==========  ======================================  ==========================
+
+The cache lives at ``<workspace>/.sbxloop/deps`` — the one directory both
+sandboxes see — reached through the stable link :data:`DEPS_HOME` in each
+sandbox's ``$HOME`` (the mount path differs per VM and is discovered after
+the environment is written). Every flag here is from the tool's own
+documentation and exercised only against the fake sandbox: field-unverified
+until the first run with a private registry.
 """
 
 from __future__ import annotations
@@ -50,10 +95,11 @@ from __future__ import annotations
 import re
 from collections.abc import Mapping, Sequence
 from html import escape
+from pathlib import Path
 from typing import NamedTuple
 from urllib.parse import urlsplit
 
-from sbxloop.config import RegistryConfig
+from sbxloop.config import RegistryConfig, RegistryKind
 from sbxloop.sbx.sandbox import SANDBOX_HOME
 
 NPMRC = f"{SANDBOX_HOME}/.npmrc"
@@ -64,14 +110,209 @@ NUGET_CONFIG = f"{SANDBOX_HOME}/.nuget/NuGet/NuGet.Config"
 GEMRC = f"{SANDBOX_HOME}/.gemrc"
 
 
+# The dependency cache the service sandbox fills and the agent sandbox reads:
+# a directory inside the shared workspace, reached through a link at a fixed
+# path in each sandbox's $HOME (see the module docstring).
+DEPS_WORKSPACE_DIR = ".sbxloop/deps"
+DEPS_HOME = f"{SANDBOX_HOME}/.sbxloop/deps"
+
+# The toolchain (``[sandbox] languages`` name) a kind's package manager
+# comes with — what the service sandbox must have installed to fetch.
+KIND_LANGUAGES: Mapping[RegistryKind, str] = {
+    "npm": "node",
+    "pypi": "python",
+    "go": "go",
+    "cargo": "rust",
+    "maven": "java",
+    "nuget": "dotnet",
+    "gem": "ruby",
+}
+
+# The manifests a workspace fetch is driven by, per kind, in the order
+# tried; a kind whose manifest the workspace lacks is not fetched for.
+KIND_MANIFESTS: Mapping[RegistryKind, tuple[str, ...]] = {
+    "npm": ("package.json",),
+    "pypi": ("requirements.txt", "pyproject.toml"),
+    "go": ("go.mod",),
+    "cargo": ("Cargo.toml",),
+    "maven": ("pom.xml",),
+    "nuget": ("*.sln", "*.csproj", "*.fsproj"),
+    "gem": ("Gemfile",),
+}
+
+FETCH_VERBS = ("fetch", "add")
+# The kinds whose recipe takes explicit packages (``add``): the others
+# resolve from the manifest only, and the agent edits the manifest itself.
+ADD_KINDS: frozenset[RegistryKind] = frozenset({"npm", "pypi", "go"})
+
+# A package spec as the ``add`` verb accepts it: a name, optionally with a
+# scope, version, extras or ``@version``/``==version`` pin. Never a leading
+# ``-`` (a flag), never whitespace or a shell character — the argv is a list
+# and no shell sees it, but a flag could still change what the tool does.
+_PACKAGE_RE = re.compile(r"^[A-Za-z0-9@_][A-Za-z0-9@_.\-/+~^<>=!,\[\]:]*$")
+
+
 class ClientFile(NamedTuple):
     path: str
     text: str
 
 
+class FetchPlan(NamedTuple):
+    """One fetch as the service sandbox runs it: the argv (host-authored,
+    never a shell) and the manifest it was chosen for (None for ``add``).
+    The environment is the sandbox's own (:func:`fetch_env`)."""
+
+    argv: tuple[str, ...]
+    manifest: str | None
+
+
 def domains(registries: Sequence[RegistryConfig]) -> list[str]:
     """The registry hosts, in configuration order, deduped."""
     return list(dict.fromkeys(r.host for r in registries))
+
+
+def kinds(registries: Sequence[RegistryConfig]) -> list[RegistryKind]:
+    """The kinds ``registries`` cover, in configuration order, deduped —
+    ``generic`` excluded: nothing fetches from it."""
+    return [k for k in dict.fromkeys(r.kind for r in registries) if k != "generic"]
+
+
+def languages(registries: Sequence[RegistryConfig]) -> list[str]:
+    """The toolchains the service sandbox needs to fetch for ``registries``."""
+    return list(dict.fromkeys(KIND_LANGUAGES[k] for k in kinds(registries)))
+
+
+def cache_dir(kind: RegistryKind) -> str:
+    return f"{DEPS_HOME}/{kind}"
+
+
+def fetch_env(registries: Sequence[RegistryConfig]) -> dict[str, str]:
+    """The service sandbox's fetch environment: each kind's package manager
+    pointed at its cache under :data:`DEPS_HOME`, online."""
+    env: dict[str, str] = {}
+    for kind in kinds(registries):
+        if kind == "npm":
+            env["npm_config_cache"] = cache_dir("npm")
+        elif kind == "go":
+            env["GOMODCACHE"] = cache_dir("go")
+            env["GOFLAGS"] = "-mod=mod"
+        elif kind == "cargo":
+            env["CARGO_HOME"] = cache_dir("cargo")
+    return env
+
+
+def offline_env(registries: Sequence[RegistryConfig]) -> dict[str, str]:
+    """The agent sandbox's environment for the kinds the service sandbox
+    fetches: each package manager reads the cache and never asks a
+    registry — there is no credential in this sandbox to ask with."""
+    env: dict[str, str] = {}
+    for kind in kinds(registries):
+        cache = cache_dir(kind)
+        if kind == "npm":
+            env["npm_config_cache"] = cache
+            env["npm_config_offline"] = "true"
+        elif kind == "pypi":
+            env["PIP_NO_INDEX"] = "1"
+            env["PIP_FIND_LINKS"] = cache
+            env["UV_NO_INDEX"] = "1"
+            env["UV_FIND_LINKS"] = cache
+        elif kind == "go":
+            env["GOMODCACHE"] = cache
+            env["GOFLAGS"] = "-mod=mod"
+            env["GOPROXY"] = "off"
+        elif kind == "cargo":
+            env["CARGO_HOME"] = cache
+            env["CARGO_NET_OFFLINE"] = "true"
+        elif kind == "maven":
+            env["MAVEN_ARGS"] = f"-o -Dmaven.repo.local={cache}"
+        elif kind == "nuget":
+            env["NUGET_PACKAGES"] = cache
+        elif kind == "gem":
+            env["BUNDLE_LOCAL"] = "true"
+    return env
+
+
+def workspace_manifests(workspace: Path, kind: RegistryKind) -> list[str]:
+    """Which of ``kind``'s manifests the host workspace has (glob patterns
+    matched, the pattern itself reported), plus npm's lockfile — what
+    :func:`fetch_plan` picks the ``fetch`` recipe from."""
+    candidates = [*KIND_MANIFESTS.get(kind, ()), *(("package-lock.json",) if kind == "npm" else ())]
+    present: list[str] = []
+    for candidate in candidates:
+        if "*" in candidate:
+            if any(workspace.glob(candidate)):
+                present.append(candidate)
+        elif (workspace / candidate).is_file():
+            present.append(candidate)
+    return present
+
+
+def check_packages(packages: Sequence[str]) -> list[str]:
+    """``add``'s packages, validated: raises ValueError naming the first
+    that is not a package spec."""
+    for package in packages:
+        if not _PACKAGE_RE.match(package):
+            raise ValueError(f"{package!r} is not a package spec")
+    return list(packages)
+
+
+def fetch_plan(
+    kind: RegistryKind,
+    verb: str,
+    packages: Sequence[str] = (),
+    *,
+    manifests: Sequence[str] = (),
+) -> FetchPlan:
+    """The recipe for one fetch in the service sandbox.
+
+    ``fetch`` resolves the workspace's manifest (``manifests`` is what the
+    workspace has, from :data:`KIND_MANIFESTS`'s candidates; the first
+    present wins); ``add`` fetches the named ``packages`` for the kinds
+    that take them. Raises ValueError for a verb, kind or package outside
+    the recipe — the host refuses before any job is built.
+    """
+    if verb not in FETCH_VERBS:
+        raise ValueError(f"unknown fetch verb {verb!r}; one of {list(FETCH_VERBS)}")
+    if kind not in KIND_MANIFESTS:
+        raise ValueError(f"nothing to fetch for a {kind!r} registry")
+    cache = cache_dir(kind)
+    if verb == "add":
+        if kind not in ADD_KINDS:
+            raise ValueError(
+                f"{kind} takes no package list: add it to the manifest and fetch again"
+            )
+        if not packages:
+            raise ValueError("add needs at least one package")
+        pkgs = check_packages(packages)
+        if kind == "npm":
+            return FetchPlan(("npm", "install", "--ignore-scripts", *pkgs), None)
+        if kind == "pypi":
+            return FetchPlan(("pip", "download", "-d", cache, *pkgs), None)
+        return FetchPlan(("go", "mod", "download", *pkgs), None)
+    if packages:
+        raise ValueError("fetch takes no packages (use add)")
+    manifest = next((m for m in KIND_MANIFESTS[kind] if m in manifests), None)
+    if manifest is None:
+        raise ValueError(
+            f"no {' / '.join(KIND_MANIFESTS[kind])} in the workspace to fetch {kind} from"
+        )
+    if kind == "npm":
+        verb_argv = ("ci",) if "package-lock.json" in manifests else ("install",)
+        return FetchPlan(("npm", *verb_argv, "--ignore-scripts"), manifest)
+    if kind == "pypi":
+        target = ("-r", manifest) if manifest == "requirements.txt" else (".",)
+        return FetchPlan(("pip", "download", "-d", cache, *target), manifest)
+    if kind == "go":
+        return FetchPlan(("go", "mod", "download"), manifest)
+    if kind == "cargo":
+        return FetchPlan(("cargo", "fetch"), manifest)
+    if kind == "maven":
+        return FetchPlan(
+            ("mvn", "-B", "dependency:go-offline", f"-Dmaven.repo.local={cache}"), manifest
+        )
+    if kind == "nuget":
+        return FetchPlan(("dotnet", "restore", "--packages", cache), manifest)
+    return FetchPlan(("bundle", "cache", "--all", "--no-install"), manifest)
 
 
 def plain_env(registries: Sequence[RegistryConfig]) -> dict[str, str]:

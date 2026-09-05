@@ -103,7 +103,8 @@ for the transport-level statement of the same rules.
 ## The security primitive: one run = two sandboxes (three, with credentials)
 
 Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pair`
-— and a run granted `[[credentials]]` a third, the *service* sandbox (#765),
+— and a run granted `[[credentials]]`, or whose repository has a credentialed
+`[[registries]]` entry, a third, the *service* sandbox (#765, #766),
 provisioned in the same parallel step.
 Before either exists, the provisioner decides what the agent sandbox is *for*:
 `toolchains.resolve_languages` reads the workspace once — which toolchains
@@ -163,6 +164,47 @@ echoed it. Each call is one `service.call` ledger event — credential name,
 method, path, status, duration; never a body or a header. The agent sandbox's
 allowlist does not carry the credential hosts: the agent never speaks to them.
 
+The same box is the run's dependency **fetcher** (#766). A `[[registries]]`
+entry with `auth_env` is a credentialed registry, and its token, client file
+(`~/.npmrc`, `~/.netrc`, …) and host go to the service sandbox only — the
+agent sandbox gets neither the file nor the host, and is configured offline
+for that ecosystem (`registries.offline_env`: `npm_config_offline`,
+`PIP_NO_INDEX`/`PIP_FIND_LINKS`, `GOPROXY=off`, `CARGO_NET_OFFLINE`,
+`MAVEN_ARGS=-o`, `NUGET_PACKAGES`, `BUNDLE_LOCAL`). Both boxes see the one
+workspace mount, and the cache is inside it — `<workspace>/.sbxloop/deps/<kind>`,
+excluded from git through `.git/info/exclude`, reached in either VM through a
+stable `~/.sbxloop/deps` symlink so the offline variables hold one path — so a
+fetch in the service box is an install in the agent box. The service box
+therefore needs the workspace view the agent's has (its own toolchains for the
+credentialed kinds too, ensured at install like the agent's) and fails
+provisioning naming the mount otherwise; its allowlist grows by the registry
+hosts and the ecosystem's public baseline (`registry.npmjs.org`, `pypi.org`,
+`proxy.golang.org`, …) so a virtual repository that proxies upstream resolves.
+It runs one more job kind, `service.fetch`: an argv the host authored from a
+fixed per-ecosystem recipe (`registries.fetch_plan` — `npm ci --ignore-scripts`
+/ `npm install --ignore-scripts [pkgs]`, `pip download -d <cache>`, `go mod download`, `cargo fetch`, `mvn -B dependency:go-offline`, `dotnet restore --packages`, `bundle cache --all --no-install`) in the workspace, never a
+shell; a package spec is one token matching `_PACKAGE_RE` (never a leading
+`-`), and an ecosystem the run has no credentialed registry for, a non-spec, or
+a package list for a manifest-only kind is refused on the host before a job
+exists. `Engine._fetch_dependencies` runs the manifest recipe for every
+credentialed kind whose manifest the workspace carries, right after the worker
+installs and before `setup_commands`; a non-zero exit is a `ProvisionError`
+carrying the argv and the output tail, and the run stays resumable like any
+infrastructure failure. The build session holds a second host tool,
+`fetch_dependencies(ecosystem, packages?)` — packages → the `add` recipe,
+none → re-fetch from the manifest the agent just edited — and reads the
+package manager's exit code and output back as the tool's answer (a failed
+fetch is an answer, not a tool error, so the agent can fix the manifest). Every
+fetch, refused or run, is one `sandbox.fetch` ledger event with the ecosystem,
+verb, argv, exit code and phase; the worker scrubs the credential's value from
+the output before it leaves the box. `sbxloop config policy` prints the service
+sandbox's allowlist as a second line; `sbxloop doctor` lists unset `auth_env`
+names in its `registry credentials` row. A registry without `auth_env` is an
+open registry and stays exactly as #680 built it: agent allowlist, agent client
+file, no service box. The `[sandbox] secret_env` key that once carried such a
+token into the agent sandbox is refused by name at config load with this
+design as the message (#766).
+
 What the agent credential *is* — its env var, the host sbx binds it to, the
 hosts it must reach, how doctor names it when missing, where its model ids
 are listed — lives on one descriptor per backend in `sbxloop.backends`
@@ -210,27 +252,32 @@ strategy that is *attempted*, not the one that usually runs. Where per-job stdin
 is unavailable, that means the in-VM env file. Tracked operationally in #46;
 interim hardening in #592.
 
-Operator secrets for the agent sandbox — `[sandbox] secret_env`, values read
-from the daemon's environment (#679) — take the same non-proxy tiers, and only
-those: the sbx proxy binds a secret to one host, which an `NPM_TOKEN` has no
-single answer for. `SandboxSpec` keeps them apart from the plain
-`persistent_env` so the proxy path can write the plain environment before the
-visibility probe and hold the secrets back until the verdict is in: a
-downgrade to stdin delivery then never leaves them at rest first, and a proxy
-that carries the agent's own credential puts them in the env file afterwards
+Operator secrets — a credentialed registry's `auth_env` (#680, #766) and the
+`[[credentials]]` values (#765), read from the daemon's environment — take the
+same non-proxy tiers, and only those, in the **service** sandbox: the sbx proxy
+binds a secret to one host, which an `NPM_TOKEN` has no single answer for. The
+agent sandbox carries no operator secret at all (`[sandbox] env` is plain
+values, and a value that names a delivered variable or a registry's `auth_env`
+is refused at load); the `secret_env` key that once put one there is refused
+by name. `SandboxSpec` keeps the secrets apart from the plain `persistent_env`
+so the proxy path can write the plain environment before the visibility probe
+and hold the secrets back until the verdict is in: a downgrade to stdin
+delivery then never leaves them at rest first, and a proxy that carries the
+box's own credential puts them in the env file afterwards
 (`_apply_operator_secrets`), since nothing else would. They are never an `sbx`
 argument, an event field or a log line; a name the daemon does not hold fails
 provisioning before any sandbox boots.
 
-Private registries (`[[registries]]`, #680) build on both roads. The host joins
-the agent allowlist beside `extra_allow_domains` — in `agent_policy_allows`, the
-plan-validation bounds and the granter's already-granted set alike, so a plan
-naming it neither fails nor re-grants. The client files ride `SandboxSpec.files`
-and are staged with `sbx cp` then chmod 600 after the credential delivery step,
-before the worker install; the credential itself is one more `secret_env` name,
-so it takes exactly the tiers above, and wherever the ecosystem's client
-expands environment variables the file references it by name. Only the netrc
-kinds hold a value at rest, and only in the agent's own VM.
+Private registries (`[[registries]]`, #680) build on both roads. An open entry
+(no `auth_env`) joins the agent allowlist beside `extra_allow_domains` — in
+`agent_policy_allows`, the plan-validation bounds and the granter's
+already-granted set alike, so a plan naming it neither fails nor re-grants —
+and its client file rides `SandboxSpec.files`, staged with `sbx cp` then chmod
+600 after the credential delivery step, before the worker install. A
+credentialed entry does the same in the service sandbox instead (#766, above):
+its host and client file never reach the agent's, and wherever the ecosystem's
+client expands environment variables the file references the variable by name.
+Only the netrc kinds hold a value at rest, and only in the service VM.
 
 Operator setup (`[sandbox] apt_packages` / `setup_commands`, #681) is the last
 step before the first phase. The packages ride `WorkerClient.install` beside the

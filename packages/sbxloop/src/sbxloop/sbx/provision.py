@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple
 
 from sbxloop import backends, hostgit, toolchains
-from sbxloop.config import Config, CredentialConfig, RepoConfig
+from sbxloop.config import Config, CredentialConfig, RegistryConfig, RepoConfig
 from sbxloop.errors import GithubOpsError, ProvisionError, SbxError
 from sbxloop.events import EventBus
 from sbxloop.gh.appauth import (
@@ -62,6 +62,7 @@ from sbxloop.gh.appauth import (
     AppTokenSource,
     app_credentials,
 )
+from sbxloop.hostgit import exclude_from_git
 from sbxloop.ids import branch_name
 from sbxloop.log import get_logger
 from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
@@ -326,8 +327,10 @@ def agent_policy_allows(
             *baseline_allows((*PROMPT_ADVERTISED_DOMAINS, *installers), config.policy.deny),
             # Operator-declared hosts: a private registry the operator
             # configured is reachable like extra_allow_domains is, deny or
-            # not — the config names it on purpose.
-            *registries.domains(config.registries_for(repo)),
+            # not — the config names it on purpose. Only the credential-less
+            # ones (#766): a registry with a credential is the service
+            # sandbox's host, and this sandbox never speaks to it.
+            *registries.domains(config.open_registries_for(repo)),
             *config.sandbox.extra_allow_domains,
             *extra_domains,
         ]
@@ -349,13 +352,49 @@ def github_policy_allows(config: Config) -> list[str]:
     )
 
 
-def service_policy_allows(credentials: Sequence[CredentialConfig]) -> list[str]:
-    """The service sandbox's network allowlist (#765): exactly the hosts its
-    credentials are good for, nothing baseline — the box runs no agent and
-    fetches no toolchain, so a host no credential names is a host it has
-    no reason to reach. (The worker install itself rides the sbx preset's
-    baseline, as the github sandbox's does.)"""
-    return dedupe_domains(cred.host for cred in credentials)
+# What the service sandbox's toolchain install reaches beyond the installer
+# hosts the toolchains name: the uv tarball and the uv-managed interpreter
+# come from a GitHub release (#250), and every release download answers with
+# a redirect to the assets host.
+SERVICE_TOOLCHAIN_DOMAINS = (
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+)
+
+
+def service_policy_allows(
+    credentials: Sequence[CredentialConfig],
+    registries_: Sequence[RegistryConfig] = (),
+    languages: Sequence[str] = (),
+    deny: Sequence[str] = (),
+) -> list[str]:
+    """The service sandbox's network allowlist (#765, #766).
+
+    With credentials only: exactly the hosts they are good for, nothing
+    baseline — the box runs no agent and fetches no toolchain, so a host no
+    credential names is a host it has no reason to reach. (The worker
+    install itself rides the sbx preset's baseline, as the github
+    sandbox's does.)
+
+    With credentialed registries the box is also the run's fetcher: their
+    hosts, the public registries a private one proxies or sits beside (a
+    scoped npm registry serves the scope; everything else still comes from
+    npmjs), the apt mirrors and installer hosts of the toolchains the
+    fetch needs — the same baseline tier the agent sandbox carries, seeded
+    through :func:`baseline_allows` so ``[policy] deny`` still wins over
+    it. ``languages`` is what :func:`registries.languages` answers for the
+    registries.
+    """
+    domains: list[str] = [*(cred.host for cred in credentials), *registries.domains(registries_)]
+    if registries_:
+        installers = toolchains.install_domains(toolchains.resolve(languages))
+        domains.extend(
+            baseline_allows(
+                (*PROMPT_ADVERTISED_DOMAINS, *SERVICE_TOOLCHAIN_DOMAINS, *installers), deny
+            )
+        )
+    return dedupe_domains(domains)
 
 
 class Provisioner:
@@ -432,7 +471,6 @@ class Provisioner:
             ),
             secrets=[self._agent_secret_spec()],
             persistent_env=self.agent_persistent_env(repo),
-            secret_env=self.agent_secret_env(repo),
             files=self.agent_files(repo),
         )
         github = SandboxSpec(
@@ -513,20 +551,25 @@ class Provisioner:
         """The plain environment the agent sandbox's worker — and so every
         agent turn and shell command it spawns — starts with.
 
-        What the repository's private registries need (``GOPRIVATE``,
-        ``PIP_INDEX_URL``; #680) first, the repository's ``[sandbox] env``
-        (#679) over it — an operator's explicit value wins over a derived
-        one — and the loop's own selector last so nothing an operator
-        writes can shadow it. The
+        What the repository's private registries need first — the
+        credential-less ones' ``GOPRIVATE`` / ``PIP_INDEX_URL`` (#680), and
+        for the credentialed ones the OFFLINE configuration (#766) that
+        points each package manager at the cache the service sandbox
+        fills, so nothing in this sandbox ever asks that registry — then
+        the repository's ``[sandbox] env`` (#679) over it (an operator's
+        explicit value wins over a derived one), and the loop's own
+        selector last so nothing an operator writes can shadow it. The
         worker resolves its backend from ``SBXLOOP_WORKER_BACKEND`` (default
         copilot), so only the claude backend needs it delivered;
         ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`` keeps the Claude Code
         CLI hermetic — no telemetry or auto-update calls to hosts the
-        balanced network policy would only refuse. Nothing secret goes here
-        — see :meth:`agent_secret_env`.
+        balanced network policy would only refuse. Nothing secret goes
+        here, or anywhere else in this sandbox: its only credential is the
+        agent's own.
         """
         env: dict[str, str] = {
-            **registries.plain_env(self.config.registries_for(repo)),
+            **registries.plain_env(self.config.open_registries_for(repo)),
+            **registries.offline_env(self.config.credentialed_registries_for(repo)),
             **self.config.sandbox_env_for(repo),
         }
         if self.agent_backend() == "claude":
@@ -534,48 +577,48 @@ class Provisioner:
             env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
         return env
 
-    def agent_secret_env(self, repo: str | None = None) -> dict[str, str]:
-        """The ``[sandbox] secret_env`` values for ``repo``'s runs, read from
-        the daemon's environment (#679), plus what its private registries'
-        ``auth_env`` credentials derive (#680).
+    def agent_files(self, repo: str | None = None) -> dict[str, str]:
+        """The client files for ``repo``'s credential-less registries (#680)
+        — the only ones the agent sandbox is configured for (#766). Without
+        a credential no file holds one, so there is nothing to look up."""
+        regs = self.config.open_registries_for(repo)
+        if not regs:
+            return {}
+        return {f.path: f.text for f in registries.client_files(regs, {})}
 
-        They ride the credential's non-proxy road — per-job stdin when this
-        sbx passes it through, the 0600 in-VM env file otherwise — and never
-        an ``sbx`` argument, an event, or a log line. The sbx secret proxy
-        is not an option: it binds a secret to one host, which an
-        ``NPM_TOKEN`` has no single answer for, and proxy secrets are
-        invisible to exec'd workers anyway; when the proxy *does* carry the
-        agent's own credential, these still take the env file (see
-        :meth:`_apply_operator_secrets`).
+    def registry_secret_env(self, repo: str | None = None) -> dict[str, str]:
+        """The credential-bearing environment for ``repo``'s credentialed
+        registries (#680): each ``auth_env`` value read from the daemon's
+        environment, plus what the kind derives from it — the service
+        sandbox's (#766), never the agent's.
 
         Every configured name must be set: the operator declared the
-        repository's tests need it, and a run without it would fail later,
-        inside the sandbox, for a reason no log line names. Raises
+        repository's dependencies need it, and a run without it would fail
+        later, inside a sandbox, for a reason no log line names. Raises
         ProvisionError listing the unset names.
         """
-        names = list(
-            dict.fromkeys(
-                [*self.config.secret_env_for(repo), *self.config.registry_auth_envs_for(repo)]
-            )
-        )
+        regs = self.config.credentialed_registries_for(repo)
+        names = self.config.registry_auth_envs_for(repo)
         missing = [name for name in names if not self.env.get(name)]
         if missing:
             raise ProvisionError(
-                f"[sandbox] secret_env / [[registries]] auth_env names {missing} are not "
-                "set in the daemon's environment (secrets.env / the service unit); set "
-                "them or remove them from the config"
+                f"[[registries]] auth_env names {missing} are not set in the daemon's "
+                "environment (secrets.env / the service unit); set them or remove them "
+                "from the config"
             )
         values = {name: self.env[name] for name in names}
-        return {**values, **registries.secret_env(self.config.registries_for(repo), values)}
+        return {**values, **registries.secret_env(regs, values)}
 
-    def agent_files(self, repo: str | None = None) -> dict[str, str]:
-        """The registry client files for ``repo``'s agent sandbox (#680);
-        the netrc kinds embed the credential, so this raises like
-        :meth:`agent_secret_env` when one is unset."""
-        regs = self.config.registries_for(repo)
+    def registry_files(self, repo: str | None = None) -> dict[str, str]:
+        """The client files for ``repo``'s credentialed registries, for the
+        service sandbox; the netrc kinds embed the credential, so this
+        raises like :meth:`registry_secret_env` when one is unset."""
+        regs = self.config.credentialed_registries_for(repo)
         if not regs:
             return {}
-        return {f.path: f.text for f in registries.client_files(regs, self.agent_secret_env(repo))}
+        return {
+            f.path: f.text for f in registries.client_files(regs, self.registry_secret_env(repo))
+        }
 
     def _agent_secret_spec(self) -> SecretSpec:
         env, host = self.backend().secret
@@ -1285,16 +1328,20 @@ class Provisioner:
         # credential.
         github_enabled = self.config.github.enabled
         creds = self.config.credentials_named(credentials)
+        # ... or, since #766, for a repository whose registries carry a
+        # credential: the box fetches the dependencies the agent sandbox
+        # then builds from offline.
+        regs = self.config.credentialed_registries_for(repo)
+        service_enabled = bool(creds or regs)
 
         # Fail fast on missing credentials before creating any microVM. In
         # App mode this mints the first installation token here.
         gh_cred = self.gh_credential(repo) if github_enabled else None
         tokens: dict[SandboxRole, str] = {"agent": self.agent_token()}
-        self.agent_secret_env(repo)
         if gh_cred is not None:
             tokens["github"] = gh_cred.token()
-        if creds:
-            self.service_secret_env(creds)
+        if service_enabled:
+            self.service_secret_env(creds, repo)
             # The service sandbox has no token of its own: its credentials
             # are the spec's secret_env, delivered whole.
             tokens["service"] = ""
@@ -1312,8 +1359,16 @@ class Provisioner:
         specs: tuple[SandboxSpec, ...] = (agent_spec,)
         if github_enabled:
             specs += (github_spec,)
-        if creds:
-            specs += (self.service_spec(run_id, workspace, creds),)
+        if service_enabled:
+            specs += (
+                self.service_spec(
+                    run_id,
+                    workspace,
+                    creds,
+                    repo,
+                    versions=languages.versions if languages else None,
+                ),
+            )
         created: list[Sandbox] = []
         registered_secret_rms: list[Callable[[], bool]] = []
         # Guards the two rollback lists: the sandboxes provision on parallel
@@ -1405,15 +1460,17 @@ class Provisioner:
                     if errors:
                         raise errors[0]
             agent_workdir, why = self._discover_mount(
-                run_id, sandboxes["agent"], workspace, expects_mount=expects_mount
+                run_id, sandboxes["agent"], workspace, expects_mount=expects_mount or bool(regs)
             )
             mounted = agent_workdir is not None
             if agent_workdir is None:
-                if expects_mount:
+                if expects_mount or regs:
                     # The tree the ask is about is on the host and the agent
                     # cannot see it. Falling back to an empty directory here
                     # is how a run "succeeds" by planning a greenfield
-                    # project and delivering files unrelated to the repo.
+                    # project and delivering files unrelated to the repo —
+                    # and, with credentialed registries, how the service
+                    # sandbox would fetch into a tree the agent never sees.
                     raise ProvisionError(
                         f"workspace {workspace} was not visible inside the agent "
                         f"sandbox {sandboxes['agent'].name}: {why}. Check the "
@@ -1423,6 +1480,11 @@ class Provisioner:
                     )
                 agent_workdir = WORK_DIR
                 sandboxes["agent"].mkdirs(agent_workdir)
+            service_workdir: str | None = None
+            if regs:
+                service_workdir = self._share_deps_cache(
+                    run_id, workspace, sandboxes["agent"], agent_workdir, sandboxes["service"]
+                )
             return SandboxPair(
                 run_id,
                 agent=sandboxes["agent"],
@@ -1433,6 +1495,7 @@ class Provisioner:
                 agent_workdir=agent_workdir,
                 mounted=mounted,
                 languages=languages,
+                service_workdir=service_workdir,
             )
         except Exception as exc:
             log.warning(
@@ -1470,34 +1533,55 @@ class Provisioner:
     # -- the service sandbox (#765) ----------------------------------------
 
     def service_spec(
-        self, run_id: str, workspace: Path, credentials: Sequence[CredentialConfig]
+        self,
+        run_id: str,
+        workspace: Path,
+        credentials: Sequence[CredentialConfig],
+        repo: str | None = None,
+        *,
+        versions: Mapping[str, toolchains.ToolchainVersion] | None = None,
     ) -> SandboxSpec:
         """The run's service sandbox: the github sandbox's pattern
-        generalized to the operator's ``[[credentials]]``. No proxy
-        secrets, no agent, an allowlist of the credentials' hosts only;
-        the catalogue (names, env names, hosts — nothing secret) rides the
-        plain environment and the values ride the non-proxy road (per-job
-        stdin, or the 0600 env file), exactly as GH_TOKEN does."""
+        generalized to the operator's ``[[credentials]]`` (#765) and, for
+        ``repo``, its credentialed ``[[registries]]`` (#766). No proxy
+        secrets, no agent; an allowlist of the credentials' and registries'
+        hosts (plus the fetch baseline when there are registries); the
+        catalogue and the registries' plain environment ride the
+        persistent env, the values ride the non-proxy road (per-job stdin,
+        or the 0600 env file) exactly as GH_TOKEN does, and the registries'
+        client files land in this sandbox's ``$HOME``."""
+        regs = self.config.credentialed_registries_for(repo)
         return SandboxSpec(
             name=sandbox_name(run_id, "service"),
             role="service",
             workspace=workspace,
             template=self.config.sandbox.template,
-            policy_allows=service_policy_allows(credentials),
-            persistent_env=self.service_persistent_env(credentials),
-            secret_env=self.service_secret_env(credentials),
+            policy_allows=service_policy_allows(
+                credentials, regs, registries.languages(regs), self.config.policy.deny
+            ),
+            persistent_env=self.service_persistent_env(credentials, repo),
+            secret_env=self.service_secret_env(credentials, repo),
+            files=self.registry_files(repo),
         )
 
-    @staticmethod
-    def service_persistent_env(credentials: Sequence[CredentialConfig]) -> dict[str, str]:
+    def service_persistent_env(
+        self, credentials: Sequence[CredentialConfig], repo: str | None = None
+    ) -> dict[str, str]:
         """The catalogue the service worker resolves a job's credential name
-        against: JSON, non-secret, one env variable."""
-        if not credentials:
-            return {}
-        return {CATALOGUE_ENV: json.dumps([cred.catalogue_entry() for cred in credentials])}
+        against (JSON, non-secret, one env variable) and, for the
+        credentialed registries, the client environment and the fetch
+        environment — each package manager pointed at its cache."""
+        regs = self.config.credentialed_registries_for(repo)
+        env: dict[str, str] = {**registries.plain_env(regs), **registries.fetch_env(regs)}
+        if credentials:
+            env[CATALOGUE_ENV] = json.dumps([cred.catalogue_entry() for cred in credentials])
+        return env
 
-    def service_secret_env(self, credentials: Sequence[CredentialConfig]) -> dict[str, str]:
-        """The credentials' values, read from the daemon's environment.
+    def service_secret_env(
+        self, credentials: Sequence[CredentialConfig], repo: str | None = None
+    ) -> dict[str, str]:
+        """The credentials' values and the registries' credential
+        environment, read from the daemon's environment.
 
         Every granted credential must be set: the run was granted it
         because its work needs it, and a run without it would fail later,
@@ -1511,13 +1595,17 @@ class Provisioner:
                 "environment (secrets.env / the service unit); set them or do not "
                 "grant those credentials"
             )
-        return {cred.env: self.env[cred.env] for cred in credentials}
+        return {
+            **{cred.env: self.env[cred.env] for cred in credentials},
+            **self.registry_secret_env(repo),
+        }
 
     def ensure_service(
         self,
         run_id: str,
         workspace: Path,
         credentials: Sequence[str],
+        repo: str | None = None,
         *,
         post_create: PostCreate | None = None,
     ) -> Sandbox:
@@ -1526,10 +1614,54 @@ class Provisioner:
         Same discipline as :meth:`ensure_pair`'s third sandbox: values
         checked before any microVM, rollback on failure."""
         creds = self.config.credentials_named(credentials)
-        spec = self.service_spec(run_id, workspace.resolve(), creds)
+        spec = self.service_spec(run_id, workspace.resolve(), creds, repo)
         return self._ensure_single(
             spec, "", reason="service", post_create=post_create, run_id=run_id
         )
+
+    def _share_deps_cache(
+        self,
+        run_id: str,
+        workspace: Path,
+        agent: Sandbox,
+        agent_workdir: str,
+        service: Sandbox,
+    ) -> str:
+        """Make the dependency cache one directory in both sandboxes (#766).
+
+        The service sandbox's mount is discovered like the agent's; a run
+        with credentialed registries whose workspace the service sandbox
+        cannot see fails closed here, naming the probe — a fetch into a
+        tree the agent never sees is not a fallback. Then each sandbox
+        gets the fixed link :data:`registries.DEPS_HOME` → the cache inside
+        its own view of the workspace, so the environment written before
+        the mount was known (``GOMODCACHE``, ``PIP_FIND_LINKS``, …) points
+        at the right place in both. The cache is excluded from the host
+        checkout's git so the agent never commits it. Returns the service
+        sandbox's in-VM workspace path.
+        """
+        service_workdir, why = self._discover_mount(run_id, service, workspace, expects_mount=True)
+        if service_workdir is None:
+            raise ProvisionError(
+                f"workspace {workspace} was not visible inside the service sandbox "
+                f"{service.name}: {why}. The run's [[registries]] carry a credential, "
+                "so its dependencies are fetched there and built here — both sandboxes "
+                "must see the workspace. Check the sandbox row of `sbxloop doctor` "
+                "(workspace-mount probe) and the sbx version"
+            )
+        for sandbox, workdir in ((agent, agent_workdir), (service, service_workdir)):
+            cache = f"{workdir.rstrip('/')}/{registries.DEPS_WORKSPACE_DIR}"
+            sandbox.mkdirs(cache, registries.DEPS_HOME.rsplit("/", 1)[0])
+            sandbox.exec(["ln", "-sfn", cache, registries.DEPS_HOME])
+        exclude_from_git(workspace, registries.DEPS_WORKSPACE_DIR.split("/", 1)[0] + "/")
+        self.bus.emit(
+            "sandbox.deps_cache",
+            run_id,
+            name=service.name,
+            workdir=service_workdir,
+            cache=registries.DEPS_WORKSPACE_DIR,
+        )
+        return service_workdir
 
     def github_only_spec(self, name: str, workspace: Path, repo: str | None = None) -> SandboxSpec:
         """A github-role spec that is not tied to a run — the daemon's
@@ -1556,7 +1688,6 @@ class Provisioner:
             policy_allows=agent_policy_allows(self.config, self.config.sandbox.effective_languages),
             secrets=[self._agent_secret_spec()],
             persistent_env=self.agent_persistent_env(),
-            secret_env=self.agent_secret_env(),
             files=self.agent_files(),
         )
 
@@ -2105,7 +2236,6 @@ class Provisioner:
             f"observed while provisioning {spec.name} ({env_name})",
         )
         if result.ok:
-            self._apply_operator_secrets(spec, sandbox)
             return
         # Auto-heal: fall back to non-proxy delivery for this sandbox —
         # per-job stdin when this sbx passes it through (the value transits
@@ -2246,9 +2376,8 @@ class Provisioner:
         so this is the ``proxy`` (default) strategy's path: the repository a
         github-ops sandbox is scoped to has to reach the worker, and the env
         file is what the worker loads at startup. Nothing secret goes here:
-        operator ``secret_env`` values wait for the visibility verdict
-        (:meth:`_apply_operator_secrets`), so a proxy downgrade to stdin
-        delivery never leaves them at rest first.
+        a spec's ``secret_env`` (the service sandbox's, #765) rides the
+        non-proxy road only (:meth:`_apply_env_file_only`).
         """
         if not spec.persistent_env or self.config.secret_strategy == "plain-env":  # nosec B105
             return
@@ -2268,16 +2397,6 @@ class Provisioner:
         sandbox.exec(["mkdir", "-p", ENV_FILE.rsplit("/", 1)[0]])
         sandbox.write_text(ENV_FILE, lines)
         sandbox.exec(["chmod", "600", ENV_FILE])
-
-    def _apply_operator_secrets(self, spec: SandboxSpec, sandbox: Sandbox) -> None:
-        """The proxy carries the agent's credential, so nothing else will
-        rewrite the env file: operator ``secret_env`` values (#679) go into
-        it here, beside the plain environment already written. The file is
-        0600 in a VM the agent controls — the same standing as the plain-env
-        fallback, and the only road these values have."""
-        if not spec.secret_env:
-            return
-        self._write_env_file(sandbox, {**spec.persistent_env, **spec.secret_env})
 
     def _apply_plain_env(self, spec: SandboxSpec, sandbox: Sandbox, token: str) -> None:
         """Weaker fallback: write tokens/env into ~/.sbxloop/env.sh in the VM."""
@@ -2362,14 +2481,13 @@ class Provisioner:
         if role == "agent":
             return lambda: {
                 **self.agent_persistent_env(repo),
-                **self.agent_secret_env(repo),
                 self.agent_token_env(): self.agent_token(),
             }
         if role == "service":
             creds = self.config.credentials_named(credentials)
             return lambda: {
-                **self.service_persistent_env(creds),
-                **self.service_secret_env(creds),
+                **self.service_persistent_env(creds, repo),
+                **self.service_secret_env(creds, repo),
             }
         cred = gh_cred
         assert cred is not None

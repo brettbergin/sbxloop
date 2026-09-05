@@ -45,6 +45,7 @@ class SandboxPair:
         agent_workdir: str = WORK_DIR,
         mounted: bool = False,
         languages: LanguageResolution | None = None,
+        service_workdir: str | None = None,
     ) -> None:
         self.run_id = run_id
         self.agent = agent
@@ -63,6 +64,9 @@ class SandboxPair:
         # the agent sandbox exists — and carried here so the worker install
         # and the verify-command lint read the same answer.
         self.languages = languages or LanguageResolution(DEFAULT_LANGUAGES, "default", {})
+        # The service sandbox's own view of the same workspace (#766) —
+        # where its dependency fetches run; None when it fetches nothing.
+        self.service_workdir = service_workdir
         self._cleaned = False
 
     def __enter__(self) -> SandboxPair:
