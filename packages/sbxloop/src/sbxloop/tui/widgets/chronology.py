@@ -19,9 +19,15 @@ class ChronologyLog(RichLog):
         super().__init__(wrap=True, markup=False, highlight=False, auto_scroll=True, **kwargs)
         self.view: View = view
         self.count = 0
+        # Two loads can race the tail's cursor off-thread; the log itself
+        # keeps the last sequence it rendered so a row is never shown twice.
+        self.last_seq = 0
 
     def feed(self, events: list[tuple[int, Event]]) -> None:
-        for _seq, event in events:
+        for seq, event in events:
+            if seq <= self.last_seq:
+                continue
+            self.last_seq = seq
             if self.view == "transcript":
                 rendered = render_event(event)
                 if rendered is not None:
@@ -36,3 +42,4 @@ class ChronologyLog(RichLog):
             self.view = view
         self.clear()
         self.count = 0
+        self.last_seq = 0

@@ -9,7 +9,7 @@ from rich.text import Text
 from textual.widgets import Static
 
 from sbxloop.tui.data import ConsoleState
-from sbxloop.tui.format import age
+from sbxloop.tui.format import age, clock
 
 #: The daemon's state markers, and their ASCII twins for `[tui] emoji = false`.
 _GLYPHS = {
@@ -32,7 +32,9 @@ _ASCII = {
 }
 
 
-def status_lines(state: ConsoleState, *, now: float | None = None, emoji: bool = True) -> Text:
+def status_lines(
+    state: ConsoleState, *, now: float | None = None, emoji: bool = True, unread: int = 0
+) -> Text:
     now = time.time() if now is None else now
     line = Text()
     daemon = state.daemon
@@ -88,9 +90,11 @@ def status_lines(state: ConsoleState, *, now: float | None = None, emoji: bool =
         second.append(f"   up since {age(state.daemon_started_at, now)}", style="dim")
     if daemon is not None and daemon.live:
         second.append(f"   ctl {daemon.latency_ms} ms", style="dim")
+    if unread:
+        second.append(f"   chat: {unread} new", style="bold magenta")
     if state.read_only:
         second.append("   [read-only]", style="bold yellow")
-    second.append(f"   {time.strftime('%H:%M:%S', time.localtime(now))}", style="dim")
+    second.append(f"   {clock(now)}", style="dim")
     line.append("\n")
     line.append_text(second)
     return line
@@ -103,6 +107,6 @@ class StatusBar(Static):
 
     last: Text = Text()
 
-    def show(self, state: ConsoleState, *, emoji: bool = True) -> None:
-        self.last = status_lines(state, emoji=emoji)
+    def show(self, state: ConsoleState, *, emoji: bool = True, unread: int = 0) -> None:
+        self.last = status_lines(state, emoji=emoji, unread=unread)
         self.update(self.last)
