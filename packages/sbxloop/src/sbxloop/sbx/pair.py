@@ -1,11 +1,13 @@
 """SandboxPair — the core sbxloop primitive — and its cleanup guarantees.
 
-A run's pair consists of the agent sandbox (COPILOT_GITHUB_TOKEN only) and,
-when the GitHub integration is configured (``[github].repo``), the
+A run's pair consists of the agent sandbox (the inference credential only)
+and, when the GitHub integration is configured (``[github].repo``), the
 github-ops sandbox (GH_TOKEN only) — otherwise ``pair.github`` is None and
-no GitHub capability exists anywhere in the run. The pair is a context
-manager whose
-exit stops and removes both sandboxes unless ``keep`` is set; a process-wide
+no GitHub capability exists anywhere in the run. A run granted
+``[[credentials]]`` (#765) has a third, *service* sandbox holding their
+values — ``pair.service`` — and, like the github one, it runs only the
+fixed ops the host submits. The pair is a context manager whose exit
+stops and removes every sandbox unless ``keep`` is set; a process-wide
 registry additionally cleans up on interpreter exit and on SIGINT/SIGTERM,
 so aborted runs do not leak microVMs.
 """
@@ -36,6 +38,7 @@ class SandboxPair:
         run_id: str,
         agent: Sandbox,
         github: Sandbox | None = None,
+        service: Sandbox | None = None,
         *,
         keep: bool = False,
         workspace: Path | None = None,
@@ -46,6 +49,7 @@ class SandboxPair:
         self.run_id = run_id
         self.agent = agent
         self.github = github
+        self.service = service
         self.keep = keep
         # The host directory sbx was given as the run workspace, the in-VM
         # working directory agent jobs run in, and whether the two are the
@@ -91,6 +95,7 @@ class SandboxPair:
         roles: tuple[tuple[Sandbox | None, SandboxRole], ...] = (
             (self.agent, "agent"),
             (self.github, "github"),
+            (self.service, "service"),
         )
         for sandbox, role in roles:
             if sandbox is None:

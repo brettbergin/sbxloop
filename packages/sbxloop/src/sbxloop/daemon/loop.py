@@ -91,6 +91,7 @@ from sbxloop.ghids import normalize_item_id, try_parse_gh_id
 from sbxloop.ids import new_run_id
 from sbxloop.log import bind_run, clear_run, get_logger
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.provision import sandbox_name
 from sbxloop.sbx.prune import remove_run_sandbox, remove_run_sandbox_secrets
 
@@ -2914,7 +2915,15 @@ class DaemonLoop:
         401s (field failure rgn9ccjam)."""
         if self.sbx is None:
             return
-        for role in ("agent", "github"):
+        roles: tuple[SandboxRole, ...] = ("agent", "github")
+        # The service sandbox (#765) exists only for a run granted
+        # credentials; the run row says whether there is one to sweep.
+        try:
+            if self.store.get_run(run_id).credentials:
+                roles += ("service",)
+        except StateError:
+            pass
+        for role in roles:
             name = sandbox_name(run_id, role)
             try:
                 remove_run_sandbox(self.sbx, name, role)

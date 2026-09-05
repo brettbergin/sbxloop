@@ -11,7 +11,7 @@ import json
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
@@ -89,7 +89,8 @@ CREATE TABLE IF NOT EXISTS runs (
     last_verdict TEXT,
     exhausted  TEXT,
     granted_rounds INTEGER NOT NULL DEFAULT 0,
-    pr_title   TEXT
+    pr_title   TEXT,
+    credentials TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS tasks (
     run_id     TEXT NOT NULL,
@@ -176,6 +177,7 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
             "granted_rounds",
             "ALTER TABLE runs ADD COLUMN granted_rounds INTEGER NOT NULL DEFAULT 0",
         ),
+        ("credentials", "ALTER TABLE runs ADD COLUMN credentials TEXT NOT NULL DEFAULT '[]'"),
     ),
     "phase_attempts": (
         ("input_tokens", "ALTER TABLE phase_attempts ADD COLUMN input_tokens INTEGER"),
@@ -233,21 +235,48 @@ class StateStore:
 
     # -- runs --------------------------------------------------------------
 
-    def create_run(self, run_id: str, outcome: str, config_json: str = "{}") -> RunRecord:
+    def create_run(
+        self,
+        run_id: str,
+        outcome: str,
+        config_json: str = "{}",
+        *,
+        credentials: Sequence[str] = (),
+    ) -> RunRecord:
+        names = list(dict.fromkeys(credentials))
         with self._lock:
             now = time.time()
             try:
                 self._conn.execute(
-                    "INSERT INTO runs (run_id, outcome, state, config_json, created_at, updated_at)"
-                    " VALUES (?, ?, 'created', ?, ?, ?)",
-                    (run_id, outcome, config_json, now, now),
+                    "INSERT INTO runs (run_id, outcome, state, config_json, created_at,"
+                    " updated_at, credentials) VALUES (?, ?, 'created', ?, ?, ?, ?)",
+                    (run_id, outcome, config_json, now, now, json.dumps(names)),
                 )
             except sqlite3.IntegrityError as exc:
                 raise StateError(f"run {run_id} already exists") from exc
             self._conn.commit()
             return RunRecord(
-                run_id=run_id, outcome=outcome, state="created", created_at=now, updated_at=now
+                run_id=run_id,
+                outcome=outcome,
+                state="created",
+                created_at=now,
+                updated_at=now,
+                credentials=names,
             )
+
+    def set_run_credentials(self, run_id: str, credentials: Sequence[str]) -> None:
+        """Record the ``[[credentials]]`` this run is granted (#765) — the
+        whole grant, replacing what was there — so a resume re-provisions
+        the same service sandbox."""
+        names = list(dict.fromkeys(credentials))
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE runs SET credentials = ?, updated_at = ? WHERE run_id = ?",
+                (json.dumps(names), time.time(), run_id),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
 
     def set_run_state(self, run_id: str, state: RunState) -> None:
         """Move the run to ``state``. A non-terminal state is also recorded
@@ -482,6 +511,7 @@ class StateStore:
             last_verdict=row["last_verdict"],
             exhausted=row["exhausted"],
             granted_rounds=int(row["granted_rounds"] or 0),
+            credentials=[str(name) for name in json.loads(row["credentials"] or "[]")],
         )
 
     def non_terminal_runs(self) -> list[RunRecord]:

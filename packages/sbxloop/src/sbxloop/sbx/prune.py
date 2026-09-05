@@ -36,7 +36,7 @@ from sbxloop.sbx.models import SandboxInfo, SandboxRole
 # against racing a run that another terminal just started or is mid-phase.
 DEFAULT_MIN_AGE_S = 3600.0
 
-_NAME_RE = re.compile(r"^sbxloop-(?P<run>[^-]+)-(?P<role>agent|github)$")
+_NAME_RE = re.compile(r"^sbxloop-(?P<run>[^-]+)-(?P<role>agent|github|service)$")
 
 # Sandboxes the daemon owns for its whole lifetime (not tied to a run):
 # the github-ops box and the concierge box. Never pruned here — the daemon
@@ -210,9 +210,13 @@ def remove_run_sandbox_secrets(cli: SbxCLI, name: str, role: SandboxRole) -> Non
     the Copilot SDK got 401). Agent sandboxes carry the configured
     backend's custom secret — and since the backend may have changed since
     the sandbox was provisioned, every backend's registration is tried
-    (#617); github sandboxes the built-in ``github`` service secret.
+    (#617); github sandboxes the built-in ``github`` service secret; a
+    service sandbox (#765) registers nothing — its credentials never touch
+    the sbx proxy — so there is nothing to remove.
     """
-    if role != "agent":
+    if role == "service":
+        return
+    if role == "github":
         with contextlib.suppress(SbxError):
             cli.secret_rm(service="github", sandbox=name)
         return

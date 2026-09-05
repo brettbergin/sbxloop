@@ -22,7 +22,11 @@ $acceptance_criteria, $verify_commands, $prior_attempt, $feedback,
 $user_guidance, $repo_conventions (engine.repocontext, #688 — defaulted to ""
 by render()), $work_dir and $toolchains (#689 — the checkout path and the
 run's resolved toolchain set with versions, rendered by phases.py from
-toolchains.describe; both defaulted by render()); $baseline_registries and
+toolchains.describe; both defaulted by render()), $service_tools (#765 —
+the credentials section when the run was granted any, rendered by
+phases.py with its own leading blank lines and glued to $user_guidance so
+a run without credentials gets the exact prompt it always did; defaulted
+to "" by render()); $baseline_registries and
 $declarable_registries are injected
 from policy.py, never hardcoded (test_registry_tiers_are_injected_not_hardcoded).
 Section rules:
@@ -183,7 +187,7 @@ $feedback
 The user can steer the run over live chat; these instructions are in effect
 for all remaining work and your changes must honor them:
 
-$user_guidance
+$user_guidance$service_tools
 
 ## Budget your investigation
 
