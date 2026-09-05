@@ -214,6 +214,17 @@ def render_event(event: Event) -> RenderableType | None:
             padding=(0, 1),
         )
 
+    if event.type == HostEventTypes.RUN_PUBLISHED and data.get("sink") == "chat":
+        # The chat sink's reply (#759) is the result itself: rendered like
+        # the agent's reply to a steer, not as a lifecycle line.
+        return Panel(
+            Markdown(str(data.get("message", "")).strip() or "*(no result reported)*"),
+            title=f"[bold cyan]result[/] [dim]{_stamp(event)}[/]",
+            title_align="left",
+            border_style="cyan",
+            padding=(0, 1),
+        )
+
     if event.type == HostEventTypes.CHAT_ACTION:
         return Text(
             f"{_stamp(event)}  ↪ {data.get('message', 'user steering applied')}",

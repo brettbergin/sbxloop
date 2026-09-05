@@ -50,6 +50,7 @@ from sbxloop.engine.model import (
     scan_artifacts,
     workload_summary,
 )
+from sbxloop.engine.sinks import published_line
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxloopError
 from sbxloop.events import Event, EventBus, HostEventTypes
@@ -593,6 +594,9 @@ def _finish(result: RunResult, config: Config) -> None:
             # A workload task's own result line (#757).
             line += f"\n      {_output_cell(task)}"
         console.print(line)
+    for entry in result.published:
+        # Where a workload's result went (#759), one line per sink.
+        console.print(f"  published: {rich_escape(published_line(entry))}")
     _print_github_summary(result, config)
     _print_artifacts_summary(result, config)
     _print_workspace_clone_summary(result, config)
@@ -970,6 +974,8 @@ def status(
     if record.reason:
         console.print(f"reason: {record.reason}")
     console.print(f"outcome: {record.outcome}")
+    for entry in record.published:
+        console.print(f"published: {rich_escape(published_line(entry))}")
     table = Table(title="tasks")
     columns: tuple[str, ...] = ("task", "title", "state", "revisions", "replans")
     if record.kind == "workload":

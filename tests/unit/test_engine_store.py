@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from sbxloop.engine.model import TaskOutput, TaskRecord, TaskSpec
+from sbxloop.engine.model import Published, TaskOutput, TaskRecord, TaskSpec
 from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import StateError
 from sbxloop_worker.protocol import Event, Usage
@@ -695,6 +695,26 @@ class TestPipelineColumns:
     def test_a_run_is_code_unless_created_otherwise(self, store: StateStore) -> None:
         assert store.create_run("r1", "x").kind == "code"
         assert store.get_run("r1").kind == "code"
+
+    def test_pre_published_database_gains_the_column_and_records_append(
+        self, tmp_path: Path
+    ) -> None:
+        """#759: a runs table from before sinks gains `published`; every row
+        reads back with nothing published, and a delivery appends to the
+        list in order — the record a resume at publishing reads."""
+        db = engine_db(tmp_path, "pre_published")
+        insert_run_row(db, run_id="old", outcome="legacy", state="publishing", updated_at=2.0)
+        store = StateStore(db)
+        assert store.get_run("old").published == []
+        store.add_run_published("old", Published(sink="artifact", location="/a", files=2))
+        store.add_run_published("old", Published(sink="chat", location="chat", tasks=["t1"]))
+        assert [(p.sink, p.location, p.files, p.tasks) for p in store.get_run("old").published] == [
+            ("artifact", "/a", 2, []),
+            ("chat", "chat", 0, ["t1"]),
+        ]
+        assert StateStore(db).get_run("old").published[0].sink == "artifact"
+        with pytest.raises(StateError, match="unknown run nope"):
+            store.add_run_published("nope", Published(sink="chat", location="chat"))
 
 
 class TestGrantRounds:

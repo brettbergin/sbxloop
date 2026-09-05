@@ -37,6 +37,7 @@ import json
 import re
 import socket
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -48,7 +49,7 @@ from sbxloop.cli.tui import (
 )
 from sbxloop.cli.tui import _one_line as _one_line_mid
 from sbxloop.daemon.model import DaemonNotice, RunReport, TaskOutcome, WorkItem
-from sbxloop.engine.model import PIPELINE_STAGES, WORKLOAD_STAGES
+from sbxloop.engine.model import PIPELINE_STAGES, WORKLOAD_STAGES, Published
 from sbxloop.events import Event, HostEventTypes
 from sbxloop.excerpt import (
     TOOL_EXCERPT_LINE_CLIP,
@@ -1430,6 +1431,19 @@ def format_for_discord(
         if files:
             text += f" · {files} file{'s' if files != 1 else ''}"
         return [line(text)]
+    if t == HostEventTypes.RUN_PUBLISHED:
+        # Where the result went (#759). The chat sink's message is the
+        # result itself, posted whole into the thread; the others get a
+        # line naming where they landed.
+        if data.get("sink") == "chat":
+            text = str(data.get("message") or "").strip() or "*(no result reported)*"
+            return [
+                block(part)
+                for part in split_markdown(
+                    text, max_chars, header="📣 **result**", cont="📣 *(cont. {i}/{n})*"
+                )
+            ]
+        return [line(f"📤 published: {_one_line(data.get('message') or '', 300)}", flush=True)]
     if t == HostEventTypes.RUN_NEEDS_GRANTED:
         # What the plan asked for and the profile allowed (#758): names
         # and hosts only, never a value.
@@ -1867,6 +1881,19 @@ def _cancel_note(item_id: str | None, report: RunReport) -> str:
     return note
 
 
+def _published_text(run_id: str, published: Sequence[Published]) -> str:
+    lines = []
+    for entry in published:
+        if entry.sink == "chat":
+            lines.append("📣 chat: posted above")
+        elif entry.sink in ("issue", "pr"):
+            lines.append(f"📤 {entry.sink}: {link(entry.location, entry.location)}")
+        else:
+            count = f"{entry.files} file{'s' if entry.files != 1 else ''}"
+            lines.append(f"📤 {entry.sink}: {count} — `sbxloop artifacts {run_id}`")
+    return "\n".join(lines)
+
+
 def finish_embed(
     item: WorkItem,
     report: RunReport,
@@ -1886,6 +1913,10 @@ def finish_embed(
         # A workload's result (#757): each task's own result line and the
         # judge's word on it, where a code run's card shows the PR.
         fields.append(("Tasks", _outputs_text(report.outputs), False))
+    if report.published:
+        # Where the result went (#759): a link for an issue, a count for
+        # the artifact directory, the thread itself for chat.
+        fields.append(("Published", _published_text(report.run_id, report.published), False))
     if report.reason and state != "merged":
         fields.append(("Reason", _one_line(report.reason, 600), False))
     if unanswered:

@@ -70,7 +70,7 @@ def test_the_profile_bounds_reach_the_planner() -> None:
         "- credentials, by name: `weather` (api.weather.example.com: forecasts), "
         "`keyed` (keyed.example.com)" in text
     )
-    assert "- sinks: `chat`, `artifact`" in text
+    assert "- sinks: `chat` (always; the default when a task names none), `artifact`" in text
     assert "(`repo`, as `owner/name`, one configured for this host): allowed" in text
     assert "WEATHER_API_KEY" not in text and "KEYED_TOKEN" not in text
 
@@ -81,7 +81,8 @@ def test_an_empty_profile_says_so_line_by_line() -> None:
     assert "Profile `bare`:" in text
     assert "- hosts: none beyond the always-reachable package registries" in text
     assert "- credentials: none" in text
-    assert "- sinks: none" in text
+    # Even an empty profile can answer: chat needs no granting (#759).
+    assert "- sinks: `chat` (always; the default when a task names none)\n" in text
     assert "one configured for this host): not allowed" in text
 
 

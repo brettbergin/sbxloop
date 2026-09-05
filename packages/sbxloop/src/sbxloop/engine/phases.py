@@ -1017,9 +1017,10 @@ class PhaseRunner:
         profile = self.config.workload_profile()
         if profile is None:
             return (
-                "This run has no workload profile: no host, credential, sink or "
-                "repository can be granted. Declare no needs — plan work that "
-                "reaches nothing beyond the always-reachable package registries."
+                "This run has no workload profile: no host, credential or "
+                "repository can be granted, and `chat` is the only sink. Declare "
+                "no needs — plan work that reaches nothing beyond the "
+                "always-reachable package registries."
             )
         lines = [
             f"Profile `{profile.name}`"
@@ -1049,8 +1050,11 @@ class PhaseRunner:
             lines.append("- credentials, by name: " + ", ".join(named))
         else:
             lines.append("- credentials: none")
+        # `chat` needs no granting: it is where a task's result goes when
+        # the plan names no sink (#759).
         lines.append(
-            "- sinks: " + (", ".join(f"`{s}`" for s in profile.sinks) if profile.sinks else "none")
+            "- sinks: `chat` (always; the default when a task names none)"
+            + "".join(f", `{s}`" for s in profile.sinks if s != "chat")
         )
         lines.append(
             "- a repository checkout (`repo`, as `owner/name`, one configured for this "

@@ -17,6 +17,7 @@ from typing import NamedTuple
 
 from sbxloop.engine.model import (
     TERMINAL_RUN_STATES,
+    Published,
     RunKind,
     RunRecord,
     RunState,
@@ -93,7 +94,8 @@ CREATE TABLE IF NOT EXISTS runs (
     granted_rounds INTEGER NOT NULL DEFAULT 0,
     pr_title   TEXT,
     credentials TEXT NOT NULL DEFAULT '[]',
-    kind       TEXT NOT NULL DEFAULT 'code'
+    kind       TEXT NOT NULL DEFAULT 'code',
+    published  TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS tasks (
     run_id     TEXT NOT NULL,
@@ -185,6 +187,8 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
         # Every run before #755 was a developer run: the default IS the
         # migration, so a legacy row reads back as `code` untouched.
         ("kind", "ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'code'"),
+        # Where a workload's result went (#759); nothing published before.
+        ("published", "ALTER TABLE runs ADD COLUMN published TEXT NOT NULL DEFAULT '[]'"),
     ),
     "phase_attempts": (
         ("input_tokens", "ALTER TABLE phase_attempts ADD COLUMN input_tokens INTEGER"),
@@ -287,6 +291,23 @@ class StateStore:
                 updated_at=now,
                 credentials=names,
             )
+
+    def add_run_published(self, run_id: str, entry: Published) -> None:
+        """Record one more place the run's result went (#759), as it lands
+        — so a resume at publishing skips it and the record says where the
+        result is."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT published FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise StateError(f"unknown run {run_id}")
+            published = [*json.loads(row["published"] or "[]"), entry.model_dump(mode="json")]
+            self._conn.execute(
+                "UPDATE runs SET published = ?, updated_at = ? WHERE run_id = ?",
+                (json.dumps(published), time.time(), run_id),
+            )
+            self._conn.commit()
 
     def set_run_credentials(self, run_id: str, credentials: Sequence[str]) -> None:
         """Record the ``[[credentials]]`` this run is granted (#765) — the
@@ -537,6 +558,9 @@ class StateStore:
             exhausted=row["exhausted"],
             granted_rounds=int(row["granted_rounds"] or 0),
             credentials=[str(name) for name in json.loads(row["credentials"] or "[]")],
+            published=[
+                Published.model_validate(entry) for entry in json.loads(row["published"] or "[]")
+            ],
         )
 
     def non_terminal_runs(self) -> list[RunRecord]:
