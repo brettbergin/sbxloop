@@ -24,7 +24,6 @@ from sbxloop.sbx.prune import (
     format_age,
 )
 from sbxloop.tui import actions
-from sbxloop.tui.data import ConsoleState
 from sbxloop.tui.screens.base import ConsoleScreen
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop.tui.widgets.tables import ConsoleTable
@@ -122,9 +121,6 @@ class SandboxesScreen(ConsoleScreen):
     ) -> None:
         self.infos, self.verdicts, self.rundirs, self.error = infos, verdicts, rundirs, error
         self.render_tables()
-
-    def refresh_data(self, state: ConsoleState) -> None:
-        super().refresh_data(state)
 
     def render_tables(self) -> None:
         status_by_name = {i.name: i.status or "" for i in self.infos}

@@ -101,4 +101,72 @@ def usage_for_run(store: StateStore, run_id: str, *, since: float = 0.0) -> RunU
     return RunUsage(total, by_agent, models, samples, turns, {k: len(v) for k, v in jobs.items()})
 
 
-__all__ = ["RunUsage", "usage_for_run", "usage_from_event"]
+def tokens_text(value: int | None) -> str:
+    return f"{value:,}" if value is not None else "—"
+
+
+def usage_row(
+    label: str, usage: Usage, *, turns: int | None = None, jobs: int | None = None
+) -> str:
+    """One spend line, with the turn/job and cache columns appended only when
+    they are known — a run that predates turn counting or a backend that
+    reports no cache figures must not grow empty columns."""
+    row = (
+        f"{label:<14} {tokens_text(usage.input_tokens):>11} in · "
+        f"{tokens_text(usage.output_tokens):>9} out"
+    )
+    if turns is not None:
+        row += f" · {turns} turn{'s' if turns != 1 else ''}"
+        if jobs:
+            row += f"/{jobs} job{'s' if jobs != 1 else ''}"
+    if usage.cache_read_tokens is not None:
+        row += f" · {tokens_text(usage.cache_read_tokens)} cached"
+    return row
+
+
+def usage_rows(
+    rows: dict[str, Usage],
+    turns: dict[str, int] | None = None,
+    jobs: dict[str, int] | None = None,
+) -> list[str]:
+    """Biggest spender first — the answer to "where did it go?" is the top line."""
+    ordered = sorted(
+        rows.items(), key=lambda kv: -((kv[1].input_tokens or 0) + (kv[1].output_tokens or 0))
+    )
+    return [
+        usage_row(
+            label,
+            usage,
+            turns=None if turns is None else turns.get(label, 0),
+            jobs=None if jobs is None else jobs.get(label, 0),
+        )
+        for label, usage in ordered
+    ]
+
+
+# No backend reports a spend figure in a known unit, so every usage block ends
+# with the same plain statement rather than a number. The concierge repeats
+# this line in chat as fact, and a zero or a fabricated figure would be
+# repeated just as confidently.
+SPEND_NOT_REPORTED = "spend: not reported by the agent backend (tokens above are the whole record)"
+
+
+def usage_lines(usage: RunUsage) -> list[str]:
+    """The per-persona rows, the total and the spend line — the block the
+    concierge's ``run_usage`` tool and the console's Phases tab both show."""
+    lines = usage_rows(usage.by_agent, usage.turns_by_agent, usage.jobs_by_agent)
+    lines.append(usage_row("total", usage.total, turns=usage.samples))
+    lines.append(SPEND_NOT_REPORTED)
+    return lines
+
+
+__all__ = [
+    "SPEND_NOT_REPORTED",
+    "RunUsage",
+    "tokens_text",
+    "usage_for_run",
+    "usage_from_event",
+    "usage_lines",
+    "usage_row",
+    "usage_rows",
+]

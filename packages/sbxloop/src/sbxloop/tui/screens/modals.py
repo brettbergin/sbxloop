@@ -25,27 +25,45 @@ ModalScreen { align: center middle; }
 """
 
 
-class ConfirmScreen(ModalScreen[bool]):
-    """``y`` confirms, ``n``/``Esc`` declines."""
+class _Dialog[T](ModalScreen[T]):
+    """A title, a prompt, an optional line of input, a hint."""
 
     DEFAULT_CSS = _DIALOG_CSS
-    BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("y", "yes", "Yes"),
-        Binding("enter", "yes", "Yes", show=False),
-        Binding("n", "no", "No"),
-        Binding("escape", "no", "No", show=False),
-    ]
+    DANGER: ClassVar[bool] = False
+    HINT: ClassVar[str] = ""
 
     def __init__(self, title: str, prompt: str) -> None:
         super().__init__()
         self.title_text = title
         self.prompt = prompt
 
+    def input_widget(self) -> Input | None:
+        return None
+
     def compose(self) -> ComposeResult:
-        with Vertical(id="dialog"):
+        with Vertical(id="dialog", classes="danger" if self.DANGER else ""):
             yield Static(Text(self.title_text), classes="title")
             yield Static(self.prompt, classes="body")
-            yield Static("y confirms · n cancels", classes="hint")
+            box = self.input_widget()
+            if box is not None:
+                yield box
+            yield Static(self.HINT, classes="hint")
+
+    def on_mount(self) -> None:
+        for box in self.query(Input):
+            box.focus()
+
+
+class ConfirmScreen(_Dialog[bool]):
+    """``y`` confirms, ``n``/``Esc`` declines."""
+
+    HINT = "y confirms · n cancels"
+    BINDINGS: ClassVar[list[BindingType]] = [
+        Binding("y", "yes", "Yes"),
+        Binding("enter", "yes", "Yes", show=False),
+        Binding("n", "no", "No"),
+        Binding("escape", "no", "No", show=False),
+    ]
 
     def action_yes(self) -> None:
         self.dismiss(True)
@@ -54,27 +72,19 @@ class ConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class TypedConfirmScreen(ModalScreen[bool]):
+class TypedConfirmScreen(_Dialog[bool]):
     """The destructive tier: the operator types ``word`` exactly."""
 
-    DEFAULT_CSS = _DIALOG_CSS
+    DANGER = True
+    HINT = "Enter confirms · Esc cancels"
     BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "no", "Cancel", show=False)]
 
     def __init__(self, title: str, prompt: str, word: str) -> None:
-        super().__init__()
-        self.title_text = title
-        self.prompt = prompt
+        super().__init__(title, prompt)
         self.word = word
 
-    def compose(self) -> ComposeResult:
-        with Vertical(id="dialog", classes="danger"):
-            yield Static(Text(self.title_text), classes="title")
-            yield Static(self.prompt, classes="body")
-            yield Input(placeholder=f"type {self.word} to confirm", id="typed")
-            yield Static("Enter confirms · Esc cancels", classes="hint")
-
-    def on_mount(self) -> None:
-        self.query_one("#typed", Input).focus()
+    def input_widget(self) -> Input:
+        return Input(placeholder=f"type {self.word} to confirm", id="typed")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         if event.value.strip() == self.word:
@@ -86,30 +96,21 @@ class TypedConfirmScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
-class TextPromptScreen(ModalScreen[str | None]):
+class TextPromptScreen(_Dialog[str | None]):
     """One line of text; ``Esc`` yields None."""
 
-    DEFAULT_CSS = _DIALOG_CSS
+    HINT = "Enter submits · Esc cancels"
     BINDINGS: ClassVar[list[BindingType]] = [Binding("escape", "cancel", "Cancel", show=False)]
 
     def __init__(
         self, title: str, prompt: str, *, placeholder: str = "", password: bool = False
     ) -> None:
-        super().__init__()
-        self.title_text = title
-        self.prompt = prompt
+        super().__init__(title, prompt)
         self.placeholder = placeholder
         self.password = password
 
-    def compose(self) -> ComposeResult:
-        with Vertical(id="dialog"):
-            yield Static(Text(self.title_text), classes="title")
-            yield Static(self.prompt, classes="body")
-            yield Input(placeholder=self.placeholder, password=self.password, id="text")
-            yield Static("Enter submits · Esc cancels", classes="hint")
-
-    def on_mount(self) -> None:
-        self.query_one("#text", Input).focus()
+    def input_widget(self) -> Input:
+        return Input(placeholder=self.placeholder, password=self.password, id="text")
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         value = event.value.strip()

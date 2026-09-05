@@ -33,6 +33,21 @@ def _mode(name: str) -> Callable[[SbxloopTui], None]:
     return go
 
 
+def _on_daemon(action: str) -> Callable[[SbxloopTui], None]:
+    """A verb the Daemon screen guards (the unit's state, a daemon already
+    answering, its own re-poll): the palette runs the screen's action, so
+    typing the verb and pressing its key cannot behave differently."""
+
+    def go(app: SbxloopTui) -> None:
+        async def run() -> None:
+            await app.switch_mode("daemon")
+            await app.screen.run_action(action)
+
+        app.run_worker(run(), exclusive=False)
+
+    return go
+
+
 def _act(build: Callable[[actions.Deps], actions.Action]) -> Callable[[SbxloopTui], None]:
     return lambda app: app.perform(build(app.deps))
 

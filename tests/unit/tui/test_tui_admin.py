@@ -327,7 +327,7 @@ def test_phases_tab_folds_usage_per_persona(seeded: Path) -> None:
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.pause(1.5)
             usage = app.screen.query_one("#usage", TextPanel).content_text
-            assert "builder" in usage and "2 turn(s)" in usage and "critic" in usage
+            assert "builder" in usage and "2 turns" in usage and "critic" in usage
             assert "claude" in usage and "spend: not reported" in usage
 
     drive(scenario)

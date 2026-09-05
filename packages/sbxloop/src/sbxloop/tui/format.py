@@ -21,6 +21,7 @@ from rich.table import Table
 from rich.text import Text
 
 from sbxloop.daemon.discord_format import STATE_MARKER, EmbedSpec, code_segments
+from sbxloop.daemon.usage import SPEND_NOT_REPORTED
 from sbxloop.engine.model import RunRecord
 
 _ANGLE_URL = re.compile(r"<(https?://[^>\s]+)>")
@@ -169,7 +170,6 @@ def tokens(n: int | None) -> str:
 
 #: Every usage rendering ends with this; the backend reports tokens, never
 #: money, and a figure of unknown unit must not be shown as one.
-SPEND_NOT_REPORTED = "spend: not reported by the agent backend"
 
 
 __all__ = [

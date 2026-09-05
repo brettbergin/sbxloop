@@ -51,7 +51,14 @@ from sbxloop.daemon.chat_choices import (
 from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX, dispatch, format_log_tail, plain
 from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.store import ChatThread, DaemonStore
-from sbxloop.daemon.usage import RunUsage, usage_for_run
+from sbxloop.daemon.usage import (
+    SPEND_NOT_REPORTED,
+    RunUsage,
+    tokens_text,
+    usage_for_run,
+    usage_row,
+    usage_rows,
+)
 from sbxloop.daemon.versions import VersionProbe
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunState
 from sbxloop.engine.prompts import bullet_list, render
@@ -1830,53 +1837,11 @@ def _int_arg(args: dict[str, Any], key: str, default: int, lo: int, hi: int) -> 
     return max(lo, min(hi, value))
 
 
-def _tokens(value: int | None) -> str:
-    return f"{value:,}" if value is not None else "—"
-
-
-def _usage_row(
-    label: str, usage: Usage, *, turns: int | None = None, jobs: int | None = None
-) -> str:
-    """One spend line, with the turn/job and cache columns appended only when
-    they are known — a run that predates turn counting or a backend that
-    reports no cache figures must not grow empty columns."""
-    row = (
-        f"{label:<14} {_tokens(usage.input_tokens):>11} in · {_tokens(usage.output_tokens):>9} out"
-    )
-    if turns is not None:
-        row += f" · {turns} turn{'s' if turns != 1 else ''}"
-        if jobs:
-            row += f"/{jobs} job{'s' if jobs != 1 else ''}"
-    if usage.cache_read_tokens is not None:
-        row += f" · {_tokens(usage.cache_read_tokens)} cached"
-    return row
-
-
-def _usage_rows(
-    rows: dict[str, Usage],
-    turns: dict[str, int] | None = None,
-    jobs: dict[str, int] | None = None,
-) -> list[str]:
-    """Biggest spender first — the answer to "where did it go?" is the top line."""
-    ordered = sorted(
-        rows.items(), key=lambda kv: -((kv[1].input_tokens or 0) + (kv[1].output_tokens or 0))
-    )
-    return [
-        _usage_row(
-            label,
-            usage,
-            turns=None if turns is None else turns.get(label, 0),
-            jobs=None if jobs is None else jobs.get(label, 0),
-        )
-        for label, usage in ordered
-    ]
-
-
-# No backend reports a spend figure in a known unit, so every usage block ends
-# with the same plain statement rather than a number. The concierge repeats
-# this line in Discord as fact, and a zero or a fabricated figure would be
-# repeated just as confidently (#386, #439).
-_SPEND_NOT_REPORTED = "spend: not reported by the agent backend (tokens above are the whole record)"
+# The usage renderers live in daemon/usage.py, shared with the console.
+_tokens = tokens_text
+_usage_row = usage_row
+_usage_rows = usage_rows
+_SPEND_NOT_REPORTED = SPEND_NOT_REPORTED
 
 
 def _clip(text: str, limit: int) -> str:

@@ -93,18 +93,18 @@ class TestCtlOutcomes:
 
     def test_daemon_verbs_build_the_ctl_commands_and_their_tiers(self, seeded: Path) -> None:
         deps = make_deps(seeded)
-        assert actions.pause(deps, "deploy-1").run().ok
+        assert actions.pause(deps).run().ok
         assert actions.resume(deps, every=True).run().ok
-        assert actions.resume(deps, "deploy-1").run().ok
+        assert actions.resume(deps).run().ok
         assert actions.cancel_current(deps, retry=True).run().ok
         assert actions.merge(deps, "gh:issue:40").run().ok
         assert actions.grant_rounds(deps, "r_live", 2).run().ok
         assert actions.resume_review(deps, "gh:issue:41").run().ok
         assert actions.resume_repo(deps, "o/r").run().ok
         assert sent(deps) == [
-            "pause --hold deploy-1",
+            "pause",
             "resume --all",
-            "resume --hold deploy-1",
+            "resume",
             "cancel --retry",
             "merge gh:issue:40",
             "grant-rounds r_live 2",
@@ -123,11 +123,11 @@ class TestItemVerbs:
         deps = make_deps(seeded)
         assert actions.retry(deps, "gh:issue:44").run().ok
         assert actions.requeue(deps, "gh:issue:41").run().ok
-        assert actions.abandon(deps, "gh:issue:41", "wrong repo").run().ok
+        assert actions.abandon(deps, "gh:issue:41").run().ok
         assert sent(deps) == [
             "retry gh:issue:44",
             "requeue gh:issue:41",
-            "abandon gh:issue:41 wrong repo",
+            "abandon gh:issue:41",
         ]
         abandon = actions.abandon(deps, "gh:issue:41")
         assert abandon.confirm == "typed" and abandon.typed == "gh:issue:41"

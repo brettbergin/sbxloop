@@ -19,6 +19,7 @@ from textual.worker import get_current_worker
 
 from sbxloop.cli.tui import TASK_STATE_STYLES
 from sbxloop.config import TUI_CONTROL_CHANNEL
+from sbxloop.daemon.usage import usage_lines
 from sbxloop.engine.model import TERMINAL_RUN_STATES, artifacts_dir, scan_artifacts
 from sbxloop.sbx.provision import sandbox_name
 from sbxloop.tui import actions
@@ -369,15 +370,11 @@ class RunDetailScreen(ConsoleScreen):
             style="bold",
         )
         if detail.usage is not None and detail.usage.recorded:
+            # The block the concierge's run_usage tool prints, verbatim.
             usage.append(f"models: {detail.usage.model_line}\n", style="dim")
-            for who, total in detail.usage.by_agent.items():
-                turns = detail.usage.turns_by_agent.get(who, 0)
-                jobs = detail.usage.jobs_by_agent.get(who, 0)
-                usage.append(
-                    f"{who:<12} {tokens(total.input_tokens)} in / {tokens(total.output_tokens)} out"
-                    f" · {turns} turn(s) / {jobs} job(s)\n"
-                )
-        usage.append(SPEND_NOT_REPORTED, style="dim")
+            usage.append("\n".join(usage_lines(detail.usage)))
+        else:
+            usage.append(SPEND_NOT_REPORTED, style="dim")
         self.query_one("#usage", TextPanel).update(usage)
 
     def _landing(self, detail: RunDetail) -> Any:

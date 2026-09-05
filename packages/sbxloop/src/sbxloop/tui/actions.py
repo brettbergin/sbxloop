@@ -57,7 +57,8 @@ class Action:
     """One verb, ready to perform: what to run and how to ask first."""
 
     title: str
-    run: Callable[[], Outcome]
+    #: What to do once confirmed; an ``interactive`` action has no ``run``.
+    run: Callable[[], Outcome] = lambda: Outcome(True, "")
     confirm: Confirm = "yes"
     prompt: str = ""
     #: For ``confirm="typed"``: what the operator must type, exactly.
@@ -158,24 +159,21 @@ def ctl_action(
     )
 
 
-def pause(deps: Deps, hold: str | None = None) -> Action:
-    cmd = f"pause --hold {hold}" if hold else "pause"
+def pause(deps: Deps) -> Action:
     return ctl_action(
         deps,
-        cmd,
+        "pause",
         title="pause the daemon",
         prompt="Pause the daemon? The current run finishes; nothing new is claimed.",
     )
 
 
-def resume(deps: Deps, hold: str | None = None, *, every: bool = False) -> Action:
+def resume(deps: Deps, *, every: bool = False) -> Action:
+    """The operator hold, or every hold (``--all``); a named hold is a
+    deploy's to release, from its own pipeline."""
     if every:
-        cmd, title = "resume --all", "release every hold"
-    elif hold:
-        cmd, title = f"resume --hold {hold}", f"release the {hold} hold"
-    else:
-        cmd, title = "resume", "resume the daemon"
-    return ctl_action(deps, cmd, title=title, confirm="none")
+        return ctl_action(deps, "resume --all", title="release every hold", confirm="none")
+    return ctl_action(deps, "resume", title="resume the daemon", confirm="none")
 
 
 def stop_daemon(deps: Deps) -> Action:
@@ -243,13 +241,13 @@ def resume_repo(deps: Deps, repo: str) -> Action:
 # -- item verbs: ctl when live, the CLI's row-only twin when down ----------------
 
 
-def _row_only(deps: Deps, verb: str, item_id: str, reason: str | None) -> Outcome:
+def _row_only(deps: Deps, verb: str, item_id: str) -> Outcome:
     item_id = normalize_item_id(item_id)
     dstore = DaemonStore(deps.db_path)
     try:
         now = deps.clock()
         if verb == "abandon":
-            item = dstore.abandon(item_id, reason or f"abandoned by {deps.operator}", now)
+            item = dstore.abandon(item_id, f"abandoned by {deps.operator} via sbxloop tui", now)
         elif verb == "retry":
             item = dstore.retry(item_id, now, f"re-queued by {deps.operator} via sbxloop tui")
         else:
@@ -265,19 +263,18 @@ def _row_only(deps: Deps, verb: str, item_id: str, reason: str | None) -> Outcom
     return Outcome(True, f"{text}\n{ROW_ONLY_NOTE}")
 
 
-def _item_verb(deps: Deps, verb: str, item_id: str, reason: str | None = None) -> Outcome:
+def _item_verb(deps: Deps, verb: str, item_id: str) -> Outcome:
     if deps.daemon_live():
-        cmd = f"{verb} {item_id}" + (f" {reason}" if reason and verb == "abandon" else "")
-        return ctl_outcome(deps, cmd)
+        return ctl_outcome(deps, f"{verb} {item_id}")
     if deps.daemon_starting():
         return Outcome(False, "the daemon is starting; retry in a moment")
-    return _row_only(deps, verb, item_id, reason)
+    return _row_only(deps, verb, item_id)
 
 
-def abandon(deps: Deps, item_id: str, reason: str | None = None) -> Action:
+def abandon(deps: Deps, item_id: str) -> Action:
     return Action(
         f"abandon {item_id}",
-        lambda: _item_verb(deps, "abandon", item_id, reason),
+        lambda: _item_verb(deps, "abandon", item_id),
         confirm="typed",
         typed=item_id,
         prompt=(
@@ -307,6 +304,9 @@ def requeue(deps: Deps, item_id: str) -> Action:
 
 
 def _store_cancel(deps: Deps, run_id: str) -> Outcome:
+    """``LoopEngine.cancel``'s rule on the store alone: the engine's
+    constructor loads the cwd's ``.env`` into the process and builds an sbx
+    handle, neither of which a row flip should do from the console."""
     store = StateStore(deps.db_path)
     try:
         record = store.get_run(run_id)
@@ -463,13 +463,7 @@ def stop_child(deps: Deps, name: str) -> Outcome:
 def shell(deps: Deps, name: str) -> Action:
     cli = deps.sbx()
     argv = tuple(cli.argv("exec", name, *INTERACTIVE_SHELL_ARGV))
-    return Action(
-        f"shell into {name}",
-        lambda: Outcome(True, ""),
-        confirm="none",
-        mutating=False,
-        interactive=argv,
-    )
+    return Action(f"shell into {name}", confirm="none", mutating=False, interactive=argv)
 
 
 def stop_sandbox(deps: Deps, name: str) -> Action:
