@@ -24,6 +24,8 @@ daemon through the same `ctl` queue `sbxloop daemon ctl` and chat's `!sbx` use.
 | `4` | Chat — the control channel: the concierge, `!sbx` verbs, daemon notices |
 | `5` | Sandboxes — `sbx ls` classified against the store; shell, remove, prune, gc |
 | `6` | Daemon — the unit, the process, versions, repositories, the journal |
+| `7` | Config — the resolved configuration with its sources, the policy, the repos, an editor |
+| `8` | Doctor — the host checks and the sbx conformance verdicts; `S` the secret registrations |
 | `?` | this help |
 | `ctrl+p` | the command palette: every screen and every argument-less verb by name |
 
@@ -95,6 +97,24 @@ spawn a daemon from this console when there is no unit (`e` stops it),
 `U` run `[daemon] upgrade_command` (typed `upgrade`), `R` resume polling a
 suspended repository. The journal: `/` grep, `l` cycle the level floor,
 `f` follow.
+
+## Config
+
+Resolved: `/` filters keys, values and sources (a non-default source is
+bold). Edit: `i` focuses the draft of `sbxloop.toml` (`Esc` leaves it),
+`V` validates it with the real loader, `W` (or `ctrl+s`) validates and
+saves it — typed `save`; the previous file is kept as a timestamped backup
+and a restart is offered — `E` opens `$EDITOR` on it, `L` reloads from
+disk.
+
+## Doctor and secrets
+
+`d` runs the host checks and the cheap conformance probes, `D` the live
+ones (boots a scratch sandbox), `p` asks GitHub about each repository from
+a github-ops sandbox. `S` opens the secret registrations: `x` cleans the
+stale ones (a dry run first, then typed `clean`), `X` every sbxloop-owned
+one, `K` rotates the agent credential's registration from a hidden prompt
+(typed `rotate`).
 """
 
 

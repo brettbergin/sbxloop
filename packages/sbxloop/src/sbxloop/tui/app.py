@@ -26,7 +26,9 @@ from sbxloop.tui.commands import ConsoleCommands
 from sbxloop.tui.data import ConsoleState, CtlClient, build_state, probe_daemon
 from sbxloop.tui.runner import CommandRunner, SubprocessRunner
 from sbxloop.tui.screens.chat import ChatScreen
+from sbxloop.tui.screens.config import ConfigScreen
 from sbxloop.tui.screens.daemon import DaemonScreen
+from sbxloop.tui.screens.doctor import DoctorScreen
 from sbxloop.tui.screens.help import HelpScreen
 from sbxloop.tui.screens.items import ItemsScreen
 from sbxloop.tui.screens.modals import (
@@ -57,6 +59,8 @@ class SbxloopTui(App[None]):
         "chat": ChatScreen,
         "sandboxes": SandboxesScreen,
         "daemon": DaemonScreen,
+        "config": ConfigScreen,
+        "doctor": DoctorScreen,
         "help": HelpScreen,
     }
     COMMANDS: ClassVar[set[Any]] = App.COMMANDS | {ConsoleCommands}
@@ -67,6 +71,8 @@ class SbxloopTui(App[None]):
         Binding("4", "mode('chat')", "Chat"),
         Binding("5", "mode('sandboxes')", "Sandboxes"),
         Binding("6", "mode('daemon')", "Daemon"),
+        Binding("7", "mode('config')", "Config"),
+        Binding("8", "mode('doctor')", "Doctor"),
         Binding("question_mark", "mode('help')", "Help"),
         Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),

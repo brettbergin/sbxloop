@@ -8,6 +8,26 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Added
 
+- **Console config, secrets and doctor screens** (#774). The last
+  operator acts outside the console were editing the configuration,
+  judging the secret registrations and running the doctor. **Config**
+  (`7`) shows the resolved configuration with the layer that set each key,
+  the effective egress policy and the repositories, and edits
+  `sbxloop.toml`: a draft is validated by the real loader (against a
+  scratch copy, the user and environment layers applied) before it is
+  saved atomically with a timestamped backup, a restart is offered, and a
+  draft the loader refuses is never written; `$EDITOR` is a key away.
+  **Doctor** (`8`) runs the host checks and the sbx conformance probes in
+  the background with their progress, cached with their age; the live
+  probes and the GitHub probe ask first. **Secrets** (`S` from Doctor, or
+  the palette) lists the tracked registrations as `sbxloop secrets list`
+  judges them, cleans the stale ones after a dry run (typed) and rotates
+  the agent credential's registration from a hidden prompt (typed). The
+  CLI and the console now render from one fold each:
+  `sbxloop.cli.doctor.doctor_report`, `sbxloop.cli.policyview.policy_view`,
+  and `secrets_context` / `secret_rows` / `clean_secrets` in
+  `sbxloop.sbx.secretstate`.
+
 - **Console admin: sandboxes, daemon control, the journal, run operations,
   a command palette** (#773). The console could watch and chat but every
   operator act still meant leaving it for the CLI, `systemctl` or

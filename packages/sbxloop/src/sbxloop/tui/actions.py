@@ -8,6 +8,7 @@ tiers and the read-only refusal live in exactly one place."""
 
 from __future__ import annotations
 
+import os
 import shlex
 import time
 from collections.abc import Callable, Sequence
@@ -31,6 +32,13 @@ from sbxloop.sbx.prune import (
     remove_run_sandbox,
     remove_sandbox,
 )
+from sbxloop.sbx.secretstate import (
+    clean_secrets,
+    replace_registration,
+    secrets_context,
+    tracked_custom_secrets,
+)
+from sbxloop.tui.configedit import save_text
 from sbxloop.tui.data import CtlClient, DaemonSnapshot, probe_daemon
 from sbxloop.tui.runner import ChildHandle, CommandRunner, sbxloop_argv
 from sbxloop.tui.system import unit_argv
@@ -648,6 +656,104 @@ def gc_run_dirs(deps: Deps, days: float) -> Action:
     )
 
 
+# -- config, secrets ------------------------------------------------------------------
+
+
+def save_config(deps: Deps, path: Path, text: str) -> Action:
+    def run() -> Outcome:
+        try:
+            backup = save_text(path, text, now=deps.clock())
+        except OSError as exc:
+            return Outcome(False, f"could not write {path}: {exc}")
+        note = f"saved {path}" + (f"\nprevious kept as {backup.name}" if backup else "")
+        return Outcome(True, note + "\nthe daemon reads it at its next start: restart to apply")
+
+    return Action(
+        f"save {path.name}",
+        run,
+        confirm="typed",
+        typed="save",
+        prompt=(
+            f"Write the draft to {path}? The current file is kept beside it as a "
+            "timestamped backup; the daemon keeps its loaded config until restarted. "
+            "Type save to confirm."
+        ),
+    )
+
+
+def open_editor(deps: Deps, path: Path) -> Action:
+    editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi")
+    return Action(
+        f"edit {path.name} in {editor[0]}",
+        lambda: Outcome(True, ""),
+        confirm="none",
+        interactive=(*editor, str(path)),
+    )
+
+
+def clean_secret_registrations(deps: Deps, *, every: bool = False) -> Action:
+    def run() -> Outcome:
+        try:
+            cli, live = secrets_context(deps.config, deps.sbx())
+            outcomes = clean_secrets(deps.config, cli, live, apply=True, all_=every)
+        except SbxloopError as exc:
+            return Outcome(False, str(exc))
+        lines = [f"{o.env}: {o.message}" for o in outcomes]
+        return Outcome(not any(o.failed for o in outcomes), "\n".join(lines) or "nothing tracked")
+
+    what = "every sbxloop-owned registration" if every else "the stale registrations"
+    return Action(
+        f"clean {what}",
+        run,
+        confirm="typed",
+        typed="clean",
+        prompt=(
+            f"Remove {what} of the tracked secrets from sbx? Only sbxloop's own scopes "
+            "are touched, never a foreign one or the built-in github secret. "
+            "Type clean to confirm."
+        ),
+    )
+
+
+def rotate_secret_registrations(deps: Deps, token: str) -> Action:
+    """The registration half of ``sbxloop secrets rotate``: replace every
+    tracked secret's sbx registration with a global one bound to the
+    canonical host. The sandbox-booting visibility check stays with the
+    CLI (``--verify``)."""
+
+    def run() -> Outcome:
+        try:
+            cli, live = secrets_context(deps.config, deps.sbx())
+            lines: list[str] = []
+            for env, host in tracked_custom_secrets(deps.config):
+                replace_registration(cli, env=env, host=host, token=token)
+                lines.append(f"rotated: {env} registered @ {host} (global scope)")
+        except SbxloopError as exc:
+            return Outcome(False, f"rotate failed: {exc}")
+        if live:
+            lines.append(
+                f"live sbxloop sandboxes exist ({', '.join(sorted(live))}): they may still "
+                "hold the old token; remove them from the Sandboxes screen"
+            )
+        lines.append(
+            "runs read the token from the environment at provision time: update your "
+            "export / .env too. `sbxloop secrets rotate --verify` reports which strategy "
+            "the next run will use."
+        )
+        return Outcome(True, "\n".join(lines), long=True)
+
+    return Action(
+        "rotate the agent credential's registration",
+        run,
+        confirm="typed",
+        typed="rotate",
+        prompt=(
+            "Replace the tracked secret registrations in sbx with the token you typed "
+            "(global scope, canonical host)? Type rotate to confirm."
+        ),
+    )
+
+
 __all__ = [
     "CTL_TIMEOUT_S",
     "ROW_ONLY_NOTE",
@@ -659,11 +765,13 @@ __all__ = [
     "ask_concierge_to_file",
     "cancel_current",
     "cancel_run",
+    "clean_secret_registrations",
     "ctl_action",
     "ctl_outcome",
     "gc_run_dirs",
     "grant_rounds",
     "merge",
+    "open_editor",
     "pause",
     "prune_sandboxes",
     "remove_one_sandbox",
@@ -673,7 +781,9 @@ __all__ = [
     "resume_review",
     "resume_run",
     "retry",
+    "rotate_secret_registrations",
     "run_text",
+    "save_config",
     "shell",
     "spawn_daemon",
     "stop_child",

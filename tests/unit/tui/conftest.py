@@ -298,7 +298,7 @@ def make_app(
     ctl: FakeCtl | None = None,
     run: str | None = None,
     runner: FakeRunner | None = None,
-    sbx: RecordingSbx | None = None,
+    sbx: SbxCLI | None = None,
     read_only: bool = False,
     daemon: dict[str, Any] | None = None,
     **tui: Any,

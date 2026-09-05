@@ -1305,6 +1305,81 @@ def render_conformance(console: Console, report: ConformanceReport) -> None:
         console.print(f"[bold yellow]{report.deep_run_hint}[/]", highlight=False)
 
 
+@dataclass
+class DoctorReport:
+    """What one doctor pass found: the host checks and, when sbx was usable,
+    the conformance suite — the data behind ``sbxloop doctor``'s tables and
+    the console's Doctor screen."""
+
+    checks: list[Check]
+    conformance: ConformanceReport | None
+    #: Why there is no conformance report (sbx missing, the suite failed).
+    conformance_note: str | None
+    checked_at: float
+    deep: bool
+    probe: bool
+
+    @property
+    def ready(self) -> bool:
+        return all(check.ok or not check.hard for check in self.checks)
+
+    @property
+    def drifted(self) -> bool:
+        return self.conformance is not None and bool(self.conformance.unverified)
+
+
+def doctor_report(
+    env: dict[str, str] | None = None,
+    *,
+    deep: bool = False,
+    probe: bool = False,
+    progress: ProgressFn | None = None,
+) -> DoctorReport:
+    """Run the host checks and the conformance suite; the report, not the
+    rendering. ``probe`` asks GitHub itself about each configured repository
+    from a github-ops sandbox — one microVM per distinct credential (#515);
+    ``deep`` implies it, since that already boots a sandbox."""
+    import os
+
+    env = dict(os.environ) if env is None else env
+    config = load_config(env=env)
+    cli = SbxCLI(app_name=config.app_name or None)
+    report = progress or (lambda _message: None)
+
+    # Reachability and token permissions are answered by GitHub, and the
+    # host has no token — so the probe runs in a github-ops sandbox, one per
+    # distinct credential. Only when asked (or under --deep): the default
+    # doctor provisions nothing. Torn down again before the table is printed.
+    boxes: dict[str, DaemonGithub] = {}
+    probe_repo = (
+        sandbox_repo_probe(config, cli, boxes=boxes)
+        if config.github.enabled and (probe or deep)
+        else None
+    )
+    try:
+        checks = collect_checks(env, cli=cli, progress=report, probe_repo=probe_repo)
+    finally:
+        for box in boxes.values():
+            box.close()
+    conformance: ConformanceReport | None = None
+    note: str | None = None
+    sbx_present = any(check.name == "sbx binary" and check.ok for check in checks)
+    if not sbx_present:
+        note = "sbx conformance skipped: no usable sbx binary"
+    else:
+        try:
+            conformance = run_conformance(
+                cli,
+                config.state_dir,
+                deep=deep,
+                template=config.sandbox.template,
+                progress=report,
+            )
+        except SbxError as exc:
+            note = f"sbx conformance suite failed to run: {_clean(str(exc))}"
+    return DoctorReport(checks, conformance, note, time.time(), deep, probe)
+
+
 def run_doctor(
     console: Console,
     env: dict[str, str] | None = None,
@@ -1328,66 +1403,41 @@ def run_doctor(
     work); CI lanes whose whole job is catching sbx drift ahead of a field
     failure pass the flag (#226).
     """
-    import os
-
-    env = dict(os.environ) if env is None else env
-    config = load_config(env=env)
-    cli = SbxCLI(app_name=config.app_name or None)
 
     def progress(message: str) -> None:
         console.print(f"[dim]\u2026 {message}[/dim]", highlight=False)
 
-    # Reachability and token permissions are answered by GitHub, and the
-    # host has no token — so the probe runs in a github-ops sandbox, one per
-    # distinct credential. Only when asked (or under --deep): the default
-    # doctor provisions nothing. Torn down again before the table is printed.
-    boxes: dict[str, DaemonGithub] = {}
-    probe_repo = (
-        sandbox_repo_probe(config, cli, boxes=boxes)
-        if config.github.enabled and (probe or deep)
-        else None
-    )
-    try:
-        checks = collect_checks(env, cli=cli, progress=progress, probe_repo=probe_repo)
-    finally:
-        for box in boxes.values():
-            box.close()
+    report = doctor_report(env, deep=deep, probe=probe, progress=progress)
     table = Table(title="sbxloop doctor")
     table.add_column("check", no_wrap=True)
     table.add_column("status", no_wrap=True)
     table.add_column("detail", overflow="fold")
-    for check in checks:
+    for check in report.checks:
         status = (
             "[green]ok[/]" if check.ok else ("[red]FAIL[/]" if check.hard else "[yellow]warn[/]")
         )
         table.add_row(check.name, status, _clean(check.detail))
     console.print(table)
-    ready = all(check.ok or not check.hard for check in checks)
+    ready = report.ready
 
-    sbx_present = any(check.name == "sbx binary" and check.ok for check in checks)
-    if not sbx_present:
-        console.print("[dim]sbx conformance skipped: no usable sbx binary[/]", highlight=False)
+    if report.conformance is None:
+        if report.conformance_note and report.conformance_note.startswith(
+            "sbx conformance skipped"
+        ):
+            console.print(f"[dim]{report.conformance_note}[/]", highlight=False)
+        elif report.conformance_note:
+            console.print(f"[yellow]{report.conformance_note}[/]", highlight=False)
         return ready and not fail_on_drift
-    try:
-        report = run_conformance(
-            cli,
-            config.state_dir,
-            deep=deep,
-            template=config.sandbox.template,
-            progress=progress,
-        )
-    except SbxError as exc:
-        console.print(f"[yellow]sbx conformance suite failed to run:[/] {_clean(str(exc))}")
-        return ready and not fail_on_drift
-    render_conformance(console, report)
+    render_conformance(console, report.conformance)
     # By default drift is a loud warning, not a failure: the dependent code
     # paths all probe-don't-assume at runtime, so runs may still work \u2014 but
     # the verdict snapshot above is exactly what a bug report should include.
-    if fail_on_drift and report.unverified:
+    if fail_on_drift and report.conformance.unverified:
+        unverified = len(report.conformance.unverified)
+        version = report.conformance.version or "(unknown)"
         console.print(
-            f"[bold red]sbx conformance gate failed:[/] {len(report.unverified)} probe(s) "
-            f"drifted, errored, or are unprobed under sbx {report.version or '(unknown)'} "
-            "(--fail-on-drift)",
+            f"[bold red]sbx conformance gate failed:[/] {unverified} probe(s) "
+            f"drifted, errored, or are unprobed under sbx {version} (--fail-on-drift)",
             highlight=False,
         )
         return False

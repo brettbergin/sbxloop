@@ -428,3 +428,101 @@ def verify_secret_visibility(
             cli.rm(name)
         except SbxError:
             log.warning("secret.visibility_check_remove_failed", sandbox=name, exc_info=True)
+
+
+# -- what the CLI and the console both show -----------------------------------------
+
+
+def secrets_context(config: Config, cli: SbxCLI | None = None) -> tuple[SbxCLI, set[str]]:
+    """The sbx handle and the live sbxloop sandbox scopes every secrets
+    command judges registrations against."""
+    cli = cli or SbxCLI(app_name=config.app_name or None)
+    live = {i.name for i in cli.ls() if i.name.startswith(SANDBOX_SCOPE_PREFIX)}
+    return cli, live
+
+
+class SecretRow(BaseModel):
+    """One tracked secret as ``sbxloop secrets list`` shows it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    env: str
+    host: str
+    state: CustomSecretState
+    judgement: Assessment
+
+    @property
+    def expected(self) -> str:
+        return f"custom @ {self.host} (per-run scope)"
+
+    @property
+    def actual(self) -> str:
+        state = self.state
+        if state.exists:
+            actual = f"scope {state.scope or '(unknown)'}"
+            if state.hosts:
+                actual += f" @ {', '.join(state.hosts)}"
+            return actual
+        if state.exists is None:
+            return "(undetermined)"
+        return "not registered"
+
+
+def secret_rows(
+    config: Config, cli: SbxCLI, live: set[str], *, probe: bool = True
+) -> list[SecretRow]:
+    rows: list[SecretRow] = []
+    for env, host in tracked_custom_secrets(config):
+        state = inspect_custom_secret(cli, env, host=host, probe=probe)
+        judgement = assess(state, canonical_host=host, live_sandboxes=live)
+        rows.append(SecretRow(env=env, host=host, state=state, judgement=judgement))
+    return rows
+
+
+class CleanOutcome(BaseModel):
+    """What ``secrets clean`` did (or, dry, would do) for one secret."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    env: str
+    message: str
+    #: A removal happened (apply) or would (dry run).
+    removed: bool = False
+    #: sbx rejected every removal.
+    failed: bool = False
+
+
+def clean_secrets(
+    config: Config, cli: SbxCLI, live: set[str], *, apply: bool, all_: bool
+) -> list[CleanOutcome]:
+    """Remove stale sbxloop-owned registrations (every owned one with
+    ``all_``); dry unless ``apply``. Never a foreign scope, never the
+    built-in ``github`` service secret."""
+    outcomes: list[CleanOutcome] = []
+    for env, host in tracked_custom_secrets(config):
+        state = inspect_custom_secret(cli, env, host=host)
+        judgement = assess(state, canonical_host=host, live_sandboxes=live)
+        if not (judgement.stale or (all_ and judgement.owned)):
+            outcomes.append(CleanOutcome(env=env, message=f"nothing to clean ({judgement.note})"))
+            continue
+        where = f"scope {state.scope or '(unknown)'}"
+        if not apply:
+            outcomes.append(
+                CleanOutcome(
+                    env=env,
+                    message=f"would remove the registration in {where} — {judgement.note}",
+                    removed=True,
+                )
+            )
+            continue
+        if any(rm() for rm in removal_ladder(cli, state, host=host)):
+            outcomes.append(
+                CleanOutcome(env=env, message=f"removed the registration in {where}", removed=True)
+            )
+        else:
+            outcomes.append(
+                CleanOutcome(
+                    env=env, message=f"sbx rejected every removal for {where}", failed=True
+                )
+            )
+    return outcomes
