@@ -382,7 +382,7 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             doc = {"github": {"repo": "you/your-repo", **parsed}}
         elif section == "workload":
             # `[workload] default` names a profile that must exist.
-            doc = {"workload": parsed, "workloads": [{"name": parsed["default"]}]}
+            doc = {"workload": parsed, "workloads": [{"name": parsed.get("default", "p")}]}
         elif section == "chat":
             # `[chat] backend` names a section that must carry a channel_id.
             doc = {

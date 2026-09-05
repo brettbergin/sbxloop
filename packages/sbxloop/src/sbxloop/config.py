@@ -1867,6 +1867,9 @@ class AgentConfig(_ConfigModel):
 # a downloadable file, ``pr`` files in a repository via a pull request.
 SinkName = Literal["chat", "issue", "artifact", "pr"]
 SINK_NAMES: tuple[SinkName, ...] = ("chat", "issue", "artifact", "pr")
+# The sinks that write to GitHub — a run granted one needs the github
+# sandbox (#759); `chat` needs nothing and is always granted.
+GITHUB_SINKS: frozenset[str] = frozenset({"issue", "pr"})
 WorkloadPublish = Literal["auto", "hold"]
 _PROFILE_NAME_RE = _CREDENTIAL_NAME_RE
 
@@ -1969,13 +1972,29 @@ class WorkloadProfile(_ConfigModel):
 
         return any(pattern_covers(pattern, host) for pattern in self.egress)
 
+    @property
+    def needs_github(self) -> bool:
+        """Whether a run under this profile gets the github sandbox: its
+        plan may publish through GitHub (#759), and every GitHub write
+        goes through that box."""
+        return any(sink in GITHUB_SINKS for sink in self.sinks)
+
 
 class WorkloadConfig(_ConfigModel):
     """The `[workload]` section: which `[[workloads]]` profile a run gets
-    when nothing names one. Unset, a workload runs without a profile —
-    fine for a plan that needs nothing, and every need is refused."""
+    when nothing names one (unset, a workload runs without a profile —
+    fine for a plan that needs nothing, and every need but the chat sink
+    is refused), and the label a result issue carries (#759)."""
 
     default: str | None = None
+    result_label: str = "sbxloop:result"
+
+    @field_validator("result_label")
+    @classmethod
+    def _label_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("[workload] result_label must not be blank")
+        return value.strip()
 
 
 class Config(_ConfigModel):
@@ -2146,7 +2165,7 @@ class Config(_ConfigModel):
             return self
         return self.model_copy(
             update={
-                "workload": WorkloadConfig(default=profile.name),
+                "workload": self.workload.model_copy(update={"default": profile.name}),
                 "budgets": profile.budgets.apply(self.budgets),
             }
         )

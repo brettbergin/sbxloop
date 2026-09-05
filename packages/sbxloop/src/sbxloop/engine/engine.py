@@ -46,6 +46,7 @@ import contextlib
 import json
 import queue
 import shlex
+import shutil
 import sqlite3
 import tarfile
 import tempfile
@@ -64,6 +65,7 @@ from pydantic import ValidationError
 from sbxloop import hostgit
 from sbxloop.config import (
     DEFAULT_PR_TITLE_TEMPLATE,
+    GITHUB_SINKS,
     Config,
     RepoConfig,
     VerifyMode,
@@ -78,6 +80,7 @@ from sbxloop.deliver import (
     ensure_repository,
     render_naming,
 )
+from sbxloop.engine import sinks
 from sbxloop.engine.checks import CheckJudgment, check_policy_reader
 from sbxloop.engine.followups import (
     Candidate,
@@ -108,6 +111,7 @@ from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
     TERMINAL_RUN_STATES,
     FixKind,
+    Published,
     RunKind,
     RunRecord,
     RunResult,
@@ -118,6 +122,7 @@ from sbxloop.engine.model import (
     TaskRecord,
     TaskSpec,
     TaskState,
+    artifacts_dir,
     scan_artifacts,
     workload_summary,
 )
@@ -896,8 +901,8 @@ class LoopEngine:
                     finally:
                         # Harvest even when a stage raised: the sandbox is
                         # still alive here, and partial artifacts beat none.
-                        self._harvest(run_id, pair)
-                        self._report_artifacts(run_id, pair)
+                        self._harvest(run_id, pair, kind)
+                        self._report_artifacts(run_id, pair, kind)
                 except SbxloopError:
                     # Infra failures (install, worker, sbx) are exactly what
                     # gets diagnosed in-sandbox; decide keep before pair exit.
@@ -953,6 +958,7 @@ class LoopEngine:
             pr_url=run.pr_url,
             reason=reason,
             summary=workload_summary(tasks, run.pr_title) if kind == "workload" else None,
+            published=list(run.published),
         )
 
     def _install_workers(
@@ -1157,7 +1163,7 @@ class LoopEngine:
             ),
         )
 
-    def _harvest(self, run_id: str, pair: SandboxPair) -> None:
+    def _harvest(self, run_id: str, pair: SandboxPair, kind: RunKind = "code") -> None:
         """Copy the in-VM work dir out to the host (unmounted runs only).
 
         Best-effort by design: a failed copy must never fail the run.  Uses
@@ -1165,31 +1171,22 @@ class LoopEngine:
         so that ``.git``, venvs, and other heavy dirs are never transferred —
         the excluded content is not delivered anyway.  The tarball is staged in
         the VM's ``.sbxloop`` dir, copied out, and extracted on the host.
+
+        A workload's harvest is its data directory's salvage, kept apart
+        (``runs/<run>/data``) from ``runs/<run>/artifacts``, which holds
+        what its ``artifact`` sink delivered (#759) and nothing else.
         """
         if pair.mounted:
             return
-        target = self.config.state_dir / "runs" / run_id / "artifacts"
+        target = self.config.state_dir / "runs" / run_id
+        target /= "data" if kind == "workload" else "artifacts"
         target.mkdir(parents=True, exist_ok=True)
         exclude = self.config.artifacts.exclude
         # Build tar exclude flags: --exclude=<name> for each entry.
         exclude_args = [arg for name in exclude for arg in ("--exclude", name)]
-        vm_tar = f"{SBXLOOP_DIR}/harvest.tar"
         started = time.monotonic()
         try:
-            result = pair.agent.exec(
-                ["tar", "-cf", vm_tar, "-C", pair.agent_workdir, *exclude_args, "."]
-            )
-            if not result.ok:
-                raise SbxError(
-                    f"tar failed (exit {result.returncode})",
-                    argv=result.argv,
-                    stderr=result.stderr,
-                )
-            with tempfile.TemporaryDirectory() as tmpdir:
-                host_tar = Path(tmpdir) / "harvest.tar"
-                pair.agent.cp_out(vm_tar, host_tar)
-                with tarfile.open(host_tar) as tf:
-                    tf.extractall(target, filter="data")
+            self._copy_out(pair, target, [*exclude_args, "."])
         except SbxError:
             log.warning(
                 "run.harvest_failed",
@@ -1206,16 +1203,42 @@ class LoopEngine:
             duration_s=round(time.monotonic() - started, 1),
         )
 
-    def _artifact_source(self, run_id: str, pair: SandboxPair) -> Path | None:
-        target = (
-            pair.workspace
-            if pair.mounted
-            else self.config.state_dir / "runs" / run_id / "artifacts"
-        )
+    def _copy_out(self, pair: SandboxPair, target: Path, tar_args: Sequence[str]) -> None:
+        """Bring files out of the agent sandbox: ``tar`` in the VM over
+        ``tar_args`` (relative to the work dir), copied out and extracted
+        under ``target`` on the host. Raises ``SbxError`` when the VM's tar
+        or the copy fails; the callers decide what that costs."""
+        vm_tar = f"{SBXLOOP_DIR}/harvest.tar"
+        result = pair.agent.exec(["tar", "-cf", vm_tar, "-C", pair.agent_workdir, *tar_args])
+        if not result.ok:
+            raise SbxError(
+                f"tar failed (exit {result.returncode})",
+                argv=result.argv,
+                stderr=result.stderr,
+            )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            host_tar = Path(tmpdir) / "harvest.tar"
+            pair.agent.cp_out(vm_tar, host_tar)
+            with tarfile.open(host_tar) as tf:
+                tf.extractall(target, filter="data")
+
+    def _artifact_source(
+        self, run_id: str, pair: SandboxPair, kind: RunKind = "code"
+    ) -> Path | None:
+        target: Path | None
+        if kind == "workload":
+            # What the artifact sink delivered (#759), when it did.
+            target = self.config.state_dir / "runs" / run_id / "artifacts"
+        else:
+            target = (
+                pair.workspace
+                if pair.mounted
+                else self.config.state_dir / "runs" / run_id / "artifacts"
+            )
         return target if target is not None and target.is_dir() else None
 
-    def _report_artifacts(self, run_id: str, pair: SandboxPair) -> None:
-        target = self._artifact_source(run_id, pair)
+    def _report_artifacts(self, run_id: str, pair: SandboxPair, kind: RunKind = "code") -> None:
+        target = self._artifact_source(run_id, pair, kind)
         if target is None:
             return
         scan = scan_artifacts(target, self.config.artifacts.exclude)
@@ -1454,8 +1477,8 @@ class LoopEngine:
         revision budget applies unchanged. The judging stage re-runs every
         task's declared checks over the finished workspace, the way the
         gate re-runs the project's; publish hands the result to its sinks.
-        The sinks are #759, and until then a red judgment ends the run
-        named and publish is the no-op that keeps the stage on the record.
+        A red judgment ends the run named; so does a sink that could not
+        take the result (#759).
         """
         if stage not in ("judging", "publishing"):
             failed = self._run_phases(p)
@@ -1470,7 +1493,9 @@ class LoopEngine:
                     return "failed", reason
                 stage = "publishing"
             elif stage == "publishing":
-                self._stage_publish(p)
+                reason = self._stage_publish(p)
+                if reason is not None:
+                    return "failed", reason
                 return "completed", None
             else:  # pragma: no cover - defensive
                 raise StateError(f"run {p.run_id} in unexpected workload stage {stage}")
@@ -1703,7 +1728,8 @@ class LoopEngine:
         Every need is answered before any task runs: a host must be inside
         the profile's egress (or already in the operator's bounds) and not
         denied; a credential must be one the profile names; a sink one it
-        lists; a repository allowed by it and configured under `[github]`.
+        lists (the `chat` sink is the default and needs no granting, #759);
+        a repository allowed by it and configured under `[github]`.
         The first need outside the profile fails the run closed — every
         refusal is on the record as ``run.needs_refused`` naming the
         sbxloop.toml key that would allow it, and nothing was granted.
@@ -1721,17 +1747,17 @@ class LoopEngine:
         pname = profile.name if profile is not None else None
         hosts: list[tuple[str, str]] = []
         credentials: list[tuple[str, str]] = []
-        sinks: list[tuple[str, str]] = []
+        sink_needs: list[tuple[str, str]] = []
         repos: list[tuple[str, str]] = []
         for task in tasks:
             needs = task.spec.needs
             hosts += [(h, task.spec.id) for h in needs.hosts]
             credentials += [(c, task.spec.id) for c in needs.credentials]
-            if needs.sink:
-                sinks.append((needs.sink, task.spec.id))
+            if needs.sink and needs.sink != sinks.DEFAULT_SINK:
+                sink_needs.append((needs.sink, task.spec.id))
             if needs.repo:
                 repos.append((needs.repo, task.spec.id))
-        if not (hosts or credentials or sinks or repos):
+        if not (hosts or credentials or sink_needs or repos):
             return None
 
         refusals: list[str] = []
@@ -1777,12 +1803,30 @@ class LoopEngine:
                 if self.config.credential(name) is None:
                     key, why = "credentials", "not in the [[credentials]] catalogue"
                 refuse("credential", name, task_id, key, why)
-        for sink, task_id in sinks:
+        for sink, task_id in sink_needs:
             if no_profile[0]:
                 refuse("sink", sink, task_id, no_profile[1], no_profile[0])
             elif sink not in (profile.sinks if profile is not None else ()):
                 refuse(
                     "sink", sink, task_id, f"workloads.{pname}.sinks", f"not in profile {pname!r}"
+                )
+            elif sink == "pr":
+                refuse("sink", sink, task_id, None, "the pr sink is not available yet")
+            elif sink in GITHUB_SINKS and p.ops is None:
+                refuse(
+                    "sink",
+                    sink,
+                    task_id,
+                    "github.repo",
+                    "no repository is configured to publish to",
+                )
+            elif sink == "issue" and p.issues_enabled is False:
+                refuse(
+                    "sink",
+                    sink,
+                    task_id,
+                    None,
+                    f"{self.config.github.repo} has Issues disabled",
                 )
         for repo, task_id in repos:
             if no_profile[0]:
@@ -1814,7 +1858,7 @@ class LoopEngine:
 
         granted_hosts = list(dict.fromkeys(h for h, _ in hosts))
         granted_creds = list(dict.fromkeys(c for c, _ in credentials))
-        granted_sinks = list(dict.fromkeys(s for s, _ in sinks))
+        granted_sinks = list(dict.fromkeys(s for s, _ in sink_needs))
         granted_repos = list(dict.fromkeys(r for r, _ in repos))
         run_row = self.store.get_run(run_id)
         new_creds = [c for c in granted_creds if c not in run_row.credentials]
@@ -2135,11 +2179,120 @@ class LoopEngine:
         named = ", ".join(f"`{command}` (exit {result.exit_code})" for command, result in failed)
         return f"the judgment failed: {len(failed)} of {len(commands)} check(s) red — {named}"
 
-    def _stage_publish(self, p: Pipeline) -> None:
-        """Hand the result to its sinks — none exist yet (#759), so the
-        stage is entered and recorded and the harvest that follows every
-        run is where the output lands."""
-        self._set_run_state(p.run_id, "publishing")
+    def _stage_publish(self, p: Pipeline) -> str | None:
+        """Hand the result to its sinks (#759).
+
+        Each task's output goes to the sink its plan declared — the
+        ``artifact`` directory, a result issue in the delivery repository,
+        the chat reply — in that order, so the chat line can name what the
+        others delivered. Every delivery is recorded on the run row
+        (``published``) before the next begins, so a resume at
+        ``publishing`` skips what already landed: one issue per run,
+        however many times the stage is entered. A sink that cannot take
+        the result fails the run, named — the work is judged and on the
+        row, and a result nobody received is not a completed run.
+        Returns the reason the run failed, or None once every sink has it.
+        """
+        run_id = p.run_id
+        self._set_run_state(run_id, "publishing")
+        run = self.store.get_run(run_id)
+        tasks = self.store.get_tasks(run_id)
+        landed = {entry.sink for entry in run.published}
+        for sink in sinks.PUBLISH_ORDER:
+            carried = sinks.tasks_for(tasks, sink)
+            if not carried or sink in landed:
+                continue
+            try:
+                if sink == "artifact":
+                    entry = self._publish_artifact(p, run, carried)
+                elif sink == "issue":
+                    entry = self._publish_issue(p, run, tasks, carried)
+                else:
+                    entry = self._publish_chat(run, tasks, carried)
+            except (SbxError, GithubOpsError, OSError, sinks.PublishError) as exc:
+                log.warning("run.publish_failed", run=run_id, sink=sink, exc_info=True)
+                return f"publishing to {sink} failed: {exc}"
+            self.store.add_run_published(run_id, entry)
+            self.bus.emit(
+                HostEventTypes.RUN_PUBLISHED,
+                run_id,
+                sink=entry.sink,
+                location=entry.location,
+                tasks=entry.tasks,
+                files=entry.files,
+                message=(
+                    sinks.chat_text(tasks, run.pr_title, carried)
+                    if sink == "chat"
+                    else sinks.published_line(entry)
+                ),
+            )
+        return None
+
+    def _publish_artifact(
+        self, p: Pipeline, run: RunRecord, carried: Sequence[TaskRecord]
+    ) -> Published:
+        """Copy the files the tasks declared — only those — out to
+        ``runs/<run>/artifacts``: a host copy from a mounted workspace, a
+        tar of the listed paths from an unmounted one."""
+        target = artifacts_dir(run, self.config.state_dir)
+        assert target is not None
+        files = sinks.declared_files(carried)
+        target.mkdir(parents=True, exist_ok=True)
+        if files:
+            if p.pair.mounted:
+                assert p.pair.workspace is not None
+                for rel in files:
+                    dest = target / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(p.pair.workspace / rel, dest)
+            else:
+                self._copy_out(p.pair, target, files)
+        return Published(
+            sink="artifact",
+            location=str(target),
+            tasks=[t.spec.id for t in carried],
+            files=len(files),
+        )
+
+    def _publish_issue(
+        self,
+        p: Pipeline,
+        run: RunRecord,
+        tasks: Sequence[TaskRecord],
+        carried: Sequence[TaskRecord],
+    ) -> Published:
+        """File the result as one issue in the delivery repository, under
+        the `[workload] result_label` (ensured best-effort, like the
+        follow-up label: an issue GitHub cannot label is still filed)."""
+        assert p.ops is not None and p.repo is not None
+        label = sinks.result_label(self.config.workload.result_label)
+        ensure_label(p.ops, p.repo, label)
+        ref = p.ops.issue_create(
+            p.repo,
+            sinks.issue_title(run.pr_title, p.outcome),
+            sinks.issue_body(tasks, run.pr_title, carried, run_id=run.run_id, outcome=p.outcome),
+            labels=[label.name],
+        )
+        return Published(
+            sink="issue",
+            location=ref.url,
+            tasks=[t.spec.id for t in carried],
+            files=sum(t.output.file_count for t in carried if t.output is not None),
+        )
+
+    def _publish_chat(
+        self, run: RunRecord, tasks: Sequence[TaskRecord], carried: Sequence[TaskRecord]
+    ) -> Published:
+        """The chat sink is the ``run.published`` event itself: its
+        ``message`` is the reply, posted where the run was asked for by
+        whoever drives the engine (the daemon's thread, the CLI's
+        terminal). Nothing to deliver from here but the record."""
+        return Published(
+            sink="chat",
+            location="chat",
+            tasks=[t.spec.id for t in carried],
+            files=sum(t.output.file_count for t in carried if t.output is not None),
+        )
 
     # -- post-build stages -------------------------------------------------
 
@@ -3772,7 +3925,7 @@ class LoopEngine:
             # Copies the whole workspace out of the shared sandbox; two lanes
             # harvesting at once would interleave into the same directory.
             with self._sandbox_lock:
-                self._harvest(run_id, pair)
+                self._harvest(run_id, pair, p.kind)
         self._emit_task_end(run_id, task)
 
     def _phase_build(

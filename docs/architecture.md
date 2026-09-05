@@ -166,6 +166,26 @@ service box is stamped at creation), so the grant step raises `_Reprovision`:
 itself at the `executing` stage on a pair provisioned from the run row —
 agent box plus service box — exactly the resume path, one extra boot.
 
+The `publishing` stage (#759) hands the judged result to its **sinks**,
+`engine/sinks.py` composing what each carries and `LoopEngine._stage_publish`
+driving them in `PUBLISH_ORDER` (artifact → issue → chat) so the chat line can
+name what the others delivered. A task's sink is `needs.sink` or `chat`; only
+`chat` needs no profile (`_grant_needs` skips it), `issue`/`pr` need the
+profile to name them and a github box — `Provisioner` boots one for a workload
+only when the pinned profile's `needs_github` says so — and `issue` is also
+refused when `_ensure_delivery_repo` found Issues disabled. `artifact` copies
+`TaskOutput.files` (each through `sinks.safe_relative`; an unsafe path is a
+`PublishError`) to `runs/<run>/artifacts` — `shutil` from a mounted workspace,
+`_copy_out` (a `tar` of the listed paths) from an unmounted one; a workload's
+harvest goes to `runs/<run>/data` so `artifacts_dir` reads only what the sink
+delivered. `issue` files one issue in `[github] repo` under `[workload] result_label` (`ensure_label` first). `chat` is the `run.published` event
+itself: its `message` is the reply, rendered whole by the Discord bridge (📣
+blocks) and the TUI. Each delivery is persisted as a `Published` row on the run
+(`runs.published`, `StateStore.add_run_published`) before the next sink runs,
+and the stage skips sinks already there — a resume at `publishing` is
+idempotent. A sink that raises (`SbxError`, `GithubOpsError`, `OSError`,
+`PublishError`) fails the run with `publishing to <sink> failed: …`.
+
 The service sandbox (`sbxloop-<run>-service`, #765) is the github sandbox's
 pattern generalized to the operator's own credentials. `[[credentials]]`
 declares a catalogue — `name`, the daemon-environment `env` holding the value,

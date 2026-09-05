@@ -7,7 +7,7 @@ from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from sbxloop.engine.model import RunKind, RunState
+from sbxloop.engine.model import Published, RunKind, RunState
 from sbxloop.ghids import normalize_item_id
 
 # ``cancelled`` is an operator's decision (``!sbx cancel``), not a failure:
@@ -156,6 +156,8 @@ class RunReport(NamedTuple):
     outputs: tuple[TaskOutcome, ...] = ()
     # A workload's closing line (`engine.model.workload_summary`).
     summary: str | None = None
+    # Where a workload's result went (#759), one entry per sink.
+    published: tuple[Published, ...] = ()
 
     @property
     def succeeded(self) -> bool:

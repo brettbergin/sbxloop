@@ -298,6 +298,15 @@ ENGINE_SHAPES: dict[EngineShape, tuple[str, ...]] = {
         " credentials TEXT NOT NULL DEFAULT '[]')",
     ),
     "pre_task_output": (_RUNS_BASE + ", kind TEXT NOT NULL DEFAULT 'code')", _TASKS_PRE_OUTPUT),
+    "pre_published": (
+        _RUNS_BASE + ", workspace TEXT, mounted INTEGER NOT NULL DEFAULT 0, kept_reason TEXT,"
+        " user_guidance TEXT NOT NULL DEFAULT '[]', reason TEXT, stage TEXT,"
+        " pr_number INTEGER, pr_url TEXT, pr_node_id TEXT, branch TEXT, head_sha TEXT,"
+        " review_rounds INTEGER NOT NULL DEFAULT 0, ci_rounds INTEGER NOT NULL DEFAULT 0,"
+        " update_attempts INTEGER NOT NULL DEFAULT 0, update_head TEXT, last_verdict TEXT,"
+        " exhausted TEXT, granted_rounds INTEGER NOT NULL DEFAULT 0, pr_title TEXT,"
+        " credentials TEXT NOT NULL DEFAULT '[]', kind TEXT NOT NULL DEFAULT 'code')",
+    ),
 }
 
 

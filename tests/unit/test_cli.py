@@ -1781,15 +1781,24 @@ class TestRunCommand:
         # of the run and again under `status` (#757).
         assert "1/1 task(s) passed the judge" in plain
         assert "wrote `hello.txt` with one line" in plain and "(1 file)" in plain
+        # The result went to chat — the terminal, here (#759): the reply
+        # itself in the event stream, and the record of it at the end.
+        assert re.search(r"╭─ result \S+ ─", plain) and "Files: hello.txt" in plain
+        assert "published: result posted to chat" in plain
+        assert run.published[0].sink == "chat" and run.published[0].tasks == ["t1"]
         detail = runner.invoke(app, ["status", run.run_id])
         assert detail.exit_code == 0, detail.output
         detail_plain = re.sub(r"\x1b\[[0-9;]*m", "", detail.output)
         assert "kind: workload" in detail_plain
         assert "output" in detail_plain and "wrote `hello.txt`" in detail_plain
+        assert "published: result posted to chat" in detail_plain
         as_json = runner.invoke(app, ["status", run.run_id, "--json"])
         assert as_json.exit_code == 0, as_json.output
         doc = json.loads(as_json.output)
         assert doc["run"]["run_id"] == run.run_id and doc["run"]["kind"] == "workload"
+        assert doc["run"]["published"] == [
+            {"sink": "chat", "location": "chat", "tasks": ["t1"], "files": 1}
+        ]
         assert doc["summary"] == (
             "1/1 task(s) passed the judge\nt1: wrote `hello.txt` with one line (1 file)"
         )

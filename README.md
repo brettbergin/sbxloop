@@ -374,8 +374,26 @@ declares no needs, or fails on the first. `sbxloop config show` lists the
 credentials (set / unset, never a value) and the profiles as two tables;
 `sbxloop doctor` adds a `workload profiles` row. `publish = "hold"` (park
 a finished run until a human releases it) is declared but refused until
-the daemon's workload intake brings the release button. Output sinks and
-scheduled intake land on this base in later pull requests.
+the daemon's workload intake brings the release button.
+
+**Where the result goes** is the `publishing` stage's work (#759). Each task's
+output goes to the **sink** its plan named in `needs.sink`: `chat` — the
+default, needing no profile — is a reply where the run was asked for (the
+Discord thread, or the terminal), carrying the run's closing line and every
+chat task's result text; `issue` files **one** result issue per run in the
+configured `[github] repo`, titled from the plan and carrying every task that
+chose it, under the `[workload] result_label` (`sbxloop:result` by default,
+created if missing); `artifact` copies the files a task reported — exactly
+those, mounted or not — to `runs/<run>/artifacts`, where `sbxloop artifacts <run>` lists them (a workload's whole data directory is salvaged to
+`runs/<run>/data` instead, so the listing is the result and not the working
+state around it); `pr` (files delivered to a repository) arrives next. A
+profile that names `issue` or `pr` gives the run a github box; `issue` is
+refused at grant time when there is no repository (`github.repo`) or it has
+Issues disabled. Sinks are worked artifact → issue → chat and each delivery
+is recorded on the run (`run.published`, `status <run>` and `--json`, the
+finish card's **Published** field) before the next, so a resume at
+`publishing` never files a second issue; a sink that cannot take the result
+fails the run naming it. Scheduled intake lands on this base next.
 
 ## CLI reference
 
@@ -2001,6 +2019,7 @@ The notable knobs:
 | `[sandbox] languages`                                                          | detected                                        | Toolchains pre-installed in the agent sandbox; unset = detect from the workspace's manifests, `python` if none (see below).                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 | `[[workloads]]`                                                                | none                                            | Named profiles bounding what a workload run's plan may ask for (#758): `name`, `egress` (host patterns the agent box may be granted; `[policy] deny` still wins), `credentials` (names from `[[credentials]]`, granted on the service sandbox), `sinks` (`chat`, `issue`, `artifact`, `pr`), `repo` (may a plan ask for a checkout in its data directory), `publish` (`auto`; `hold` is refused until the daemon's workload intake), `budgets` (per-key overrides of `[budgets]`), `description`. A need outside the profile fails the run closed naming the key here. |
 | `[workload] default`                                                           | unset                                           | The profile a workload run gets when `--profile` does not name one. Unset: the run has no profile and every declared need is refused. Must name a `[[workloads]]` entry.                                                                                                                                                                                                                                                                                                                                                                                               |
+| `[workload] result_label`                                                      | `sbxloop:result`                                | The label a workload's result issue carries (the `issue` sink, #759); ensured on the repository before filing.                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `[policy] allow` / `deny`                                                      | `[]`                                            | Bounds for task-declared egress.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `[github] repo`                                                                | unset                                           | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public`, `pr_title_template`, `commit_message_template`, `branch_prefix`, `bot_login` beside it.                                                                                                                                                                                                                                                                                                                                         |
 | `[github] api_url`                                                             | api.github.com                                  | The GitHub REST root — GitHub Enterprise Server: `https://ghe.example.com/api/v3`. One source of truth for the REST transport, App auth, `gh` (`GH_HOST`) and both sandboxes' network allows; a `GH_HOST` in the daemon's environment that names another host is refused at config load. FIELD-UNVERIFIED on GHES.                                                                                                                                                                                                                                                     |

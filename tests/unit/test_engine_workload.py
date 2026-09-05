@@ -1097,3 +1097,307 @@ class TestNeeds:
         with pytest.raises(ConfigError, match="'nope' is not declared"):
             engine.start("plain", kind="workload", profile="nope")
         assert engine.store.list_runs() == []
+
+
+PUBLISHING = {**RESEARCH, "sinks": ["chat", "issue", "artifact", "pr"]}
+
+
+class TestSinks:
+    """Where the result goes (#759): the sink each task declared, the
+    record of every delivery, and a resume that never delivers twice."""
+
+    def published(self, harness: Harness) -> list[dict[str, Any]]:
+        return [e.data for e in harness.events if e.type == HostEventTypes.RUN_PUBLISHED]
+
+    def refused(self, harness: Harness) -> list[dict[str, Any]]:
+        return [e.data for e in harness.events if e.type == HostEventTypes.RUN_NEEDS_REFUSED]
+
+    def test_chat_is_the_default_sink_and_needs_no_profile(self, harness: Harness) -> None:
+        """A run with no profile still publishes: the tasks' results go to
+        chat, as the `run.published` event whose message is the reply."""
+        harness.script(
+            [
+                plan(task("t1"), task("t2", deps=["t1"]), title="Two things"),
+                {"text": "## Result\nwrote a", "files": {"a.txt": "a\n"}},
+                PASS,
+                {"text": "## Result\nread a"},
+                PASS,
+            ]
+        )
+        engine = harness.engine()
+        result = engine.start("two things", kind="workload")
+        assert result.state == "completed"
+        (posted,) = self.published(harness)
+        assert (posted["sink"], posted["location"], posted["tasks"], posted["files"]) == (
+            "chat",
+            "chat",
+            ["t1", "t2"],
+            1,
+        )
+        assert posted["message"] == (
+            "Two things — 2/2 task(s) passed the judge\n"
+            "t1: wrote a (1 file)\n"
+            "t2: read a\n\n"
+            "## t1: Task t1\n\nwrote a\n\nFiles: `a.txt`\n\n"
+            "## t2: Task t2\n\nread a"
+        )
+        assert [p.sink for p in result.published] == ["chat"]
+        assert [p.sink for p in engine.store.get_run(result.run_id).published] == ["chat"]
+        assert [e for e in harness.events if e.type == HostEventTypes.RUN_NEEDS_GRANTED] == []
+        # a workload's artifacts are what the artifact sink delivered: nothing
+        assert [e for e in harness.events if e.type == HostEventTypes.RUN_ARTIFACTS] == []
+
+    def test_the_issue_sink_files_one_result_issue(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        fake = FakeGithub()
+        harness.script(
+            [
+                plan(needing("t1", sink="issue"), needing("t2", sink="issue"), title="Digest"),
+                {"text": "## Result\nfirst half"},
+                PASS,
+                {"text": "## Result\nsecond half"},
+                PASS,
+            ]
+        )
+        engine = harness.engine(
+            **{**profiled, "workloads": [PUBLISHING]},
+            ops=fake,
+            github={"repo": fake.repo},
+            keep_sandboxes=True,
+        )
+        result = engine.start("write the digest", kind="workload")
+        assert result.state == "completed", result.reason
+        # the profile's sinks need GitHub, so the run got its github box
+        assert harness.sandboxes_left() == [
+            f"sbxloop-{result.run_id}-agent",
+            f"sbxloop-{result.run_id}-github",
+        ]
+        ((title, body, labels),) = fake.issues_created
+        assert title == "Digest"
+        assert labels == ["sbxloop:result"]
+        assert "sbxloop:result" in fake.labels_created
+        assert body == (
+            "Digest — 2/2 task(s) passed the judge\n"
+            "t1: first half\n"
+            "t2: second half\n\n"
+            "## t1: Task t1\n\nfirst half\n\n"
+            "## t2: Task t2\n\nsecond half\n\n"
+            f"---\n*sbxloop run `{result.run_id}`*\n\n**Asked:** write the digest\n"
+        )
+        (posted,) = self.published(harness)
+        url = f"https://github.com/{fake.repo}/issues/901"
+        assert (posted["sink"], posted["location"], posted["tasks"]) == ("issue", url, ["t1", "t2"])
+        assert posted["message"] == f"result filed as {url}"
+        assert [(p.sink, p.location) for p in result.published] == [("issue", url)]
+        assert result.pr_number is None and fake.pr_create_calls == 0
+        (grant,) = [e for e in harness.events if e.type == HostEventTypes.RUN_NEEDS_GRANTED]
+        assert grant.data["sinks"] == ["issue"]
+
+    def test_a_custom_result_label(self, harness: Harness, profiled: dict[str, Any]) -> None:
+        fake = FakeGithub()
+        harness.script([plan(needing("t1", sink="issue")), BUILD, PASS])
+        engine = harness.engine(
+            **{
+                **profiled,
+                "workloads": [PUBLISHING],
+                "workload": {"default": "research", "result_label": "loop:out"},
+            },
+            ops=fake,
+            github={"repo": fake.repo},
+        )
+        result = engine.start("write it up", kind="workload")
+        assert result.state == "completed", result.reason
+        ((_, _, labels),) = fake.issues_created
+        assert labels == ["loop:out"]
+
+    def test_the_issue_sink_needs_a_repository(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        harness.script([plan(needing("t1", sink="issue")), BUILD, PASS])
+        engine = harness.engine(**{**profiled, "workloads": [PUBLISHING]})
+        result = engine.start("file it", kind="workload")
+        assert result.state == "failed"
+        (refusal,) = self.refused(harness)
+        assert refusal["key"] == "github.repo"
+        assert refusal["message"] == (
+            "task t1 needs sink `issue` — no repository is configured to publish to; "
+            "`github.repo` in sbxloop.toml would allow it"
+        )
+        assert self.published(harness) == []
+
+    def test_the_issue_sink_is_refused_where_issues_are_disabled(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        fake = FakeGithub()
+        fake.has_issues = False
+        harness.script([plan(needing("t1", sink="issue")), BUILD, PASS])
+        engine = harness.engine(
+            **{**profiled, "workloads": [PUBLISHING]}, ops=fake, github={"repo": fake.repo}
+        )
+        result = engine.start("file it", kind="workload")
+        assert result.state == "failed"
+        (refusal,) = self.refused(harness)
+        assert refusal["key"] is None
+        assert f"{fake.repo} has Issues disabled" in refusal["message"]
+        assert fake.issues_created == []
+
+    def test_a_sink_outside_the_profile_is_refused(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        harness.script([plan(needing("t1", sink="artifact")), BUILD, PASS])
+        result = harness.engine(**profiled).start("keep the files", kind="workload")
+        assert result.state == "failed"
+        (refusal,) = self.refused(harness)
+        assert refusal["key"] == "workloads.research.sinks"
+        assert (refusal["need"], refusal["value"]) == ("sink", "artifact")
+
+    def test_the_pr_sink_is_not_available_yet(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        fake = FakeGithub()
+        harness.script([plan(needing("t1", sink="pr")), BUILD, PASS])
+        engine = harness.engine(
+            **{**profiled, "workloads": [PUBLISHING]}, ops=fake, github={"repo": fake.repo}
+        )
+        result = engine.start("deliver it", kind="workload")
+        assert result.state == "failed"
+        (refusal,) = self.refused(harness)
+        assert refusal["key"] is None and "not available yet" in refusal["message"]
+
+    @pytest.mark.parametrize("mounted", [True, False])
+    def test_the_artifact_sink_delivers_the_declared_files_only(
+        self,
+        harness: Harness,
+        profiled: dict[str, Any],
+        monkeypatch: pytest.MonkeyPatch,
+        mounted: bool,
+    ) -> None:
+        """Two tasks write; the artifact directory holds the artifact
+        task's files and nothing of the other's — mounted (a host copy)
+        or not (a tar of the listed paths, beside the data directory's
+        salvage)."""
+        if not mounted:
+            monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        harness.script(
+            [
+                plan(needing("t1", sink="artifact"), needing("t2")),
+                {"text": "## Result\nwrote the report", "files": {"out/report.csv": "1,2\n"}},
+                PASS,
+                {"text": "## Result\nscratch", "files": {"scratch.txt": "x\n"}},
+                PASS,
+            ]
+        )
+        engine = harness.engine(**{**profiled, "workloads": [PUBLISHING]})
+        result = engine.start("report", kind="workload")
+        assert result.state == "completed", result.reason
+        assert result.mounted is mounted
+        target = harness.state_dir / "runs" / result.run_id / "artifacts"
+        assert sorted(
+            p.relative_to(target).as_posix() for p in target.rglob("*") if p.is_file()
+        ) == ["out/report.csv"]
+        assert (target / "out/report.csv").read_text() == "1,2\n"
+        if not mounted:
+            salvage = harness.state_dir / "runs" / result.run_id / "data"
+            assert (salvage / "scratch.txt").read_text() == "x\n"
+        delivered, posted = self.published(harness)
+        assert (
+            delivered["sink"],
+            delivered["location"],
+            delivered["tasks"],
+            delivered["files"],
+        ) == (
+            "artifact",
+            str(target),
+            ["t1"],
+            1,
+        )
+        assert delivered["message"] == f"1 file delivered to {target}"
+        assert posted["sink"] == "chat" and posted["tasks"] == ["t2"]
+        # `sbxloop artifacts` reads what the sink delivered, not the data dir
+        report = [e for e in harness.events if e.type == HostEventTypes.RUN_ARTIFACTS][-1]
+        assert report.data["path"] == str(target) and report.data["files"] == 1
+        from sbxloop.engine.model import artifacts_dir
+
+        assert artifacts_dir(result, harness.state_dir) == target
+
+    def test_a_resume_at_publishing_never_delivers_twice(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        fake = FakeGithub()
+        harness.script([plan(needing("t1", sink="issue"), needing("t2")), BUILD, PASS, BUILD, PASS])
+        engine = harness.engine(
+            **{**profiled, "workloads": [PUBLISHING]}, ops=fake, github={"repo": fake.repo}
+        )
+        result = engine.start("file it", kind="workload")
+        assert result.state == "completed", result.reason
+        assert len(fake.issues_created) == 1
+        # Park the run as if it had died after the issue, before the chat.
+        engine.store.set_run_state(result.run_id, "publishing")
+        engine.store._conn.execute(
+            "UPDATE runs SET published = ? WHERE run_id = ?",
+            (json.dumps([result.published[0].model_dump(mode="json")]), result.run_id),
+        )
+        engine.store._conn.commit()
+        harness.events.clear()
+        harness.script([])
+        resumed = harness.engine(
+            **{**profiled, "workloads": [PUBLISHING]}, ops=fake, github={"repo": fake.repo}
+        ).resume(result.run_id)
+        assert resumed.state == "completed", resumed.reason
+        assert len(fake.issues_created) == 1, "one issue per run"
+        assert [p["sink"] for p in self.published(harness)] == ["chat"]
+        assert [p.sink for p in resumed.published] == ["issue", "chat"]
+        assert harness.run_states() == ["provisioning", "publishing", "completed"]
+
+    def test_a_sink_that_fails_fails_the_run_named(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        from sbxloop.errors import GithubOpsError
+
+        fake = FakeGithub()
+        fake.fail_once["issue_create"] = GithubOpsError("boom (HTTP 502)", http_status=502)
+        harness.script([plan(needing("t1", sink="issue")), BUILD, PASS])
+        engine = harness.engine(
+            **{**profiled, "workloads": [PUBLISHING]}, ops=fake, github={"repo": fake.repo}
+        )
+        result = engine.start("file it", kind="workload")
+        assert result.state == "failed"
+        assert result.reason == "publishing to issue failed: boom (HTTP 502)"
+        assert result.published == [] and self.published(harness) == []
+        # resumable where it stopped: the retry files the issue
+        harness.events.clear()
+        harness.script([])
+        resumed = harness.engine(
+            **{**profiled, "workloads": [PUBLISHING]}, ops=fake, github={"repo": fake.repo}
+        ).resume(result.run_id)
+        assert resumed.state == "completed", resumed.reason
+        assert len(fake.issues_created) == 1
+
+    def test_an_unsafe_declared_path_fails_the_artifact_sink(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        harness.script([plan(needing("t1", sink="artifact")), FILES_BUILD, PASS])
+        engine = harness.engine(**{**profiled, "workloads": [PUBLISHING]})
+        result = engine.start("report", kind="workload")
+        assert result.state == "completed", result.reason
+        # Corrupt the persisted row the way only a broken store could, and
+        # re-enter publishing.
+        (t1,) = engine.store.get_tasks(result.run_id)
+        assert t1.output is not None
+        row = {**t1.output.model_dump(mode="json"), "files": ["../escape"]}
+        engine.store._conn.execute(
+            "UPDATE tasks SET output_json = ? WHERE run_id = ? AND task_id = ?",
+            (json.dumps(row), result.run_id, "t1"),
+        )
+        engine.store._conn.execute(
+            "UPDATE runs SET published = '[]', state = 'publishing' WHERE run_id = ?",
+            (result.run_id,),
+        )
+        engine.store._conn.commit()
+        harness.script([])
+        resumed = harness.engine(**{**profiled, "workloads": [PUBLISHING]}).resume(result.run_id)
+        assert resumed.state == "failed"
+        assert resumed.reason == (
+            "publishing to artifact failed: task t1 declared an unsafe path '../escape'"
+        )

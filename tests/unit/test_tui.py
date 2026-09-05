@@ -122,6 +122,29 @@ class TestChatRendering:
         )
         assert "steering failed: worker died" in render_to_text(rendered)
 
+    def test_a_chat_published_result_renders_as_a_panel(self) -> None:
+        """#759: the chat sink's reply is the run's result, rendered like
+        the agent's reply — not folded into a dim lifecycle line."""
+        rendered = render_event(
+            make_event(
+                HostEventTypes.RUN_PUBLISHED,
+                sink="chat",
+                location="chat",
+                message="1/1 task(s) passed the judge\n\n## t1: A\n\n**wrote a**",
+            )
+        )
+        text = render_to_text(rendered)
+        assert "result" in text and "wrote a" in text
+        filed = render_event(
+            make_event(
+                HostEventTypes.RUN_PUBLISHED,
+                sink="issue",
+                location="https://x/issues/1",
+                message="result filed as https://x/issues/1",
+            )
+        )
+        assert "result filed as https://x/issues/1" in render_to_text(filed)
+
     def test_chat_action_renders_one_liner(self) -> None:
         rendered = render_event(
             make_event(

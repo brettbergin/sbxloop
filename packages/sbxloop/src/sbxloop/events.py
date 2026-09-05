@@ -250,6 +250,11 @@ class HostEventTypes:
     # sbxloop.toml key that would have allowed it — and `message`. The run
     # fails closed on the first; every refusal is on the record.
     RUN_NEEDS_REFUSED = "run.needs_refused"
+    # A workload's result reached one of its sinks (#759): `sink` (chat /
+    # issue / artifact / pr), `location` (the issue's URL, the artifacts
+    # directory, `chat`), `tasks` (the ids the sink carried), `files`, and
+    # `message` — for the chat sink, the reply itself.
+    RUN_PUBLISHED = "run.published"
     # The judge's verdict on one workload task (#756): `task_id`,
     # `attempt`, `passed`, `unmet`, `notes`.
     JUDGE_VERDICT = "judge.verdict"

@@ -43,6 +43,7 @@ from sbxloop.daemon.discord_format import (
     summary_text,
 )
 from sbxloop.daemon.model import DaemonNotice, RunReport, TaskOutcome, WorkItem
+from sbxloop.engine.model import Published
 from sbxloop.events import Event
 
 
@@ -837,6 +838,50 @@ class TestEmbeds:
         long = finish_embed(item, report._replace(outputs=many), "completed")
         text = {n: v for n, v, _ in long.fields}["Tasks"]
         assert text.count("\n") == 8 and text.endswith("… and 3 more task(s)")
+
+    def test_run_published_posts_the_chat_result_whole_and_names_the_rest(self) -> None:
+        """#759: the chat sink's message is the result — posted as blocks
+        like a steering reply; another sink gets one 📤 line."""
+        text = "Digest — 2/2 task(s) passed the judge\nt1: wrote a\n\n## t1: A\n\nwrote a"
+        chat = format_for_discord(
+            ev("run.published", sink="chat", location="chat", tasks=["t1"], files=0, message=text)
+        )
+        assert [c.text for c in chat] == [f"📣 **result**\n{text}"]
+        assert chat[0].flush
+        (filed,) = format_for_discord(
+            ev(
+                "run.published",
+                sink="issue",
+                location="https://github.com/o/r/issues/9",
+                tasks=["t1"],
+                files=0,
+                message="result filed as https://github.com/o/r/issues/9",
+            )
+        )
+        assert filed.text == "📤 published: result filed as https://github.com/o/r/issues/9"
+        long = "x" * 5000
+        parts = format_for_discord(ev("run.published", sink="chat", location="chat", message=long))
+        assert len(parts) > 1 and all(len(p.text) <= 1900 for p in parts)
+
+    def test_finish_card_names_where_a_workload_published(self) -> None:
+        item = WorkItem(item_id="discord:m1", source_key="m1", title="Digest")
+        report = RunReport(
+            "r1",
+            "completed",
+            "2/2 tasks done",
+            kind="workload",
+            published=(
+                Published(sink="artifact", location="/state/runs/r1/artifacts", files=3),
+                Published(sink="issue", location="https://github.com/o/r/issues/9"),
+                Published(sink="chat", location="chat"),
+            ),
+        )
+        card = finish_embed(item, report, "completed")
+        assert {n: v for n, v, _ in card.fields}["Published"].splitlines() == [
+            "📤 artifact: 3 files — `sbxloop artifacts r1`",
+            "📤 issue: [https://github.com/o/r/issues/9](https://github.com/o/r/issues/9)",
+            "📣 chat: posted above",
+        ]
 
     def test_task_output_event_line(self) -> None:
         line = texts(

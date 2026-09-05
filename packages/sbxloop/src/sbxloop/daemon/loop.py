@@ -2715,6 +2715,7 @@ class DaemonLoop:
             kind=kind,
             outputs=outputs,
             summary=closing,
+            published=tuple(record.published) if record is not None else (),
         )
 
     def _task_outcome(self, run_id: str, task: TaskRecord) -> TaskOutcome:
@@ -3055,6 +3056,7 @@ class DaemonLoop:
                 if record.kind == "workload"
                 else None
             ),
+            published=list(record.published),
         )
 
     # -- helpers ------------------------------------------------------------------------

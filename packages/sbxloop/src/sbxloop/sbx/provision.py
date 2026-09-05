@@ -1346,9 +1346,13 @@ class Provisioner:
         # GitHub integration is configured; without [github].repo a run has
         # no GitHub capability at all — and one less microVM to boot. The
         # service sandbox (#765) likewise exists only for a run granted a
-        # credential. A workload (#755) delivers nothing to GitHub, so it
-        # never gets the github sandbox, configured or not.
-        github_enabled = self.config.github.enabled and kind == "code"
+        # credential. A workload (#755) gets the github sandbox only under
+        # a profile whose sinks write to GitHub (#759) — an issue is filed
+        # through that box like every other GitHub write — and never
+        # otherwise, configured or not.
+        github_enabled = self.config.github.enabled and (
+            kind == "code" or self._workload_needs_github()
+        )
         creds = self.config.credentials_named(credentials)
         # ... or, since #766, for a repository whose registries carry a
         # credential: the box fetches the dependencies the agent sandbox
@@ -1551,6 +1555,12 @@ class Provisioner:
             if isinstance(exc, ProvisionError):
                 raise
             raise ProvisionError(f"provisioning run {run_id} failed: {exc}") from exc
+
+    def _workload_needs_github(self) -> bool:
+        """Whether a workload run gets the github sandbox: its pinned
+        profile (#758) names a sink that writes to GitHub (#759)."""
+        profile = self.config.workload_profile()
+        return profile is not None and profile.needs_github
 
     # -- a workload's repository checkout (#758) ---------------------------
 

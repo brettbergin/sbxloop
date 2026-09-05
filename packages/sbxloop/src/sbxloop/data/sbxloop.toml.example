@@ -239,8 +239,11 @@ secret_strategy = "proxy"
 # `[policy] allow`) bounding the hosts the AGENT box may be granted —
 # `[policy] deny` still wins. `credentials`: the `[[credentials]]` names a
 # plan may ask for; a granted one is held by the run's separate service
-# box, never the agent's. `sinks`: where a result may go (`chat`, `issue`,
-# `artifact`, `pr`). `repo`: whether a plan may ask for a checkout of a
+# box, never the agent's. `sinks`: where a task's result may go beyond the
+# always-available `chat` reply — `issue` (one result issue filed in
+# `[github] repo`, which needs the github box), `artifact` (the files the
+# task reported, copied to `runs/<run>/artifacts` for `sbxloop artifacts`),
+# `pr` (files delivered to a repository). `repo`: whether a plan may ask for a checkout of a
 # configured repository in its data directory. `budgets`: `[budgets]` keys
 # overridden for this profile's runs. `publish = "hold"` (park a finished
 # run for a human release) arrives with the daemon's workload intake and is
@@ -259,6 +262,9 @@ secret_strategy = "proxy"
 # [workload]
 # The profile a workload run gets when `sbxloop run --profile` names none.
 # default = "research"
+# The label a result issue carries (the `issue` sink), so a repository can
+# tell the loop's results from the work it is asked to do.
+# result_label = "sbxloop:result"
 
 # [policy]
 # Bounds for plan-declared egress. At PLAN time the agent may declare extra

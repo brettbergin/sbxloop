@@ -397,6 +397,20 @@ class TaskOutput(_Model):
         return cls(summary=summary, text=text, files=list(files), more_files=more_files)
 
 
+class Published(_Model):
+    """One place a workload's result went (#759): the sink and where it
+    landed — an issue's URL, the artifacts directory, ``chat`` for the
+    reply posted where the run was asked for (the thread, the terminal).
+    Persisted on the run row, so a resume at publishing skips what already
+    landed and the record says where a result is."""
+
+    sink: str
+    location: str
+    # What the sink carried, for the record: task ids and a file count.
+    tasks: list[str] = Field(default_factory=list)
+    files: int = 0
+
+
 class TaskRecord(_Model):
     """Persisted per-task state."""
 
@@ -478,6 +492,10 @@ class RunRecord(_Model):
     # a resume re-provisions the same sandbox; empty for every run that
     # asked for none — which is every `code` run today.
     credentials: list[str] = Field(default_factory=list)
+    # Where a workload's result went (#759), sink by sink, as it lands;
+    # empty for a code run (its result is the pull request) and for a
+    # workload that has not published yet.
+    published: list[Published] = Field(default_factory=list)
 
 
 class RunResult(_Model):
@@ -502,6 +520,8 @@ class RunResult(_Model):
     # A workload's closing line (#757), composed from its tasks' outputs;
     # None for a code run, whose result is the pull request.
     summary: str | None = None
+    # Where the result went (#759), for a workload that published.
+    published: list[Published] = Field(default_factory=list)
 
     @property
     def succeeded(self) -> bool:
@@ -698,9 +718,16 @@ def artifacts_dir(run: RunRecord | RunResult, state_dir: Path) -> Path | None:
     harvested to ``runs/<run>/artifacts``. Every reader (run summary,
     ``sbxloop artifacts``, delivery) resolves through here. None means the
     run never got as far as provisioning a workspace.
+
+    A workload's artifacts are what its ``artifact`` sink delivered (#759)
+    — the files its tasks declared, copied to ``runs/<run>/artifacts``
+    mounted or not — never its whole data directory, so the listing is
+    the result and not the working state around it.
     """
     if run.workspace is None:
         return None
+    if run.kind == "workload":
+        return state_dir / "runs" / run.run_id / "artifacts"
     if run.mounted:
         return run.workspace
     return state_dir / "runs" / run.run_id / "artifacts"

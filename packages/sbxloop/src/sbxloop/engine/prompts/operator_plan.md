@@ -84,8 +84,12 @@ lost when the sandbox is destroyed.
   calls needing that credential be made on the task's behalf, in a
   separate box that holds it. The task never sees the secret, and a
   credential that is not declared here is not available later. `sink` —
-  where the result should go when the run publishes (a chat reply, an
-  issue, a repository, a file), by name; `repo` — a repository the task
+  where the task's result goes when the run publishes, by name: `chat`
+  (a reply where the run was asked for — the default, `null`), `issue`
+  (one issue filed in the configured repository, carrying every task that
+  chose it), `artifact` (the files the task reports, copied out for
+  download; the report's file list is exactly what is delivered), `pr`
+  (files delivered to a repository); `repo` — a repository the task
   needs, as `owner/name`. Declare it here or do without it: an executor
   cannot ask for a host or a credential mid-task. Use empty lists and
   `null` for a task with no needs (the common case). What this run may be
