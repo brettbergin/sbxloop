@@ -55,6 +55,7 @@ from sbxloop.daemon.model import (
     TickResult,
     WorkItem,
 )
+from sbxloop.daemon.schedule import Cadence, ScheduleRow, format_due
 from sbxloop.daemon.sources import HIDDEN_MARKER_RE, IssueContext, WorkSource
 from sbxloop.daemon.store import DaemonStore, MergeGate, ReviewHold
 from sbxloop.engine.checks import check_policy_reader
@@ -94,7 +95,14 @@ from sbxloop.errors import (
 )
 from sbxloop.events import Event, EventBus
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
-from sbxloop.ghids import is_chat_id, normalize_item_id, try_parse_gh_id
+from sbxloop.ghids import (
+    is_chat_id,
+    is_local_id,
+    normalize_item_id,
+    parse_schedule_id,
+    schedule_item_id,
+    try_parse_gh_id,
+)
 from sbxloop.ids import new_run_id
 from sbxloop.log import bind_run, clear_run, get_logger
 from sbxloop.sbx.cli import SbxCLI
@@ -843,7 +851,7 @@ class DaemonLoop:
                     resets_at=day_end,
                 )
             return TickResult(idle_kind="daily_cap")
-        discovered = self._discover(now)
+        discovered = self._discover(now) + self._fire_schedules(now)
         item = self.dstore.next_queued(now, self.config.daemon.retry_backoff_s)
         if item is None:
             # Say WHY there is nothing to run: a queue full of items sitting
@@ -1163,6 +1171,158 @@ class DaemonLoop:
             duration_s=round(time.monotonic() - started, 2),
         )
         return fresh
+
+    # -- schedules (#761) --------------------------------------------------------------
+
+    def _schedule_tz(self, name: str) -> ZoneInfo:
+        spec = self.config.schedule(name)
+        tz = spec.timezone if spec is not None and spec.timezone else None
+        return ZoneInfo(tz or self.config.daemon.run_cap_timezone)
+
+    def _fire_schedules(self, now: float) -> int:
+        """Queue every `[[schedules]]` tick that has come due since the
+        last one handled — at most one per schedule, the latest, recorded
+        at its due time so the grid never drifts. A tick whose previous
+        item is still live is skipped and said so; a paused schedule's
+        ticks are swallowed. Returns how many items were queued."""
+        fresh = 0
+        for spec in self.config.schedules:
+            cadence = Cadence.parse(spec.every, spec.cron)
+            tz = self._schedule_tz(spec.name)
+            row = self.dstore.schedule_row(spec.name, now)
+            due = cadence.latest_due(row.base, now, tz)
+            if due is None:
+                continue
+            when = format_due(due)
+            if row.paused_by is not None:
+                self.dstore.schedule_due_handled(spec.name, due)
+                log.debug("schedule.tick_paused", schedule=spec.name, due=when, by=row.paused_by)
+                continue
+            live = self.dstore.live_schedule_item(spec.name)
+            if live is not None:
+                self.dstore.schedule_due_handled(spec.name, due)
+                self._notice(
+                    "daemon.schedule_skipped",
+                    f"⏭ schedule {spec.name}: tick due {when} skipped — {live.item_id} is "
+                    f"still {live.state}" + (f" (run {live.run_id})" if live.run_id else ""),
+                    schedule=spec.name,
+                    due=when,
+                    live_item=live.item_id,
+                    live_state=live.state,
+                    level="warning",
+                )
+                continue
+            item = self._schedule_item(spec.name, spec.ask, spec.profile, when)
+            # The item first, the row second: a crash between the two leaves
+            # a queued tick the next pass finds (below) rather than a row
+            # claiming a fire that never queued anything.
+            queued = self.dstore.upsert_new(item, now)
+            self.dstore.schedule_fired(spec.name, due, item.item_id, now)
+            if queued:
+                fresh += 1
+                self._notice(
+                    "daemon.schedule_fired",
+                    f"⏰ schedule {spec.name}: tick due {when} queued as {item.item_id}",
+                    schedule=spec.name,
+                    due=when,
+                    item=item.item_id,
+                    title=item.title,
+                )
+            else:
+                # The tick was queued and the process died before the row
+                # recorded it: nothing to add, the row catches up.
+                log.info("schedule.tick_exists", schedule=spec.name, item=item.item_id)
+        return fresh
+
+    @staticmethod
+    def _schedule_item(name: str, ask: str, profile: str, due: str) -> WorkItem:
+        title = next((ln.strip() for ln in ask.splitlines() if ln.strip()), name)
+        return WorkItem(
+            item_id=schedule_item_id(name, due),
+            source_key=due,
+            title=title if len(title) <= 120 else title[:119] + "…",
+            body=ask,
+            url="",
+            kind="workload",
+            profile=profile,
+        )
+
+    def schedules(self) -> list[dict[str, Any]]:
+        """Every configured schedule with its state, for `schedules`: cadence,
+        timezone, profile, last fire, next due, who paused it."""
+        now = self.clock()
+        rows = self.dstore.schedule_rows()
+        out: list[dict[str, Any]] = []
+        for spec in self.config.schedules:
+            cadence = Cadence.parse(spec.every, spec.cron)
+            tz = self._schedule_tz(spec.name)
+            row = rows.get(spec.name) or ScheduleRow(name=spec.name, anchor=now)
+            out.append(
+                {
+                    "name": spec.name,
+                    "cadence": cadence.describe(),
+                    "timezone": str(tz.key),
+                    "profile": spec.profile,
+                    "last_due": row.last_due,
+                    "last_fired_at": row.last_fired_at,
+                    "last_item": row.last_item,
+                    "next_due": cadence.next_due(row.base, tz),
+                    "paused_by": row.paused_by,
+                    "seen": spec.name in rows,
+                }
+            )
+        return out
+
+    def pause_schedule(self, name: str, by: str | None) -> str:
+        """Park one schedule: its ticks are swallowed until `schedules
+        resume <name>`. The daemon's own holds are untouched. Returns the
+        line to answer with; ``ValueError`` names an unknown schedule."""
+        if self.config.schedule(name) is None:
+            raise ValueError(self._unknown_schedule(name))
+        now = self.clock()
+        self.dstore.schedule_row(name, now)
+        who = by or "operator"
+        if not self.dstore.set_schedule_paused(name, who, now):
+            return f"schedule {name} is already paused."
+        self._notice(
+            "daemon.schedule_paused",
+            f"⏸ schedule {name} paused by {who}; its ticks are skipped until resumed",
+            schedule=name,
+            by=by,
+        )
+        return f"schedule {name} paused; its ticks are skipped until `schedules resume {name}`."
+
+    def resume_schedule(self, name: str, by: str | None) -> str:
+        """Release a parked schedule: it fires again from its next tick
+        (a tick that passed while paused is not made up)."""
+        if self.config.schedule(name) is None:
+            raise ValueError(self._unknown_schedule(name))
+        now = self.clock()
+        row = self.dstore.schedule_row(name, now)
+        if not self.dstore.set_schedule_paused(name, None, now):
+            return f"schedule {name} is not paused."
+        # Whatever came due while parked is handled, so a daemon that was
+        # down for part of the pause does not fire a catch-up on resume.
+        spec = self.config.schedule(name)
+        assert spec is not None
+        due = Cadence.parse(spec.every, spec.cron).latest_due(
+            row.base, now, self._schedule_tz(name)
+        )
+        if due is not None:
+            self.dstore.schedule_due_handled(name, due)
+        self._notice(
+            "daemon.schedule_resumed",
+            f"▶ schedule {name} resumed"
+            + (f" by {by}" if by else "")
+            + "; fires from its next tick",
+            schedule=name,
+            by=by,
+        )
+        return f"schedule {name} resumed; fires from its next tick."
+
+    def _unknown_schedule(self, name: str) -> str:
+        known = ", ".join(s.name for s in self.config.schedules) or "none"
+        return f"no schedule called {name!r} (configured: {known})"
 
     # -- dispatch ----------------------------------------------------------------------
 
@@ -2517,10 +2677,10 @@ class DaemonLoop:
         # per-repo deliver_base / token_env win over the global defaults.
         item_repo = self._item_repo(item)
         # The issue that queued the item, if one did: a chat item's key is
-        # a message id, not an issue (#760).
+        # a message id (#760), a schedule tick's its due time (#761).
         issue = (
             int(item.source_key)
-            if item.source_key.isdigit() and not is_chat_id(item.item_id)
+            if item.source_key.isdigit() and not is_local_id(item.item_id)
             else None
         )
         gh = GithubConfig.model_validate(
@@ -2656,14 +2816,19 @@ class DaemonLoop:
         explicit line saying the discussion is missing — the run goes on
         with the ask itself rather than waiting on a GitHub read.
         """
-        if is_chat_id(item.item_id):
-            # A chat ask (#760): the message is the whole ask, and there is
-            # no issue discussion to fetch.
-            who = f"<@{item.requested_by}>" if item.requested_by else "an operator"
+        if is_local_id(item.item_id):
+            # A chat ask (#760) or a schedule tick (#761): the ask is the
+            # whole ask, and there is no issue discussion to fetch.
+            if is_chat_id(item.item_id):
+                who = f"<@{item.requested_by}>" if item.requested_by else "an operator"
+                origin = f"a chat ask by {who}"
+            else:
+                name, due = parse_schedule_id(item.item_id)
+                origin = f"the schedule `{name}`, due {due}"
             return "\n\n".join(
                 [
                     _MARKER_RE.sub("", item.body).strip() or item.title.strip(),
-                    f"---\nThis work item came from: a chat ask by {who}.",
+                    f"---\nThis work item came from: {origin}.",
                 ]
             )
         parts = [item.title.strip()]

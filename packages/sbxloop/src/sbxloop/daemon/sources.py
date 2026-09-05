@@ -42,7 +42,7 @@ from sbxloop.engine.model import RunKind
 from sbxloop.engine.sinks import published_line
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
 from sbxloop.gh.ops import GithubOps, Identity, identities_match, raw_pages, user_identity
-from sbxloop.ghids import is_chat_id, issue_item_id, try_parse_gh_id
+from sbxloop.ghids import is_chat_id, is_schedule_id, issue_item_id, try_parse_gh_id
 from sbxloop.log import get_logger
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
@@ -1430,39 +1430,44 @@ class ChatSource:
         return []
 
     def claim(self, item: WorkItem) -> bool:
-        log.info("chat.claimed", item=item.item_id, kind=item.kind, profile=item.profile)
+        log.info(f"{self.name}.claimed", item=item.item_id, kind=item.kind, profile=item.profile)
         return True
 
     def settle_claim(self, item: WorkItem) -> bool:
         return False
 
     def report_started(self, item: WorkItem, run_id: str) -> None:
-        log.info("chat.run_started", item=item.item_id, run_id=run_id)
+        log.info(f"{self.name}.run_started", item=item.item_id, run_id=run_id)
 
     def report_retry(self, item: WorkItem, error: str, attempts_left: int) -> None:
-        log.info("chat.retry", item=item.item_id, error=error, attempts_left=attempts_left)
+        log.info(f"{self.name}.retry", item=item.item_id, error=error, attempts_left=attempts_left)
 
     def report_abandoned(self, item: WorkItem, error: str) -> None:
-        log.warning("chat.abandoned", item=item.item_id, error=error)
+        log.warning(f"{self.name}.abandoned", item=item.item_id, error=error)
 
     def report_cancelled(self, item: WorkItem, report: RunReport) -> None:
-        log.info("chat.cancelled", item=item.item_id, run_id=report.run_id, by=report.cancelled_by)
+        log.info(
+            f"{self.name}.cancelled",
+            item=item.item_id,
+            run_id=report.run_id,
+            by=report.cancelled_by,
+        )
 
     def report_requeued(self, item: WorkItem, by: str) -> None:
-        log.info("chat.requeued", item=item.item_id, by=by)
+        log.info(f"{self.name}.requeued", item=item.item_id, by=by)
 
     def report_merged(self, item: WorkItem, pr_number: int | None, pr_url: str) -> bool:
-        log.info("chat.merged", item=item.item_id, pr=pr_number)
+        log.info(f"{self.name}.merged", item=item.item_id, pr=pr_number)
         return True
 
     def report_blocked(
         self, item: WorkItem, reason: str, pr_number: int | None, pr_url: str
     ) -> bool:
-        log.warning("chat.blocked", item=item.item_id, reason=reason, pr=pr_number)
+        log.warning(f"{self.name}.blocked", item=item.item_id, reason=reason, pr=pr_number)
         return True
 
     def report_gated(self, item: WorkItem, pr_number: int | None, pr_url: str) -> bool:
-        log.info("chat.gated", item=item.item_id, pr=pr_number)
+        log.info(f"{self.name}.gated", item=item.item_id, pr=pr_number)
         return True
 
     def report_completed(self, item: WorkItem, report: RunReport) -> bool:
@@ -1475,38 +1480,64 @@ class ChatSource:
         return True
 
     def report_held(self, item: WorkItem) -> bool:
-        log.info("chat.held", item=item.item_id, run_id=item.run_id)
+        log.info(f"{self.name}.held", item=item.item_id, run_id=item.run_id)
         return True
 
 
+class ScheduleSource(ChatSource):
+    """The queue a schedule feeds (#761): the loop's ``_fire_schedules``
+    writes each due tick straight into the store, so — as for a chat ask
+    — there is nothing to poll or label, and every report is a log line.
+    The run's own chat thread and the terminal ``run.done`` line in the
+    control channel are its chronology."""
+
+    name = "schedule"
+
+
 class CompositeSource:
-    """The GitHub source and the chat source behind one queue (#760).
+    """The GitHub source, the chat source and the schedule source behind
+    one queue (#760, #761).
 
     Polling is GitHub's; everything keyed on an item goes to the source its
-    id names — ``chat:`` ids to the chat source, the rest to GitHub. The
-    multi-repo extras the loop and the CLI reach for by name
-    (``repo_health``, ``resume_repo``, ``issue_context``, ``notify``) are
-    GitHub's, and only there when GitHub provides them.
+    id names — ``chat:`` ids to the chat source, ``sched:`` ids to the
+    schedule source, the rest to GitHub. The multi-repo extras the loop
+    and the CLI reach for by name (``repo_health``, ``resume_repo``,
+    ``issue_context``, ``notify``) are GitHub's, and only there when
+    GitHub provides them. A daemon with no repository to poll (chat
+    intake or schedules alone) passes ``github=None``.
     """
 
-    name = "github+chat"
-
-    def __init__(self, github: WorkSource, chat: WorkSource) -> None:
+    def __init__(
+        self,
+        github: WorkSource | None,
+        chat: WorkSource | None = None,
+        schedule: WorkSource | None = None,
+    ) -> None:
         self.github = github
         self.chat = chat
+        self.schedule = schedule
+        parts = [p for p in (github, chat, schedule) if p is not None]
+        if not parts:
+            raise ValueError("CompositeSource needs at least one source")
+        self.name = "+".join(p.name for p in parts)
+        self._parts = parts
 
     def for_item(self, item: WorkItem) -> WorkSource:
-        return self.chat if is_chat_id(item.item_id) else self.github
+        if is_chat_id(item.item_id) and self.chat is not None:
+            return self.chat
+        if is_schedule_id(item.item_id) and self.schedule is not None:
+            return self.schedule
+        return self.github if self.github is not None else self._parts[0]
 
     def __getattr__(self, name: str) -> Any:
         # `repo_health`, `resume_repo`, `issue_context`, `notify`, … —
         # whatever the GitHub source offers beyond the protocol.
-        if name.startswith("_"):
+        if name.startswith("_") or self.github is None:
             raise AttributeError(name)
         return getattr(self.github, name)
 
     def poll(self) -> list[WorkItem]:
-        return [*self.github.poll(), *self.chat.poll()]
+        return [item for part in self._parts for item in part.poll()]
 
     def claim(self, item: WorkItem) -> bool:
         return self.for_item(item).claim(item)

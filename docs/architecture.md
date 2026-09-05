@@ -1256,6 +1256,32 @@ repo-attribution passes (`backfill_repo`, `attribute_repoless`,
 queued ask. With `[chat]` configured and `[github]` absent the daemon runs on
 `ChatSource` alone.
 
+The third source is time (#761). `[[schedules]]` declares workloads the
+daemon asks for by itself: a `name`, the `profile` to run under, the `ask`,
+and one cadence — `every` (a period, `"24h"`, `"90m"`, parsed by
+`daemon/schedule.py::parse_every`) or `cron` (five fields, `CronSpec`),
+read in `timezone` (`[daemon] run_cap_timezone` when unset). The loop's
+`tick` calls `_fire_schedules` right after the poll: for each schedule it
+reads (creating on first sight) its `daemon_schedules` row — `anchor`, the
+origin of an `every` grid; `last_due`, the latest due instant handled —
+and asks `Cadence.latest_due(row.base, now, tz)` for the most recent due in
+`(last_due, now]`. None: nothing. Otherwise exactly one tick is handled, at
+its *due* time: a paused schedule (`schedules pause <name>`, `paused_by` on
+the row) swallows it; a schedule whose previous tick is still live
+(`live_schedule_item`: a `sched:<name>:%` row outside the terminal states)
+skips it and says so (`daemon.schedule_skipped`); otherwise the loop
+upserts `WorkItem(sched:<name>:<due UTC minute>, kind=workload, profile, body=ask)` and records the fire (`schedule_fired`). So a late daemon does
+not shift the grid, a daemon down for several ticks catches up with one,
+and `every = "1h"` restarted at *t*+1h30 after firing at *t*+1h fires next
+at *t*+2h. `ScheduleSource` is `ChatSource` under another name — nothing to
+poll or label, every report a log line — and `CompositeSource(github, chat, schedule)` routes `sched:` ids to it (`github=None` when there is no
+repository: chat intake or schedules alone are a valid daemon). The store's
+repo-attribution passes skip `sched:` rows as they skip `chat:` rows;
+`_item_config` and `outcome_text` treat both as *local* ids
+(`ghids.is_local_id`) — no issue behind them, provenance names the schedule
+and its due. `schedules` (ctl, `!sbx`, the concierge's `sbx_control`) lists
+each schedule's cadence, last fire and next due.
+
 ### Repositories
 
 One daemon may tend several repositories. They are declared as an array of

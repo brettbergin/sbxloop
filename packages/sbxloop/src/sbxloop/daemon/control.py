@@ -56,6 +56,7 @@ COMMANDS: tuple[str, ...] = (
     "release <item|run>",
     "grant-rounds <run> <n>",
     "resume-repo <owner/name>",
+    "schedules [pause <name>|resume <name>]",
     "log [--tail N] [--level LEVEL] [--grep TEXT]",
     "stop",
 )
@@ -113,7 +114,7 @@ def usage(prefix: str) -> str:
 
 # Read-only commands: answered constantly by dashboards and humans checking
 # in, so they trace at DEBUG; every mutating command is an INFO audit line.
-_READ_ONLY_COMMANDS = frozenset({"status", "queue", "items", "log"})
+_READ_ONLY_COMMANDS = frozenset({"status", "queue", "items", "log", "schedules"})
 
 #: The daemon's log levels, as ``log`` accepts them — the one list
 #: ``[daemon] log_level`` accepts, so the three surfaces cannot drift.
@@ -242,7 +243,9 @@ def dispatch(
         # Not traced: the trace would land in the very buffer `log` reads,
         # and a console polling it would evict real records with echoes.
         return reply
-    level = "debug" if word in _READ_ONLY_COMMANDS and reply.ok else "info"
+    # `schedules pause/resume` mutates; the bare listing does not.
+    read_only = word in _READ_ONLY_COMMANDS and not (word == "schedules" and args)
+    level = "debug" if read_only and reply.ok else "info"
     getattr(log, level)(
         "operator.command",
         via=via,
@@ -254,6 +257,60 @@ def dispatch(
         reply=reply.text[:200],
     )
     return reply
+
+
+def _schedules(loop: Any, args: list[str], by: str | None) -> CommandReply:
+    """`schedules` lists every `[[schedules]]` entry with its state;
+    `schedules pause <name>` / `schedules resume <name>` park one and
+    release it (#761). A daemon `pause` holds everything; this holds one."""
+    if args:
+        verb = args[0].lower()
+        if verb not in ("pause", "resume") or len(args) != 2:
+            return CommandReply("usage: schedules [pause <name>|resume <name>]", ok=False)
+        try:
+            text = (
+                loop.pause_schedule(args[1], by)
+                if verb == "pause"
+                else loop.resume_schedule(args[1], by)
+            )
+        except ValueError as exc:
+            return CommandReply(
+                f"schedules {verb} failed: {exc.args[0] if exc.args else exc}", ok=False
+            )
+        return CommandReply(text)
+    rows = loop.schedules()
+    if not rows:
+        return CommandReply("no schedules configured ([[schedules]] in sbxloop.toml).")
+    return CommandReply("\n".join(schedule_line(row, loop.clock()) for row in rows))
+
+
+def schedule_line(row: dict[str, Any], now: float) -> str:
+    """One schedule as `schedules` shows it: name, cadence and zone, the
+    profile, the last fire and the next due, and who paused it."""
+    parts = [
+        f"**{row['name']}** · {row['cadence']} ({row['timezone']}) · profile {code(row['profile'])}"
+    ]
+    last = row.get("last_fired_at")
+    if last is not None:
+        parts.append(f"last fired {_ago(now - float(last))} ({row.get('last_item')})")
+    else:
+        parts.append("never fired")
+    if row.get("paused_by"):
+        parts.append(f"paused by {row['paused_by']}")
+    else:
+        parts.append(f"next due in {_ago(float(row['next_due']) - now, suffix='')}")
+    return " · ".join(parts)
+
+
+def _ago(seconds: float, suffix: str = " ago") -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.0f}s{suffix}"
+    if seconds < 3600:
+        return f"{seconds / 60:.0f}m{suffix}"
+    if seconds < 86400:
+        return f"{seconds / 3600:.1f}h{suffix}"
+    return f"{seconds / 86400:.1f}d{suffix}"
 
 
 def _tz(status: dict[str, Any]) -> str:
@@ -381,6 +438,8 @@ def _dispatch(
         except (KeyError, ValueError) as exc:
             return CommandReply(f"resume-repo failed: {exc.args[0] if exc.args else exc}", ok=False)
         return CommandReply(f"polling {code(health['repo'])} again from the next tick.")
+    if word == "schedules":
+        return _schedules(loop, args, by)
     if word == "log":
         parsed = _log_args(args)
         if isinstance(parsed, str):

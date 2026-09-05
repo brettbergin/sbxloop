@@ -1522,3 +1522,49 @@ class TestWorkloadItems:
         assert store.get("gh:issue:5") is None
         queued = store.get("chat:9001")
         assert queued is not None and queued.state == "queued" and queued.repo is None
+
+    def test_schedule_ticks_are_local_like_chat_asks(self, tmp_path: Path) -> None:
+        """#761: a `sched:` tick is the daemon's own item — no repository, no
+        URL — and the repo passes leave it alone the way they do a chat ask."""
+        store = DaemonStore(tmp_path / "state.db")
+        tick = "sched:daily:2026-09-05T07:00Z"
+        store.upsert_new(item("x", item_id=tick, kind="workload", url=""), now=1.0)
+        store.upsert_new(item("4", item_id="gh:issue:4"), now=1.0)
+        assert store.backfill_repo("o/a") == 1
+        assert store.get(tick).repo is None  # type: ignore[union-attr]
+        assert store.attribute_repoless(["o/a", "o/b"]) == 0
+        assert store.drop_repoless() == 0
+        assert store.get(tick) is not None
+
+    def test_schedule_rows_record_the_grid(self, tmp_path: Path) -> None:
+        """#761: a schedule's row anchors on first sight, keeps the last due
+        tick and what it queued, and pauses per schedule."""
+        store = DaemonStore(tmp_path / "state.db")
+        assert store.schedule_rows() == {}
+        row = store.schedule_row("daily", now=100.0)
+        assert row.anchor == 100.0 and row.last_due is None and row.base == 100.0
+        assert store.schedule_row("daily", now=200.0).anchor == 100.0  # first sight sticks
+        store.schedule_due_handled("daily", 160.0)
+        row = store.schedule_row("daily", now=200.0)
+        assert row.last_due == 160.0 and row.last_fired_at is None and row.base == 160.0
+        store.schedule_fired("daily", 220.0, "sched:daily:t", now=230.0)
+        row = store.schedule_rows()["daily"]
+        assert (row.last_due, row.last_fired_at, row.last_item) == (220.0, 230.0, "sched:daily:t")
+        assert store.set_schedule_paused("daily", "brett", 240.0) is True
+        assert store.set_schedule_paused("daily", "brett", 241.0) is False  # already paused
+        row = store.schedule_rows()["daily"]
+        assert (row.paused_by, row.paused_at) == ("brett", 240.0)
+        assert store.set_schedule_paused("daily", None, 250.0) is True
+        assert store.set_schedule_paused("daily", None, 251.0) is False
+        assert store.set_schedule_paused("nope", "brett", 252.0) is False
+        assert store.schedule_rows()["daily"].paused_by is None
+        # The live tick is the newest non-terminal item of that schedule only.
+        assert store.live_schedule_item("daily") is None
+        store.upsert_new(item("a", item_id="sched:daily:t1", kind="workload", url=""), now=1.0)
+        store.upsert_new(item("c", item_id="sched:dailyx:t1", kind="workload", url=""), now=1.0)
+        assert store.live_schedule_item("daily_") is None  # `_` is not a wildcard
+        store.upsert_new(item("b", item_id="sched:other:t1", kind="workload", url=""), now=1.0)
+        live = store.live_schedule_item("daily")
+        assert live is not None and live.item_id == "sched:daily:t1"
+        store.mark_done("sched:daily:t1", now=2.0)
+        assert store.live_schedule_item("daily") is None

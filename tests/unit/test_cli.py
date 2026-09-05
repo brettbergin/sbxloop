@@ -632,6 +632,23 @@ class TestDaemonCommand:
         assert "source=chat" in result.output and "chat=discord" in result.output
         assert "tick:" in result.output and "no_work" in result.output
 
+    def test_a_scheduled_daemon_runs_without_a_repository(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#761: `[[schedules]]` is intake enough — the daemon starts on its
+        ticks alone, its source named `schedule`."""
+        (workdir / "sbxloop.toml").write_text(
+            "[[workloads]]\nname = 'brief'\n"
+            "[[schedules]]\nname = 'daily'\nprofile = 'brief'\n"
+            "ask = 'Summarise the day'\ncron = '0 7 * * *'\n"
+        )
+        self.offline(monkeypatch)
+        result = runner.invoke(app, ["daemon", "--once"])
+        assert result.exit_code == 0, result.output
+        assert "daemon.no_repository" not in result.output
+        assert "source=schedule" in result.output
+        assert "tick:" in result.output and "no_work" in result.output
+
     def test_a_chat_daemon_with_the_concierge_off_needs_a_repository(
         self, workdir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
