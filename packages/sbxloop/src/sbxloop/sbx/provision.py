@@ -52,6 +52,7 @@ from typing import Literal, NamedTuple
 
 from sbxloop import backends, hostgit, toolchains
 from sbxloop.config import Config, CredentialConfig, RegistryConfig, RepoConfig
+from sbxloop.engine.model import RunKind
 from sbxloop.errors import GithubOpsError, ProvisionError, SbxError
 from sbxloop.events import EventBus
 from sbxloop.gh.appauth import (
@@ -762,6 +763,7 @@ class Provisioner:
         *,
         expects_mount: bool | None = None,
         credentials: Sequence[str] = (),
+        kind: RunKind = "code",
     ) -> SandboxPair:
         """Provision the run's sandbox pair around its workspace.
 
@@ -773,6 +775,13 @@ class Provisioner:
         this run is granted (#765): when non-empty a third, *service*
         sandbox holding their values is provisioned beside the pair; empty
         (every run today) provisions exactly what it always did.
+
+        A ``workload`` run (#755) works in its own per-run data directory
+        — whatever workspace the config names belongs to code runs — on
+        the agent sandbox alone: no github sandbox, no clone, and the
+        toolchain set is the config's answer, never a detection over a
+        directory that starts empty. Its ``workspace`` is passed only by a
+        resume, pinning the same data directory.
         """
         if workspace is not None:
             # An explicit workspace is authoritative: it is either the
@@ -783,6 +792,10 @@ class Provisioner:
             workspace = workspace.resolve()
             if expects_mount is None:
                 expects_mount = True
+        elif kind == "workload":
+            workspace = self._data_dir(run_id)
+            if expects_mount is None:
+                expects_mount = False
         else:
             workspace, resolved_expects = self._resolve_workspace_source(run_id, repo)
             if expects_mount is None:
@@ -793,7 +806,7 @@ class Provisioner:
         # so "which toolchains" has to be known before the spec is built —
         # and it is decided exactly once, so the install and the lint
         # cannot disagree with the allowlist.
-        languages = self.resolve_languages(workspace)
+        languages = self.resolve_languages(workspace if kind == "code" else None)
         self.bus.emit(
             "sandbox.languages",
             run_id,
@@ -821,7 +834,14 @@ class Provisioner:
             languages=languages,
             expects_mount=expects_mount,
             credentials=credentials,
+            kind=kind,
         )
+
+    def _data_dir(self, run_id: str) -> Path:
+        """Where a ``workload`` run works (#755): the same per-run directory
+        an unconfigured code run gets, which is harvested — not mounted as
+        the work — when the run ends."""
+        return (self.config.state_dir / "runs" / run_id / "workspace").resolve()
 
     def _run_repo(self, repo: str | None) -> str | None:
         """The ``owner/name`` this run acts on, or None when there is none."""
@@ -855,7 +875,7 @@ class Provisioner:
         would otherwise build every repo's runs from whichever repository
         that checkout happens to be (#526).
         """
-        clone_dir = (self.config.state_dir / "runs" / run_id / "workspace").resolve()
+        clone_dir = self._data_dir(run_id)
         mode = self.config.sandbox.workspace_isolation
         run_repo = self._run_repo(repo)
         source = self.config.workspace_for_repo(run_repo)
@@ -1320,13 +1340,15 @@ class Provisioner:
         languages: toolchains.LanguageResolution | None = None,
         expects_mount: bool = True,
         credentials: Sequence[str] = (),
+        kind: RunKind = "code",
     ) -> SandboxPair:
         # The github sandbox (and its token requirement) exists only when the
         # GitHub integration is configured; without [github].repo a run has
         # no GitHub capability at all — and one less microVM to boot. The
         # service sandbox (#765) likewise exists only for a run granted a
-        # credential.
-        github_enabled = self.config.github.enabled
+        # credential. A workload (#755) delivers nothing to GitHub, so it
+        # never gets the github sandbox, configured or not.
+        github_enabled = self.config.github.enabled and kind == "code"
         creds = self.config.credentials_named(credentials)
         # ... or, since #766, for a repository whose registries carry a
         # credential: the box fetches the dependencies the agent sandbox

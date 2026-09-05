@@ -105,6 +105,7 @@ from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
     TERMINAL_RUN_STATES,
     FixKind,
+    RunKind,
     RunRecord,
     RunResult,
     RunState,
@@ -224,6 +225,9 @@ class Pipeline:
     # the gate, `completed`.
     ops: GithubOps | None
     repo: str | None
+    # Which stage list drives the run (#755): the developer pipeline for
+    # `code`, plan → execute → judge → publish for `workload`.
+    kind: RunKind = "code"
     # The service sandbox's ops (#765); None for a run granted no
     # credential, which then has no service sandbox at all.
     service: ServiceOps | None = None
@@ -388,6 +392,7 @@ class LoopEngine:
         prior_pr: int | None = None,
         workspace_source: str | None = None,
         credentials: Sequence[str] = (),
+        kind: RunKind = "code",
     ) -> RunResult:
         """Drive a fresh run all the way through.
 
@@ -417,13 +422,38 @@ class LoopEngine:
         build session gets the ``call_service`` tool for them. Every name
         must be in the catalogue — checked here, before the run row exists.
         Empty (every ``code`` run) changes nothing.
+
+        ``kind`` (#755) picks the stage list: ``code`` is the developer
+        pipeline above; ``workload`` runs the operator persona — plan,
+        execute, judge, publish — in its own per-run data directory, on
+        the agent sandbox alone (no github sandbox, no clone). It is
+        persisted with the run, so a resume re-enters the same stages
+        whatever the on-disk config says by then.
         """
         run_id = run_id or new_run_id()
         self._select_repo(repo)
         granted = [c.name for c in self.config.credentials_named(credentials)]
-        self.store.create_run(run_id, outcome, self.config.model_dump_json(), credentials=granted)
+        self.store.create_run(
+            run_id, outcome, self.config.model_dump_json(), credentials=granted, kind=kind
+        )
         if tasks:
             self.store.save_tasks(run_id, list(tasks))
+        if kind == "workload":
+            # The data dir is cut at provisioning (`sandbox.workspace_mount`
+            # names it); the start event says only that no checkout is in
+            # play. A code run's event is untouched — its `kind` is implied,
+            # as it is for every run recorded before there were two.
+            self.bus.emit(
+                HostEventTypes.RUN_START,
+                run_id,
+                outcome=outcome,
+                seeded=len(tasks or ()),
+                kind=kind,
+                workspace=None,
+                workspace_source="data-dir",
+            )
+            self._prior = PriorArtifacts(branch=None, pr_number=None)
+            return self._drive(run_id, outcome)
         workspace = self.config.workspace_for_repo(self.config.github.repo)
         self.bus.emit(
             HostEventTypes.RUN_START,
@@ -490,7 +520,14 @@ class LoopEngine:
             # earns its own or ends merged.
             self.store.set_run_reason(run_id, None)
         self._rehydrate_config(run_id)
-        self.bus.emit(HostEventTypes.RUN_START, run_id, outcome=run.outcome, resumed=True)
+        self.bus.emit(
+            HostEventTypes.RUN_START,
+            run_id,
+            outcome=run.outcome,
+            resumed=True,
+            # The persisted kind, never the on-disk config's idea (#755).
+            **({"kind": run.kind} if run.kind != "code" else {}),
+        )
         # The first provisioning decided whether the agent must see this
         # workspace; a harvest-mode run resumes as one instead of failing
         # the mount check its empty per-run dir was never going to pass.
@@ -640,14 +677,17 @@ class LoopEngine:
         # The run's repository (its config was narrowed to it in
         # _select_repo) scopes the github sandbox's token and remote. The
         # credentials the run was granted (#765) are read back from the
-        # run row so a resume re-provisions the same service sandbox.
-        credentials = self.store.get_run(run_id).credentials
+        # run row so a resume re-provisions the same service sandbox — and
+        # so is its kind (#755), which decides the sandboxes it gets.
+        run_row = self.store.get_run(run_id)
+        credentials, kind = run_row.credentials, run_row.kind
         pair = provisioner.ensure_pair(
             run_id,
             workspace,
             self.config.github.repo,
             expects_mount=expects_mount,
             credentials=credentials,
+            kind=kind,
         )
         assert pair.workspace is not None
         self._confirm_prior_checkout(run_id, pair)
@@ -740,7 +780,10 @@ class LoopEngine:
                         self._install_workers(run_id, pair, agent, github, service_client)
                     if service is not None:
                         self._fetch_dependencies(run_id, service)
-                    self._run_setup_commands(run_id, pair, agent)
+                    if kind == "code":
+                        # `setup_commands` prepare a cloned checkout; a
+                        # workload has none to prepare (#755).
+                        self._run_setup_commands(run_id, pair, agent)
                     repo_config = self.config.github.effective_repo(None)
                     ops = (
                         self._github_ops(github, run_id)
@@ -772,6 +815,7 @@ class LoopEngine:
                     pipeline = Pipeline(
                         run_id=run_id,
                         outcome=outcome,
+                        kind=kind,
                         pair=pair,
                         phases=phases,
                         granter=EgressGranter(
@@ -829,6 +873,7 @@ class LoopEngine:
         return RunResult(
             run_id=run_id,
             state=state,
+            kind=kind,
             exhausted=run.exhausted,
             tasks=tasks,
             workspace=pair.workspace,
@@ -1321,11 +1366,43 @@ class LoopEngine:
     def _run_pipeline(self, p: Pipeline, stage: str | None) -> tuple[RunState, str | None]:
         """Drive the run from ``stage`` (None: the beginning) to a terminal
         state; returns it with the reason the run stopped short of merged."""
-        state, reason = self._stages(p, stage)
+        state, reason = (
+            self._workload_stages(p, stage) if p.kind == "workload" else self._stages(p, stage)
+        )
         # A message that arrived during the last wait or stage still gets
         # answered — as steer_run; there is nothing left to steer.
         self._process_chat(p.run_id, p.phases, None, stage=f"finished ({state})")
         return state, reason
+
+    def _workload_stages(self, p: Pipeline, stage: str | None) -> tuple[RunState, str | None]:
+        """A ``workload`` run's life (#755): plan → execute → judge → publish.
+
+        Plan and execute are the task graph — the same decomposition and
+        per-task build/verify a code run gets, under the operator's stage
+        names — so the revision and replan budgets apply unchanged. Judge
+        re-runs every task's checks over the finished workspace, the way
+        the gate re-runs the project's; publish hands the result to its
+        sinks. Neither has its persona yet: the LLM judge is #756 and the
+        sinks are #759, and until then a red judgment ends the run named
+        and publish is the no-op that keeps the stage on the record.
+        """
+        if stage not in ("judging", "publishing"):
+            failed = self._run_phases(p)
+            if failed:
+                return "failed", self._failure_reason(p.run_id)
+            stage = "judging"
+        while True:
+            self._check_cancelled_and_clock(p.run_id, p.deadline)
+            if stage == "judging":
+                reason = self._stage_judge(p)
+                if reason is not None:
+                    return "failed", reason
+                stage = "publishing"
+            elif stage == "publishing":
+                self._stage_publish(p)
+                return "completed", None
+            else:  # pragma: no cover - defensive
+                raise StateError(f"run {p.run_id} in unexpected workload stage {stage}")
 
     def _stages(self, p: Pipeline, stage: str | None) -> tuple[RunState, str | None]:
         if stage not in PIPELINE_STAGES:
@@ -1458,9 +1535,16 @@ class LoopEngine:
         """DECOMPOSE (unless seeded or resumed) and the task graph; True when
         a task failed or was skipped."""
         run_id, phases = p.run_id, p.phases
+        # The graph is the graph; a workload only calls its stages by the
+        # operator's names (#755).
+        planning: RunState
+        executing: RunState
+        planning, executing = (
+            ("planning", "executing") if p.kind == "workload" else ("decomposing", "building")
+        )
         tasks = [t for t in self.store.get_tasks(run_id) if not is_fix_task(t.spec.id)]
         if not tasks:
-            self._set_run_state(run_id, "decomposing")
+            self._set_run_state(run_id, planning)
             self._hint_services(run_id, phases.workspace)
             started = time.time()
             graph = phases.decompose()
@@ -1487,7 +1571,7 @@ class LoopEngine:
             )
             tasks = self.store.get_tasks(run_id)
 
-        self._set_run_state(run_id, "building")
+        self._set_run_state(run_id, executing)
         self._announce_roster(run_id, tasks)
         failed_ids, skipped_ids = self._schedule_tasks(p, tasks)
         # Messages that arrived during the last phase still get answered
@@ -1694,6 +1778,90 @@ class LoopEngine:
         if failure is not None:
             raise failure
         return failed_ids, skipped_ids
+
+    # -- workload stages (#755) ---------------------------------------------
+
+    def _stage_judge(self, p: Pipeline) -> str | None:
+        """Re-run every task's checks over the finished workspace.
+
+        Each task proved its own checks as it finished; a later task can
+        undo an earlier one's proof, so the judgment is taken once more on
+        the tree as it stands. Returns the reason the run failed, or None
+        to publish. Until the LLM judge lands (#756) this is the whole
+        judgment, and a red check ends the run rather than spending a fix
+        round: a workload's rounds are that PR's to define.
+        """
+        run_id, phases = p.run_id, p.phases
+        self._set_run_state(run_id, "judging")
+        commands = list(
+            dict.fromkeys(
+                c
+                for t in self.store.get_tasks(run_id)
+                if not is_fix_task(t.spec.id)
+                for c in t.spec.verify_commands
+            )
+        )
+        attempt = 1 + sum(1 for row in self.store.phase_attempts(run_id) if row["phase"] == "judge")
+        started = time.time()
+        results = phases.shell_batch(commands) if commands else []
+        failed = [
+            (command, result)
+            for command, result in zip(commands, results, strict=True)
+            if result.exit_code != 0
+        ]
+        status = "ok" if not failed else "failed"
+        self.store.record_phase(
+            run_id,
+            "judge",
+            task_id=None,
+            attempt=attempt,
+            status=status,
+            output_json=json.dumps(
+                {
+                    "commands": commands,
+                    "failed": [
+                        {
+                            "command": command,
+                            "exit_code": result.exit_code,
+                            "output": clip_head_tail(result.output),
+                        }
+                        for command, result in failed
+                    ],
+                }
+            ),
+            started_at=started,
+        )
+        if not failed:
+            message = (
+                f"{len(commands)} check(s) passed on the finished workspace"
+                if commands
+                else "no task declared a check; nothing to re-run"
+            )
+        else:
+            command, result = failed[0]
+            first_line = next(
+                (line for line in (result.output or "").splitlines() if line.strip()), ""
+            )
+            message = f"`{command}` exit {result.exit_code}: {first_line}"
+        self.bus.emit(
+            HostEventTypes.PHASE_END,
+            run_id,
+            task_id=None,
+            phase="judge",
+            status=status,
+            attempt=attempt,
+            message=message,
+        )
+        if not failed:
+            return None
+        named = ", ".join(f"`{command}` (exit {result.exit_code})" for command, result in failed)
+        return f"the judgment failed: {len(failed)} of {len(commands)} check(s) red — {named}"
+
+    def _stage_publish(self, p: Pipeline) -> None:
+        """Hand the result to its sinks — none exist yet (#759), so the
+        stage is entered and recorded and the harvest that follows every
+        run is where the output lands."""
+        self._set_run_state(p.run_id, "publishing")
 
     # -- post-build stages -------------------------------------------------
 

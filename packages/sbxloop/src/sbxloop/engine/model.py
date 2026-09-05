@@ -11,6 +11,13 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+# What a run is for (#755). `code` is the developer loop: a task graph that
+# ends in a pull request. `workload` runs the operator persona through the
+# same run shape — sandboxes, store, events, thread — but its stages are
+# plan → execute → judge → publish, and its result is whatever the ask
+# named, not a PR. Persisted with the run; a resume never re-derives it.
+RunKind = Literal["code", "workload"]
+
 RunState = Literal[
     # the task graph
     "created",
@@ -24,6 +31,12 @@ RunState = Literal[
     "fixing",
     "awaiting_ci",
     "landing",
+    # the workload stages (#755): the operator's plan, its execution, the
+    # judgment against the ask, and the publication of the result
+    "planning",
+    "executing",
+    "judging",
+    "publishing",
     # terminal
     "merged",
     "completed",
@@ -44,6 +57,17 @@ PIPELINE_STAGES: tuple[str, ...] = (
     "fixing",
     "awaiting_ci",
     "landing",
+)
+
+# A `workload` run's stages in order (#755). `planning` and `executing` are
+# the task graph under other names — a resume from either re-enters the
+# graph where it stopped, exactly as `decomposing`/`building` do for a code
+# run; `judging` and `publishing` re-enter themselves.
+WORKLOAD_STAGES: tuple[str, ...] = (
+    "planning",
+    "executing",
+    "judging",
+    "publishing",
 )
 
 TaskState = Literal[
@@ -83,6 +107,7 @@ RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
         "decomposing",
         "building",
         *PIPELINE_STAGES,
+        *WORKLOAD_STAGES,
         "failed",
         "blocked",
         "cancelled",
@@ -90,7 +115,7 @@ RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
     }
 )
 
-Phase = Literal["decompose", "build", "verify", "gate", "review", "steer", "followup"]
+Phase = Literal["decompose", "build", "verify", "gate", "review", "steer", "followup", "judge"]
 
 # What a fix round is for. `review` rounds are charged to the review budget;
 # everything else — a red gate, red CI, a base conflict, a human objecting on
@@ -253,6 +278,10 @@ class RunRecord(_Model):
     run_id: str
     outcome: str
     state: RunState
+    # `code` for every run the developer loop drives — and for every row a
+    # database from before #755 holds, which the migration reads back as
+    # such; `workload` for a run of the operator persona.
+    kind: RunKind = "code"
     created_at: float
     updated_at: float
     # Host workspace directory and whether it was live-mounted into the
@@ -308,6 +337,7 @@ class RunResult(_Model):
 
     run_id: str
     state: RunState
+    kind: RunKind = "code"
     tasks: list[TaskRecord] = Field(default_factory=list)
     workspace: Path | None = None
     mounted: bool = False

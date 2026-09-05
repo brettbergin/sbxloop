@@ -839,6 +839,14 @@ class TestEmbeds:
             "⏳ **awaiting ci**"
         ]
         assert format_for_discord(ev("run.state", state="building")) == []
+        # A workload's own stages (#755) — its graph stages render like a
+        # code run's: nothing, the task lines carry that.
+        assert texts(format_for_discord(ev("run.state", state="judging"))) == ["⚖️ **judging**"]
+        assert texts(format_for_discord(ev("run.state", state="publishing"))) == [
+            "📤 **publishing**"
+        ]
+        assert format_for_discord(ev("run.state", state="planning")) == []
+        assert format_for_discord(ev("run.state", state="executing")) == []
         verdict = format_for_discord(
             ev("review.verdict", round=2, verdict="request_changes", findings=3, url="https://r")
         )
@@ -1454,6 +1462,19 @@ class TestStatusLineStages:
         assert "updating from base (attempt 1)" in s.render()
         s.observe(ev("run.state", state="merged"))
         assert s.render().startswith("🎉 finished · 2/2 tasks done")
+
+    def test_workload_stages(self) -> None:
+        """A workload (#755) walks executing → judging → publishing: the
+        graph stage clears the line, the two after it name themselves."""
+        s = self._built()
+        s.observe(ev("run.state", state="executing"))
+        assert s.render() == "⏳ 1 task(s) planned\n✅ 1 done"
+        s.observe(ev("run.state", state="judging"))
+        assert s.render().startswith("⚖️ judging · re-running every task's check")
+        s.observe(ev("run.state", state="publishing"))
+        assert s.render().startswith("📤 publishing")
+        s.observe(ev("run.state", state="completed"))
+        assert s.render().startswith("✅ finished · 1/1 tasks done")
 
     def test_ci_red_and_blocked(self) -> None:
         s = self._built()

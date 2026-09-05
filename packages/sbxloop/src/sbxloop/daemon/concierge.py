@@ -1110,8 +1110,9 @@ class Concierge:
         item = self.dstore.get(item_id) if item_id else None
         thread = self._thread_for(run_id)
         lines = [
-            f"run {run.run_id}: state={run.state}, created {_age(self.clock() - run.created_at)} "
-            f"ago, updated {_age(self.clock() - run.updated_at)} ago",
+            f"run {run.run_id}: state={run.state}, kind={run.kind}, "
+            f"created {_age(self.clock() - run.created_at)} ago, "
+            f"updated {_age(self.clock() - run.updated_at)} ago",
             f"outcome: {_one_line(run.outcome, 400)}",
             f"tasks: {report.task_summary}",
         ]

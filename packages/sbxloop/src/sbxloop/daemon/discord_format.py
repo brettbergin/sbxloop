@@ -48,7 +48,7 @@ from sbxloop.cli.tui import (
 )
 from sbxloop.cli.tui import _one_line as _one_line_mid
 from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
-from sbxloop.engine.model import PIPELINE_STAGES
+from sbxloop.engine.model import PIPELINE_STAGES, WORKLOAD_STAGES
 from sbxloop.events import Event, HostEventTypes
 from sbxloop.excerpt import (
     TOOL_EXCERPT_LINE_CLIP,
@@ -116,7 +116,16 @@ STAGE_MARKER = {
     "fixing": "🛠",
     "awaiting_ci": "⏳",
     "landing": "🚀",
+    # a workload's stages after its task graph (#755)
+    "judging": "⚖️",
+    "publishing": "📤",
 }
+# The stages a chronology line announces: the pipeline's, and the two a
+# workload enters once its task graph is done — `planning`/`executing`
+# are the graph itself and are narrated task by task, as `decomposing`/
+# `building` are.
+_STAGE_STATES: tuple[str, ...] = (*PIPELINE_STAGES, *WORKLOAD_STAGES[2:])
+_GRAPH_STATES: tuple[str, ...] = ("building", "executing")
 
 _FENCE_RE = re.compile(r"^\s*(```|~~~)\s*([\w+#.-]*)")
 _URL_RE = re.compile(r"(?<![<(\[])https?://[^\s<>()\[\]]+")
@@ -1090,7 +1099,7 @@ class StatusLine:
         elif t in ("run.end", "run.state") and d.get("state") in STATE_MARKER:
             self.finished = str(d["state"])
             self._dirty = True
-        elif t == "run.state" and d.get("state") in PIPELINE_STAGES:
+        elif t == "run.state" and d.get("state") in _STAGE_STATES:
             self.stage = str(d["state"])
             if self.stage == "reviewing":
                 self.review_round += 1
@@ -1101,7 +1110,7 @@ class StatusLine:
             if self.stage != "landing":
                 self.landing = None
             self._dirty = True
-        elif t == "run.state" and d.get("state") == "building":
+        elif t == "run.state" and d.get("state") in _GRAPH_STATES:
             self.stage = None
             self._dirty = True
         elif t == HostEventTypes.FIX_ROUND:
@@ -1195,6 +1204,10 @@ class StatusLine:
             return f"⏳ CI{pending}"
         if stage == "landing":
             return f"🚀 landing · {self.landing or 'merging'}"
+        if stage == "judging":
+            return "⚖️ judging · re-running every task's check on the finished workspace"
+        if stage == "publishing":
+            return "📤 publishing"
         return f"⏳ {stage}"
 
 
@@ -1276,10 +1289,10 @@ class SteerProgress:
             if d.get("cap"):
                 self.cap = int(d["cap"])
             self._dirty = True
-        elif t == "run.state" and d.get("state") in PIPELINE_STAGES:
+        elif t == "run.state" and d.get("state") in _STAGE_STATES:
             self.stage = str(d["state"])
             self._dirty = True
-        elif t == "run.state" and d.get("state") == "building":
+        elif t == "run.state" and d.get("state") in _GRAPH_STATES:
             self.stage = None
             self._dirty = True
 
@@ -1516,7 +1529,7 @@ def format_for_discord(
                 flush=True,
             )
         ]
-    if t == HostEventTypes.RUN_STATE and data.get("state") in PIPELINE_STAGES:
+    if t == HostEventTypes.RUN_STATE and data.get("state") in _STAGE_STATES:
         stage = str(data["state"])
         return [line(f"{STAGE_MARKER.get(stage, '▶')} **{stage.replace('_', ' ')}**")]
     if t == "sandbox.workspace_clone":
