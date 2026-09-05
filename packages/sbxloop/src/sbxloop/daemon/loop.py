@@ -2981,7 +2981,14 @@ class DaemonLoop:
                     reason="run record missing; starting over",
                 )
                 continue
-            if record.state in ("merged", "blocked", "completed", "gated", "awaiting_review"):
+            if record.state in (
+                "merged",
+                "blocked",
+                "completed",
+                "gated",
+                "awaiting_review",
+                "held",
+            ):
                 self._notice(
                     "recovery.settling",
                     f"recovery: {item.run_id} had ended {record.state}; settling {item.item_id}",

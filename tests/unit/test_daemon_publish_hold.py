@@ -107,6 +107,31 @@ class TestParkOnHeld:
         item = h.dstore.get(ITEM)
         assert item is not None and item.pending_report is None
 
+    def test_recovery_settles_a_run_that_ended_held_as_a_hold(self, tmp_path: Path) -> None:
+        """The daemon died between the engine ending ``held`` and the
+        settle: recovery parks the item, it does not retry the run."""
+        h = held_harness(tmp_path)
+        h.source.items = [gh_item("1", kind="workload")]
+        h.outcomes = ["completed"]
+        h.loop.tick()
+        item = h.dstore.get(ITEM)
+        assert item is not None and item.run_id is not None
+        run_id = item.run_id
+        # Rewind the store to the moment before the settle: the run ended
+        # held and the item still says running.
+        h.store.set_run_state(run_id, "held")
+        h.dstore._conn.execute(
+            "UPDATE daemon_work_items SET state = 'running', pending_report = NULL "
+            "WHERE item_id = ?",
+            (ITEM,),
+        )
+        h.dstore._conn.commit()
+        h.loop.recover()
+        item = h.dstore.get(ITEM)
+        assert item is not None and (item.state, item.run_id) == ("gated", run_id)
+        gate = h.dstore.merge_gate_for(run_id)
+        assert gate is not None and (gate.kind, gate.state) == ("publish", "open")
+
     def test_a_held_item_is_never_dispatched(self, tmp_path: Path) -> None:
         h = held_harness(tmp_path)
         park(h)
