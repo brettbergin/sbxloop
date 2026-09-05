@@ -985,35 +985,26 @@ class TestDoctor:
         assert result.exit_code == 1
         assert "FAIL" in result.output
 
-    def test_doctor_names_unset_secret_env_before_a_run_would(
+    def test_doctor_refuses_secret_env_with_the_way_forward(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """`[sandbox] secret_env` names must be set in the daemon's
-        environment (#679); the row lists the unset ones by scope and never
-        shows a value."""
+        """`[sandbox] secret_env` is gone (#766): doctor, like every command,
+        fails the config by name and says where the secret now belongs."""
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
         monkeypatch.setenv("GH_TOKEN", "tok")
-        monkeypatch.setenv("NPM_TOKEN", "npm_value_never_shown")
-        monkeypatch.delenv("PIP_INDEX_URL", raising=False)
-        (workdir / "sbxloop.toml").write_text(
-            '[sandbox]\nsecret_env = ["NPM_TOKEN"]\n\n'
-            '[[github.repos]]\nrepo = "owner/repo"\nsecret_env = ["NPM_TOKEN", "PIP_INDEX_URL"]\n'
-        )
+        (workdir / "sbxloop.toml").write_text('[sandbox]\nsecret_env = ["NPM_TOKEN"]\n')
         result = runner.invoke(app, ["doctor"])
-        assert result.exit_code == 1
-        assert "sandbox secret env" in result.output
-        assert "owner/repo: PIP_INDEX_URL" in result.output
-        assert "npm_value_never_shown" not in result.output
-        monkeypatch.setenv("PIP_INDEX_URL", "https://pypi.example/simple")
-        result = runner.invoke(app, ["doctor"])
-        assert result.exit_code == 0, result.output
-        assert "set: NPM_TOKEN, PIP_INDEX_URL" in result.output
+        assert result.exit_code != 0
+        output = result.output + str(result.exception or "")
+        assert "[sandbox] secret_env is no longer supported" in output
+        assert "auth_env" in output and "[[credentials]]" in output
 
     def test_doctor_names_an_unset_registry_credential(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A `[[registries]]` auth_env is a secret the daemon must hold
-        (#680); the same row covers it."""
+        (#680) for the service sandbox (#766); the row says so and never
+        shows a value."""
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
         monkeypatch.setenv("GH_TOKEN", "tok")
         monkeypatch.delenv("ARTIFACTORY_TOKEN", raising=False)
@@ -1026,7 +1017,7 @@ class TestDoctor:
         )
         result = runner.invoke(app, ["doctor"])
         assert result.exit_code == 1
-        assert "sandbox secret env" in result.output
+        assert "registry credentials" in result.output
         assert "ARTIFACTORY_TOKEN" in result.output
         monkeypatch.setenv("ARTIFACTORY_TOKEN", "value_never_shown")
         result = runner.invoke(app, ["doctor"])

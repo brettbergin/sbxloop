@@ -63,7 +63,6 @@ from sbxloop import hostgit
 from sbxloop.config import (
     DEFAULT_PR_TITLE_TEMPLATE,
     Config,
-    CredentialConfig,
     RepoConfig,
     VerifyMode,
     _flatten,
@@ -156,6 +155,7 @@ from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import (
     BudgetExceededError,
     GithubOpsError,
+    ProvisionError,
     RunCancelledError,
     SbxError,
     SbxloopError,
@@ -179,6 +179,7 @@ from sbxloop.gh.ops import (
 from sbxloop.ids import branch_name, new_message_id, new_run_id
 from sbxloop.log import get_logger
 from sbxloop.policy import EgressGranter
+from sbxloop.sbx import registries
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.provision import Provisioner
@@ -189,7 +190,7 @@ from sbxloop.worker.client import WorkerClient
 log = get_logger(__name__)
 
 GithubOpsFactory = Callable[[WorkerClient, str], GithubOps]
-ServiceOpsFactory = Callable[[WorkerClient, str, EventBus, Sequence[CredentialConfig]], ServiceOps]
+ServiceOpsFactory = Callable[..., ServiceOps]  # ServiceOps.__init__'s signature
 
 
 class ChatMessage(NamedTuple):
@@ -708,23 +709,18 @@ class LoopEngine:
                             python=self.worker_python,
                             role="service",
                             limits=self.config.limits,
-                            # The credentials ride the same non-proxy road
-                            # as GH_TOKEN (#765): per job over stdin when
-                            # this sbx passes it, else the in-VM env file.
+                            # The credentials — and the registries' (#766)
+                            # — ride the same non-proxy road as GH_TOKEN
+                            # (#765): per job over stdin when this sbx
+                            # passes it, else the in-VM env file.
                             job_env=provisioner.job_env(
-                                "service", sandbox=pair.service, credentials=credentials
+                                "service",
+                                self.config.github.repo,
+                                sandbox=pair.service,
+                                credentials=credentials,
                             ),
                         )
                         if pair.service is not None
-                        else None
-                    )
-                    if self.install_workers:
-                        self._install_workers(run_id, pair, agent, github, service_client)
-                    self._run_setup_commands(run_id, pair, agent)
-                    repo_config = self.config.github.effective_repo(None)
-                    ops = (
-                        self._github_ops(github, run_id)
-                        if github is not None and repo_config is not None
                         else None
                     )
                     service = (
@@ -733,8 +729,22 @@ class LoopEngine:
                             run_id,
                             self.bus,
                             self.config.credentials_named(credentials),
+                            self.config.credentialed_registries_for(self.config.github.repo),
+                            workdir=pair.service_workdir,
+                            workspace=pair.workspace,
                         )
                         if service_client is not None
+                        else None
+                    )
+                    if self.install_workers:
+                        self._install_workers(run_id, pair, agent, github, service_client)
+                    if service is not None:
+                        self._fetch_dependencies(run_id, service)
+                    self._run_setup_commands(run_id, pair, agent)
+                    repo_config = self.config.github.effective_repo(None)
+                    ops = (
+                        self._github_ops(github, run_id)
+                        if github is not None and repo_config is not None
                         else None
                     )
                     issues_enabled = self._ensure_delivery_repo(run_id, ops)
@@ -747,9 +757,10 @@ class LoopEngine:
                         workspace=pair.workspace,
                         languages=pair.languages.languages,
                         versions=pair.languages.versions,
-                        # The build session's `call_service` tool (#765),
-                        # answered on the host through the service sandbox.
-                        host_tools=(service.tool_spec(),) if service is not None else (),
+                        # The build session's `call_service` (#765) and
+                        # `fetch_dependencies` (#766) tools, answered on the
+                        # host through the service sandbox.
+                        host_tools=service.tool_specs() if service is not None else (),
                         tool_handler=service.handler(phase="build")
                         if service is not None
                         else None,
@@ -843,11 +854,13 @@ class LoopEngine:
 
         A configured template is expected to be prebaked (`sbxloop bake`):
         install() probes it and skips the ladder on success, falling back
-        when stale. ensure_dev_tools is agent-only — the agent builds
-        projects in its VM, so it gets the run's resolved toolchains
-        (`[sandbox] languages`, or what the workspace declares); the github
-        sandbox only runs API ops, and so does the service sandbox (#765).
-        Every install always runs to completion before any failure
+        when stale. ensure_dev_tools is for the sandboxes that run a
+        toolchain: the agent builds projects in its VM, so it gets the run's
+        resolved toolchains (`[sandbox] languages`, or what the workspace
+        declares); the service sandbox gets the package managers of the
+        run's credentialed registries (#766) — it fetches, the agent builds
+        offline — and the github sandbox, which only runs API ops, gets
+        none. Every install always runs to completion before any failure
         propagates, so an error never unwinds into pair teardown while
         another install is still mid-exec.
         """
@@ -879,7 +892,21 @@ class LoopEngine:
             installs.append(partial(github.install, extras="", expect_prebaked=prebaked_expected))
         if service is not None:
             roles.append("service")
-            installs.append(partial(service.install, extras="", expect_prebaked=prebaked_expected))
+            fetch_languages = registries.languages(
+                self.config.credentialed_registries_for(self.config.github.repo)
+            )
+            installs.append(
+                partial(
+                    service.install,
+                    extras="",
+                    ensure_dev_tools=bool(fetch_languages),
+                    languages=fetch_languages,
+                    versions={
+                        k: v for k, v in pair.languages.versions.items() if k in fetch_languages
+                    },
+                    expect_prebaked=prebaked_expected,
+                )
+            )
         if len(installs) == 1:
             installs[0]()
         else:
@@ -921,6 +948,25 @@ class LoopEngine:
                     else ""
                 ),
             )
+
+    def _fetch_dependencies(self, run_id: str, service: ServiceOps) -> None:
+        """The setup-time fetch (#766): one ``service.fetch`` per credentialed
+        ecosystem the workspace has a manifest for, so the agent's first
+        offline install finds its dependencies in the shared cache. A
+        non-zero exit fails provisioning the way a failed setup command
+        does — the run cannot build without its dependencies, and the
+        event carries the package manager's output."""
+        for kind in service.kinds:
+            manifests = service.manifests(kind)
+            if not manifests:
+                continue
+            result = service.fetch(kind, manifests=manifests, phase="setup")
+            if result["exit_code"] != 0:
+                tail = result["output"][-2000:]
+                raise ProvisionError(
+                    f"dependency fetch for {kind} failed in the service sandbox "
+                    f"(exit {result['exit_code']}): {' '.join(result['argv'])}\n{tail}"
+                )
 
     def _run_setup_commands(self, run_id: str, pair: SandboxPair, agent: WorkerClient) -> None:
         """The operator's `setup_commands` (#681) in the cloned workspace,

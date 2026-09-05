@@ -210,7 +210,9 @@ def effective_egress_bounds(config: Config, repo: str | None = None) -> tuple[li
 
     allow = [
         *AGENT_ALLOW_DOMAINS,
-        *registries.domains(config.registries_for(repo)),
+        # Open registries only: a credentialed one is the service
+        # sandbox's, and the agent never reaches it (#766).
+        *registries.domains(config.open_registries_for(repo)),
         *config.sandbox.extra_allow_domains,
         *PROMPT_ADVERTISED_DOMAINS,
         *WELL_KNOWN_REGISTRY_DOMAINS,
@@ -257,7 +259,7 @@ class EgressGranter:
                 # granted" (``apply`` refuses it on the deny check first
                 # either way, but the set should describe reality).
                 *baseline_allows(PROMPT_ADVERTISED_DOMAINS, self.deny),
-                *registries.domains(config.registries_for(repo)),
+                *registries.domains(config.open_registries_for(repo)),
                 *config.sandbox.extra_allow_domains,
             )
         }

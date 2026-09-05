@@ -140,15 +140,14 @@ secret_strategy = "proxy"
 # Python when nothing is recognized. Setting it replaces detection.
 # languages = ["python", "node"]
 # Environment for the agent sandbox's worker and every command it runs (the
-# agent's turns, verify commands). `env` holds plain values as written here;
-# `secret_env` names variables whose VALUES are read from the daemon's own
-# environment at provision time and delivered like the agent credential
-# (per-job stdin or the 0600 in-VM env file) — never an sbx argument, event
-# or log line. A name the daemon does not hold fails provisioning by name;
-# `sbxloop doctor` lists unset ones. Neither may name what the loop delivers
-# itself (GH_TOKEN, the agent credential, SBXLOOP_*).
+# agent's turns, verify commands): plain values as written here. It may not
+# name what the loop delivers itself (GH_TOKEN, the agent credential,
+# SBXLOOP_*), and it has no secret counterpart: the only credential in the
+# agent sandbox is the agent's own. A registry credential goes on its
+# [[registries]] entry (`auth_env`, used in the service sandbox that fetches
+# the dependencies); a key a workload calls with goes under [[credentials]];
+# a secret only the test suite needs belongs to CI (`verify_mode`).
 # env = { RAILS_ENV = "test", DATABASE_URL = "postgres://localhost/app_test" }
-# secret_env = ["NPM_TOKEN", "PIP_INDEX_URL"]
 # OS packages the toolchains do not cover, installed beside them (probed
 # with dpkg first, so a template baked with the list installs nothing), and
 # commands run in the workspace after the clone, toolchains and registries
@@ -169,20 +168,28 @@ secret_strategy = "proxy"
 # changes nothing on its own.
 # verify_mode = "full"
 
-# Private package registries. Each entry opens its `host` for the
-# agent sandbox AND writes the ecosystem's client config so its tooling
-# uses the registry: ~/.npmrc for npm (pnpm, yarn classic), PIP_INDEX_URL +
-# UV_DEFAULT_INDEX for pypi, GOPRIVATE for go, ~/.cargo/config.toml for
-# cargo, ~/.m2/settings.xml for maven, NuGet.Config for nuget, BUNDLE_* for
-# gem; `generic` opens a host only. `auth_env` names the daemon-environment
-# variable holding the credential — delivered like `secret_env` above and
-# referenced by NAME from the client file wherever the tool expands
-# environment variables (npm, maven, nuget, cargo, bundler); the netrc kinds
-# (pypi, go, generic) pair it with `auth_user` in a 0600 ~/.netrc. pypi and
-# maven make the registry THE source (point them at a virtual/group
-# repository that proxies the public index); npm with `scope` serves that
-# scope only. A [[github.repos]] entry may set its own `registries` list,
-# which replaces this one.
+# Private package registries. An entry WITHOUT `auth_env` (open) is the
+# agent sandbox's: its `host` is opened there and the ecosystem's client
+# config is written so its tooling uses the registry — ~/.npmrc for npm
+# (pnpm, yarn classic), PIP_INDEX_URL + UV_DEFAULT_INDEX for pypi, GOPRIVATE
+# for go, ~/.cargo/config.toml for cargo, ~/.m2/settings.xml for maven,
+# NuGet.Config for nuget, BUNDLE_* for gem; `generic` opens a host only.
+# An entry WITH `auth_env` (credentialed) is the run's SERVICE sandbox's:
+# the credential — the named daemon-environment variable, delivered like
+# the agent credential is, never an sbx argument, event or log line — the
+# client config and the host all go there, and the dependencies are fetched
+# there (`npm ci --ignore-scripts`, `pip download`, `go mod download`,
+# `cargo fetch`, `mvn dependency:go-offline`, `dotnet restore`, `bundle
+# cache`) into a cache both sandboxes share; the agent sandbox is set up
+# OFFLINE for that ecosystem and builds from the cache, and asks for more
+# through its `fetch_dependencies` tool. The credential is referenced by
+# NAME from the client file wherever the tool expands environment variables
+# (npm, maven, nuget, cargo, bundler); the netrc kinds (pypi, go, generic)
+# pair it with `auth_user` in a 0600 ~/.netrc. pypi and maven make the
+# registry THE source (point them at a virtual/group repository that proxies
+# the public index); npm with `scope` serves that scope only. A
+# [[github.repos]] entry may set its own `registries` list, which replaces
+# this one.
 # [[registries]]
 # kind = "npm"                          # npm | pypi | go | cargo | maven | nuget | gem | generic
 # host = "artifactory.example.com"
@@ -328,7 +335,6 @@ secret_strategy = "proxy"
 # reviewers = ["their-lead"]       # review requests; unset uses [github]'s, [] requests nobody
 # review_notify = ["<chat user id>"] # pinged when a PR waits for a review; unset uses [landing]'s
 # env = { RAILS_ENV = "test" }     # agent-sandbox environment; a set value REPLACES [sandbox]'s
-# secret_env = []                  # names read from the daemon env; [] = this repo needs none
 # registries = []                  # private registries; a set list REPLACES the top-level [[registries]]
 # apt_packages = ["libpq-dev"]     # OS packages beside the toolchains; a set list REPLACES [sandbox]'s
 # setup_commands = ["make setup"]  # run in the workspace before the first phase; REPLACES [sandbox]'s

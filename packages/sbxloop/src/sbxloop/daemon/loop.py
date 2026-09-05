@@ -2916,10 +2916,13 @@ class DaemonLoop:
         if self.sbx is None:
             return
         roles: tuple[SandboxRole, ...] = ("agent", "github")
-        # The service sandbox (#765) exists only for a run granted
-        # credentials; the run row says whether there is one to sweep.
+        # The service sandbox (#765) exists for a run granted credentials
+        # — the run row says — or for a repo with a credentialed registry
+        # (#766); the run row does not say which repo, so any repo
+        # configured with one is reason to sweep (a missing sandbox is the
+        # common, tolerated case below).
         try:
-            if self.store.get_run(run_id).credentials:
+            if self.store.get_run(run_id).credentials or self._any_credentialed_registries():
                 roles += ("service",)
         except StateError:
             pass
@@ -2939,6 +2942,14 @@ class DaemonLoop:
                 # still linger from a rollback race; clearing it is cheap.
                 log.debug("recovery.no_stale_sandbox", run=run_id, sandbox=name, role=role)
                 remove_run_sandbox_secrets(self.sbx, name, role)
+
+    def _any_credentialed_registries(self) -> bool:
+        """Whether any repo this daemon runs for fetches through a service
+        sandbox (#766)."""
+        repos: list[str | None] = [r.repo for r in self.config.github.repos] or [
+            self.config.github.repo
+        ]
+        return any(self.config.credentialed_registries_for(repo) for repo in repos)
 
     def _result_from_record(self, run_id: str) -> RunResult:
         record = self.store.get_run(run_id)

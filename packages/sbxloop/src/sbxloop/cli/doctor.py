@@ -735,22 +735,17 @@ def _missing_repo_labels(
         return None
 
 
-def secret_env_checks(config: Config, env: dict[str, str]) -> list[Check]:
-    """One row when `[sandbox] secret_env` (or a repository's override)
-    names anything (#679), or a `[[registries]]` entry has an `auth_env`
-    (#680): every name must be set in the daemon's environment, or
-    provisioning fails by name before a sandbox boots — this row says so
-    before the first run does. Values are never shown."""
+def registry_credential_checks(config: Config, env: dict[str, str]) -> list[Check]:
+    """One row when a `[[registries]]` entry (or a repository's override)
+    has an `auth_env` (#680): every name must be set in the daemon's
+    environment, or provisioning fails by name before a sandbox boots —
+    this row says so before the first run does. The names go to the
+    service sandbox, which fetches the dependencies; the agent's sandbox
+    never sees them (#766). Values are never shown."""
     scopes: list[tuple[str, list[str]]] = [
-        ("[sandbox]", list(config.sandbox.secret_env)),
         # (no brackets: the detail is rich markup on the way to the table)
         ("registries", [r.auth_env for r in config.registries if r.auth_env]),
     ]
-    scopes.extend(
-        (entry.repo, list(entry.secret_env))
-        for entry in config.github.repos
-        if entry.secret_env is not None
-    )
     scopes.extend(
         (f"{entry.repo} registries", [r.auth_env for r in entry.registries if r.auth_env])
         for entry in config.github.repos
@@ -761,7 +756,7 @@ def secret_env_checks(config: Config, env: dict[str, str]) -> list[Check]:
         return []
     unset = [name for name in names if not env.get(name)]
     if not unset:
-        return [Check("sandbox secret env", True, f"set: {', '.join(names)}")]
+        return [Check("registry credentials", True, f"set: {', '.join(names)} (service sandbox)")]
     where = "; ".join(
         f"{scope}: {', '.join(n for n in listed if n in unset)}"
         for scope, listed in scopes
@@ -769,11 +764,11 @@ def secret_env_checks(config: Config, env: dict[str, str]) -> list[Check]:
     )
     return [
         Check(
-            "sandbox secret env",
+            "registry credentials",
             False,
             f"not set in the daemon's environment — {where}; export them where the "
-            "daemon reads its secrets, or drop them from secret_env / auth_env (runs "
-            "that need them fail at provisioning)",
+            "daemon reads its secrets, or drop the auth_env (runs that need them "
+            "fail at provisioning)",
         )
     ]
 
@@ -1017,7 +1012,7 @@ def collect_checks(
             "set" if agent.has_token(env) else agent.missing_token_detail,
         )
     )
-    checks.extend(secret_env_checks(config, env))
+    checks.extend(registry_credential_checks(config, env))
     checks.extend(credentials_checks(config, env))
     # A github credential matters only when the GitHub integration is
     # configured; an unconfigured integration is a valid (GitHub-less)
