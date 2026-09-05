@@ -1471,16 +1471,29 @@ class ChatBridge(ABC):
         # the steering hint on the usage line.
         word = (cmd.split() or [""])[0].lower()
         by = self._author_name(msg)
-        if word in ITEM_COMMANDS:
-            # Abandoning a queued GitHub item reports through the ops
-            # sandbox — seconds, not milliseconds — so keep it off the
-            # gateway's event loop.
-            reply = await asyncio.get_event_loop().run_in_executor(
-                None,
-                functools.partial(dispatch, loop, cmd, prefix=prefix, by=by, via=self.backend),
-            )
-        else:
-            reply = dispatch(loop, cmd, prefix=prefix, by=by, via=self.backend)
+        run = functools.partial(
+            dispatch,
+            loop,
+            cmd,
+            prefix=prefix,
+            by=by,
+            via=self.backend,
+            max_chars=self.chat.max_message_chars - 8,  # a fence around a log tail
+        )
+        try:
+            if word in ITEM_COMMANDS:
+                # Abandoning a queued GitHub item reports through the ops
+                # sandbox — seconds, not milliseconds — so keep it off the
+                # gateway's event loop.
+                reply = await asyncio.get_event_loop().run_in_executor(None, run)
+            else:
+                reply = run()
+        except Exception as exc:
+            # This task runs on a discarded future: an exception here would
+            # be a command with no answer and no log line.
+            self.log.warning("chat.command_crashed", command=word, by=by, exc_info=True)
+            await self._send(channel, f"error: {exc}")
+            return
         if reply.status is not None:
             await self._send(channel, reply.text, embed=status_embed(reply.status))
         elif not reply.known:
@@ -1488,8 +1501,13 @@ class ChatBridge(ABC):
             if self.concierge is not None:
                 hint += ", or here to ask in plain language"
             await self._send(channel, f"{reply.text}{hint}.")
+        elif reply.preformatted:
+            await self._send(channel, f"```\n{reply.text}\n```")
         else:
             await self._send(channel, reply.text)
+        if reply.after is not None:
+            # `stop`: the flag goes up only now the answer is on its way.
+            reply.after()
 
     # -- pump: queue -> chat (bridge thread) ---------------------------------------------
 

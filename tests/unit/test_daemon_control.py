@@ -26,6 +26,7 @@ from sbxloop.daemon.control import (
     ControlServer,
     _reply_from,
     dispatch,
+    format_log_tail,
     plain,
     usage,
 )
@@ -148,6 +149,84 @@ class TestDispatch:
             assert not reply.ok and "usage:" in reply.text, cmd
         assert not floop.paused and floop.hold_calls == []
 
+    def test_log_answers_from_the_ring_buffer_with_filters(self, tmp_path: Path) -> None:
+        """`!sbx log` / `ctl log`: the journal without ssh, the same rendering
+        the concierge's tool returns."""
+        from sbxloop.log import get_logger
+
+        logger = get_logger("sbxloop.test.ctl")
+        logger.info("ctl.probe_one", n=1)
+        logger.warning("ctl.probe_two", n=2)
+        floop = FakeLoop(_dstore(tmp_path))
+        reply = dispatch(floop, "log --tail 3")
+        assert reply.ok and reply.preformatted and reply.text.startswith("showing")
+        assert "```" not in reply.text, "the fence is the transport's, ctl prints it raw"
+        assert "ctl.probe_two" in reply.text
+        only_warn = dispatch(floop, "log --tail 50 --level WARNING --grep probe")
+        assert "ctl.probe_two" in only_warn.text and "ctl.probe_one" not in only_warn.text
+        assert "level=WARNING" in only_warn.text and "grep='probe'" in only_warn.text
+        # Flags after --grep are still flags; chat hands over quotes verbatim.
+        late = dispatch(floop, 'log --grep "probe_two" --level WARNING --tail 5')
+        assert late.ok and "grep='probe_two'" in late.text and "level=WARNING" in late.text
+        for bad_line in ("log --level LOUD", "log --tail ²", "log --tail 0", "log --grep"):
+            bad = dispatch(floop, bad_line)
+            assert not bad.ok and bad.text.startswith("usage: log"), bad_line
+        usage_reply = dispatch(floop, "log --nope")
+        assert not usage_reply.ok and usage_reply.text.startswith("usage: log")
+        assert format_log_tail(tail=1, grep="no-such-line-anywhere").startswith(
+            "no matching log records"
+        )
+
+    def test_log_fits_a_message_newest_first(self, tmp_path: Path) -> None:
+        """A chat message is head-clipped by its transport: the tail must
+        drop its oldest lines to fit, never its newest."""
+        from sbxloop.log import get_logger
+
+        logger = get_logger("sbxloop.test.ctl")
+        for n in range(40):
+            logger.info("ctl.fit_probe", n=n, pad="x" * 80)
+        text = format_log_tail(tail=40, grep="fit_probe", max_chars=1500)
+        assert len(text) <= 1500
+        assert "n=39" in text and "n=0 " not in text
+        assert "older line(s) trimmed to fit the message" in text
+        full = format_log_tail(tail=40, grep="fit_probe")
+        assert "trimmed" not in full and "n=0 " in full
+
+    def test_log_is_not_traced_into_its_own_buffer(self, tmp_path: Path) -> None:
+        from sbxloop.log import get_logger, log_buffer
+
+        get_logger("sbxloop.test.ctl").info("ctl.trace_probe")
+        floop = FakeLoop(_dstore(tmp_path))
+        before = len(log_buffer())
+        dispatch(floop, "log --grep trace_probe")
+        dispatch(floop, "log --grep trace_probe")
+        assert len(log_buffer()) == before
+
+    def test_stop_asks_the_loop_to_finish_and_exit(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(tmp_path))
+        reply = dispatch(floop, "stop", by="ops")
+        # The flag goes up through `after`, once the caller has sent the
+        # reply — a chat bridge must not be torn down under its answer.
+        assert reply.ok and not getattr(floop, "stopped", False)
+        assert reply.after is not None
+        reply.after()
+        assert floop.stopped
+        assert "exits once the current run" in reply.text and "pause" in reply.text
+        assert not dispatch(floop, "stop now").ok
+        plain_status = floop.status
+        floop.status = lambda: {**plain_status(), "stopping": True}  # type: ignore[method-assign]
+        assert "stopping:" in dispatch(floop, "status").text
+
+    def test_stop_over_ctl_takes_effect_after_the_reply_is_written(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(tmp_path))
+        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        server.dir.mkdir(parents=True)
+        (server.dir / f"{time.time():.6f}-stop.json").write_text(json.dumps({"cmd": "stop"}))
+        assert server.serve_once() == 1
+        assert floop.stopped
+        (reply_path,) = server.dir.glob("*.reply.json")
+        assert json.loads(reply_path.read_text())["ok"]
+
     def test_unknown_verb_returns_usage_with_the_callers_prefix(self, tmp_path: Path) -> None:
         reply = dispatch(FakeLoop(_dstore(tmp_path)), "bogus", prefix="sbxloop daemon ctl")
         assert not reply.ok and not reply.known
@@ -156,6 +235,7 @@ class TestDispatch:
             "sbxloop daemon ctl status|pause [--hold NAME]|resume [<item|run>|--hold NAME|--all]|"
             "cancel [--retry]|queue|items|" in reply.text
         )
+        assert "log [--tail N] [--level LEVEL] [--grep TEXT]|stop" in reply.text
 
     def test_cancel_rejects_unknown_arguments(self, tmp_path: Path) -> None:
         # A typo (`--rety`) must not silently become a terminal no-retry
