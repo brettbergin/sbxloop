@@ -357,6 +357,13 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "*Symptom (assumed)* section" in flat
     assert "You never wait forever and no request is ever dropped." in flat
     assert "a close never proceeds on silence" in flat
+    # #797: a workload's subject is unbounded — the concierge never declares
+    # an ask out of scope, and never asks whether to queue one
+    assert "`start_workload`, **one call, no confirmation**" in text
+    assert "Its subject is unbounded" in text
+    assert "You have no scope of your own to police" in text
+    assert "The topic is never yours to judge" in flat
+    assert 'or "want me to queue a workload?"** — the ask *is* the yes' in flat
 
 
 def test_review_prompt_carries_contract() -> None:
