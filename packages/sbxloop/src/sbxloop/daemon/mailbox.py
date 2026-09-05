@@ -198,6 +198,23 @@ class MailboxClient:
         with self._lock:
             return self.engine.last_event_ts(run_id)
 
+    def last_event_ts_many(self, run_ids: Sequence[str]) -> dict[str, float]:
+        with self._lock:
+            return self.engine.last_event_ts_many(run_ids)
+
+    def last_event(self, run_id: str, type_prefix: str) -> Event | None:
+        with self._lock:
+            return self.engine.last_event(run_id, type_prefix)
+
+    def run_items(self) -> dict[str, str]:
+        with self._lock:
+            return self.daemon.run_items()
+
+    def queued_in_order(self) -> list[WorkItem]:
+        """The queue as the daemon will dispatch it."""
+        with self._lock:
+            return self.daemon.queued_in_order()
+
     def items(self, states: Sequence[str] | None = None) -> list[WorkItem]:
         with self._lock:
             return self.daemon.items(list(states) if states else None)  # type: ignore[arg-type]

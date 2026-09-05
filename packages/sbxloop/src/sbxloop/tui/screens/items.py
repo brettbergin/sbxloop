@@ -12,6 +12,7 @@ from textual.containers import Vertical
 from textual.widgets import Static
 
 from sbxloop.daemon.discord_format import ITEM_STATE_MARKER
+from sbxloop.daemon.model import WorkItem
 from sbxloop.tui.data import ConsoleState
 from sbxloop.tui.format import age
 from sbxloop.tui.screens.base import ConsoleScreen
@@ -59,11 +60,7 @@ class ItemsScreen(ConsoleScreen):
                     i.repo or "—",
                     i.title[:60],
                     str(i.attempts),
-                    (
-                        time.strftime("%H:%M", time.localtime(i.not_before))
-                        if i.not_before and i.not_before > now
-                        else "now"
-                    ),
+                    self._eligible(items.eligible_at.get(i.item_id, 0.0), now, i),
                 ),
             )
             for i in items.queued
@@ -84,6 +81,16 @@ class ItemsScreen(ConsoleScreen):
             )
             for i in items.items
         )
+
+    @staticmethod
+    def _eligible(at: float, now: float, item: WorkItem) -> str:
+        """When the daemon's own rule lets the item go — a resume first,
+        a scheduled retry or a backoff at its clock, else now."""
+        if item.run_id:
+            return "resume, first"
+        if at <= now:
+            return "now"
+        return time.strftime("%H:%M", time.localtime(at))
 
     def action_open(self) -> None:
         for table_id in ("items", "queued"):

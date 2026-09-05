@@ -10,8 +10,9 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from textual import work
-from textual.app import App
+from textual.app import App, ScreenStackError
 from textual.binding import Binding, BindingType
+from textual.worker import get_current_worker
 
 from sbxloop import __version__
 from sbxloop.config import Config
@@ -87,15 +88,26 @@ class SbxloopTui(App[None]):
 
     @work(thread=True, exclusive=True, group="refresh")
     def refresh_state(self) -> None:
-        state = build_state(self.mailbox, self.state, now=self.clock())
+        state = build_state(
+            self.mailbox,
+            self.state,
+            now=self.clock(),
+            retry_backoff_s=self.config.daemon.retry_backoff_s,
+        )
+        if get_current_worker().is_cancelled:
+            return  # superseded, or the app is shutting down
         self.call_from_thread(self._apply_state, state)
 
     @work(thread=True, exclusive=True, group="probe")
     def probe(self) -> None:
         snapshot = probe_daemon(self.ctl, now=self.clock())
+        if get_current_worker().is_cancelled:
+            return
         self.call_from_thread(self._apply_daemon, snapshot)
 
     def _apply_state(self, state: ConsoleState) -> None:
+        if state.refreshed_at < self.state.refreshed_at:
+            return  # an older snapshot landing after a newer one
         # The snapshot was built off-thread from an older state: the daemon
         # probe applied here since then is the fresher fact, keep it.
         state.daemon = self.state.daemon
@@ -107,7 +119,11 @@ class SbxloopTui(App[None]):
         self._repaint()
 
     def _repaint(self) -> None:
-        repaint = getattr(self.screen, "repaint", None)
+        try:
+            screen = self.screen
+        except ScreenStackError:  # a snapshot landing while the app shuts down
+            return
+        repaint = getattr(screen, "repaint", None)
         if repaint is not None:
             repaint()
 

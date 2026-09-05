@@ -82,9 +82,17 @@ class OverviewScreen(ConsoleScreen):
         if daemon is None:
             text.append("probing the daemon…", style="dim")
             return text
+        if daemon.starting:
+            text.append("daemon starting ", style="yellow")
+            text.append("(recovery); commands wait until it answers", style="dim")
+            return text
         if not daemon.live:
             text.append("no daemon answered ", style="bold red")
             text.append("(ctl status); history below is still browsable", style="dim")
+            return text
+        if daemon.status is None:
+            text.append("daemon busy ", style="yellow")
+            text.append("(status not answered in time); the store below is live", style="dim")
             return text
         if not current:
             text.append("idle", style="green")
@@ -118,16 +126,20 @@ class OverviewScreen(ConsoleScreen):
         if items is None or (not items.gates and not items.holds):
             return Text("nobody is waiting on you", style="dim")
         text = Text()
+        emoji = self.console_app.emoji
+        gate_mark = "⏸ " if emoji else ""
+        hold_mark = "👀 " if emoji else ""
         for gate in items.gates:
             line = (
-                f"⏸ **{gate.item_id}** ready to merge · PR #{gate.pr_number} · run `{gate.run_id}`"
+                f"{gate_mark}**{gate.item_id}** ready to merge · PR #{gate.pr_number} "
+                f"· run `{gate.run_id}`"
             )
             text.append_text(to_rich(line))
             text.append("\n")
         for hold in items.holds:
             what = "held in draft" if hold.held_by_draft else "awaiting review"
             line = (
-                f"👀 **{hold.item_id}** {what} · PR #{hold.pr_number} · {hold.state} "
+                f"{hold_mark}**{hold.item_id}** {what} · PR #{hold.pr_number} · {hold.state} "
                 f"· run `{hold.run_id}`"
             )
             text.append_text(to_rich(line))

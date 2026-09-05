@@ -17,27 +17,40 @@ from typing import Any, Protocol
 from sbxloop.daemon.control import CommandReply
 from sbxloop.daemon.mailbox import MailboxClient
 from sbxloop.daemon.model import WorkItem
-from sbxloop.daemon.store import ChatThread, MergeGate, ReviewHold
+from sbxloop.daemon.store import ChatThread, MergeGate, ReviewHold, dispatch_eligible_at
 from sbxloop.engine.model import RunRecord, TaskRecord
+from sbxloop.events import HostEventTypes
 from sbxloop_worker.protocol import Event
 
 #: A ``status`` question to the daemon: cheap (read-only verb), and the
 #: ctl server refuses a request older than its start, so a short budget
 #: says "no daemon" quickly without ever mis-executing.
 STATUS_TIMEOUT_S = 3.0
-#: The event types the Landing tab folds, newest of each.
-LANDING_PREFIXES: tuple[str, ...] = (
-    "run.deliver",
-    "review.verdict",
-    "review.reconciled",
-    "fix.round",
-    "ci.status",
-    "landing.checks",
-    "land.",
-    "run.gated",
-    "run.awaiting_review",
-    "run.merged",
-    "run.blocked",
+#: The event types the Landing tab shows, newest of each — the host's own
+#: names, each `land.*` kind on its own so a draft hold is not hidden
+#: behind a later update.
+LANDING_KINDS: tuple[str, ...] = (
+    HostEventTypes.RUN_DELIVER,
+    HostEventTypes.REVIEW_VERDICT,
+    HostEventTypes.REVIEW_RECONCILED,
+    HostEventTypes.FIX_ROUND,
+    HostEventTypes.FIX_UNANSWERED,
+    HostEventTypes.CI_STATUS,
+    HostEventTypes.LANDING_CHECKS,
+    HostEventTypes.LAND_UNDRAFT,
+    HostEventTypes.LAND_HELD_BY_DRAFT,
+    HostEventTypes.LAND_UPDATE,
+    HostEventTypes.LAND_ENQUEUED,
+    HostEventTypes.LAND_DEQUEUED,
+    HostEventTypes.LAND_HUMAN_ACK,
+    HostEventTypes.LAND_HUMAN_ACK_CAPPED,
+    HostEventTypes.LAND_BOT_STANDING,
+    HostEventTypes.RUN_GATED,
+    HostEventTypes.RUN_AWAITING_REVIEW,
+    HostEventTypes.RUN_MERGED,
+    HostEventTypes.RUN_FOLLOWUPS,
+    HostEventTypes.RUN_BLOCKED,
+    HostEventTypes.RUN_RECONCILED,
 )
 
 
@@ -66,6 +79,10 @@ class DaemonSnapshot:
 def probe_daemon(
     ctl: CtlClient, *, now: float, timeout_s: float = STATUS_TIMEOUT_S
 ) -> DaemonSnapshot:
+    """Ask the daemon ``status``. ``None`` is no daemon; a stale refusal is
+    a daemon still starting; a *pending* reply is a daemon that took the
+    request but was too busy to answer in time — alive, not down (the
+    misread the ctl queue's own docstring warns about)."""
     t0 = time.monotonic()
     try:
         reply = ctl.submit("status", timeout_s=timeout_s)
@@ -76,6 +93,10 @@ def probe_daemon(
         return DaemonSnapshot(False, False, None, latency, now)
     if reply.stale:
         return DaemonSnapshot(False, True, None, latency, now)
+    if reply.pending:
+        return DaemonSnapshot(
+            True, False, None, latency, now, error="busy: status not answered in time"
+        )
     return DaemonSnapshot(bool(reply.ok), False, reply.status, latency, now)
 
 
@@ -95,40 +116,38 @@ class RunsSnapshot:
 
 
 def build_runs(mailbox: MailboxClient, *, limit: int = 200) -> RunsSnapshot:
+    """Every run with its item and repository — a few queries, not one per
+    run: the daemon's ledger maps runs to items, and an item's pinned run
+    wins for the item it currently belongs to."""
     runs = tuple(mailbox.runs(limit=limit))
     items = mailbox.items()
-    item_by_run: dict[str, str] = {}
+    item_by_run = mailbox.run_items()
     repo_by_item: dict[str, str] = {}
     for item in items:
         if item.repo:
             repo_by_item[item.item_id] = item.repo
         if item.run_id:
             item_by_run[item.run_id] = item.item_id
-    for record in runs:
-        if record.run_id not in item_by_run:
-            found = mailbox.item_for_run(record.run_id)
-            if found:
-                item_by_run[record.run_id] = found
-    last: dict[str, float] = {}
-    for record in runs[:30]:
-        ts = mailbox.last_event_ts(record.run_id)
-        if ts is not None:
-            last[record.run_id] = ts
+    last = mailbox.last_event_ts_many([r.run_id for r in runs[:30]])
     return RunsSnapshot(runs, item_by_run, repo_by_item, last)
 
 
 @dataclass(frozen=True)
 class ItemsSnapshot:
-    queued: tuple[WorkItem, ...]
+    queued: tuple[WorkItem, ...]  # in the daemon's dispatch order
+    eligible_at: dict[str, float]  # item id -> when the dispatch rule lets it go
     items: tuple[WorkItem, ...]
     gates: tuple[MergeGate, ...]
     holds: tuple[ReviewHold, ...]
 
 
-def build_items(mailbox: MailboxClient) -> ItemsSnapshot:
+def build_items(mailbox: MailboxClient, *, retry_backoff_s: float) -> ItemsSnapshot:
+    """The queue as the daemon will take it: its own order and its own
+    eligibility rule (`dispatch_eligible_at`), never re-derived here."""
     items = tuple(mailbox.items())
-    queued = tuple(sorted((i for i in items if i.state == "queued"), key=lambda i: i.created_at))
-    return ItemsSnapshot(queued, items, tuple(mailbox.gates()), tuple(mailbox.holds()))
+    queued = tuple(mailbox.queued_in_order())
+    eligible = {i.item_id: dispatch_eligible_at(i, retry_backoff_s) for i in queued}
+    return ItemsSnapshot(queued, eligible, items, tuple(mailbox.gates()), tuple(mailbox.holds()))
 
 
 @dataclass(frozen=True)
@@ -153,10 +172,8 @@ def build_run_detail(mailbox: MailboxClient, run_id: str) -> RunDetail | None:
     gate = next((g for g in mailbox.gates(("open", "approving")) if g.run_id == run_id), None)
     hold = next((h for h in mailbox.holds() if h.run_id == run_id), None)
     landing: list[Event] = []
-    for prefix in LANDING_PREFIXES:
-        last: Event | None = None
-        for _seq, event in mailbox.events(run_id, type_prefix=prefix):
-            last = event
+    for kind in LANDING_KINDS:
+        last = mailbox.last_event(run_id, kind)
         if last is not None:
             landing.append(last)
     landing.sort(key=lambda e: e.ts)
@@ -186,15 +203,21 @@ class EventTail:
         self.after_seq = 0
 
     def pull(self, *, limit: int = 2000) -> list[tuple[int, Event]]:
+        """Rows after the cursor. The cursor moves only in :meth:`commit`,
+        once the rows were rendered: a worker superseded mid-pull must not
+        advance it and lose its rows."""
         out: list[tuple[int, Event]] = []
         for seq, event in self.mailbox.events(
             self.run_id, after_seq=self.after_seq, type_prefix=self.type_prefix
         ):
             out.append((seq, event))
-            self.after_seq = seq
             if len(out) >= limit:
                 break
         return out
+
+    def commit(self, rows: list[tuple[int, Event]]) -> None:
+        if rows:
+            self.after_seq = max(self.after_seq, rows[-1][0])
 
     def reset(self, *, type_prefix: str | None = None) -> None:
         self.type_prefix = type_prefix
@@ -220,7 +243,9 @@ class ConsoleState:
         return self.heartbeat is not None and time.time() - self.heartbeat <= 15.0
 
 
-def build_state(mailbox: MailboxClient, previous: ConsoleState, *, now: float) -> ConsoleState:
+def build_state(
+    mailbox: MailboxClient, previous: ConsoleState, *, now: float, retry_backoff_s: float = 900.0
+) -> ConsoleState:
     """One refresh: every list the screens share, from one worker pass."""
     state = ConsoleState(
         daemon=previous.daemon,
@@ -229,7 +254,7 @@ def build_state(mailbox: MailboxClient, previous: ConsoleState, *, now: float) -
     )
     try:
         state.runs = build_runs(mailbox)
-        state.items = build_items(mailbox)
+        state.items = build_items(mailbox, retry_backoff_s=retry_backoff_s)
         state.heartbeat = mailbox.heartbeat()
         state.daemon_started_at = mailbox.daemon_started_at()
     except Exception as exc:
@@ -249,7 +274,7 @@ def iter_events(mailbox: MailboxClient, run_id: str) -> Iterator[Event]:
 
 
 __all__ = [
-    "LANDING_PREFIXES",
+    "LANDING_KINDS",
     "STATUS_TIMEOUT_S",
     "ConsoleState",
     "CtlClient",

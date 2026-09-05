@@ -2118,6 +2118,9 @@ def tui(
 
     config = load_config()
     resolved = state_dir if state_dir is not None else _daemon_state_dir()
+    # The daemon stamps its resolved state dir on its config before it
+    # harvests; the console reads artifacts through the same value.
+    config = config.model_copy(update={"state_dir": resolved})
     operator = config.tui.operator_id or getpass.getuser()
     try:
         console_app = build_app(

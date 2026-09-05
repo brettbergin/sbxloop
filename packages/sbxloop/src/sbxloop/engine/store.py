@@ -948,6 +948,28 @@ class StateStore:
         for row in rows:
             yield (row["seq"], self._event_record(row))
 
+    def last_event(self, run_id: str, type_prefix: str) -> Event | None:
+        """The newest event of a type (prefix) on the run, one indexed read."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM events WHERE run_id = ? AND type LIKE ? ORDER BY seq DESC LIMIT 1",
+                (run_id, type_prefix + "%"),
+            ).fetchone()
+        return None if row is None else self._event_record(row)
+
+    def last_event_ts_many(self, run_ids: Sequence[str]) -> dict[str, float]:
+        """``run_id -> newest event ts`` for the given runs, in one query."""
+        if not run_ids:
+            return {}
+        marks = ",".join("?" for _ in run_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT run_id, MAX(ts) AS ts FROM events WHERE run_id IN ({marks}) "  # nosec B608
+                "GROUP BY run_id",
+                tuple(run_ids),
+            ).fetchall()
+        return {str(r["run_id"]): float(r["ts"]) for r in rows if r["ts"] is not None}
+
     @staticmethod
     def _event_record(row: sqlite3.Row) -> Event:
         return Event(

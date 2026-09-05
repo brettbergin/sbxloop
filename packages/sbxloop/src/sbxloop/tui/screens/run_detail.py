@@ -14,7 +14,9 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Vertical
+from textual.css.query import NoMatches
 from textual.widgets import Input, TabbedContent, TabPane, Tree
+from textual.worker import get_current_worker
 
 from sbxloop.cli.tui import TASK_STATE_STYLES
 from sbxloop.engine.model import artifacts_dir, scan_artifacts
@@ -40,6 +42,7 @@ _TREE_MAX_FILES = 500
 class RunDetailScreen(ConsoleScreen):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "back", "Back"),
+        Binding("r", "refresh_run", "Refresh", show=False),
         Binding("f", "follow", "Follow events"),
         Binding("slash", "event_filter", "Event type filter"),
         Binding("v", "toggle_view", "Transcript/lines", show=False),
@@ -58,6 +61,14 @@ class RunDetailScreen(ConsoleScreen):
         self._thread_tail: EventTail | None = None
         self._events_tail: EventTail | None = None
         self._artifacts_seen: tuple[Path, ...] | None = None
+        # The artifacts scan walks a workspace and may fork git: once on
+        # mount, on `r`, and when the tab is opened — not every tick.
+        self._scan_artifacts_next = True
+        # Events that land while follow is off wait for it.
+        self._held: list[tuple[int, Event]] = []
+        # Bumped by every reset of a tail: a load still in flight from
+        # before the reset lands with the old number and is dropped.
+        self._generation = 0
 
     def compose(self) -> ComposeResult:
         yield from self.compose_frame()
@@ -65,7 +76,7 @@ class RunDetailScreen(ConsoleScreen):
             yield TextPanel(Text(f"run {self.run_id}", style="bold cyan"), id="header")
             with TabbedContent(id="tabs"):
                 with TabPane("Thread", id="thread"):
-                    yield ChronologyLog("transcript", id="thread-log")
+                    yield ChronologyLog("transcript", id="thread-log", max_lines=4000)
                 with TabPane("Tasks", id="tasks"):
                     yield ConsoleTable(
                         "task",
@@ -97,7 +108,7 @@ class RunDetailScreen(ConsoleScreen):
                     yield Tree("artifacts", id="artifacts-tree")
                 with TabPane("Events", id="events"):
                     yield Input(placeholder="event type prefix, e.g. policy.", id="event-filter")
-                    yield ChronologyLog("lines", id="events-log")
+                    yield ChronologyLog("lines", id="events-log", max_lines=4000)
         yield from self.compose_footer()
 
     def on_mount(self) -> None:
@@ -118,15 +129,23 @@ class RunDetailScreen(ConsoleScreen):
     @work(thread=True, exclusive=True, group="run-detail")
     def load(self) -> None:
         mailbox = self.console_app.mailbox
+        generation = self._generation
+        scan = self._scan_artifacts_next
+        self._scan_artifacts_next = False
         try:
             detail = build_run_detail(mailbox, self.run_id)
             thread = self._thread_tail.pull() if self._thread_tail else []
             events = self._events_tail.pull() if self._events_tail else []
-            artifacts = self._scan_artifacts(detail)
+            artifacts = self._scan_artifacts(detail) if scan else None
         except Exception as exc:
+            self._scan_artifacts_next = self._scan_artifacts_next or scan
             self.app.call_from_thread(self.app.notify, f"read failed: {exc}", severity="error")
             return
-        self.app.call_from_thread(self._apply, detail, thread, events, artifacts)
+        # A superseded or shut-down worker keeps running to here (a thread
+        # cannot be cancelled); its rows are not applied.
+        if get_current_worker().is_cancelled:
+            return
+        self.app.call_from_thread(self._apply, detail, thread, events, artifacts, generation)
 
     def _scan_artifacts(self, detail: RunDetail | None) -> tuple[Path | None, list[Path], str]:
         if detail is None:
@@ -143,22 +162,36 @@ class RunDetailScreen(ConsoleScreen):
         detail: RunDetail | None,
         thread: list[tuple[int, Event]],
         events: list[tuple[int, Event]],
-        artifacts: tuple[Path | None, list[Path], str],
+        artifacts: tuple[Path | None, list[Path], str] | None,
+        generation: int = -1,
     ) -> None:
+        if generation != -1 and generation != self._generation:
+            return  # a load from before a reset: its rows belong to the old view
+        try:
+            header = self.query_one("#header", TextPanel)
+        except NoMatches:
+            return  # the screen was closed while the load ran
+        if self._thread_tail is not None:
+            self._thread_tail.commit(thread)
+        if self._events_tail is not None:
+            self._events_tail.commit(events)
         if detail is None:
-            self.query_one("#header", TextPanel).update(
-                Text(f"run {self.run_id} is not in the store", style="red")
-            )
+            header.update(Text(f"run {self.run_id} is not in the store", style="red"))
             return
         self.detail = detail
-        self.query_one("#header", TextPanel).update(self._header(detail))
+        header.update(self._header(detail))
         self.query_one("#thread-log", ChronologyLog).feed(thread)
+        # Events that land while follow is off wait, so toggling it back on
+        # catches up rather than leaving a gap.
+        self._held.extend(events)
         if self.follow:
-            self.query_one("#events-log", ChronologyLog).feed(events)
+            self.query_one("#events-log", ChronologyLog).feed(self._held)
+            self._held = []
         self._tasks(detail)
         self._phases(detail)
         self.query_one("#landing-body", TextPanel).update(self._landing(detail))
-        self._artifacts(*artifacts)
+        if artifacts is not None:
+            self._artifacts(*artifacts)
 
     # -- rendering ---------------------------------------------------------------
 
@@ -193,9 +226,11 @@ class RunDetailScreen(ConsoleScreen):
         bits.append(f"last event {age(detail.last_event_ts or r.updated_at)}")
         text.append(" · ".join(bits), style="dim")
         if detail.gate is not None:
-            text.append("\n⏸ ready to merge — waiting for approval", style="bold yellow")
+            mark = "⏸ " if emoji else ""
+            text.append(f"\n{mark}ready to merge — waiting for approval", style="bold yellow")
         if detail.hold is not None:
-            text.append(f"\n👀 {detail.hold.state}: waiting on a reviewer", style="yellow")
+            mark = "👀 " if emoji else ""
+            text.append(f"\n{mark}{detail.hold.state}: waiting on a reviewer", style="yellow")
         return text
 
     def _tasks(self, detail: RunDetail) -> None:
@@ -210,7 +245,7 @@ class RunDetailScreen(ConsoleScreen):
                         t.spec.title[:60],
                         Text(t.state, style=TASK_STATE_STYLES.get(t.state, "")),
                         f"{t.revisions}/{t.replans}",
-                        "⚠" if t.verify_suspect else "",
+                        ("⚠" if self.console_app.emoji else "suspect") if t.verify_suspect else "",
                         feedback,
                     ),
                 )
@@ -347,18 +382,39 @@ class RunDetailScreen(ConsoleScreen):
     # -- actions -----------------------------------------------------------------
 
     def action_back(self) -> None:
+        """``Esc``: clear an open event filter first; then leave the run."""
+        box = self.query_one("#event-filter", Input)
+        if box.display:
+            box.value = ""
+            box.display = False
+            self.query_one("#events-log", ChronologyLog).focus()
+            return
         self.app.pop_screen()
+
+    def action_refresh_run(self) -> None:
+        self._scan_artifacts_next = True
+        self.load()
+        self.console_app.action_refresh()
 
     def action_follow(self) -> None:
         self.follow = not self.follow
         self.app.notify(f"events follow {'on' if self.follow else 'off'}")
+        if self.follow and self._held:
+            self.query_one("#events-log", ChronologyLog).feed(self._held)
+            self._held = []
 
     def action_toggle_view(self) -> None:
         log = self.query_one("#thread-log", ChronologyLog)
         log.reset("lines" if log.view == "transcript" else "transcript")
         if self._thread_tail:
             self._thread_tail.reset()
+        self._generation += 1
         self.load()
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        if event.pane.id == "artifacts":
+            self._scan_artifacts_next = True
+            self.load()
 
     def action_event_filter(self) -> None:
         box = self.query_one("#event-filter", Input)
@@ -371,7 +427,9 @@ class RunDetailScreen(ConsoleScreen):
         prefix = event.value.strip() or None
         log = self.query_one("#events-log", ChronologyLog)
         log.reset()
+        self._held = []
         if self._events_tail:
             self._events_tail.reset(type_prefix=prefix)
+        self._generation += 1
         event.input.display = False
         self.load()
