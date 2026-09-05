@@ -345,6 +345,17 @@ class TestTools:
         assert "{" not in status.text and "consecutive failures: 0" in status.text
         assert "paused: True" in status.text
 
+    def test_sbx_control_refuses_the_process_level_stop(self, tmp_path: Path) -> None:
+        """`stop` ends the daemon process: an operator's verb, never the
+        in-sandbox model's — a user's "stop it" must not become an exit."""
+        concierge, client, _, loop, _ = make(
+            tmp_path, [{"calls": [("sbx_control", {"command": "stop"})]}]
+        )
+        turn(concierge, "stop it")
+        (resp,) = client.responses
+        assert resp.text.startswith("(command not accepted)") and "cancel" in resp.text
+        assert not getattr(loop, "stopped", False)
+
     def test_sbx_control_bad_verb_is_not_accepted(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(
             tmp_path, [{"calls": [("sbx_control", {"command": "explode"})]}]

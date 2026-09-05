@@ -224,6 +224,27 @@ class TestApprove:
             time.sleep(0.05)
         assert item is not None and item.state == "done"
 
+    def test_an_operator_stop_lets_the_landing_finish(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`stop` (the operator's verb) waits for a landing in flight; a
+        signal still cuts it short and the boot reconcile re-arms the gate."""
+        from sbxloop.errors import RunCancelledError
+
+        monkeypatch.setattr("sbxloop.daemon.loop.time.sleep", lambda _s: None)
+        h, _fake, run_id = self.approve_ready(tmp_path)
+        h.loop.approve_merge("gh:issue:1", by="brett")
+        assert [t.name for t in h.loop._landing_threads] == [f"sbxloop-merge-{run_id}"]
+        h.loop.request_stop()
+        h.loop._merge_tick("ci")  # graceful: the wait goes on
+        h.loop._join_landings()
+        assert h.loop._landing_threads == []
+        item = h.dstore.get("gh:issue:1")
+        assert item is not None and item.state == "done"
+        h.loop._graceful = False
+        with pytest.raises(RunCancelledError, match="daemon stopping"):
+            h.loop._merge_tick("ci")
+
     def test_a_double_approve_loses_the_cas(self, tmp_path: Path) -> None:
         h, _fake, run_id = self.approve_ready(tmp_path)
         assert h.dstore.claim_merge_gate(run_id)
