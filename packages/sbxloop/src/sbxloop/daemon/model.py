@@ -7,7 +7,7 @@ from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, field_validator
 
-from sbxloop.engine.model import RunState
+from sbxloop.engine.model import Published, RunKind, RunState
 from sbxloop.ghids import normalize_item_id
 
 # ``cancelled`` is an operator's decision (``!sbx cancel``), not a failure:
@@ -19,8 +19,23 @@ from sbxloop.ghids import normalize_item_id
 # is the opt-in merge gate (``[landing] merge_gate``): the run cleared every
 # bar and parked awaiting one merge approval — a *waiting* state, not a
 # terminal one (never superseded by rediscovery, invisible to dispatch),
-# resolved by ``approve_merge`` or ``abandon``.
-ItemState = Literal["queued", "running", "done", "failed", "blocked", "cancelled", "gated"]
+# resolved by ``approve_merge`` or ``abandon``. ``awaiting_review`` (#675)
+# is the same shape for a base that requires an approving review the loop
+# cannot give: the run stays pinned, the daemon polls the PR slowly, and a
+# person on GitHub ends it. ``paused_review`` is that wait past
+# ``[landing] review_wait_s``: nothing polls, the run stays pinned, and
+# ``resume <item>`` puts the wait back up.
+ItemState = Literal[
+    "queued",
+    "running",
+    "done",
+    "failed",
+    "blocked",
+    "cancelled",
+    "gated",
+    "awaiting_review",
+    "paused_review",
+]
 # A decision the source has not been told about yet. ``abandoned`` /
 # ``requeued`` are operator decisions from another process (the row-only
 # CLI cannot report); ``merged`` / ``blocked`` are the run's own outcome,
@@ -99,9 +114,24 @@ class WorkItem(BaseModel):
         return normalize_item_id(value)
 
 
+class TaskOutcome(NamedTuple):
+    """One workload task on the finish card (#757): what it produced and
+    what the judge made of it."""
+
+    task_id: str
+    title: str
+    state: str
+    summary: str
+    files: int
+    # ``passed`` / ``failed — unmet: …`` from the judge's last verdict, or
+    # None for a task that was never judged (skipped, or the run died first).
+    verdict: str | None
+
+
 class RunReport(NamedTuple):
     """What the daemon tells the source and the humans about a finished
-    run — read from the engine's run record, which carries the PR."""
+    run — read from the engine's run record, which carries the PR (a
+    ``code`` run) or the tasks' outputs (a ``workload``)."""
 
     run_id: str
     state: RunState
@@ -120,6 +150,14 @@ class RunReport(NamedTuple):
     cancelled_by: str | None = None
     # ``!sbx cancel --retry``: the item went straight back to the queue.
     requeued: bool = False
+    # Which run shape the cards render (#757): a workload's finish card
+    # shows its tasks' outputs and verdicts where a code run's shows the PR.
+    kind: RunKind = "code"
+    outputs: tuple[TaskOutcome, ...] = ()
+    # A workload's closing line (`engine.model.workload_summary`).
+    summary: str | None = None
+    # Where a workload's result went (#759), one entry per sink.
+    published: tuple[Published, ...] = ()
 
     @property
     def succeeded(self) -> bool:
@@ -132,6 +170,7 @@ TickOutcome = Literal[
     "failed",
     "blocked",
     "gated",
+    "awaiting_review",
     "interrupted",
     "cancelled",
     "requeued",
@@ -195,11 +234,20 @@ NoticeKind = Literal[
     "run.abandoned",
     "run.blocked",
     "run.gated",
+    "run.awaiting_review",
+    "run.review_paused",
+    "run.review_resumed",
     "run.cancelled",
     "run.requeued",
     "gate.approved",
     "gate.merge_failed",
     "gate.dismissed",
+    "review.approved",
+    "review.ready",
+    "review.reparked",
+    "review.changes_requested",
+    "review.merge_failed",
+    "review.dismissed",
     "recovery.requeued",
     "recovery.settling",
     "recovery.resume_pending",
@@ -220,6 +268,8 @@ TERMINAL_NOTICE_KINDS: frozenset[str] = frozenset(
         "run.abandoned",
         "run.blocked",
         "run.gated",
+        "run.awaiting_review",
+        "run.review_paused",
         "run.cancelled",
         "run.requeued",
         "item.abandoned",
@@ -239,3 +289,6 @@ class DaemonNotice(NamedTuple):
     run_id: str | None = None
     url: str | None = None
     level: NoticeLevel = "info"
+    # Chat user ids this notice is addressed to (#675): the frontend spells
+    # each as a mention in front of the text and lets it ping.
+    mention_ids: tuple[str, ...] = ()

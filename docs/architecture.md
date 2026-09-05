@@ -132,20 +132,28 @@ versioned envelopes" — nothing more.
 
 ### 2. Host mediation between the sandboxes
 
-The agent box and the github box never communicate. All traffic between them
-passes through the host.
+The agent box and the credential-bearing boxes — the github box, and the
+service box a run granted `[[credentials]]` gets (#765) — never communicate.
+All traffic between them passes through the host.
 
-*Why it holds.* The model-driven side produces a tree; the host harvests that
-tree and then speaks to the credential-bearing side only in a closed vocabulary
-of typed `github.op` jobs. Neither box has an address for, or a route to, the
-other — the split is enforced by the same directionality invariant above.
+*Why it holds.* The model-driven side produces a tree and asks questions; the
+host harvests that tree and speaks to the credential-bearing side only in a
+closed vocabulary of typed jobs (`github.op`, `service.http`). Neither box has
+an address for, or a route to, the other — the split is enforced by the same
+directionality invariant above. Stated as the property every design is held
+to: **the model's arbitrary commands never execute where a secret other than
+its own inference credential is readable.** The only key in the agent box is
+the inference key; everything else that needs a secret happens in a separate
+sandbox that runs no model and only the fixed ops the host submits.
 
-*What it forbids.* Any direct agent-box ↔ github-box channel: shared sockets,
-box-to-box networking, forwarded credentials, or a "convenience" pipe between
-the halves. The credential split is valuable because of what *stands between*
-the halves, not because the secret lives in a different VM. A direct channel
-would keep the ceremony while losing the control — a confused deputy with a
-private line to its credential.
+*What it forbids.* Any direct agent-box ↔ credential-box channel: shared
+sockets, box-to-box networking, forwarded credentials, or a "convenience"
+pipe between the halves. The credential split is valuable because of what
+*stands between* the halves, not because the secret lives in a different VM. A
+direct channel would keep the ceremony while losing the control — a confused
+deputy with a private line to its credential. The same rule refuses an
+operator secret in the agent box "for the build": a credential the model can
+read is a credential the model can exfiltrate.
 
 ### Evaluating future proposals
 
@@ -156,16 +164,34 @@ that lets the two boxes talk directly, is rejected on these grounds regardless o
 how much plumbing it removes. See [docs/worker-protocol.md](worker-protocol.md)
 for the transport-level statement of the same rules.
 
-## The security primitive: one run = two sandboxes
+## The security primitive: one run = two sandboxes (three, with credentials)
 
-Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pair`.
+Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pair`
+— and a run granted `[[credentials]]`, or whose repository has a credentialed
+`[[registries]]` entry, a third, the *service* sandbox (#765, #766),
+provisioned in the same parallel step.
 Before either exists, the provisioner decides what the agent sandbox is *for*:
 `toolchains.resolve_languages` reads the workspace once — which toolchains
 (`[sandbox] languages`, else the manifests, else Python; `sandbox.languages`)
 and which series of each (`.python-version` / `requires-python`, `.nvmrc` /
 `engines.node`; one `sandbox.toolchain` event per versioned toolchain, #627).
 That single answer builds the installer allowlist, drives the worker
-install, and scopes the project gate, so none of them can disagree.
+install, and scopes the project gate, so none of them can disagree. A fresh
+run clone has its submodules populated first (`hostgit.populate_submodules`,
+#692) — from the host checkout's copy when it has the recorded commit, else
+from the `.gitmodules` URL under the run's credential — and the hosts they
+fetch from join that allowlist (`sandbox.submodule_hosts`). A clone whose
+`.gitattributes` routes files through Git LFS is populated the same way
+(`hostgit.populate_lfs`, #693) — the host checkout's LFS store first, the
+repository's LFS endpoint under the run's credential second — with the
+`git-lfs` workspace tool and its hosts riding along into the sandbox; an
+LFS-tracked add or edit is refused at delivery rather than committed as a
+blob. A clone whose manifests name a tag-derived versioning tool
+(`toolchains.tag_version_markers`, #694) also gets the repository's tags
+(`hostgit.fetch_tags`) — the run clone is cut `--no-tags`, and a build that
+runs `git describe` on it would otherwise report the wrong version — from the
+host checkout when it has them, else from origin under the run's credential;
+`[sandbox] fetch_tags` overrides the detection.
 The github sandbox exists only when the GitHub integration is configured
 (`[github] repo = "owner/repo"`, or at least one `[[github.repos]]` entry);
 without it, `pair.github` is `None`, `GH_TOKEN`
@@ -181,6 +207,109 @@ credential:
 | injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows) | built-in `github` service secret (PAT), or the in-VM env file carrying a host-minted App installation token (#568) |
 | network    | balanced policy + copilot hosts + the `[github] api_url` hosts + plan-declared grants                                                                                   | balanced policy + the `[github] api_url` hosts (+ the dotcom storage hosts when that is github.com)                |
 | runs       | agent SDK sessions (Copilot SDK, or the Claude Agent SDK + Claude Code CLI with the claude backend), shell checks                                                       | `github.op` jobs (gh CLI or REST)                                                                                  |
+
+A workload run's needs (#758) are held to a **profile** before any task
+runs. `[[workloads]]` declares each profile (`egress` patterns, the
+`[[credentials]]` names it may grant, `sinks`, `repo`, `budgets` overrides)
+and `[workload] default` names the run's when `--profile` does not;
+`Config.for_workload_profile` pins the choice into the persisted run config
+(`workload.default`) with the overrides applied, so a resume compares like
+with like. `LoopEngine._grant_needs` runs right after the plan is saved: every
+task's `TaskNeeds` is answered — a host must be inside the profile's egress
+(`EgressGranter.extra_allow`; `[policy] deny` still wins) and is applied at
+the task's execute entry beside `task.egress`; a credential must be one the
+profile names and goes on the run row; a sink one it lists; a repository
+allowed by it, configured under `[github]`, and the data directory mounted,
+then `Provisioner.clone_repo_into_data_dir` cuts a single-branch checkout at
+`<data dir>/<name>` (reused on resume). Any refusal fails the run closed with
+every refusal emitted as `run.needs_refused` (need, value, task, the
+sbxloop.toml key that would allow it) and nothing granted; a grant emits
+`run.needs_granted`. A credential grant cannot be added to a running pair (the
+service box is stamped at creation), so the grant step raises `_Reprovision`:
+`_drive` tears the pair down (even under `keep_sandboxes`) and re-enters
+itself at the `executing` stage on a pair provisioned from the run row —
+agent box plus service box — exactly the resume path, one extra boot.
+
+The `publishing` stage (#759) hands the judged result to its **sinks**,
+`engine/sinks.py` composing what each carries and `LoopEngine._stage_publish`
+driving them in `PUBLISH_ORDER` (artifact → issue → chat) so the chat line can
+name what the others delivered. A task's sink is `needs.sink` or `chat`; only
+`chat` needs no profile (`_grant_needs` skips it), `issue`/`pr` need the
+profile to name them and a github box — `Provisioner` boots one for a workload
+only when the pinned profile's `needs_github` says so — and `issue` is also
+refused when `_ensure_delivery_repo` found Issues disabled. `artifact` copies
+`TaskOutput.files` (each through `sinks.safe_relative`; an unsafe path is a
+`PublishError`) to `runs/<run>/artifacts` — `shutil` from a mounted workspace,
+`_copy_out` (a `tar` of the listed paths) from an unmounted one; a workload's
+harvest goes to `runs/<run>/data` so `artifacts_dir` reads only what the sink
+delivered. `issue` files one issue in `[github] repo` under `[workload] result_label` (`ensure_label` first). `chat` is the `run.published` event
+itself: its `message` is the reply, rendered whole by the Discord bridge (📣
+blocks) and the TUI. Each delivery is persisted as a `Published` row on the run
+(`runs.published`, `StateStore.add_run_published`) before the next sink runs,
+and the stage skips sinks already there — a resume at `publishing` is
+idempotent. A sink that raises (`SbxError`, `GithubOpsError`, `OSError`,
+`PublishError`) fails the run with `publishing to <sink> failed: …`.
+
+The service sandbox (`sbxloop-<run>-service`, #765) is the github sandbox's
+pattern generalized to the operator's own credentials. `[[credentials]]`
+declares a catalogue — `name`, the daemon-environment `env` holding the value,
+the ONE `host` the credential is good for, and how it is attached (`header`,
+`scheme`) — and a run is granted a subset by name (`Engine.start(credentials=…)`,
+persisted on the run row so a resume re-provisions the same box; no `code`
+run is granted any today). The box holds exactly the granted values, delivered
+the way `GH_TOKEN` is on the non-proxy road (per-job stdin, else the 0600 env
+file; never an `sbx` argument), plus the non-secret catalogue in
+`SBXLOOP_SERVICE_CREDENTIALS`; its allowlist is the credentials' hosts and
+nothing else; it runs only `service.http` jobs — one request to
+`https://<catalogue host><path>` with the named credential attached,
+redirects not followed, the credential's own header un-overridable. The agent
+reaches it through one host tool, `call_service(credential, method, path, query?, headers?, body?)`, attached to the build session only: the host checks
+the name against the run's grant, submits the job, and hands back the status,
+headers and clipped body with the credential's value redacted wherever the API
+echoed it. Each call is one `service.call` ledger event — credential name,
+method, path, status, duration; never a body or a header. The agent sandbox's
+allowlist does not carry the credential hosts: the agent never speaks to them.
+
+The same box is the run's dependency **fetcher** (#766). A `[[registries]]`
+entry with `auth_env` is a credentialed registry, and its token, client file
+(`~/.npmrc`, `~/.netrc`, …) and host go to the service sandbox only — the
+agent sandbox gets neither the file nor the host, and is configured offline
+for that ecosystem (`registries.offline_env`: `npm_config_offline`,
+`PIP_NO_INDEX`/`PIP_FIND_LINKS`, `GOPROXY=off`, `CARGO_NET_OFFLINE`,
+`MAVEN_ARGS=-o`, `NUGET_PACKAGES`, `BUNDLE_LOCAL`). Both boxes see the one
+workspace mount, and the cache is inside it — `<workspace>/.sbxloop/deps/<kind>`,
+excluded from git through `.git/info/exclude`, reached in either VM through a
+stable `~/.sbxloop/deps` symlink so the offline variables hold one path — so a
+fetch in the service box is an install in the agent box. The service box
+therefore needs the workspace view the agent's has (its own toolchains for the
+credentialed kinds too, ensured at install like the agent's) and fails
+provisioning naming the mount otherwise; its allowlist grows by the registry
+hosts and the ecosystem's public baseline (`registry.npmjs.org`, `pypi.org`,
+`proxy.golang.org`, …) so a virtual repository that proxies upstream resolves.
+It runs one more job kind, `service.fetch`: an argv the host authored from a
+fixed per-ecosystem recipe (`registries.fetch_plan` — `npm ci --ignore-scripts`
+/ `npm install --ignore-scripts [pkgs]`, `pip download -d <cache>`, `go mod download`, `cargo fetch`, `mvn -B dependency:go-offline`, `dotnet restore --packages`, `bundle cache --all --no-install`) in the workspace, never a
+shell; a package spec is one token matching `_PACKAGE_RE` (never a leading
+`-`), and an ecosystem the run has no credentialed registry for, a non-spec, or
+a package list for a manifest-only kind is refused on the host before a job
+exists. `Engine._fetch_dependencies` runs the manifest recipe for every
+credentialed kind whose manifest the workspace carries, right after the worker
+installs and before `setup_commands`; a non-zero exit is a `ProvisionError`
+carrying the argv and the output tail, and the run stays resumable like any
+infrastructure failure. The build session holds a second host tool,
+`fetch_dependencies(ecosystem, packages?)` — packages → the `add` recipe,
+none → re-fetch from the manifest the agent just edited — and reads the
+package manager's exit code and output back as the tool's answer (a failed
+fetch is an answer, not a tool error, so the agent can fix the manifest). Every
+fetch, refused or run, is one `sandbox.fetch` ledger event with the ecosystem,
+verb, argv, exit code and phase; the worker scrubs the credential's value from
+the output before it leaves the box. `sbxloop config policy` prints the service
+sandbox's allowlist as a second line; `sbxloop doctor` lists unset `auth_env`
+names in its `registry credentials` row. A registry without `auth_env` is an
+open registry and stays exactly as #680 built it: agent allowlist, agent client
+file, no service box. The `[sandbox] secret_env` key that once carried such a
+token into the agent sandbox is refused by name at config load with this
+design as the message (#766).
 
 What the agent credential *is* — its env var, the host sbx binds it to, the
 hosts it must reach, how doctor names it when missing, where its model ids
@@ -228,6 +357,60 @@ non-proxy path is the common case, not an edge case — `proxy` names the
 strategy that is *attempted*, not the one that usually runs. Where per-job stdin
 is unavailable, that means the in-VM env file. Tracked operationally in #46;
 interim hardening in #592.
+
+Operator secrets — a credentialed registry's `auth_env` (#680, #766) and the
+`[[credentials]]` values (#765), read from the daemon's environment — take the
+same non-proxy tiers, and only those, in the **service** sandbox: the sbx proxy
+binds a secret to one host, which an `NPM_TOKEN` has no single answer for. The
+agent sandbox carries no operator secret at all (`[sandbox] env` is plain
+values, and a value that names a delivered variable or a registry's `auth_env`
+is refused at load); the `secret_env` key that once put one there is refused
+by name. `SandboxSpec` keeps the secrets apart from the plain `persistent_env`
+so the proxy path can write the plain environment before the visibility probe
+and hold the secrets back until the verdict is in: a downgrade to stdin
+delivery then never leaves them at rest first, and a proxy that carries the
+box's own credential puts them in the env file afterwards
+(`_apply_operator_secrets`), since nothing else would. They are never an `sbx`
+argument, an event field or a log line; a name the daemon does not hold fails
+provisioning before any sandbox boots.
+
+Private registries (`[[registries]]`, #680) build on both roads. An open entry
+(no `auth_env`) joins the agent allowlist beside `extra_allow_domains` — in
+`agent_policy_allows`, the plan-validation bounds and the granter's
+already-granted set alike, so a plan naming it neither fails nor re-grants —
+and its client file rides `SandboxSpec.files`, staged with `sbx cp` then chmod
+600 after the credential delivery step, before the worker install. A
+credentialed entry does the same in the service sandbox instead (#766, above):
+its host and client file never reach the agent's, and wherever the ecosystem's
+client expands environment variables the file references the variable by name.
+Only the netrc kinds hold a value at rest, and only in the service VM.
+
+Operator setup (`[sandbox] apt_packages` / `setup_commands`, #681) is the last
+step before the first phase. The packages ride `WorkerClient.install` beside the
+toolchain ensure — a `dpkg -s` probe, then one apt call for what is missing — on
+both the ladder and the prebaked path, and fail closed where the toolchains
+warn: the operator named them. The commands run from the engine after both
+worker installs, in the agent's workdir, launched exactly as a job is (the
+login shell evals the stdin-delivered exports or sources the env file), each
+reported as a `sandbox.setup` event with delivered secret values scrubbed from
+the tail; the first failure raises out of provisioning like an install failure,
+so `keep_on_failure` applies. The bake installs the global package list only.
+
+### Verify mode (#682)
+
+`Config.verify_mode_for(repo)` resolves `[sandbox] verify_mode` with the
+`[[github.repos]]` override, and the engine reads it at three points: the
+per-task VERIFY phase, the GATE stage, and `_verification_note`, which turns
+the phase rows back into prose for the review prompt (`$verification`,
+defaulted empty by `prompts.render`) and the pull request body
+(`deliver_workspace(verification=...)`, a **Verification** section before
+`Closes`). The note is read from `phase_attempts`, not memory, so a resumed
+run tells the same story, and only the latest attempt of each check counts.
+The services hint (`verifylint.services_evidence`: compose files at the root
+or one level down, `testcontainers` in a lockfile or manifest, `services:`
+in a workflow) is emitted once per run by `_hint_services`, before
+decomposition and only under `full` — a hint the operator acts on, never a
+switch the loop flips.
 
 ### GitHub App installation auth (#568)
 
@@ -375,32 +558,69 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   author its own exam) — and any per-task `egress` declarations, both
   checked at JSON acceptance.
 - **BUILD** — full tool access, plans and does the work in one session,
-  narrating its approach first. The one phase that *continues* rather than
+  narrating its approach first. build.md frames the session as a clone on
+  a feature branch that a human reviews (#689): `$work_dir` and
+  `$toolchains` (the resolved set with versions, `toolchains.describe`)
+  say where it is and what it has, and the scope rule review.md judges by
+  — "beyond the outcome's scope is a defect" — is stated to the builder in
+  the same words (`test_build_and_review_share_the_scope_rule`). The one
+  phase that *continues* rather than
   starting fresh: a revision resumes the previous attempt's session where
   the SDK still has it, and is handed that attempt's report either way, so
   it builds on what was already established instead of re-deriving it. A
   replan (or a chat steer) clears the session — the approach it holds was
   the one thrown away.
 - **VERIFY** — mechanical: the task's decomposer-authored `verify_commands`
-  must all exit 0. No LLM.
+  must all exit 0. No LLM. Under `[sandbox] verify_mode = "advisory"` (#682)
+  a failure is recorded with its own phase status (`advisory`) and the task
+  is done regardless — no revision, no replan, no suspect fingerprint; under
+  `"ci-only"` no verify job is submitted at all (`skipped`). Both apply to a
+  fix task's verify commands too.
 - **GATE** — the project's own gate (`[sandbox] gate_command`, or the one
-  `verifylint.project_gate` detects: a `check`/`ci`/`verify` target in a
-  makefile, justfile or Taskfile; a package.json script run under the
-  client its `packageManager` field or lockfile names; tox; nox; a
-  Rakefile `ci`/`check`/`default` task; a composer `check`/`ci` script;
-  `./gradlew check`; `mvn -q verify`; a cargo `ci` alias; and, when a Go,
-  Rust or .NET repo declares nothing, the tool itself — `go vet && go test`, `cargo test`, `dotnet test`) over the whole tree, mechanical.
-  Detectors tied to a language only run when that language was resolved
-  for the sandbox (#624), so the gate is always a command the toolchain
-  can execute. The decomposer must put the gate in *some* task's
+  `verifylint.project_gate` detects: a `check`/`ci`/`verify` *rule* in a
+  makefile or justfile (a `check := …` variable is not one) or a *task*
+  in a parsed Taskfile (not an include or a var); a package.json script
+  run under the client its `packageManager` field or lockfile names; tox;
+  nox; a Rakefile `ci`/`check`/`default` task; a composer `check`/`ci`
+  script; `./gradlew check`; `mvn -q verify`; a cargo `ci` alias; and,
+  when a Go (`go.mod` or `go.work`), Rust or .NET repo declares nothing,
+  the tool itself — `go vet && go test`, `cargo test`, `dotnet test`)
+  over the whole tree, mechanical. The walk mirrors language detection
+  (#687): the root first, then the same `toolchains.DETECT_DEPTH` levels
+  of subdirectories in sorted order, skipping `toolchains.SKIP_DIRS`
+  plus test/fixture/example/docs directories; the first gate found below
+  the root is emitted as `cd <relative dir> && <gate>` (one `shell_batch`
+  line, so the `cd` scopes it), and a package below a monorepo root
+  inherits the client the root's `packageManager` or lockfile pins.
+  Every detector is tied to a toolchain and only runs when that toolchain
+  was resolved for the sandbox (#624) — `make`, `just` and `task` are
+  entries of their own, selected by their manifests (#685) — so the gate is
+  always a command the sandbox can execute. The decomposer must put the gate in *some* task's
   exam, but a later task can break what an earlier one proved; this is the
-  last check on the tree exactly as it will be delivered. A run with no
+  last check on the tree exactly as it will be delivered. `verify_mode`
+  governs this stage the same way: `advisory` records a red gate without a
+  fix round, `ci-only` skips it. A run with no
   `[github] repo` (and no `[[github.repos]]`) ends `completed` here, its
   work in the workspace.
 - **DELIVER** — the tree becomes one commit on `sbxloop/<run>` (the
   prefix, the PR title and the commit message are `[github]` templates)
   and a draft PR (see [Delivery](#delivery)); every later round re-delivers
-  onto the same branch, so one run is one PR.
+  onto the same branch, so one run is one PR. A checkout delivers its git
+  diff against the base, a history-less workspace a snapshot, and both
+  go through one tree builder (`deliver._blob_upload`, #695) that keeps
+  exec bits (`100755`) and symlinks (`120000`) as `hostgit.tree_mode`
+  reads them from disk. The repository's own
+  conventions shape the PR (#678): `deliver.pr_template` opens the body
+  with the repository's pull request template, the agent's
+  `.sbxloop/pr-body` (read from the workspace by `exec`, like
+  `.sbxloop/pr-title`, and taken away) replaces the body outright — on
+  the create, or by `PATCH` on a re-delivery — and
+  `deliver.conventional_titles` detects a commitlint / semantic-PR title
+  lint from the tree, on which a default `pr_title_template` renders the
+  bare conventional title (`deliver.conventional_title`) instead of
+  `sbxloop: {title}`. The decompose prompt's `$pr_conventions`
+  (`deliver.pr_conventions`) tells the planner both, and only when the
+  workspace declares them.
 - **REVIEW** — a fresh read-only session reads the PR's whole diff
   adversarially (concurrency, failure ordering, trust-boundary parsing,
   cross-module invariants, scope) and returns a verdict with line-anchored
@@ -573,17 +793,42 @@ worked example is the anchor the model pattern-matches against, and a story
 about this repository is the wrong anchor for every other one, so no prompt
 body names an issue or PR number, a path, state name or product term from
 sbxloop itself (`test_prompt_bodies_stay_domain_neutral`; the concierge, being
-the loop's own front desk, keeps its item ids and sandboxes). The one
-ecosystem-specific example — the config-override that decompose.md warns
+the loop's own front desk, keeps its item ids and sandboxes). A workload
+run (#756) renders three more: operator_plan.md (the plan, with each
+task's `needs` declared by name — "never its value" — and the criteria as
+"the judge's whole exam"), operator_execute.md (one task, ending in a
+`## Result` the judge reads) and operator_judge.md (read-only, the report
+"a claim" to check against the data directory, the tool digest and the
+mechanical evidence; a failing verdict must "quote the criterion"). They
+are sent as the whole system prompt rather than appended to the coding
+agent's preset (`JobRequest.system_preset = False`), so the operator and
+the judge present as themselves. The one ecosystem-specific example — the config-override that decompose.md warns
 against and review.md's wrong-check section describes — is rendered per run:
 `verifylint.config_override_example` picks the story for the first resolved
 language that has one (mypy `files`; `tsc` ignoring `tsconfig.json` when
 handed input files; rubocop inspecting an `Exclude`d file named on the
 command line; a Go build tag pulling an integration suite into `go test`),
 Python when none does, and the engine passes it as
-`$config_override_example`. The stories live beside the lint's
+`$config_override_example`. Every registry ecosystem has a story of its
+own (#690): mocha adding a positional path to its configured `spec`, a
+Cargo workspace's `default-members` overridden by `--workspace`,
+surefire's `excludes` overridden by `-Dtest`, PHPUnit dropping its
+`<testsuites>` for a path argument, a .NET solution filter reached past by
+naming the project, a CTest preset's `filter` lost without `--preset` —
+and a repository that resolved TypeScript reads the `tsc` story whichever
+order the set came in, since TypeScript pulls JavaScript in as a
+requirement. The stories of tools the lint reads live beside their
 `CONFIG_SCOPED_TOOLS` entries so a tool the lint learns to read gains its
-example in the same place. The lint itself reads beyond Python (#628): each
+example in the same place; the rest are `_STANDALONE_EXAMPLES`. The
+reviewer's gate paragraph is its own (`verifylint.reviewer_gate_rule`,
+#690): the decomposer's "one task MUST run the gate" is an instruction to a
+planner, and handed to a read-only reviewer it read as a step to perform —
+the reviewer is told the gate as a result to weigh, or that there is none
+to lean on. Likewise the diff the review prompt carries is cut by
+`phases.clip_diff` at `[landing] review_diff_max_chars`, and the cut
+carries a marker in the diff's own terms (`[diff clipped at N chars — M chars / L lines not shown; do not assume they are unchanged …]`), because
+the prompt's rule that an untouched file is unchanged is true of the tree
+and false of a clipped diff. The lint itself reads beyond Python (#628): each
 entry names how its tool treats an explicit path — `include` (mypy `files`,
 ruff `src`/`include`, pytest `testpaths`: a path outside the declared set
 overrides it, one inside only narrows the run), `exclude` (rubocop: a file
@@ -596,10 +841,39 @@ through like `uv run`. eslint and golangci-lint deliberately have no entry:
 both keep applying their configured ignores to paths given on the command
 line, so an explicit path there is a narrowing the lint must not reject.
 
+The repository's own instruction files reach every phase the same way
+(#688). `engine.repocontext.read_repo_context` reads `AGENTS.md`,
+`CLAUDE.md`, `.cursorrules`, `.github/copilot-instructions.md`, the
+`CONTRIBUTING.md` and `CODEOWNERS` locations GitHub honours — in that
+order, a symlink or copy rendered once under both names — into one block
+capped at `[budgets] repo_context_max_chars` (12k; the cut ends with an
+explicit `(clipped at N chars)` note, 0 hands the prompts nothing), and
+`PhaseRunner.repo_conventions` renders it as `$repo_conventions` under the
+heading "Repository conventions (from the repository itself — follow them
+over the defaults below)" in decompose.md, build.md (so the fixer's brief
+too) and review.md. It is re-read per render, like the gate: a task may
+write the `AGENTS.md` the next plan is held to. The block is the *only*
+route those files take: the planner and the reviewer run as their own
+sessions, and the builder's CLI is not left to find them by convention —
+the Claude backend passes `setting_sources=[]` explicitly (the SDK's own
+default, which loads no filesystem settings), so a target repository's
+`.claude/settings.json` cannot reconfigure an unattended session and
+CLAUDE.md costs its tokens once, through the prompt.
+
 ## Persistence and resume
 
 `StateStore` is a WAL-mode SQLite database at `<state_dir>/state.db` with
-four tables: `runs`, `tasks`, `phase_attempts`, `events`. It runs
+four tables: `runs`, `tasks`, `phase_attempts`, `events`. A workload task's
+row also carries its `TaskOutput` (`tasks.output_json`, #757): the
+`## Result` section of the operator's report, its first line as the
+summary, and the names of the files the attempt left in the data directory
+— the engine marks the directory before a task's first attempt
+(`.sbxloop/task-<id>.start`) and lists what is newer after each one,
+pruning the harvest excludes and capping the list at 200 names (the rest
+is a count). The engine's `RunResult.summary`, the daemon's `RunReport`
+and `status --json` all compose the run's closing line from those rows
+(`workload_summary`), so no surface needs a model turn to say what the
+run produced. It runs
 `synchronous=NORMAL`, which is the safe setting under WAL: commits no longer
 fsync one-by-one, and a crash can only lose the tail of the WAL, never
 corrupt the database. Streaming `agent.message_delta` events are *not*
@@ -825,6 +1099,64 @@ CI, then mergeability, and only then the merge:
    skips straight to the merge.
 6. **Merge**, sending the head sha the loop actually judged. A push that
    landed since loses the race with a 409 rather than being merged over.
+   On a base that merges through a **merge queue** (#676 — the ruleset's
+   `merge_queue` rule, or a 405 that names the queue when the rules could
+   not be read) this step is an enqueue instead: `enqueuePullRequest`
+   with the judged head as `expectedHeadOid` (the same race guard), then
+   the queue is polled — `mergeQueueEntry`, `merged`, and the PR's
+   `RemovedFromMergeQueueEvent` count — until it merges the PR (`Landed`),
+   removes it, or `ci_timeout_s` runs out. A removal is judged by the red
+   checks on the queue's *own* merge-group commit (`headCommit` of the
+   entry, where the queue's checks report), which become a `ci`
+   `NeedsFix` under the usual budget; a removal with no red check to name
+   is `Blocked` — a fix round with nothing to fix is budget burn. A
+   timeout leaves the PR queued (the queue merges or removes it on its
+   own) and ends `Blocked` saying so. A PR found already queued — a
+   resume, a parked landing re-entering — is watched, not enqueued
+   twice. The queue's own merge method applies; `merge_method` is not
+   consulted. Field-unverified against a live queue: `expectedHeadOid`,
+   `headCommit`, the removal event's `reason`, and whether GitHub reports
+   a queue-bound PR `blocked` before it is queued (the enqueue is
+   attempted either way and its refusal is the block).
+
+A base whose *only* unmet rules are review rules — N approving reviews, a
+CODEOWNERS review — is a wait, not a block (#675): `land()` returns
+`AwaitingReview` (the `blocked` mergeability, or the 405, is read against
+the base's rulesets and classic protection; any rule the loop can never
+satisfy still makes it `Blocked`). The daemon parks the run
+`awaiting_review` (a terminal, resumable run state): the PR is already out
+of draft, `[github] reviewers` are requested once (logins, or `org/team`),
+a `daemon_review_holds` row is persisted, the sandboxes are freed and the
+breaker reset, and one `run.awaiting_review` notice @mentions the
+requester, the run's watchers and `review_notify`. Every tick — before the
+paused gate, so an approval during a pause still lands — `_review_tick`
+polls each due hold with two requests (the PR, and its reviews folded to
+one verdict per human login, latest wins, dismissed dropped): closed →
+the hold is dismissed and the item abandoned; a human's
+`CHANGES_REQUESTED` → the hold is claimed `fixing` and the run resumed for
+a fix round (the same tick may dispatch it; the resume budget is not
+charged); merged, or the required number of human approvals → the hold is
+claimed `approving` and the same gh-ops-only `land()` the merge gate uses
+finishes the landing, so a review left during the park is honoured. A
+landing that comes back `AwaitingReview` re-parks the hold for what it now
+waits on — `held_by_draft` and `approvals_required` rewritten
+(`review.reparked`); anything else but `Landed`/`Closed` reopens the hold
+with the detail (`review.merge_failed`).
+
+A draft the loop did not make is a person's hold (#677). `land()` clears
+the draft once when `own_draft=True` (the engine passes
+`deliver_draft and not _undrafted(run_id)`, the record being the run's own
+`land.undraft` event); a draft found otherwise returns
+`AwaitingReview(draft=True)` after `land.held_by_draft`, and the daemon
+parks it on the same hold row with `held_by_draft = 1` — no reviewers
+requested, the poll watching `draft` rather than approvals (`review.ready`
+when a person marks it ready), and `_land_parked` passing
+`own_draft=False` so the finishing landing never un-drafts either. Past `review_wait_s` without a
+verdict the hold pauses — item `paused_review`, one `run.review_paused`
+mention, no more polling — until `resume <item>` reopens it; a restart
+reopens holds caught mid-approval. A human's changes-requested review that
+the fix round answered but that still stands ends the resumed run
+`Blocked`, as #520 decided.
 
 Two answers come back as *data* rather than as exceptions, and the difference
 matters: **405** is GitHub's blanket "not mergeable right now" — a protection
@@ -851,6 +1183,16 @@ its backoff), `sbxloop:blocked` when GitHub would not let the loop finish. Re-ad
 `sbxloop:run` to an issue whose attempt finished re-queues it on the next
 poll even if the issue text is unchanged, and the new run resumes the
 branch and PR the previous attempt pushed to origin (#600).
+The outcome a run is handed is the issue as a human would read it (#691):
+title, body, then a `## Discussion` block of the comments — the loop's own
+left out, by the hidden stamp on every status comment it posts and by its
+resolved identity (App slug, `GET /user`, or `[github] bot_login`) for
+anything unstamped — the last twenty of a long thread with the count
+omitted named, then `## Linked issues`: every `#N` and same-repository
+issue/PR URL the body and kept comments mention, read for its title,
+state and the head of its body. The block is what `[budgets] outcome_max_chars` cuts, with a note naming the budget; the title, body
+and provenance are always whole. A comment read that fails becomes one
+explicit line in the outcome — the run goes on with the ask itself.
 It never files work of its own: only a human labelling an issue — directly,
 or by asking the Discord concierge, which files the issue *with* the label —
 starts a run. Everything else the daemon does is a guardrail or a
@@ -934,20 +1276,32 @@ repository:
 
 Remote URLs are compared as normalised `owner/name` (scp-style ssh, https
 with or without embedded userinfo, `.git` suffix, case). A repository with
-no workspace at all clones **from its own remote** into the run directory;
-because the host holds no git credential by design (#46) that mode is
-public-repository-only and a private repository fails the run explicitly.
-There is no fallback to another repository's checkout in any of these
-paths. Migration for an existing single-repo daemon: move
+no workspace at all clones **from its own remote** into the run directory,
+authenticating with the run's GitHub credential (#683): the same PAT or App
+installation token the github sandbox delivers with, handed to git through
+a `credential.helper` set in the clone's environment (`GIT_CONFIG_COUNT`,
+git ≥ 2.31) so it never touches argv, `.git/config` or the URL, with the
+host user's own helpers cleared for that process. The host still holds no
+git credential of its own (#46). With no credential configured only a
+public repository clones; a private one fails the run explicitly, naming
+the case. There is no fallback to another repository's checkout in any of
+these paths. Migration for an existing single-repo daemon: move
 `[sandbox] workspace` into the matching `[[github.repos]]` entry.
 
 `sbxloop doctor` checks each configured repository on its own line
 (reachable, token permissions), so one broken repo never masks the others'
 verdicts. The host never holds the PAT, so that check is made from a
 short-lived github-ops sandbox per repository, provisioned with exactly that
-repository's credentials (`repo.get`, whose `permissions` block says whether
-the token has write access). If no sandbox can be provisioned the row is a
-soft "reachability unverified" rather than a verdict against the repo. `sbxloop config repos` lists the registered repositories, and
+repository's credentials. The token is judged against the permission table
+in `sbxloop.gh.permissions` (`docs/permissions.md`, #696) from whichever
+source describes it — the App installation's grant carried on the minted
+token, a classic PAT's `X-OAuth-Scopes` (the worker's `token.scopes` op), or
+for a fine-grained PAT one read per permission plus the repository payload's
+`push` bit — and a required permission it lacks fails the row naming the
+feature that first needs it; `workflows:write` only warns, and a `ci` row
+reports the repository's Actions workflows and latest run on the base. If no
+sandbox can be provisioned the row is a soft "reachability unverified"
+rather than a verdict against the repo. `sbxloop config repos` lists the registered repositories, and
 `sbxloop status` / `sbxloop daemon items` carry a `repo` column. From chat,
 the concierge's `list_repos` tool answers "what projects are you configured
 to work on?" with each repository's enabled state, base branch and trigger
@@ -1023,7 +1377,13 @@ advisory or ignored, and the baseline sha — emitted when it says more than
 "all green, all gating"), `land.bot_standing` (an automated reviewer's
 changes-requested review the merge goes over, #613), `land.human_ack` /
 `land.human_ack_capped`, `land.undraft` / `land.update`, and `run.merged` / `run.blocked` with
-the PR and why. `run.state` fires on every stage entry — the state *is* the
+the PR and why. A workload adds `judge.verdict` / `judge.degraded` (#756)
+and `task.output` (#757: the task, the attempt, the one-line summary and
+how many files the attempt left), emitted after each execute attempt and
+before the judge's word on it, and `run.needs_granted` / `run.needs_refused`
+(#758: the plan's needs against the run's profile — what was granted by name,
+or each refusal with the sbxloop.toml key that would allow it — emitted
+between the plan and the first task). `run.state` fires on every stage entry — the state *is* the
 stage. These carry no information the agent's reply did not — they exist so
 a surface can show the decision without showing the agent's JSON, which is
 what the Discord bridge does.
@@ -1164,7 +1524,7 @@ calls get their own rendering rules (`sbxloop.cli.cmdfmt`,
   character caps stay in `discord_format`: the fenced body is clipped to
   `TOOL_EXCERPT_MAX_CHARS` (1200) and the finished message to
   `DISCORD_MAX_MESSAGE`, so no input can overflow Discord's limit. The
-  `sbxloop watch` TUI renders a failed tool call through the same shared
+  `sbxloop run` transcript (and the `sbxloop tui` console) renders a failed tool call through the same shared
   helper, so its excerpt has the same head+tail shape, per-line clip and
   elision marker rather than a plain last-N-lines tail.
 - **No link previews, ever.** The bridge posts its own embed cards (headline,

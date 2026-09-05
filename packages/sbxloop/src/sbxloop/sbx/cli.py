@@ -42,6 +42,13 @@ _INFRA_MARKERS = (
 # Flags whose values are secrets. ExecResult/SbxError carry argv into error
 # messages, logs, and events — secret values must never travel with them.
 _SECRET_FLAGS = frozenset({"--value"})
+#: What an interactive shell inside a sandbox execs: bash when the image
+#: has it, else sh — shared by ``sbxloop shell`` and the console.
+INTERACTIVE_SHELL_ARGV: tuple[str, ...] = (
+    "sh",
+    "-c",
+    "command -v bash >/dev/null && exec bash -l; exec sh -l",
+)
 _REDACTED = "***"
 
 

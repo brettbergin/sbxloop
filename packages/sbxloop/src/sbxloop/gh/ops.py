@@ -65,6 +65,36 @@ class MergeOutcome(NamedTuple):
     stale: bool = False
 
 
+class QueueEntry(NamedTuple):
+    """The pull request's place in its base's merge queue (#676), as the
+    enqueue mutation and the queue read describe it. ``state`` is
+    GitHub's ``MergeQueueEntryState`` (QUEUED, AWAITING_CHECKS, MERGEABLE,
+    UNMERGEABLE, LOCKED); ``head`` is the commit the queue is testing for
+    this entry — the queue's own merge-group commit, not the PR's head —
+    which is where its checks report."""
+
+    id: str
+    state: str
+    position: int | None = None
+    head: str = ""
+
+
+class QueueState(NamedTuple):
+    """What the merge queue has done with the pull request so far (#676):
+    whether it is merged or closed, its live entry when it is queued, and
+    the queue's removals — ``removals`` counts every removed-from-queue
+    event on the PR's timeline (a caller compares against the count it
+    saw when it enqueued) and ``removed_reason`` is the latest one's
+    reason as GitHub words it."""
+
+    merged: bool
+    closed: bool
+    entry: QueueEntry | None
+    removals: int = 0
+    removed_reason: str = ""
+    merge_sha: str = ""
+
+
 class ReviewComment(BaseModel):
     """One inline comment, anchored to a line of the PR's diff."""
 
@@ -364,6 +394,44 @@ class ChecksVerdict(NamedTuple):
         return f"{len(self.failed)} of {self.total} check(s) failed: {', '.join(self.failed)}"
 
 
+class ReviewVerdict(NamedTuple):
+    """One reviewer's standing verdict on a pull request (#675)."""
+
+    login: str
+    state: str  # APPROVED | CHANGES_REQUESTED
+    is_bot: bool
+
+
+def fold_review_verdicts(
+    payload: Any, *, exclude: Identity | None = None
+) -> tuple[ReviewVerdict, ...]:
+    """Every reviewer's *standing* verdict from the reviews payload (#675):
+    the latest APPROVED / CHANGES_REQUESTED per reviewer, a DISMISSED
+    clearing it, COMMENT reviews skipped — the same fold as
+    :func:`fold_reviews`, kept per reviewer so a caller can count the
+    approvals and name who objects. ``exclude`` drops the loop's own
+    identity: its review lives in the run, and GitHub would not count it
+    toward the base's approvals anyway."""
+    if not isinstance(payload, list):
+        return ()
+    latest: dict[str, tuple[str, bool]] = {}
+    for review in payload:
+        if not isinstance(review, dict):
+            continue
+        state = str(review.get("state") or "").upper()
+        if state not in ("APPROVED", "CHANGES_REQUESTED", "DISMISSED"):
+            continue
+        identity = user_identity(review.get("user"))
+        if not identity[0] or (exclude is not None and identities_match(identity, exclude)):
+            continue
+        latest[identity[0]] = (state, bool(identity[1]))
+    return tuple(
+        ReviewVerdict(login, state, is_bot)
+        for login, (state, is_bot) in latest.items()
+        if state != "DISMISSED"
+    )
+
+
 class FailedCheck(NamedTuple):
     """One red check run or commit status, with the text that explains it.
 
@@ -559,6 +627,87 @@ def _review_threads_connection(payload: Any) -> dict[str, Any]:
         "reviewThreads"
     )
     return nodes if isinstance(nodes, dict) else {}
+
+
+def _rollup_connection(payload: Any) -> dict[str, Any]:
+    """The ``statusCheckRollup.contexts`` connection of the PR's last
+    commit, or ``{}`` when the commit has no rollup yet (nothing has
+    reported on it — GitHub serves ``null``, not an empty connection)."""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    repository = data.get("repository") if isinstance(data, dict) else None
+    pr = repository.get("pullRequest") if isinstance(repository, dict) else None
+    commits = pr.get("commits") if isinstance(pr, dict) else None
+    nodes = commits.get("nodes") if isinstance(commits, dict) else None
+    first = nodes[0] if isinstance(nodes, list) and nodes else None
+    commit = first.get("commit") if isinstance(first, dict) else None
+    rollup = commit.get("statusCheckRollup") if isinstance(commit, dict) else None
+    contexts = rollup.get("contexts") if isinstance(rollup, dict) else None
+    return contexts if isinstance(contexts, dict) else {}
+
+
+def rollup_next_cursor(payload: Any) -> str | None:
+    """The cursor of the rollup page after this one, or ``None`` on the last."""
+    info = _rollup_connection(payload).get("pageInfo")
+    if not isinstance(info, dict) or not info.get("hasNextPage"):
+        return None
+    cursor = info.get("endCursor")
+    return str(cursor) if cursor else None
+
+
+def fold_required_contexts(payload: Any) -> list[str]:
+    """The names of one rollup page's contexts GitHub marks ``isRequired``
+    for the pull request (#674): a check run's ``name`` or a status'
+    ``context`` — the shared namespace of #610. A node in a shape not
+    understood is skipped; it cannot be named, so it cannot be gated on."""
+    out: list[str] = []
+    entries = _rollup_connection(payload).get("nodes")
+    for node in entries if isinstance(entries, list) else []:
+        if not isinstance(node, dict) or node.get("isRequired") is not True:
+            continue
+        name = node.get("name") or node.get("context")
+        if name:
+            out.append(str(name))
+    return out
+
+
+def fold_queue_entry(node: Any) -> QueueEntry | None:
+    """A GraphQL ``MergeQueueEntry`` node as a typed row; ``None`` when
+    there is no entry (the PR is not queued) or the node has no id."""
+    if not isinstance(node, dict) or not node.get("id"):
+        return None
+    head = node.get("headCommit")
+    position = node.get("position")
+    return QueueEntry(
+        id=str(node["id"]),
+        state=str(node.get("state") or ""),
+        position=int(position) if isinstance(position, int) else None,
+        head=str(head.get("oid") or "") if isinstance(head, dict) else "",
+    )
+
+
+def fold_queue_state(payload: Any) -> QueueState:
+    """The queue read's ``pullRequest`` folded to :class:`QueueState`
+    (#676). A payload with no pull request raises: the caller is waiting
+    on the queue and cannot tell "not queued" from "not read"."""
+    data = payload.get("data") if isinstance(payload, dict) else None
+    repo = data.get("repository") if isinstance(data, dict) else None
+    pr = repo.get("pullRequest") if isinstance(repo, dict) else None
+    if not isinstance(pr, dict):
+        raise GithubOpsError(f"mergeQueueEntry returned no pull request: {payload!r}")
+    removals = pr.get("timelineItems")
+    count = removals.get("totalCount") if isinstance(removals, dict) else None
+    nodes = removals.get("nodes") if isinstance(removals, dict) else None
+    last = nodes[-1] if isinstance(nodes, list) and nodes else None
+    reason = last.get("reason") if isinstance(last, dict) else None
+    merge = pr.get("mergeCommit")
+    return QueueState(
+        merged=bool(pr.get("merged")),
+        closed=str(pr.get("state") or "").upper() == "CLOSED",
+        entry=fold_queue_entry(pr.get("mergeQueueEntry")),
+        removals=int(count) if isinstance(count, int) else 0,
+        removed_reason=str(reason or ""),
+        merge_sha=str(merge.get("oid") or "") if isinstance(merge, dict) else "",
+    )
 
 
 def review_threads_next_cursor(payload: Any) -> str | None:
@@ -758,6 +907,31 @@ class GithubOps:
         merge_base = data.get("merge_base_commit") if isinstance(data, dict) else None
         sha = merge_base.get("sha") if isinstance(merge_base, dict) else None
         return str(sha) if sha else None
+
+    def pr_review_verdicts(
+        self, repo: str, number: int, *, exclude: Identity | None = None
+    ) -> tuple[ReviewVerdict, ...]:
+        """Each reviewer's standing verdict (#675), the loop's own excluded.
+        One request per page of reviews."""
+        return fold_review_verdicts(
+            raw_pages(self, f"/repos/{repo}/pulls/{number}/reviews"), exclude=exclude
+        )
+
+    def pr_request_reviewers(self, repo: str, number: int, reviewers: Sequence[str]) -> None:
+        """Ask GitHub for reviews from ``reviewers`` (#675): user logins,
+        or ``org/team`` slugs for team reviewers. Write access suffices.
+        A login GitHub refuses (not a collaborator, the PR's own author)
+        fails the whole request; the caller decides how loud to be."""
+        users = [name for name in reviewers if "/" not in name]
+        teams = [name.split("/", 1)[1] for name in reviewers if "/" in name]
+        body: dict[str, Any] = {}
+        if users:
+            body["reviewers"] = users
+        if teams:
+            body["team_reviewers"] = teams
+        if not body:
+            return
+        self.raw("POST", f"/repos/{repo}/pulls/{number}/requested_reviewers", body)
 
     def pr_review_state(self, repo: str, number: int, *, login: str | None = None) -> str:
         """``APPROVED`` / ``CHANGES_REQUESTED`` / ``NONE`` — each reviewer's
@@ -1136,6 +1310,60 @@ class GithubOps:
             "the list was not read to its end"
         )
 
+    # Which of the checks on the PR's head GitHub itself would hold the
+    # merge for (#674). ``isRequired`` is evaluated against the pull
+    # request's base rules — classic protection and rulesets both — and is
+    # readable with pull access, unlike classic protection itself (admin
+    # only). Field-unverified beyond GitHub's schema: the argument is
+    # ``pullRequestNumber`` on both ``CheckRun`` and ``StatusContext``.
+    _ROLLUP_QUERY = (
+        "query($owner: String!, $name: String!, $number: Int!, $cursor: String) { "
+        "repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
+        "commits(last: 1) { nodes { commit { oid statusCheckRollup { "
+        "contexts(first: 100, after: $cursor) { "
+        "pageInfo { hasNextPage endCursor } "
+        "nodes { __typename "
+        "... on CheckRun { name isRequired(pullRequestNumber: $number) } "
+        "... on StatusContext { context isRequired(pullRequestNumber: $number) } "
+        "} } } } } } } }"
+    )
+
+    def pr_required_checks(self, repo: str, number: int) -> tuple[str, ...]:
+        """The checks on the PR's last commit that GitHub marks required
+        for this pull request, across every page of the rollup (#674).
+
+        Only what has *reported* on the head appears in a rollup: a
+        required check that has not started yet is not in the answer, and
+        an empty tuple means "none of what has reported is required" —
+        which, before anything reports, is no answer at all. Callers ask
+        again as checks arrive.
+        """
+        owner, _, name = repo.partition("/")
+        required: list[str] = []
+        cursor: str | None = None
+        for _ in range(MAX_PAGES):
+            data = self.raw(
+                "POST",
+                "/graphql",
+                {
+                    "query": self._ROLLUP_QUERY,
+                    "variables": {"owner": owner, "name": name, "number": number, "cursor": cursor},
+                },
+            )
+            if not isinstance(data, dict):
+                raise GithubOpsError(f"statusCheckRollup returned a malformed result: {data!r}")
+            errors = data.get("errors")
+            if errors:
+                raise GithubOpsError(f"statusCheckRollup failed: {errors!r}")
+            required.extend(fold_required_contexts(data))
+            cursor = rollup_next_cursor(data)
+            if cursor is None:
+                return tuple(dict.fromkeys(required))
+        raise PaginationError(
+            f"{repo}#{number} has more than {MAX_PAGES * 100} checks on its head; "
+            "the required set was not read to its end"
+        )
+
     # -- landing a pull request ---------------------------------------------
     #
     # The last stretch of an autonomous run: take the delivery out of draft,
@@ -1221,6 +1449,74 @@ class GithubOps:
             return MergeOutcome(False, "", f"merge was not confirmed: {data!r}", blocked=True)
         return MergeOutcome(True, str(data.get("sha") or ""), str(data.get("message") or "merged"))
 
+    # A base that merges through a merge queue refuses PUT /merge outright
+    # (#676); the queue is entered and read through GraphQL — the REST API
+    # has no queue surface. Field-unverified beyond GitHub's schema:
+    # ``expectedHeadOid`` on the enqueue input (the same race guard the
+    # merge's ``sha`` gives), ``headCommit`` on the entry, and the
+    # ``reason`` of a ``RemovedFromMergeQueueEvent``.
+    _ENQUEUE_MUTATION = (
+        "mutation($id: ID!, $head: GitObjectID) { "
+        "enqueuePullRequest(input: {pullRequestId: $id, expectedHeadOid: $head}) { "
+        "mergeQueueEntry { id state position headCommit { oid } } } }"
+    )
+    _QUEUE_QUERY = (
+        "query($owner: String!, $name: String!, $number: Int!) { "
+        "repository(owner: $owner, name: $name) { pullRequest(number: $number) { "
+        "merged state mergeCommit { oid } "
+        "mergeQueueEntry { id state position headCommit { oid } } "
+        "timelineItems(last: 1, itemTypes: [REMOVED_FROM_MERGE_QUEUE_EVENT]) { "
+        "totalCount nodes { ... on RemovedFromMergeQueueEvent { reason } } } "
+        "} } }"
+    )
+
+    def pr_enqueue(self, node_id: str, *, head: str = "") -> QueueEntry:
+        """Add the PR to its base's merge queue; the entry GitHub made.
+
+        ``head`` is the commit the caller judged: GitHub refuses the
+        enqueue when the branch has moved past it, the way the merge's
+        ``sha`` makes a concurrent push lose the race. A refusal — the PR
+        is not mergeable, the queue is not required for its base, the
+        branch moved — is a GraphQL ``errors`` array under a 200 and is
+        raised as :class:`GithubOpsError` with GitHub's words.
+        """
+        variables: dict[str, Any] = {"id": node_id}
+        if head:
+            variables["head"] = head
+        data = self.raw(
+            "POST", "/graphql", {"query": self._ENQUEUE_MUTATION, "variables": variables}
+        )
+        if not isinstance(data, dict):
+            raise GithubOpsError(f"enqueuePullRequest returned a malformed result: {data!r}")
+        errors = data.get("errors")
+        if errors:
+            raise GithubOpsError(f"enqueuePullRequest failed: {errors!r}")
+        entry = fold_queue_entry(
+            ((data.get("data") or {}).get("enqueuePullRequest") or {}).get("mergeQueueEntry")
+        )
+        if entry is None:
+            raise GithubOpsError(f"enqueuePullRequest returned no queue entry: {data!r}")
+        return entry
+
+    def pr_queue_state(self, repo: str, number: int) -> QueueState:
+        """Where the PR stands with its base's merge queue (#676): merged,
+        closed, its live entry, and the queue's removals so far."""
+        owner, _, name = repo.partition("/")
+        data = self.raw(
+            "POST",
+            "/graphql",
+            {
+                "query": self._QUEUE_QUERY,
+                "variables": {"owner": owner, "name": name, "number": number},
+            },
+        )
+        if not isinstance(data, dict):
+            raise GithubOpsError(f"mergeQueueEntry returned a malformed result: {data!r}")
+        errors = data.get("errors")
+        if errors:
+            raise GithubOpsError(f"mergeQueueEntry failed: {errors!r}")
+        return fold_queue_state(data)
+
     def pr_update_branch(self, repo: str, number: int, *, expected_head_sha: str = "") -> bool:
         """Merge the base branch into the PR's branch; True when accepted.
 
@@ -1289,6 +1585,23 @@ class GithubOps:
         assert isinstance(data, dict)
         return data
 
+    def default_branch(self, repo: str) -> str:
+        """The branch GitHub reports as the repository's default.
+
+        The one place the loop learns which branch a repository lives on
+        when no ``deliver_base`` is configured. There is no guess when the
+        field is missing: a ``main`` assumed against a ``master`` or
+        ``develop`` repository would deliver, merge from and gate against
+        a branch that does not exist (#672).
+        """
+        name = self.repo_get(repo).get("default_branch")
+        if not isinstance(name, str) or not name:
+            raise GithubOpsError(
+                f"GitHub did not report a default branch for {repo}; "
+                "set [github] deliver_base to name the branch to deliver against"
+            )
+        return name
+
     def repo_lookup(self, repo: str) -> dict[str, Any] | None:
         """Probe a repository: its data, or None when it does not exist.
 
@@ -1338,6 +1651,17 @@ class GithubOps:
         if body is not None:
             params["body"] = body
         return self._op("raw.api", params)
+
+    def token_scopes(self) -> tuple[str, ...] | None:
+        """The credential's classic OAuth scopes (``repo``, ``workflow``,
+        ...), or ``None`` for a token that has none to report — a
+        fine-grained PAT or an App installation token, whose permissions
+        are per-resource (#696)."""
+        result = self._op("token.scopes", {})
+        scopes = result.get("scopes") if isinstance(result, dict) else None
+        if scopes is None:
+            return None
+        return tuple(str(s) for s in scopes)
 
     # Extra seconds of job timeout granted per file in a blob batch: the
     # batch job makes one REST call per file, so the flat per-op timeout

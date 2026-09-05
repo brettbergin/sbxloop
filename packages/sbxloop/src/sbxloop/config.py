@@ -40,6 +40,7 @@ from pydantic import (
     model_validator,
 )
 
+from sbxloop.backends import ANTHROPIC_TOKEN_ENV, COPILOT_TOKEN_ENV
 from sbxloop.errors import ConfigError
 from sbxloop.ids import DEFAULT_BRANCH_PREFIX
 from sbxloop.log import LogFormat, LogLevel, get_logger
@@ -53,10 +54,84 @@ ENV_PREFIX = "SBXLOOP_"
 # host configuration; the env config layer must not treat them as settings.
 RESERVED_ENV_KEYS = frozenset({"worker_backend", "echo_script"})
 
+# Environment the loop delivers to a sandbox itself (#679): the credentials
+# it mints and the worker's own selectors. Operator `[sandbox] env` and a
+# registry's `auth_env` may not name them — a config that did would either
+# clobber the run's credential or be clobbered silently, and neither is a
+# setting.
+LOOP_MANAGED_ENV = frozenset(
+    {"GH_TOKEN", "GITHUB_TOKEN", "GH_REPO", COPILOT_TOKEN_ENV, ANTHROPIC_TOKEN_ENV}
+)
+_ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+# A Debian package name (policy 5.6.1), optionally pinned `=version` or
+# suffixed `/release`, exactly as `apt-get install` takes it. Anything else
+# — a space, a shell character — is refused at load rather than joined into
+# the apt command line.
+_APT_PACKAGE_RE = re.compile(r"^[a-z0-9][a-z0-9+.\-]+(?:=[A-Za-z0-9+.:~\-]+|/[a-z\-]+)?$")
+
+
+def _check_apt_packages(value: list[str], key: str) -> list[str]:
+    for name in value:
+        if not _APT_PACKAGE_RE.match(name):
+            raise ValueError(f"{key}: {name!r} is not an apt package name")
+    return list(dict.fromkeys(value))
+
+
+def _check_setup_commands(value: list[str], key: str) -> list[str]:
+    for command in value:
+        if not command.strip():
+            raise ValueError(f"{key}: a setup command cannot be empty")
+        if "\n" in command:
+            raise ValueError(
+                f"{key}: one command per entry (a newline in {command!r}); chain with && or ;"
+            )
+    return value
+
+
+def _check_env_names(names: Sequence[str], key: str) -> None:
+    for name in names:
+        if not _ENV_NAME_RE.match(name):
+            raise ValueError(f"{key}: {name!r} is not an environment variable name")
+        if name.startswith(ENV_PREFIX) or name in LOOP_MANAGED_ENV:
+            raise ValueError(
+                f"{key}: {name} is delivered by sbxloop itself and cannot be configured"
+            )
+
+
+_REMOVED_KEY_GUIDANCE = (
+    "{where} secret_env is no longer supported (#766): the only credential in the "
+    "agent sandbox is the agent's own. A registry credential belongs on its "
+    "[[registries]] entry as auth_env (used in the service sandbox, which fetches "
+    "the dependencies), a key a workload calls with belongs under [[credentials]] "
+    "(used through the service sandbox), and a secret only the test suite needs "
+    'belongs to CI (verify_mode = "ci-only" or "advisory")'
+)
+
+
+def _refuse_secret_env(data: Any, where: str) -> Any:
+    """Fail a `secret_env` key by name, before `extra="forbid"` reduces it to
+    "Extra inputs are not permitted": the operator is told where each kind
+    of secret goes now."""
+    if isinstance(data, Mapping) and "secret_env" in data:
+        raise ValueError(_REMOVED_KEY_GUIDANCE.format(where=where))
+    return data
+
+
 WorkerTransport = Literal["stream", "poll"]
+WorkspaceSource = Literal["configured", "remote", "none"]
 SecretStrategy = Literal["proxy", "plain-env"]
 HarvestMode = Literal["per-task", "final"]
+FetchTags = Literal["auto", "always", "never"]
 WorkspaceIsolation = Literal["auto", "clone", "in-place"]
+# How much the in-sandbox verify phase decides (#682). `full`: a task's
+# verify commands and the project gate must pass (a failure spends
+# revisions, then a replan). `advisory`: they run and their result is
+# reported — to the chronology, the review and the pull request — but a
+# failure blocks nothing. `ci-only`: they do not run; the pull request's
+# own checks, in landing, are the verification.
+VerifyMode = Literal["full", "advisory", "ci-only"]
 
 
 class _Unset:
@@ -136,10 +211,93 @@ class SandboxConfig(_ConfigModel):
     # default on purpose: a partial clone fetches blobs lazily from inside
     # the sandbox, which holds no git credential and pays a network round
     # trip per touched file; see the "Clone size" note in `sbxloop.hostgit`.
-    # Every run clone is already `--single-branch --no-tags` regardless.
+    # Every run clone is already `--single-branch --no-tags` regardless;
+    # `fetch_tags` below is how a tag-versioned build gets its tags back.
     clone_filter: str | None = None
+    # Whether a run clone's submodules are populated (#692). On by default:
+    # a repository that vendors a dependency as a submodule does not build
+    # without it. Each submodule comes from the host checkout's own copy
+    # when that copy has the recorded commit, else from its `.gitmodules`
+    # URL with the run's GitHub credential; a submodule neither route can
+    # populate fails provisioning by name. Off leaves the submodule
+    # directories empty — for a repository whose submodules are optional
+    # (docs, examples) or live somewhere the run's credential cannot read.
+    clone_submodules: bool = True
+    # Whether a run clone's Git LFS objects are populated (#693). On by
+    # default: a repository whose `.gitattributes` routes files through
+    # `filter=lfs` keeps its fixtures and assets there, and a run on the
+    # pointer files fails on the first test that opens one. Objects come
+    # from the host checkout's LFS store where it has them, else from the
+    # repository's LFS endpoint with the run's GitHub credential; that
+    # needs git-lfs on the host, and a repository using LFS fails
+    # provisioning by name without it. Off runs on the pointer files — for
+    # a repository whose LFS content the run does not need, or whose store
+    # the run's credential cannot read. Either way a file the run adds or
+    # changes under an LFS attribute is never delivered as a plain blob.
+    clone_lfs: bool = True
+    # Whether a fresh run clone gets the repository's tags (#694). Every
+    # run clone is cut `--no-tags` for size; a project whose build derives
+    # its version from the nearest tag (setuptools-scm, hatch-vcs,
+    # versioningit, Gradle's axion-release, Rust's vergen, a Makefile's
+    # `git describe`) then builds as 0.0.0 or not at all. `auto` fetches
+    # tags when a manifest names such a tool, from the host checkout's own
+    # tags where it has them and from the remote with the run's credential
+    # otherwise; `always` fetches them for every repository; `never` keeps
+    # the bare clone.
+    fetch_tags: FetchTags = "auto"
     extra_allow_domains: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=list)
+    # Operator environment for the agent sandbox (#679): plain values —
+    # `RAILS_ENV`, `DATABASE_URL`, a `PIP_INDEX_URL` — written as given and
+    # visible wherever the config is. It may not name a variable the loop
+    # delivers itself (`GH_TOKEN`, the agent credential, `SBXLOOP_*`). A
+    # `[[github.repos]]` entry replaces it for its own runs. There is no
+    # secret counterpart (#766): the only credential in the agent sandbox
+    # is the agent's own — see `_no_secret_env`.
+    env: dict[str, str] = Field(default_factory=dict)
+    # OS packages and pre-run setup the toolchains do not cover (#681).
+    # `apt_packages` join the resolved toolchains' apt install (a `libpq-dev`,
+    # `protobuf-compiler`, a JDK for a Python project) — probed with `dpkg`
+    # first, so a template baked with them installs nothing. `setup_commands`
+    # run in the workspace after the clone, the toolchains and the
+    # registries' client files, before the first agent phase, under the
+    # run's egress policy and with the sandbox environment above (a
+    # `playwright install --with-deps`, a `pre-commit install-hooks`).
+    # Each command's exit and output tail is a `sandbox.setup` event; a
+    # non-zero exit fails the run at provisioning (the gate would fail
+    # anyway, and this names the cause). A `[[github.repos]]` entry replaces
+    # either list for its own runs.
+    apt_packages: list[str] = Field(default_factory=list)
+    setup_commands: list[str] = Field(default_factory=list)
+    # What the verify phase decides (#682). Most service-backed suites
+    # (a database, a broker, a browser the sandbox does not have) fail in
+    # the sandbox for reasons no revision can fix; `advisory` keeps the
+    # signal without spending the budget on it and `ci-only` leaves the
+    # judging to the pull request's checks. Under `full` the loop names
+    # the evidence it sees for such a suite (`verify.services_detected`)
+    # and changes nothing on its own.
+    verify_mode: VerifyMode = "full"
+
+    @field_validator("env")
+    @classmethod
+    def _check_env(cls, value: dict[str, str]) -> dict[str, str]:
+        _check_env_names(list(value), "sandbox.env")
+        return value
+
+    @field_validator("apt_packages")
+    @classmethod
+    def _check_apt_packages(cls, value: list[str]) -> list[str]:
+        return _check_apt_packages(value, "sandbox.apt_packages")
+
+    @field_validator("setup_commands")
+    @classmethod
+    def _check_setup_commands(cls, value: list[str]) -> list[str]:
+        return _check_setup_commands(value, "sandbox.setup_commands")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_secret_env(cls, data: Any) -> Any:
+        return _refuse_secret_env(data, "[sandbox]")
 
     @field_validator("clone_filter")
     @classmethod
@@ -186,6 +344,233 @@ class SandboxConfig(_ConfigModel):
         contexts without a workspace — bake, the concierge sandbox.
         """
         return tuple(self.languages) or DEFAULT_LANGUAGES
+
+
+RegistryKind = Literal["npm", "pypi", "go", "cargo", "maven", "nuget", "gem", "generic"]
+
+# Kinds whose credential is a `~/.netrc` entry (pip, uv, go's git fetch,
+# curl all honour it) and so need a login beside the token.
+NETRC_REGISTRY_KINDS = frozenset({"pypi", "go", "generic"})
+# Kinds whose client file names a username explicitly.
+USERNAME_REGISTRY_KINDS = NETRC_REGISTRY_KINDS | {"maven", "nuget", "gem"}
+# Kinds that point at a URL, not just a host.
+URL_REGISTRY_KINDS = frozenset({"npm", "pypi", "cargo", "maven", "nuget", "gem"})
+_HOST_RE = re.compile(r"^(?:[a-z0-9](?:[a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$")
+_NPM_SCOPE_RE = re.compile(r"^@[a-z0-9][a-z0-9._-]*$")
+_REGISTRY_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
+
+
+class RegistryConfig(_ConfigModel):
+    """One private package registry a run's dependencies come from (#680).
+
+    `kind` picks the client file or environment sbxloop writes so the
+    ecosystem's tooling actually uses the registry (`~/.npmrc`,
+    `PIP_INDEX_URL`, `GOPRIVATE`, `~/.cargo/config.toml`,
+    `~/.m2/settings.xml`, `NuGet.Config`, `BUNDLE_*`) — see
+    ``sbxloop.sbx.registries`` for what each kind writes. Without
+    `auth_env` the registry is the agent sandbox's own: `host` joins its
+    allowlist and the client file lands in its `$HOME`. With `auth_env`
+    (the daemon-environment variable holding the credential) the registry
+    belongs to the SERVICE sandbox (#766): host, credential and client file
+    go there, the dependencies are fetched there into a cache in the shared
+    workspace, and the agent sandbox — which never sees the credential —
+    builds offline from that cache.
+    """
+
+    kind: RegistryKind
+    host: str
+    # The registry endpoint; required for every kind but `go` and `generic`,
+    # which are host-only (a module path / any other host).
+    url: str | None = None
+    # Daemon-environment variable holding the credential (delivered to the
+    # service sandbox, #766) and, for the kinds that pair a login with it,
+    # the login.
+    auth_env: str | None = None
+    auth_user: str | None = None
+    # npm only: `@scope` served from this registry; unset → the default
+    # registry for unscoped packages too.
+    scope: str | None = None
+    # cargo registry name / maven `<server>` and `<mirror>` id / NuGet
+    # source key; derived from `host` when unset.
+    name: str | None = None
+
+    @field_validator("host")
+    @classmethod
+    def _check_host(cls, value: str) -> str:
+        value = value.strip().lower()
+        if not _HOST_RE.match(value):
+            raise ValueError(f"registries[].host must be a bare hostname, got {value!r}")
+        return value
+
+    @field_validator("auth_env")
+    @classmethod
+    def _check_auth_env(cls, value: str | None) -> str | None:
+        if value is not None:
+            _check_env_names([value], "registries[].auth_env")
+        return value
+
+    @field_validator("scope")
+    @classmethod
+    def _check_scope(cls, value: str | None) -> str | None:
+        if value is not None and not _NPM_SCOPE_RE.match(value):
+            raise ValueError(
+                f"registries[].scope must be an npm scope such as '@org', got {value!r}"
+            )
+        return value
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str | None) -> str | None:
+        if value is not None and not _REGISTRY_NAME_RE.match(value):
+            raise ValueError(
+                f"registries[].name must be letters, digits, '-' or '_', got {value!r}"
+            )
+        return value
+
+    @model_validator(mode="after")
+    def _fields_fit_the_kind(self) -> RegistryConfig:
+        where = f"registries[{self.kind} {self.host}]"
+        if self.kind in URL_REGISTRY_KINDS and self.kind != "gem" and self.url is None:
+            raise ValueError(f"{where}: kind={self.kind} needs url")
+        if self.kind not in URL_REGISTRY_KINDS and self.url is not None:
+            raise ValueError(f"{where}: kind={self.kind} takes only host, not url")
+        if self.url is not None:
+            # cargo spells a sparse index `sparse+https://...`; the host
+            # check looks through the prefix.
+            parts = urlsplit(self.url.removeprefix("sparse+") if self.kind == "cargo" else self.url)
+            if parts.scheme not in ("http", "https") or not parts.netloc:
+                raise ValueError(f"{where}: url must be http(s)://..., got {self.url!r}")
+            if (parts.hostname or "").lower() != self.host:
+                raise ValueError(
+                    f"{where}: url {self.url!r} is not on host {self.host!r} — host is "
+                    "what the sandbox is allowed to reach, and the url must be there"
+                )
+        if self.scope is not None and self.kind != "npm":
+            raise ValueError(f"{where}: scope is npm-only")
+        if self.auth_user is not None and self.auth_env is None:
+            raise ValueError(f"{where}: auth_user needs auth_env")
+        if self.auth_env is not None:
+            if self.kind in USERNAME_REGISTRY_KINDS and not self.auth_user:
+                raise ValueError(
+                    f"{where}: kind={self.kind} pairs the credential with a login; "
+                    "set auth_user (what the registry expects beside the token)"
+                )
+            if self.kind not in USERNAME_REGISTRY_KINDS and self.auth_user is not None:
+                raise ValueError(
+                    f"{where}: kind={self.kind} authenticates by token; drop auth_user"
+                )
+        return self
+
+    @property
+    def effective_name(self) -> str:
+        return self.name or re.sub(r"[^a-z0-9]+", "-", self.host).strip("-")
+
+    @property
+    def identity(self) -> tuple[str, ...]:
+        """What must be unique within one list: npm by scope (one unscoped
+        default plus any number of scopes), the named kinds by name, the
+        single-index kinds (pypi, gem) once, host-only kinds by host."""
+        if self.kind == "npm":
+            return ("npm", self.scope or "")
+        if self.kind in ("cargo", "maven", "nuget"):
+            return (self.kind, self.effective_name)
+        if self.kind in ("go", "generic"):
+            return (self.kind, self.host)
+        return (self.kind,)
+
+
+_CREDENTIAL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
+
+
+class CredentialConfig(_ConfigModel):
+    """One credential a run may be granted (#765) — held by the run's
+    *service* sandbox, never the agent's.
+
+    `name` is what a run asks for and what the ledger records; `env` names
+    the daemon-environment variable holding the value (the value is never
+    in TOML); `host` is the ONE host the credential is good for — every
+    `service.http` op with this credential goes to `https://<host>` and
+    nowhere else; `header` / `scheme` say how it is attached
+    (`Authorization: Bearer <value>` by default; `scheme = ""` sends the
+    bare value, for an `X-Api-Key` style header). The agent sandbox does
+    not need `host` on its own allowlist: the agent never speaks to it.
+    """
+
+    name: str
+    env: str
+    host: str
+    header: str = "Authorization"
+    scheme: str = "Bearer"
+    description: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        if not _CREDENTIAL_NAME_RE.match(value):
+            raise ValueError(
+                f"credentials[].name must be lowercase letters, digits, '-' or '_', got {value!r}"
+            )
+        return value
+
+    @field_validator("env")
+    @classmethod
+    def _check_env(cls, value: str) -> str:
+        _check_env_names([value], "credentials[].env")
+        return value
+
+    @field_validator("host")
+    @classmethod
+    def _check_host(cls, value: str) -> str:
+        value = value.strip().lower()
+        if not _HOST_RE.match(value):
+            raise ValueError(f"credentials[].host must be a bare hostname, got {value!r}")
+        return value
+
+    @field_validator("header")
+    @classmethod
+    def _check_header(cls, value: str) -> str:
+        if not _HEADER_NAME_RE.match(value):
+            raise ValueError(f"credentials[].header must be an HTTP header name, got {value!r}")
+        return value
+
+    @field_validator("scheme")
+    @classmethod
+    def _check_scheme(cls, value: str) -> str:
+        value = value.strip()
+        if any(c.isspace() for c in value):
+            raise ValueError(f"credentials[].scheme must be one word, got {value!r}")
+        return value
+
+    def catalogue_entry(self) -> dict[str, str]:
+        """The non-secret part, as the service sandbox's worker reads it."""
+        return {
+            "name": self.name,
+            "env": self.env,
+            "host": self.host,
+            "header": self.header,
+            "scheme": self.scheme,
+        }
+
+
+def _check_credentials(entries: Sequence[CredentialConfig], key: str) -> None:
+    seen: set[str] = set()
+    for entry in entries:
+        if entry.name in seen:
+            raise ValueError(f"{key}: credential {entry.name!r} is declared twice")
+        seen.add(entry.name)
+
+
+def _check_registries(entries: Sequence[RegistryConfig], key: str) -> None:
+    seen: set[tuple[str, ...]] = set()
+    for entry in entries:
+        if entry.identity in seen:
+            what = " ".join(entry.identity) or entry.kind
+            raise ValueError(
+                f"{key}: more than one {what!r} registry; an ecosystem's tooling can "
+                "follow only one default (npm takes one registry per scope)"
+            )
+        seen.add(entry.identity)
 
 
 class PolicyConfig(_ConfigModel):
@@ -357,6 +742,26 @@ class RepoConfig(_ConfigModel):
     # The loop's own login on this repository, for when neither the App
     # slug nor `GET /user` can say (#622); None → `[github] bot_login`.
     bot_login: str | None = None
+    # Who is asked to review a PR the base will not merge without an
+    # approving review (#675); None → `[github] reviewers`. Logins, or
+    # `org/team` slugs.
+    reviewers: list[str] | None = None
+    # Chat user ids to @mention when such a PR waits (#675); None →
+    # `[landing] review_notify`. The requester is always mentioned.
+    review_notify: list[str] | None = None
+    # This repository's agent-sandbox environment (#679); None → the
+    # `[sandbox]` value, and a set value REPLACES it (restate what the
+    # global setting held and this repository still needs).
+    env: dict[str, str] | None = None
+    # This repository's private registries (#680); None → the top-level
+    # `[[registries]]`, and a set list REPLACES it.
+    registries: list[RegistryConfig] | None = None
+    # This repository's OS packages and setup commands (#681); None → the
+    # `[sandbox]` list, and a set list REPLACES it.
+    apt_packages: list[str] | None = None
+    setup_commands: list[str] | None = None
+    # This repository's verify mode (#682); None → `[sandbox] verify_mode`.
+    verify_mode: VerifyMode | None = None
 
     @field_validator("repo")
     @classmethod
@@ -383,6 +788,37 @@ class RepoConfig(_ConfigModel):
     @classmethod
     def _check_bot_login(cls, value: str | None) -> str | None:
         return None if value is None else _check_login(value, "github.repos[].bot_login")
+
+    @field_validator("env")
+    @classmethod
+    def _check_env(cls, value: dict[str, str] | None) -> dict[str, str] | None:
+        if value is not None:
+            _check_env_names(list(value), "github.repos[].env")
+        return value
+
+    @model_validator(mode="before")
+    @classmethod
+    def _no_secret_env(cls, data: Any) -> Any:
+        return _refuse_secret_env(data, "[[github.repos]]")
+
+    @field_validator("registries")
+    @classmethod
+    def _check_registries(cls, value: list[RegistryConfig] | None) -> list[RegistryConfig] | None:
+        if value is not None:
+            _check_registries(value, "github.repos[].registries")
+        return value
+
+    @field_validator("apt_packages")
+    @classmethod
+    def _check_apt_packages(cls, value: list[str] | None) -> list[str] | None:
+        return None if value is None else _check_apt_packages(value, "github.repos[].apt_packages")
+
+    @field_validator("setup_commands")
+    @classmethod
+    def _check_setup_commands(cls, value: list[str] | None) -> list[str] | None:
+        if value is None:
+            return None
+        return _check_setup_commands(value, "github.repos[].setup_commands")
 
     @field_validator(*(f"{name}_label" for name in LABEL_KINDS))
     @classmethod
@@ -447,6 +883,13 @@ class GithubConfig(_ConfigModel):
     # (the same credential opened it), else the identity is unknown and
     # landing hands over rather than guess.
     bot_login: str | None = None
+    # Who GitHub asks to review a PR whose base requires an approving
+    # review the loop cannot give (#675): user logins, or `org/team` slugs.
+    # Requested once, when the run parks `awaiting_review`, so the PR shows
+    # up in their review queue; write access suffices. Overridable per
+    # `[[github.repos]]` entry. Empty asks nobody — the chat notice still
+    # names the requester.
+    reviewers: list[str] = Field(default_factory=list)
     # How many repositories were enabled in the *un-narrowed* config this was
     # derived from. `for_repo` cuts `repos` down to a single entry, so the
     # list length downstream says nothing about the deployment's shape; the
@@ -638,6 +1081,14 @@ class GithubConfig(_ConfigModel):
         if entry is not None and entry.branch_prefix:
             return entry.branch_prefix
         return self.branch_prefix
+
+    def reviewers_for(self, repo: str | None = None) -> list[str]:
+        """Who to request reviews from on ``repo``'s pull requests (#675):
+        the entry's own list when set, else `[github] reviewers`."""
+        entry = self.effective_repo(repo)
+        if entry is not None and entry.reviewers is not None:
+            return list(entry.reviewers)
+        return list(self.reviewers)
 
     def bot_login_for(self, repo: str | None = None) -> str | None:
         """The operator-declared login for ``repo``'s runs: the entry's own,
@@ -850,6 +1301,17 @@ class Budgets(_ConfigModel):
     # file-disjoint; per-task workspace isolation is what would make it
     # unconditionally safe.
     max_parallel_tasks: int = Field(default=1, ge=1)
+    # How much of the repository's own instruction files (AGENTS.md,
+    # CLAUDE.md, .cursorrules, CONTRIBUTING, CODEOWNERS — #688) every
+    # phase prompt carries, in characters; the block is cut at the budget
+    # with an explicit note. 0 hands the prompts none of it.
+    repo_context_max_chars: int = Field(default=12_000, ge=0)
+    # How large the outcome handed to the planner may grow once the
+    # issue's discussion and linked issues are added to its title and
+    # body (#691), in characters. The title, body and provenance are
+    # always carried whole; the discussion block is cut at what is left
+    # of the budget, with an explicit note.
+    outcome_max_chars: int = Field(default=16_000, ge=1_000)
 
 
 # How a landed PR is written onto the base branch. "auto" (the default)
@@ -882,6 +1344,17 @@ class LandingConfig(_ConfigModel):
     ``blocked`` with the PR left open for a human. On a repository whose
     merges publish (sbxloop's own does), every merged run is therefore an
     unattended release.
+
+    A base that requires an approving review is not a block (#675): the
+    loop cannot approve its own pull request and no second identity
+    should, so the run parks ``awaiting_review`` — no sandbox kept, the
+    PR open with its reviewers requested (`[github] reviewers`), the
+    requester and ``review_notify`` mentioned in chat once — and the
+    daemon polls the PR every ``review_poll_interval_s`` with two GitHub
+    requests. An approval completes the landing with gh ops alone; a
+    changes-requested review resumes the run for a fix round; after
+    ``review_wait_s`` without either the item pauses (``paused_review``)
+    and ``resume <item>`` re-arms the wait — nothing is deleted.
 
     ``merge_gate`` is the ONE opt-in human touchpoint of the pipeline:
     ``"chat"`` makes a run that cleared every bar — review, CI,
@@ -946,6 +1419,12 @@ class LandingConfig(_ConfigModel):
     ci_poll_interval_s: float = Field(default=60.0, gt=0)
     ci_settle_s: float = Field(default=90.0, ge=0)
     ci_timeout_s: float = Field(default=3600.0, gt=0)
+    # The wait for a human review (#675): how often the parked PR is read
+    # (two requests per read per parked run), how long before the item
+    # pauses, and which chat user ids are mentioned besides the requester.
+    review_poll_interval_s: float = Field(default=600.0, gt=0)
+    review_wait_s: float = Field(default=14400.0, gt=0)
+    review_notify: list[str] = Field(default_factory=list)
     merge_method: MergeMethod = "auto"
     delete_branch_on_merge: bool = True
     merge_update_attempts: int = Field(default=3, ge=0)
@@ -1069,6 +1548,26 @@ class DaemonConfig(_ConfigModel):
     # shippers; ``console`` is key=value for humans and journalctl.
     log_level: LogLevel = "INFO"
     log_format: LogFormat = "console"
+    # The release-drift check (#641): on start (not `--once`) the daemon asks
+    # pypi.org for the latest sbxloop once, off the startup path, and posts a
+    # notice to the control channel when this host is behind; the
+    # concierge's `version_status` answers the same question on demand.
+    # False makes zero outbound HTTP from the host for it — an air-gapped
+    # host, a mirror-pinned one, or one a deploy pipeline keeps current,
+    # where the advice would contradict the pipeline. Development builds
+    # skip it regardless.
+    version_check: bool = True
+    # What the drift notice tells the operator to run — `pipx upgrade
+    # sbxloop`, `uv tool upgrade sbxloop`, a deploy script. Unset, the notice
+    # says the exact command depends on how sbxloop was installed (#638).
+    upgrade_command: str | None = None
+
+    @field_validator("upgrade_command")
+    @classmethod
+    def _upgrade_command_not_blank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("upgrade_command must not be blank; omit it instead")
+        return value.strip() if value is not None else None
 
     @field_validator("log_level", mode="before")
     @classmethod
@@ -1117,6 +1616,11 @@ ChronologyLevel = Literal["quiet", "normal", "verbose"]
 
 ChatBackend = Literal["discord", "slack"]
 CHAT_BACKENDS: tuple[ChatBackend, ...] = ("discord", "slack")
+#: Every bridge the daemon can run: the external ``[chat] backend`` choices
+#: plus ``local``, the operator console's bridge, which is always on.
+BridgeBackend = Literal["discord", "slack", "local"]
+#: The local bridge's control channel id (its threads are ``thread:<id>``).
+TUI_CONTROL_CHANNEL = "control"
 
 
 class ChatBridgeConfig(_ConfigModel):
@@ -1224,6 +1728,36 @@ class SlackConfig(ChatBridgeConfig):
         return self.channel_id or ""
 
 
+class TuiConfig(ChatBridgeConfig):
+    """The operator console, ``sbxloop tui`` — always on. The daemon keeps a
+    local chat mailbox in ``state.db`` with the same headline, thread,
+    steering, concierge and merge-gate experience ``[discord]`` / ``[slack]``
+    give, and the console attaches to it on the daemon host; there is no
+    channel to configure and no token. The rendering knobs are the shared
+    ones; these are the terminal's own."""
+
+    # Who the console speaks as (watches, mentions, GitHub attribution);
+    # empty means the login name of whoever runs it.
+    operator_id: str = ""
+    # Glyph markers in the console (off: ASCII stand-ins).
+    emoji: bool = True
+    # The systemd --user unit the console tails (journalctl) and can restart.
+    daemon_unit: str = "sbxloop-daemon"
+    # How often the console re-reads the store while a screen is live.
+    refresh_s: float = Field(default=0.5, ge=0.1, le=10.0)
+    # Mailbox rows older than this are pruned by the daemon (0 keeps them);
+    # an open merge gate's prompt is never pruned.
+    retention_days: float = Field(default=14.0, ge=0.0)
+
+    @property
+    def enabled(self) -> bool:
+        return True
+
+    @property
+    def channel_ref(self) -> str:
+        return TUI_CONTROL_CHANNEL
+
+
 class ChatConfig(_ConfigModel):
     """Which service carries the daemon's human channel. ``backend`` names
     the ``[discord]`` or ``[slack]`` section to use; when it is unset the
@@ -1327,6 +1861,142 @@ class AgentConfig(_ConfigModel):
     backend: Literal["copilot", "claude"] = "copilot"
 
 
+# Where a workload's result may go when the run publishes (#759 delivers
+# them; a profile names the ones its runs may ask for). ``chat`` is a reply
+# in the run's thread, ``issue`` a GitHub issue or issue comment, ``artifact``
+# a downloadable file, ``pr`` files in a repository via a pull request.
+SinkName = Literal["chat", "issue", "artifact", "pr"]
+SINK_NAMES: tuple[SinkName, ...] = ("chat", "issue", "artifact", "pr")
+# The sinks that write to GitHub — a run granted one needs the github
+# sandbox (#759); `chat` needs nothing and is always granted.
+GITHUB_SINKS: frozenset[str] = frozenset({"issue", "pr"})
+WorkloadPublish = Literal["auto", "hold"]
+_PROFILE_NAME_RE = _CREDENTIAL_NAME_RE
+
+
+class BudgetOverrides(_ConfigModel):
+    """`[workloads.budgets]`: the `[budgets]` keys a profile overrides for
+    its runs, each unset by default. The same keys with the same bounds as
+    :class:`Budgets`; a key left None keeps the run on `[budgets]`.
+    (A separate model rather than a partial ``Budgets`` so a persisted
+    run config dumps the same shape the operator wrote — a resume compares
+    the two for drift.)"""
+
+    max_revisions_per_task: int | None = Field(default=None, ge=0)
+    max_replans_per_task: int | None = Field(default=None, ge=0)
+    max_tasks: int | None = Field(default=None, ge=1)
+    max_wall_clock_s: float | None = Field(default=None, gt=0)
+    per_job_timeout_s: float | None = Field(default=None, gt=0)
+    max_tool_calls_per_phase: int | None = Field(default=None, ge=0)
+    max_parallel_tasks: int | None = Field(default=None, ge=1)
+
+    def apply(self, base: Budgets) -> Budgets:
+        """``base`` with every key set here written over it."""
+        return base.model_copy(update=self.model_dump(exclude_none=True))
+
+    @property
+    def set_keys(self) -> list[str]:
+        return sorted(self.model_dump(exclude_none=True))
+
+
+class WorkloadProfile(_ConfigModel):
+    """One named bound for workload runs (#758): what a plan may ask for.
+
+    The operator's plan declares needs by name (hosts, credentials, a
+    sink, a repository — ``TaskNeeds``); the run's profile decides which
+    are granted. ``egress`` bounds the hosts the *agent* box may be
+    granted (patterns, as ``[policy] allow``; ``[policy] deny`` still wins
+    over it); ``credentials`` names the ``[[credentials]]`` a plan may ask
+    for — granted on the *service* box, never the agent's (#765);
+    ``sinks`` the places a result may go; ``repo`` whether a plan may ask
+    for a repository checkout in its data directory. ``budgets`` overrides
+    ``[budgets]`` for the run, key by key. Anything a plan asks for
+    outside the profile fails the run closed, naming the key here that
+    would have allowed it.
+
+    ``publish = "hold"`` will park a finished run at publishing until a
+    human releases it, on the daemon's merge-gate button; it arrives with
+    the daemon's workload intake (#760) and is refused until then.
+    """
+
+    name: str
+    egress: list[str] = Field(default_factory=list)
+    credentials: list[str] = Field(default_factory=list)
+    sinks: list[SinkName] = Field(default_factory=list)
+    repo: bool = False
+    publish: WorkloadPublish = "auto"
+    budgets: BudgetOverrides = Field(default_factory=BudgetOverrides)
+    description: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        if not _PROFILE_NAME_RE.match(value):
+            raise ValueError(
+                f"workloads[].name must be lowercase letters, digits, '-' or '_', got {value!r}"
+            )
+        return value
+
+    @field_validator("egress")
+    @classmethod
+    def _check_egress(cls, value: list[str]) -> list[str]:
+        from sbxloop.policy import valid_pattern
+
+        patterns = [p.strip().lower() for p in value]
+        bad = [p for p in patterns if not valid_pattern(p, operator=True)]
+        if bad:
+            raise ValueError(
+                "workloads[].egress patterns must be domains, *.domain wildcards or '*', "
+                f"got {bad!r}"
+            )
+        return patterns
+
+    @field_validator("credentials", "sinks")
+    @classmethod
+    def _dedupe(cls, value: list[Any]) -> list[Any]:
+        return list(dict.fromkeys(value))
+
+    @field_validator("publish")
+    @classmethod
+    def _hold_not_yet(cls, value: WorkloadPublish) -> WorkloadPublish:
+        if value == "hold":
+            raise ValueError(
+                'workloads[].publish = "hold" is not available yet: a held run needs the '
+                "daemon's release button, which arrives with the workload intake; "
+                'use "auto" (the default)'
+            )
+        return value
+
+    def covers_host(self, host: str) -> bool:
+        from sbxloop.policy import pattern_covers
+
+        return any(pattern_covers(pattern, host) for pattern in self.egress)
+
+    @property
+    def needs_github(self) -> bool:
+        """Whether a run under this profile gets the github sandbox: its
+        plan may publish through GitHub (#759), and every GitHub write
+        goes through that box."""
+        return any(sink in GITHUB_SINKS for sink in self.sinks)
+
+
+class WorkloadConfig(_ConfigModel):
+    """The `[workload]` section: which `[[workloads]]` profile a run gets
+    when nothing names one (unset, a workload runs without a profile —
+    fine for a plan that needs nothing, and every need but the chat sink
+    is refused), and the label a result issue carries (#759)."""
+
+    default: str | None = None
+    result_label: str = "sbxloop:result"
+
+    @field_validator("result_label")
+    @classmethod
+    def _label_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("[workload] result_label must not be blank")
+        return value.strip()
+
+
 class Config(_ConfigModel):
     model: str = "auto"
     agent: AgentConfig = Field(default_factory=AgentConfig)
@@ -1353,6 +2023,12 @@ class Config(_ConfigModel):
     install_workers: bool = True
     sandbox: SandboxConfig = Field(default_factory=SandboxConfig)
     policy: PolicyConfig = Field(default_factory=PolicyConfig)
+    # Private package registries every run's agent sandbox reaches and is
+    # configured for (#680); a `[[github.repos]]` entry may replace the list.
+    registries: list[RegistryConfig] = Field(default_factory=list)
+    # The credentials a run may be granted (#765): held by a per-run service
+    # sandbox and used through host-driven ops; never in the agent sandbox.
+    credentials: list[CredentialConfig] = Field(default_factory=list)
     github: GithubConfig = Field(default_factory=GithubConfig)
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     budgets: Budgets = Field(default_factory=Budgets)
@@ -1362,7 +2038,12 @@ class Config(_ConfigModel):
     chat: ChatConfig = Field(default_factory=ChatConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
+    tui: TuiConfig = Field(default_factory=TuiConfig)
     concierge: ConciergeConfig = Field(default_factory=ConciergeConfig)
+    # Named bounds for workload runs (#758) and the one a run gets by
+    # default; a code run ignores both.
+    workloads: list[WorkloadProfile] = Field(default_factory=list)
+    workload: WorkloadConfig = Field(default_factory=WorkloadConfig)
 
     @field_validator("state_dir", mode="after")
     @classmethod
@@ -1380,12 +2061,183 @@ class Config(_ConfigModel):
             _check_label_set(self.daemon.labels_for(entry), f"github.repos[{entry.repo}]")
         return self
 
+    def review_notify_for(self, repo: str | None = None) -> list[str]:
+        """The chat user ids mentioned when ``repo``'s PR waits for a review
+        (#675): the entry's own list when set, else `[landing]
+        review_notify`."""
+        entry = self.github.effective_repo(repo)
+        if entry is not None and entry.review_notify is not None:
+            return list(entry.review_notify)
+        return list(self.landing.review_notify)
+
     def labels_for(self, repo: str | None = None) -> LabelSet:
         """The lifecycle labels for ``repo`` (its ``[[github.repos]]``
         overrides over the ``[daemon]`` defaults, #630); ``None`` resolves
         the default repository, and a repository with no entry gets the
         daemon-wide set."""
         return self.daemon.labels_for(self.github.effective_repo(repo))
+
+    def sandbox_env_for(self, repo: str | None = None) -> dict[str, str]:
+        """The plain environment ``repo``'s agent sandbox gets (#679): the
+        entry's own mapping when set, else `[sandbox] env`."""
+        entry = self.github.effective_repo(repo)
+        if entry is not None and entry.env is not None:
+            return dict(entry.env)
+        return dict(self.sandbox.env)
+
+    @field_validator("registries")
+    @classmethod
+    def _check_registries(cls, value: list[RegistryConfig]) -> list[RegistryConfig]:
+        _check_registries(value, "registries")
+        return value
+
+    @field_validator("credentials")
+    @classmethod
+    def _check_credentials(cls, value: list[CredentialConfig]) -> list[CredentialConfig]:
+        _check_credentials(value, "credentials")
+        return value
+
+    def credential(self, name: str) -> CredentialConfig | None:
+        """The `[[credentials]]` entry called ``name``, or None."""
+        return next((c for c in self.credentials if c.name == name), None)
+
+    def credentials_named(self, names: Sequence[str]) -> list[CredentialConfig]:
+        """The catalogue entries for ``names``, in order and deduplicated;
+        a name the catalogue lacks is a ``ConfigError`` naming it."""
+        entries: list[CredentialConfig] = []
+        for name in dict.fromkeys(names):
+            entry = self.credential(name)
+            if entry is None:
+                known = ", ".join(c.name for c in self.credentials) or "none"
+                raise ConfigError(
+                    f"credential {name!r} is not declared under [[credentials]] (declared: {known})"
+                )
+            entries.append(entry)
+        return entries
+
+    @model_validator(mode="after")
+    def _workload_profiles_are_sound(self) -> Config:
+        """Every profile is distinct by name and names only catalogued
+        credentials; the default names a profile that exists — each an
+        operator's typo to fix before a run refuses on it."""
+        seen: set[str] = set()
+        for profile in self.workloads:
+            if profile.name in seen:
+                raise ValueError(f"workloads: profile {profile.name!r} is declared twice")
+            seen.add(profile.name)
+            for name in profile.credentials:
+                if self.credential(name) is None:
+                    known = ", ".join(c.name for c in self.credentials) or "none"
+                    raise ValueError(
+                        f"workloads.{profile.name}.credentials names {name!r}, which is not "
+                        f"declared under [[credentials]] (declared: {known})"
+                    )
+        default = self.workload.default
+        if default is not None and default not in seen:
+            known = ", ".join(sorted(seen)) or "none"
+            raise ValueError(
+                f"[workload] default = {default!r} names no [[workloads]] profile "
+                f"(declared: {known})"
+            )
+        return self
+
+    def workload_profile(self, name: str | None = None) -> WorkloadProfile | None:
+        """The `[[workloads]]` profile called ``name`` (the `[workload]`
+        default when None); None when the run has no profile. A name no
+        profile carries is a ``ConfigError`` naming it."""
+        name = name if name is not None else self.workload.default
+        if name is None:
+            return None
+        profile = next((p for p in self.workloads if p.name == name), None)
+        if profile is None:
+            known = ", ".join(p.name for p in self.workloads) or "none"
+            raise ConfigError(
+                f"workload profile {name!r} is not declared under [[workloads]] (declared: {known})"
+            )
+        return profile
+
+    def for_workload_profile(self, name: str | None) -> Config:
+        """This config narrowed to one workload run's profile (#758): the
+        profile pinned as the default (so the persisted config carries the
+        choice through a resume) and its budget overrides applied."""
+        profile = self.workload_profile(name)
+        if profile is None:
+            return self
+        return self.model_copy(
+            update={
+                "workload": self.workload.model_copy(update={"default": profile.name}),
+                "budgets": profile.budgets.apply(self.budgets),
+            }
+        )
+
+    def registries_for(self, repo: str | None = None) -> list[RegistryConfig]:
+        """The private registries ``repo``'s run is configured for (#680):
+        the entry's own list when set, else `[[registries]]`."""
+        entry = self.github.effective_repo(repo)
+        if entry is not None and entry.registries is not None:
+            return list(entry.registries)
+        return list(self.registries)
+
+    def credentialed_registries_for(self, repo: str | None = None) -> list[RegistryConfig]:
+        """The registries with an ``auth_env`` — the service sandbox's (#766):
+        it holds the credential and fetches from them. A registry without
+        one stays the agent sandbox's own; there is no secret to keep from
+        it."""
+        return [r for r in self.registries_for(repo) if r.auth_env is not None]
+
+    def open_registries_for(self, repo: str | None = None) -> list[RegistryConfig]:
+        """The registries without a credential, configured in the agent
+        sandbox as they always were."""
+        return [r for r in self.registries_for(repo) if r.auth_env is None]
+
+    def registry_auth_envs_for(self, repo: str | None = None) -> list[str]:
+        """The daemon-environment names the registries' credentials come
+        from — delivered to the service sandbox, never the agent's."""
+        return list(
+            dict.fromkeys(r.auth_env for r in self.registries_for(repo) if r.auth_env is not None)
+        )
+
+    def apt_packages_for(self, repo: str | None = None) -> list[str]:
+        """The OS packages ``repo``'s agent sandbox gets beside its toolchains
+        (#681): the entry's own list when set, else `[sandbox] apt_packages`."""
+        entry = self.github.effective_repo(repo)
+        if entry is not None and entry.apt_packages is not None:
+            return list(entry.apt_packages)
+        return list(self.sandbox.apt_packages)
+
+    def setup_commands_for(self, repo: str | None = None) -> list[str]:
+        """The commands run in ``repo``'s workspace before the first phase
+        (#681): the entry's own list when set, else `[sandbox] setup_commands`."""
+        entry = self.github.effective_repo(repo)
+        if entry is not None and entry.setup_commands is not None:
+            return list(entry.setup_commands)
+        return list(self.sandbox.setup_commands)
+
+    def verify_mode_for(self, repo: str | None = None) -> VerifyMode:
+        """What ``repo``'s verify phase decides (#682): the entry's own mode
+        when set, else `[sandbox] verify_mode`."""
+        entry = self.github.effective_repo(repo)
+        if entry is not None and entry.verify_mode is not None:
+            return entry.verify_mode
+        return self.sandbox.verify_mode
+
+    @model_validator(mode="after")
+    def _env_and_registry_credentials_are_disjoint(self) -> Config:
+        """A registry's credential is a secret (#680): plain env must not
+        name it, in the global scope or any repository's effective one (an
+        entry that overrides only one side can collide with the global
+        other)."""
+        for scope in (None, *(entry.repo for entry in self.github.repos)):
+            both = sorted(
+                set(self.sandbox_env_for(scope)) & set(self.registry_auth_envs_for(scope))
+            )
+            if both:
+                where = "[sandbox]" if scope is None else f"github.repos[{scope}]"
+                raise ValueError(
+                    f"{where}: env and a registry's auth_env both name {both}: the credential "
+                    "is read from the daemon's environment, not written in the config"
+                )
+        return self
 
     @model_validator(mode="after")
     def _chat_backend_is_consistent(self) -> Config:
@@ -1407,7 +2259,9 @@ class Config(_ConfigModel):
             )
         return self
 
-    def chat_section(self, backend: ChatBackend) -> DiscordConfig | SlackConfig:
+    def chat_section(self, backend: BridgeBackend) -> DiscordConfig | SlackConfig | TuiConfig:
+        if backend == "local":
+            return self.tui
         return self.discord if backend == "discord" else self.slack
 
     @property
@@ -1428,7 +2282,9 @@ class Config(_ConfigModel):
     def chat_settings(self) -> DiscordConfig | SlackConfig | None:
         """The active backend's section, or None when the daemon is headless."""
         backend = self.chat_backend
-        return None if backend is None else self.chat_section(backend)
+        if backend is None:
+            return None
+        return self.discord if backend == "discord" else self.slack
 
     def workspace_for_repo(self, repo: str | None) -> Path | None:
         """The host checkout runs for ``repo`` clone and refresh from.
@@ -1462,6 +2318,24 @@ class Config(_ConfigModel):
             return legacy
         return legacy if hostgit.origin_matches_repo(legacy, entry.repo) else None
 
+    def workspace_source(self, repo: str | None) -> WorkspaceSource:
+        """Where a fresh run for ``repo`` gets its tree from.
+
+        ``configured``: :meth:`workspace_for_repo` names a host checkout.
+        ``remote``: a workspace is configured, but for another repository —
+        the run clones ``repo`` from its own remote rather than borrowing
+        that checkout. ``none``: nothing is configured anywhere; the agent
+        starts from an empty directory and the run's output is harvested as
+        artifacts.
+        """
+        if self.workspace_for_repo(repo) is not None:
+            return "configured"
+        if self.sandbox.workspace is not None or any(
+            entry.workspace is not None for entry in self.github.repos
+        ):
+            return "remote"
+        return "none"
+
 
 def _read_toml(path: Path) -> dict[str, Any]:
     try:
@@ -1488,6 +2362,124 @@ def _sbxloop_toml_layer(cwd: Path) -> dict[str, Any]:
     if not path.is_file():
         return {}
     return _read_toml(path)
+
+
+def _has_config_file(directory: Path) -> bool:
+    return (directory / "sbxloop.toml").is_file() or bool(_pyproject_layer(directory))
+
+
+# What a repository may say about itself (#671). A `sbxloop.toml` or
+# `[tool.sbxloop]` that the target repository *carries* — tracked in git, so
+# any merged pull request (the loop's own included) can change it — is
+# project config: how the tree is built and checked, how its branches and
+# PRs are named. Everything else — egress policy, the merge gate, budgets,
+# the daemon, where state lives, which repository the token delivers to — is
+# the operator's, and is honoured only from files the operator owns.
+PROJECT_LAYER_KEYS: dict[str, frozenset[str]] = {
+    "sandbox": frozenset({"languages", "gate_command"}),
+    "github": frozenset({"branch_prefix", "pr_title_template", "commit_message_template"}),
+    "artifacts": frozenset({"exclude"}),
+}
+
+
+class ConfigDiscovery(NamedTuple):
+    """Where a load looked for its file layers.
+
+    ``root`` is the directory whose ``sbxloop.toml`` / ``pyproject.toml``
+    were read — ``cwd`` itself, or the nearest ancestor up to and including
+    the enclosing git checkout's top level that carries one (a run from
+    ``packages/foo/`` of a monorepo used to see built-in defaults, #671).
+    ``git_root`` is that checkout, or None outside one.
+    """
+
+    cwd: Path
+    root: Path
+    git_root: Path | None
+
+    def is_project_file(self, path: Path) -> bool:
+        """Whether ``path`` came with the repository rather than from the
+        operator: inside a checkout *and* tracked by git. A file whose
+        tracked-ness cannot be determined is treated as the repository's —
+        the restrictive reading."""
+        from sbxloop import hostgit
+
+        if self.git_root is None:
+            return False
+        return hostgit.is_tracked(self.git_root, path) is not False
+
+
+def discover_config(cwd: Path) -> ConfigDiscovery:
+    from sbxloop import hostgit
+
+    git_root = hostgit.repo_toplevel(cwd)
+    if git_root is None:
+        return ConfigDiscovery(cwd, cwd, None)
+    top = git_root.resolve()
+    for candidate in (cwd.resolve(), *cwd.resolve().parents):
+        if _has_config_file(candidate):
+            return ConfigDiscovery(cwd, candidate, top)
+        if candidate == top:
+            break
+    return ConfigDiscovery(cwd, cwd, top)
+
+
+def _project_layer(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Split a repository-carried layer into the keys it may set and the
+    dotted keys it may not."""
+    kept: dict[str, Any] = {}
+    dropped: list[str] = []
+    for section, value in raw.items():
+        allowed = PROJECT_LAYER_KEYS.get(section)
+        if allowed is None or not isinstance(value, dict):
+            dropped.extend(_flatten({section: value}))
+            continue
+        keep = {k: v for k, v in value.items() if k in allowed}
+        if keep:
+            kept[section] = keep
+        dropped.extend(_flatten({section: {k: v for k, v in value.items() if k not in allowed}}))
+    return kept, dropped
+
+
+def _file_layers(
+    discovery: ConfigDiscovery,
+    *,
+    sbxloop_toml_text: str | None = None,
+    dropped_keys: list[str] | None = None,
+) -> list[tuple[str, dict[str, Any]]]:
+    """The two file layers at the discovered root, each cut down to project
+    config when the repository carries it (see ``PROJECT_LAYER_KEYS``).
+    ``sbxloop_toml_text`` stands in for the root's ``sbxloop.toml`` — a
+    draft validated exactly as the file would load, the cut-down included;
+    ``dropped_keys`` collects what the cut-down ignored."""
+    layers: list[tuple[str, dict[str, Any]]] = []
+    for name, read in (
+        ("pyproject.toml", _pyproject_layer),
+        ("sbxloop.toml", _sbxloop_toml_layer),
+    ):
+        path = discovery.root / name
+        if name == "sbxloop.toml" and sbxloop_toml_text is not None:
+            try:
+                raw = tomllib.loads(sbxloop_toml_text)
+            except tomllib.TOMLDecodeError as exc:
+                raise ConfigError(f"invalid TOML in the draft of {path}: {exc}") from exc
+        else:
+            raw = read(discovery.root)
+        if raw and discovery.is_project_file(path):
+            raw, dropped = _project_layer(raw)
+            if dropped_keys is not None:
+                dropped_keys.extend(dropped)
+            if dropped:
+                log.warning(
+                    "config.project_layer.ignored",
+                    path=str(path),
+                    keys=sorted(dropped),
+                    hint="a repository's own config may set only project keys; "
+                    "operator settings belong in ~/.config/sbxloop/sbxloop.toml, "
+                    "an untracked sbxloop.toml, or the environment",
+                )
+            name = f"{name} (project)"
+        layers.append((name, raw))
+    return layers
 
 
 def user_config_path(env: Mapping[str, str]) -> Path | None:
@@ -1555,28 +2547,54 @@ def _flatten(data: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     return flat
 
 
-def load_dotenv_file(cwd: Path | None = None) -> Path | None:
-    """Load ``<cwd>/.env`` into the process environment, if present.
+def load_dotenv_file(cwd: Path | None = None, env: Mapping[str, str] | None = None) -> Path | None:
+    """Load the operator's ``.env`` files into the process environment.
 
-    Real environment variables always win (``override=False``), so a ``.env``
-    file is a convenience layer for the two PATs and ``SBXLOOP_*`` settings —
-    never a way to silently shadow explicit exports. Returns the loaded path,
-    or None when there is no file.
+    Two places, most specific first: ``<cwd>/.env`` — but only when ``cwd``
+    is not inside a git checkout, because a checkout's ``.env`` is the
+    *application's* (its own secrets, its own settings) and must never leak
+    into the loop's environment (#671) — then ``~/.config/sbxloop/.env``
+    next to the user config. Real environment variables always win
+    (``override=False``), so a ``.env`` file is a convenience layer for the
+    PATs and ``SBXLOOP_*`` settings — never a way to silently shadow explicit
+    exports. Returns the first path loaded, or None when there is none.
     """
     from dotenv import load_dotenv
 
-    path = (cwd or Path.cwd()) / ".env"
-    if not path.is_file():
-        return None
-    load_dotenv(path, override=False)
-    return path
+    from sbxloop import hostgit
+
+    env = os.environ if env is None else env
+    cwd = cwd or Path.cwd()
+    candidates: list[Path] = []
+    local = cwd / ".env"
+    if local.is_file():
+        if hostgit.repo_toplevel(cwd) is None:
+            candidates.append(local)
+        else:
+            log.debug(
+                "config.dotenv.skipped",
+                path=str(local),
+                reason="inside a git checkout: an application's .env is never loaded",
+            )
+    user = user_config_path(env)
+    if user is not None and (user.parent / ".env").is_file():
+        candidates.append(user.parent / ".env")
+    for path in candidates:
+        load_dotenv(path, override=False)
+    return candidates[0] if candidates else None
 
 
 def load_config_with_sources(
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
+    *,
+    sbxloop_toml_text: str | None = None,
+    dropped_keys: list[str] | None = None,
 ) -> tuple[Config, dict[str, str]]:
-    """Load config and report, per dotted key, which layer supplied it."""
+    """Load config and report, per dotted key, which layer supplied it.
+    ``sbxloop_toml_text`` replaces the discovered root's ``sbxloop.toml``
+    (the console validating a draft); ``dropped_keys`` receives the keys a
+    repository-carried layer may not set."""
     cwd = cwd or Path.cwd()
     if env is None:
         # Only consult .env when reading the real environment; explicit env
@@ -1584,10 +2602,10 @@ def load_config_with_sources(
         load_dotenv_file(cwd)
     env = os.environ if env is None else env
 
+    discovery = discover_config(cwd)
     layers: list[tuple[str, dict[str, Any]]] = [
         ("user config", _user_config_layer(env)),
-        ("pyproject.toml", _pyproject_layer(cwd)),
-        ("sbxloop.toml", _sbxloop_toml_layer(cwd)),
+        *_file_layers(discovery, sbxloop_toml_text=sbxloop_toml_text, dropped_keys=dropped_keys),
         ("env", _env_layer(env)),
     ]
 
@@ -1627,7 +2645,7 @@ def load_config_with_sources(
         # An explicit relative state_dir means project-scoped state: pin it
         # to the directory the config was discovered in so its meaning
         # cannot drift with a later chdir.
-        config = config.model_copy(update={"state_dir": cwd / config.state_dir})
+        config = config.model_copy(update={"state_dir": discovery.root / config.state_dir})
 
     for dotted in _flatten(config.model_dump()):
         sources.setdefault(dotted, "default")
@@ -1636,6 +2654,7 @@ def load_config_with_sources(
     log.debug(
         "config.loaded",
         cwd=str(cwd),
+        root=str(discovery.root),
         state_dir=str(config.state_dir),
         layers={name: len(_flatten(layer)) for name, layer in layers},
         overrides=overridden,

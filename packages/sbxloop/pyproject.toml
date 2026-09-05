@@ -31,6 +31,7 @@ dependencies = [
     # `requires-python` is a PEP 440 specifier; the toolchain series a run
     # provisions is chosen against it (#627).
     "packaging>=24",
+    "textual>=8.2",
 ]
 
 [project.optional-dependencies]
@@ -72,10 +73,18 @@ version-file = "src/sbxloop/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/sbxloop"]
-artifacts = ["src/sbxloop/_vendor/*.whl", "src/sbxloop/data/*.example"]
+artifacts = [
+  "src/sbxloop/_vendor/*.whl",
+  "src/sbxloop/data/*.example",
+  "src/sbxloop/data/presets/*.toml",
+]
 
 [tool.hatch.build.targets.sdist]
-artifacts = ["src/sbxloop/_vendor/*.whl", "src/sbxloop/data/*.example"]
+artifacts = [
+  "src/sbxloop/_vendor/*.whl",
+  "src/sbxloop/data/*.example",
+  "src/sbxloop/data/presets/*.toml",
+]
 
 [tool.hatch.build.hooks.custom]
 path = "hatch_build.py"

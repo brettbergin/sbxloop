@@ -80,6 +80,10 @@ def scripted_response(root: Path, args: list[str]) -> dict[str, object] | None:
             if response.get("once"):
                 del responses[i]
                 path.write_text(json.dumps(responses))
+            if response.get("passthrough"):
+                # A carve-out: this prefix is handled by the real fake even
+                # though a broader scripted prefix further down would match.
+                return None
             return dict(response)
     return None
 

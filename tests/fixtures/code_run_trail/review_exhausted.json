@@ -1,0 +1,333 @@
+{
+ "events": [
+  {
+   "type": "run.start"
+  },
+  {
+   "state": "provisioning",
+   "type": "run.state"
+  },
+  {
+   "state": "decomposing",
+   "type": "run.state"
+  },
+  {
+   "kind": "agent.session",
+   "type": "worker.start"
+  },
+  {
+   "status": "ok",
+   "type": "worker.result"
+  },
+  {
+   "type": "worker.end"
+  },
+  {
+   "state": "building",
+   "type": "run.state"
+  },
+  {
+   "state": "pending",
+   "task_id": "t1",
+   "type": "task.state"
+  },
+  {
+   "type": "run.tasks"
+  },
+  {
+   "state": "executing",
+   "task_id": "t1",
+   "type": "task.state"
+  },
+  {
+   "task_id": "t1",
+   "type": "task.start"
+  },
+  {
+   "kind": "agent.session",
+   "type": "worker.start"
+  },
+  {
+   "agent": "builder",
+   "backend": "echo",
+   "model": "echo",
+   "type": "agent.message"
+  },
+  {
+   "status": "ok",
+   "type": "worker.result"
+  },
+  {
+   "type": "worker.end"
+  },
+  {
+   "attempt": 1,
+   "phase": "build",
+   "status": "ok",
+   "task_id": "t1",
+   "type": "phase.end"
+  },
+  {
+   "state": "verifying",
+   "task_id": "t1",
+   "type": "task.state"
+  },
+  {
+   "kind": "shell.batch",
+   "type": "worker.start"
+  },
+  {
+   "status": "ok",
+   "type": "worker.result"
+  },
+  {
+   "type": "worker.end"
+  },
+  {
+   "state": "done",
+   "task_id": "t1",
+   "type": "task.state"
+  },
+  {
+   "state": "done",
+   "task_id": "t1",
+   "type": "task.end"
+  },
+  {
+   "state": "gating",
+   "type": "run.state"
+  },
+  {
+   "state": "delivering",
+   "type": "run.state"
+  },
+  {
+   "pr": 7,
+   "round": 1,
+   "type": "run.deliver"
+  },
+  {
+   "state": "reviewing",
+   "type": "run.state"
+  },
+  {
+   "kind": "agent.session",
+   "type": "worker.start"
+  },
+  {
+   "status": "ok",
+   "type": "worker.result"
+  },
+  {
+   "type": "worker.end"
+  },
+  {
+   "pr": 7,
+   "round": 1,
+   "type": "review.verdict",
+   "verdict": "request_changes"
+  },
+  {
+   "kind": "review",
+   "pr": 7,
+   "round": 1,
+   "task_id": "fix-1",
+   "type": "fix.round"
+  },
+  {
+   "state": "done",
+   "task_id": "t1",
+   "type": "task.state"
+  },
+  {
+   "state": "pending",
+   "task_id": "fix-1",
+   "type": "task.state"
+  },
+  {
+   "type": "run.tasks"
+  },
+  {
+   "state": "fixing",
+   "type": "run.state"
+  },
+  {
+   "state": "executing",
+   "task_id": "fix-1",
+   "type": "task.state"
+  },
+  {
+   "task_id": "fix-1",
+   "type": "task.start"
+  },
+  {
+   "kind": "agent.session",
+   "type": "worker.start"
+  },
+  {
+   "agent": "builder",
+   "backend": "echo",
+   "model": "echo",
+   "type": "agent.message"
+  },
+  {
+   "status": "ok",
+   "type": "worker.result"
+  },
+  {
+   "type": "worker.end"
+  },
+  {
+   "round": 1,
+   "task_id": "fix-1",
+   "type": "fix.unanswered"
+  },
+  {
+   "attempt": 1,
+   "phase": "build",
+   "status": "ok",
+   "task_id": "fix-1",
+   "type": "phase.end"
+  },
+  {
+   "state": "verifying",
+   "task_id": "fix-1",
+   "type": "task.state"
+  },
+  {
+   "kind": "shell.batch",
+   "type": "worker.start"
+  },
+  {
+   "status": "ok",
+   "type": "worker.result"
+  },
+  {
+   "type": "worker.end"
+  },
+  {
+   "state": "done",
+   "task_id": "fix-1",
+   "type": "task.state"
+  },
+  {
+   "state": "done",
+   "task_id": "fix-1",
+   "type": "task.end"
+  },
+  {
+   "state": "gating",
+   "type": "run.state"
+  },
+  {
+   "state": "delivering",
+   "type": "run.state"
+  },
+  {
+   "pr": 7,
+   "round": 2,
+   "type": "run.deliver"
+  },
+  {
+   "pr": 7,
+   "round": 1,
+   "type": "review.reconciled"
+  },
+  {
+   "state": "reviewing",
+   "type": "run.state"
+  },
+  {
+   "kind": "agent.session",
+   "type": "worker.start"
+  },
+  {
+   "status": "ok",
+   "type": "worker.result"
+  },
+  {
+   "type": "worker.end"
+  },
+  {
+   "pr": 7,
+   "round": 2,
+   "type": "review.reconciled"
+  },
+  {
+   "pr": 7,
+   "round": 2,
+   "type": "review.verdict",
+   "verdict": "request_changes"
+  },
+  {
+   "mounted": true,
+   "type": "run.artifacts"
+  },
+  {
+   "state": "failed",
+   "type": "run.state"
+  },
+  {
+   "exhausted": "review",
+   "pr": 7,
+   "state": "failed",
+   "type": "run.end"
+  }
+ ],
+ "sandbox_events": [
+  {
+   "delivery": "env-file",
+   "name": "sbxloop-<run>-agent",
+   "type": "sandbox.secret_env_fallback"
+  },
+  {
+   "delivery": "env-file",
+   "name": "sbxloop-<run>-github",
+   "type": "sandbox.secret_env_fallback"
+  },
+  {
+   "mounted": true,
+   "name": "sbxloop-<run>-agent",
+   "type": "sandbox.workspace_mount"
+  },
+  {
+   "name": "sbxloop-<run>-agent",
+   "role": "agent",
+   "type": "sandbox.provision_start"
+  },
+  {
+   "name": "sbxloop-<run>-agent",
+   "role": "agent",
+   "type": "sandbox.ready"
+  },
+  {
+   "name": "sbxloop-<run>-github",
+   "role": "github",
+   "type": "sandbox.provision_start"
+  },
+  {
+   "name": "sbxloop-<run>-github",
+   "role": "github",
+   "type": "sandbox.ready"
+  },
+  {
+   "type": "sandbox.languages"
+  },
+  {
+   "type": "sandbox.toolchain"
+  }
+ ],
+ "states": [
+  "provisioning",
+  "decomposing",
+  "building",
+  "gating",
+  "delivering",
+  "reviewing",
+  "fixing",
+  "gating",
+  "delivering",
+  "reviewing",
+  "failed"
+ ]
+}

@@ -34,7 +34,7 @@ from urllib.parse import quote
 
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
-from sbxloop.gh.ops import GithubOps, raw_pages
+from sbxloop.gh.ops import GithubOps, Identity, identities_match, raw_pages, user_identity
 from sbxloop.ghids import issue_item_id, try_parse_gh_id
 from sbxloop.log import get_logger
 
@@ -56,6 +56,17 @@ _CLAIM_RE = re.compile(
     + r" -->"
 )
 _STARTED_RE = re.compile(r"^Run `[^`]+` started\.")
+# Every hidden marker the loop writes into an issue thread (claims,
+# status comments, follow-up lists). Readers building an outcome strip
+# them from what they keep and drop the comments that are only markers.
+HIDDEN_MARKER_RE = re.compile(r"<!--\s*sbxloop-\S+.*?-->", re.DOTALL)
+# Stamped onto every status comment the source posts (started, merged,
+# blocked, ...), so the outcome reader can tell the loop's own chatter
+# from the humans' discussion without an identity lookup (#691).
+STATUS_MARKER = "<!-- sbxloop-status -->"
+# A bare ``#123`` reference, not part of a word, path (``a/b#1``) or an
+# HTML entity; and a same-repository issue/PR URL on any host (#623).
+_ISSUE_REF_RE = re.compile(r"(?<![\w/&#])#(\d+)\b")
 
 
 class ClaimComment(NamedTuple):
@@ -66,6 +77,34 @@ class ClaimComment(NamedTuple):
     token: str
     host: str
     pid: int | None
+
+
+class IssueComment(NamedTuple):
+    """One comment of the issue's discussion, as the outcome carries it."""
+
+    author: str
+    created: str  # the date, ``YYYY-MM-DD``
+    body: str
+
+
+class LinkedIssue(NamedTuple):
+    """An issue or pull request the discussion refers to (#691)."""
+
+    number: int
+    title: str
+    state: str
+    excerpt: str
+    kind: str  # "issue" or "pull request"
+
+
+class IssueContext(NamedTuple):
+    """What an issue says beyond its title and body (#691): the discussion,
+    minus the loop's own comments, and the issues it links to. ``omitted``
+    counts the earliest comments dropped by the comment cap."""
+
+    comments: tuple[IssueComment, ...]
+    omitted: int
+    linked: tuple[LinkedIssue, ...]
 
 
 def _clean_error(text: str, limit: int = 200) -> str:
@@ -263,7 +302,111 @@ class GitHubIssueSource:
         )
 
     def _comment(self, ops: GithubOps, number: str, body: str) -> None:
+        # A claim already carries its own marker; every other status
+        # comment gets the hidden stamp so ``issue_context`` can leave the
+        # loop's chatter out of the discussion it hands the agent.
+        if "<!-- sbxloop-" not in body:
+            body = f"{body}\n\n{STATUS_MARKER}"
         ops.issue_comment(self.repo, int(number), body)
+
+    # -- the issue beyond its body (#691) -----------------------------------------
+
+    def issue_context(
+        self,
+        item: WorkItem,
+        *,
+        own: Identity = ("", None),
+        max_comments: int = 20,
+        max_linked: int = 10,
+        excerpt_chars: int = 400,
+    ) -> IssueContext:
+        """The issue's discussion and the issues it links to.
+
+        On real trackers the body is a one-liner and the substance lives in
+        the comments — the repro, the maintainer's scoping, "do it the way
+        #123 did" — so the outcome carries them. Left out: any comment the
+        loop wrote (``own`` is its identity; a comment that is a hidden
+        marker with nothing else, or a marker-stamped status comment,
+        counts as the loop's even when the identity is unknown), with the
+        markers stripped from the comments that stay. The last
+        ``max_comments`` are kept — a long thread's latest comments are
+        where the decision usually is — and the count dropped is reported.
+        Linked issues are the ``#N`` and same-repository issue/PR URLs in
+        the body and the kept comments, in first-mention order, each read
+        for its title, state and the head of its body; one that cannot be
+        read is skipped. A failure reading the comments **raises** (after
+        the usual failure notice): the caller decides how to run without
+        the discussion, and says so in the outcome.
+        """
+        number = item.source_key
+        ops = self._ops()
+        try:
+            rows = list(raw_pages(ops, f"{self._issue_path(number)}/comments"))
+        except (GithubOpsError, WorkerError, SbxError) as exc:
+            log.warning("github.comments_failed", repo=self.repo, issue=number, error=str(exc))
+            self._failed(exc)
+            raise
+        comments: list[IssueComment] = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            raw_body = str(row.get("body") or "")
+            body = HIDDEN_MARKER_RE.sub("", raw_body).strip()
+            if not body or STATUS_MARKER in raw_body:
+                continue
+            author = user_identity(row.get("user"))
+            if own[0] and identities_match(author, own):
+                continue
+            comments.append(
+                IssueComment(author[0] or "unknown", str(row.get("created_at") or "")[:10], body)
+            )
+        omitted = max(0, len(comments) - max_comments)
+        kept = tuple(comments[omitted:])
+        linked = self._linked_issues(
+            ops, number, [item.body, *(c.body for c in kept)], max_linked, excerpt_chars
+        )
+        return IssueContext(kept, omitted, linked)
+
+    def _linked_issues(
+        self, ops: GithubOps, number: str, texts: Sequence[str], limit: int, excerpt_chars: int
+    ) -> tuple[LinkedIssue, ...]:
+        url_re = re.compile(
+            r"https?://[^\s/]+/" + re.escape(self.repo) + r"/(?:issues|pull)/(\d+)\b",
+            re.IGNORECASE,
+        )
+        found: list[int] = []
+        for text in texts:
+            for match in url_re.finditer(text):
+                found.append(int(match.group(1)))
+            for match in _ISSUE_REF_RE.finditer(text):
+                found.append(int(match.group(1)))
+        wanted: list[int] = []
+        for ref in found:
+            if ref != int(number) and ref not in wanted:
+                wanted.append(ref)
+        linked: list[LinkedIssue] = []
+        for ref in wanted[:limit]:
+            try:
+                row = ops.raw("GET", self._issue_path(str(ref)))
+            except (GithubOpsError, WorkerError, SbxError) as exc:
+                log.debug("github.linked_issue_skipped", repo=self.repo, issue=ref, error=str(exc))
+                continue
+            if not isinstance(row, dict) or not row.get("title"):
+                continue
+            body = HIDDEN_MARKER_RE.sub("", str(row.get("body") or ""))
+            excerpt = " ".join(body.split())
+            if len(excerpt) > excerpt_chars:
+                excerpt = excerpt[:excerpt_chars].rstrip() + "…"
+            linked.append(
+                LinkedIssue(
+                    ref,
+                    str(row["title"]).strip(),
+                    str(row.get("state") or "unknown"),
+                    excerpt,
+                    "pull request" if row.get("pull_request") else "issue",
+                )
+            )
+        return tuple(linked)
 
     # -- protocol ---------------------------------------------------------------
 
@@ -1049,6 +1192,9 @@ class MultiRepoIssueSource:
 
     def claim(self, item: WorkItem) -> bool:
         return self.for_item(item).claim(item)
+
+    def issue_context(self, item: WorkItem, **kwargs: Any) -> IssueContext:
+        return self.for_item(item).issue_context(item, **kwargs)
 
     def settle_claim(self, item: WorkItem) -> bool:
         return self.for_item(item).settle_claim(item)

@@ -290,14 +290,19 @@ class ClaudeBackend:
         kwargs: dict[str, Any] = {
             # The Claude Code system prompt is opt-in for SDK sessions; the
             # coding personas are written against a Claude Code-shaped
-            # agent, so the preset is always requested and the job's system
+            # agent, so the preset is requested and the job's system
             # message appended after it (the Copilot backend's `append`
-            # mode, same semantics).
-            "system_prompt": (
-                {"type": "preset", "preset": "claude_code", "append": job.system_message}
-                if job.system_message
-                else {"type": "preset", "preset": "claude_code"}
-            ),
+            # mode, same semantics). A job that declines the preset is not
+            # a coding agent: its system message is the whole system
+            # prompt, and with none the SDK's own default stands.
+            "system_prompt": self._system_prompt(job),
+            # No filesystem settings — the SDK's own default, declared
+            # rather than inherited (#688): the repository's CLAUDE.md
+            # reaches every phase through the prompt's repository
+            # conventions block, capped by the host, and a target repo's
+            # `.claude/settings.json` (hooks, permission rules) must not
+            # reconfigure an unattended session under it.
+            "setting_sources": [],
         }
         if job.model and job.model != "auto":
             kwargs["model"] = job.model
@@ -352,6 +357,14 @@ class ClaudeBackend:
             return PermissionResultAllow()
 
         return can_use_tool
+
+    @staticmethod
+    def _system_prompt(job: JobRequest) -> Any:
+        if not job.system_preset:
+            return job.system_message
+        if job.system_message:
+            return {"type": "preset", "preset": "claude_code", "append": job.system_message}
+        return {"type": "preset", "preset": "claude_code"}
 
     def _host_tool_server(self, job: JobRequest, emit: EmitFn) -> Any:
         """An in-process MCP server whose tools round-trip to the host."""

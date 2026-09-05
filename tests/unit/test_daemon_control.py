@@ -26,6 +26,7 @@ from sbxloop.daemon.control import (
     ControlServer,
     _reply_from,
     dispatch,
+    format_log_tail,
     plain,
     usage,
 )
@@ -82,6 +83,20 @@ class TestDispatch:
         assert "run again fresh" in dispatch(floop, "cancel --retry", by="ops").text
         assert dispatch(floop, "retry gh:issue:8", by="ops").ok
         assert floop.retried == [("gh:issue:8", "ops")]
+
+    def test_a_client_names_its_operator_on_the_request(self, tmp_path: Path) -> None:
+        """The console submits as "<user> via sbxloop tui": the request
+        carries it, so the source's "cancelled by …" names the surface."""
+        floop = FakeLoop(_dstore(tmp_path))
+        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        server.start()
+        try:
+            client = ControlClient(tmp_path, by="brett via sbxloop tui")
+            reply = client.submit("cancel", timeout_s=5)
+            assert reply is not None and reply.ok
+            assert floop.cancel_calls == [("brett via sbxloop tui", False)]
+        finally:
+            server.close()
 
     def test_item_verbs_report_the_stores_reason(self, tmp_path: Path) -> None:
         floop = FakeLoop(_dstore(tmp_path))
@@ -148,14 +163,93 @@ class TestDispatch:
             assert not reply.ok and "usage:" in reply.text, cmd
         assert not floop.paused and floop.hold_calls == []
 
+    def test_log_answers_from_the_ring_buffer_with_filters(self, tmp_path: Path) -> None:
+        """`!sbx log` / `ctl log`: the journal without ssh, the same rendering
+        the concierge's tool returns."""
+        from sbxloop.log import get_logger
+
+        logger = get_logger("sbxloop.test.ctl")
+        logger.info("ctl.probe_one", n=1)
+        logger.warning("ctl.probe_two", n=2)
+        floop = FakeLoop(_dstore(tmp_path))
+        reply = dispatch(floop, "log --tail 3")
+        assert reply.ok and reply.preformatted and reply.text.startswith("showing")
+        assert "```" not in reply.text, "the fence is the transport's, ctl prints it raw"
+        assert "ctl.probe_two" in reply.text
+        only_warn = dispatch(floop, "log --tail 50 --level WARNING --grep probe")
+        assert "ctl.probe_two" in only_warn.text and "ctl.probe_one" not in only_warn.text
+        assert "level=WARNING" in only_warn.text and "grep='probe'" in only_warn.text
+        # Flags after --grep are still flags; chat hands over quotes verbatim.
+        late = dispatch(floop, 'log --grep "probe_two" --level WARNING --tail 5')
+        assert late.ok and "grep='probe_two'" in late.text and "level=WARNING" in late.text
+        for bad_line in ("log --level LOUD", "log --tail ²", "log --tail 0", "log --grep"):
+            bad = dispatch(floop, bad_line)
+            assert not bad.ok and bad.text.startswith("usage: log"), bad_line
+        usage_reply = dispatch(floop, "log --nope")
+        assert not usage_reply.ok and usage_reply.text.startswith("usage: log")
+        assert format_log_tail(tail=1, grep="no-such-line-anywhere").startswith(
+            "no matching log records"
+        )
+
+    def test_log_fits_a_message_newest_first(self, tmp_path: Path) -> None:
+        """A chat message is head-clipped by its transport: the tail must
+        drop its oldest lines to fit, never its newest."""
+        from sbxloop.log import get_logger
+
+        logger = get_logger("sbxloop.test.ctl")
+        for n in range(40):
+            logger.info("ctl.fit_probe", n=n, pad="x" * 80)
+        text = format_log_tail(tail=40, grep="fit_probe", max_chars=1500)
+        assert len(text) <= 1500
+        assert "n=39" in text and "n=0 " not in text
+        assert "older line(s) trimmed to fit the message" in text
+        full = format_log_tail(tail=40, grep="fit_probe")
+        assert "trimmed" not in full and "n=0 " in full
+
+    def test_log_is_not_traced_into_its_own_buffer(self, tmp_path: Path) -> None:
+        from sbxloop.log import get_logger, log_buffer
+
+        get_logger("sbxloop.test.ctl").info("ctl.trace_probe")
+        floop = FakeLoop(_dstore(tmp_path))
+        before = len(log_buffer())
+        dispatch(floop, "log --grep trace_probe")
+        dispatch(floop, "log --grep trace_probe")
+        assert len(log_buffer()) == before
+
+    def test_stop_asks_the_loop_to_finish_and_exit(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(tmp_path))
+        reply = dispatch(floop, "stop", by="ops")
+        # The flag goes up through `after`, once the caller has sent the
+        # reply — a chat bridge must not be torn down under its answer.
+        assert reply.ok and not getattr(floop, "stopped", False)
+        assert reply.after is not None
+        reply.after()
+        assert floop.stopped
+        assert "exits once the current run" in reply.text and "pause" in reply.text
+        assert not dispatch(floop, "stop now").ok
+        plain_status = floop.status
+        floop.status = lambda: {**plain_status(), "stopping": True}  # type: ignore[method-assign]
+        assert "stopping:" in dispatch(floop, "status").text
+
+    def test_stop_over_ctl_takes_effect_after_the_reply_is_written(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(tmp_path))
+        server = ControlServer(floop, tmp_path, poll_s=0.02)
+        server.dir.mkdir(parents=True)
+        (server.dir / f"{time.time():.6f}-stop.json").write_text(json.dumps({"cmd": "stop"}))
+        assert server.serve_once() == 1
+        assert floop.stopped
+        (reply_path,) = server.dir.glob("*.reply.json")
+        assert json.loads(reply_path.read_text())["ok"]
+
     def test_unknown_verb_returns_usage_with_the_callers_prefix(self, tmp_path: Path) -> None:
         reply = dispatch(FakeLoop(_dstore(tmp_path)), "bogus", prefix="sbxloop daemon ctl")
         assert not reply.ok and not reply.known
         assert reply.text == usage("sbxloop daemon ctl")
         assert (
-            "sbxloop daemon ctl status|pause [--hold NAME]|resume [--hold NAME|--all]|"
+            "sbxloop daemon ctl status|pause [--hold NAME]|resume [<item|run>|--hold NAME|--all]|"
             "cancel [--retry]|queue|items|" in reply.text
         )
+        assert "log [--tail N] [--level LEVEL] [--grep TEXT]|stop" in reply.text
 
     def test_cancel_rejects_unknown_arguments(self, tmp_path: Path) -> None:
         # A typo (`--rety`) must not silently become a terminal no-retry
@@ -454,6 +548,59 @@ class TestDaemonCtlCommand:
             result = runner.invoke(app, ["daemon", "ctl", "bogus"])
             assert result.exit_code == 1
             assert "commands: sbxloop daemon ctl status|pause" in result.output
+        finally:
+            server.close()
+
+    def test_status_json_prints_the_structured_status(self, workdir: Path) -> None:
+        # #639: the deploy pipeline reads this dict with jq instead of
+        # grepping `current:` out of the prose.
+        state_dir = daemon_state(workdir)
+        floop = FakeLoop(_dstore(state_dir))
+        floop.holds.add("deploy-1")
+        floop.claiming = "gh:issue:7"
+        server = ControlServer(floop, state_dir, poll_s=0.02)
+        server.start()
+        try:
+            result = runner.invoke(app, ["daemon", "ctl", "status", "--json"])
+            assert result.exit_code == 0, result.output
+            status = json.loads(result.output)
+            assert status["current"] is None
+            assert status["claiming"] == "gh:issue:7"
+            assert status["holds"] == ["deploy-1"] and isinstance(status["paused"], bool)
+            assert status["queued"] == 2
+            # Not the prose.
+            assert "current:" not in result.output
+        finally:
+            server.close()
+
+    def test_json_is_for_status_only(self, workdir: Path) -> None:
+        result = runner.invoke(app, ["daemon", "ctl", "pause", "--json", "--timeout", "0.2"])
+        assert result.exit_code == 2
+        assert "--json applies to" in result.output
+
+    def test_json_against_an_older_daemon_exits_1_not_2(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A daemon from before #639 answers `status` with prose only. That
+        # is "answered, too old" (exit 1) — distinct from "no daemon" (exit
+        # 2), which a deploy treats as nothing to drain.
+        state_dir = daemon_state(workdir)
+        floop = FakeLoop(_dstore(state_dir))
+        server = ControlServer(floop, state_dir, poll_s=0.02)
+        answer = ControlServer._answer
+
+        def prose_only(self: ControlServer, request: Path, reply: CommandReply) -> None:
+            answer(self, request, reply._replace(status=None))
+
+        monkeypatch.setattr(ControlServer, "_answer", prose_only)
+        server.start()
+        try:
+            result = runner.invoke(app, ["daemon", "ctl", "status", "--json"])
+            assert result.exit_code == 1, result.output
+            assert "without a structured status" in result.output
+            # The prose form is unaffected.
+            result = runner.invoke(app, ["daemon", "ctl", "status"])
+            assert result.exit_code == 0 and "queued: 2" in result.output
         finally:
             server.close()
 

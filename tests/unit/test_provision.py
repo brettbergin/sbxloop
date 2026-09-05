@@ -1,6 +1,8 @@
 """Provisioner tests: specs, token split, policy, secrets, rollback."""
 
+import logging
 import shutil
+import time
 from pathlib import Path
 from typing import ClassVar
 
@@ -1172,6 +1174,113 @@ class TestMountDiscovery:
             pair.cleanup()
 
 
+class TestMountExpected:
+    """A workspace that *is* the work must be seen by the agent (#670).
+
+    Harvest mode is for the bare per-run directory nothing was configured
+    for. Once a checkout is configured — or handed over explicitly — a mount
+    the agent cannot find is a provisioning failure, never a quiet run on an
+    empty directory that "succeeds" with unrelated files.
+    """
+
+    def configured(self, fake_sbx: FakeSbx, tmp_path: Path) -> tuple[Provisioner, list[Event]]:
+        source = tmp_path / "checkout"
+        source.mkdir()
+        (source / "README").write_text("the repo\n")
+        return make_isolation_provisioner(fake_sbx, tmp_path, source)
+
+    def test_configured_workspace_that_never_mounts_fails_closed(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        provisioner, events = self.configured(fake_sbx, tmp_path)
+        with pytest.raises(ProvisionError) as info:
+            provisioner.ensure_pair("r1")
+        message = str(info.value)
+        assert "was not visible inside the agent sandbox sbxloop-r1-agent" in message
+        assert "found no marker under any candidate root" in message
+        assert "sbxloop doctor" in message
+        # The pair is torn down: nothing is left for `sandbox prune`.
+        boxes = fake_sbx.state / "sandboxes"
+        assert not boxes.is_dir() or not any(boxes.iterdir())
+        (mount,) = [e for e in events if e.type == "sandbox.workspace_mount"]
+        assert mount.data["mounted"] is False
+        assert mount.data["probe"] == "answered"
+        # ... and the event does not promise a harvest that is not coming.
+        assert "the run stops" in mount.data["message"]
+        assert "harvest" not in mount.data["message"]
+
+    def test_configured_workspace_with_a_broken_probe_fails_closed(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """Could not tell is not "not mounted": the probe's own failure is
+        what the message names, so field debugging chases the right cause."""
+        fake_sbx.script("exec sbxloop-r1-agent sh -c set --", returncode=1, stderr="find: boom")
+        provisioner, events = self.configured(fake_sbx, tmp_path)
+        with pytest.raises(ProvisionError, match="mount discovery probe failed") as info:
+            provisioner.ensure_pair("r1")
+        assert "probe exited 1: find: boom" in str(info.value)
+        (mount,) = [e for e in events if e.type == "sandbox.workspace_mount"]
+        assert mount.data["probe"] == "error"
+        assert "the run stops" in mount.data["message"]
+
+    def test_explicit_workspace_expects_a_mount(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An embedder or a resume hands the workspace over by path: that
+        path is the work, whatever the config says."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        workspace = tmp_path / "handed-over"
+        workspace.mkdir()
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        with pytest.raises(ProvisionError, match="was not visible inside the agent sandbox"):
+            provisioner.ensure_pair("r1", workspace=workspace)
+
+    def test_explicit_workspace_can_be_declared_harvest_mode(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A resumed harvest-mode run passes its recorded verdict and keeps
+        working the way its first provisioning did."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        workspace = tmp_path / "state/runs/r1/workspace"
+        workspace.mkdir(parents=True)
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        pair = provisioner.ensure_pair("r1", workspace=workspace, expects_mount=False)
+        try:
+            assert not pair.mounted
+            assert pair.agent_workdir == WORK_DIR
+        finally:
+            pair.cleanup()
+
+    def test_mounted_configured_workspace_is_unchanged(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner, _events = self.configured(fake_sbx, tmp_path)
+        pair = provisioner.ensure_pair("r1")
+        try:
+            assert pair.mounted
+            assert (Path(pair.agent_workdir) / "README").read_text() == "the repo\n"
+        finally:
+            pair.cleanup()
+
+    def test_unconfigured_run_stays_harvest_mode(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The game-repo case: nothing configured, the operator wants the
+        artifact flow. The event still says so."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        pair = make_provisioner(fake_sbx, tmp_path, bus=bus).ensure_pair("r1")
+        try:
+            assert not pair.mounted
+            (mount,) = [e for e in events if e.type == "sandbox.workspace_mount"]
+            assert "artifacts will be harvested" in mount.data["message"]
+        finally:
+            pair.cleanup()
+
+
 class TestConformanceRecording:
     """Provisioning's own field checks double as conformance probes: every
     run refreshes the version-keyed verdict cache for free."""
@@ -1674,6 +1783,54 @@ class TestBotLoginResolution:
         assert provisioner.gh_bot_login("owner/repo") is None
 
 
+class TestAppPermissionsResolution:
+    """`Provisioner.gh_app_permissions` (#696): what the installation may
+    do, from the token mint — for doctor, never the engine."""
+
+    def test_pat_mode_answers_none(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+        assert make_provisioner(fake_sbx, tmp_path).gh_app_permissions(None) is None
+
+    def test_app_mode_reports_the_mint_permissions(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.gh import appauth
+
+        minted: list[int] = []
+
+        def mint(creds: object, **kwargs: object) -> appauth.InstallationToken:
+            minted.append(1)
+            return appauth.InstallationToken(
+                "ghs_x", time.time() + 3600.0, {"contents": "write", "checks": "read"}
+            )
+
+        monkeypatch.setattr(appauth, "mint_installation_token", mint)
+        provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
+        assert provisioner.gh_app_permissions(None) == {"contents": "write", "checks": "read"}
+        assert provisioner.gh_app_permissions(None) == {"contents": "write", "checks": "read"}
+        assert minted == [1], "the cached token answers"
+
+    def test_a_failed_mint_answers_none_not_raise(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.errors import GithubOpsError
+        from sbxloop.gh import appauth
+
+        def boom(creds: object, **kwargs: object) -> appauth.InstallationToken:
+            raise GithubOpsError("refused")
+
+        monkeypatch.setattr(appauth, "mint_installation_token", boom)
+        provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
+        assert provisioner.gh_app_permissions(None) is None
+
+    def test_a_misconfigured_credential_answers_none(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = make_provisioner(
+            fake_sbx, tmp_path, env={**TestGithubAppAuth.APP_ENV, "GH_TOKEN": "github_pat_x"}
+        )
+        assert provisioner.gh_app_permissions(None) is None
+
+
 class TestStdinEnvDelivery:
     """Per-job stdin secret delivery (#592): when the exec-stdin-env probe
     passes, non-proxy credential delivery skips the in-VM env file entirely
@@ -1893,3 +2050,317 @@ class TestClaudeAgentBackend:
         assert "ANTHROPIC_API_KEY=sk-ant-claude-agent-key" in content
         assert "SBXLOOP_WORKER_BACKEND=claude" in content
         assert "COPILOT_GITHUB_TOKEN" not in content
+
+
+class TestOperatorSandboxEnv:
+    """`[sandbox] env` reaches the agent sandbox (#679): plain values as
+    given. Its old secret counterpart is gone (#766) — the only credential
+    in the agent sandbox is the agent's own, and nothing here can put
+    another beside it."""
+
+    def _config(self, tmp_path: Path, **repo_overrides: object) -> Config:
+        entry: dict[str, object] = {"repo": "owner/repo", **repo_overrides}
+        return Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "sandbox": {"env": {"RAILS_ENV": "test", "GREETING": "hello world"}},
+                "github": {"repos": [entry]},
+            }
+        )
+
+    def _provisioner(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        *,
+        config: Config | None = None,
+        bus: EventBus | None = None,
+    ) -> Provisioner:
+        return make_provisioner(
+            fake_sbx, tmp_path, config=config or self._config(tmp_path), bus=bus
+        )
+
+    def test_the_agent_spec_carries_the_env_and_no_secrets(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        agent, github = provisioner.build_specs("r1", tmp_path, "owner/repo")
+        assert agent.persistent_env == {"RAILS_ENV": "test", "GREETING": "hello world"}
+        assert agent.secret_env == {}
+        assert "RAILS_ENV" not in github.persistent_env
+        assert github.secret_env == {}
+
+    def test_env_file_delivery_writes_the_plain_values(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        provisioner.ensure_pair("r1", repo="owner/repo")
+        env_sh = (
+            fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+        ).read_text()
+        assert "export RAILS_ENV=test\n" in env_sh
+        assert "export GREETING='hello world'\n" in env_sh
+        github_sh = fake_sbx.sandbox_fs("sbxloop-r1-github") / "home/agent/.sbxloop/env.sh"
+        if github_sh.exists():
+            assert "RAILS_ENV" not in github_sh.read_text()
+
+    def test_stdin_delivery_pipes_the_env_per_job(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBX_FAKE_EXEC_STDIN", "1")
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        provisioner.ensure_pair("r1", repo="owner/repo")
+        env_sh = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+        assert "export RAILS_ENV=test\n" in env_sh.read_text()
+        provider = provisioner.job_env("agent", "owner/repo")
+        assert provider is not None
+        exports = provider()
+        assert exports["RAILS_ENV"] == "test"
+        assert exports["COPILOT_GITHUB_TOKEN"] == TOKENS["COPILOT_GITHUB_TOKEN"]
+        # The agent's own credential is the only secret in its job env.
+        assert set(exports) == {"RAILS_ENV", "GREETING", "COPILOT_GITHUB_TOKEN"}
+
+    def test_a_repository_override_replaces_the_global_setting(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        config = self._config(tmp_path, env={"GOFLAGS": "-mod=vendor"})
+        provisioner = self._provisioner(fake_sbx, tmp_path, config=config)
+        agent, _github = provisioner.build_specs("r1", tmp_path, "owner/repo")
+        assert agent.persistent_env == {"GOFLAGS": "-mod=vendor"}
+        provisioner.ensure_pair("r1", repo="owner/repo")
+        env_sh = (
+            fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+        ).read_text()
+        assert "GOFLAGS=-mod=vendor" in env_sh
+        assert "RAILS_ENV" not in env_sh
+
+    def test_the_backend_selector_stays_on_top_of_operator_env(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        config = Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "agent": {"backend": "claude"},
+                "sandbox": {"env": {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "0"}},
+                **GITHUB_ENABLED,
+            }
+        )
+        provisioner = make_provisioner(
+            fake_sbx, tmp_path, config=config, env={"ANTHROPIC_API_KEY": "sk-ant-x", **TOKENS}
+        )
+        assert provisioner.agent_persistent_env()["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] == "1"
+
+
+class TestPrivateRegistries:
+    """`[[registries]]` (#680, #766): an OPEN registry (no `auth_env`) is
+    the agent sandbox's — its host joins the allowlist and its client env
+    lands in the VM, as before. A CREDENTIALED registry is the service
+    sandbox's: the credential, the client files and the host go there, the
+    dependencies are fetched there into a cache both sandboxes see, and the
+    agent sandbox gets the offline environment for that ecosystem and
+    nothing that names the credential."""
+
+    SECRET = "artifactory-token-7c1e"  # nosec B105 - test fixture
+    REGISTRIES: ClassVar[list[dict[str, object]]] = [
+        {
+            "kind": "npm",
+            "host": "artifactory.example.com",
+            "url": "https://artifactory.example.com/api/npm/npm-virtual/",
+            "auth_env": "NPM_TOKEN",
+            "scope": "@example",
+        },
+        {
+            "kind": "pypi",
+            "host": "artifactory.example.com",
+            "url": "https://artifactory.example.com/api/pypi/pypi-virtual/simple",
+            "auth_env": "NPM_TOKEN",
+            "auth_user": "svc-ci",
+        },
+        {"kind": "go", "host": "github.example.com"},
+    ]
+
+    def _config(self, tmp_path: Path, **overrides: object) -> Config:
+        return Config.model_validate(
+            {
+                "state_dir": str(tmp_path / "state"),
+                "sandbox": {"extra_allow_domains": ["mirror.example.com"]},
+                "registries": self.REGISTRIES,
+                "github": {"repos": [{"repo": "owner/repo"}]},
+                **overrides,
+            }
+        )
+
+    def _provisioner(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        *,
+        config: Config | None = None,
+        with_secret: bool = True,
+        bus: EventBus | None = None,
+    ) -> Provisioner:
+        env = dict(TOKENS)
+        if with_secret:
+            env["NPM_TOKEN"] = self.SECRET
+        return make_provisioner(
+            fake_sbx, tmp_path, config=config or self._config(tmp_path), env=env, bus=bus
+        )
+
+    def _workspace(self, tmp_path: Path) -> Path:
+        from tests.unit.test_hostgit import make_repo
+
+        return make_repo(tmp_path)
+
+    def test_open_registry_hosts_join_the_agent_allowlist_and_credentialed_ones_do_not(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        agent, github = provisioner.build_specs("r1", tmp_path, "owner/repo")
+        assert "github.example.com" in agent.policy_allows  # open: the agent's
+        assert "artifactory.example.com" not in agent.policy_allows  # credentialed: not
+        assert "mirror.example.com" in agent.policy_allows  # extra_allow_domains keeps working
+        assert len(agent.policy_allows) == len(set(agent.policy_allows))  # one rule per host
+        assert "artifactory.example.com" not in github.policy_allows
+        service = provisioner.service_spec("r1", tmp_path, [], "owner/repo")
+        assert "artifactory.example.com" in service.policy_allows
+        assert "github.example.com" not in service.policy_allows
+        # The fetch needs the toolchains' own install sources (node, pip).
+        assert "registry.npmjs.org" in service.policy_allows
+        assert "pypi.org" in service.policy_allows
+        assert len(service.policy_allows) == len(set(service.policy_allows))
+
+    def test_the_credential_and_client_files_land_in_the_service_sandbox_only(
+        self, fake_sbx: FakeSbx, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = self._provisioner(fake_sbx, tmp_path, bus=bus)
+        workspace = self._workspace(tmp_path)
+        with caplog.at_level(logging.DEBUG):
+            pair = provisioner.ensure_pair("r1", workspace, repo="owner/repo")
+        assert pair.service is not None and pair.service_workdir is not None
+
+        service_home = fake_sbx.sandbox_fs("sbxloop-r1-service") / "home/agent"
+        npmrc = (service_home / ".npmrc").read_text()
+        assert "@example:registry=https://artifactory.example.com/api/npm/npm-virtual/\n" in npmrc
+        assert "//artifactory.example.com/api/npm/npm-virtual/:_authToken=${NPM_TOKEN}\n" in npmrc
+        assert self.SECRET not in npmrc
+        assert (service_home / ".netrc").read_text() == (
+            f"machine artifactory.example.com login svc-ci password {self.SECRET}\n"
+        )
+        service_sh = (service_home / ".sbxloop/env.sh").read_text()
+        assert f"export NPM_TOKEN={self.SECRET}\n" in service_sh
+        assert (
+            "export PIP_INDEX_URL=https://artifactory.example.com/api/pypi/pypi-virtual/simple\n"
+            in service_sh
+        )
+        assert "GOPRIVATE" not in service_sh  # the open registry is not its business
+        # the files were staged with cp and locked down, never passed inline
+        chmods = [c for c in fake_sbx.invocations("exec") if "chmod" in c and ".netrc" in c[-1]]
+        assert chmods and chmods[0][-2:] == ["600", "/home/agent/.netrc"]
+
+        agent_home = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent"
+        assert not (agent_home / ".npmrc").exists()
+        assert not (agent_home / ".netrc").exists()
+        agent_sh = (agent_home / ".sbxloop/env.sh").read_text()
+        assert "NPM_TOKEN" not in agent_sh
+        assert "PIP_INDEX_URL" not in agent_sh
+        assert "artifactory.example.com" not in agent_sh
+        assert "export GOPRIVATE=github.example.com\n" in agent_sh  # open: as before
+        # …and instead the offline environment pointing at the shared cache.
+        assert "export npm_config_offline=true\n" in agent_sh
+        assert "export PIP_NO_INDEX=1\n" in agent_sh
+        assert "export PIP_FIND_LINKS=/home/agent/.sbxloop/deps/pypi\n" in agent_sh
+        assert "export npm_config_cache=/home/agent/.sbxloop/deps/npm\n" in agent_sh
+
+        for call in fake_sbx.invocations():
+            assert all(self.SECRET not in arg for arg in call), call
+        for event in events:
+            assert self.SECRET not in repr(event.data), event
+        assert all(self.SECRET not in record.getMessage() for record in caplog.records)
+        assert not (fake_sbx.sandbox_fs("sbxloop-r1-github") / "home/agent/.netrc").exists()
+
+    def test_the_cache_is_one_directory_in_both_sandboxes_and_never_committed(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        bus = EventBus()
+        events: list[Event] = []
+        bus.subscribe(events.append)
+        provisioner = self._provisioner(fake_sbx, tmp_path, bus=bus)
+        workspace = self._workspace(tmp_path)
+        pair = provisioner.ensure_pair("r1", workspace, repo="owner/repo")
+        cache = workspace / ".sbxloop" / "deps"
+        assert cache.is_dir()
+        for name in ("sbxloop-r1-agent", "sbxloop-r1-service"):
+            link = fake_sbx.sandbox_fs(name) / "home/agent/.sbxloop/deps"
+            assert link.is_symlink(), name
+            assert Path(link.readlink()).resolve() == cache.resolve(), name
+        assert ".sbxloop/" in (workspace / ".git/info/exclude").read_text().splitlines()
+        (event,) = [e for e in events if e.type == "sandbox.deps_cache"]
+        assert event.data["name"] == "sbxloop-r1-service"
+        assert event.data["workdir"] == pair.service_workdir
+
+    def test_a_service_sandbox_that_cannot_see_the_workspace_fails_closed(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The fetch lands in the service sandbox's view of the workspace;
+        with no view there is nowhere the agent would find it — not a
+        harvest-mode fallback, a provisioning failure naming the probe."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        provisioner = self._provisioner(fake_sbx, tmp_path)
+        workspace = self._workspace(tmp_path)
+        with pytest.raises(ProvisionError, match="workspace-mount"):
+            provisioner.ensure_pair("r1", workspace, repo="owner/repo")
+
+    def test_an_unset_credential_fails_provisioning_by_name_before_any_sandbox(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = self._provisioner(fake_sbx, tmp_path, with_secret=False)
+        with pytest.raises(ProvisionError, match=r"auth_env names \['NPM_TOKEN'\] are not set"):
+            provisioner.ensure_pair("r1", repo="owner/repo")
+        assert fake_sbx.invocations("create") == []
+
+    def test_operator_env_wins_over_a_registry_derived_variable(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        config = self._config(
+            tmp_path,
+            sandbox={"env": {"GOPRIVATE": "github.example.com,gitlab.example.com"}},
+        )
+        provisioner = self._provisioner(fake_sbx, tmp_path, config=config)
+        assert provisioner.agent_persistent_env("owner/repo")["GOPRIVATE"] == (
+            "github.example.com,gitlab.example.com"
+        )
+
+    def test_open_registries_alone_need_no_service_sandbox(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """Byte-for-byte the pre-#766 run: no credential, no third sandbox,
+        the registry's env and host in the agent's as before."""
+        config = self._config(tmp_path, registries=[self.REGISTRIES[2]])
+        provisioner = self._provisioner(fake_sbx, tmp_path, config=config, with_secret=False)
+        pair = provisioner.ensure_pair("r1", repo="owner/repo")
+        assert pair.service is None
+        created = {c[1].removeprefix("--name=") for c in fake_sbx.invocations("create")}
+        assert created == {"sbxloop-r1-agent", "sbxloop-r1-github"}
+        agent_sh = (
+            fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/env.sh"
+        ).read_text()
+        assert "export GOPRIVATE=github.example.com\n" in agent_sh
+        assert "GOPROXY=off" not in agent_sh
+
+    def test_a_repository_override_replaces_the_global_list(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        config = self._config(
+            tmp_path,
+            github={"repos": [{"repo": "owner/repo", "registries": []}]},
+        )
+        # NPM_TOKEN deliberately absent: the override dropped every
+        # registry, so nothing may ask for it.
+        provisioner = self._provisioner(fake_sbx, tmp_path, config=config, with_secret=False)
+        agent, _github = provisioner.build_specs("r1", tmp_path, "owner/repo")
+        assert "artifactory.example.com" not in agent.policy_allows
+        assert agent.files == {}
+        assert "GOPRIVATE" not in agent.persistent_env

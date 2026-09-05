@@ -7,7 +7,16 @@ from typing import Any, NamedTuple
 import pytest
 
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import MAX_PAGES, FailedCheck, GithubOps, IssueRef, PaginationError, raw_pages
+from sbxloop.gh.ops import (
+    MAX_PAGES,
+    FailedCheck,
+    GithubOps,
+    IssueRef,
+    PaginationError,
+    ReviewVerdict,
+    fold_review_verdicts,
+    raw_pages,
+)
 from sbxloop_worker.protocol import ErrorInfo, JobRequest, JobResult
 from tests.fakes.github_errors import worker_error
 
@@ -157,6 +166,21 @@ class TestGithubOpsFacade:
         # No structured status from the stub -> host field stays unset
         # (callers then fall back to message matching, see deliver tests).
         assert info.value.http_status is None
+
+    def test_default_branch_is_what_the_repository_reports(self) -> None:
+        ops, client = make_ops({"repo.get": {"full_name": "o/r", "default_branch": "develop"}})
+        assert ops.default_branch("o/r") == "develop"
+        assert [j.op for j in client.jobs] == ["repo.get"]
+
+    def test_default_branch_is_never_guessed(self) -> None:
+        """#672: a repository whose payload carries no default branch gets
+        an error naming `deliver_base`, not a silent `main`."""
+        ops, _ = make_ops({"repo.get": {"full_name": "o/r"}})
+        with pytest.raises(GithubOpsError, match="did not report a default branch for o/r"):
+            ops.default_branch("o/r")
+        ops, _ = make_ops({"repo.get": {"full_name": "o/r", "default_branch": ""}})
+        with pytest.raises(GithubOpsError, match="deliver_base"):
+            ops.default_branch("o/r")
 
     def test_error_http_status_is_carried_onto_host_error(self) -> None:
         class StatusClient(StubWorkerClient):
@@ -481,6 +505,57 @@ class TestPrReviewFeedback:
         )
         ops = GithubOps(client, "r1")  # type: ignore[arg-type]
         assert ops.pr_review_feedback("o/r", 7) == ""
+
+
+class TestReviewVerdicts:
+    """#675: each reviewer's standing verdict, for counting approvals."""
+
+    def test_latest_verdict_per_reviewer_dismissal_clears_comments_skip(self) -> None:
+        payload = [
+            review("alice", "CHANGES_REQUESTED", "no"),
+            review("alice", "APPROVED", "ok now"),
+            review("bob", "APPROVED"),
+            review("bob", "DISMISSED"),
+            review("carol", "COMMENTED", "drive-by"),
+            {"user": {"login": "dep[bot]", "type": "Bot"}, "state": "APPROVED"},
+            {"user": None, "state": "APPROVED"},
+            "junk",
+        ]
+        verdicts = fold_review_verdicts(payload)
+        assert [(v.login, v.state, v.is_bot) for v in verdicts] == [
+            ("alice", "APPROVED", False),
+            ("dep[bot]", "APPROVED", True),
+        ]
+
+    def test_the_loops_own_review_is_excluded(self) -> None:
+        payload = [review("sbxloop-bot", "APPROVED"), review("alice", "APPROVED")]
+        assert [v.login for v in fold_review_verdicts(payload, exclude=("sbxloop-bot", False))] == [
+            "alice"
+        ]
+        assert fold_review_verdicts("not a list") == ()
+
+    def test_pr_review_verdicts_reads_the_reviews_paged(self) -> None:
+        client = PathStubClient({"/repos/o/r/pulls/7/reviews": [review("alice", "APPROVED")]})
+        ops = GithubOps(client, "r1")  # type: ignore[arg-type]
+        assert ops.pr_review_verdicts("o/r", 7) == (ReviewVerdict("alice", "APPROVED", False),)
+
+    def test_request_reviewers_splits_users_from_team_slugs(self) -> None:
+        client = PathStubClient({})
+        ops = GithubOps(client, "r1")  # type: ignore[arg-type]
+        ops.pr_request_reviewers("o/r", 7, ["alice", "o/reviewers", "bob"])
+        (job,) = client.jobs
+        assert job.params["method"] == "POST"
+        assert job.params["path"] == "/repos/o/r/pulls/7/requested_reviewers"
+        assert job.params["body"] == {
+            "reviewers": ["alice", "bob"],
+            "team_reviewers": ["reviewers"],
+        }
+
+    def test_request_reviewers_with_nobody_is_a_no_op(self) -> None:
+        client = PathStubClient({})
+        ops = GithubOps(client, "r1")  # type: ignore[arg-type]
+        ops.pr_request_reviewers("o/r", 7, [])
+        assert client.jobs == []
 
 
 class TestLanding:

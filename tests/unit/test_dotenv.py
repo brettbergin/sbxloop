@@ -112,3 +112,50 @@ class TestEnvExample:
         config = load_config(cwd=tmp_path, env=env)
         assert isinstance(config, Config)
         assert config.github.repo == "you/your-repo"
+
+
+class TestTrustBoundary:
+    """A checkout's ``.env`` belongs to the application in it, never to the
+    loop (#671); the operator's lives next to the user config."""
+
+    def test_dotenv_inside_a_checkout_is_never_read(self, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        root = make_repo(tmp_path)
+        (root / ".env").write_text(f"{SENTINEL}=the-applications-secret\n")
+        assert load_dotenv_file(root, env={}) is None
+        assert SENTINEL not in os.environ
+        sub = root / "src"
+        sub.mkdir()
+        (sub / ".env").write_text(f"{SENTINEL}=deeper\n")
+        assert load_dotenv_file(sub, env={}) is None
+        assert SENTINEL not in os.environ
+
+    def test_load_config_from_a_checkout_ignores_its_dotenv(self, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        root = make_repo(tmp_path)
+        (root / ".env").write_text("SBXLOOP_MODEL=from-the-app\n")
+        config = load_config(cwd=root)  # env=None -> real environ + .env files
+        assert config.model == "auto"
+        assert "SBXLOOP_MODEL" not in os.environ
+
+    def test_user_config_dotenv_is_read(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        (home / ".config" / "sbxloop").mkdir(parents=True)
+        (home / ".config" / "sbxloop" / ".env").write_text(f"{SENTINEL}=from-user-config\n")
+        work = tmp_path / "work"
+        work.mkdir()
+        loaded = load_dotenv_file(work, env={"HOME": str(home)})
+        assert loaded == home / ".config" / "sbxloop" / ".env"
+        assert os.environ[SENTINEL] == "from-user-config"
+
+    def test_working_directory_dotenv_outranks_the_user_one(self, tmp_path: Path) -> None:
+        home = tmp_path / "home"
+        (home / ".config" / "sbxloop").mkdir(parents=True)
+        (home / ".config" / "sbxloop" / ".env").write_text(f"{SENTINEL}=from-user-config\n")
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / ".env").write_text(f"{SENTINEL}=from-the-runner-dir\n")
+        assert load_dotenv_file(work, env={"HOME": str(home)}) == work / ".env"
+        assert os.environ[SENTINEL] == "from-the-runner-dir"

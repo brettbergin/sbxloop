@@ -11,14 +11,17 @@ import json
 import sqlite3
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from pathlib import Path
 from typing import NamedTuple
 
 from sbxloop.engine.model import (
     TERMINAL_RUN_STATES,
+    Published,
+    RunKind,
     RunRecord,
     RunState,
+    TaskOutput,
     TaskRecord,
     TaskSpec,
 )
@@ -89,7 +92,10 @@ CREATE TABLE IF NOT EXISTS runs (
     last_verdict TEXT,
     exhausted  TEXT,
     granted_rounds INTEGER NOT NULL DEFAULT 0,
-    pr_title   TEXT
+    pr_title   TEXT,
+    credentials TEXT NOT NULL DEFAULT '[]',
+    kind       TEXT NOT NULL DEFAULT 'code',
+    published  TEXT NOT NULL DEFAULT '[]'
 );
 CREATE TABLE IF NOT EXISTS tasks (
     run_id     TEXT NOT NULL,
@@ -103,6 +109,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     session_id TEXT,
     verify_fingerprints TEXT NOT NULL DEFAULT '[]',
     verify_suspect INTEGER NOT NULL DEFAULT 0,
+    output_json TEXT,
     PRIMARY KEY (run_id, task_id)
 );
 CREATE TABLE IF NOT EXISTS phase_attempts (
@@ -176,6 +183,12 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
             "granted_rounds",
             "ALTER TABLE runs ADD COLUMN granted_rounds INTEGER NOT NULL DEFAULT 0",
         ),
+        ("credentials", "ALTER TABLE runs ADD COLUMN credentials TEXT NOT NULL DEFAULT '[]'"),
+        # Every run before #755 was a developer run: the default IS the
+        # migration, so a legacy row reads back as `code` untouched.
+        ("kind", "ALTER TABLE runs ADD COLUMN kind TEXT NOT NULL DEFAULT 'code'"),
+        # Where a workload's result went (#759); nothing published before.
+        ("published", "ALTER TABLE runs ADD COLUMN published TEXT NOT NULL DEFAULT '[]'"),
     ),
     "phase_attempts": (
         ("input_tokens", "ALTER TABLE phase_attempts ADD COLUMN input_tokens INTEGER"),
@@ -199,14 +212,19 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
             "verify_suspect",
             "ALTER TABLE tasks ADD COLUMN verify_suspect INTEGER NOT NULL DEFAULT 0",
         ),
+        # A workload task's TaskOutput (#757); NULL for every code task.
+        ("output_json", "ALTER TABLE tasks ADD COLUMN output_json TEXT"),
     ),
 }
 
 
 class StateStore:
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, *, readonly: bool = False) -> None:
+        """Open the store. ``readonly`` opens the file through a read-only
+        URI and runs no schema statement (the operator console's handle; a
+        write then fails in SQLite); the file must already exist."""
         self.path = path
-        path.parent.mkdir(parents=True, exist_ok=True)
+        self.readonly = readonly
         # One connection is shared by every caller (check_same_thread=False),
         # so writers serialise here rather than relying on SQLite's own
         # per-statement mutex: `append_event_if_state` holds an explicit
@@ -214,6 +232,16 @@ class StateStore:
         # thread committing mid-transaction would end it early. Reentrant
         # so a guarded method may call another.
         self._lock = threading.RLock()
+        if readonly:
+            if not path.exists():
+                raise StateError(f"{path} does not exist")
+            self._conn = sqlite3.connect(
+                f"{path.resolve().as_uri()}?mode=ro", uri=True, check_same_thread=False
+            )
+            self._conn.row_factory = sqlite3.Row
+            self._conn.execute("PRAGMA busy_timeout=5000")
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL")
@@ -233,21 +261,67 @@ class StateStore:
 
     # -- runs --------------------------------------------------------------
 
-    def create_run(self, run_id: str, outcome: str, config_json: str = "{}") -> RunRecord:
+    def create_run(
+        self,
+        run_id: str,
+        outcome: str,
+        config_json: str = "{}",
+        *,
+        credentials: Sequence[str] = (),
+        kind: RunKind = "code",
+    ) -> RunRecord:
+        names = list(dict.fromkeys(credentials))
         with self._lock:
             now = time.time()
             try:
                 self._conn.execute(
-                    "INSERT INTO runs (run_id, outcome, state, config_json, created_at, updated_at)"
-                    " VALUES (?, ?, 'created', ?, ?, ?)",
-                    (run_id, outcome, config_json, now, now),
+                    "INSERT INTO runs (run_id, outcome, state, config_json, created_at,"
+                    " updated_at, credentials, kind) VALUES (?, ?, 'created', ?, ?, ?, ?, ?)",
+                    (run_id, outcome, config_json, now, now, json.dumps(names), kind),
                 )
             except sqlite3.IntegrityError as exc:
                 raise StateError(f"run {run_id} already exists") from exc
             self._conn.commit()
             return RunRecord(
-                run_id=run_id, outcome=outcome, state="created", created_at=now, updated_at=now
+                run_id=run_id,
+                outcome=outcome,
+                state="created",
+                kind=kind,
+                created_at=now,
+                updated_at=now,
+                credentials=names,
             )
+
+    def add_run_published(self, run_id: str, entry: Published) -> None:
+        """Record one more place the run's result went (#759), as it lands
+        — so a resume at publishing skips it and the record says where the
+        result is."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT published FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+            if row is None:
+                raise StateError(f"unknown run {run_id}")
+            published = [*json.loads(row["published"] or "[]"), entry.model_dump(mode="json")]
+            self._conn.execute(
+                "UPDATE runs SET published = ?, updated_at = ? WHERE run_id = ?",
+                (json.dumps(published), time.time(), run_id),
+            )
+            self._conn.commit()
+
+    def set_run_credentials(self, run_id: str, credentials: Sequence[str]) -> None:
+        """Record the ``[[credentials]]`` this run is granted (#765) — the
+        whole grant, replacing what was there — so a resume re-provisions
+        the same service sandbox."""
+        names = list(dict.fromkeys(credentials))
+        with self._lock:
+            cursor = self._conn.execute(
+                "UPDATE runs SET credentials = ?, updated_at = ? WHERE run_id = ?",
+                (json.dumps(names), time.time(), run_id),
+            )
+            if cursor.rowcount == 0:
+                raise StateError(f"unknown run {run_id}")
+            self._conn.commit()
 
     def set_run_state(self, run_id: str, state: RunState) -> None:
         """Move the run to ``state``. A non-terminal state is also recorded
@@ -462,6 +536,7 @@ class StateStore:
             run_id=row["run_id"],
             outcome=row["outcome"],
             state=_LEGACY_RUN_STATES.get(row["state"], row["state"]),
+            kind=row["kind"] or "code",
             created_at=row["created_at"],
             updated_at=row["updated_at"],
             workspace=Path(row["workspace"]) if row["workspace"] else None,
@@ -482,6 +557,10 @@ class StateStore:
             last_verdict=row["last_verdict"],
             exhausted=row["exhausted"],
             granted_rounds=int(row["granted_rounds"] or 0),
+            credentials=[str(name) for name in json.loads(row["credentials"] or "[]")],
+            published=[
+                Published.model_validate(entry) for entry in json.loads(row["published"] or "[]")
+            ],
         )
 
     def non_terminal_runs(self) -> list[RunRecord]:
@@ -566,7 +645,7 @@ class StateStore:
             cursor = self._conn.execute(
                 "UPDATE tasks SET state = ?, revisions = ?, replans = ?,"
                 " last_feedback = ?, session_id = ?, verify_fingerprints = ?,"
-                " verify_suspect = ? WHERE run_id = ? AND task_id = ?",
+                " verify_suspect = ?, output_json = ? WHERE run_id = ? AND task_id = ?",
                 (
                     task.state,
                     task.revisions,
@@ -575,6 +654,7 @@ class StateStore:
                     task.session_id,
                     json.dumps(task.verify_fingerprints),
                     int(task.verify_suspect),
+                    task.output.model_dump_json() if task.output is not None else None,
                     run_id,
                     task.spec.id,
                 ),
@@ -587,21 +667,23 @@ class StateStore:
         rows = self._conn.execute(
             "SELECT * FROM tasks WHERE run_id = ? ORDER BY order_idx", (run_id,)
         ).fetchall()
-        records: list[TaskRecord] = []
-        for row in rows:
-            records.append(
-                TaskRecord(
-                    spec=TaskSpec.model_validate_json(row["spec_json"]),
-                    state=row["state"],
-                    revisions=row["revisions"],
-                    replans=row["replans"],
-                    last_feedback=row["last_feedback"],
-                    session_id=row["session_id"],
-                    verify_fingerprints=json.loads(row["verify_fingerprints"] or "[]"),
-                    verify_suspect=bool(row["verify_suspect"]),
-                )
-            )
-        return records
+        return [self._task_record(row) for row in rows]
+
+    @staticmethod
+    def _task_record(row: sqlite3.Row) -> TaskRecord:
+        return TaskRecord(
+            spec=TaskSpec.model_validate_json(row["spec_json"]),
+            state=row["state"],
+            revisions=row["revisions"],
+            replans=row["replans"],
+            last_feedback=row["last_feedback"],
+            session_id=row["session_id"],
+            verify_fingerprints=json.loads(row["verify_fingerprints"] or "[]"),
+            verify_suspect=bool(row["verify_suspect"]),
+            output=(
+                TaskOutput.model_validate_json(row["output_json"]) if row["output_json"] else None
+            ),
+        )
 
     # -- phase attempts ----------------------------------------------------
 
@@ -901,14 +983,39 @@ class StateStore:
             query += " AND type LIKE ?"
             params.append(type_prefix + "%")
         query += " ORDER BY seq"
-        for row in self._conn.execute(query, params):
-            yield (
-                row["seq"],
-                Event(
-                    ts=row["ts"],
-                    run_id=row["run_id"],
-                    job_id=row["job_id"],
-                    type=row["type"],
-                    data=json.loads(row["data_json"]),
-                ),
-            )
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+        for row in rows:
+            yield (row["seq"], self._event_record(row))
+
+    def last_event(self, run_id: str, type_prefix: str) -> Event | None:
+        """The newest event of a type (prefix) on the run, one indexed read."""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM events WHERE run_id = ? AND type LIKE ? ORDER BY seq DESC LIMIT 1",
+                (run_id, type_prefix + "%"),
+            ).fetchone()
+        return None if row is None else self._event_record(row)
+
+    def last_event_ts_many(self, run_ids: Sequence[str]) -> dict[str, float]:
+        """``run_id -> newest event ts`` for the given runs, in one query."""
+        if not run_ids:
+            return {}
+        marks = ",".join("?" for _ in run_ids)
+        with self._lock:
+            rows = self._conn.execute(
+                f"SELECT run_id, MAX(ts) AS ts FROM events WHERE run_id IN ({marks}) "  # nosec B608
+                "GROUP BY run_id",
+                tuple(run_ids),
+            ).fetchall()
+        return {str(r["run_id"]): float(r["ts"]) for r in rows if r["ts"] is not None}
+
+    @staticmethod
+    def _event_record(row: sqlite3.Row) -> Event:
+        return Event(
+            ts=row["ts"],
+            run_id=row["run_id"],
+            job_id=row["job_id"],
+            type=row["type"],
+            data=json.loads(row["data_json"]),
+        )

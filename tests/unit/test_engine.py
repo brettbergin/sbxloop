@@ -971,6 +971,106 @@ class TestKeepOnFailure:
         assert result.kept_sandboxes == [f"sbxloop-{result.run_id}-agent"]
 
 
+class TestRunWorkspace:
+    """What the run works on is announced first and enforced at provisioning
+    (#670): a configured checkout the agent cannot see stops the run; the
+    empty per-run directory nothing was configured for stays harvest mode,
+    on the first attempt and on a resume."""
+
+    def run_start(self, harness: Harness) -> Event:
+        (event,) = [e for e in harness.events if e.type == HostEventTypes.RUN_START]
+        return event
+
+    def test_first_event_names_the_configured_workspace(self, harness: Harness) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(harness.tmp_path)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(sandbox={"workspace": str(source), "gate_command": ""})
+        result = engine.start("work on the checkout")
+        assert result.state == "completed"
+        start = self.run_start(harness)
+        assert start.data["workspace"] == str(source)
+        assert start.data["workspace_source"] == "configured"
+
+    def test_first_event_says_when_there_is_no_workspace(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        result = harness.engine().start("start from nothing")
+        assert result.state == "completed"
+        assert not result.mounted
+        start = self.run_start(harness)
+        assert start.data["workspace"] is None
+        assert start.data["workspace_source"] == "none"
+
+    def test_caller_label_wins_in_the_first_event(self, harness: Harness) -> None:
+        """The CLI knows it chose the checkout (a flag, the cwd); the engine
+        repeats that rather than re-deriving 'configured' from the pinned
+        config."""
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        source = harness.tmp_path / "ws"
+        source.mkdir()
+        engine = harness.engine(sandbox={"workspace": str(source), "gate_command": ""})
+        engine.start("flagged", workspace_source="--workspace")
+        assert self.run_start(harness).data["workspace_source"] == "--workspace"
+
+    def test_configured_workspace_that_never_mounts_stops_the_run(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        source = harness.tmp_path / "ws"
+        source.mkdir()
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(sandbox={"workspace": str(source)})
+        with pytest.raises(ProvisionError, match="was not visible inside the agent sandbox"):
+            engine.start("work on the checkout")
+        # The run never left provisioning — no job reached a worker, so the
+        # agent never saw an empty tree — and, like any infra failure, it is
+        # left resumable once the mount is fixed rather than marked failed.
+        assert harness.run_states() == ["provisioning"]
+        assert engine.store.list_runs()[0].state == "provisioning"
+        assert harness.sandboxes_left() == []
+
+    def test_harvest_mode_run_resumes_as_harvest_mode(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The resume pins the per-run directory by path — which on its own
+        would read as 'the work' — but the first provisioning recorded that
+        nothing was mounted, and the resume honours that verdict."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        harness.script([taskgraph(task("t1")), {"fail": "sandbox exploded"}])
+        engine = harness.engine()
+        with pytest.raises(WorkerError, match="sandbox exploded"):
+            engine.start("crashy harvest run")
+        run_id = engine.store.list_runs()[0].run_id
+        assert not engine.store.get_run(run_id).mounted
+
+        harness.script([*HAPPY_TASK])
+        result = harness.engine().resume(run_id)
+        assert result.state == "completed"
+        assert not result.mounted
+
+    def test_mounted_run_that_loses_its_mount_does_not_resume_on_nothing(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        source = make_repo(harness.tmp_path)
+        harness.script([taskgraph(task("t1")), {"fail": "sandbox exploded"}])
+        engine = harness.engine(sandbox={"workspace": str(source), "gate_command": ""})
+        with pytest.raises(WorkerError, match="sandbox exploded"):
+            engine.start("crashy mounted run")
+        run_id = engine.store.list_runs()[0].run_id
+        assert engine.store.get_run(run_id).mounted
+
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        harness.script([*HAPPY_TASK])
+        with pytest.raises(ProvisionError, match="was not visible inside the agent sandbox"):
+            harness.engine(sandbox={"workspace": str(source), "gate_command": ""}).resume(run_id)
+
+
 class TestWorkspaceExecution:
     """The artifacts linchpin: jobs run in the workspace mount, so files the
     builder writes appear on the host live and survive sandbox teardown."""
@@ -1369,7 +1469,10 @@ class TestPrebakedTemplate:
         )
         run_id = new_run_id_for(engine)
         # apt and the go installer (both `sh -c`) succeed; the prebake probe
-        # (`python3 -c`) and the jobs still run against the fake sandbox.
+        # (`python3 -c`) and the jobs still run against the fake sandbox, and
+        # so does the workspace mount probe — with a configured workspace a
+        # swallowed probe is a provisioning failure, not harvest mode.
+        harness.fake_sbx.script(f"exec sbxloop-{run_id}-agent sh -c set --;", passthrough=True)
         harness.fake_sbx.script(f"exec sbxloop-{run_id}-agent sh -c", returncode=0)
         result = engine.start("use the baked template on a go repo", run_id=run_id)
 
@@ -2224,6 +2327,47 @@ class TestPipeline:
         assert engine.store.advisory_rounds(result.run_id) == frozenset({"lint"})
         assert len(fake.issue_comments) >= 1
 
+    def test_a_non_admin_token_gates_only_on_what_the_pr_says_is_required(
+        self, harness: Harness
+    ) -> None:
+        """#674: classic protection 403s for a bot without admin and the
+        rulesets declare nothing; the PR's own rollup marks one of three
+        checks required, so only that one gates — the others are advisory,
+        as the baseline comparison of #611 intends."""
+        fake = FakeGithub()
+        fake.protection_forbidden = True
+        fake.rules = []
+        fake.rollup_required = ("ci",)
+        fake.checks = [ChecksVerdict("red", 3, ("docs",), ("lint",), ("ci",))]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, landing={"max_ci_rounds": 0})
+        result = engine.start("write, not admin")
+        assert result.state == "merged", result.reason
+        assert fake.rollup_calls >= 1
+        (status, *_rest) = self._events(harness, HostEventTypes.CI_STATUS)
+        assert status.data["source"] == "pr-rollup"
+        assert status.data["required"] == ["ci"]
+        assert status.data["regressions"] == ["lint"], "red, but the PR's own and not gating"
+        assert status.data["pending"] == [], "the advisory `docs` is not waited on"
+        assert any(
+            "`lint` — went red on this PR but is not required" in c for c in fake.issue_comments
+        )
+
+    def test_a_non_admin_token_without_a_rollup_gates_on_everything(self, harness: Harness) -> None:
+        """#674, the last fallback: nothing readable at all keeps the old
+        doctrine — every check gates, the red `lint` is the PR's to fix."""
+        fake = FakeGithub()
+        fake.protection_forbidden = True
+        fake.rollup_required = None
+        fake.checks = [ChecksVerdict("red", 3, ("docs",), ("lint",), ("ci",))]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, landing={"max_ci_rounds": 0})
+        result = engine.start("write, not admin, no rollup")
+        assert result.state != "merged"
+        assert "ci fix rounds exhausted" in result.reason
+        (status, *_rest) = self._events(harness, HostEventTypes.CI_STATUS)
+        assert status.data["source"] == "all"
+
     def test_a_required_check_red_on_the_base_is_fixed_and_the_brief_says_so(
         self, harness: Harness
     ) -> None:
@@ -2301,6 +2445,151 @@ class TestPipeline:
         # read before the merge: 300s of waiting against a 10s budget
         assert engine._waited_s == 300.0
 
+    def test_a_blocked_run_names_every_rule_of_the_base_it_cannot_meet(
+        self, harness: Harness
+    ) -> None:
+        """#673: the base's rulesets are read in full; the run's reason
+        lists each rule the loop cannot satisfy, one per line, and the
+        `run.blocked` event carries them as a list."""
+        fake = FakeGithub()
+        # The queue's own 405 (#676): GitHub refuses to enqueue a PR the
+        # base's other rules do not allow; those rules are the verdict.
+        fake.enqueue_ok = False
+        fake.rules = [
+            {
+                "type": "pull_request",
+                "parameters": {
+                    "required_approving_review_count": 1,
+                    "require_last_push_approval": True,
+                },
+            },
+            {"type": "merge_queue"},
+        ]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("land it")
+        assert result.state == "blocked"
+        assert fake.merges == [] and fake.enqueued == [("PR_node7", "commit1")]
+        (blocked,) = self._events(harness, HostEventTypes.RUN_BLOCKED)
+        blockers = blocked.data["blockers"]
+        assert [b.split(",")[0] for b in blockers] == [
+            "the base requires approval of the last push (require_last_push_approval)",
+            "the base requires an approving review",
+        ]
+        assert all(f"\n- {b}" in result.reason for b in blockers)
+        assert "merge_gate" not in result.reason
+        # A merge queue is not a blocker (#676); GitHub's refusal rides along.
+        assert "not mergeable" in result.reason
+
+    def test_a_merge_queue_base_is_entered_and_a_removal_gets_its_ci_round(
+        self, harness: Harness
+    ) -> None:
+        """#676: the loop never PUTs a merge on a merge-queue base. The
+        queue's removal for a red check on its own commit is one CI round
+        with that check named; the fix is re-enqueued and the queue merges."""
+        from sbxloop.gh.ops import QueueEntry, QueueState
+
+        fake = FakeGithub()
+        fake.rules = [{"type": "merge_queue", "parameters": {"merge_method": "SQUASH"}}]
+        queued = QueueState(False, False, QueueEntry("MQE_1", "AWAITING_CHECKS", 1, "queue0"))
+        removed = QueueState(False, False, None, removals=1, removed_reason="CI_FAILED")
+        merged = QueueState(True, False, None, removals=1, merge_sha="queued0001")
+        # First landing: not queued → queued → removed. Second: the fix's
+        # head is enqueued and merged.
+        fake.queue_states = [
+            QueueState(False, False, None),
+            queued,
+            removed,
+            removed,
+            queued,
+            merged,
+        ]
+        fake.failed_logs = [
+            FailedCheck("integration", "failure", "assert 1 == 2", "https://x/logs")
+        ]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("through the queue")
+        assert result.state == "merged", result.reason
+        assert fake.merges == [], "never PUT /merge"
+        assert [head for _, head in fake.enqueued] == ["commit1", "commit2"]
+        fix = result.tasks[1].spec
+        assert "assert 1 == 2" in fix.description and "#### `integration` (failure)" in (
+            fix.description
+        )
+        (fix_round,) = self._events(harness, HostEventTypes.FIX_ROUND)
+        assert fix_round.data["kind"] == "ci"
+        assert "removed the pull request (CI_FAILED)" in fix_round.data["why"]
+        assert "integration" in fix_round.data["why"]
+        kinds = [e.type for e in harness.events]
+        assert kinds.count(HostEventTypes.LAND_ENQUEUED) == 2
+        assert kinds.count(HostEventTypes.LAND_DEQUEUED) == 1
+        run = engine.store.get_run(result.run_id)
+        assert run.ci_rounds == 1
+
+    def test_a_person_converting_the_pr_to_draft_parks_the_run(self, harness: Harness) -> None:
+        """#677: the loop clears its own draft once; a draft after that is
+        a person's hold. The run parks `awaiting_review` (draft flavour)
+        rather than un-drafting over them, and files nothing twice."""
+
+        class Redrafting(FakeGithub):
+            def pr_get(self, repo: str, number: int) -> dict[str, Any]:
+                pr = super().pr_get(repo, number)
+                if self.ready_calls and not self.pr.get("redrafted"):
+                    # Someone converts it back right after the loop's un-draft.
+                    self.pr["draft"] = True
+                    self.pr["redrafted"] = True
+                    pr["draft"] = True
+                return pr
+
+        fake = Redrafting()
+        fake.pr["draft"] = True
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("hold it")
+        assert result.state == "awaiting_review", result.reason
+        assert "converted the PR to draft" in (result.reason or "")
+        assert fake.ready_calls == ["PR_node7"], "un-drafted once, never over a person"
+        assert fake.merges == []
+        (held,) = self._events(harness, HostEventTypes.LAND_HELD_BY_DRAFT)
+        assert held.data["pr"] == 7
+        (parked,) = self._events(harness, HostEventTypes.RUN_AWAITING_REVIEW)
+        assert parked.data["draft"] is True and parked.data["approvals_required"] == 0
+
+    def test_the_loops_own_undraft_is_on_the_runs_record(self, harness: Harness) -> None:
+        """The record of the loop's un-draft (`land.undraft`) outlives the
+        landing call, so a later landing of this run (a resume, a parked
+        one re-entering) knows a draft is a person's."""
+        fake = FakeGithub()
+        fake.pr["draft"] = True
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("land it")
+        assert result.state == "merged" and fake.ready_calls == ["PR_node7"]
+        assert engine._undrafted(result.run_id) is True
+        assert engine._undrafted("nope") is False
+
+    def test_a_queue_removal_past_the_ci_budget_fails_naming_the_check(
+        self, harness: Harness
+    ) -> None:
+        from sbxloop.gh.ops import QueueEntry, QueueState
+
+        fake = FakeGithub()
+        fake.rules = [{"type": "merge_queue"}]
+        fake.queue_states = [
+            QueueState(False, False, None),
+            QueueState(False, False, QueueEntry("MQE_1", "QUEUED", 1, "queue0")),
+            QueueState(False, False, None, removals=1, removed_reason="CI_FAILED"),
+        ]
+        fake.failed_logs = [FailedCheck("integration", "failure", "boom", "")]
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        result = harness.pipeline(fake, landing={"max_ci_rounds": 0}).start("queue")
+        assert result.state == "failed"
+        assert result.reason is not None
+        assert "ci fix rounds exhausted (0 allowed by [landing] ci_rounds)" in result.reason
+        assert "integration" in result.reason
+        assert fake.merges == []
+
     def test_landing_405_blocks_and_a_resume_finishes(self, harness: Harness) -> None:
         """A protection rule no round can satisfy hands the PR to a human;
         once they have acted, the run resumes at landing — no decompose, no
@@ -2318,6 +2607,7 @@ class TestPipeline:
         assert not result.succeeded
         (blocked,) = self._events(harness, HostEventTypes.RUN_BLOCKED)
         assert blocked.data["pr"] == 7 and blocked.data["why"] == result.reason
+        assert blocked.data["blockers"] == []  # the base declared no rule the loop misses
         run = engine.store.get_run(result.run_id)
         assert run.state == "blocked" and run.stage == "landing"
         assert run.reason == result.reason
@@ -3157,6 +3447,92 @@ class TestNamingInThePipeline:
         assert engine.store.get_run(result.run_id).pr_title == "fix: the corrected title"
 
 
+class TestPrConventionsInThePipeline:
+    """#678: the repository's own pull request conventions — a title lint,
+    a template, the agent's `.sbxloop/pr-body` — shape the PR the run opens."""
+
+    def test_a_title_lint_in_the_workspace_drops_the_sbxloop_prefix(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        plan = taskgraph(task("t1"))
+        plan["json"]["pr_title"] = "feat(hello): add the greeting"
+        build = {"text": "wrote", "files": {"hello.txt": "hi\n", "commitlint.config.js": "x"}}
+        harness.script([plan, build, REVIEW_OK])
+        result = harness.pipeline(fake).start("write hello.txt")
+        assert result.state == "merged"
+        assert fake.pr_kwargs["title"] == "feat(hello): add the greeting"
+
+    def test_a_title_lint_with_no_plan_title_gets_a_conventional_guess(
+        self, harness: Harness
+    ) -> None:
+        fake = FakeGithub()
+        build = {"text": "wrote", "files": {"hello.txt": "hi\n", ".commitlintrc.json": "{}"}}
+        harness.script([taskgraph(task("t1")), build, REVIEW_OK])
+        result = harness.pipeline(fake).start("Write hello.txt")
+        assert result.state == "merged"
+        assert fake.pr_kwargs["title"] == "chore: write hello.txt"
+
+    def test_an_operators_title_template_stands_over_the_lint(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        build = {"text": "wrote", "files": {"hello.txt": "hi\n", "commitlint.config.js": "x"}}
+        harness.script([taskgraph(task("t1")), build, REVIEW_OK])
+        engine = harness.engine(
+            ops=fake,
+            github={"repo": fake.repo, "pr_title_template": "bot: {title}"},
+            landing=FAST_LANDING,
+        )
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+        assert fake.pr_kwargs["title"] == "bot: write hello.txt"
+
+    def test_the_repositorys_template_opens_the_body(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        build = {
+            "text": "wrote",
+            "files": {
+                "hello.txt": "hi\n",
+                ".github/PULL_REQUEST_TEMPLATE.md": "## Why\n\n- [ ] tests added\n",
+            },
+        }
+        harness.script([taskgraph(task("t1")), build, REVIEW_OK])
+        result = harness.pipeline(fake).start("write hello.txt")
+        assert result.state == "merged"
+        body = fake.pr_kwargs["body"]
+        assert body.startswith("## Why\n\n- [ ] tests added\n")
+        assert f"sbxloop run `{result.run_id}`" in body
+
+    def test_the_agents_pr_body_is_the_description_and_never_ships(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        build = {
+            "text": "wrote",
+            "files": {
+                "hello.txt": "hi\n",
+                ".github/PULL_REQUEST_TEMPLATE.md": "## Why\n",
+                ".sbxloop/pr-body": "## Why\n\nBecause hello.\n\n- [x] tests added\n",
+            },
+        }
+        harness.script([taskgraph(task("t1")), build, REVIEW_OK])
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+        body = fake.pr_kwargs["body"]
+        assert body.startswith("## Why\n\nBecause hello.\n\n- [x] tests added\n")
+        assert f"sbxloop run `{result.run_id}`" in body
+        delivered = [e["path"] for batch in fake.blob_batches for e in batch]
+        assert ".sbxloop/pr-body" not in delivered
+
+    def test_a_fix_round_can_rewrite_the_body(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.checks = [ChecksVerdict("red", 1, (), ("pr-lint",)), GREEN]
+        fake.failed_logs = [FailedCheck("pr-lint", "failure", "checklist unticked", "https://x")]
+        rebody = {"text": "rewrote", "files": {".sbxloop/pr-body": "## Why\n\n- [x] done\n"}}
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, rebody, REVIEW_OK])
+        result = harness.pipeline(fake).start("write hello.txt")
+        assert result.state == "merged"
+        assert ".sbxloop/pr-body" in result.tasks[1].spec.description
+        patched = [b for m, p, b in fake.raw_calls if m == "PATCH" and p == "/repos/o/r/pulls/7"]
+        assert patched and patched[-1]["body"].startswith("## Why\n\n- [x] done\n")
+
+
 class TestWorkflowApprovalInThePipeline:
     """#612: a check waiting on a maintainer's approval ends the run
     blocked and named — no round, no wait."""
@@ -3353,3 +3729,240 @@ class TestBotSuffixLanding:
         assert not any("did not arrive with a changes-requested" in b for b in bodies), (
             "the loop must not ack its own finding threads"
         )
+
+
+class TestOperatorSandboxEnvInThePipeline:
+    """#679: `[sandbox] env` is in the environment of every command the
+    agent sandbox's worker runs — here a task's verify command. The fake
+    sbx's exec inherits the test process's environment, so the variable is
+    one nothing but the config sets."""
+
+    CHECK = '[ "$OPERATOR_GREETING" = "hello from config" ]'
+
+    def test_a_configured_variable_is_in_the_verify_commands_environment(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OPERATOR_GREETING", raising=False)
+        harness.script([taskgraph(task("t1", verify=[self.CHECK])), BUILD])
+        engine = harness.engine(
+            sandbox={"env": {"OPERATOR_GREETING": "hello from config"}},
+            budgets=NO_RETRY_BUDGETS,
+        )
+        assert engine.start("see the env").state == "completed"
+
+    def test_without_the_setting_the_same_check_fails(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("OPERATOR_GREETING", raising=False)
+        harness.script([taskgraph(task("t1", verify=[self.CHECK])), BUILD])
+        assert harness.engine(budgets=NO_RETRY_BUDGETS).start("see the env").state == "failed"
+
+
+class TestSetupCommandsInThePipeline:
+    """#681: `[sandbox] setup_commands` run in the cloned workspace before
+    the first phase, and a failing one ends the run at provisioning with
+    the command on the run's events. The fake sbx runs them on the host,
+    in the run's real workspace directory."""
+
+    def test_commands_run_in_the_workspace_before_the_first_phase(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(
+            sandbox={
+                "setup_commands": ["printf setup-ran > .setup-marker", "test -f .setup-marker"]
+            }
+        )
+        result = engine.start("set the workspace up")
+
+        assert result.state == "completed"
+        assert result.workspace is not None
+        assert (result.workspace / ".setup-marker").read_text() == "setup-ran"
+        setup = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_SETUP]
+        assert [e.data["command"] for e in setup] == [
+            "printf setup-ran > .setup-marker",
+            "test -f .setup-marker",
+        ]
+        assert all(e.data["rc"] == 0 for e in setup)
+        # before any phase: the first agent job comes after the last setup event
+        first_job = next(i for i, e in enumerate(harness.events) if e.job_id is not None)
+        last_setup = max(i for i, e in enumerate(harness.events) if e.type == "sandbox.setup")
+        assert last_setup < first_job
+
+    def test_a_failing_command_fails_the_run_at_provisioning(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(
+            sandbox={"setup_commands": ["echo 'chromium: download failed' >&2; exit 9"]}
+        )
+        with pytest.raises(WorkerError, match=r"setup command failed \(rc=9\)") as info:
+            engine.start("set the workspace up")
+        assert "chromium: download failed" in str(info.value)
+        (setup,) = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_SETUP]
+        assert setup.data["rc"] == 9
+        assert setup.data["tail"] == "chromium: download failed"
+        # no phase ran: the decomposer was never asked
+        assert not [e for e in harness.events if e.job_id is not None]
+
+
+class TestVerifyMode:
+    """#682: `[sandbox] verify_mode`. `advisory` runs the checks and blocks
+    on none of them — the failure is evidence for the review and the pull
+    request; `ci-only` submits no verify job at all and leaves the judging
+    to the pull request's checks; `full` (the default) names the evidence
+    of a service-backed suite before the plan spends anything on it."""
+
+    REFUSED = "echo 'psycopg2.OperationalError: connection refused' >&2; exit 1"
+
+    def test_advisory_failure_completes_and_is_evidence_for_review_and_pr(
+        self, harness: Harness
+    ) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1", verify=[self.REFUSED])), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(
+            fake, sandbox={"verify_mode": "advisory", "gate_command": ""}, keep_sandboxes=True
+        )
+        result = engine.start("advisory verify")
+
+        assert result.state == "merged"
+        assert result.tasks[0].state == "done"
+        # no revision, no replan, no suspect bookkeeping: the failure gated nothing
+        assert result.tasks[0].revisions == 0
+        assert result.tasks[0].replans == 0
+        assert not result.tasks[0].verify_suspect
+        assert result.tasks[0].verify_fingerprints == []
+        verify_ends = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data["phase"] == "verify"
+        ]
+        assert [e.data["status"] for e in verify_ends] == ["advisory"]
+        assert "connection refused" in verify_ends[0].data["message"]
+        assert "not blocking" in verify_ends[0].data["message"]
+        # the review prompt carries the failure as evidence, framed as advisory
+        jobs = harness.agent_jobs(result.run_id)
+        (review_job,) = [j for j in jobs if "Review the pull request" in (j.get("prompt") or "")]
+        assert 'verify_mode = "advisory"' in review_job["prompt"]
+        assert "connection refused" in review_job["prompt"]
+        assert "task t1" in review_job["prompt"]
+        # and so does the pull request's body
+        body = fake.pr_kwargs["body"]
+        assert "**Verification:**" in body
+        assert "connection refused" in body
+
+    def test_advisory_pass_is_reported_as_such(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1", verify=["true"])), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(fake, sandbox={"verify_mode": "advisory", "gate_command": ""})
+        result = engine.start("advisory verify that passes")
+        assert result.state == "merged"
+        assert "ran in the sandbox and passed" in fake.pr_kwargs["body"]
+        # a pass is a pass: nothing advisory (or failed) in the chronology
+        assert not [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data["phase"] == "verify"
+        ]
+
+    def test_advisory_gate_failure_spends_no_fix_round(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1", verify=["false"])), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(
+            fake, sandbox={"verify_mode": "advisory", "gate_command": "false"}
+        )
+        result = engine.start("advisory gate")
+        assert result.state == "merged"
+        assert HostEventTypes.FIX_ROUND not in harness.event_types()
+        (gate_end,) = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data["phase"] == "gate"
+        ]
+        assert gate_end.data["status"] == "advisory"
+        assert "project gate `false` exit 1" in fake.pr_kwargs["body"]
+
+    def test_ci_only_submits_no_verify_job(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1", verify=["false"])), FILES_BUILD, REVIEW_OK])
+        engine = harness.pipeline(
+            fake, sandbox={"verify_mode": "ci-only", "gate_command": "false"}, keep_sandboxes=True
+        )
+        result = engine.start("ci-only verify")
+
+        assert result.state == "merged"
+        assert result.tasks[0].state == "done"
+        assert result.tasks[0].revisions == 0
+        # neither the task's verify commands nor the gate ran: no shell job at all
+        jobs = harness.agent_jobs(result.run_id)
+        assert not [j for j in jobs if j.get("kind") == "shell.batch"]
+        ends = {
+            e.data["phase"]: e.data
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data["phase"] in ("verify", "gate")
+        }
+        assert ends["verify"]["status"] == "skipped"
+        assert "1 verify command(s) not run" in ends["verify"]["message"]
+        assert ends["gate"]["status"] == "skipped"
+        assert HostEventTypes.FIX_ROUND not in harness.event_types()
+        # landing still went through its CI round
+        assert HostEventTypes.CI_STATUS in harness.event_types()
+        # the review and the pull request both say nothing ran
+        (review_job,) = [j for j in jobs if "Review the pull request" in (j.get("prompt") or "")]
+        assert 'verify_mode = "ci-only"' in review_job["prompt"]
+        assert 'verify_mode = "ci-only"' in fake.pr_kwargs["body"]
+
+    def test_ci_only_skips_verify_without_a_delivery_repo_too(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1", verify=["false"])), BUILD])
+        result = harness.engine(sandbox={"verify_mode": "ci-only"}).start("ci-only, no github")
+        assert result.state == "completed"
+        assert result.tasks[0].state == "done"
+
+    def test_full_mode_still_gates(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1", verify=["false"])), BUILD])
+        result = harness.engine(budgets=NO_RETRY_BUDGETS).start("full verify")
+        assert result.state == "failed"
+        assert result.tasks[0].state == "failed"
+
+    def test_per_repo_override_wins(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1", verify=["false"])), FILES_BUILD, REVIEW_OK])
+        engine = harness.engine(
+            ops=fake,
+            landing=FAST_LANDING,
+            sandbox={"verify_mode": "full", "gate_command": ""},
+            github={"repo": fake.repo, "repos": [{"repo": fake.repo, "verify_mode": "advisory"}]},
+        )
+        result = engine.start("repo says advisory")
+        assert result.state == "merged"
+        assert result.tasks[0].state == "done"
+
+    def test_full_mode_hints_at_a_service_backed_suite(self, harness: Harness) -> None:
+        from tests.unit.test_hostgit import commit_all, make_repo
+
+        source = make_repo(harness.tmp_path)
+        (source / "docker-compose.yml").write_text("services:\n  db:\n    image: postgres\n")
+        commit_all(source, "compose")
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(sandbox={"workspace": str(source), "gate_command": ""})
+        result = engine.start("work on a service-backed repo")
+        assert result.state == "completed"
+        (hint,) = [e for e in harness.events if e.type == HostEventTypes.VERIFY_SERVICES_DETECTED]
+        assert hint.data["evidence"] == ["docker-compose.yml (compose file)"]
+        assert 'verify_mode = "advisory"' in hint.data["hint"]
+        # before the plan: the decomposer's job comes after the hint
+        first_job = next(i for i, e in enumerate(harness.events) if e.job_id is not None)
+        assert harness.events.index(hint) < first_job
+
+    def test_no_hint_without_evidence_or_under_another_mode(self, harness: Harness) -> None:
+        from tests.unit.test_hostgit import commit_all, make_repo
+
+        source = make_repo(harness.tmp_path)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        harness.engine(sandbox={"workspace": str(source), "gate_command": ""}).start("plain")
+        assert HostEventTypes.VERIFY_SERVICES_DETECTED not in harness.event_types()
+
+        harness.events.clear()
+        (source / "docker-compose.yml").write_text("services: {}\n")
+        commit_all(source, "compose")
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        harness.engine(
+            sandbox={"workspace": str(source), "gate_command": "", "verify_mode": "advisory"}
+        ).start("advisory already")
+        assert HostEventTypes.VERIFY_SERVICES_DETECTED not in harness.event_types()

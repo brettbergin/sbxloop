@@ -1,0 +1,309 @@
+# Keep a `sbxloop daemon` current from PyPI, without ever restarting it
+# under a live run. Copy to .github/workflows/deploy-daemon.yml in the
+# repository that owns the daemon host; docs/deploy.md walks through it.
+#
+# What it does, in order: take a named pause hold on the daemon; wait —
+# with no cap short of the job timeout — until nothing is running; install
+# the exact version; snapshot the operator's holds; restart the unit;
+# health-check it (unit active, version matches, `sbxloop doctor`, the
+# daemon answers `ctl status`, no crash loop in 45 s); roll back to the
+# previous version on any failed check; restore the operator's holds;
+# release the deploy's own hold whatever happened; tell the control channel.
+#
+# Assumes the host layout contrib/systemd/README.md sets up, relative to the
+# runner user's home: the venv at ~/.sbxloop-venv, the `sbxloop` wrapper at
+# ~/.local/bin/sbxloop (it sources the tokens — the job reads no secrets
+# file), the daemon's working directory at ~/sbxloop-runner (config and
+# state_dir resolve from there), and the user unit `sbxloop-daemon`. The
+# Actions runner runs as that same user (contrib/systemd/github-runner.service)
+# so it can `systemctl --user restart`.
+#
+# Two settings: the repository variable SBXLOOP_DEPLOY_HOST is the runner
+# label (register the runner with `--labels <that>`) and the name notices
+# call the host; the `schedule` below is how often the host checks PyPI.
+#
+# SECURITY: a self-hosted runner executes whatever a workflow says as its
+# user. Never let a job carrying the `self-hosted` label be reachable from a
+# fork-triggerable event (pull_request, pull_request_target, issue_comment)
+# — the two triggers here are safe: `workflow_dispatch` needs write access,
+# `schedule` runs the default branch in base-repository context.
+
+name: Deploy the daemon
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to deploy (X.Y.Z). Blank = latest on PyPI."
+        required: false
+        default: ""
+
+concurrency:
+  group: deploy-daemon
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: [self-hosted, "${{ vars.SBXLOOP_DEPLOY_HOST }}"]
+    # Bounds the idle wait. A timeout installs nothing: the hold is released
+    # and the daemon runs on as it was.
+    timeout-minutes: 480
+    defaults:
+      run:
+        shell: bash
+    env:
+      HOST: ${{ vars.SBXLOOP_DEPLOY_HOST }}
+      UNIT: sbxloop-daemon
+      HOLD: deploy-${{ github.run_id }}
+      # How `ctl status --json` reads: the run in flight, else the claim in
+      # progress (a restart there orphans the issue), else idle.
+      CURRENT_JQ: >-
+        if .current != null then "\(.current.run_id) — \(.current.title)"
+        elif (.claiming // null) != null then "claiming \(.claiming)"
+        else "idle" end
+
+    steps:
+      - name: Resolve host paths
+        run: |
+          set -euo pipefail
+          {
+            echo "VENV_PIP=${HOME}/.sbxloop-venv/bin/pip"
+            echo "VENV_SBXLOOP=${HOME}/.sbxloop-venv/bin/sbxloop"
+            echo "SBXLOOP=${HOME}/.local/bin/sbxloop"
+            echo "WORKDIR=${HOME}/sbxloop-runner"
+          } >> "$GITHUB_ENV"
+
+      - name: Resolve the target version
+        id: target
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            version="${INPUT_VERSION#v}"
+          else
+            version="$(curl -fsSL https://pypi.org/pypi/sbxloop/json | jq -r .info.version)"
+          fi
+          [ -n "${version}" ] || { echo "::error::could not resolve a version to deploy"; exit 1; }
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+
+      - name: Compare against what is installed
+        id: installed
+        run: |
+          set -euo pipefail
+          current="$("${VENV_SBXLOOP}" --version | awk '{print $2}')"
+          echo "current=${current}" >> "$GITHUB_OUTPUT"
+          if [ "${current}" = "${{ steps.target.outputs.version }}" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${HOST} is already at ${current} — nothing to deploy."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::deploying ${current} -> ${{ steps.target.outputs.version }}"
+          fi
+
+      - name: Take the deploy hold
+        id: hold
+        if: steps.installed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          cd "${WORKDIR}"
+          # Exit 2 = no daemon answered; the wait and the health check
+          # below are what notice a daemon that never comes up.
+          "${SBXLOOP}" daemon ctl pause --hold "${HOLD}" --timeout 30 || true
+          status="$("${SBXLOOP}" daemon ctl status --json --timeout 30 || true)"
+          current="$(jq -r "${CURRENT_JQ}" <<<"${status}" 2>/dev/null || true)"
+          echo "current=${current:-unknown}" >> "$GITHUB_OUTPUT"
+
+      - name: Announce
+        if: steps.installed.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+          FROM: ${{ steps.installed.outputs.current }}
+          CURRENT: ${{ steps.hold.outputs.current }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          if [ "${CURRENT}" = "idle" ] || [ "${CURRENT}" = "unknown" ]; then
+            MSG="🚀 deploying sbxloop \`${FROM}\` → \`${VERSION}\` on \`${HOST}\` — [run](${RUN_URL})"
+          else
+            MSG="🚀 sbxloop \`${FROM}\` → \`${VERSION}\` staged on \`${HOST}\` — restart deferred until the daemon is idle (now: ${CURRENT}); hold \`${HOLD}\` — [run](${RUN_URL})"
+          fi
+          cd "${WORKDIR}" && "${SBXLOOP}" daemon notify "${MSG}"
+
+      - name: Wait for the daemon to go idle
+        id: drain
+        if: steps.installed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          cd "${WORKDIR}"
+          # No cap: a restart under a live run kills its in-flight task. With
+          # the hold taken nothing new is claimed, so idle stays idle. Poll no
+          # faster than 15 s (status() touches the circuit breaker). A daemon
+          # that answers nothing for 5 minutes has nothing to drain. Exit 1
+          # means it answered without JSON (older than `ctl status --json`)
+          # — fail before anything is installed rather than guess.
+          waited=0
+          misses=0
+          while :; do
+            set +e
+            status="$("${SBXLOOP}" daemon ctl status --json --timeout 30)"
+            rc=$?
+            set -e
+            if [ "${rc}" -eq 0 ]; then
+              misses=0
+              current="$(jq -r "${CURRENT_JQ}" <<<"${status}")"
+              if [ "${current}" = "idle" ]; then
+                echo "daemon is idle after ${waited}s — safe to restart"
+                echo "waited_s=${waited}" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              echo "not idle (${current}) — waiting (${waited}s so far)"
+            elif [ "${rc}" -eq 1 ]; then
+              echo "::error::the daemon answered ctl status but gave no structured status — upgrade it by hand once, then redeploy"
+              exit 1
+            else
+              misses=$((misses + 1))
+              echo "no answer from the daemon (${misses}/20)"
+              if [ "${misses}" -ge 20 ]; then
+                echo "::warning::no daemon answered ctl status for 5 min — nothing to drain; restarting"
+                echo "waited_s=${waited}" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
+            sleep 15
+            waited=$((waited + 15))
+          done
+
+      - name: Upgrade
+        id: upgrade
+        if: steps.installed.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Both packages pinned to the same version; both chat extras so
+          # switching [chat] backend on the host is a config change.
+          "${VENV_PIP}" install --upgrade \
+            "sbxloop[discord,slack]==${VERSION}" "sbxloop-worker==${VERSION}"
+          "${VENV_SBXLOOP}" --version
+
+      - name: Snapshot the holds to restore
+        id: state
+        if: steps.installed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # Holds are in-memory, so the restart drops every one of them.
+          # Read them now — an operator who paused during the wait must
+          # still be paused afterwards. Ours is dropped: the restart
+          # releases it.
+          status="$(cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --json --timeout 30 || true)"
+          holds="$(jq -r '.holds // [] | .[]' <<<"${status}" 2>/dev/null | tr '\n' ' ' || true)"
+          keep=""
+          for h in ${holds}; do
+            [ "${h}" = "${HOLD}" ] && continue
+            keep="${keep} ${h}"
+          done
+          echo "holds=${keep# }" >> "$GITHUB_OUTPUT"
+
+      - name: Restart the daemon
+        if: steps.installed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # reset-failed: a unit that crash-looped earlier sits `failed` and
+          # a plain restart will not revive it.
+          systemctl --user reset-failed "${UNIT}" || true
+          timeout 300 systemctl --user restart "${UNIT}"
+
+      - name: Health check
+        id: health
+        if: steps.installed.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::health check failed: $1"; exit 1; }
+          systemctl --user is-active --quiet "${UNIT}" || fail "unit is not active"
+          got="$("${VENV_SBXLOOP}" --version | awk '{print $2}')"
+          [ "${got}" = "${VERSION}" ] || fail "version is ${got}, expected ${VERSION}"
+          # Plain doctor only — never --deep or --probe, which boot microVMs.
+          (cd "${WORKDIR}" && "${SBXLOOP}" doctor) || fail "sbxloop doctor is unhappy"
+          # The control server starts only after the daemon's recovery, which
+          # can take minutes on a host with orphaned runs; the client resends
+          # across that window, so give it a generous budget.
+          (cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --json --timeout 300 >/dev/null) || fail "daemon did not answer ctl status"
+          before="$(systemctl --user show "${UNIT}" -p NRestarts --value)"
+          sleep 45
+          systemctl --user is-active --quiet "${UNIT}" || fail "unit died within 45s of starting"
+          after="$(systemctl --user show "${UNIT}" -p NRestarts --value)"
+          [ "${before}" = "${after}" ] || fail "unit restarted ${before} -> ${after} within 45s (crash loop)"
+          echo "::notice::${HOST} is healthy on ${VERSION}"
+
+      - name: Roll back
+        # Only once the upgrade ran: before it nothing on the host changed.
+        if: failure() && steps.installed.outputs.changed == 'true' && steps.upgrade.outcome != 'skipped'
+        env:
+          PREV: ${{ steps.installed.outputs.current }}
+        run: |
+          set -euo pipefail
+          echo "::error::deploy failed — rolling back to ${PREV}"
+          # The same extras as the upgrade: dropping one rolls a host on
+          # that backend back to a build that cannot start.
+          "${VENV_PIP}" install --upgrade "sbxloop[discord,slack]==${PREV}" "sbxloop-worker==${PREV}"
+          systemctl --user reset-failed "${UNIT}" || true
+          timeout 300 systemctl --user restart "${UNIT}"
+          sleep 15
+          systemctl --user is-active --quiet "${UNIT}" \
+            && echo "rolled back to $("${VENV_SBXLOOP}" --version | awk '{print $2}')" \
+            || echo "::error::ROLLBACK ALSO FAILED — ${HOST} needs a human"
+
+      - name: Restore the other holds
+        if: always() && steps.installed.outputs.changed == 'true' && steps.state.outcome == 'success'
+        env:
+          HOLDS: ${{ steps.state.outputs.holds }}
+        run: |
+          set -euo pipefail
+          cd "${WORKDIR}"
+          for h in ${HOLDS}; do
+            "${SBXLOOP}" daemon ctl pause --hold "${h}" --timeout 60 \
+              || echo "::warning::could not restore hold ${h}"
+          done
+
+      - name: Release the deploy hold
+        # Whatever happened, our hold must not outlive the job.
+        if: always() && steps.hold.outcome == 'success'
+        run: |
+          set -euo pipefail
+          cd "${WORKDIR}"
+          "${SBXLOOP}" daemon ctl resume --hold "${HOLD}" --timeout 60 \
+            || echo "::warning::could not release hold ${HOLD}"
+
+      - name: Report
+        if: always() && steps.installed.outputs.changed == 'true'
+        env:
+          VERSION: ${{ steps.target.outputs.version }}
+          FROM: ${{ steps.installed.outputs.current }}
+          RESULT: ${{ job.status }}
+          WAITED_S: ${{ steps.drain.outputs.waited_s }}
+          UPGRADED: ${{ steps.upgrade.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          waited=""
+          if [ "${WAITED_S:-0}" -gt 0 ] 2>/dev/null; then
+            waited=" after waiting $((WAITED_S / 60)) min for the daemon to go idle"
+          fi
+          if [ "${RESULT}" = "success" ]; then
+            MSG="✅ \`${HOST}\` restarted on sbxloop \`${VERSION}\`${waited} — [run](${RUN_URL})"
+          elif [ "${UPGRADED}" = "skipped" ]; then
+            MSG="❌ deploy of sbxloop \`${VERSION}\` to \`${HOST}\` **${RESULT}** before anything was installed — still on \`${FROM}\`, daemon untouched. [run](${RUN_URL})"
+          else
+            MSG="❌ deploy of sbxloop \`${VERSION}\` to \`${HOST}\` **${RESULT}** — rolled back to \`${FROM}\`. [run](${RUN_URL})"
+          fi
+          cd "${WORKDIR}" && "${SBXLOOP}" daemon notify "${MSG}"

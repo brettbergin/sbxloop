@@ -96,6 +96,7 @@ SUMMARY_KEYS: tuple[str, ...] = (
     "op",
     "line",
     "message",
+    "summary",
     "outcome",
     "error",
     "url",
@@ -191,7 +192,17 @@ class HostEventTypes:
     # `regressions`, `preexisting`, `advisory`, `ignored`, `baseline_sha`.
     LANDING_CHECKS = "landing.checks"
     LAND_UNDRAFT = "land.undraft"
+    # A draft the loop did not make (#677): a person converted the PR back,
+    # and the landing parks until they mark it ready (`pr`, `head`).
+    LAND_HELD_BY_DRAFT = "land.held_by_draft"
     LAND_UPDATE = "land.update"
+    # The base merges through a merge queue (#676): the PR entered it
+    # (`pr`, `head`, `position`, `resumed` when it was already queued) …
+    LAND_ENQUEUED = "land.enqueued"
+    # … and the queue removed it unmerged (`pr`, `head`, `reason` as GitHub
+    # words it, `failed` — the red checks on the queue's commit, which a
+    # fix round gets; none means the run blocks).
+    LAND_DEQUEUED = "land.dequeued"
     # Landing answered human threads nothing else in the pipeline would
     # ever speak to (`pr`, `acked`) — the reply is the not-silent part.
     LAND_HUMAN_ACK = "land.human_ack"
@@ -205,19 +216,68 @@ class HostEventTypes:
     # awaiting one human approval (`pr`, `url`, `sha`, `review_rounds`,
     # `ci_rounds`).
     RUN_GATED = "run.gated"
+    # The base requires an approving review the loop cannot give its own
+    # PR (#675): every bar it can clear is cleared; the run parks and the
+    # daemon waits for a person on GitHub (`pr`, `url`, `sha`,
+    # `approvals_required`, `approvals_have`, `code_owners`).
+    RUN_AWAITING_REVIEW = "run.awaiting_review"
     # Follow-up issues filed (or listed on the PR) after the merge (#517):
     # `pr`, `mode`, `filed` [{number, url, title}], `listed` (titles).
     RUN_FOLLOWUPS = "run.followups"
     RUN_BLOCKED = "run.blocked"
     # A non-terminal run closed out by daemon startup/staleness reconciliation.
     RUN_RECONCILED = "run.reconciled"
+    # One authenticated request the service sandbox made on the agent's
+    # behalf (#765): `credential`, `method`, `path`, `status` (or `error`),
+    # `duration_s`, `phase`, `task_id`. Never the body, never a header.
+    SERVICE_CALL = "service.call"
+    # One dependency fetch the service sandbox ran for the agent (#766):
+    # `ecosystem`, `verb`, `argv`, `exit_code` (or `error`), `duration_s`,
+    # `phase`, `task_id`. The output tail rides `detail` only on failure.
+    SANDBOX_FETCH = "sandbox.fetch"
+    # What one workload task produced (#757), after each execute attempt:
+    # `task_id`, `attempt`, `summary` (the report's result line), `files`
+    # (how many data-directory files the task touched). The full output
+    # lives on the task row, never on the wire.
+    TASK_OUTPUT = "task.output"
+    # What the workload's plan asked for and the run's profile granted
+    # (#758), once after planning: `profile` (name or None), `hosts`,
+    # `credentials` (names only), `sinks`, `repos`. Only when the plan
+    # declared a need.
+    RUN_NEEDS_GRANTED = "run.needs_granted"
+    # A need the profile does not cover (#758): `profile`, `need` (host /
+    # credential / sink / repo), `value`, `task_id`, `key` — the
+    # sbxloop.toml key that would have allowed it — and `message`. The run
+    # fails closed on the first; every refusal is on the record.
+    RUN_NEEDS_REFUSED = "run.needs_refused"
+    # A workload's result reached one of its sinks (#759): `sink` (chat /
+    # issue / artifact / pr), `location` (the issue's URL, the artifacts
+    # directory, `chat`), `tasks` (the ids the sink carried), `files`, and
+    # `message` — for the chat sink, the reply itself.
+    RUN_PUBLISHED = "run.published"
+    # The judge's verdict on one workload task (#756): `task_id`,
+    # `attempt`, `passed`, `unmet`, `notes`.
+    JUDGE_VERDICT = "judge.verdict"
+    # The judge produced no usable verdict twice running (#756): `task_id`,
+    # `attempt`, `error`. The run fails closed — a judge that cannot judge
+    # never passes work.
+    JUDGE_DEGRADED = "judge.degraded"
     # The task roster as the run will work it (also re-announced on resume,
     # with each task's persisted state).
     RUN_TASKS = "run.tasks"
     TASK_START = "task.start"
     TASK_STATE = "task.state"
     TASK_END = "task.end"
+    # Also carries `status="advisory"` (the check failed under
+    # `verify_mode = "advisory"` and blocked nothing) and `status="skipped"`
+    # (`ci-only`: the pull request's checks are the verification) — #682.
     PHASE_END = "phase.end"
+    # Once per run, before decomposition, when `verify_mode = "full"` and
+    # the workspace shows a suite that needs services the sandbox does not
+    # have (a compose file, testcontainers in a lockfile, `services:` in a
+    # workflow): `evidence` names what was seen, `hint` the knob (#682).
+    # A hint only — the mode never changes on its own.
+    VERIFY_SERVICES_DETECTED = "verify.services_detected"
     POLICY_ALLOW = "policy.allow"
     POLICY_DENY = "policy.deny"
     SANDBOX_PROVISION_START = "sandbox.provision_start"
@@ -229,6 +289,10 @@ class HostEventTypes:
     # registry default), so a probe failure can be read against the
     # interpreter the project asked for.
     SANDBOX_TOOLCHAIN = "sandbox.toolchain"
+    # One per operator setup step (#681): the `apt_packages` install when a
+    # template lacked any, and each `setup_commands` entry with its exit
+    # code, duration and output tail (delivered secret values scrubbed).
+    SANDBOX_SETUP = "sandbox.setup"
     SANDBOX_READY = "sandbox.ready"
     SANDBOX_PREBAKED = "sandbox.prebaked"
     SANDBOX_CLEANUP = "sandbox.cleanup"

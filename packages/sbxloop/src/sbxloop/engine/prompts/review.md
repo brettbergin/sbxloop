@@ -16,9 +16,15 @@ tests/unit/test_prompts.py):
   prompt reaches the model; everything below it is sent verbatim.
 
 Variables: $outcome, $pr_number, $round, $diff, $tasks_summary,
-$prior_rounds, $user_guidance, $project_gate, $config_override_example
-(rendered by verifylint.config_override_example for the run's resolved
-toolchains, #634); $retry_context (defaulted by render()).
+$prior_rounds, $user_guidance, $project_gate (rendered by
+verifylint.reviewer_gate_rule — the gate as a result to weigh, or that
+there is none, #690; test_review_prompt_treats_the_gate_as_evidence),
+$config_override_example (rendered by verifylint.config_override_example
+for the run's resolved toolchains, #634 — one story per registry
+ecosystem, #690); $retry_context and $verification (what the sandbox's
+checks did not decide under an advisory or ci-only verify mode, #682;
+both defaulted by render()); $repo_conventions (engine.repocontext, #688 —
+defaulted to "" by render()).
 Examples are domain-neutral on purpose (#634): no issue or PR numbers, no
 path, state name or product vocabulary from the loop's own repository —
 tests anchor on the rule phrases, not the examples
@@ -59,6 +65,8 @@ That is the review that stops the pull request which deletes the retry
 loop when the person is seeing duplicate emails: a second worker sends them,
 and the diff leaves it exactly where it was.
 
+$repo_conventions
+
 ## The tasks the run built, with their acceptance criteria
 
 $tasks_summary
@@ -80,7 +88,10 @@ at a time — each one a row shape nobody enumerated.
 $project_gate
 
 A green gate is necessary, not sufficient: the defects that reach a PR are
-precisely the ones its tests do not encode.
+precisely the ones its tests do not encode. You are reading, not building:
+the gate's result is evidence to weigh, not a step of yours to perform.
+
+$verification
 
 ## Earlier rounds
 
@@ -131,9 +142,12 @@ $user_guidance
 
 ## The diff
 
-The PR's changes against its base (working tree included). Anything not
-shown here is unchanged; you can read the whole tree from the working
-directory.
+The PR's changes against its base (working tree included). A file the diff
+does not touch is unchanged, and you can read the whole tree from the
+working directory. If the diff carries a `[diff clipped …]` marker, the
+budget cut its middle: the lines it counts are real changes you have not
+seen, so read those files from the tree before you judge them — never
+treat the gap as unchanged.
 
 ```diff
 $diff
@@ -163,8 +177,9 @@ lenses:
   and breaks a caller's assumption is the classic leaked defect.
 
 Also check that the PR does what the outcome asked and nothing it did not:
-work deleted or rewritten beyond the outcome's scope is a finding, and so is
-an acceptance criterion the diff does not meet.
+work deleted, rewritten or reformatted beyond the outcome's scope is a
+defect, and so is an acceptance criterion the diff does not meet — the
+builder was told both in the same words.
 
 ## When the work is right and the check is wrong
 

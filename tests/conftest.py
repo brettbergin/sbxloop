@@ -80,7 +80,15 @@ class FakeSbx:
         stdout: str = "",
         stderr: str = "",
         once: bool = False,
+        passthrough: bool = False,
     ) -> None:
+        """Script the fake's answer to every invocation starting with ``prefix``.
+
+        First match wins, in scripting order. ``passthrough`` reserves a
+        prefix for the fake's real behaviour so a broader prefix scripted
+        after it (say, every ``sh -c``) does not swallow it — the workspace
+        mount probe is the usual one to protect.
+        """
         path = self.state / "responses.json"
         responses = json.loads(path.read_text()) if path.is_file() else []
         responses.append(
@@ -90,12 +98,23 @@ class FakeSbx:
                 "stdout": stdout,
                 "stderr": stderr,
                 "once": once,
+                "passthrough": passthrough,
             }
         )
         path.write_text(json.dumps(responses))
 
     def fail_next(self, prefix: str, *, returncode: int = 1, stderr: str = "error") -> None:
         self.script(prefix, returncode=returncode, stderr=stderr, once=True)
+
+
+def pytest_addoption(parser: pytest.Parser) -> None:
+    parser.addoption(
+        "--update-trail",
+        action="store_true",
+        default=False,
+        help="re-record tests/fixtures/code_run_trail/*.json from the current code "
+        "(tests/unit/test_code_run_trail.py); a deliberate act, read the diff",
+    )
 
 
 @pytest.fixture
@@ -105,8 +124,12 @@ def fake_sbx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeSbx:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     shim = bin_dir / "sbx"
+    # ``-I -S`` skips site-packages, ``.pth`` files and the user site: the fake
+    # is stdlib-only, and the suite execs it thousands of times, so interpreter
+    # start-up is a measurable share of wall clock (#750).
     shim.write_text(
-        f'#!/bin/sh\nSBX_FAKE_DIR="{state}" exec "{sys.executable}" "{FAKE_SBX_SOURCE}" "$@"\n'
+        "#!/bin/sh\n"
+        f'SBX_FAKE_DIR="{state}" exec "{sys.executable}" -I -S "{FAKE_SBX_SOURCE}" "$@"\n'
     )
     shim.chmod(shim.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     monkeypatch.setenv("PATH", str(bin_dir), prepend=":")
@@ -128,6 +151,31 @@ def _structlog_through_stdlib() -> None:
     from sbxloop.log import configure_logging
 
     configure_logging("DEBUG")
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _cli_console_follows_columns() -> None:
+    """Make the CLI's module-level rich ``Console`` read ``COLUMNS``/``LINES``
+    at render time, the way CLI tests assume when they ``monkeypatch.setenv``
+    them or pass ``env=`` to ``CliRunner.invoke``.
+
+    rich freezes both variables into the console when they are set at
+    construction, and construction happens at import. Importing GNU readline
+    (which pytest's startup does) ``setenv``s ``COLUMNS=80``/``LINES=24`` in
+    the C environment; the importing process never sees that in ``os.environ``
+    but every xdist worker inherits it, so on a Linux system Python the
+    console is born frozen at 80 columns and rich tables truncate cells the
+    tests look for. libedit builds (macOS, uv-managed CPython) do not, which
+    is why the failure only shows on distro interpreters.
+    """
+    from sbxloop.cli import app as app_module
+
+    console = app_module.console
+    # These are rich internals; fail loudly if a rich upgrade renames them
+    # rather than quietly bringing the frozen-width failure back.
+    assert hasattr(console, "_width") and hasattr(console, "_height")
+    console._width = None
+    console._height = None
 
 
 @pytest.fixture(autouse=True)

@@ -39,10 +39,18 @@ from sbxloop.config import (
     load_dotenv_file,
 )
 from sbxloop.daemon.control import DEFAULT_TIMEOUT_S
-from sbxloop.daemon.store import DaemonStore
+from sbxloop.daemon.store import DaemonStore, apply_item_verb
 from sbxloop.daemon.versions import VersionProbe, start_drift_check
 from sbxloop.engine.engine import LoopEngine
-from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, artifacts_dir, scan_artifacts
+from sbxloop.engine.model import (
+    TERMINAL_RUN_STATES,
+    RunResult,
+    TaskRecord,
+    artifacts_dir,
+    scan_artifacts,
+    workload_summary,
+)
+from sbxloop.engine.sinks import published_line
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxloopError
 from sbxloop.events import Event, EventBus, HostEventTypes
@@ -50,7 +58,7 @@ from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
 from sbxloop.ghids import normalize_item_id, try_parse_gh_id
 from sbxloop.log import configure_logging, get_logger
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
-from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.cli import INTERACTIVE_SHELL_ARGV, SbxCLI
 from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.pair import cleanup_registry
 from sbxloop.sbx.provision import sandbox_name
@@ -61,12 +69,10 @@ from sbxloop.sbx.prune import (
     remove_sandbox,
 )
 from sbxloop.sbx.secretstate import (
-    SANDBOX_SCOPE_PREFIX,
-    assess,
-    inspect_custom_secret,
-    removal_ladder,
-    replace_registration,
-    tracked_custom_secrets,
+    clean_secrets,
+    rotate_registrations,
+    secret_rows,
+    secrets_context,
     verify_secret_visibility,
 )
 
@@ -154,6 +160,63 @@ def _run_config() -> Config:
 
 def _store(config: Config) -> StateStore:
     return StateStore(config.state_dir / "state.db")
+
+
+def _resolve_run_workspace(
+    config: Config, flag: Path | None, *, cwd: Path
+) -> tuple[Config, Path | None, str]:
+    """The checkout a one-shot ``sbxloop run`` works on, and where it came from.
+
+    In order: ``--workspace``; whatever the config already resolves for the
+    run's repository (or configures for another — that run clones from its
+    remote instead, see ``Provisioner._resolve_workspace_source``); the git
+    checkout enclosing ``cwd``. A run from inside a checkout used to operate
+    on an *empty* per-run directory and report success (#670) — the
+    enclosing checkout is what the person typing the command means.
+
+    None with no checkout anywhere is harvest mode, kept as is: the agent
+    starts from nothing and the output is collected as artifacts.
+    """
+    from sbxloop import hostgit
+
+    if flag is not None:
+        chosen = flag.expanduser()
+        if not chosen.is_dir():
+            raise SbxloopError(f"{chosen} is not a directory")
+        return _pin_workspace(config, chosen.resolve()), chosen.resolve(), "--workspace"
+    source = config.workspace_source(config.github.repo)
+    if source == "configured":
+        return config, config.workspace_for_repo(config.github.repo), source
+    if source == "remote":
+        # Configured for some other repository: the provisioner clones this
+        # one from its remote rather than borrowing that checkout.
+        return config, None, source
+    root = hostgit.repo_toplevel(cwd)
+    if root is None:
+        return config, None, "none"
+    return _pin_workspace(config, root), root, "cwd-checkout"
+
+
+_WORKSPACE_SOURCE_TEXT = {
+    "--workspace": "from --workspace",
+    "configured": "configured",
+    "cwd-checkout": "the git checkout enclosing the current directory",
+}
+
+
+def _pin_workspace(config: Config, workspace: Path) -> Config:
+    """Make ``workspace`` the one checkout this run works on.
+
+    Set on the ``[sandbox]`` section and on every repository entry the run
+    still carries (at most one after ``run`` narrows), so
+    ``Config.workspace_for_repo`` resolves to it whichever path it takes and
+    the provisioner's origin check still guards a checkout of the wrong
+    repository.
+    """
+    sandbox = config.sandbox.model_copy(update={"workspace": workspace})
+    repos = [entry.model_copy(update={"workspace": workspace}) for entry in config.github.repos]
+    github = config.github.model_copy(update={"repos": repos})
+    return config.model_copy(update={"sandbox": sandbox, "github": github})
 
 
 def _resolve_repo(config: Config, selector: str | None) -> RepoConfig:
@@ -411,7 +474,7 @@ def _artifacts_tree(root: Path, files: list[Path], cap: int = _TREE_MAX_FILES) -
             if child not in nodes:
                 nodes[child] = nodes[parent].add(f"{part}/")
             parent = child
-        nodes[parent].add(f"{rel.name} [dim]({_human_size(path.stat().st_size)})[/]")
+        nodes[parent].add(f"{rel.name} [dim]({_human_size(path.lstat().st_size)})[/]")
     if len(files) > cap:
         tree.add(f"[dim]… +{len(files) - cap} more[/]")
     return tree
@@ -518,10 +581,22 @@ def _print_retention_note(config: Config) -> None:
 def _finish(result: RunResult, config: Config) -> None:
     style = "green" if result.succeeded else ("yellow" if result.state == "blocked" else "red")
     console.print(f"\nrun [bold cyan]{result.run_id}[/] finished: [bold {style}]{result.state}[/]")
+    if result.kind != "code":
+        console.print(f"  kind: {result.kind}")
     if result.reason:
         console.print(f"  reason: {result.reason}")
+    if result.summary:
+        # A workload's closing line (#757); the per-task lines follow.
+        console.print(f"  summary: {rich_escape(result.summary.splitlines()[0])}")
     for task in result.tasks:
-        console.print(f"  {task.spec.id}: {task.state}  ({task.spec.title})")
+        line = f"  {task.spec.id}: {task.state}  ({rich_escape(task.spec.title)})"
+        if task.output is not None:
+            # A workload task's own result line (#757).
+            line += f"\n      {_output_cell(task)}"
+        console.print(line)
+    for entry in result.published:
+        # Where a workload's result went (#759), one line per sink.
+        console.print(f"  published: {rich_escape(published_line(entry))}")
     _print_github_summary(result, config)
     _print_artifacts_summary(result, config)
     _print_workspace_clone_summary(result, config)
@@ -535,6 +610,23 @@ def _finish(result: RunResult, config: Config) -> None:
 @app.command()
 def run(
     outcome: Annotated[str, typer.Argument(help="The outcome to achieve.")],
+    kind: Annotated[
+        str,
+        typer.Option(
+            "--kind",
+            help="What the run is for: `code` (the developer loop: a task graph that "
+            "ends in a pull request) or `workload` (the operator persona: plan, "
+            "execute, judge, publish — in its own data directory, no repository).",
+        ),
+    ] = "code",
+    profile: Annotated[
+        str | None,
+        typer.Option(
+            "--profile",
+            help="The [[workloads]] profile a `--kind workload` run is bounded by "
+            "(default: [workload] default; none at all lets the plan declare no needs).",
+        ),
+    ] = None,
     repo: Annotated[
         str | None,
         typer.Option(
@@ -565,6 +657,15 @@ def run(
         typer.Option(
             "--create-public/--no-create-public",
             help="Make a repository created via --create-repo public.",
+        ),
+    ] = None,
+    workspace: Annotated[
+        Path | None,
+        typer.Option(
+            "--workspace",
+            "-w",
+            help="Repository checkout to work on. Default: [sandbox] workspace (or the "
+            "repo entry's), then the git checkout enclosing the current directory.",
         ),
     ] = None,
     model: Annotated[
@@ -608,6 +709,62 @@ def run(
         keep_sandboxes=keep_sandboxes,
         keep_on_failure=keep_on_failure,
     )
+    if kind not in ("code", "workload"):
+        console.print(f"[bold red]invalid --kind:[/] {kind!r} (expected `code` or `workload`)")
+        raise typer.Exit(2)
+    if profile is not None and kind != "workload":
+        console.print(
+            "[bold red]--profile cannot be combined with --kind code:[/] a workload "
+            "profile bounds what a workload's plan may ask for"
+        )
+        raise typer.Exit(2)
+    if kind == "workload":
+        # A workload works in its own data directory on the agent sandbox
+        # alone (#755); a checkout or a repository is a code run's, and
+        # what a workload may do with either comes with its config (#758).
+        refused = [
+            flag
+            for flag, value in (
+                ("--repo", repo),
+                ("--deliver-base", deliver_base),
+                ("--create-repo", create_repo),
+                ("--create-public", create_public),
+                ("--workspace", workspace),
+            )
+            if value is not None
+        ]
+        if refused:
+            console.print(
+                f"[bold red]{', '.join(refused)} cannot be combined with --kind workload:[/] "
+                "a workload runs in its own data directory and delivers to no repository"
+            )
+            raise typer.Exit(2)
+        console.print(
+            "workspace: a per-run data directory — the agent starts from an empty "
+            "directory and the run's output is harvested as artifacts"
+        )
+        try:
+            chosen_profile = config.workload_profile(profile)
+        except SbxloopError as exc:
+            console.print(f"[bold red]{exc}[/]")
+            raise typer.Exit(2) from exc
+        console.print(
+            f"profile: {chosen_profile.name}"
+            if chosen_profile is not None
+            else "profile: none (no needs can be granted)"
+        )
+        engine = LoopEngine(config)
+        try:
+            result = _drive_with_ui(
+                engine,
+                tui=tui,
+                chat=chat,
+                action=lambda: engine.start(outcome, kind="workload", profile=profile),
+            )
+        except SbxloopError as exc:
+            console.print(f"[bold red]run failed:[/] {exc}")
+            raise typer.Exit(2) from exc
+        _finish(result, config)
     github_overrides = {
         key: value
         for key, value in (
@@ -656,9 +813,32 @@ def run(
             "(see `sbxloop init`), then re-run."
         )
         raise typer.Exit(2)
+    try:
+        config, chosen, source = _resolve_run_workspace(config, workspace, cwd=Path.cwd())
+    except SbxloopError as exc:
+        console.print(f"[bold red]invalid --workspace:[/] {exc}")
+        raise typer.Exit(2) from exc
+    if chosen is not None:
+        console.print(f"workspace: {chosen} ({_WORKSPACE_SOURCE_TEXT[source]})")
+    elif source == "remote":
+        console.print(
+            f"workspace: a fresh clone of {config.github.repo} (the configured checkout "
+            "belongs to another repository)"
+        )
+    else:
+        console.print(
+            "workspace: none — not inside a git checkout and none configured; the "
+            "agent starts from an empty directory and the run's output is harvested "
+            "as artifacts (pass [cyan]--workspace PATH[/] to work on a checkout)"
+        )
     engine = LoopEngine(config)
     try:
-        result = _drive_with_ui(engine, tui=tui, chat=chat, action=lambda: engine.start(outcome))
+        result = _drive_with_ui(
+            engine,
+            tui=tui,
+            chat=chat,
+            action=lambda: engine.start(outcome, workspace_source=source),
+        )
     except SbxloopError as exc:
         console.print(f"[bold red]run failed:[/] {exc}")
         raise typer.Exit(2) from exc
@@ -712,16 +892,38 @@ def cancel(run_id: Annotated[str, typer.Argument()]) -> None:
     console.print(f"run {run_id} cancelled")
 
 
+def _output_cell(task: TaskRecord) -> str:
+    """One task's output as the status table shows it (#757)."""
+    if task.output is None:
+        return "[dim]—[/]"
+    cell = rich_escape(task.output.summary) or "[dim](no result reported)[/]"
+    if count := task.output.file_count:
+        cell += f" [dim]({count} file{'s' if count != 1 else ''})[/]"
+    return cell
+
+
 @app.command()
 def status(
     run_id: Annotated[str | None, typer.Argument(help="Run id for details.")] = None,
+    json_output: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="With a run id: the run, its tasks and their outputs as one JSON "
+            "object on stdout, for scripts.",
+        ),
+    ] = False,
 ) -> None:
-    """List runs, or show one run's tasks and phase history."""
+    """List runs, or show one run's tasks, outputs and phase history."""
     config = _run_config()
     store = _store(config)
     if run_id is None:
+        if json_output:
+            console.print("[bold red]--json needs a run id.[/]")
+            raise typer.Exit(2)
         table = Table(title="sbxloop runs")
         table.add_column("run")
+        table.add_column("kind")
         table.add_column("repo")
         table.add_column("state", max_width=60)
         table.add_column("outcome", max_width=60)
@@ -732,6 +934,7 @@ def status(
             state = f"{record.state} — [dim]{record.reason}[/]" if record.reason else record.state
             table.add_row(
                 record.run_id,
+                record.kind,
                 _run_repo(store, record.run_id) or "[dim]—[/]",
                 state,
                 record.outcome[:60],
@@ -745,31 +948,64 @@ def status(
     except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
+    tasks = store.get_tasks(run_id)
+    if json_output:
+        # Bare JSON on stdout, nothing else — `sbxloop status <run> --json | jq`.
+        # A workload's tasks carry their outputs (#757); a code run's are null.
+        typer.echo(
+            json.dumps(
+                {
+                    "run": record.model_dump(mode="json"),
+                    "summary": (
+                        workload_summary(tasks, record.pr_title)
+                        if record.kind == "workload"
+                        else None
+                    ),
+                    "tasks": [task.model_dump(mode="json") for task in tasks],
+                }
+            )
+        )
+        return
     console.print(f"run [bold cyan]{record.run_id}[/]  state: [bold]{record.state}[/]")
+    console.print(f"kind: {record.kind}")
     repo = _run_repo(store, record.run_id)
     if repo:
         console.print(f"repo: [bold]{repo}[/]")
     if record.reason:
         console.print(f"reason: {record.reason}")
     console.print(f"outcome: {record.outcome}")
+    for entry in record.published:
+        console.print(f"published: {rich_escape(published_line(entry))}")
     table = Table(title="tasks")
-    for column in ("task", "title", "state", "revisions", "replans"):
+    columns: tuple[str, ...] = ("task", "title", "state", "revisions", "replans")
+    if record.kind == "workload":
+        columns += ("output",)
+    for column in columns:
         table.add_column(column)
-    for task in store.get_tasks(run_id):
-        table.add_row(
+    for task in tasks:
+        row = [
             task.spec.id,
             task.spec.title,
             task.state,
             str(task.revisions),
             str(task.replans),
-        )
+        ]
+        if record.kind == "workload":
+            row.append(_output_cell(task))
+        table.add_row(*row)
     console.print(table)
     attempts = store.phase_attempts(run_id)
     console.print(f"{len(attempts)} phase attempts recorded")
     # The pair names, so debugging a live run needs no by-hand
     # `sbxloop-<run>-agent` reconstruction.
     console.print("sandboxes:")
-    roles: tuple[SandboxRole, ...] = ("agent", "github")
+    # The service sandbox (#765) exists only for a run granted credentials;
+    # the github sandbox never for a workload (#755).
+    roles: tuple[SandboxRole, ...] = (
+        ("agent",) if record.kind == "workload" else ("agent", "github")
+    )
+    if record.credentials:
+        roles += ("service",)
     try:
         live = {info.name for info in SbxCLI(app_name=config.app_name or None).ls()}
     except SbxloopError:
@@ -838,9 +1074,6 @@ def logs(
 
 # Prefer bash when the template has it, fall back to POSIX sh. `sbx exec`
 # has no documented -it flags; terminal attachment is inherited stdio.
-_INTERACTIVE_SHELL = ("sh", "-c", "command -v bash >/dev/null && exec bash -l; exec sh -l")
-
-
 @app.command()
 def shell(
     run_id: Annotated[str, typer.Argument(help="Run id.")],
@@ -859,8 +1092,8 @@ def shell(
     Attaching to an in-flight run is meant as observation: the worker owns
     its env files and workspace, so avoid mutating them mid-phase.
     """
-    if role not in ("agent", "github"):
-        console.print(f"[bold red]invalid --role {role!r}:[/] must be agent or github")
+    if role not in ("agent", "github", "service"):
+        console.print(f"[bold red]invalid --role {role!r}:[/] must be agent, github or service")
         raise typer.Exit(2)
     config = _run_config()
     store = _store(config)
@@ -883,7 +1116,7 @@ def shell(
             "pruned since."
         )
         raise typer.Exit(2)
-    argv = ("sh", "-lc", command) if command else _INTERACTIVE_SHELL
+    argv = ("sh", "-lc", command) if command else INTERACTIVE_SHELL_ARGV
     raise typer.Exit(cli.exec_interactive(name, argv))
 
 
@@ -927,7 +1160,8 @@ def artifacts(
         console.print(_artifacts_tree(target, files))
     else:
         for file in files:
-            size = _human_size(file.stat().st_size)
+            # lstat: a symlink lists as itself, even one that does not resolve
+            size = _human_size(file.lstat().st_size)
             console.print(f"  {file.relative_to(target)}  [dim]{size}[/]")
     if scan.excluded_note:
         console.print(f"  [dim]{scan.excluded_note}[/]")
@@ -981,8 +1215,7 @@ def _secrets_context(config: Config | None = None) -> tuple[Config, SbxCLI, set[
     """Config, an sbx handle, and the live sbxloop sandbox names (for
     telling in-use registration scopes from stale ones)."""
     config = load_config() if config is None else config
-    cli = SbxCLI(app_name=config.app_name or None)
-    live = {i.name for i in cli.ls() if i.name.startswith(SANDBOX_SCOPE_PREFIX)}
+    cli, live = secrets_context(config)
     return config, cli, live
 
 
@@ -1011,24 +1244,14 @@ def secrets_list(
         for column in ("env", "expected", "actual", "status", "note"):
             table.add_column(column)
         warned = False
-        for env, host in tracked_custom_secrets(config):
-            state = inspect_custom_secret(cli, env, host=host, probe=probe)
-            judgement = assess(state, canonical_host=host, live_sandboxes=live)
-            warned = warned or judgement.status == "warn"
-            if state.exists:
-                actual = f"scope {state.scope or '(unknown)'}"
-                if state.hosts:
-                    actual += f" @ {', '.join(state.hosts)}"
-            elif state.exists is None:
-                actual = "(undetermined)"
-            else:
-                actual = "not registered"
+        for row in secret_rows(config, cli, live, probe=probe):
+            warned = warned or row.judgement.status == "warn"
             table.add_row(
-                env,
-                f"custom @ {host} (per-run scope)",
-                actual,
-                _STATUS_STYLES[judgement.status],
-                judgement.note,
+                row.env,
+                row.expected,
+                row.actual,
+                _STATUS_STYLES[row.judgement.status],
+                row.judgement.note,
             )
         console.print(table)
         console.print(
@@ -1069,23 +1292,16 @@ def secrets_clean(
         config, cli, live = _secrets_context()
         failed = False
         removed_any = False
-        for env, host in tracked_custom_secrets(config):
-            state = inspect_custom_secret(cli, env, host=host)
-            judgement = assess(state, canonical_host=host, live_sandboxes=live)
-            if not (judgement.stale or (all_ and judgement.owned)):
-                console.print(f"{env}: nothing to clean ({judgement.note})")
-                continue
-            where = f"scope {state.scope or '(unknown)'}"
-            if not apply:
-                console.print(f"{env}: would remove the registration in {where} — {judgement.note}")
-                removed_any = True
-                continue
-            if any(rm() for rm in removal_ladder(cli, state, host=host)):
-                console.print(f"[green]{env}: removed the registration in {where}[/]")
+        for outcome in clean_secrets(config, cli, live, apply=apply, all_=all_):
+            if outcome.failed:
+                console.print(f"[bold red]{outcome.env}: {outcome.message}[/]")
+                failed = True
+            elif outcome.removed and apply:
+                console.print(f"[green]{outcome.env}: {outcome.message}[/]")
                 removed_any = True
             else:
-                console.print(f"[bold red]{env}: sbx rejected every removal for {where}[/]")
-                failed = True
+                console.print(f"{outcome.env}: {outcome.message}")
+                removed_any = removed_any or outcome.removed
         if not apply and removed_any:
             console.print("\ndry run — re-run with [cyan]--apply[/] to remove")
         if failed:
@@ -1139,26 +1355,13 @@ def secrets_rotate(
                 )
                 raise typer.Exit(2)
         config, cli, live = _secrets_context(config)
-        for env, host in tracked_custom_secrets(config):
-            replace_registration(cli, env=env, host=host, token=token)
-            console.print(f"[green]rotated:[/] {env} registered @ {host} (global scope)")
-        if live:
-            console.print(
-                f"[yellow]live sbxloop sandboxes exist ({', '.join(sorted(live))})[/] — "
-                "they may still hold the old token in their in-VM env file; "
-                "remove them with `sbxloop sandbox rm --all`"
-            )
-        if prompt:
-            console.print(
-                f"[yellow]runs read {token_env} from the environment at "
-                "provision time[/] — update your export / ./.env with the new value too"
-            )
-        if config.secret_strategy == "plain-env":  # nosec B105 - strategy label
-            console.print(
-                "next run: [bold]plain-env[/] strategy (configured) — the token is "
-                "written to the in-VM env file from your environment"
-            )
-        elif verify:
+        styles = {"ok": "[green]{}[/]", "warn": "[yellow]{}[/]", "note": "{}"}
+        for kind, line in rotate_registrations(config, cli, live, token=token):
+            if kind == "warn" and "update your export" in line and not prompt:
+                continue  # the token came from the environment: it is current there
+            console.print(styles[kind].format(line))
+        # Under plain-env the strategy line above already says it all.
+        if config.secret_strategy != "plain-env" and verify:  # nosec B105 - strategy label
             workspace = config.state_dir / "secretcheck"
             workspace.mkdir(parents=True, exist_ok=True)
             visible = verify_secret_visibility(
@@ -1248,7 +1451,7 @@ def sandbox_prune(
     failures = 0
     for v in orphans:
         try:
-            if v.role in ("agent", "github"):
+            if v.role in ("agent", "github", "service"):
                 # A pruned run sandbox takes its secret registrations with
                 # it; otherwise a later run under the same name (resume)
                 # cannot replace them and comes up with the proxy sentinel.
@@ -1357,10 +1560,40 @@ def config_show() -> None:
             else:
                 flat[dotted] = value
 
-    flatten("", config.model_dump(mode="json"))
+    dumped = config.model_dump(mode="json")
+    # The catalogue and the profiles are lists of tables: shown by name
+    # below rather than as one repr each. A credential's value is never in
+    # the model — only whether its env var is set is worth showing.
+    dumped.pop("credentials", None)
+    dumped.pop("workloads", None)
+    flatten("", dumped)
     for dotted in sorted(flat):
         table.add_row(dotted, repr(flat[dotted]), sources.get(dotted, "default"))
     console.print(table)
+    if config.credentials:
+        creds = Table(title="credentials (values never shown)")
+        for col in ("name", "env", "present", "host", "description"):
+            creds.add_column(col)
+        for entry in config.credentials:
+            present = "set" if os.environ.get(entry.env) else "[yellow]unset[/]"
+            creds.add_row(entry.name, entry.env, present, entry.host, entry.description)
+        console.print(creds)
+    if config.workloads:
+        profiles = Table(title="workload profiles")
+        for col in ("name", "egress", "credentials", "sinks", "repo", "publish", "budgets"):
+            profiles.add_column(col)
+        for prof in config.workloads:
+            overrides = prof.budgets.model_dump(exclude_none=True)
+            profiles.add_row(
+                prof.name + (" (default)" if prof.name == config.workload.default else ""),
+                ", ".join(prof.egress) or "-",
+                ", ".join(prof.credentials) or "-",
+                ", ".join(prof.sinks) or "-",
+                "yes" if prof.repo else "no",
+                prof.publish,
+                ", ".join(f"{k}={v}" for k, v in overrides.items()) or "-",
+            )
+        console.print(profiles)
 
 
 @config_app.command("repos")
@@ -1397,71 +1630,43 @@ def config_repos(
 @config_app.command("policy")
 def config_policy() -> None:
     """Show the effective per-phase network egress policy."""
-    from sbxloop.policy import (
-        APT_MIRROR_DOMAINS,
-        BASELINE_REGISTRY_DOMAINS,
-        WELL_KNOWN_REGISTRY_DOMAINS,
-        baseline_allows,
-    )
-    from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS, github_policy_allows
+    from sbxloop.cli.policyview import policy_view
 
     try:
         config = load_config()
     except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
-
-    extra = list(config.sandbox.extra_allow_domains)
-    baseline = ", ".join(
-        dict.fromkeys([*AGENT_ALLOW_DOMAINS, *config.github.allow_domains, *extra])
-    )
-    # What provisioning actually seeds, deny applied — an operator reading
-    # this needs the effective set, not the constant.
-    registries = ", ".join(baseline_allows(BASELINE_REGISTRY_DOMAINS, config.policy.deny))
-    mirrors = ", ".join(baseline_allows(APT_MIRROR_DOMAINS, config.policy.deny))
+    view = policy_view(config)
 
     table = Table(title="agent sandbox: effective egress per phase")
     table.add_column("phase", no_wrap=True)
     table.add_column("policy", overflow="fold")
-    table.add_row("decompose", "baseline")
-    table.add_row(
-        "build",
-        "baseline + task-declared grants (auto-granted just before build, "
-        "within the [policy] bounds below; every grant/refusal is event-logged)",
-    )
-    table.add_row(
-        "verify",
-        "baseline + grants already made — sbx has no policy revocation, so "
-        "grants persist for the sandbox's lifetime (sandboxes are removed at "
-        "run end; grants never outlive a run)",
-    )
+    for phase, policy in view.phases:
+        table.add_row(phase, policy)
     console.print(table)
-    console.print(f"baseline (provisioned per-sandbox): {baseline}")
-    console.print(f"language registry baseline (always reachable, no declaration): {registries}")
-    console.print(f"distro mirrors (always reachable, no declaration): {mirrors}")
+    console.print(f"baseline (provisioned per-sandbox): {view.baseline}")
     console.print(
-        "well-known registries (declarable without [policy] allow): "
-        + (
-            ", ".join(WELL_KNOWN_REGISTRY_DOMAINS)
-            or "(none — every supported language's registry is in the baseline above)"
-        )
+        f"language registry baseline (always reachable, no declaration): {view.registries}"
     )
+    console.print(f"distro mirrors (always reachable, no declaration): {view.mirrors}")
+    console.print(f"well-known registries (declarable without [policy] allow): {view.well_known}")
 
     bounds = Table(title="[policy] bounds for task-declared grants")
     bounds.add_column("bound", no_wrap=True)
     bounds.add_column("patterns", overflow="fold")
-    bounds.add_row(
-        "allow",
-        ", ".join(config.policy.allow)
-        or "(empty — tasks may only use the baseline and well-known registries)",
-    )
-    bounds.add_row("deny", ", ".join(config.policy.deny) or "(none)")
+    bounds.add_row("allow", view.allow)
+    bounds.add_row("deny", view.deny)
     console.print(bounds)
 
-    if config.github.enabled:
-        gh_domains = ", ".join(github_policy_allows(config))
-        console.print(f"github sandbox (all phases, no task grants): {gh_domains}")
-    console.print("audit trail: [cyan]sbxloop logs RUN_ID --type policy.[/]")
+    if view.github is not None:
+        console.print(f"github sandbox (all phases, no task grants): {view.github}")
+    if view.service is not None:
+        console.print(
+            "service sandbox (fetches from the credentialed registries; the agent "
+            f"reaches none of them): {view.service}"
+        )
+    console.print(f"audit trail: [cyan]{view.audit}[/]")
 
 
 @app.command()
@@ -1471,22 +1676,40 @@ def init(
         bool,
         typer.Option("--stdout", help="Print the template instead of writing sbxloop.toml."),
     ] = False,
+    preset: Annotated[
+        str | None,
+        typer.Option(
+            "--preset",
+            help=(
+                "Append a packaged preset's live sections to the template, e.g. "
+                "`large-repo` for a repository whose gate takes minutes."
+            ),
+        ),
+    ] = None,
 ) -> None:
     """Write a commented sbxloop.toml with the default configuration.
 
     The template is `sbxloop.toml.example`, shipped as package data and
     published at the repository root — one source of truth, so the example
-    file and this command cannot drift.
+    file and this command cannot drift. `--preset NAME` appends the packaged
+    `presets/NAME.toml` (live sections, every table in the template is
+    commented out) so the result is one self-contained file.
     """
+    try:
+        text = render_config_template(preset)
+    except KeyError:
+        available = ", ".join(sorted(config_presets())) or "none"
+        console.print(f"unknown preset {preset!r} (available: {available})")
+        raise typer.Exit(2) from None
     if to_stdout:
         # bare TOML on stdout, nothing else — `sbxloop init --stdout > f.toml`
-        sys.stdout.write(DEFAULT_CONFIG_TOML)
+        sys.stdout.write(text)
         return
     path = Path("sbxloop.toml")
     if path.exists() and not force:
         console.print("sbxloop.toml already exists (use --force to overwrite)")
         raise typer.Exit(2)
-    path.write_text(DEFAULT_CONFIG_TOML)
+    path.write_text(text)
     console.print(f"wrote {path}")
 
 
@@ -1565,9 +1788,9 @@ def daemon(
     if ctx.invoked_subcommand is not None:
         return
     from sbxloop.daemon.agentbox import DaemonAgent
-    from sbxloop.daemon.chat import ChatBridge, build_bridge
     from sbxloop.daemon.concierge import Concierge
     from sbxloop.daemon.control import ControlServer
+    from sbxloop.daemon.fanout import FanoutFrontend, build_frontend
     from sbxloop.daemon.github import DaemonGithub
     from sbxloop.daemon.logsink import event_log_subscriber
     from sbxloop.daemon.loop import DaemonLoop
@@ -1801,7 +2024,8 @@ def daemon(
         merge_gate=config.landing.merge_gate,
         chat=config.chat_backend or "off",
         chat_channel=(config.chat_settings.channel_ref if config.chat_settings else None),
-        concierge=("on" if config.chat_backend and config.concierge.enabled else "off"),
+        tui="on",
+        concierge=("on" if concierge_wanted(config, once=once) else "off"),
         log_level=config.daemon.log_level,
         log_format=config.daemon.log_format,
         once=once,
@@ -1838,79 +2062,86 @@ def daemon(
         source.notify = loop.source_notice
     # One probe, shared: the startup drift check below warms its PyPI memo, so
     # the concierge's first `version_status` answers without a network call.
-    versions = VersionProbe(sbx=sbx)
-    bridge: ChatBridge | None = None
+    versions = VersionProbe(
+        sbx=sbx,
+        check_pypi=config.daemon.version_check,
+        upgrade_command=config.daemon.upgrade_command,
+    )
     concierge: Concierge | None = None
-    bridge = build_bridge(config, dstore, loop_ref=loop)
-    if bridge is not None:
-        try:
-            bridge.start()
-        except SbxloopError as exc:
-            log.error("chat.bridge_failed", backend=bridge.backend, error=str(exc), exc_info=True)
-            raise typer.Exit(2) from exc
-        loop.frontend = bridge
-        if archived is not None:
-            bridge.daemon_notice(
-                DaemonNotice(
-                    kind="daemon.state_archived",
-                    text=f"pre-1.0 daemon state moved aside to {archived}; starting fresh",
-                    level="warning",
-                )
+    # Every bridge at once: the [chat] backend's when one is configured, and
+    # always the operator console's local one (`sbxloop tui`).
+    frontend: FanoutFrontend = build_frontend(config, dstore, loop_ref=loop)
+    try:
+        frontend.start()
+    except SbxloopError as exc:
+        log.error("chat.bridge_failed", error=str(exc), exc_info=True)
+        raise typer.Exit(2) from exc
+    loop.frontend = frontend
+    if archived is not None:
+        frontend.daemon_notice(
+            DaemonNotice(
+                kind="daemon.state_archived",
+                text=f"pre-1.0 daemon state moved aside to {archived}; starting fresh",
+                level="warning",
             )
-        if stranded:
-            listed = "\n".join(f"- {i.item_id} {i.url}".rstrip() for i in stranded)
-            bridge.daemon_notice(
-                DaemonNotice(
-                    kind="daemon.repoless_items_stranded",
-                    text=(
-                        f"{len(stranded)} in-flight work item(s) could not be "
-                        "attributed to a configured repository after the multi-repo "
-                        "upgrade and were failed. Their issues still carry the "
-                        "in-progress label and will not be rediscovered — clear it "
-                        f"by hand:\n{listed}"
-                    ),
-                    level="warning",
-                )
+        )
+    if stranded:
+        listed = "\n".join(f"- {i.item_id} {i.url}".rstrip() for i in stranded)
+        frontend.daemon_notice(
+            DaemonNotice(
+                kind="daemon.repoless_items_stranded",
+                text=(
+                    f"{len(stranded)} in-flight work item(s) could not be "
+                    "attributed to a configured repository after the multi-repo "
+                    "upgrade and were failed. Their issues still carry the "
+                    "in-progress label and will not be rediscovered — clear it "
+                    f"by hand:\n{listed}"
+                ),
+                level="warning",
             )
-        if config.concierge.enabled and not once:
-            # The control channel's agent: its own event bus (the log sink
-            # sees its turns like any agent session) and a long-lived agent
-            # sandbox provisioned in the background, so the first mention
-            # does not pay the microVM boot. Built after the bridge so a
-            # missing bot token exits before any sandbox work starts.
-            concierge_bus = EventBus()
-            concierge_bus.subscribe(event_log_subscriber)
-            concierge = Concierge(
-                config,
-                loop=loop,
-                dstore=dstore,
-                store_factory=lambda: _store(config),
-                github=github,
-                host=DaemonAgent(config, sbx, concierge_bus, worker_python=config.worker_python),
-                bus=concierge_bus,
-                versions=versions,
-                on_watch=bridge.on_watch,
-                thread_link=bridge.thread_link,
-            )
-            bridge.concierge = concierge
-            concierge.warm_up()
+        )
+    if concierge_wanted(config, once=once):
+        # The control channel's agent: its own event bus (the log sink
+        # sees its turns like any agent session) and a long-lived agent
+        # sandbox provisioned in the background, so the first mention
+        # does not pay the microVM boot. Built after the bridges so a
+        # missing bot token exits before any sandbox work starts. It is
+        # built whenever it is enabled: the local bridge always exists,
+        # so a headless daemon's console can talk to it too.
+        concierge_bus = EventBus()
+        concierge_bus.subscribe(event_log_subscriber)
+        concierge = Concierge(
+            config,
+            loop=loop,
+            dstore=dstore,
+            store_factory=lambda: _store(config),
+            github=github,
+            host=DaemonAgent(config, sbx, concierge_bus, worker_python=config.worker_python),
+            bus=concierge_bus,
+            versions=versions,
+            on_watch=frontend.on_watch,
+            thread_link=frontend.thread_link,
+        )
+        frontend.set_concierge(concierge)
+        concierge.warm_up()
 
-    if not once:
-        # Merges to main auto-release a patch; deploying here is manual, so a
-        # long-lived daemon drifts behind silently. Check once in the
-        # background (never on the startup path) and narrate it only when
-        # behind — nobody has to remember to ask. `sbx_control`'s concierge
-        # tool `version_status` answers the same question on demand.
+    if not once and not config.daemon.version_check:
+        # #641: the operator switched the PyPI half off — no request leaves
+        # the host for it, and no advice is given that a pipeline or a mirror
+        # pin would contradict. The concierge's `version_status` still
+        # answers with the installed half.
+        log.info("versions.check_disabled")
+    elif not once:
+        # sbxloop's releases ship often while upgrading a host is an
+        # operator's step, so a long-lived daemon drifts behind silently.
+        # Check once in the background (never on the startup path) and
+        # narrate it only when behind — nobody has to remember to ask.
+        # `sbx_control`'s concierge tool `version_status` answers the same
+        # question on demand.
         start_drift_check(
             versions,
-            (
-                (
-                    lambda text: bridge.daemon_notice(
-                        DaemonNotice(kind="daemon.version_drift", text=text, level="warning")
-                    )
-                )
-                if bridge is not None
-                else None
+            lambda text: frontend.daemon_notice(
+                DaemonNotice(kind="daemon.version_drift", text=text, level="warning")
             ),
         )
 
@@ -1950,9 +2181,8 @@ def daemon(
         cleanup_registry.set_quiesce(None)
         log.debug("daemon.shutdown", step="control server")
         ctl.close()
-        if bridge is not None:
-            log.debug("daemon.shutdown", step="chat bridge")
-            bridge.close()
+        log.debug("daemon.shutdown", step="chat bridges")
+        frontend.close()
         if concierge is not None:
             # Forgets the handle; the concierge sandbox itself is kept for
             # the next daemon process (conversation memory lives in it).
@@ -1966,6 +2196,68 @@ def daemon(
             reason=stop_reason,
             uptime_s=round(time.monotonic() - started_at, 1),
         )
+
+
+@app.command()
+def tui(
+    run: Annotated[
+        str | None, typer.Option("--run", help="Open this run's screen straight away.")
+    ] = None,
+    read_only: Annotated[
+        bool, typer.Option("--read-only", help="Observe only: no daemon commands, no chat.")
+    ] = False,
+    state_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--state-dir", help="The daemon's state directory (default: the daemon's own rule)."
+        ),
+    ] = None,
+    unit: Annotated[
+        str | None,
+        typer.Option(
+            "--unit", help="The daemon's systemd --user unit (default: [tui] daemon_unit)."
+        ),
+    ] = None,
+) -> None:
+    """The operator console: watch, steer and administer the daemon on this host.
+
+    Reads the daemon's state.db read-only, drives the daemon through the
+    same `ctl` queue `sbxloop daemon ctl` uses, and (from the chat screens)
+    speaks to the daemon's local chat bridge with the same experience a
+    Discord or Slack channel gets.
+    """
+    import getpass
+
+    from sbxloop.tui.app import build_app
+
+    config = load_config()
+    resolved = state_dir if state_dir is not None else _daemon_state_dir()
+    # The daemon stamps its resolved state dir on its config before it
+    # harvests; the console reads artifacts through the same value.
+    config = config.model_copy(update={"state_dir": resolved})
+    operator = config.tui.operator_id or getpass.getuser()
+    try:
+        console_app = build_app(
+            config,
+            resolved,
+            operator_id=operator,
+            read_only=read_only,
+            initial_run=run,
+            unit=unit,
+        )
+    except SbxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    console_app.run()
+
+
+def concierge_wanted(config: Config, *, once: bool) -> bool:
+    """Whether this daemon builds the concierge: whenever it is enabled and
+    the daemon is long-lived. The console's local bridge always exists, so
+    a headless daemon has a surface for it too — a host without a chat
+    service now boots the concierge sandbox at start and needs the agent
+    credential (`sbxloop doctor` shows the row)."""
+    return bool(config.concierge.enabled) and not once
 
 
 def _daemon_state_dir() -> Path:
@@ -2064,10 +2356,8 @@ def _item_control(action: str, item_id: str, reason: str | None) -> None:
         now = time.time()
         if action == "abandon":
             item = dstore.abandon(item_id, reason or "abandoned by operator", now)
-        elif action == "retry":
-            item = dstore.retry(item_id, now, "re-queued by operator (CLI)")
         else:
-            item = dstore.requeue(item_id, now)
+            item = apply_item_verb(dstore, action, item_id, now=now, by="operator (CLI)")
     except KeyError:
         console.print(f"[bold red]unknown work item:[/] {item_id}")
         raise typer.Exit(2) from None
@@ -2096,7 +2386,8 @@ def daemon_ctl(
         typer.Argument(
             help="status | pause [--hold NAME] | resume [--hold NAME|--all] | cancel "
             "[--retry] | queue | items | abandon <item> [reason] | retry <item> | "
-            "requeue <item> | grant-rounds <run> <n> (the Discord !sbx verbs)."
+            "requeue <item> | grant-rounds <run> <n> | log [--tail N] [--level L] [--grep T] "
+            "| stop (the chat !sbx verbs)."
         ),
     ],
     timeout: Annotated[
@@ -2108,12 +2399,23 @@ def daemon_ctl(
             "executing and is reported as pending (exit 1).",
         ),
     ] = DEFAULT_TIMEOUT_S,
+    as_json: Annotated[
+        bool,
+        typer.Option(
+            "--json",
+            help="With `status`: print the daemon's status as one JSON object (current, "
+            "claiming, holds, paused, …) instead of prose, for scripts.",
+        ),
+    ] = False,
 ) -> None:
     """Send a command to the daemon running against this state_dir — the
     programmatic twin of Discord's `!sbx`, for scripts, cron and remote
     operators (the bot ignores its own messages by design)."""
     from sbxloop.daemon.control import ControlClient, plain
 
+    if as_json and (not command or command[0].lower() != "status"):
+        console.print("[bold red]--json applies to[/] [cyan]ctl status[/] only.")
+        raise typer.Exit(2)
     state_dir = _daemon_state_dir()
     reply = ControlClient(state_dir).submit(" ".join(command), timeout_s=timeout)
     if reply is None:
@@ -2125,9 +2427,47 @@ def daemon_ctl(
     if reply.pending:
         console.print(f"pending: {plain(reply.text)}", markup=False, highlight=False)
         raise typer.Exit(1)
+    if as_json:
+        if reply.ok and reply.status is None:
+            # A daemon from before #639 answered with prose only. Say so
+            # rather than print prose to a jq: exit 1, not 2, so a script
+            # can tell "answered, too old" from "no daemon".
+            console.print(
+                "[bold red]the daemon answered without a structured status[/] — it predates "
+                "`ctl status --json`; upgrade and restart it, then retry."
+            )
+            raise typer.Exit(1)
+        if reply.ok:
+            typer.echo(json.dumps(reply.status, sort_keys=True))
+            return
     console.print(plain(reply.text), markup=False, highlight=False)
     if not reply.ok:
         raise typer.Exit(1)
+
+
+@daemon_app.command("notify")
+def daemon_notify(
+    text: Annotated[
+        str,
+        typer.Argument(help="The notice, in the chat's Markdown (bold, `code`, [label](url))."),
+    ],
+    timeout: Annotated[
+        float, typer.Option("--timeout", help="Seconds to wait for the chat service.")
+    ] = 30.0,
+) -> None:
+    """Post one message to the daemon's control channel through the configured
+    `[chat] backend` — from the host, without the daemon, for deploy scripts
+    and cron. The bot token comes from the environment / .env, as for the
+    daemon; nothing else about the channel is read outside sbxloop.toml."""
+    from sbxloop.daemon.notify import post_notice
+
+    try:
+        config = load_config()
+        posted = post_notice(config, text, timeout_s=timeout)
+    except SbxloopError as exc:
+        console.print(f"[bold red]notify failed:[/] {exc}")
+        raise typer.Exit(2) from exc
+    console.print(f"posted to {posted.backend} channel {posted.channel_id}", highlight=False)
 
 
 @app.command()
@@ -2301,6 +2641,33 @@ def doctor(
 DEFAULT_CONFIG_TOML = (
     resources.files("sbxloop.data").joinpath("sbxloop.toml.example").read_text(encoding="utf-8")
 )
+
+
+def config_presets() -> dict[str, str]:
+    """The packaged `init --preset` fragments by name, from `sbxloop/data/presets`.
+
+    Package data, not a checkout path, so `sbxloop init --preset` works from a
+    wheel (#636) and nothing `init` writes points outside the user's project.
+    """
+    folder = resources.files("sbxloop.data").joinpath("presets")
+    return {
+        entry.name.removesuffix(".toml"): entry.read_text(encoding="utf-8")
+        for entry in folder.iterdir()
+        if entry.name.endswith(".toml")
+    }
+
+
+def render_config_template(preset: str | None = None) -> str:
+    """The template `sbxloop init` writes, with a preset's sections appended.
+
+    Every table in the template is commented out, so appending a preset's
+    live `[budgets]`/`[limits]` yields valid TOML. Raises KeyError for a
+    preset name the package does not ship.
+    """
+    if preset is None:
+        return DEFAULT_CONFIG_TOML
+    fragment = config_presets()[preset]
+    return DEFAULT_CONFIG_TOML.rstrip("\n") + "\n\n" + fragment
 
 
 def main() -> None:

@@ -61,12 +61,25 @@ class WorkerError(SbxloopError):
     """The in-sandbox worker failed or returned an invalid result."""
 
 
+class InvalidOutputTwice(WorkerError):
+    """A JSON-expecting agent job produced no valid output on either of its
+    two attempts. Its own class so a phase that must fail closed on a
+    model that cannot answer — the workload judge — can tell it from a
+    broken worker."""
+
+
 class WorkerTimeoutError(WorkerError):
     """The worker exceeded its job timeout and was killed."""
 
 
 class ProtocolError(SbxloopError):
     """Host/worker protocol violation (bad event line, missing result, ...)."""
+
+
+class ServiceOpsError(SbxloopError):
+    """A service op the run's service sandbox could not carry out (#765):
+    a credential the run was not granted, a request the op refuses, or a
+    transport failure. Never carries a credential value."""
 
 
 class GithubOpsError(SbxloopError):

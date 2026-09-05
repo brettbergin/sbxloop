@@ -13,6 +13,14 @@
 # line is how you change one — uncomment the `[section]` header along with
 # the key. Secrets never live here — they live in .env / the environment
 # (see .env.example).
+#
+# Keep this file out of git. A copy the repository carries (tracked) is read
+# as the *project's* config and may set only how the tree is built and
+# checked ([sandbox] languages / gate_command), how branches and PRs are
+# named ([github] branch_prefix / *_template) and [artifacts] exclude; every
+# other key in a tracked file is ignored with a warning. Operator settings
+# ([policy], [landing], [daemon], [budgets], state_dir, the repository) come
+# from an untracked copy, ~/.config/sbxloop/sbxloop.toml or the environment.
 
 # Model for agent sessions, whichever [agent] backend runs them ("auto"
 # lets the chosen SDK pick its default).
@@ -41,7 +49,7 @@ secret_strategy = "proxy"
 # install_workers = true
 
 # [agent]
-# Which SDK runs the agent personas inside the agent sandbox (#533):
+# Which SDK runs the agent personas inside the agent sandbox:
 # "copilot" (the default) runs the GitHub Copilot SDK and needs
 # COPILOT_GITHUB_TOKEN; "claude" runs the Claude Agent SDK (the Claude Code
 # harness) and needs ANTHROPIC_API_KEY — provisioning then installs Node and
@@ -83,18 +91,180 @@ secret_strategy = "proxy"
 # continue_branch_optional = false
 # Extra network allow rules applied to both sandboxes.
 # extra_allow_domains = []
-# Git partial-clone filter for the credential-free remote clone a repository
-# WITHOUT a host checkout gets. Every run clone is already single-branch and
-# tagless; this additionally defers file contents until first checkout,
-# which is worth it only for a very large repository. Lazy fetches then
-# happen wherever git next needs a blob — the VM included, which holds no
-# git credential — so it stays opt-in, and only the public-repo remote
-# clone honours it. A git without --filter support clones in full and logs.
+# Git partial-clone filter for the remote clone a repository WITHOUT a host
+# checkout gets. Every run clone is already single-branch and tagless; this
+# additionally defers file contents until first checkout, which is worth it
+# only for a very large repository. Lazy fetches then happen wherever git
+# next needs a blob — the VM included, which holds no git credential (the
+# run's token authenticates the host clone only) — so it stays opt-in,
+# only the remote clone honours it, and it suits public repositories only.
+# A git without --filter support clones in full and logs.
 # clone_filter = "blob:none"
+# Whether a run clone's submodules are checked out. On by default: a
+# repository that vendors a dependency as a submodule does not build without
+# it. Each submodule comes from the host checkout's own copy when that copy
+# has the recorded commit, else from its .gitmodules URL with the run's
+# GitHub credential (which must be able to read that repository too); one
+# that neither route can populate fails provisioning by name. The hosts the
+# submodules fetch from join the run's egress allow list. Set false for a
+# repository whose submodules are optional or unreadable to the run — the
+# directories are then left empty. Either way, a run's changes INSIDE a
+# submodule are never delivered (the pull request is against this
+# repository); a submodule moved to a commit its remote has is delivered as
+# the moved pointer.
+# clone_submodules = true
+# Whether a run clone's Git LFS objects are populated. Default true: a
+# repository whose .gitattributes routes files through filter=lfs keeps its
+# fixtures and assets in LFS, and a run on the pointer files fails on the
+# first test that opens one. Objects come from the host checkout's own LFS
+# store where it has them, else from the repository's LFS endpoint with the
+# run's GitHub credential. Needs git-lfs installed on the host (apt install
+# git-lfs); a repository that uses LFS fails provisioning by name without
+# it. The agent sandbox gets git-lfs and egress to GitHub's LFS hosts
+# whenever the workspace uses LFS. Set false to run on the pointer files.
+# Either way a file the run adds or changes under an LFS attribute is left
+# out of the pull request and named in its "Not delivered" line rather than
+# committed as a plain blob.
+# clone_lfs = true
+# Whether a run clone gets the repository's tags. Run clones are cut
+# without tags to stay small; a project whose build reads its version off
+# the nearest tag (setuptools-scm, hatch-vcs, versioningit, Gradle's
+# axion-release, Rust's vergen, a Makefile's `git describe`) then builds as
+# 0.0.0 or not at all. "auto" (default) fetches tags when a manifest names
+# such a tool — from the host checkout where it has tags, else from the
+# remote with the run's GitHub credential; "always" fetches them for every
+# repository; "never" keeps the bare clone.
+# fetch_tags = "auto"
 # Toolchains preinstalled in the agent sandbox. Unset = whatever the
 # workspace's manifests declare (go.mod, package.json, Cargo.toml, ...),
 # Python when nothing is recognized. Setting it replaces detection.
 # languages = ["python", "node"]
+# Environment for the agent sandbox's worker and every command it runs (the
+# agent's turns, verify commands): plain values as written here. It may not
+# name what the loop delivers itself (GH_TOKEN, the agent credential,
+# SBXLOOP_*), and it has no secret counterpart: the only credential in the
+# agent sandbox is the agent's own. A registry credential goes on its
+# [[registries]] entry (`auth_env`, used in the service sandbox that fetches
+# the dependencies); a key a workload calls with goes under [[credentials]];
+# a secret only the test suite needs belongs to CI (`verify_mode`).
+# env = { RAILS_ENV = "test", DATABASE_URL = "postgres://localhost/app_test" }
+# OS packages the toolchains do not cover, installed beside them (probed
+# with dpkg first, so a template baked with the list installs nothing), and
+# commands run in the workspace after the clone, toolchains and registries
+# and before the first agent phase — under the run's egress policy, with the
+# environment above. Each command's exit and output tail is a
+# `sandbox.setup` event; a non-zero exit fails the run at provisioning.
+# apt_packages = ["libpq-dev", "protobuf-compiler"]
+# setup_commands = ["npx playwright install --with-deps chromium", "pre-commit install-hooks"]
+# What the in-sandbox verify phase and the gate decide. "full": a task's
+# verify commands and the gate must pass (a failure spends revisions, then
+# a replan). "advisory": they run and the result is reported — to the
+# chronology, the review and the pull request body — but a failure blocks
+# nothing. "ci-only": they do not run; the pull request's own checks are
+# the verification. For a suite that needs services the sandbox does not
+# have (a database, a broker, a browser): under "full" the loop names the
+# evidence it sees — a compose file, testcontainers in a lockfile,
+# `services:` in a workflow — as a `verify.services_detected` event and
+# changes nothing on its own.
+# verify_mode = "full"
+
+# Private package registries. An entry WITHOUT `auth_env` (open) is the
+# agent sandbox's: its `host` is opened there and the ecosystem's client
+# config is written so its tooling uses the registry — ~/.npmrc for npm
+# (pnpm, yarn classic), PIP_INDEX_URL + UV_DEFAULT_INDEX for pypi, GOPRIVATE
+# for go, ~/.cargo/config.toml for cargo, ~/.m2/settings.xml for maven,
+# NuGet.Config for nuget, BUNDLE_* for gem; `generic` opens a host only.
+# An entry WITH `auth_env` (credentialed) is the run's SERVICE sandbox's:
+# the credential — the named daemon-environment variable, delivered like
+# the agent credential is, never an sbx argument, event or log line — the
+# client config and the host all go there, and the dependencies are fetched
+# there (`npm ci --ignore-scripts`, `pip download`, `go mod download`,
+# `cargo fetch`, `mvn dependency:go-offline`, `dotnet restore`, `bundle
+# cache`) into a cache both sandboxes share; the agent sandbox is set up
+# OFFLINE for that ecosystem and builds from the cache, and asks for more
+# through its `fetch_dependencies` tool. The credential is referenced by
+# NAME from the client file wherever the tool expands environment variables
+# (npm, maven, nuget, cargo, bundler); the netrc kinds (pypi, go, generic)
+# pair it with `auth_user` in a 0600 ~/.netrc. pypi and maven make the
+# registry THE source (point them at a virtual/group repository that proxies
+# the public index); npm with `scope` serves that scope only. A
+# [[github.repos]] entry may set its own `registries` list, which replaces
+# this one.
+# [[registries]]
+# kind = "npm"                          # npm | pypi | go | cargo | maven | nuget | gem | generic
+# host = "artifactory.example.com"
+# url = "https://artifactory.example.com/api/npm/npm-virtual/"
+# auth_env = "NPM_TOKEN"
+# scope = "@example"                    # npm only: serve this scope, leave the rest on npmjs
+# [[registries]]
+# kind = "pypi"
+# host = "artifactory.example.com"
+# url = "https://artifactory.example.com/api/pypi/pypi-virtual/simple/"
+# auth_env = "PYPI_TOKEN"
+# auth_user = "ci-bot"                  # the login beside the token (netrc kinds, maven, nuget, gem)
+# [[registries]]
+# kind = "cargo"
+# host = "artifactory.example.com"
+# url = "sparse+https://artifactory.example.com/api/cargo/cargo-local/index/"
+# auth_env = "CARGO_TOKEN"
+# name = "company"                      # cargo/maven/nuget: the registry's name in the client config
+# [[registries]]
+# kind = "go"
+# host = "github.example.com"           # → GOPRIVATE=github.example.com
+
+# Service credentials. A catalogue of credentials a run may be GRANTED
+# by name; a granted run gets a third, "service" sandbox holding exactly
+# those values (never the agent sandbox — the only key in an agent sandbox
+# is its inference key) and the build session gets a `call_service` tool:
+# the agent names a credential, method and path, and the service sandbox
+# makes the one request to `https://<host><path>` with the credential
+# attached. `env` names the daemon-environment variable holding the value
+# (never in this file); `host` is the ONE host the credential is good for.
+# `header` / `scheme` say how it is attached — `Authorization: Bearer …` by
+# default; `scheme = ""` sends the bare value. Nothing grants a credential
+# to a `code` run today; `sbxloop doctor` checks every `env` is set.
+# [[credentials]]
+# name = "weather"
+# env = "WEATHER_API_KEY"
+# host = "api.weather.example.com"
+# header = "X-Api-Key"
+# scheme = ""
+# description = "read-only weather forecasts"
+
+# Named bounds for `--kind workload` runs. The operator's plan
+# declares what each task needs — hosts, credentials by name, a sink, a
+# repository — and the run's profile decides what is granted; a need
+# outside the profile fails the run closed, with a `run.needs_refused`
+# event naming the key here that would allow it. `egress`: patterns (as
+# `[policy] allow`) bounding the hosts the AGENT box may be granted —
+# `[policy] deny` still wins. `credentials`: the `[[credentials]]` names a
+# plan may ask for; a granted one is held by the run's separate service
+# box, never the agent's. `sinks`: where a task's result may go beyond the
+# always-available `chat` reply — `issue` (one result issue filed in
+# `[github] repo`, which needs the github box), `artifact` (the files the
+# task reported, copied to `runs/<run>/artifacts` for `sbxloop artifacts`),
+# `pr` (files delivered to a repository). `repo`: whether a plan may ask for a checkout of a
+# configured repository in its data directory. `budgets`: `[budgets]` keys
+# overridden for this profile's runs. `publish = "hold"` (park a finished
+# run for a human release) arrives with the daemon's workload intake and is
+# refused until then. A workload run with no profile at all may declare no
+# needs.
+# [[workloads]]
+# name = "research"
+# description = "read the web, call the weather API, report in the thread"
+# egress = ["*.example.com"]
+# credentials = ["weather"]
+# sinks = ["chat", "artifact"]
+# repo = false
+# publish = "auto"
+# budgets = { max_tasks = 8, max_wall_clock_s = 3600.0 }
+
+# [workload]
+# The profile a workload run gets when `sbxloop run --profile` names none.
+# default = "research"
+# The label a result issue carries (the `issue` sink), so a repository can
+# tell the loop's results from the work it is asked to do.
+# result_label = "sbxloop:result"
 
 # [policy]
 # Bounds for plan-declared egress. At PLAN time the agent may declare extra
@@ -143,7 +313,10 @@ secret_strategy = "proxy"
 # matched to the repository's commit-subject style; falls back to the run's
 # outcome), {outcome}, {run_id}, {repo}. Every one is overridable per
 # repository in a `[[github.repos]]` entry. The defaults are what the loop
-# always wrote.
+# always wrote — except on a repository that lints titles as conventional
+# commits (commitlint, action-semantic-pull-request), where the default
+# title becomes the plan's `type(scope): summary` alone; a template set
+# here is always used as written.
 # pr_title_template = "sbxloop: {title}"
 # commit_message_template = "sbxloop run {run_id}: deliver artifacts\n\nOutcome: {outcome}"
 # Branches are `<branch_prefix><run id>`; pick a prefix the repository's
@@ -157,6 +330,13 @@ secret_strategy = "proxy"
 # the loop's writes to; `<slug>[bot]` for an App. Overridable per
 # repository below.
 # bot_login = "my-app[bot]"
+#
+# REVIEWERS. When the base branch requires an approving review the loop
+# cannot give itself (it authored the PR), the run parks `awaiting_review`
+# with the PR un-drafted and these requested as reviewers — logins, or
+# `org/team` for a team. Overridable per repository below; unset requests
+# nobody and relies on CODEOWNERS or a human noticing the PR.
+# reviewers = ["a-maintainer", "my-org/reviewers"]
 #
 # WHERE GitHub is. The REST root; everything else derives from it — the web
 # host the clones and PR links use, GH_HOST for gh in the github sandbox,
@@ -187,6 +367,13 @@ secret_strategy = "proxy"
 # commit_message_template = "{title}"
 # branch_prefix = "bot/"
 # bot_login = "other-app[bot]"     # identity override; unset uses [github]'s
+# reviewers = ["their-lead"]       # review requests; unset uses [github]'s, [] requests nobody
+# review_notify = ["<chat user id>"] # pinged when a PR waits for a review; unset uses [landing]'s
+# env = { RAILS_ENV = "test" }     # agent-sandbox environment; a set value REPLACES [sandbox]'s
+# registries = []                  # private registries; a set list REPLACES the top-level [[registries]]
+# apt_packages = ["libpq-dev"]     # OS packages beside the toolchains; a set list REPLACES [sandbox]'s
+# setup_commands = ["make setup"]  # run in the workspace before the first phase; REPLACES [sandbox]'s
+# verify_mode = "advisory"         # "full" | "advisory" | "ci-only"; unset uses [sandbox]'s
 # [[github.repos]]
 # repo = "you/other-repo"
 # enabled = false              # registered but not polled
@@ -207,8 +394,22 @@ secret_strategy = "proxy"
 # cleared every bar (`gated`) and asks for one approval in the run's chat
 # thread — `!sbx merge <item>` or `sbxloop daemon ctl merge <item>` lands
 # it; `!sbx abandon <item>` declines. No deadline; survives restarts.
+# A base branch that REQUIRES an approving review is not a block: the run
+# parks `awaiting_review` (PR un-drafted, [github] reviewers requested,
+# the requester and review_notify mentioned once) and the daemon polls
+# the PR. A human's approval — or a human merging it — lands the run; a
+# changes-requested review resumes it for a fix round; the PR closed
+# abandons it. After review_wait_s without a verdict the item goes
+# `paused_review` (one more mention, no more polling) until
+# `!sbx resume <item>` picks it up again. Survives restarts. A person
+# converting the PR to draft is the same park: it waits for the PR to be
+# marked ready for review (approvals alone do not end it), then lands.
 # merge_gate = "off"         # off | chat
-# deliver_draft = true
+# review_poll_interval_s = 600  # how often a parked PR is checked (2 API requests per check)
+# review_wait_s = 14400      # how long to keep checking before pausing the wait
+# review_notify = []         # chat user ids mentioned when a PR parks for review; overridable per repo
+# deliver_draft = true      # the PR opens as a draft, un-drafted once review and CI pass; a
+#                           # repository plan without drafts gets a ready PR on one retry
 # max_review_rounds = 3      # times the review may request changes
 # max_ci_rounds = 2          # red gate / red CI / conflict / human objection rounds
 # retry_rounds = 2           # daemon: an exhausted run resumes its own PR once with this many more; 0 = hand to a human
@@ -219,6 +420,9 @@ secret_strategy = "proxy"
 #                            # registers later (queued self-hosted runners, Jenkins reporting through webhooks)
 # ci_timeout_s = 3600        # per wait; exceeding it ends the run blocked
 # merge_method = "auto"      # auto | squash | merge | rebase — auto takes the first of squash, merge, rebase the repository allows; an explicit method the repository disallows ends the run blocked, named
+#                            # A base that merges through a merge queue is enqueued instead (the queue's own method applies): the
+#                            # run polls the queue every ci_poll_interval_s until it merges the PR or removes it — a removal for
+#                            # red checks on the queue's commit is one CI fix round; one with nothing to fix ends the run blocked.
 # delete_branch_on_merge = true
 # merge_update_attempts = 3  # update-branch calls when protection wants "up to date"
 # required_checks = []       # the checks that gate the merge; empty = what the base's protection declares, else all
@@ -254,9 +458,9 @@ secret_strategy = "proxy"
 # harvest_mode = "per-task"
 
 # [budgets]
-# Sized for a small greenfield project. A large existing repo (thousands of
-# tests, a multi-package tree to orient in) wants a bigger wall clock and
-# tool cap — see contrib/presets/large-repo.toml.
+# Sized for a project whose gate finishes in seconds. When one run of the
+# gate command takes two minutes or more, the loop wants a bigger wall clock
+# and tool cap — `sbxloop init --preset large-repo` writes them.
 # max_revisions_per_task = 2
 # max_replans_per_task = 1
 # max_tasks = 20
@@ -267,6 +471,16 @@ secret_strategy = "proxy"
 # concurrent task shares one sandbox and one workspace, so "independent"
 # tasks can still clobber each other.
 # max_parallel_tasks = 1
+# How much of the repository's own instruction files (AGENTS.md, CLAUDE.md,
+# .cursorrules, copilot-instructions.md, CONTRIBUTING, CODEOWNERS) the
+# planner, builder and reviewer prompts carry, in characters. The block is
+# cut at the budget with an explicit note; 0 hands the prompts none of it.
+# repo_context_max_chars = 12000
+# How large the outcome the planner reads may grow once the issue's
+# discussion (comments, minus the loop's own) and linked issues are added
+# to its title and body, in characters. Title, body and provenance are
+# always whole; the discussion is cut at the remainder with an explicit note.
+# outcome_max_chars = 16000
 
 # [limits]
 # Sandbox resource guardrails (percent used; 0 disables). Sampled in-VM on
@@ -320,6 +534,15 @@ secret_strategy = "proxy"
 # The daemon's own log stream (stderr → journald under systemd).
 # log_level = "INFO"               # DEBUG | INFO | WARNING | ERROR
 # log_format = "console"           # console (key=value) | json
+# Release drift: once at start the daemon asks pypi.org for the latest
+# sbxloop and posts a notice when this host is behind (the concierge's
+# `version_status` answers on demand). false = no request leaves the host
+# for it and no advice is given — for an air-gapped or mirror-pinned host,
+# or one a deploy pipeline keeps current.
+# version_check = true
+# What the notice tells the operator to run; unset, it says the command
+# depends on how sbxloop was installed (pip, pipx, uv tool, a container…).
+# upgrade_command = "pipx upgrade sbxloop"
 # Unattended workspace posture. Point [sandbox] workspace at a dedicated clone
 # nobody edits; before each run the daemon `git fetch`es it and fast-forwards
 # to origin (never merges/rebases), and daemon runs use `clone` isolation so a
@@ -385,13 +608,28 @@ secret_strategy = "proxy"
 # tool_output_lines = 0
 # tool_fail_output_lines = 20
 
+# [tui]
+# The operator console, `sbxloop tui`, run on the daemon host — always on,
+# no channel or token to configure. The daemon keeps a local chat mailbox
+# in state.db with the same headline, thread, steering, concierge and
+# merge-gate experience [discord] / [slack] give, and the console attaches
+# to it. The rendering knobs are the ones [discord] / [slack] share
+# (command_prefix, thread_per_run, chronology_level, max_message_chars,
+# embeds, status_line, tool_batch_lines, tool_output_lines,
+# tool_fail_output_lines); these are the terminal's own.
+# operator_id = ""                 # who the console speaks as; "" = the login name
+# emoji = true                     # glyph markers in the console (false: ASCII)
+# daemon_unit = "sbxloop-daemon"   # the systemd --user unit it tails and can restart
+# refresh_s = 0.5                  # how often a live screen re-reads the store
+# retention_days = 14              # mailbox rows pruned past this (0 keeps them)
+
 # [concierge]
 # The control channel's agent: @mention the bot (or reply to it) to ask
 # about runs, PRs and diffs, operate the daemon (every !sbx verb) or queue
 # new work in plain language. Runs as a Copilot session in a long-lived
 # agent sandbox and reaches the daemon only through host tools; needs
 # COPILOT_GITHUB_TOKEN on the daemon host. Acts with the same authority as
-# !sbx. Effective only when a [chat] backend ([discord] or [slack]) is on.
+# !sbx. Answers the operator console too, so it runs whenever enabled.
 # enabled = true
 # model = ""                       # empty = the top-level model
 # timeout_s = 180                  # one message's wall-clock budget

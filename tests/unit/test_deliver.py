@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -11,10 +12,17 @@ from typing import Any
 import pytest
 
 from sbxloop import hostgit
-from sbxloop.deliver import branch_name, deliver_workspace, ensure_repository
+from sbxloop.deliver import (
+    _plan_git_diff,
+    _plan_snapshot,
+    branch_name,
+    deliver_workspace,
+    ensure_repository,
+)
 from sbxloop.errors import DeliveryError, GithubOpsError
 from sbxloop.gh.ops import PrRef
 from tests.fakes.github_errors import github_error
+from tests.fakes.gitserver import PrivateGitServer, bare_from
 
 
 class StubOps:
@@ -34,6 +42,13 @@ class StubOps:
     def repo_get(self, repo: str) -> dict[str, Any]:
         self.repo_get_calls.append(repo)
         return {"default_branch": "main"}
+
+    def default_branch(self, repo: str) -> str:
+        # The real one's contract (#672): the reported name or an error.
+        name = self.repo_get(repo).get("default_branch")
+        if not name:
+            raise GithubOpsError(f"GitHub did not report a default branch for {repo}")
+        return str(name)
 
     def repo_lookup(self, repo: str) -> dict[str, Any] | None:
         self.repo_get_calls.append(repo)
@@ -200,6 +215,46 @@ class TestDeliverWorkspace:
         )
         assert "excluded" not in ops2.pr_kwargs["body"]
 
+    def test_base_is_the_repositorys_default_branch(self, tmp_path: Path) -> None:
+        """#672: a `develop`/`master` repository is delivered against that
+        branch — the base commit, the merge parent and the PR all name it."""
+
+        class DevelopOps(StubOps):
+            def repo_get(self, repo: str) -> dict[str, Any]:
+                self.repo_get_calls.append(repo)
+                return {"default_branch": "develop"}
+
+        ops = DevelopOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r1",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+        )
+        assert ops.ref_lookups[0] == ("o/r", "heads/develop")
+        assert ops.pr_kwargs["base"] == "develop"
+
+    def test_no_default_branch_reported_stops_the_delivery(self, tmp_path: Path) -> None:
+        """#672: no guess of `main` — the delivery fails before a single
+        ref lookup or blob upload."""
+
+        class BranchlessOps(StubOps):
+            def repo_get(self, repo: str) -> dict[str, Any]:
+                self.repo_get_calls.append(repo)
+                return {"full_name": repo}
+
+        ops = BranchlessOps()
+        with pytest.raises(GithubOpsError, match="did not report a default branch"):
+            deliver_workspace(
+                ops,  # type: ignore[arg-type]
+                "o/r",
+                run_id="r1",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
+        assert ops.ref_lookups == [] and ops.blob_batches == [] and ops.pr_kwargs == {}
+
     def test_explicit_base_skips_repo_get(self, tmp_path: Path) -> None:
         ops = StubOps()
         deliver_workspace(
@@ -218,6 +273,65 @@ class TestDeliverWorkspace:
         ]
         assert ops.pr_kwargs["base"] == "develop"
         assert ops.pr_kwargs["draft"] is True
+
+    def test_a_repository_without_drafts_gets_a_ready_pr_on_one_retry(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """#677: private repositories on GitHub Free and GHE instances
+        without drafts 422 a draft PR; `deliver_draft` was a preference."""
+
+        class NoDraftsOps(StubOps):
+            def __init__(self) -> None:
+                super().__init__()
+                self.creates: list[dict[str, Any]] = []
+
+            def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
+                self.creates.append(kwargs)
+                if kwargs.get("draft"):
+                    raise github_error("pr_draft_unsupported_422")
+                return super().pr_create(repo, **kwargs)
+
+        ops = NoDraftsOps()
+        with caplog.at_level(logging.INFO, logger="sbxloop.deliver"):
+            pr = deliver_workspace(
+                ops,  # type: ignore[arg-type]
+                "o/r",
+                run_id="r1",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+                draft=True,
+            )
+        assert pr.number == 7
+        assert [c["draft"] for c in ops.creates] == [True, False]
+        assert not [c for c in ops.raw_calls if "/pulls?" in c[1]], "not a collision: no lookup"
+        assert any("deliver.draft_unsupported" in r.getMessage() for r in caplog.records)
+
+    def test_a_draft_refusal_that_says_something_else_is_not_retried(self, tmp_path: Path) -> None:
+        class RefusingOps(StubOps):
+            def __init__(self) -> None:
+                super().__init__()
+                self.creates = 0
+
+            def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
+                self.creates += 1
+                raise github_error("pr_no_commits_422")
+
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "GET" and "/pulls?" in path:
+                    return []  # the collision lookup finds no open PR
+                return super().raw(method, path, body)
+
+        ops = RefusingOps()
+        with pytest.raises(GithubOpsError):
+            deliver_workspace(
+                ops,  # type: ignore[arg-type]
+                "o/r",
+                run_id="r1",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+                draft=True,
+            )
+        assert ops.creates == 1, "a bare 422 is a possible collision, never a draft retry"
 
     def test_empty_workspace_refused(self, tmp_path: Path) -> None:
         empty = tmp_path / "empty"
@@ -666,6 +780,266 @@ class TestGitDiffDelivery:
         assert "**Files (" in ops.pr_kwargs["body"]
 
 
+class TestSnapshotModes:
+    """#695: a snapshot delivery records what is on disk — exec bits and
+    symlinks — the same way the git-diff plan does, instead of writing
+    ``100644`` for everything and de-linking every symlink."""
+
+    def make_workspace(self, tmp_path: Path) -> Path:
+        root = tmp_path / "ws"
+        (root / "bin").mkdir(parents=True)
+        (root / "bin" / "run").write_text("#!/bin/sh\necho hi\n")
+        (root / "bin" / "run").chmod(0o755)
+        (root / "config.yml").write_text("a: 1\n")
+        (root / "shared").mkdir()
+        (root / "shared" / "settings.yml").write_text("b: 2\n")
+        (root / "config.link.yml").symlink_to("config.yml")
+        (root / "settings").symlink_to("shared")  # a directory symlink
+        (root / "dangling").symlink_to("nowhere")
+        return root
+
+    def test_snapshot_keeps_exec_bits_and_symlinks(self, tmp_path: Path) -> None:
+        root = self.make_workspace(tmp_path)
+        ops = StubOps()
+        deliver(ops, root)
+        by_path = {e["path"]: e for e in tree_entries(ops)}
+        assert set(by_path) == {
+            "bin/run",
+            "config.link.yml",
+            "config.yml",
+            "dangling",
+            "settings",
+            "shared/settings.yml",
+        }
+        assert by_path["bin/run"]["mode"] == "100755"
+        assert by_path["config.yml"]["mode"] == "100644"
+        assert by_path["config.link.yml"]["mode"] == "120000"
+        assert by_path["settings"]["mode"] == "120000"
+        assert by_path["dangling"]["mode"] == "120000"
+        # a symlink uploads its target string, not what it points at
+        uploaded = {
+            e["path"]: base64.b64decode(e["content_b64"])
+            for batch in ops.blob_batches
+            for e in batch
+        }
+        assert uploaded["config.link.yml"] == b"config.yml"
+        assert uploaded["settings"] == b"shared"
+        assert uploaded["dangling"] == b"nowhere"
+        assert uploaded["config.yml"] == b"a: 1\n"
+        assert "**Files (6):**" in ops.pr_kwargs["body"]
+
+    def test_the_two_plans_agree_on_modes(self, tmp_path: Path) -> None:
+        """The same tree delivered as a snapshot and as a git diff produces
+        the same modes and contents — one builder, not two."""
+        root = self.make_workspace(tmp_path)
+        snapshot = _plan_snapshot(root, [])
+        clone, base_sha = make_clone_workspace(tmp_path)
+        for name in ("bin", "shared"):
+            shutil.copytree(root / name, clone / name)
+        for name in ("config.yml", "config.link.yml", "settings", "dangling"):
+            shutil.copy(root / name, clone / name, follow_symlinks=False)
+        diff = _plan_git_diff(clone, base_sha, [])
+        assert diff is not None
+        snap = {e["path"]: e["mode"] for e in snapshot.entries}
+        assert {e["path"]: e["mode"] for e in diff.entries if e["path"] in snap} == snap
+        assert {p: diff.uploads[p] for p in snap} == snapshot.uploads
+
+
+class TestSubmoduleDelivery:
+    """#692: a submodule is a gitlink, delivered as the commit it points at
+    — never as the deletion of the directory ``stat`` sees — and work
+    inside one is named as not delivered rather than dropped."""
+
+    @pytest.fixture
+    def workspace(self, tmp_path: Path):  # type: ignore[no-untyped-def]
+        """(clone, base_sha, bump): a run clone of a superproject vendoring
+        ``vendor/lib``, and a function that moves the library to a new
+        commit its remote has and returns that sha."""
+        lib = tmp_path / "lib"
+        lib.mkdir()
+        git("init", "-b", "main", cwd=lib)
+        (lib / "lib.txt").write_text("v1\n")
+        git("add", ".", cwd=lib)
+        git("commit", "-m", "lib v1", cwd=lib)
+        lib_bare = bare_from(lib, tmp_path / "remotes", "lib.git")
+        with PrivateGitServer(tmp_path / "remotes", username="x", token="y", public=True) as srv:
+            app = tmp_path / "app"
+            app.mkdir()
+            git("init", "-b", "main", cwd=app)
+            (app / "README").write_text("app\n")
+            git("add", ".", cwd=app)
+            git("submodule", "add", "-q", f"{srv.url}/lib.git", "vendor/lib", cwd=app)
+            git("commit", "-q", "-m", "init", cwd=app)
+            clone = tmp_path / "clone"
+            hostgit.clone_for_run(app, clone, "sbxloop/r1")
+            hostgit.populate_submodules(clone, source=app, token=None)
+
+            def bump() -> str:
+                (lib / "lib.txt").write_text("v2\n")
+                git("commit", "-q", "-am", "lib v2", cwd=lib)
+                git("push", "-q", str(lib_bare), "main", cwd=lib)
+                sha = git("rev-parse", "HEAD", cwd=lib)
+                git("fetch", "-q", "origin", cwd=clone / "vendor" / "lib")
+                git("checkout", "-q", sha, cwd=clone / "vendor" / "lib")
+                return sha
+
+            yield clone, git("rev-parse", "HEAD", cwd=app), bump
+
+    def _ops(self, base_sha: str) -> StubOps:
+        class KnownBaseOps(StubOps):
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                self.ref_lookups.append((repo, ref))
+                return base_sha
+
+        return KnownBaseOps()
+
+    def test_a_bumped_gitlink_is_a_commit_entry_with_no_blob(
+        self, workspace: tuple[Path, str, Any]
+    ) -> None:
+        clone, base_sha, bump = workspace
+        sha = bump()
+        (clone / "README").write_text("uses v2\n")
+        ops = self._ops(base_sha)
+        deliver(ops, clone)
+        uploaded = {e["path"] for batch in ops.blob_batches for e in batch}
+        assert uploaded == {"README"}
+        by_path = {e["path"]: e for e in tree_entries(ops)}
+        assert by_path["vendor/lib"] == {
+            "path": "vendor/lib",
+            "mode": "160000",
+            "type": "commit",
+            "sha": sha,
+        }
+        body = ops.pr_kwargs["body"]
+        assert f"- M `vendor/lib` (submodule → {sha[:12]})" in body
+        assert "Not delivered" not in body
+
+    def test_work_inside_a_submodule_is_named_not_delivered(
+        self, workspace: tuple[Path, str, Any]
+    ) -> None:
+        clone, base_sha, _ = workspace
+        (clone / "vendor" / "lib" / "lib.txt").write_text("patched in place\n")
+        (clone / "README").write_text("real work\n")
+        ops = self._ops(base_sha)
+        deliver(ops, clone)
+        assert [e["path"] for e in tree_entries(ops)] == ["README"]
+        body = ops.pr_kwargs["body"]
+        assert "**Not delivered:** changes inside submodule `vendor/lib` are not delivered" in body
+
+    def test_only_work_inside_a_submodule_is_nothing_to_deliver(
+        self, workspace: tuple[Path, str, Any]
+    ) -> None:
+        clone, base_sha, _ = workspace
+        (clone / "vendor" / "lib" / "lib.txt").write_text("patched in place\n")
+        with pytest.raises(DeliveryError, match="inside submodule `vendor/lib`"):
+            deliver(self._ops(base_sha), clone)
+
+    def test_an_untouched_submodule_stays_out_of_the_tree(
+        self, workspace: tuple[Path, str, Any]
+    ) -> None:
+        clone, base_sha, _ = workspace
+        (clone / "README").write_text("real work\n")
+        ops = self._ops(base_sha)
+        deliver(ops, clone)
+        assert [e["path"] for e in tree_entries(ops)] == ["README"]
+
+    def test_a_removed_submodule_drops_its_path(self, workspace: tuple[Path, str, Any]) -> None:
+        clone, base_sha, _ = workspace
+        git("rm", "-q", "vendor/lib", cwd=clone)
+        ops = self._ops(base_sha)
+        deliver(ops, clone)
+        by_path = {e["path"]: e for e in tree_entries(ops)}
+        assert by_path["vendor/lib"] == {
+            "path": "vendor/lib",
+            "mode": "160000",
+            "type": "commit",
+            "sha": None,
+        }
+        assert by_path[".gitmodules"]["type"] == "blob"
+        assert "- D `vendor/lib` (submodule)" in ops.pr_kwargs["body"]
+
+
+@pytest.mark.skipif(hostgit.lfs_version() is None, reason="git-lfs is not installed on this host")
+@pytest.mark.slow
+class TestLfsDelivery:
+    """#693: a file ``.gitattributes`` routes through Git LFS is refused
+    rather than committed as a blob where the repository expects a pointer
+    — named in the PR body, with the rest of the work still delivered."""
+
+    @pytest.fixture
+    def workspace(self, tmp_path: Path) -> tuple[Path, str]:
+        """(clone, base_sha): a populated run clone of a checkout whose
+        ``*.bin`` files live in LFS."""
+        app = tmp_path / "app"
+        app.mkdir()
+        git("init", "-b", "main", cwd=app)
+        git("lfs", "install", "--local", cwd=app)
+        (app / ".gitattributes").write_text("*.bin filter=lfs diff=lfs merge=lfs -text\n")
+        (app / "asset.bin").write_bytes(bytes(range(256)))
+        (app / "README").write_text("app\n")
+        git("add", "-A", cwd=app)
+        git("commit", "-q", "-m", "init", cwd=app)
+        clone = tmp_path / "clone"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_lfs(clone, source=app, lfs_url=None, token=None)
+        return clone, git("rev-parse", "HEAD", cwd=app)
+
+    def _ops(self, base_sha: str) -> StubOps:
+        class KnownBaseOps(StubOps):
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                self.ref_lookups.append((repo, ref))
+                return base_sha
+
+        return KnownBaseOps()
+
+    def test_an_added_lfs_file_is_named_not_delivered(
+        self, workspace: tuple[Path, str], caplog: pytest.LogCaptureFixture
+    ) -> None:
+        clone, base_sha = workspace
+        (clone / "new.bin").write_bytes(b"\x00" * 32)
+        (clone / "README").write_text("real work\n")
+        ops = self._ops(base_sha)
+        with caplog.at_level(logging.WARNING):
+            deliver(ops, clone)
+        assert [e["path"] for e in tree_entries(ops)] == ["README"]
+        body = ops.pr_kwargs["body"]
+        assert "**Not delivered:** LFS-tracked file `new.bin` is not delivered" in body
+        assert "does not push objects to the repository's LFS store" in body
+        assert any("deliver.lfs_change_skipped" in r.getMessage() for r in caplog.records)
+
+    def test_a_modified_lfs_file_is_refused_the_same_way(self, workspace: tuple[Path, str]) -> None:
+        clone, base_sha = workspace
+        (clone / "asset.bin").write_bytes(b"\xff" * 32)
+        (clone / "README").write_text("real work\n")
+        ops = self._ops(base_sha)
+        deliver(ops, clone)
+        assert [e["path"] for e in tree_entries(ops)] == ["README"]
+        assert "LFS-tracked file `asset.bin` is not delivered" in ops.pr_kwargs["body"]
+
+    def test_only_lfs_changes_is_nothing_to_deliver(self, workspace: tuple[Path, str]) -> None:
+        clone, base_sha = workspace
+        (clone / "new.bin").write_bytes(b"\x00" * 32)
+        with pytest.raises(DeliveryError, match=r"LFS-tracked file `new\.bin`"):
+            deliver(self._ops(base_sha), clone)
+
+    def test_deleting_an_lfs_file_delivers(self, workspace: tuple[Path, str]) -> None:
+        clone, base_sha = workspace
+        (clone / "asset.bin").unlink()
+        ops = self._ops(base_sha)
+        deliver(ops, clone)
+        by_path = {e["path"]: e for e in tree_entries(ops)}
+        assert by_path["asset.bin"]["sha"] is None
+        assert "Not delivered" not in ops.pr_kwargs["body"]
+
+    def test_an_untouched_lfs_file_stays_out_of_the_tree(self, workspace: tuple[Path, str]) -> None:
+        clone, base_sha = workspace
+        (clone / "README").write_text("real work\n")
+        ops = self._ops(base_sha)
+        deliver(ops, clone)
+        assert [e["path"] for e in tree_entries(ops)] == ["README"]
+        assert "Not delivered" not in ops.pr_kwargs["body"]
+
+
 def _refs_calls(ops: StubOps) -> list[tuple[str, str]]:
     return [(m, p) for m, p, _ in ops.raw_calls if "/git/refs" in p]
 
@@ -953,6 +1327,195 @@ class TestContinuedHistory:
         assert commit_body is not None and commit_body["parents"] == ["PRIORHEAD"]
 
 
+class TestPrConventions:
+    """#678: the repository's pull request template opens the body, the
+    agent's own `.sbxloop/pr-body` wins over it, and a title lint in the
+    tree is detected — each from the delivered tree itself."""
+
+    def test_the_template_opens_the_body_verbatim(self, tmp_path: Path) -> None:
+        root = make_workspace(tmp_path)
+        (root / ".github").mkdir()
+        (root / ".github" / "PULL_REQUEST_TEMPLATE.md").write_text(
+            "## Summary\n\n## Checklist\n- [ ] tests\n"
+        )
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=root,
+            closes=5,
+        )
+        body = ops.pr_kwargs["body"]
+        assert body.startswith("## Summary\n\n## Checklist\n- [ ] tests\n\n---\n\n")
+        assert "Artifacts produced by sbxloop run `r42`." in body
+        assert body.endswith("\nCloses #5\n")
+
+    def test_the_agents_body_wins_over_the_template(self, tmp_path: Path) -> None:
+        root = make_workspace(tmp_path)
+        (root / "PULL_REQUEST_TEMPLATE.md").write_text("## Summary\n")
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=root,
+            closes=5,
+            authored_body="  ## Summary\n\nDid the thing.\n\n- [x] tests\n\n",
+        )
+        body = ops.pr_kwargs["body"]
+        assert body.startswith("## Summary\n\nDid the thing.\n\n- [x] tests\n\n---\n\n")
+        assert "Files (" not in body, "the authored body replaces the summary"
+        assert "sbxloop run `r42`" in body and body.endswith("\nCloses #5\n")
+
+    def test_without_either_the_body_reads_as_before(self, tmp_path: Path) -> None:
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+        )
+        body = ops.pr_kwargs["body"]
+        assert body.startswith("Artifacts produced by sbxloop run `r42`.\n\n**Outcome:** x\n")
+        assert "---" not in body
+
+    def test_a_redelivery_with_an_authored_body_rewrites_the_open_pr(self, tmp_path: Path) -> None:
+        class KnownPrOps(StubOps):
+            def pr_get(self, repo: str, number: int) -> dict[str, Any]:
+                return {"number": number, "html_url": "https://github.com/o/r/pull/12"}
+
+            def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
+                raise AssertionError("a known PR must not be re-created")
+
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "PATCH" and path.endswith("/pulls/12"):
+                    self.raw_calls.append((method, path, body))
+                    return {}
+                return super().raw(method, path, body)
+
+        ops = KnownPrOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            pr_number=12,
+            authored_body="## Fixed\n",
+        )
+        (patch,) = [b for m, p, b in ops.raw_calls if m == "PATCH" and p.endswith("/pulls/12")]
+        assert patch is not None and patch["body"].startswith("## Fixed\n\n---\n\n")
+
+    def test_a_redelivery_without_one_leaves_the_body_alone(self, tmp_path: Path) -> None:
+        class KnownPrOps(StubOps):
+            def pr_get(self, repo: str, number: int) -> dict[str, Any]:
+                return {"number": number, "html_url": "https://github.com/o/r/pull/12"}
+
+        ops = KnownPrOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            pr_number=12,
+        )
+        assert not [b for m, p, b in ops.raw_calls if m == "PATCH" and p.endswith("/pulls/12")]
+
+    def test_pr_template_takes_githubs_first_choice_and_skips_empty_ones(
+        self, tmp_path: Path
+    ) -> None:
+        from sbxloop.deliver import pr_template
+
+        # One spelling per directory: the checkout may sit on a
+        # case-insensitive filesystem, where the two spellings are one file.
+        root = make_workspace(tmp_path)
+        assert pr_template(root) is None
+        (root / "docs").mkdir()
+        (root / "docs" / "pull_request_template.md").write_text("docs one\n")
+        assert pr_template(root)[1] == "docs one"  # type: ignore[index]
+        (root / "PULL_REQUEST_TEMPLATE.md").write_text("root one\n")
+        assert pr_template(root) == ("PULL_REQUEST_TEMPLATE.md", "root one")
+        (root / ".github").mkdir()
+        (root / ".github" / "PULL_REQUEST_TEMPLATE.md").write_text("  \n")
+        assert pr_template(root) == ("PULL_REQUEST_TEMPLATE.md", "root one"), (
+            "an empty template is no template"
+        )
+        (root / ".github" / "PULL_REQUEST_TEMPLATE.md").write_text("gh one\n")
+        assert pr_template(root) == (".github/PULL_REQUEST_TEMPLATE.md", "gh one")
+
+    @pytest.mark.parametrize(
+        ("files", "expected"),
+        [
+            ({}, None),
+            ({"commitlint.config.js": "module.exports = {}"}, "commitlint.config.js"),
+            ({".commitlintrc.yml": "extends: []"}, ".commitlintrc.yml"),
+            ({"package.json": '{"commitlint": {}}'}, "package.json (commitlint)"),
+            ({"package.json": '{"name": "x"}'}, None),
+            ({"package.json": "not json"}, None),
+            (
+                {".github/workflows/pr.yml": "uses: amannn/action-semantic-pull-request@v5\n"},
+                ".github/workflows/pr.yml (amannn/action-semantic-pull-request)",
+            ),
+            (
+                {".github/workflows/lint.yaml": "uses: wagoid/commitlint-github-action@v6\n"},
+                ".github/workflows/lint.yaml (wagoid/commitlint-github-action)",
+            ),
+            ({".github/workflows/ci.yml": "uses: actions/checkout@v4\n"}, None),
+            ({"src/commitlint.config.js": "x"}, None),
+        ],
+    )
+    def test_conventional_titles_names_the_evidence(
+        self, tmp_path: Path, files: dict[str, str], expected: str | None
+    ) -> None:
+        from sbxloop.deliver import conventional_titles
+
+        root = make_workspace(tmp_path)
+        for rel, text in files.items():
+            (root / rel).parent.mkdir(parents=True, exist_ok=True)
+            (root / rel).write_text(text)
+        assert conventional_titles(root) == expected
+
+    @pytest.mark.parametrize(
+        ("title", "expected"),
+        [
+            ("feat(api): add the endpoint", "feat(api): add the endpoint"),
+            ("fix!: drop  the\n thing", "fix!: drop the thing"),
+            ("Add the endpoint", "chore: add the endpoint"),
+            ("sbxloop: Add the endpoint", "chore: sbxloop: Add the endpoint"),
+            ("Feat: shouting type", "chore: feat: shouting type"),
+            ("revert: the last change", "revert: the last change"),
+            ("", "chore: deliver artifacts"),
+        ],
+    )
+    def test_conventional_title_keeps_one_and_guesses_otherwise(
+        self, title: str, expected: str
+    ) -> None:
+        from sbxloop.deliver import conventional_title
+
+        assert conventional_title(title) == expected
+
+    def test_pr_conventions_is_a_paragraph_only_when_the_workspace_says_so(
+        self, tmp_path: Path
+    ) -> None:
+        from sbxloop.deliver import pr_conventions
+
+        root = make_workspace(tmp_path)
+        assert pr_conventions(None) == "" and pr_conventions(root) == ""
+        (root / "commitlint.config.js").write_text("x")
+        text = pr_conventions(root)
+        assert "`commitlint.config.js`" in text and "`type(scope): summary`" in text
+        assert "pr-body" not in text
+        (root / "PULL_REQUEST_TEMPLATE.md").write_text("## Why\n")
+        text = pr_conventions(root)
+        assert "`PULL_REQUEST_TEMPLATE.md`" in text and "`.sbxloop/pr-body`" in text
+        assert text.count("\n- ") == 1 and text.startswith("- ")
+
+
 class TestNaming:
     """#621: the PR title and commit message are the operator's templates,
     rendered with the plan's title when the model gave one; unset, they
@@ -1083,16 +1646,68 @@ class TestNaming:
         )
         assert pr.number == 12
 
+    def test_a_ref_422_naming_signatures_names_signing_not_the_prefix(self, tmp_path: Path) -> None:
+        """#677: every non-collision 422 used to be "the branch name"."""
+
+        class RefusedRefOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "POST" and path.endswith("/git/refs"):
+                    raise github_error("ref_signature_required_422")
+                return super().raw(method, path, body)
+
+        with pytest.raises(DeliveryError) as info:
+            deliver_workspace(
+                RefusedRefOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
+        text = str(info.value)
+        assert "verified signatures" in text and "signed commits" in text
+        assert "GitHub App" in text and "branch_prefix" not in text
+
+    def test_a_ref_422_naming_a_lock_says_so(self, tmp_path: Path) -> None:
+        class RefusedRefOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "POST" and path.endswith("/git/refs"):
+                    raise github_error("ref_locked_422")
+                return super().raw(method, path, body)
+
+        with pytest.raises(DeliveryError, match="locked") as info:
+            deliver_workspace(
+                RefusedRefOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
+        assert "branch_prefix" not in str(info.value)
+
+    def test_an_unrecognised_ref_422_quotes_github_and_names_no_knob(self, tmp_path: Path) -> None:
+        class RefusedRefOps(StubOps):
+            def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+                if method == "POST" and path.endswith("/git/refs"):
+                    raise github_error("ref_refused_unclassified_422")
+                return super().raw(method, path, body)
+
+        with pytest.raises(DeliveryError) as info:
+            deliver_workspace(
+                RefusedRefOps(),  # type: ignore[arg-type]
+                "o/r",
+                run_id="r42",
+                outcome="x",
+                source_dir=make_workspace(tmp_path),
+            )
+        text = str(info.value)
+        assert "Something about the size limit" in text
+        assert "branch_prefix" not in text and "signed" not in text and "locked" not in text
+
     def test_a_ruleset_refusing_the_branch_names_the_knob(self, tmp_path: Path) -> None:
         class RefusedRefOps(StubOps):
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "POST" and path.endswith("/git/refs"):
-                    raise GithubOpsError(
-                        "github op raw.api failed: GithubOpError: gh api POST "
-                        f"{path} failed (rc=1): Cannot create ref due to creations being "
-                        "restricted. (HTTP 422)",
-                        http_status=422,
-                    )
+                    raise github_error("ref_creation_restricted_422")
                 return super().raw(method, path, body)
 
         with pytest.raises(DeliveryError, match=r"\[github\] branch_prefix") as info:
@@ -1105,3 +1720,55 @@ class TestNaming:
             )
         assert "'sbxloop/r42'" in str(info.value)
         assert "creations being restricted" in str(info.value)
+
+
+class TestVerificationSection:
+    """#682: what the sandbox's checks did not decide closes the body as its
+    own section, before `Closes`, whichever way the body was written."""
+
+    NOTE = 'The operator set `verify_mode = "advisory"`: these checks failed\n- task t1: x'
+
+    def test_the_section_precedes_closes_in_the_summary_body(self, tmp_path: Path) -> None:
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            closes=5,
+            verification=self.NOTE,
+        )
+        body = ops.pr_kwargs["body"]
+        assert body.startswith("Artifacts produced by sbxloop run `r42`.")
+        assert f"\n**Verification:** {self.NOTE}\n\nCloses #5\n" in body
+        assert body.endswith("\nCloses #5\n")
+
+    def test_the_section_follows_an_authored_body(self, tmp_path: Path) -> None:
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            authored_body="## Summary\n\nDid it.\n",
+            verification=self.NOTE,
+        )
+        body = ops.pr_kwargs["body"]
+        assert body.startswith(
+            "## Summary\n\nDid it.\n\n---\n\nArtifacts produced by sbxloop run `r42`."
+        )
+        assert body.endswith(f"\n**Verification:** {self.NOTE}\n")
+
+    def test_no_note_no_section(self, tmp_path: Path) -> None:
+        ops = StubOps()
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            verification="  ",
+        )
+        assert "Verification" not in ops.pr_kwargs["body"]

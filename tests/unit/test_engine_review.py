@@ -403,13 +403,27 @@ class TestFixBrief:
                 FailedCheck("lint", "failure", "E501 line too long (src/app.py:3)", "https://x"),
                 FailedCheck("test", "timed_out", "   ", "https://y"),
             ],
+            gate="make check",
         )
         assert "Failing checks, with their log output where it could be read:" in brief
         assert (
             "#### `lint` (failure) — https://x\n\n```\nE501 line too long (src/app.py:3)\n```"
             in brief
         )
-        assert "run the project's own gate here before you finish" in brief
+        assert "run the project's own gate (`make check`) here before you finish" in brief
+
+    def test_the_gate_is_named_wherever_the_brief_asks_for_it(self) -> None:
+        """#690: "run the project's own gate" named nothing. The brief
+        carries the command, and says there is none rather than asking
+        for a gate the repository does not declare."""
+        checks = [FailedCheck("test", "failure", "", "https://y")]
+        named = fix_brief(
+            pr_number=9, kind="ci", why="w", round=1, failed_checks=checks, gate="just ci"
+        )
+        assert named.count("run the project's own gate (`just ci`)") == 2
+        without = fix_brief(pr_number=9, kind="ci", why="w", round=1, failed_checks=checks)
+        assert "project's own gate" not in without
+        assert "run the tasks' verify commands (this repository declares no single gate)" in without
 
     def test_a_check_without_a_log_points_at_its_link_not_a_placeholder(self) -> None:
         """A commit status, or an Actions job whose log the token cannot
@@ -422,10 +436,11 @@ class TestFixBrief:
             why="1 of 2 check(s) failed: ci/jenkins",
             round=2,
             failed_checks=[FailedCheck("ci/jenkins", "failure", "   ", "https://jenkins/42")],
+            gate="make check",
         )
         assert "#### `ci/jenkins` (failure) — https://jenkins/42\n\n" in brief
         assert "not readable from here" in brief
-        assert "Reproduce the failure with the project's own gate" in brief
+        assert "Reproduce the failure — run the project's own gate (`make check`) —" in brief
         assert "(no log output was available)" not in brief
         assert "```" not in brief.split("#### `ci/jenkins`")[1].split("Make these pass")[0]
 

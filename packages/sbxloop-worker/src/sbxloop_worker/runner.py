@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import threading
 import time
@@ -117,6 +118,10 @@ class JobRunner:
             return self._run_shell_check()
         if self.job.kind == "shell.batch":
             return self._run_shell_batch()
+        if self.job.kind == "service.http":
+            return self._run_service_http(writer)
+        if self.job.kind == "service.fetch":
+            return self._run_service_fetch(writer)
         return self._run_github_op(writer)
 
     def _run_agent_session(self, writer: EventWriter) -> JobResult:
@@ -211,6 +216,66 @@ class JobRunner:
         output = execute_op(self.job.op, self.job.params, progress=progress)
         writer.emit(EventTypes.GH_OP_END, op=self.job.op)
         return JobResult(job_id=self.job.job_id, status="ok", output_json=output)
+
+    def _run_service_http(self, writer: EventWriter) -> JobResult:
+        from sbxloop_worker.serviceops import execute_http
+
+        params = self.job.params
+        summary = {
+            "credential": params.get("credential"),
+            "method": str(params.get("method", "")).upper(),
+            "path": params.get("path"),
+        }
+        writer.emit(EventTypes.SERVICE_HTTP_START, **summary)
+        output = execute_http(params)
+        writer.emit(EventTypes.SERVICE_HTTP_END, status=output["status"], **summary)
+        return JobResult(job_id=self.job.job_id, status="ok", output_json=output)
+
+    def _run_service_fetch(self, writer: EventWriter) -> JobResult:
+        """One dependency fetch in the service sandbox (#766): the argv the
+        host composed, in the workspace, with the sandbox's own environment
+        (the registry credential and the cache location are in it). Exit
+        code and output tail come back like shell.check's; the host decides
+        what a non-zero exit means."""
+        assert self.job.argv is not None
+        summary = {
+            "ecosystem": self.job.params.get("ecosystem"),
+            "verb": self.job.params.get("verb"),
+            "argv": list(self.job.argv),
+        }
+        writer.emit(EventTypes.SERVICE_FETCH_START, **summary)
+        started = time.monotonic()
+        # nosec below: running the host-authored fetch argv inside the
+        # sandbox IS this job kind's contract; list argv, never shell=True.
+        proc = subprocess.run(  # nosec B603
+            self.job.argv,
+            capture_output=True,
+            text=True,
+            cwd=self.job.cwd,
+            timeout=self.job.timeout_s,
+            check=False,
+        )
+        output = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
+        # The output goes back to the host and into the ledger; a package
+        # manager is free to echo a URL with the token in it. The host names
+        # the variables holding the secrets (names, not values); their
+        # values are blanked out here, where they are.
+        for name in self.job.params.get("scrub_env") or ():
+            value = os.environ.get(str(name), "")
+            if len(value) >= 8:
+                output = output.replace(value, "***")
+        writer.emit(
+            EventTypes.SERVICE_FETCH_END,
+            exit_code=proc.returncode,
+            duration_s=round(time.monotonic() - started, 2),
+            **summary,
+        )
+        return JobResult(
+            job_id=self.job.job_id,
+            status="ok",
+            exit_code=proc.returncode,
+            output_text=output[-OUTPUT_TAIL_CHARS:],
+        )
 
     # -- helpers -----------------------------------------------------------
 

@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from sbxloop.engine.model import TaskRecord, TaskSpec
+from sbxloop.engine.model import Published, TaskOutput, TaskRecord, TaskSpec
 from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import StateError
 from sbxloop_worker.protocol import Event, Usage
@@ -35,6 +35,18 @@ class TestRuns:
         assert record.state == "created"
         store.set_run_state("r1", "building")
         assert store.get_run("r1").state == "building"
+
+    def test_credentials_round_trip(self, store: StateStore) -> None:
+        """The grant (#765) is part of the run row so a resume re-provisions
+        the same service sandbox; it is replaced whole, deduplicated."""
+        assert store.create_run("plain", "do things", "{}").credentials == []
+        record = store.create_run("r1", "do things", "{}", credentials=["weather", "mail"])
+        assert record.credentials == ["weather", "mail"]
+        assert store.get_run("r1").credentials == ["weather", "mail"]
+        store.set_run_credentials("r1", ["mail", "mail"])
+        assert store.get_run("r1").credentials == ["mail"]
+        with pytest.raises(StateError, match="unknown run"):
+            store.set_run_credentials("nope", ["mail"])
 
     def test_stage_tracks_non_terminal_states_and_survives_terminal_ones(
         self, store: StateStore
@@ -137,6 +149,40 @@ class TestTasks:
         assert loaded.revisions == 2
         assert loaded.last_feedback == "try harder"
         assert loaded.session_id == "s-1"
+
+    def test_task_output_round_trips_and_is_null_by_default(self, store: StateStore) -> None:
+        store.create_run("r1", "x", kind="workload")
+        store.save_tasks("r1", [TaskSpec(id="t1", title="A")])
+        task = store.get_tasks("r1")[0]
+        assert task.output is None
+        task.output = TaskOutput(summary="wrote it", text="## Result\nwrote it", files=["a"])
+        store.update_task("r1", task)
+        loaded = store.get_tasks("r1")[0]
+        assert loaded.output == task.output
+        task.output = None
+        store.update_task("r1", task)
+        assert store.get_tasks("r1")[0].output is None
+
+    def test_pre_task_output_database_migrates_in_place(self, tmp_path: Path) -> None:
+        """#757: a tasks table from before outputs gains `output_json`; the
+        rows it held read back with no output and can be given one."""
+        db = engine_db(tmp_path, "pre_task_output")
+        insert_run_row(db, run_id="old", outcome="legacy", state="building", updated_at=2.0)
+        conn = sqlite3.connect(db)
+        conn.execute(
+            "INSERT INTO tasks (run_id, task_id, order_idx, state, spec_json)"
+            " VALUES ('old', 't1', 0, 'done', ?)",
+            (TaskSpec(id="t1", title="T").model_dump_json(),),
+        )
+        conn.commit()
+        conn.close()
+        store = StateStore(db)
+        task = store.get_tasks("old")[0]
+        assert task.state == "done" and task.output is None
+        task.output = TaskOutput(summary="s")
+        store.update_task("old", task)
+        # reopening does not re-apply the ALTER
+        assert StateStore(db).get_tasks("old")[0].output == TaskOutput(summary="s")
 
     def test_append_task_orders_after_the_saved_graph(self, store: StateStore) -> None:
         """A fix round is appended behind every graph task, and a second
@@ -626,6 +672,49 @@ class TestPipelineColumns:
         assert store.get_run("old").pr_title is None
         store.set_run_title("old", "t")
         assert StateStore(db).get_run("old").pr_title == "t"
+
+    def test_pre_kind_database_reads_every_run_as_code(self, tmp_path: Path) -> None:
+        """#755: a state database from before there were two kinds of run
+        gains `kind`, and every row it held — whatever state it stopped in
+        — reads back as a `code` run; a workload written afterwards keeps
+        its kind beside them."""
+        db = engine_db(tmp_path, "pre_kind")
+        for run_id, state in (("done", "merged"), ("mid", "building"), ("dead", "failed")):
+            insert_run_row(db, run_id=run_id, outcome="legacy", state=state, updated_at=2.0)
+        store = StateStore(db)
+        assert {r.run_id: r.kind for r in store.list_runs()} == {
+            "done": "code",
+            "mid": "code",
+            "dead": "code",
+        }
+        assert store.create_run("w1", "count the things", kind="workload").kind == "workload"
+        reopened = StateStore(db)
+        assert reopened.get_run("w1").kind == "workload"
+        assert reopened.get_run("mid").kind == "code"
+
+    def test_a_run_is_code_unless_created_otherwise(self, store: StateStore) -> None:
+        assert store.create_run("r1", "x").kind == "code"
+        assert store.get_run("r1").kind == "code"
+
+    def test_pre_published_database_gains_the_column_and_records_append(
+        self, tmp_path: Path
+    ) -> None:
+        """#759: a runs table from before sinks gains `published`; every row
+        reads back with nothing published, and a delivery appends to the
+        list in order — the record a resume at publishing reads."""
+        db = engine_db(tmp_path, "pre_published")
+        insert_run_row(db, run_id="old", outcome="legacy", state="publishing", updated_at=2.0)
+        store = StateStore(db)
+        assert store.get_run("old").published == []
+        store.add_run_published("old", Published(sink="artifact", location="/a", files=2))
+        store.add_run_published("old", Published(sink="chat", location="chat", tasks=["t1"]))
+        assert [(p.sink, p.location, p.files, p.tasks) for p in store.get_run("old").published] == [
+            ("artifact", "/a", 2, []),
+            ("chat", "chat", 0, ["t1"]),
+        ]
+        assert StateStore(db).get_run("old").published[0].sink == "artifact"
+        with pytest.raises(StateError, match="unknown run nope"):
+            store.add_run_published("nope", Published(sink="chat", location="chat"))
 
 
 class TestGrantRounds:

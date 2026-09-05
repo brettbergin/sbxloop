@@ -1,0 +1,11 @@
+version: "3"
+
+tasks:
+  verify:
+    deps: [lint, test]
+  lint:
+    cmds:
+      - npx --no-install eslint .
+  test:
+    cmds:
+      - npm test

@@ -1,0 +1,1 @@
+{"name": "fixture", "engines": {"node": ">=20"}, "scripts": {"ci": "echo ok"}, "devDependencies": {"eslint": "^9.0.0"}}

@@ -7,6 +7,8 @@ independent of the code under test.
 
 from __future__ import annotations
 
+import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -16,6 +18,7 @@ from git import GitCommandError, Repo
 
 from sbxloop import hostgit
 from sbxloop.errors import DeliveryError, ProvisionError
+from tests.fakes.gitserver import PrivateGitServer, bare_from
 
 
 def git(*argv: str, cwd: Path) -> None:
@@ -1045,3 +1048,662 @@ class TestCloneSize:
         assert (clone / "other.txt").read_text() == "other\n"
         with Repo(clone) as repo:
             assert repo.active_branch.name == "sbxloop/r1"
+
+
+class TestPrivateRemoteClone:
+    """#683: the run's token — and only it — authenticates a private remote,
+    through a helper that leaves no trace in the clone."""
+
+    TOKEN = "ghs_test-installation-token"
+
+    @pytest.fixture
+    def remote(self, tmp_path: Path):  # type: ignore[no-untyped-def]
+        seed = make_repo(tmp_path)
+        bare_from(seed, tmp_path / "srv", "o/private.git")
+        with PrivateGitServer(
+            tmp_path / "srv", username="x-access-token", token=self.TOKEN
+        ) as server:
+            yield server
+
+    def test_clones_with_the_token_and_leaves_no_trace(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        clone = tmp_path / "run"
+        url = f"{remote.url}/o/private.git"
+        sha = hostgit.clone_from_remote(url, clone, "sbxloop/r1", token=self.TOKEN)
+        assert sha == rev(tmp_path / "src", "main")
+        assert (clone / "hello.txt").read_text() == "hi\n"
+        # The first request is unauthenticated (git only sends a credential
+        # once challenged); the retry carried the run's token.
+        assert remote.requests[0] is None
+        assert any(r is not None for r in remote.requests)
+        # git remote -v shows the bare URL; the token is nowhere in the clone.
+        assert git_out("remote", "-v", cwd=clone).count(url) == 2
+        assert self.TOKEN not in (clone / ".git" / "config").read_text()
+        assert "credential" not in git_out("config", "--list", "--local", cwd=clone)
+
+    def test_without_a_token_the_private_remote_refuses(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        target = tmp_path / "run"
+        with pytest.raises(ProvisionError) as excinfo:
+            hostgit.clone_from_remote(f"{remote.url}/o/private.git", target, "sbxloop/r1")
+        assert "cloning" in str(excinfo.value)
+        assert not (target / ".git").is_dir()
+
+    def test_a_wrong_token_fails_without_leaking_it(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        target = tmp_path / "run"
+        with pytest.raises(ProvisionError) as excinfo:
+            hostgit.clone_from_remote(
+                f"{remote.url}/o/private.git", target, "sbxloop/r1", token="ghs_wrong"
+            )
+        message = str(excinfo.value)
+        assert "Authentication failed" in message
+        assert "ghs_wrong" not in message
+        assert not (target / ".git").is_dir()
+
+    def test_the_helper_lives_only_in_the_clone_environment(self) -> None:
+        env = hostgit._clone_env("s3cr3t-value")
+        assert env["GIT_TERMINAL_PROMPT"] == "0"
+        assert env[hostgit.CLONE_TOKEN_ENV] == "s3cr3t-value"
+        # The host user's own helpers are cleared before ours is added, so a
+        # keychain never answers for the run.
+        assert (env["GIT_CONFIG_KEY_0"], env["GIT_CONFIG_VALUE_0"]) == ("credential.helper", "")
+        assert env["GIT_CONFIG_KEY_1"] == "credential.helper"
+        assert "x-access-token" in env["GIT_CONFIG_VALUE_1"]
+        assert "s3cr3t-value" not in env["GIT_CONFIG_VALUE_1"]
+        assert "GIT_CONFIG_COUNT" not in hostgit._clone_env(None)
+
+
+class TestIsTracked:
+    def test_tracked_untracked_and_outside(self, tmp_path: Path) -> None:
+        root = make_repo(tmp_path)
+        assert hostgit.is_tracked(root, root / "hello.txt") is True
+        (root / "local.toml").write_text("x = 1\n")
+        assert hostgit.is_tracked(root, root / "local.toml") is False
+        assert hostgit.is_tracked(root, root / "missing.toml") is False
+        assert hostgit.is_tracked(root, tmp_path / "elsewhere.toml") is False
+
+    def test_nested_path_and_ignored_file(self, tmp_path: Path) -> None:
+        root = make_repo(tmp_path)
+        (root / ".gitignore").write_text("sbxloop.toml\n")
+        (root / "sbxloop.toml").write_text("model = 'x'\n")
+        git("add", ".gitignore", cwd=root)
+        git("commit", "-m", "ignore", cwd=root)
+        assert hostgit.is_tracked(root, root / "sbxloop.toml") is False
+        (root / "pkg").mkdir()
+        (root / "pkg" / "pyproject.toml").write_text("[tool.sbxloop]\n")
+        git("add", "pkg/pyproject.toml", cwd=root)
+        git("commit", "-m", "pkg", cwd=root)
+        assert hostgit.is_tracked(root, root / "pkg" / "pyproject.toml") is True
+
+    def test_without_git_is_unknown(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        root = make_repo(tmp_path)
+        monkeypatch.setattr(hostgit, "find_git", lambda: None)
+        assert hostgit.is_tracked(root, root / "hello.txt") is None
+
+
+def make_submodule_setup(tmp_path: Path, remote_root: str) -> tuple[Path, Path, Path]:
+    """A library repo, its bare copy under ``tmp_path/remotes`` (served at
+    ``remote_root``), and a superproject checkout that vendors the library
+    as the submodule ``vendor/lib`` — populated, at the library's first
+    commit. Returns (superproject, lib checkout, lib bare)."""
+    lib = tmp_path / "lib"
+    lib.mkdir()
+    git("init", "-b", "main", cwd=lib)
+    (lib / "lib.txt").write_text("v1\n")
+    git("add", ".", cwd=lib)
+    git("commit", "-m", "lib v1", cwd=lib)
+    lib_bare = bare_from(lib, tmp_path / "remotes", "lib.git")
+    app = make_repo(tmp_path, "app")
+    git("submodule", "add", "-q", f"{remote_root}/lib.git", "vendor/lib", cwd=app)
+    git("commit", "-q", "-m", "vendor lib", cwd=app)
+    return app, lib, lib_bare
+
+
+def lib_v2(lib: Path, lib_bare: Path) -> str:
+    """A second library commit, pushed to the bare remote; returns its sha."""
+    (lib / "lib.txt").write_text("v2\n")
+    git("commit", "-q", "-am", "lib v2", cwd=lib)
+    git("push", "-q", str(lib_bare), "main", cwd=lib)
+    return rev(lib)
+
+
+@pytest.mark.slow
+class TestSubmodules:
+    """#692: a run clone's submodules are populated, from the host checkout
+    when it can, and a moved gitlink surfaces as a ``160000`` change with
+    the commit it points at — never as the deletion of a directory."""
+
+    @pytest.fixture
+    def remote(self, tmp_path: Path):  # type: ignore[no-untyped-def]
+        (tmp_path / "remotes").mkdir()
+        with PrivateGitServer(tmp_path / "remotes", username="x", token="y", public=True) as srv:
+            yield srv
+
+    def test_lists_gitmodules_entries(self, tmp_path: Path, remote: PrivateGitServer) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        (sub,) = hostgit.list_submodules(app)
+        assert (sub.name, sub.path, sub.url) == (
+            "vendor/lib",
+            "vendor/lib",
+            f"{remote.url}/lib.git",
+        )
+        assert hostgit.list_submodules(make_repo(tmp_path, "plain")) == []
+
+    def test_fresh_clone_populates_from_the_host_checkout(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert not (clone / "vendor" / "lib" / "lib.txt").exists()  # a bare gitlink
+        before = len(remote.requests)
+        populated = hostgit.populate_submodules(clone, source=app, token=None)
+        assert populated == [("vendor/lib", "local")]
+        assert (clone / "vendor" / "lib" / "lib.txt").read_text() == "v1\n"
+        assert len(remote.requests) == before  # nothing fetched over the network
+        # origin points at the URL .gitmodules names, not at the host path
+        sub = clone / "vendor" / "lib"
+        assert git_out("remote", "get-url", "origin", cwd=sub) == f"{remote.url}/lib.git"
+        assert clone_config(clone, "submodule.vendor/lib.url") == f"{remote.url}/lib.git"
+        assert str(app) not in git_out("config", "--list", cwd=sub)
+
+    def test_a_stale_host_copy_falls_back_to_the_remote(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        """The host checkout's submodule lacks the commit the superproject
+        records (someone bumped the gitlink without `submodule update`)."""
+        app, lib, lib_bare = make_submodule_setup(tmp_path, remote.url)
+        v2 = lib_v2(lib, lib_bare)
+        git("update-index", "--cacheinfo", f"160000,{v2},vendor/lib", cwd=app)
+        git("commit", "-q", "-m", "bump lib without updating", cwd=app)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        populated = hostgit.populate_submodules(clone, source=app, token=None)
+        assert populated == [("vendor/lib", "remote")]
+        assert (clone / "vendor" / "lib" / "lib.txt").read_text() == "v2\n"
+        assert rev(clone / "vendor" / "lib") == v2
+        assert remote.requests  # the fallback went to the remote
+
+    def test_without_a_host_checkout_the_remote_is_the_source(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert hostgit.populate_submodules(clone, source=None, token=None) == [
+            ("vendor/lib", "remote")
+        ]
+        assert (clone / "vendor" / "lib" / "lib.txt").read_text() == "v1\n"
+
+    def test_a_private_submodule_takes_the_runs_token(self, tmp_path: Path) -> None:
+        token = "ghs_sub-token"
+        (tmp_path / "remotes").mkdir()
+        with PrivateGitServer(
+            tmp_path / "remotes", username="x-access-token", token=token
+        ) as private:
+            # The superproject is built while the server is public, then
+            # its .gitmodules is pointed at the same server made private.
+            private.public = True
+            app, _, _ = make_submodule_setup(tmp_path, private.url)
+            private.public = False
+            clone = tmp_path / "run"
+            hostgit.clone_for_run(app, clone, "sbxloop/r1")
+            with pytest.raises(ProvisionError) as excinfo:
+                hostgit.populate_submodules(clone, source=None, token=None)
+            assert "vendor/lib" in str(excinfo.value)
+            populated = hostgit.populate_submodules(clone, source=None, token=token)
+            assert populated == [("vendor/lib", "remote")]
+            assert (clone / "vendor" / "lib" / "lib.txt").read_text() == "v1\n"
+            assert token not in (clone / ".git" / "config").read_text()
+            assert (
+                token not in (clone / ".git" / "modules" / "vendor" / "lib" / "config").read_text()
+            )
+
+    def test_a_local_path_submodule_url_is_refused(self, tmp_path: Path) -> None:
+        """A `.gitmodules` URL naming a host path must not be followed: the
+        clone is read by the sandbox, and such a URL would copy any git
+        repository on the host into it."""
+        lib = make_repo(tmp_path, "lib")
+        app = make_repo(tmp_path, "app")
+        git(
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "-q",
+            str(lib),
+            "vendor/lib",
+            cwd=app,
+        )
+        git("commit", "-q", "-m", "vendor lib", cwd=app)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        with pytest.raises(ProvisionError) as excinfo:
+            hostgit.populate_submodules(clone, source=None, token=None)
+        assert "vendor/lib" in str(excinfo.value)
+        assert "clone_submodules = false" in str(excinfo.value)
+
+    def test_nested_submodules_populate_level_by_level(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        """The library itself vendors a submodule: the host checkout's copy
+        of it is the source one level down, the remote when that copy is
+        absent."""
+        core = tmp_path / "core"
+        core.mkdir()
+        git("init", "-b", "main", cwd=core)
+        (core / "core.txt").write_text("core\n")
+        git("add", ".", cwd=core)
+        git("commit", "-m", "core", cwd=core)
+        bare_from(core, tmp_path / "remotes", "core.git")
+        app, lib, lib_bare = make_submodule_setup(tmp_path, remote.url)
+        git("submodule", "add", "-q", f"{remote.url}/core.git", "deps/core", cwd=lib)
+        git("commit", "-q", "-m", "vendor core", cwd=lib)
+        git("push", "-q", str(lib_bare), "main", cwd=lib)
+        git("-C", "vendor/lib", "pull", "-q", "origin", "main", cwd=app)
+        git("-C", "vendor/lib", "submodule", "update", "--init", "-q", cwd=app)
+        git("commit", "-q", "-am", "bump lib", cwd=app)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert hostgit.populate_submodules(clone, source=app, token=None) == [
+            ("vendor/lib", "local"),
+            ("vendor/lib/deps/core", "local"),
+        ]
+        assert (clone / "vendor" / "lib" / "deps" / "core" / "core.txt").read_text() == "core\n"
+        clone2 = tmp_path / "run2"
+        hostgit.clone_for_run(app, clone2, "sbxloop/r2")
+        assert hostgit.populate_submodules(clone2, source=None, token=None) == [
+            ("vendor/lib", "remote"),
+            ("vendor/lib/deps/core", "remote"),
+        ]
+        assert (clone2 / "vendor" / "lib" / "deps" / "core" / "core.txt").read_text() == "core\n"
+
+    def test_no_submodules_is_a_no_op(self, tmp_path: Path) -> None:
+        source, clone = make_clone(tmp_path)
+        assert hostgit.populate_submodules(clone, source=source, token=None) == []
+
+    def test_a_gitmodules_entry_without_a_gitlink_is_skipped(
+        self, tmp_path: Path, remote: PrivateGitServer, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # a half-finished ``git rm``: the gitlink is gone, the .gitmodules
+        # entry stayed behind — nothing to check out, not a failed run
+        app, _lib, _lib_bare = make_submodule_setup(tmp_path, remote.url)
+        git("rm", "--cached", "vendor/lib", cwd=app)
+        git("commit", "-m", "drop the gitlink, keep the stanza", cwd=app)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        with caplog.at_level(logging.INFO):
+            assert hostgit.populate_submodules(clone, source=app, token=None) == []
+        assert not (clone / "vendor" / "lib").exists()
+        assert any("workspace.submodule_not_in_tree" in r.getMessage() for r in caplog.records)
+
+    def test_a_bumped_gitlink_is_a_160000_change_with_its_commit(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, lib, lib_bare = make_submodule_setup(tmp_path, remote.url)
+        v2 = lib_v2(lib, lib_bare)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_submodules(clone, source=app, token=None)
+        # the agent fetches and checks the new library commit out, staging
+        # nothing in the superproject
+        git("fetch", "-q", "origin", cwd=clone / "vendor" / "lib")
+        git("checkout", "-q", v2, cwd=clone / "vendor" / "lib")
+        notes: list[str] = []
+        (change,) = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF), notes=notes)
+        assert change == hostgit.WorkspaceChange(
+            path="vendor/lib", status="modified", mode="160000", sha=v2
+        )
+        assert change.is_gitlink
+        assert notes == []
+        # staged, the diff carries the sha itself: same answer
+        git("add", "vendor/lib", cwd=clone)
+        (change,) = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF))
+        assert change.sha == v2
+
+    def test_changes_inside_a_submodule_are_skipped_with_a_note(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_submodules(clone, source=app, token=None)
+        (clone / "vendor" / "lib" / "lib.txt").write_text("edited in place\n")
+        (clone / "README").write_text("real work\n")
+        notes: list[str] = []
+        changes = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF), notes=notes)
+        assert [c.path for c in changes] == ["README"]
+        assert notes == ["changes inside submodule `vendor/lib` are not delivered"]
+
+    def test_a_commit_the_remote_lacks_is_not_delivered(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_submodules(clone, source=app, token=None)
+        sub = clone / "vendor" / "lib"
+        (sub / "lib.txt").write_text("local\n")
+        git("commit", "-q", "-am", "local only", cwd=sub)
+        local = rev(sub)
+        notes: list[str] = []
+        assert hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF), notes=notes) == []
+        (note,) = notes
+        assert local[:12] in note and "vendor/lib" in note and "remote does not have" in note
+
+    def test_a_removed_submodule_is_a_gitlink_deletion(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_submodules(clone, source=app, token=None)
+        git("rm", "-q", "vendor/lib", cwd=clone)  # also drops its .gitmodules entry
+        changes = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF))
+        assert [(c.path, c.status, c.mode) for c in changes] == [
+            (".gitmodules", "modified", "100644"),
+            ("vendor/lib", "deleted", "160000"),
+        ]
+
+    def test_an_untouched_submodule_is_not_a_change(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_submodules(clone, source=app, token=None)
+        (clone / "README").write_text("real work\n")
+        changes = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF))
+        assert [c.path for c in changes] == ["README"]
+
+
+class TestSubmoduleHosts:
+    def test_hosts_come_from_gitmodules_urls(self, tmp_path: Path) -> None:
+        app = make_repo(tmp_path, "app")
+        (app / ".gitmodules").write_text(
+            '[submodule "a"]\n\tpath = a\n\turl = https://gitlab.example.com/o/a.git\n'
+            '[submodule "b"]\n\tpath = vendor/b\n\turl = git@github.com:o/b.git\n'
+            '[submodule "c"]\n\tpath = c\n\turl = ssh://git@git.corp.example:2222/o/c\n'
+            '[submodule "d"]\n\tpath = d\n\turl = ../d.git\n'
+            '[submodule "e"]\n\tpath = e\n\turl = /srv/git/e.git\n'
+            '[submodule "f"]\n\tpath = f\n\turl = https://github.com/o/f\n'
+        )
+        git("remote", "add", "origin", "https://github.com/o/app.git", cwd=app)
+        assert hostgit.submodule_hosts(app) == [
+            "gitlab.example.com",
+            "github.com",
+            "git.corp.example",
+        ]
+
+    def test_relative_urls_need_an_origin(self, tmp_path: Path) -> None:
+        app = make_repo(tmp_path, "app")
+        (app / ".gitmodules").write_text('[submodule "d"]\n\tpath = d\n\turl = ../d.git\n')
+        assert hostgit.submodule_hosts(app) == []
+
+    def test_no_gitmodules_is_empty(self, tmp_path: Path) -> None:
+        assert hostgit.submodule_hosts(make_repo(tmp_path)) == []
+        assert hostgit.submodule_hosts(tmp_path / "missing") == []
+
+    @pytest.mark.parametrize(
+        ("url", "host"),
+        [
+            ("https://github.com/o/r.git", "github.com"),
+            ("https://user:tok@ghe.example.com:8443/o/r", "ghe.example.com"),
+            ("ssh://git@[::1]:22/o/r", "::1"),
+            ("git@github.com:o/r.git", "github.com"),
+            ("/srv/git/r.git", None),
+            ("../r.git", None),
+            ("C:/git/r.git", None),
+        ],
+    )
+    def test_url_host(self, url: str, host: str | None) -> None:
+        assert hostgit.url_host(url) == host
+
+
+# -- Git LFS (#693) ----------------------------------------------------------
+
+
+needs_git_lfs = pytest.mark.skipif(
+    hostgit.lfs_version() is None, reason="git-lfs is not installed on this host"
+)
+
+
+def make_lfs_repo(tmp_path: Path, name: str = "app") -> tuple[Path, bytes]:
+    """A checkout whose ``*.bin`` files live in Git LFS, one committed
+    asset in its store. Returns (checkout, the asset's real bytes)."""
+    root = tmp_path / name
+    root.mkdir()
+    git("init", "-b", "main", cwd=root)
+    git("lfs", "install", "--local", cwd=root)
+    (root / ".gitattributes").write_text("*.bin filter=lfs diff=lfs merge=lfs -text\n")
+    payload = bytes(range(256)) * 4
+    (root / "asset.bin").write_bytes(payload)
+    (root / "README").write_text("hi\n")
+    git("add", "-A", cwd=root)
+    git("commit", "-q", "-m", "init", cwd=root)
+    return root, payload
+
+
+def is_pointer(path: Path) -> bool:
+    return path.read_bytes().startswith(b"version https://git-lfs.github.com/spec/v1")
+
+
+@needs_git_lfs
+@pytest.mark.slow
+class TestLfs:
+    """#693: a run clone is cut with pointer files and populated from the
+    host checkout's store first, the repository's LFS endpoint second —
+    with the run's token, never the host's global git-lfs setup."""
+
+    @pytest.fixture
+    def remote(self, tmp_path: Path):  # type: ignore[no-untyped-def]
+        (tmp_path / "remotes").mkdir()
+        with PrivateGitServer(
+            tmp_path / "remotes", username="x-access-token", token="ghs_lfs"
+        ) as srv:
+            yield srv
+
+    def test_endpoint_is_the_dot_git_info_lfs_of_the_clone_url(self) -> None:
+        assert (
+            hostgit.lfs_endpoint("https://github.com/o/r") == "https://github.com/o/r.git/info/lfs"
+        )
+        assert (
+            hostgit.lfs_endpoint("https://github.com/o/r.git/")
+            == "https://github.com/o/r.git/info/lfs"
+        )
+
+    def test_a_run_clone_starts_on_pointer_files(self, tmp_path: Path) -> None:
+        app, _ = make_lfs_repo(tmp_path)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert is_pointer(clone / "asset.bin")
+
+    def test_populates_from_the_host_checkout_without_the_network(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, payload = make_lfs_repo(tmp_path)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        population = hostgit.populate_lfs(clone, source=app, lfs_url=None, token=None)
+        assert population == hostgit.LfsPopulation(files=1, linked=1, fetched=0)
+        assert (clone / "asset.bin").read_bytes() == payload
+        assert remote.lfs_requests == []
+        # the clone's own config carries the filters; the source is untouched
+        assert 'filter "lfs"' in (clone / ".git" / "config").read_text()
+        assert not hostgit.is_dirty(app)
+
+    def test_fetches_what_the_host_store_lacks_with_the_runs_token(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, payload = make_lfs_repo(tmp_path)
+        bare_from(app, tmp_path / "remotes", "o/app.git")
+        remote.seed_lfs(app)
+        url = f"{remote.url}/o/app.git"
+        clone = tmp_path / "run"
+        hostgit.clone_from_remote(url, clone, "sbxloop/r1", token="ghs_lfs")
+        assert is_pointer(clone / "asset.bin")
+        population = hostgit.populate_lfs(
+            clone, source=None, lfs_url=hostgit.lfs_endpoint(url), token="ghs_lfs"
+        )
+        assert population == hostgit.LfsPopulation(files=1, linked=0, fetched=1)
+        assert (clone / "asset.bin").read_bytes() == payload
+        assert [p.rsplit("/", 1)[-1] for p in remote.lfs_requests][:1] == ["batch"]
+        assert "ghs_lfs" not in (clone / ".git" / "config").read_text()
+
+    def test_a_wrong_token_fails_closed(self, tmp_path: Path, remote: PrivateGitServer) -> None:
+        app, _ = make_lfs_repo(tmp_path)
+        bare_from(app, tmp_path / "remotes", "o/app.git")
+        remote.seed_lfs(app)
+        url = f"{remote.url}/o/app.git"
+        clone = tmp_path / "run"
+        hostgit.clone_from_remote(url, clone, "sbxloop/r1", token="ghs_lfs")
+        with pytest.raises(ProvisionError) as excinfo:
+            hostgit.populate_lfs(
+                clone, source=None, lfs_url=hostgit.lfs_endpoint(url), token="wrong"
+            )
+        assert "1 Git LFS object(s)" in str(excinfo.value)
+        assert "clone_lfs = false" in str(excinfo.value)
+
+    def test_missing_objects_with_no_endpoint_fail_closed(self, tmp_path: Path) -> None:
+        app, _ = make_lfs_repo(tmp_path)
+        shutil.rmtree(app / ".git" / "lfs")  # a host checkout that never pulled
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        with pytest.raises(ProvisionError) as excinfo:
+            hostgit.populate_lfs(clone, source=app, lfs_url=None, token=None)
+        assert "asset.bin" in str(excinfo.value)
+        assert "no GitHub repository" in str(excinfo.value)
+
+    def test_without_git_lfs_on_the_host_it_names_the_package(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        app, _ = make_lfs_repo(tmp_path)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        monkeypatch.setattr(hostgit, "lfs_version", lambda: None)
+        with pytest.raises(ProvisionError) as excinfo:
+            hostgit.populate_lfs(clone, source=app, lfs_url=None, token=None)
+        assert "apt install git-lfs" in str(excinfo.value)
+        assert "clone_lfs = false" in str(excinfo.value)
+
+    def test_a_populated_asset_is_not_a_change(self, tmp_path: Path) -> None:
+        app, _ = make_lfs_repo(tmp_path)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_lfs(clone, source=app, lfs_url=None, token=None)
+        assert hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF)) == []
+        # a build that touches the file's mtime re-runs the clean filter,
+        # which hashes the bytes back to the committed pointer
+        os.utime(clone / "asset.bin")
+        assert hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF)) == []
+
+    def test_lfs_tracked_names_the_paths_gitattributes_routes(self, tmp_path: Path) -> None:
+        app, _ = make_lfs_repo(tmp_path)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        hostgit.populate_lfs(clone, source=app, lfs_url=None, token=None)
+        (clone / "new.bin").write_bytes(b"\x00" * 16)
+        (clone / "README").write_text("more\n")
+        assert hostgit.lfs_tracked(clone, ["new.bin", "README", "asset.bin"]) == [
+            "new.bin",
+            "asset.bin",
+        ]
+        assert hostgit.lfs_tracked(clone, []) == []
+
+
+# -- tags (#694) ------------------------------------------------------------
+
+
+def describe(cwd: Path) -> str:
+    return git_out("describe", "--tags", "--always", cwd=cwd)
+
+
+class TestFetchTags:
+    """#694: a ``--no-tags`` run clone can be given the repository's tags —
+    from the host checkout when it has them, from origin under the run's
+    credential otherwise — so a build that reads ``git describe`` sees the
+    version the repository actually has."""
+
+    def test_a_run_clone_starts_without_tags(self, tmp_path: Path) -> None:
+        app = make_repo(tmp_path, "app")
+        git("tag", "-a", "v1.2.3", "-m", "release", cwd=app)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert hostgit.tag_count(clone) == 0
+        assert hostgit.tag_count(app) == 1
+
+    def test_tags_come_from_the_host_checkout_without_the_network(self, tmp_path: Path) -> None:
+        (tmp_path / "remotes").mkdir()
+        with PrivateGitServer(tmp_path / "remotes", username="x", token="y") as private:
+            app = make_repo(tmp_path, "app")
+            git("tag", "-a", "v1.2.3", "-m", "release", cwd=app)
+            git("remote", "add", "origin", f"{private.url}/o/app.git", cwd=app)
+            clone = tmp_path / "run"
+            hostgit.clone_for_run(app, clone, "sbxloop/r1")
+            fetched = hostgit.fetch_tags(clone, source=app, token=None)
+            assert fetched == hostgit.TagFetch(tags=1, source="local")
+            assert describe(clone) == "v1.2.3"
+            assert private.requests == []
+
+    def test_a_host_checkout_without_tags_falls_back_to_origin(self, tmp_path: Path) -> None:
+        upstream = make_repo(tmp_path, "upstream")
+        git("tag", "-a", "v2.0.0", "-m", "release", cwd=upstream)
+        (tmp_path / "remotes").mkdir()
+        bare_from(upstream, tmp_path / "remotes", "o/app.git")
+        with PrivateGitServer(
+            tmp_path / "remotes", username="x-access-token", token="ghs_tags"
+        ) as private:
+            url = f"{private.url}/o/app.git"
+            # the host checkout is itself a --no-tags clone
+            host = tmp_path / "host"
+            hostgit.clone_from_remote(url, host, "main", existing=True, token="ghs_tags")
+            assert hostgit.tag_count(host) == 0
+            clone = tmp_path / "run"
+            hostgit.clone_for_run(host, clone, "sbxloop/r1")
+            fetched = hostgit.fetch_tags(clone, source=host, token="ghs_tags")
+            assert fetched == hostgit.TagFetch(tags=1, source="remote")
+            assert describe(clone) == "v2.0.0"
+            assert private.requests
+            assert "ghs_tags" not in (clone / ".git" / "config").read_text()
+
+    def test_a_remote_clone_fetches_under_the_runs_token(self, tmp_path: Path) -> None:
+        upstream = make_repo(tmp_path, "upstream")
+        git("tag", "v0.9", cwd=upstream)  # lightweight tags count too
+        (tmp_path / "remotes").mkdir()
+        bare_from(upstream, tmp_path / "remotes", "o/app.git")
+        with PrivateGitServer(
+            tmp_path / "remotes", username="x-access-token", token="ghs_tags"
+        ) as private:
+            url = f"{private.url}/o/app.git"
+            clone = tmp_path / "run"
+            hostgit.clone_from_remote(url, clone, "sbxloop/r1", token="ghs_tags")
+            with pytest.raises(ProvisionError) as excinfo:
+                hostgit.fetch_tags(clone, source=None, token="wrong")
+            assert 'fetch_tags = "never"' in str(excinfo.value)
+            assert hostgit.tag_count(clone) == 0
+            fetched = hostgit.fetch_tags(clone, source=None, token="ghs_tags")
+            assert fetched == hostgit.TagFetch(tags=1, source="remote")
+            assert describe(clone) == "v0.9"
+
+    def test_a_repository_without_tags_is_not_an_error(self, tmp_path: Path) -> None:
+        app = make_repo(tmp_path, "app")
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert hostgit.fetch_tags(clone, source=app, token=None) == hostgit.TagFetch(0, "remote")
+
+    def test_a_tag_off_the_branch_brings_its_commit(self, tmp_path: Path) -> None:
+        app = make_repo(tmp_path, "app")
+        git("checkout", "-q", "-b", "release", cwd=app)
+        (app / "rel.txt").write_text("r\n")
+        git("add", ".", cwd=app)
+        git("commit", "-q", "-m", "release only", cwd=app)
+        git("tag", "v3.0.0", cwd=app)
+        git("checkout", "-q", "main", cwd=app)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert hostgit.fetch_tags(clone, source=app, token=None) == hostgit.TagFetch(1, "local")
+        assert git_out("cat-file", "-t", "v3.0.0^{commit}", cwd=clone) == "commit"

@@ -36,7 +36,7 @@ from typing import Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from sbxloop.engine.model import FixKind, TaskSpec
+from sbxloop.engine.model import PR_BODY_FILE, FixKind, TaskSpec
 from sbxloop.gh.ops import FailedCheck, ReviewComment, ReviewEvent
 
 # How many inline comments one posted review may carry. A reviewer that
@@ -60,7 +60,10 @@ PR_TITLE_HINT = (
     f"If a failing check judges the pull request's *title* rather than its code "
     f"(a title lint, a conventional-commits or semantic-PR check), write the "
     f"corrected title alone, on one line, to `{PR_TITLE_FILE}` under the workspace "
-    f"root; the loop retitles the pull request on re-delivery."
+    f"root; the loop retitles the pull request on re-delivery. If a failing check "
+    f"judges the pull request's *description* (a template checklist, a body lint), "
+    f"write the whole corrected description to `{PR_BODY_FILE}`; the loop replaces "
+    f"the description on re-delivery. Neither file is delivered."
 )
 
 Severity = Literal["blocking", "major", "minor", "nit"]
@@ -735,6 +738,7 @@ def fix_brief(
     history: str = "",
     unanswered: Sequence[ReviewFinding] = (),
     preexisting: Sequence[str] = (),
+    gate: str | None = None,
 ) -> str:
     """What one fix round is for, concretely.
 
@@ -755,7 +759,15 @@ def fix_brief(
     ``preexisting`` names the failing checks that were already red on the
     commit the PR is built on (#611) — required by the base, so still to
     be fixed, but not this PR's doing, and the fixer should know that.
+    ``gate`` is the project's own gate command, named where the brief asks
+    for it to be run (#690): "the project's own gate" told a fixer to run
+    something the brief never identified.
     """
+    run_gate = (
+        f"run the project's own gate (`{gate}`)"
+        if gate
+        else "run the tasks' verify commands (this repository declares no single gate)"
+    )
     what = _pr_label(pr_number)
     parts = [
         f"{what[0].upper()}{what[1:]} is not yet acceptable (fix round {round}, {kind}): {why}.",
@@ -834,13 +846,13 @@ def fix_brief(
                 # might mistake for an empty log.
                 blocks.append(
                     f"{heading}\n\nThe log for this check is not readable from here; "
-                    "the link above is where it lives. Reproduce the failure with "
-                    "the project's own gate before changing anything."
+                    "the link above is where it lives. Reproduce the failure — "
+                    f"{run_gate} — before changing anything."
                 )
         parts.append(
             "Failing checks, with their log output where it could be read:\n\n"
             + "\n\n".join(blocks)
-            + "\n\nMake these pass; run the project's own gate here before you finish."
+            + f"\n\nMake these pass; {run_gate} here before you finish."
         )
     if objections:
         who = "an automated reviewer" if kind == "bot" else "a human"

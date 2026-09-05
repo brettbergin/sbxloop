@@ -32,10 +32,12 @@ upstream missed. It is idempotent, so already-masked text is unchanged.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import re
 import socket
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -46,8 +48,8 @@ from sbxloop.cli.tui import (
     TOOL_ARGS_LINE_CLIP,
 )
 from sbxloop.cli.tui import _one_line as _one_line_mid
-from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
-from sbxloop.engine.model import PIPELINE_STAGES
+from sbxloop.daemon.model import DaemonNotice, RunReport, TaskOutcome, WorkItem
+from sbxloop.engine.model import PIPELINE_STAGES, WORKLOAD_STAGES, Published
 from sbxloop.events import Event, HostEventTypes
 from sbxloop.excerpt import (
     TOOL_EXCERPT_LINE_CLIP,
@@ -96,6 +98,7 @@ STATE_MARKER = {
     "blocked": "🚧",
     "cancelled": "⏹",
     "gated": "⏸",
+    "awaiting_review": "👀",
 }
 STATE_COLOR = {
     "merged": COLOR_OK,
@@ -104,6 +107,7 @@ STATE_COLOR = {
     "blocked": COLOR_WARN,
     "cancelled": COLOR_DIM,
     "gated": COLOR_WARN,
+    "awaiting_review": COLOR_WARN,
 }
 # How a post-build stage reads in the chronology when the run enters it.
 STAGE_MARKER = {
@@ -113,7 +117,16 @@ STAGE_MARKER = {
     "fixing": "🛠",
     "awaiting_ci": "⏳",
     "landing": "🚀",
+    # a workload's stages after its task graph (#755)
+    "judging": "⚖️",
+    "publishing": "📤",
 }
+# The stages a chronology line announces: the pipeline's, and the two a
+# workload enters once its task graph is done — `planning`/`executing`
+# are the graph itself and are narrated task by task, as `decomposing`/
+# `building` are.
+_STAGE_STATES: tuple[str, ...] = (*PIPELINE_STAGES, *WORKLOAD_STAGES[2:])
+_GRAPH_STATES: tuple[str, ...] = ("building", "executing")
 
 _FENCE_RE = re.compile(r"^\s*(```|~~~)\s*([\w+#.-]*)")
 _URL_RE = re.compile(r"(?<![<(\[])https?://[^\s<>()\[\]]+")
@@ -315,6 +328,36 @@ class EmbedSpec:
         if self.footer:
             lines.append(f"_{self.footer}_")
         return "\n".join(lines)
+
+
+def code_segments(text: str) -> list[tuple[str, bool]]:
+    """``(segment, is_code)`` pairs: fenced blocks and inline spans marked,
+    so a dialect converter (Slack's, the console's) leaves them alone."""
+    return _code_segments(text)
+
+
+def embed_to_json(spec: EmbedSpec) -> str:
+    """The card as JSON, for a transport that stores rather than posts —
+    the dataclass's own fields, so a field added to :class:`EmbedSpec`
+    rides along."""
+    return json.dumps(dataclasses.asdict(spec))
+
+
+def embed_from_json(text: str) -> EmbedSpec | None:
+    """The card back from :func:`embed_to_json`; None for anything else."""
+    try:
+        data = json.loads(text)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    known = {f.name for f in dataclasses.fields(EmbedSpec)}
+    fields = data.get("fields") or ()
+    try:
+        data["fields"] = tuple((str(n), str(v), bool(i)) for n, v, i in fields)
+        return EmbedSpec(**{k: v for k, v in data.items() if k in known})
+    except (TypeError, ValueError):
+        return None
 
 
 @dataclass(frozen=True)
@@ -1057,7 +1100,7 @@ class StatusLine:
         elif t in ("run.end", "run.state") and d.get("state") in STATE_MARKER:
             self.finished = str(d["state"])
             self._dirty = True
-        elif t == "run.state" and d.get("state") in PIPELINE_STAGES:
+        elif t == "run.state" and d.get("state") in _STAGE_STATES:
             self.stage = str(d["state"])
             if self.stage == "reviewing":
                 self.review_round += 1
@@ -1068,7 +1111,7 @@ class StatusLine:
             if self.stage != "landing":
                 self.landing = None
             self._dirty = True
-        elif t == "run.state" and d.get("state") == "building":
+        elif t == "run.state" and d.get("state") in _GRAPH_STATES:
             self.stage = None
             self._dirty = True
         elif t == HostEventTypes.FIX_ROUND:
@@ -1085,8 +1128,17 @@ class StatusLine:
         elif t == HostEventTypes.LAND_UNDRAFT:
             self.landing = "out of draft"
             self._dirty = True
+        elif t == HostEventTypes.LAND_HELD_BY_DRAFT:
+            self.landing = "held in draft by a person"
+            self._dirty = True
         elif t == HostEventTypes.LAND_UPDATE:
             self.landing = f"updating from base (attempt {d.get('attempt')})"
+            self._dirty = True
+        elif t == HostEventTypes.LAND_ENQUEUED:
+            self.landing = "in the merge queue"
+            self._dirty = True
+        elif t == HostEventTypes.LAND_DEQUEUED:
+            self.landing = "removed from the merge queue"
             self._dirty = True
 
     def finish(self, state: str) -> None:
@@ -1153,6 +1205,10 @@ class StatusLine:
             return f"⏳ CI{pending}"
         if stage == "landing":
             return f"🚀 landing · {self.landing or 'merging'}"
+        if stage == "judging":
+            return "⚖️ judging · re-running every task's check on the finished workspace"
+        if stage == "publishing":
+            return "📤 publishing"
         return f"⏳ {stage}"
 
 
@@ -1163,6 +1219,11 @@ _STATE_PHASE = {
     "executing": "build",
     "verifying": "verify",
 }
+# A workload's tasks walk the same states under different names (#756).
+_WORKLOAD_STATE_PHASE = {
+    "executing": "execute",
+    "verifying": "judge",
+}
 _PHASE_STATES = frozenset(_STATE_PHASE)
 # What the run is doing in each post-build stage, for the steer note.
 _STAGE_DOING = {
@@ -1172,6 +1233,9 @@ _STAGE_DOING = {
     "fixing": "in a fix round",
     "awaiting_ci": "waiting on CI",
     "landing": "landing the pull request",
+    # A workload's post-graph stages (#757).
+    "judging": "re-running every task's check on the finished data directory",
+    "publishing": "publishing the result",
 }
 # Stages where the engine is polling GitHub rather than running an agent job.
 _WAIT_STAGES = frozenset({"awaiting_ci", "landing"})
@@ -1196,6 +1260,7 @@ class SteerProgress:
         self.stage: str | None = None
         self.tool_calls = 0
         self.capped = False
+        self.kind = "code"
         self._dirty = False
 
     @property
@@ -1206,7 +1271,9 @@ class SteerProgress:
         d = event.data
         t = event.type
         tid = str(d.get("task_id") or "")
-        if t == "task.start" and tid:
+        if t == "run.start":
+            self.kind = str(d.get("kind") or "code")
+        elif t == "task.start" and tid:
             # The engine emits ``task.state=executing`` (and, on resume, the
             # persisted phase) *before* ``task.start``, so a start for the
             # task already being tracked only supplies the title — the
@@ -1219,7 +1286,8 @@ class SteerProgress:
             # Every state change is a checkpoint: the per-phase job (and its
             # tool-call ceiling) restarts, so the count restarts with it.
             self.task_id = tid
-            self.phase = _STATE_PHASE[str(d["state"])]
+            names = _WORKLOAD_STATE_PHASE if self.kind == "workload" else _STATE_PHASE
+            self.phase = names[str(d["state"])]
             self.tool_calls, self.capped = 0, False
             self._dirty = True
         elif t == "task.end" and tid == self.task_id:
@@ -1234,10 +1302,10 @@ class SteerProgress:
             if d.get("cap"):
                 self.cap = int(d["cap"])
             self._dirty = True
-        elif t == "run.state" and d.get("state") in PIPELINE_STAGES:
+        elif t == "run.state" and d.get("state") in _STAGE_STATES:
             self.stage = str(d["state"])
             self._dirty = True
-        elif t == "run.state" and d.get("state") == "building":
+        elif t == "run.state" and d.get("state") in _GRAPH_STATES:
             self.stage = None
             self._dirty = True
 
@@ -1339,6 +1407,71 @@ def format_for_discord(
         if data.get("url"):
             text += f" · {link('review', data['url'])}"
         return [line(text, flush=True)]
+    if t == HostEventTypes.JUDGE_VERDICT:
+        # The judge's answer to the operator's report (#756): the unmet
+        # criteria are the next attempt's brief, so the first one is quoted.
+        where = f" task {code(data.get('task_id'))}"
+        attempt = data.get("attempt")
+        tail = f" (attempt {attempt})" if isinstance(attempt, int) and attempt > 1 else ""
+        if data.get("passed"):
+            return [line(f"⚖️ judge:{where} **passed**{tail}", flush=True)]
+        unmet = [str(item) for item in _list(data, "unmet")]
+        text = f"⚖️ judge:{where} **failed**{tail} · {len(unmet)} unmet"
+        if unmet:
+            text += f" — {_one_line(unmet[0], 200)}"
+        return [line(text, flush=True)]
+    if t == HostEventTypes.TASK_OUTPUT:
+        # The task's own result line (#757), before the judge's word on it.
+        files = int(data.get("files") or 0)
+        text = f"📦 output: task {code(data.get('task_id'))}"
+        if summary := _one_line(data.get("summary") or "", 200):
+            text += f" — {summary}"
+        else:
+            text += " — (no result reported)"
+        if files:
+            text += f" · {files} file{'s' if files != 1 else ''}"
+        return [line(text)]
+    if t == HostEventTypes.RUN_PUBLISHED:
+        # Where the result went (#759). The chat sink's message is the
+        # result itself, posted whole into the thread; the others get a
+        # line naming where they landed.
+        if data.get("sink") == "chat":
+            text = str(data.get("message") or "").strip() or "*(no result reported)*"
+            return [
+                block(part)
+                for part in split_markdown(
+                    text, max_chars, header="📣 **result**", cont="📣 *(cont. {i}/{n})*"
+                )
+            ]
+        return [line(f"📤 published: {_one_line(data.get('message') or '', 300)}", flush=True)]
+    if t == HostEventTypes.RUN_NEEDS_GRANTED:
+        # What the plan asked for and the profile allowed (#758): names
+        # and hosts only, never a value.
+        parts = [
+            f"{label} " + ", ".join(code(str(v)) for v in values)
+            for label, key in (
+                ("hosts", "hosts"),
+                ("credentials", "credentials"),
+                ("sinks", "sinks"),
+                ("repos", "repos"),
+            )
+            if (values := _list(data, key))
+        ]
+        profile = data.get("profile")
+        text = f"🔐 needs granted under profile {code(str(profile))}: " + "; ".join(parts)
+        return [line(text, flush=True)]
+    if t == HostEventTypes.RUN_NEEDS_REFUSED:
+        text = "🚫 need refused: " + _one_line(data.get("message") or "", 300)
+        return [line(text, flush=True)]
+    if t == HostEventTypes.JUDGE_DEGRADED:
+        err = _one_line(data.get("error") or "", 300)
+        return [
+            line(
+                f"🛑 judge: task {code(data.get('task_id'))} — no usable verdict twice; "
+                f"the task fails closed" + (f" ({err})" if err else ""),
+                flush=True,
+            )
+        ]
     if t == HostEventTypes.REVIEW_RECONCILED:
         parts = [
             f"{data.get('addressed', 0)} addressed",
@@ -1381,9 +1514,30 @@ def format_for_discord(
         return []
     if t == HostEventTypes.LAND_UNDRAFT:
         return [line(f"🚀 PR #{data.get('pr')} taken out of draft")]
+    if t == HostEventTypes.LAND_HELD_BY_DRAFT:
+        return [
+            line(
+                f"✋ PR #{data.get('pr')} was converted to draft by a person — holding until "
+                "it is marked ready for review",
+                flush=True,
+            )
+        ]
     if t == HostEventTypes.LAND_UPDATE:
         return [
             line(f"🚀 PR #{data.get('pr')} updated from its base (attempt {data.get('attempt')})")
+        ]
+    if t == HostEventTypes.LAND_ENQUEUED:
+        position = data.get("position")
+        where = f" at position {position}" if isinstance(position, int) else ""
+        verb = "already in" if data.get("resumed") else "entered"
+        return [line(f"🚀 PR #{data.get('pr')} {verb} the merge queue{where}")]
+    if t == HostEventTypes.LAND_DEQUEUED:
+        red = [str(name) for name in _list(data, "failed")]
+        reason = str(data.get("reason") or "")
+        tail = f" — failing: {', '.join(red)}" if red else ""
+        why = f" ({reason})" if reason else ""
+        return [
+            line(f"🚧 PR #{data.get('pr')} removed from the merge queue{why}{tail}", flush=True)
         ]
     if t == HostEventTypes.RUN_GATED:
         label = f"#{data.get('pr')}"
@@ -1391,6 +1545,27 @@ def format_for_discord(
             line(
                 f"⏸ **ready to merge** PR {link(label, data.get('url'))} — parked by "
                 "`[landing] merge_gate`, waiting for human approval",
+                flush=True,
+            )
+        ]
+    if t == HostEventTypes.RUN_AWAITING_REVIEW:
+        label = f"#{data.get('pr')}"
+        if data.get("draft"):
+            return [
+                line(
+                    f"✋ **held in draft** PR {link(label, data.get('url'))} — a person "
+                    "converted it to draft; waiting for it to be marked ready for review",
+                    flush=True,
+                )
+            ]
+        need = data.get("approvals_required") or 1
+        have = data.get("approvals_have") or 0
+        owners = " from a code owner" if data.get("code_owners") else ""
+        return [
+            line(
+                f"👀 **awaiting review** PR {link(label, data.get('url'))} — the base requires "
+                f"{need} approving review(s){owners} ({have}/{need} so far); waiting for a "
+                "reviewer on GitHub",
                 flush=True,
             )
         ]
@@ -1432,7 +1607,7 @@ def format_for_discord(
                 flush=True,
             )
         ]
-    if t == HostEventTypes.RUN_STATE and data.get("state") in PIPELINE_STAGES:
+    if t == HostEventTypes.RUN_STATE and data.get("state") in _STAGE_STATES:
         stage = str(data["state"])
         return [line(f"{STAGE_MARKER.get(stage, '▶')} **{stage.replace('_', ' ')}**")]
     if t == "sandbox.workspace_clone":
@@ -1472,11 +1647,19 @@ def format_for_discord(
         msg = _one_line(data.get("message") or "", 300)
         if status == "failed":
             return [line(f"✗ **{phase}**{where}" + (f" — {msg}" if msg else ""))]
+        if status == "advisory":
+            # A check that failed and blocked nothing (#682): the human is
+            # the one it is evidence for, so it is never verbose-only.
+            return [line(f"⚠ **{phase}**{where}" + (f" — {msg}" if msg else ""))]
         if status == "ok" and phase == "build" and msg:
             # The builder's report excerpt is the chronology's record of what
             # the attempt did — the plan card's replacement now that the
             # approach is narrated in prose instead of structured JSON.
             return [line(f"🔨 **build**{where} — {msg}")]
+        if status == "ok" and phase == "execute" and msg:
+            # The operator's report excerpt (#756): the same record for a
+            # workload task, which the judge's verdict line then answers.
+            return [line(f"🛠 **execute**{where} — {msg}")]
         if verbose and msg:
             return [line(f"· {phase}{where} — {msg}")]
         return []
@@ -1514,6 +1697,20 @@ def format_for_discord(
         if level == "quiet":
             return []
         return [line(f"⚠ tooling: {_one_line(data.get('message') or '', 300)}")]
+    if t == HostEventTypes.VERIFY_SERVICES_DETECTED:
+        # The knob is the human's to turn (#682): the evidence and the hint
+        # reach the channel before the plan spends anything on the suite.
+        if level == "quiet":
+            return []
+        evidence = data.get("evidence")
+        seen = ", ".join(code(e) for e in evidence) if isinstance(evidence, list) else ""
+        return [
+            line(
+                "⚠ verify: the suite may need services the sandbox does not have"
+                + (f" ({seen})" if seen else "")
+                + f" — {_one_line(data.get('hint') or '', 300)}"
+            )
+        ]
     if t == "task.state":
         if verbose:
             return [line(f"· task {data.get('task_id')} → {data.get('state')}")]
@@ -1649,6 +1846,23 @@ def headline_embed(
     ).clamped()
 
 
+def _outputs_text(outputs: tuple[TaskOutcome, ...], limit: int = 8) -> str:
+    lines: list[str] = []
+    for out in outputs[:limit]:
+        marker = {"done": "✅", "failed": "❌", "skipped": "⏭"}.get(out.state, "▫")
+        line = f"{marker} {code(out.task_id)} {_one_line(out.title, 60)}"
+        if out.summary:
+            line += f" — {_one_line(out.summary, 140)}"
+        if out.files:
+            line += f" ({out.files} file{'s' if out.files != 1 else ''})"
+        if out.verdict and out.verdict != "passed":
+            line += f"\n  ⚖️ {_one_line(out.verdict, 160)}"
+        lines.append(line)
+    if len(outputs) > limit:
+        lines.append(f"… and {len(outputs) - limit} more task(s)")
+    return "\n".join(lines)
+
+
 def finish_text(state: str, report: RunReport) -> str:
     text = f"**finished: {state}** — {report.task_summary}"
     if report.cancelled_by:
@@ -1667,6 +1881,19 @@ def _cancel_note(item_id: str | None, report: RunReport) -> str:
     return note
 
 
+def _published_text(run_id: str, published: Sequence[Published]) -> str:
+    lines = []
+    for entry in published:
+        if entry.sink == "chat":
+            lines.append("📣 chat: posted above")
+        elif entry.sink in ("issue", "pr"):
+            lines.append(f"📤 {entry.sink}: {link(entry.location, entry.location)}")
+        else:
+            count = f"{entry.files} file{'s' if entry.files != 1 else ''}"
+            lines.append(f"📤 {entry.sink}: {count} — `sbxloop artifacts {run_id}`")
+    return "\n".join(lines)
+
+
 def finish_embed(
     item: WorkItem,
     report: RunReport,
@@ -1682,6 +1909,14 @@ def finish_embed(
         fields.append(("PR", link(f"#{report.pr[0]}", report.pr[1]), True))
     if report.rounds:
         fields.append(("Fix rounds", str(report.rounds), True))
+    if report.outputs:
+        # A workload's result (#757): each task's own result line and the
+        # judge's word on it, where a code run's card shows the PR.
+        fields.append(("Tasks", _outputs_text(report.outputs), False))
+    if report.published:
+        # Where the result went (#759): a link for an issue, a count for
+        # the artifact directory, the thread itself for chat.
+        fields.append(("Published", _published_text(report.run_id, report.published), False))
     if report.reason and state != "merged":
         fields.append(("Reason", _one_line(report.reason, 600), False))
     if unanswered:
@@ -1741,6 +1976,9 @@ class RunStats:
         self.total_tasks = 0
         self.states: dict[str, str] = {}
         self.revisions: dict[str, int] = {}
+        # Which run shape the ledgers describe (#757): a workload's tasks
+        # pass the judge where a code run's pass verify.
+        self.kind = "code"
 
     def observe(self, event: Event) -> None:
         if self.first_ts is None:
@@ -1748,8 +1986,10 @@ class RunStats:
         self.last_ts = event.ts
         d = event.data
         t = event.type
-        if t == HostEventTypes.RUN_START and d.get("resumed"):
-            self.resumed = True
+        if t == HostEventTypes.RUN_START:
+            self.kind = str(d.get("kind") or "code")
+            if d.get("resumed"):
+                self.resumed = True
         elif t == "agent.usage":
             self.turns += 1
             if d.get("input_tokens") is not None:
@@ -1781,7 +2021,7 @@ class RunStats:
                 self.revisions[tid] = int(d["revisions"] or 0)
         elif t == HostEventTypes.PHASE_END:
             phase = str(d.get("phase") or "?")
-            if phase == "verify" and str(d.get("status") or "") == "failed":
+            if phase in ("verify", "judge") and str(d.get("status") or "") == "failed":
                 self.rework.append(
                     (str(d.get("task_id") or "?"), phase, "failed", str(d.get("message") or ""))
                 )
@@ -1864,7 +2104,8 @@ def _went_well(stats: RunStats, report: RunReport) -> list[str]:
         1 for tid, s in stats.states.items() if s == "done" and not stats.revisions.get(tid)
     )
     if clean:
-        out.append(f"{clean} task(s) verified without revision")
+        how = "passed the judge" if stats.kind == "workload" else "verified"
+        out.append(f"{clean} task(s) {how} without revision")
     if stats.steers and stats.steers_answered == stats.steers:
         out.append(f"answered all {stats.steers} steering message(s)")
     return out
@@ -1878,7 +2119,8 @@ def _needed_work(stats: RunStats, report: RunReport, unanswered: int) -> list[st
             line += f" — {_one_line(reason, 160)}"
         out.append(line)
     if len(stats.rework) > 4:
-        out.append(f"… and {len(stats.rework) - 4} more verify failure(s)")
+        what = "judge" if stats.kind == "workload" else "verify"
+        out.append(f"… and {len(stats.rework) - 4} more {what} failure(s)")
     failed = sum(1 for s in stats.states.values() if s == "failed")
     if failed:
         out.append(f"{failed} task(s) failed")
@@ -1995,6 +2237,8 @@ ITEM_STATE_MARKER = {
     "blocked": "🚧",
     "cancelled": "⏹",
     "gated": "⏸",
+    "awaiting_review": "👀",
+    "paused_review": "💤",
 }
 
 

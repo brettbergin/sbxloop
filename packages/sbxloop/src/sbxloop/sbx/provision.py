@@ -36,6 +36,7 @@ doomed registration, no probe, no per-run warning — when either
 
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import shlex
@@ -50,8 +51,9 @@ from pathlib import Path
 from typing import Literal, NamedTuple
 
 from sbxloop import backends, hostgit, toolchains
-from sbxloop.config import Config, RepoConfig
-from sbxloop.errors import ProvisionError, SbxError
+from sbxloop.config import Config, CredentialConfig, RegistryConfig, RepoConfig
+from sbxloop.engine.model import RunKind
+from sbxloop.errors import GithubOpsError, ProvisionError, SbxError
 from sbxloop.events import EventBus
 from sbxloop.gh.appauth import (
     APP_ID_ENV,
@@ -61,9 +63,11 @@ from sbxloop.gh.appauth import (
     AppTokenSource,
     app_credentials,
 )
+from sbxloop.hostgit import exclude_from_git
 from sbxloop.ids import branch_name
 from sbxloop.log import get_logger
 from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
+from sbxloop.sbx import registries
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import (
     PROBE_EXEC_STDIN_ENV,
@@ -93,6 +97,7 @@ from sbxloop.sbx.secretstate import (
     set_secret_replacing,
 )
 from sbxloop_worker.secrets import shell_sentinel_case, shell_token_case
+from sbxloop_worker.serviceops import CATALOGUE_ENV
 
 log = get_logger(__name__)
 
@@ -145,7 +150,10 @@ _PROXY_BROKEN_VERDICTS = ("invisible-under-exec", "sentinel-under-exec")
 
 # Why a sandbox's credentials are delivered via the in-VM env file rather
 # than the sbx secret proxy. ``None`` means the proxy path is attempted.
-EnvFileReason = Literal["strategy", "cached", "app"]
+# ``service``: the service sandbox's credentials (#765) are operator values
+# bound to hosts the sbx proxy has no service for; they only ever travel
+# the non-proxy road.
+EnvFileReason = Literal["strategy", "cached", "app", "service"]
 
 
 @dataclass(frozen=True)
@@ -277,8 +285,16 @@ def dedupe_domains(domains: Iterable[str]) -> list[str]:
     return seen
 
 
-def agent_policy_allows(config: Config, languages: Sequence[str]) -> list[str]:
-    """The agent sandbox's network allowlist for ``languages``.
+def agent_policy_allows(
+    config: Config,
+    languages: Sequence[str],
+    repo: str | None = None,
+    *,
+    extra_domains: Sequence[str] = (),
+) -> list[str]:
+    """The agent sandbox's network allowlist for ``languages`` (and
+    ``repo``'s private registries, #680; ``extra_domains`` are what the
+    workspace itself asks for — the hosts its submodules fetch from, #692).
 
     The one builder behind a run's agent spec, the daemon's concierge
     sandbox and the bake's scratch sandbox (#615): what a template is baked
@@ -310,7 +326,14 @@ def agent_policy_allows(config: Config, languages: Sequence[str]) -> list[str]:
             *config.github.allow_domains,
             *((ANTHROPIC_TOKEN_HOST,) if claude else ()),
             *baseline_allows((*PROMPT_ADVERTISED_DOMAINS, *installers), config.policy.deny),
+            # Operator-declared hosts: a private registry the operator
+            # configured is reachable like extra_allow_domains is, deny or
+            # not — the config names it on purpose. Only the credential-less
+            # ones (#766): a registry with a credential is the service
+            # sandbox's host, and this sandbox never speaks to it.
+            *registries.domains(config.open_registries_for(repo)),
             *config.sandbox.extra_allow_domains,
+            *extra_domains,
         ]
     )
 
@@ -328,6 +351,51 @@ def github_policy_allows(config: Config) -> list[str]:
             *config.sandbox.extra_allow_domains,
         ]
     )
+
+
+# What the service sandbox's toolchain install reaches beyond the installer
+# hosts the toolchains name: the uv tarball and the uv-managed interpreter
+# come from a GitHub release (#250), and every release download answers with
+# a redirect to the assets host.
+SERVICE_TOOLCHAIN_DOMAINS = (
+    "github.com",
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+)
+
+
+def service_policy_allows(
+    credentials: Sequence[CredentialConfig],
+    registries_: Sequence[RegistryConfig] = (),
+    languages: Sequence[str] = (),
+    deny: Sequence[str] = (),
+) -> list[str]:
+    """The service sandbox's network allowlist (#765, #766).
+
+    With credentials only: exactly the hosts they are good for, nothing
+    baseline — the box runs no agent and fetches no toolchain, so a host no
+    credential names is a host it has no reason to reach. (The worker
+    install itself rides the sbx preset's baseline, as the github
+    sandbox's does.)
+
+    With credentialed registries the box is also the run's fetcher: their
+    hosts, the public registries a private one proxies or sits beside (a
+    scoped npm registry serves the scope; everything else still comes from
+    npmjs), the apt mirrors and installer hosts of the toolchains the
+    fetch needs — the same baseline tier the agent sandbox carries, seeded
+    through :func:`baseline_allows` so ``[policy] deny`` still wins over
+    it. ``languages`` is what :func:`registries.languages` answers for the
+    registries.
+    """
+    domains: list[str] = [*(cred.host for cred in credentials), *registries.domains(registries_)]
+    if registries_:
+        installers = toolchains.install_domains(toolchains.resolve(languages))
+        domains.extend(
+            baseline_allows(
+                (*PROMPT_ADVERTISED_DOMAINS, *SERVICE_TOOLCHAIN_DOMAINS, *installers), deny
+            )
+        )
+    return dedupe_domains(domains)
 
 
 class Provisioner:
@@ -396,9 +464,15 @@ class Provisioner:
             role="agent",
             workspace=workspace,
             template=template,
-            policy_allows=agent_policy_allows(self.config, languages),
+            policy_allows=agent_policy_allows(
+                self.config,
+                languages,
+                repo,
+                extra_domains=self._submodule_hosts(run_id, workspace, languages, repo),
+            ),
             secrets=[self._agent_secret_spec()],
-            persistent_env=self.agent_persistent_env(),
+            persistent_env=self.agent_persistent_env(repo),
+            files=self.agent_files(repo),
         )
         github = SandboxSpec(
             name=sandbox_name(run_id, "github"),
@@ -410,6 +484,30 @@ class Provisioner:
             persistent_env=self.github_repo_env(repo),
         )
         return agent, github
+
+    def _submodule_hosts(
+        self, run_id: str, workspace: Path, languages: Sequence[str], repo: str | None
+    ) -> list[str]:
+        """The hosts ``workspace``'s submodules fetch from (#692), said out
+        loud as an event when they widen the allow list the run would
+        otherwise get — an operator reading the chronology should see why
+        a host they never configured is reachable."""
+        hosts = hostgit.submodule_hosts(workspace)
+        if not hosts:
+            return []
+        baseline = agent_policy_allows(self.config, languages, repo)
+        new = [host for host in hosts if host not in baseline]
+        if new:
+            self.bus.emit(
+                "sandbox.submodule_hosts",
+                run_id,
+                hosts=new,
+                message=(
+                    "submodule hosts added to the agent sandbox's egress allow list: "
+                    + ", ".join(new)
+                ),
+            )
+        return hosts
 
     def resolve_languages(self, workspace: Path | None) -> toolchains.LanguageResolution:
         """The language set a run on ``workspace`` provisions (#624):
@@ -450,20 +548,77 @@ class Provisioner:
         """Hosts the agent sandbox's credential path needs (doctor rows)."""
         return self.backend().token_hosts
 
-    def agent_persistent_env(self) -> dict[str, str]:
-        """Non-secret env the agent sandbox needs for the chosen backend.
+    def agent_persistent_env(self, repo: str | None = None) -> dict[str, str]:
+        """The plain environment the agent sandbox's worker — and so every
+        agent turn and shell command it spawns — starts with.
 
-        The worker resolves its backend from ``SBXLOOP_WORKER_BACKEND``
-        (default copilot), so only the claude backend needs the selector
-        delivered. ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`` keeps the
-        Claude Code CLI hermetic — no telemetry or auto-update calls to
-        hosts the balanced network policy would only refuse.
+        What the repository's private registries need first — the
+        credential-less ones' ``GOPRIVATE`` / ``PIP_INDEX_URL`` (#680), and
+        for the credentialed ones the OFFLINE configuration (#766) that
+        points each package manager at the cache the service sandbox
+        fills, so nothing in this sandbox ever asks that registry — then
+        the repository's ``[sandbox] env`` (#679) over it (an operator's
+        explicit value wins over a derived one), and the loop's own
+        selector last so nothing an operator writes can shadow it. The
+        worker resolves its backend from ``SBXLOOP_WORKER_BACKEND`` (default
+        copilot), so only the claude backend needs it delivered;
+        ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`` keeps the Claude Code
+        CLI hermetic — no telemetry or auto-update calls to hosts the
+        balanced network policy would only refuse. Nothing secret goes
+        here, or anywhere else in this sandbox: its only credential is the
+        agent's own.
         """
-        if self.agent_backend() != "claude":
+        env: dict[str, str] = {
+            **registries.plain_env(self.config.open_registries_for(repo)),
+            **registries.offline_env(self.config.credentialed_registries_for(repo)),
+            **self.config.sandbox_env_for(repo),
+        }
+        if self.agent_backend() == "claude":
+            env["SBXLOOP_WORKER_BACKEND"] = "claude"
+            env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        return env
+
+    def agent_files(self, repo: str | None = None) -> dict[str, str]:
+        """The client files for ``repo``'s credential-less registries (#680)
+        — the only ones the agent sandbox is configured for (#766). Without
+        a credential no file holds one, so there is nothing to look up."""
+        regs = self.config.open_registries_for(repo)
+        if not regs:
+            return {}
+        return {f.path: f.text for f in registries.client_files(regs, {})}
+
+    def registry_secret_env(self, repo: str | None = None) -> dict[str, str]:
+        """The credential-bearing environment for ``repo``'s credentialed
+        registries (#680): each ``auth_env`` value read from the daemon's
+        environment, plus what the kind derives from it — the service
+        sandbox's (#766), never the agent's.
+
+        Every configured name must be set: the operator declared the
+        repository's dependencies need it, and a run without it would fail
+        later, inside a sandbox, for a reason no log line names. Raises
+        ProvisionError listing the unset names.
+        """
+        regs = self.config.credentialed_registries_for(repo)
+        names = self.config.registry_auth_envs_for(repo)
+        missing = [name for name in names if not self.env.get(name)]
+        if missing:
+            raise ProvisionError(
+                f"[[registries]] auth_env names {missing} are not set in the daemon's "
+                "environment (secrets.env / the service unit); set them or remove them "
+                "from the config"
+            )
+        values = {name: self.env[name] for name in names}
+        return {**values, **registries.secret_env(regs, values)}
+
+    def registry_files(self, repo: str | None = None) -> dict[str, str]:
+        """The client files for ``repo``'s credentialed registries, for the
+        service sandbox; the netrc kinds embed the credential, so this
+        raises like :meth:`registry_secret_env` when one is unset."""
+        regs = self.config.credentialed_registries_for(repo)
+        if not regs:
             return {}
         return {
-            "SBXLOOP_WORKER_BACKEND": "claude",
-            "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            f.path: f.text for f in registries.client_files(regs, self.registry_secret_env(repo))
         }
 
     def _agent_secret_spec(self) -> SecretSpec:
@@ -544,6 +699,23 @@ class Provisioner:
             return cred.source.bot_login()
         return None
 
+    def gh_app_permissions(self, repo: str | None = None) -> Mapping[str, str] | None:
+        """What the App installation may do, as GitHub reported it with the
+        token mint (#696) — ``None`` in PAT mode, when the credential is
+        misconfigured, or when the mint carried no permissions map. Doctor
+        compares this to what a run needs; the engine never reads it.
+        """
+        try:
+            cred = self.gh_credential(repo)
+        except ProvisionError:
+            return None
+        if isinstance(cred, GhApp):
+            try:
+                return cred.source.permissions()
+            except GithubOpsError:
+                return None
+        return None
+
     def _repo_entry(self, repo: str | None) -> RepoConfig | None:
         """The configured entry a sandbox is scoped to.
 
@@ -584,8 +756,33 @@ class Provisioner:
     # -- provisioning ------------------------------------------------------
 
     def ensure_pair(
-        self, run_id: str, workspace: Path | None = None, repo: str | None = None
+        self,
+        run_id: str,
+        workspace: Path | None = None,
+        repo: str | None = None,
+        *,
+        expects_mount: bool | None = None,
+        credentials: Sequence[str] = (),
+        kind: RunKind = "code",
     ) -> SandboxPair:
+        """Provision the run's sandbox pair around its workspace.
+
+        ``expects_mount`` says whether the agent sandbox must see the
+        workspace: None lets the workspace's origin decide (an explicit path
+        is the work; an unconfigured per-run dir is not), a resume passes
+        the verdict its first provisioning recorded so a harvest-mode run
+        stays one (#670). ``credentials`` names the ``[[credentials]]``
+        this run is granted (#765): when non-empty a third, *service*
+        sandbox holding their values is provisioned beside the pair; empty
+        (every run today) provisions exactly what it always did.
+
+        A ``workload`` run (#755) works in its own per-run data directory
+        — whatever workspace the config names belongs to code runs — on
+        the agent sandbox alone: no github sandbox, no clone, and the
+        toolchain set is the config's answer, never a detection over a
+        directory that starts empty. Its ``workspace`` is passed only by a
+        resume, pinning the same data directory.
+        """
         if workspace is not None:
             # An explicit workspace is authoritative: it is either the
             # resume pin from the runs table (which must be reused in place
@@ -593,15 +790,23 @@ class Provisioner:
             # embedder's deliberate choice. Isolation applies only to
             # config-sourced workspaces on fresh runs.
             workspace = workspace.resolve()
+            if expects_mount is None:
+                expects_mount = True
+        elif kind == "workload":
+            workspace = self._data_dir(run_id)
+            if expects_mount is None:
+                expects_mount = False
         else:
-            workspace = self._resolve_workspace(run_id, repo)
+            workspace, resolved_expects = self._resolve_workspace_source(run_id, repo)
+            if expects_mount is None:
+                expects_mount = resolved_expects
         workspace.mkdir(parents=True, exist_ok=True)
         # Resolved here, after the workspace exists and before any microVM
         # does: the agent sandbox's egress allowlist is fixed at creation,
         # so "which toolchains" has to be known before the spec is built —
         # and it is decided exactly once, so the install and the lint
         # cannot disagree with the allowlist.
-        languages = self.resolve_languages(workspace)
+        languages = self.resolve_languages(workspace if kind == "code" else None)
         self.bus.emit(
             "sandbox.languages",
             run_id,
@@ -622,7 +827,21 @@ class Provisioner:
                 source=version.source,
                 constraint=version.constraint,
             )
-        return self._provision_pair(run_id, workspace, repo, languages=languages)
+        return self._provision_pair(
+            run_id,
+            workspace,
+            repo,
+            languages=languages,
+            expects_mount=expects_mount,
+            credentials=credentials,
+            kind=kind,
+        )
+
+    def _data_dir(self, run_id: str) -> Path:
+        """Where a ``workload`` run works (#755): the same per-run directory
+        an unconfigured code run gets, which is harvested — not mounted as
+        the work — when the run ends."""
+        return (self.config.state_dir / "runs" / run_id / "workspace").resolve()
 
     def _run_repo(self, repo: str | None) -> str | None:
         """The ``owner/name`` this run acts on, or None when there is none."""
@@ -634,10 +853,21 @@ class Provisioner:
         return self.config.github.repo
 
     def _resolve_workspace(self, run_id: str, repo: str | None = None) -> Path:
-        """Where this fresh run works: the per-run dir, *this repo's*
-        configured workspace, or — when that workspace is a git checkout — a
-        per-run clone of it, so runs never disturb the checkout's branch
-        setup.
+        """Where this fresh run works (see :meth:`_resolve_workspace_source`)."""
+        return self._resolve_workspace_source(run_id, repo)[0]
+
+    def _resolve_workspace_source(self, run_id: str, repo: str | None = None) -> tuple[Path, bool]:
+        """Where this fresh run works, and whether that tree is *the work*.
+
+        The path is the per-run dir, *this repo's* configured workspace, or —
+        when that workspace is a git checkout — a per-run clone of it, so
+        runs never disturb the checkout's branch setup. The flag is False
+        only for the bare per-run dir nothing was configured for: the agent
+        starts from nothing and the run's output is harvested as artifacts.
+        Everywhere else the tree carries the repository the ask is about,
+        and the agent sandbox must see it — a mount that cannot be found is
+        then a provisioning failure, not a quiet fall back to an empty
+        directory (#670).
 
         The clone source is resolved per repository
         (:meth:`Config.workspace_for_repo`), never from a daemon-wide path:
@@ -645,7 +875,7 @@ class Provisioner:
         would otherwise build every repo's runs from whichever repository
         that checkout happens to be (#526).
         """
-        clone_dir = (self.config.state_dir / "runs" / run_id / "workspace").resolve()
+        clone_dir = self._data_dir(run_id)
         mode = self.config.sandbox.workspace_isolation
         run_repo = self._run_repo(repo)
         source = self.config.workspace_for_repo(run_repo)
@@ -657,30 +887,30 @@ class Provisioner:
                 # A workspace is configured somewhere, but none of it belongs
                 # to this repository. Its tree must come from its own remote
                 # or not at all — never from another repo's checkout.
-                return self._clone_repo_remote(run_id, run_repo, clone_dir)
+                return self._clone_repo_remote(run_id, run_repo, clone_dir), True
             if mode == "clone":
                 raise ProvisionError(
                     "workspace_isolation = 'clone' requires [sandbox] workspace "
                     "to point at a git checkout"
                 )
-            return clone_dir
+            return clone_dir, False
         source = source.resolve()
         self._assert_origin_matches(source, run_repo)
         if mode == "in-place" or source == clone_dir:
-            return source
+            return source, True
         git = hostgit.find_git()
         if git is None:
             if mode == "clone":
                 raise ProvisionError("workspace_isolation = 'clone' but no git binary is on PATH")
             log.debug("workspace.in_place", path=str(source), reason="no git binary on PATH")
-            return source
+            return source, True
         root = hostgit.repo_toplevel(source)
         if root is None:
             if mode == "clone":
                 raise ProvisionError(
                     f"workspace_isolation = 'clone' but {source} is not a git repository"
                 )
-            return source
+            return source, True
         if root != source:
             raise ProvisionError(
                 f"workspace {source} is inside a git checkout (root {root}) but is "
@@ -709,7 +939,7 @@ class Provisioner:
                 "workspace_isolation = 'clone' to run from HEAD anyway, or "
                 "'in-place' to run directly in the checkout"
             )
-        return self._clone_workspace(run_id, source, clone_dir, dirty=dirty)
+        return self._clone_workspace(run_id, source, clone_dir, dirty=dirty, repo=run_repo), True
 
     def _assert_origin_matches(self, source: Path, repo: str | None) -> None:
         """Refuse a source checkout whose ``origin`` names another repository.
@@ -755,10 +985,14 @@ class Provisioner:
         """Clone the run's repository from its remote into the run dir.
 
         The explicit no-workspace path: this repository has no host checkout,
-        so its tree comes from its own remote. Only credential-free (public)
-        remotes can succeed — the host holds no git credential by design
-        (#46) — and a failure is raised with that reason rather than falling
-        back to another repository's tree or to an empty directory.
+        so its tree comes from its own remote. The clone authenticates with
+        the run's own GitHub credential — the PAT or App installation token
+        the github sandbox delivers with — through a one-shot helper that
+        lives only in the clone's environment (#683); the host still holds
+        no git credential of its own (#46). With no credential configured
+        at all only a public remote can succeed. A failure is raised with
+        that reason rather than falling back to another repository's tree
+        or to an empty directory.
         """
         if (clone_dir / ".git").exists():
             self.bus.emit(
@@ -782,6 +1016,7 @@ class Provisioner:
         continue_branch = self.config.sandbox.continue_branch
         branch = continue_branch or self._branch_name(run_id, repo)
         clone_filter = self.config.sandbox.clone_filter
+        token = self._clone_token(repo)
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
         try:
             sha = hostgit.clone_from_remote(
@@ -790,23 +1025,183 @@ class Provisioner:
                 branch,
                 existing=bool(continue_branch),
                 clone_filter=clone_filter,
+                token=token,
             )
         except ProvisionError as exc:
             if continue_branch and self.config.sandbox.continue_branch_optional:
                 # The offered branch is not on the remote any more: start
                 # fresh rather than fail the run (#600).
                 branch = self._fresh_after_missing_continue(run_id, continue_branch, exc, clone_dir)
-                sha = hostgit.clone_from_remote(url, clone_dir, branch, clone_filter=clone_filter)
-                self._emit_clone(run_id, url, clone_dir, sha, branch)
+                sha = hostgit.clone_from_remote(
+                    url, clone_dir, branch, clone_filter=clone_filter, token=token
+                )
+                self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
+                self._populate_submodules(run_id, clone_dir, source=None, token=lambda: token)
+                self._populate_lfs(run_id, clone_dir, source=None, repo=repo, token=lambda: token)
+                self._fetch_tags(run_id, clone_dir, source=None, token=lambda: token)
                 return clone_dir
+            if token:
+                why = (
+                    "The clone authenticated with the run's GitHub credential; check "
+                    "that it has contents:read on this repository"
+                )
+            else:
+                why = (
+                    "No GitHub credential is configured on the host, so only a public "
+                    "repository can be cloned this way; export GH_TOKEN or configure a "
+                    "GitHub App"
+                )
             raise ProvisionError(
                 f"no workspace is configured for {repo}, and cloning it from "
-                f"{url} failed: {exc}. The host holds no git credential, so this "
-                "path only works for a public repository; configure a workspace "
-                "for this repository in its [[github.repos]] entry (see #46)"
+                f"{url} failed: {exc}. {why}, or configure a workspace for this "
+                "repository in its [[github.repos]] entry"
             ) from exc
-        self._emit_clone(run_id, url, clone_dir, sha, branch)
+        self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
+        self._populate_submodules(run_id, clone_dir, source=None, token=lambda: token)
+        self._populate_lfs(run_id, clone_dir, source=None, repo=repo, token=lambda: token)
+        self._fetch_tags(run_id, clone_dir, source=None, token=lambda: token)
         return clone_dir
+
+    def _fetch_tags(
+        self,
+        run_id: str,
+        clone_dir: Path,
+        *,
+        source: Path | None,
+        token: Callable[[], str | None],
+    ) -> None:
+        """Give a fresh ``--no-tags`` clone the repository's tags when its
+        build derives the version from them (#694), and say why. ``auto``
+        asks the workspace's manifests; ``always`` and ``never`` do not.
+        Never for a reused clone. ``token`` is asked for only when the
+        host checkout cannot supply the tags."""
+        mode = self.config.sandbox.fetch_tags
+        if mode == "never":
+            return
+        markers = toolchains.tag_version_markers(clone_dir)
+        if mode == "auto" and not markers:
+            return
+        source_tags = source is not None and hostgit.tag_count(source) > 0
+        fetched = hostgit.fetch_tags(
+            clone_dir, source=source, token=None if source_tags else token()
+        )
+        evidence = [f"{m.path}: {m.marker}" for m in markers]
+        self.bus.emit(
+            "sandbox.workspace_tags",
+            run_id,
+            target=str(clone_dir),
+            mode=mode,
+            markers=evidence,
+            tags=fetched.tags,
+            source=fetched.source,
+            message=(
+                f"fetched {fetched.tags} tag(s) from the "
+                f"{'host checkout' if fetched.source == 'local' else 'remote'}"
+                + (f" — {', '.join(evidence[:3])}" if evidence else " — fetch_tags = always")
+            ),
+        )
+
+    def _populate_lfs(
+        self,
+        run_id: str,
+        clone_dir: Path,
+        *,
+        source: Path | None,
+        repo: str | None,
+        token: Callable[[], str | None],
+    ) -> None:
+        """Populate a fresh clone's Git LFS objects (#693) when its
+        ``.gitattributes`` route files through LFS, and say where they came
+        from. Never for a reused clone. ``token`` is asked for only when
+        something has to be fetched from the repository's LFS endpoint —
+        the endpoint being the run's repository on the configured GitHub;
+        a workspace-only run with no repository can only populate from the
+        host checkout's store."""
+        attributes = toolchains.lfs_attribute_files(clone_dir)
+        if not attributes:
+            return
+        if not self.config.sandbox.clone_lfs:
+            log.info(
+                "workspace.lfs_skipped",
+                run=run_id,
+                target=str(clone_dir),
+                attributes=list(attributes),
+                reason="[sandbox] clone_lfs = false; LFS-tracked files are pointer files",
+            )
+            return
+        lfs_url = (
+            hostgit.lfs_endpoint(f"{self.config.github.web_url}/{repo}")
+            if repo is not None
+            else None
+        )
+        population = hostgit.populate_lfs(
+            clone_dir,
+            source=source,
+            lfs_url=lfs_url,
+            token=token() if lfs_url is not None else None,
+        )
+        self.bus.emit(
+            "sandbox.workspace_lfs",
+            run_id,
+            target=str(clone_dir),
+            attributes=list(attributes),
+            files=population.files,
+            linked=population.linked,
+            fetched=population.fetched,
+            message=(
+                f"populated Git LFS: {population.files} tracked file(s), "
+                f"{population.linked} object(s) from the host checkout, "
+                f"{population.fetched} fetched" + (f" from {lfs_url}" if population.fetched else "")
+            ),
+        )
+
+    def _populate_submodules(
+        self,
+        run_id: str,
+        clone_dir: Path,
+        *,
+        source: Path | None,
+        token: Callable[[], str | None],
+    ) -> None:
+        """Check out a fresh clone's submodules (#692) and say which came
+        from where. Never called for a reused clone: the agent may have
+        moved a submodule, and ``submodule update`` would move it back.
+        ``token`` is asked for only when there is a submodule to populate —
+        in App mode it mints an installation token."""
+        if not hostgit.list_submodules(clone_dir):
+            return
+        if not self.config.sandbox.clone_submodules:
+            log.info(
+                "workspace.submodules_skipped",
+                run=run_id,
+                target=str(clone_dir),
+                reason="[sandbox] clone_submodules = false",
+            )
+            return
+        populated = hostgit.populate_submodules(clone_dir, source=source, token=token())
+        if not populated:
+            return
+        self.bus.emit(
+            "sandbox.workspace_submodules",
+            run_id,
+            target=str(clone_dir),
+            submodules=[{"path": path, "source": how} for path, how in populated],
+            message="populated submodules: "
+            + ", ".join(f"{path} ({how})" for path, how in populated),
+        )
+
+    def _clone_token(self, repo: str) -> str | None:
+        """The token the remote clone authenticates with, or ``None`` when
+        the host has no GitHub credential configured at all (a public
+        remote still clones). A *misconfigured* credential — a per-repo
+        ``token_env`` that is unset, both a PAT and App credentials — is
+        raised here exactly as it would be for the github sandbox, so the
+        run fails naming the fix instead of at the remote."""
+        entry = self.config.github.effective_repo(repo)
+        status = gh_credential_status(self.env, token_env=entry.token_env if entry else None)
+        if status.mode == "none":
+            return None
+        return self.gh_token(repo)
 
     def _fresh_after_missing_continue(
         self, run_id: str, branch: str, exc: Exception, clone_dir: Path
@@ -825,7 +1220,17 @@ class Provisioner:
             shutil.rmtree(clone_dir, ignore_errors=True)
         return self._branch_name(run_id)
 
-    def _emit_clone(self, run_id: str, source: str, clone_dir: Path, sha: str, branch: str) -> None:
+    def _emit_clone(
+        self,
+        run_id: str,
+        source: str,
+        clone_dir: Path,
+        sha: str,
+        branch: str,
+        *,
+        authenticated: bool,
+    ) -> None:
+        how = "with the run's GitHub credential" if authenticated else "unauthenticated"
         self.bus.emit(
             "sandbox.workspace_clone",
             run_id,
@@ -835,13 +1240,16 @@ class Provisioner:
             branch=branch,
             dirty=False,
             reused=False,
-            message=f"cloned {source} at {sha[:12]} onto branch {branch}",
+            authenticated=authenticated,
+            message=f"cloned {source} at {sha[:12]} onto branch {branch} ({how})",
         )
 
     def _branch_name(self, run_id: str, repo: str | None = None) -> str:
         return branch_name(run_id, self.config.github.branch_prefix_for(repo))
 
-    def _clone_workspace(self, run_id: str, source: Path, clone_dir: Path, *, dirty: bool) -> Path:
+    def _clone_workspace(
+        self, run_id: str, source: Path, clone_dir: Path, *, dirty: bool, repo: str | None = None
+    ) -> Path:
         branch = self._branch_name(run_id)
         if (clone_dir / ".git").exists():
             # A run that crashed after cloning but before the workspace pin
@@ -898,6 +1306,29 @@ class Provisioner:
             reused=False,
             message=message,
         )
+        # The host checkout's own submodules are the first source; one it
+        # lacks comes from its remote under the run's token (None when the
+        # host holds no credential, or has no repository configured at all:
+        # a public submodule still clones).
+        self._populate_submodules(
+            run_id,
+            clone_dir,
+            source=source,
+            token=lambda: self._clone_token(repo) if repo is not None else None,
+        )
+        self._populate_lfs(
+            run_id,
+            clone_dir,
+            source=source,
+            repo=repo,
+            token=lambda: self._clone_token(repo) if repo is not None else None,
+        )
+        self._fetch_tags(
+            run_id,
+            clone_dir,
+            source=source,
+            token=lambda: self._clone_token(repo) if repo is not None else None,
+        )
         return clone_dir
 
     def _provision_pair(
@@ -907,11 +1338,27 @@ class Provisioner:
         repo: str | None = None,
         *,
         languages: toolchains.LanguageResolution | None = None,
+        expects_mount: bool = True,
+        credentials: Sequence[str] = (),
+        kind: RunKind = "code",
     ) -> SandboxPair:
         # The github sandbox (and its token requirement) exists only when the
         # GitHub integration is configured; without [github].repo a run has
-        # no GitHub capability at all — and one less microVM to boot.
-        github_enabled = self.config.github.enabled
+        # no GitHub capability at all — and one less microVM to boot. The
+        # service sandbox (#765) likewise exists only for a run granted a
+        # credential. A workload (#755) gets the github sandbox only under
+        # a profile whose sinks write to GitHub (#759) — an issue is filed
+        # through that box like every other GitHub write — and never
+        # otherwise, configured or not.
+        github_enabled = self.config.github.enabled and (
+            kind == "code" or self._workload_needs_github()
+        )
+        creds = self.config.credentials_named(credentials)
+        # ... or, since #766, for a repository whose registries carry a
+        # credential: the box fetches the dependencies the agent sandbox
+        # then builds from offline.
+        regs = self.config.credentialed_registries_for(repo)
+        service_enabled = bool(creds or regs)
 
         # Fail fast on missing credentials before creating any microVM. In
         # App mode this mints the first installation token here.
@@ -919,17 +1366,35 @@ class Provisioner:
         tokens: dict[SandboxRole, str] = {"agent": self.agent_token()}
         if gh_cred is not None:
             tokens["github"] = gh_cred.token()
+        if service_enabled:
+            self.service_secret_env(creds, repo)
+            # The service sandbox has no token of its own: its credentials
+            # are the spec's secret_env, delivered whole.
+            tokens["service"] = ""
         # Decided once, before the parallel threads: a probe verdict recorded
         # by one thread must not flip the other thread's delivery mid-flight.
         env_file_reasons: dict[SandboxRole, EnvFileReason | None] = {
             "agent": self._env_file_reason("agent", None),
             "github": self._env_file_reason("github", gh_cred),
+            "service": self._env_file_reason("service", None),
         }
 
         agent_spec, github_spec = self.build_specs(
             run_id, workspace, repo, languages=languages.languages if languages else None
         )
-        specs = (agent_spec, github_spec) if github_enabled else (agent_spec,)
+        specs: tuple[SandboxSpec, ...] = (agent_spec,)
+        if github_enabled:
+            specs += (github_spec,)
+        if service_enabled:
+            specs += (
+                self.service_spec(
+                    run_id,
+                    workspace,
+                    creds,
+                    repo,
+                    versions=languages.versions if languages else None,
+                ),
+            )
         created: list[Sandbox] = []
         registered_secret_rms: list[Callable[[], bool]] = []
         # Guards the two rollback lists: the sandboxes provision on parallel
@@ -974,6 +1439,7 @@ class Provisioner:
                 # (it folds persistent_env in itself), so it must have the
                 # last word.
                 self._verify_secret_env(run_id, spec, sandbox, tokens[spec.role])
+            self._apply_files(spec, sandbox)
             sandbox.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR, TOOLS_DIR)
             if self.post_create is not None:
                 self.post_create(sandbox, spec.role)
@@ -992,8 +1458,8 @@ class Provisioner:
             if len(specs) == 1:
                 sandboxes[specs[0].role] = provision_one(specs[0])
             else:
-                # The pair shares nothing but the host workspace dir, so the
-                # two microVMs boot and configure concurrently (#127). Every
+                # The sandboxes share nothing but the host workspace dir, so
+                # the microVMs boot and configure concurrently (#127). Every
                 # future is drained before any failure propagates: rollback
                 # must never race a thread still mid-provision.
                 with ThreadPoolExecutor(
@@ -1019,20 +1485,43 @@ class Provisioner:
                             errors.append(exc)
                     if errors:
                         raise errors[0]
-            agent_workdir = self._discover_mount(run_id, sandboxes["agent"], workspace)
+            agent_workdir, why = self._discover_mount(
+                run_id, sandboxes["agent"], workspace, expects_mount=expects_mount or bool(regs)
+            )
             mounted = agent_workdir is not None
             if agent_workdir is None:
+                if expects_mount or regs:
+                    # The tree the ask is about is on the host and the agent
+                    # cannot see it. Falling back to an empty directory here
+                    # is how a run "succeeds" by planning a greenfield
+                    # project and delivering files unrelated to the repo —
+                    # and, with credentialed registries, how the service
+                    # sandbox would fetch into a tree the agent never sees.
+                    raise ProvisionError(
+                        f"workspace {workspace} was not visible inside the agent "
+                        f"sandbox {sandboxes['agent'].name}: {why}. Check the "
+                        "sandbox row of `sbxloop doctor` (workspace-mount probe) "
+                        "and the sbx version; the run does not continue on an "
+                        "empty directory"
+                    )
                 agent_workdir = WORK_DIR
                 sandboxes["agent"].mkdirs(agent_workdir)
+            service_workdir: str | None = None
+            if regs:
+                service_workdir = self._share_deps_cache(
+                    run_id, workspace, sandboxes["agent"], agent_workdir, sandboxes["service"]
+                )
             return SandboxPair(
                 run_id,
                 agent=sandboxes["agent"],
                 github=sandboxes.get("github"),
+                service=sandboxes.get("service"),
                 keep=self.config.keep_sandboxes,
                 workspace=workspace,
                 agent_workdir=agent_workdir,
                 mounted=mounted,
                 languages=languages,
+                service_workdir=service_workdir,
             )
         except Exception as exc:
             log.warning(
@@ -1067,6 +1556,192 @@ class Provisioner:
                 raise
             raise ProvisionError(f"provisioning run {run_id} failed: {exc}") from exc
 
+    def _workload_needs_github(self) -> bool:
+        """Whether a workload run gets the github sandbox: its pinned
+        profile (#758) names a sink that writes to GitHub (#759)."""
+        profile = self.config.workload_profile()
+        return profile is not None and profile.needs_github
+
+    # -- a workload's repository checkout (#758) ---------------------------
+
+    def clone_repo_into_data_dir(self, run_id: str, workspace: Path, repo: str) -> Path:
+        """A plain checkout of ``repo`` for a workload whose plan asked for
+        one, cut into its data directory at ``<workspace>/<name>`` — the
+        agent reads it there (the data directory is what the agent box
+        sees). Single-branch from the remote under the host's GitHub
+        credential; no submodules, LFS or tags, and nothing to deliver:
+        publishing to a repository is the pr sink's (#759). An existing
+        checkout (a resume) is reused as it stands.
+        """
+        clone_dir = workspace / repo.split("/", 1)[1]
+        if (clone_dir / ".git").exists():
+            self.bus.emit(
+                "sandbox.workspace_clone",
+                run_id,
+                source=repo,
+                target=str(clone_dir),
+                commit=hostgit.head_commit(clone_dir),
+                branch=self._branch_name(run_id, repo),
+                dirty=False,
+                reused=True,
+                message=f"reusing the checkout of {repo} at {clone_dir}",
+            )
+            return clone_dir
+        if hostgit.find_git() is None:
+            raise ProvisionError(f"no git binary is on PATH to clone {repo} for the workload")
+        url = f"{self.config.github.web_url}/{repo}"
+        branch = self._branch_name(run_id, repo)
+        token = self._clone_token(repo)
+        try:
+            sha = hostgit.clone_from_remote(
+                url, clone_dir, branch, clone_filter=self.config.sandbox.clone_filter, token=token
+            )
+        except ProvisionError as exc:
+            why = (
+                "check that the host's GitHub credential has contents:read on it"
+                if token
+                else "no GitHub credential is configured on the host, so only a public "
+                "repository can be cloned; export GH_TOKEN or configure a GitHub App"
+            )
+            raise ProvisionError(
+                f"cloning {repo} from {url} into the workload's data directory failed: {exc}. {why}"
+            ) from exc
+        self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
+        return clone_dir
+
+    # -- the service sandbox (#765) ----------------------------------------
+
+    def service_spec(
+        self,
+        run_id: str,
+        workspace: Path,
+        credentials: Sequence[CredentialConfig],
+        repo: str | None = None,
+        *,
+        versions: Mapping[str, toolchains.ToolchainVersion] | None = None,
+    ) -> SandboxSpec:
+        """The run's service sandbox: the github sandbox's pattern
+        generalized to the operator's ``[[credentials]]`` (#765) and, for
+        ``repo``, its credentialed ``[[registries]]`` (#766). No proxy
+        secrets, no agent; an allowlist of the credentials' and registries'
+        hosts (plus the fetch baseline when there are registries); the
+        catalogue and the registries' plain environment ride the
+        persistent env, the values ride the non-proxy road (per-job stdin,
+        or the 0600 env file) exactly as GH_TOKEN does, and the registries'
+        client files land in this sandbox's ``$HOME``."""
+        regs = self.config.credentialed_registries_for(repo)
+        return SandboxSpec(
+            name=sandbox_name(run_id, "service"),
+            role="service",
+            workspace=workspace,
+            template=self.config.sandbox.template,
+            policy_allows=service_policy_allows(
+                credentials, regs, registries.languages(regs), self.config.policy.deny
+            ),
+            persistent_env=self.service_persistent_env(credentials, repo),
+            secret_env=self.service_secret_env(credentials, repo),
+            files=self.registry_files(repo),
+        )
+
+    def service_persistent_env(
+        self, credentials: Sequence[CredentialConfig], repo: str | None = None
+    ) -> dict[str, str]:
+        """The catalogue the service worker resolves a job's credential name
+        against (JSON, non-secret, one env variable) and, for the
+        credentialed registries, the client environment and the fetch
+        environment — each package manager pointed at its cache."""
+        regs = self.config.credentialed_registries_for(repo)
+        env: dict[str, str] = {**registries.plain_env(regs), **registries.fetch_env(regs)}
+        if credentials:
+            env[CATALOGUE_ENV] = json.dumps([cred.catalogue_entry() for cred in credentials])
+        return env
+
+    def service_secret_env(
+        self, credentials: Sequence[CredentialConfig], repo: str | None = None
+    ) -> dict[str, str]:
+        """The credentials' values and the registries' credential
+        environment, read from the daemon's environment.
+
+        Every granted credential must be set: the run was granted it
+        because its work needs it, and a run without it would fail later,
+        inside the sandbox, for a reason no log line names. Raises
+        ProvisionError listing the unset variables — before any microVM
+        boots, when called from provisioning."""
+        missing = [cred.env for cred in credentials if not self.env.get(cred.env)]
+        if missing:
+            raise ProvisionError(
+                f"[[credentials]] env names {missing} are not set in the daemon's "
+                "environment (secrets.env / the service unit); set them or do not "
+                "grant those credentials"
+            )
+        return {
+            **{cred.env: self.env[cred.env] for cred in credentials},
+            **self.registry_secret_env(repo),
+        }
+
+    def ensure_service(
+        self,
+        run_id: str,
+        workspace: Path,
+        credentials: Sequence[str],
+        repo: str | None = None,
+        *,
+        post_create: PostCreate | None = None,
+    ) -> Sandbox:
+        """Provision a run's service sandbox on its own — for a grant made
+        after the pair exists (a plan that asks for a credential mid-run).
+        Same discipline as :meth:`ensure_pair`'s third sandbox: values
+        checked before any microVM, rollback on failure."""
+        creds = self.config.credentials_named(credentials)
+        spec = self.service_spec(run_id, workspace.resolve(), creds, repo)
+        return self._ensure_single(
+            spec, "", reason="service", post_create=post_create, run_id=run_id
+        )
+
+    def _share_deps_cache(
+        self,
+        run_id: str,
+        workspace: Path,
+        agent: Sandbox,
+        agent_workdir: str,
+        service: Sandbox,
+    ) -> str:
+        """Make the dependency cache one directory in both sandboxes (#766).
+
+        The service sandbox's mount is discovered like the agent's; a run
+        with credentialed registries whose workspace the service sandbox
+        cannot see fails closed here, naming the probe — a fetch into a
+        tree the agent never sees is not a fallback. Then each sandbox
+        gets the fixed link :data:`registries.DEPS_HOME` → the cache inside
+        its own view of the workspace, so the environment written before
+        the mount was known (``GOMODCACHE``, ``PIP_FIND_LINKS``, …) points
+        at the right place in both. The cache is excluded from the host
+        checkout's git so the agent never commits it. Returns the service
+        sandbox's in-VM workspace path.
+        """
+        service_workdir, why = self._discover_mount(run_id, service, workspace, expects_mount=True)
+        if service_workdir is None:
+            raise ProvisionError(
+                f"workspace {workspace} was not visible inside the service sandbox "
+                f"{service.name}: {why}. The run's [[registries]] carry a credential, "
+                "so its dependencies are fetched there and built here — both sandboxes "
+                "must see the workspace. Check the sandbox row of `sbxloop doctor` "
+                "(workspace-mount probe) and the sbx version"
+            )
+        for sandbox, workdir in ((agent, agent_workdir), (service, service_workdir)):
+            cache = f"{workdir.rstrip('/')}/{registries.DEPS_WORKSPACE_DIR}"
+            sandbox.mkdirs(cache, registries.DEPS_HOME.rsplit("/", 1)[0])
+            sandbox.exec(["ln", "-sfn", cache, registries.DEPS_HOME])
+        exclude_from_git(workspace, registries.DEPS_WORKSPACE_DIR.split("/", 1)[0] + "/")
+        self.bus.emit(
+            "sandbox.deps_cache",
+            run_id,
+            name=service.name,
+            workdir=service_workdir,
+            cache=registries.DEPS_WORKSPACE_DIR,
+        )
+        return service_workdir
+
     def github_only_spec(self, name: str, workspace: Path, repo: str | None = None) -> SandboxSpec:
         """A github-role spec that is not tied to a run — the daemon's
         long-lived polling/ops sandbox. Mirrors the pair's github spec."""
@@ -1092,6 +1767,7 @@ class Provisioner:
             policy_allows=agent_policy_allows(self.config, self.config.sandbox.effective_languages),
             secrets=[self._agent_secret_spec()],
             persistent_env=self.agent_persistent_env(),
+            files=self.agent_files(),
         )
 
     def ensure_github_only(
@@ -1177,6 +1853,7 @@ class Provisioner:
                 registered_secret_rms.extend(self._apply_secrets(spec, created, token))
                 self._apply_persistent_env(spec, created)
                 self._verify_secret_env(label, spec, created, token)
+            self._apply_files(spec, created)
             created.mkdirs(JOBS_DIR, RESULTS_DIR, EVENTS_DIR, TOOLS_DIR)
             hook = post_create or self.post_create
             if hook is not None:
@@ -1269,6 +1946,10 @@ class Provisioner:
     ) -> EnvFileReason | None:
         """Why ``role``'s credentials go to the in-VM env file (``None`` →
         try the sbx secret proxy)."""
+        if role == "service":
+            # Operator credentials for arbitrary hosts: the proxy has no
+            # service for them, and they are never an sbx argument (#765).
+            return "service"
         if self.config.secret_strategy == "plain-env":  # nosec B105 - strategy label
             return "strategy"
         if role == "github" and isinstance(gh_cred, GhApp):
@@ -1367,10 +2048,33 @@ class Provisioner:
         probe-driven downgrade emits — the semantic is identical, the
         decision just came from the conformance cache — but calmly (info
         log, ``cached=True``) rather than as a per-run warning. ``app``
-        announces the App identity once per sandbox.
+        announces the App identity once per sandbox. ``service`` says which
+        credentials (names only, never values) the service sandbox holds.
         """
         delivery = self._deliver_env(spec, sandbox, token)
         via_file = delivery == "env-file"
+        if spec.role == "service":
+            names = sorted(spec.secret_env)
+            road = (
+                "via the in-VM env file" if via_file else "per job over the worker launch's stdin"
+            )
+            message = f"service sandbox holds credentials {names}, delivered {road}"
+            log.info(
+                "sandbox.service_credentials",
+                run=run_id,
+                sandbox=spec.name,
+                envs=names,
+                delivery=delivery,
+            )
+            self.bus.emit(
+                "sandbox.service_credentials",
+                run_id,
+                name=spec.name,
+                envs=names,
+                delivery=delivery,
+                message=message,
+            )
+            return
         env_name = self.agent_token_env() if spec.role == "agent" else "GH_TOKEN"
         how = (
             "using the in-VM env file directly"
@@ -1647,14 +2351,19 @@ class Provisioner:
             message=message,
         )
 
-    def _discover_mount(self, run_id: str, sandbox: Sandbox, workspace: Path) -> str | None:
+    def _discover_mount(
+        self, run_id: str, sandbox: Sandbox, workspace: Path, *, expects_mount: bool = False
+    ) -> tuple[str | None, str]:
         """Find where sbx mounted the host workspace inside the agent VM.
 
         Writes a nonce marker file into the host workspace, then runs one
         bounded in-sandbox search for it over candidate roots. Returns the
-        in-VM directory containing the marker, or None when discovery fails
-        (→ harvest mode; non-fatal, mirroring _verify_secret_env's
-        probe-don't-assume pattern). The marker is always removed.
+        in-VM directory containing the marker and an empty reason, or None
+        and the reason discovery came up empty. The caller decides what
+        None means: harvest mode when nothing was configured (non-fatal,
+        mirroring _verify_secret_env's probe-don't-assume pattern), a
+        provisioning failure when ``expects_mount`` — the events emitted
+        here say which. The marker is always removed.
 
         A failed probe degrades the same way a clean "not mounted" answer
         does, but the two are kept distinguishable (#63): the
@@ -1668,7 +2377,8 @@ class Provisioner:
             (workspace / marker).write_text("")
         except OSError:
             log.warning("mount.marker_write_failed", run=run_id, workspace=str(workspace))
-            return None
+            return None, "the discovery marker could not be written into the workspace"
+        outcome = "the run stops" if expects_mount else "artifacts will be harvested"
         probe_error = ""
         try:
             command = mount_probe_command(workspace, marker)
@@ -1699,7 +2409,7 @@ class Provisioner:
                 probe="answered",
                 path=mount_dir,
             )
-            return mount_dir
+            return mount_dir, ""
         if probe_error:
             # No verdict recorded: an infra failure is not knowledge about
             # sbx mount semantics and must not clobber the cached answer.
@@ -1709,10 +2419,9 @@ class Provisioner:
                 name=sandbox.name,
                 mounted=False,
                 probe="error",
-                message=f"mount discovery probe failed ({probe_error}); "
-                "artifacts will be harvested",
+                message=f"mount discovery probe failed ({probe_error}); {outcome}",
             )
-            return None
+            return None, f"the mount discovery probe failed ({probe_error})"
         self._record_probe(
             PROBE_WORKSPACE_MOUNT,
             "not-found",
@@ -1724,9 +2433,20 @@ class Provisioner:
             name=sandbox.name,
             mounted=False,
             probe="answered",
-            message="workspace mount not found in VM; artifacts will be harvested",
+            message=f"workspace mount not found in VM; {outcome}",
         )
-        return None
+        return None, "mount discovery found no marker under any candidate root"
+
+    def _apply_files(self, spec: SandboxSpec, sandbox: Sandbox) -> None:
+        """Write the spec's registry client files (#680): staged in with
+        ``sbx cp`` (the contents never touch an argv) and made 0600, since
+        the netrc kinds hold a credential. Before the worker install and
+        any toolchain — a toolchain installer creates its own directory
+        beside these files and leaves them alone."""
+        for path, text in spec.files.items():
+            sandbox.exec(["mkdir", "-p", path.rsplit("/", 1)[0]])
+            sandbox.write_text(path, text)
+            sandbox.exec(["chmod", "600", path])
 
     def _apply_persistent_env(self, spec: SandboxSpec, sandbox: Sandbox) -> None:
         """Write the spec's non-secret environment into the VM's env file.
@@ -1734,7 +2454,9 @@ class Provisioner:
         Under ``plain-env`` the token writer already emitted these exports,
         so this is the ``proxy`` (default) strategy's path: the repository a
         github-ops sandbox is scoped to has to reach the worker, and the env
-        file is what the worker loads at startup. Nothing secret goes here.
+        file is what the worker loads at startup. Nothing secret goes here:
+        a spec's ``secret_env`` (the service sandbox's, #765) rides the
+        non-proxy road only (:meth:`_apply_env_file_only`).
         """
         if not spec.persistent_env or self.config.secret_strategy == "plain-env":  # nosec B105
             return
@@ -1757,12 +2479,13 @@ class Provisioner:
 
     def _apply_plain_env(self, spec: SandboxSpec, sandbox: Sandbox, token: str) -> None:
         """Weaker fallback: write tokens/env into ~/.sbxloop/env.sh in the VM."""
-        exports: dict[str, str] = dict(spec.persistent_env)
+        exports: dict[str, str] = {**spec.persistent_env, **spec.secret_env}
         if spec.role == "agent":
             exports[self.agent_token_env()] = token
-        else:
+        elif spec.role == "github":
             exports["GH_TOKEN"] = token
             exports["GITHUB_TOKEN"] = token
+        # The service sandbox has no token: its credentials are secret_env.
         self._write_env_file(sandbox, exports)
 
     def gh_refresher(self, sandbox: Sandbox, repo: str | None = None) -> Callable[[], None] | None:
@@ -1803,6 +2526,7 @@ class Provisioner:
         repo: str | None = None,
         *,
         sandbox: Sandbox | None = None,
+        credentials: Sequence[str] = (),
     ) -> Callable[[], dict[str, str]] | None:
         """A per-job env provider for stdin delivery, or ``None`` (#592).
 
@@ -1819,7 +2543,9 @@ class Provisioner:
 
         The provider computes exports fresh per job — ``cred.token()``
         re-mints an App installation token inside its refresh margin — so
-        rotating credentials need nothing rewritten anywhere.
+        rotating credentials need nothing rewritten anywhere. For the
+        service role ``credentials`` names the run's grant (#765): the
+        provider carries the catalogue and the values.
         """
         gh_cred = self.gh_credential(repo) if role == "github" else None
         if self._env_file_reason(role, gh_cred) is None:
@@ -1833,8 +2559,14 @@ class Provisioner:
             return None
         if role == "agent":
             return lambda: {
-                **self.agent_persistent_env(),
+                **self.agent_persistent_env(repo),
                 self.agent_token_env(): self.agent_token(),
+            }
+        if role == "service":
+            creds = self.config.credentials_named(credentials)
+            return lambda: {
+                **self.service_persistent_env(creds, repo),
+                **self.service_secret_env(creds, repo),
             }
         cred = gh_cred
         assert cred is not None

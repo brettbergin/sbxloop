@@ -47,6 +47,8 @@ from typing import Any, Literal
 
 import yaml
 
+from sbxloop import toolchains
+
 
 @dataclass(frozen=True)
 class LanguageRule:
@@ -82,6 +84,20 @@ LANGUAGE_RULES: dict[str, LanguageRule] = {
         remedy=(
             "use the project path `./vendor/bin/phpunit`: composer-installed "
             "binaries are not on PATH"
+        ),
+    ),
+    # The package-manager clients themselves (npm, npx, pnpm, yarn, bun,
+    # node) are the prefix, so they stay bare-legal; the dev binaries a
+    # project pins in devDependencies are what must not be (#684).
+    "javascript": LanguageRule(
+        commands=frozenset({"eslint", "jest", "vitest", "tsc", "prettier", "mocha"}),
+        remedy=(
+            "run it through the project's own dependencies: `npx --no-install "
+            "<bin>` or the package.json script via its runner (`npm run lint`, "
+            "`pnpm run lint`, `yarn run lint`, `bun run lint` — whichever "
+            "client the lockfile names). A bare binary resolves to a global "
+            "(the sandbox's global `tsc`, or nothing at all) instead of the "
+            "version the project pins"
         ),
     ),
 }
@@ -364,28 +380,55 @@ def _target_gate(
     return None
 
 
-def _make_gate(workspace: Path) -> str | None:
+# A rule is `name:` or `name::`; `name :=` / `name ::=` assign a variable
+# (make and just alike), and `check := 1` is not a gate (#687).
+_RULE_PATTERN = r"^{target}\s*:(?!:?=)"
+
+
+def _make_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     # GNU make's own search order.
     return _target_gate(
-        workspace, ("GNUmakefile", "makefile", "Makefile"), r"^{target}\s*:", "make {target}"
+        workspace, ("GNUmakefile", "makefile", "Makefile"), _RULE_PATTERN, "make {target}"
     )
 
 
-def _just_gate(workspace: Path) -> str | None:
+def _just_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     return _target_gate(
-        workspace, ("justfile", ".justfile", "Justfile"), r"^{target}\s*:", "just {target}"
+        workspace, ("justfile", ".justfile", "Justfile"), _RULE_PATTERN, "just {target}"
     )
 
 
-def _task_gate(workspace: Path) -> str | None:
-    # Taskfile targets are YAML keys under `tasks:`, so a two-space indent is
-    # the shape rather than a line start.
-    return _target_gate(
-        workspace, ("Taskfile.yml", "Taskfile.yaml"), r"^\s+{target}\s*:", "task {target}"
-    )
+def _task_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
+    # Taskfile targets are the keys of the `tasks:` mapping — parsed, not
+    # pattern-matched, so a `check:` under `includes:` (or `vars:`) is not
+    # taken for one (#687). The first file Task would read is the one read.
+    for name in ("Taskfile.yml", "Taskfile.yaml"):
+        text = _read(workspace / name)
+        if text is None:
+            continue
+        try:
+            data = yaml.safe_load(text)
+        except yaml.YAMLError:
+            return None
+        tasks = data.get("tasks") if isinstance(data, dict) else None
+        if not isinstance(tasks, dict):
+            return None
+        for target in GATE_TARGETS:
+            if target in tasks:
+                return f"task {target}"
+        return None
+    return None
 
 
-def _rake_gate(workspace: Path) -> str | None:
+def _rake_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     # `task :ci do`, `task ci: [...]`, `task "check" => ...`, `task default:`.
     return _target_gate(
         workspace,
@@ -412,44 +455,75 @@ def _json_object(path: Path, key: str) -> dict[str, Any] | None:
 # first: corepack's `packageManager` declaration, then the lockfile. `npm
 # run` in a pnpm workspace fails outright on `workspace:` dependencies, so
 # it would be a gate the executor cannot satisfy.
+# The client each lockfile names, and the explicit `<client> run` form for
+# each: `yarn run lint` rather than `yarn lint`, so the script name can never
+# collide with a yarn subcommand (#684). pnpm and yarn ride on the corepack
+# shims the `javascript` toolchain enables; bun is its own toolchain entry
+# (`bun` in the resolved language set), which is why the runner takes the
+# set — a `bun run` on a sandbox that has no bun is not a runnable gate.
 _LOCKFILE_CLIENTS: tuple[tuple[str, str], ...] = (
-    ("pnpm-lock.yaml", "pnpm run"),
+    ("pnpm-lock.yaml", "pnpm"),
     ("yarn.lock", "yarn"),
-    ("bun.lockb", "bun run"),
-    ("bun.lock", "bun run"),
+    ("bun.lockb", "bun"),
+    ("bun.lock", "bun"),
 )
-_PACKAGE_MANAGER_CLIENTS = {"pnpm": "pnpm run", "yarn": "yarn", "bun": "bun run", "npm": "npm run"}
+_PACKAGE_MANAGER_CLIENTS = frozenset({"pnpm", "yarn", "bun", "npm"})
 
 
-def node_script_runner(workspace: Path) -> str:
-    """How to run a script declared in ``workspace``'s package.json."""
-    text = _read(workspace / "package.json")
-    if text is not None:
-        try:
-            declared = json.loads(text).get("packageManager")
-        except (ValueError, AttributeError):
-            declared = None
-        if isinstance(declared, str):
-            name = declared.split("@", 1)[0].strip()
-            if name in _PACKAGE_MANAGER_CLIENTS:
-                return _PACKAGE_MANAGER_CLIENTS[name]
-    for lockfile, client in _LOCKFILE_CLIENTS:
-        if (workspace / lockfile).is_file():
-            return client
-    return "npm run"
+def _node_package_client(workspace: Path, top: Path | None = None) -> str:
+    """The package-manager client the workspace names: the ``packageManager``
+    pin first (it is what corepack honours), then the lockfile — read at the
+    package, then at ``top`` when the package is one of a monorepo's, since
+    a workspace pins its client and keeps its lockfile once, at the root."""
+    for directory in (workspace, top) if top is not None and top != workspace else (workspace,):
+        text = _read(directory / "package.json")
+        if text is not None:
+            try:
+                declared = json.loads(text).get("packageManager")
+            except (ValueError, AttributeError):
+                declared = None
+            if isinstance(declared, str):
+                name = declared.split("@", 1)[0].strip()
+                if name in _PACKAGE_MANAGER_CLIENTS:
+                    return name
+        for lockfile, client in _LOCKFILE_CLIENTS:
+            if (directory / lockfile).is_file():
+                return client
+    return "npm"
 
 
-def _npm_gate(workspace: Path) -> str | None:
+def node_script_runner(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str:
+    """How to run a script declared in ``workspace``'s package.json.
+
+    ``languages`` is the run's resolved toolchain set; a workspace naming
+    bun on a sandbox whose set lacks it (an explicit ``languages`` that left
+    it out) falls back to ``npm run``, the one client every Node sandbox
+    has. None consults nothing but the workspace. ``top`` is the monorepo
+    root when ``workspace`` is a package below it (#687).
+    """
+    client = _node_package_client(workspace, top)
+    if client == "bun" and languages is not None and "bun" not in languages:
+        client = "npm"
+    return f"{client} run"
+
+
+def _npm_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     scripts = _json_object(workspace / "package.json", "scripts")
     if scripts is None:
         return None
     for target in GATE_TARGETS:
         if target in scripts:
-            return f"{node_script_runner(workspace)} {target}"
+            return f"{node_script_runner(workspace, languages, top)} {target}"
     return None
 
 
-def _composer_gate(workspace: Path) -> str | None:
+def _composer_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     scripts = _json_object(workspace / "composer.json", "scripts")
     if scripts is None:
         return None
@@ -459,17 +533,23 @@ def _composer_gate(workspace: Path) -> str | None:
     return None
 
 
-def _tox_gate(workspace: Path) -> str | None:
+def _tox_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     # tox and nox declare the whole matrix in one file; running the bare
     # command IS the gate, so presence is the whole signal.
     return "tox" if (workspace / "tox.ini").is_file() else None
 
 
-def _nox_gate(workspace: Path) -> str | None:
+def _nox_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     return "nox" if (workspace / "noxfile.py").is_file() else None
 
 
-def _gradle_gate(workspace: Path) -> str | None:
+def _gradle_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     # `check` is Gradle's built-in lifecycle gate; the wrapper script is the
     # declaration of how to run it (and the only Gradle the sandbox has —
     # the java toolchain ships Maven, not Gradle).
@@ -480,7 +560,9 @@ def _gradle_gate(workspace: Path) -> str | None:
     return None
 
 
-def _maven_gate(workspace: Path) -> str | None:
+def _maven_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     # `verify` is Maven's lifecycle gate; a wrapper is preferred when the
     # project ships one, else the toolchain's mvn.
     if not (workspace / "pom.xml").is_file():
@@ -488,7 +570,9 @@ def _maven_gate(workspace: Path) -> str | None:
     return "./mvnw -q verify" if (workspace / "mvnw").is_file() else "mvn -q verify"
 
 
-def _cargo_alias_gate(workspace: Path) -> str | None:
+def _cargo_alias_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     for name in (".cargo/config.toml", ".cargo/config"):
         text = _read(workspace / name)
         if text is None:
@@ -511,15 +595,25 @@ def _cargo_alias_gate(workspace: Path) -> str | None:
 # is the declaration, and the command is satisfiable by construction on the
 # toolchain that manifest resolved. Go has no task-runner convention at all,
 # which is why it is here and not above.
-def _go_gate(workspace: Path) -> str | None:
-    return "go vet ./... && go test ./..." if (workspace / "go.mod").is_file() else None
+def _go_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
+    # A `go.work` makes `./...` span every module in the workspace, so the
+    # same command is the gate of a Go monorepo (#687).
+    if any((workspace / name).is_file() for name in ("go.mod", "go.work")):
+        return "go vet ./... && go test ./..."
+    return None
 
 
-def _cargo_gate(workspace: Path) -> str | None:
+def _cargo_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     return "cargo test" if (workspace / "Cargo.toml").is_file() else None
 
 
-def _dotnet_gate(workspace: Path) -> str | None:
+def _dotnet_gate(
+    workspace: Path, languages: Sequence[str] | None = None, top: Path | None = None
+) -> str | None:
     # `dotnet test` needs exactly one solution or project file in the
     # directory to know what to build.
     try:
@@ -537,14 +631,22 @@ def _dotnet_gate(workspace: Path) -> str | None:
 class GateDetector:
     """One convention: the detector, and the toolchain its command needs.
 
-    ``language`` is None for a task runner (make, just, task) that any
-    sandbox has; otherwise the registry name whose toolchain must be in
-    the run's resolved set (#624) for the command to be runnable at all.
+    ``language`` is the registry name whose toolchain must be in the run's
+    resolved set (#624) for the command to be runnable at all — the task
+    runners included (#685): ``make`` only ever arrived with
+    build-essential and ``just``/``task`` never did, so each is an entry
+    the manifest selects. None would mean a command every sandbox can run;
+    no detector emits one.
     Rule: a detector may only emit a command the resolved toolchain can
     run — a gate the executor cannot invoke is unsatisfiable, not strict.
+    Every detector receives the resolved set for that reason; only the
+    npm one consults it (a bun lockfile on a sandbox without bun, #684).
+    Every detector also receives the workspace root, since it may be run
+    at a package below it (#687); again only the npm one reads it (the
+    client a monorepo pins at its root).
     """
 
-    detect: Callable[[Path], str | None]
+    detect: Callable[[Path, Sequence[str] | None, Path | None], str | None]
     language: str | None = None
 
 
@@ -553,9 +655,9 @@ class GateDetector:
 # usually made the task runner the front door; the language-native
 # fallbacks come last, after every declaration.
 GATE_DETECTORS: tuple[GateDetector, ...] = (
-    GateDetector(_make_gate),
-    GateDetector(_just_gate),
-    GateDetector(_task_gate),
+    GateDetector(_make_gate, "make"),
+    GateDetector(_just_gate, "just"),
+    GateDetector(_task_gate, "task"),
     GateDetector(_npm_gate, "javascript"),
     GateDetector(_tox_gate, "python"),
     GateDetector(_nox_gate, "python"),
@@ -596,6 +698,18 @@ def project_gate(
         return override.strip() or None
     if workspace is None:
         return None
+    for root in _gate_roots(workspace):
+        gate = _gate_at(root, languages, workspace)
+        if gate is None:
+            continue
+        if root == workspace:
+            return gate
+        return f"cd {shlex.quote(root.relative_to(workspace).as_posix())} && {gate}"
+    return None
+
+
+def _gate_at(root: Path, languages: Sequence[str] | None, top: Path) -> str | None:
+    """The first detector's gate at ``root``, under the resolved toolchains."""
     for detector in GATE_DETECTORS:
         if (
             languages is not None
@@ -603,10 +717,136 @@ def project_gate(
             and detector.language not in languages
         ):
             continue
-        gate = detector.detect(workspace)
+        gate = detector.detect(root, languages, top)
         if gate:
             return gate
     return None
+
+
+# Directories the gate walk does not descend into, beyond the dependency
+# trees language detection skips: a fixture's package.json or a sample's
+# go.mod is a manifest, but its gate is not the project's, and a guessed
+# gate is unsatisfiable rather than strict.
+_GATE_SKIP_DIRS = frozenset(
+    {
+        "test",
+        "tests",
+        "testdata",
+        "fixtures",
+        "fixture",
+        "examples",
+        "example",
+        "samples",
+        "sample",
+        "docs",
+        "doc",
+        "benchmarks",
+    }
+)
+
+
+def _gate_roots(workspace: Path) -> list[Path]:
+    """The workspace root, then its subdirectories to the depth language
+    detection reads (#687) — level by level, sorted by name within a level,
+    skipping dot-directories, dependency trees and fixture-shaped names.
+
+    The root goes first because a monorepo with a real whole-project gate
+    declares it there (a Makefile, a root package.json script); the packages
+    below are consulted only when the root declares none.
+    """
+    roots = [workspace]
+    level = [workspace]
+    for _depth in range(toolchains.DETECT_DEPTH):
+        next_level: list[Path] = []
+        for directory in level:
+            try:
+                entries = sorted(directory.iterdir(), key=lambda p: p.name)
+            except OSError:
+                continue
+            next_level += [
+                entry
+                for entry in entries
+                if entry.is_dir()
+                and not entry.name.startswith(".")
+                and entry.name not in toolchains.SKIP_DIRS
+                and entry.name not in _GATE_SKIP_DIRS
+            ]
+        roots += next_level
+        level = next_level
+    return roots
+
+
+# Lockfiles and manifests a test-container dependency would be pinned in
+# (#682). Read as text: the name is what matters, not the format.
+SERVICE_LOCKFILES = (
+    "uv.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "requirements.txt",
+    "requirements-dev.txt",
+    "requirements-test.txt",
+    "pyproject.toml",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "bun.lock",
+    "bun.lockb",
+    "Gemfile.lock",
+    "go.sum",
+    "Cargo.lock",
+    "packages.lock.json",
+    "Directory.Packages.props",
+    "pom.xml",
+    "build.gradle",
+    "build.gradle.kts",
+    "composer.lock",
+)
+_COMPOSE_GLOBS = ("docker-compose*.yml", "docker-compose*.yaml", "compose.yml", "compose.yaml")
+_WORKFLOW_SERVICES_RE = re.compile(r"^\s*services:\s*(#.*)?$", re.MULTILINE)
+
+
+def services_evidence(workspace: Path | None) -> list[str]:
+    """What in the workspace says its suite needs services the sandbox does
+    not have (#682): compose files, a test-container dependency in a
+    lockfile, ``services:`` blocks in the GitHub workflows.
+
+    Evidence, not a decision: the loop reports it under
+    ``verify_mode = "full"`` and leaves the knob to the operator, because
+    a compose file for local development says nothing certain about the
+    unit suite. The root and one level down are looked at — a monorepo's
+    packages, a ``backend/`` — never the whole tree.
+    """
+    if workspace is None or not workspace.is_dir():
+        return []
+    evidence: list[str] = []
+    roots = [workspace, *sorted(p for p in workspace.iterdir() if p.is_dir() and p.name[0] != ".")]
+    for root in roots:
+        compose = {path for pattern in _COMPOSE_GLOBS for path in root.glob(pattern)}
+        for path in sorted(compose):
+            if path.is_file():
+                evidence.append(f"{path.relative_to(workspace).as_posix()} (compose file)")
+        for name in SERVICE_LOCKFILES:
+            path = root / name
+            if not path.is_file():
+                continue
+            try:
+                text = path.read_text(errors="replace")
+            except OSError:
+                continue
+            if "testcontainers" in text.lower():
+                evidence.append(f"{path.relative_to(workspace).as_posix()} mentions testcontainers")
+    workflows = workspace / ".github" / "workflows"
+    if workflows.is_dir():
+        for path in sorted(workflows.iterdir()):
+            if path.suffix not in (".yml", ".yaml") or not path.is_file():
+                continue
+            try:
+                text = path.read_text(errors="replace")
+            except OSError:
+                continue
+            if _WORKFLOW_SERVICES_RE.search(text):
+                evidence.append(f"{path.relative_to(workspace).as_posix()} declares `services:`")
+    return evidence
 
 
 def gate_rule(gate: str | None) -> str:
@@ -633,6 +873,32 @@ def gate_rule(gate: str | None) -> str:
     )
 
 
+def reviewer_gate_rule(gate: str | None) -> str:
+    """The review prompt's gate paragraph — evidence, not an instruction.
+
+    The decomposer's :func:`gate_rule` says "one task MUST run the gate":
+    an instruction to the planner. Handed to the reviewer verbatim it read
+    as an instruction to *run* it, which the reviewer neither can (its
+    session is read-only) nor should (the sandbox already did, and the
+    verification notes carry what that left undecided, #682) — and with
+    no gate at all it told the reviewer nothing was required of a plan it
+    was not writing (#690). The reviewer's paragraph names the gate as a
+    result to weigh, or says plainly that there is none to lean on.
+    """
+    if not gate:
+        return (
+            "This repository declares no single gate command, so there is no gate "
+            "result to lean on: judge the diff on its own and on what each task's "
+            "verify commands actually checked."
+        )
+    return (
+        f"This repository's gate is `{gate}`. The sandbox ran it before delivering "
+        "the pull request, and the verification notes below say what it left "
+        "undecided; treat its result as evidence about the diff — do not re-run "
+        "it, and do not raise a finding that only asks for it to be run."
+    )
+
+
 def runs_gate(command: str, gate: str) -> bool:
     """Whether ``command`` invokes ``gate``.
 
@@ -642,7 +908,9 @@ def runs_gate(command: str, gate: str) -> bool:
     A single-word gate (``tox``, ``nox``) needs only its program.
     """
     try:
-        words = shlex.split(command)
+        # `(cd packages/api && npm run check)` runs `cd packages/api && npm
+        # run check` — the subshell's parentheses are not part of any word.
+        words = [word.strip("()") for word in shlex.split(command)]
         wanted = shlex.split(gate)
     except ValueError:
         return False
@@ -963,20 +1231,161 @@ CONFIG_SCOPED_TOOLS: dict[str, ConfigScopedTool] = {
 }
 
 
-def config_override_example(languages: Sequence[str] | None = None) -> str:
-    """The rendered config-override example for a run's resolved toolchains.
+# Worked examples for the ecosystems whose override is not a tool the lint
+# reads (#690): the story is the same shape — the configured set, the
+# explicit argument that reached past it, the failure no revision can fix —
+# but the mechanism is a workspace manifest, a build-tool filter or a test
+# runner's suite list rather than a file-set key the lint could check. Each
+# one was checked against the tool's documented behaviour (mocha's against
+# mocha 11 itself: positional paths are *added to* a configured `spec`).
+_STANDALONE_EXAMPLES: tuple[ConfigOverrideExample, ...] = (
+    ConfigOverrideExample(
+        language="javascript",
+        fence="yaml",
+        config="# .mocharc.yml\nspec:\n  - test/unit/**/*.test.js",
+        story=(
+            "The project gate runs `npm test` (`mocha`) and passes: `spec` names "
+            "the unit tree and leaves `test/integration` out. The task's verify "
+            "command runs `npx --no-install mocha --recursive test`; a path on "
+            "the command line is added to the configured `spec`, not substituted "
+            "for it, so the integration suite comes along — it dials a database "
+            'the sandbox does not have and fails with "connect ECONNREFUSED '
+            f'127.0.0.1:5432" on every attempt. {_REMEDY} and letting the '
+            "configuration choose the files."
+        ),
+    ),
+    ConfigOverrideExample(
+        language="rust",
+        fence="toml",
+        config=(
+            "# Cargo.toml\n[workspace]\n"
+            'members = ["crates/core", "crates/cli", "crates/integration"]\n'
+            'default-members = ["crates/core", "crates/cli"]'
+        ),
+        story=(
+            "The project gate runs `cargo test` at the workspace root and passes: "
+            "`default-members` keeps `crates/integration` out of the default set. "
+            "The task's verify command runs `cargo test --workspace`; the flag "
+            "selects every member, `crates/integration` included, and that crate "
+            "links a native library the sandbox does not carry, so the build "
+            'fails with "could not find native static library" on every attempt. '
+            f"{_REMEDY}, or `-p <crate>` for the crate the task is about."
+        ),
+    ),
+    ConfigOverrideExample(
+        language="java",
+        fence="xml",
+        config=(
+            "<!-- pom.xml -->\n<plugin>\n"
+            "  <artifactId>maven-surefire-plugin</artifactId>\n"
+            "  <configuration>\n"
+            "    <excludes><exclude>**/*IT.java</exclude></excludes>\n"
+            "  </configuration>\n</plugin>"
+        ),
+        story=(
+            "The project gate runs `./mvnw -q verify` and passes: surefire's "
+            "`excludes` keeps the `*IT` classes out of the unit phase. The task's "
+            "verify command runs `./mvnw -q test -Dtest='Order*'`; the `test` "
+            "property overrides `includes` and `excludes` alike, so "
+            "`OrderRepositoryIT` runs with the unit tests — it needs a database "
+            'the sandbox does not have and fails with "Connection refused" on '
+            f"every attempt. {_REMEDY} and letting the plugin choose the classes."
+        ),
+    ),
+    ConfigOverrideExample(
+        language="php",
+        fence="xml",
+        config=(
+            "<!-- phpunit.xml -->\n<testsuites>\n"
+            '  <testsuite name="unit">\n'
+            "    <directory>tests</directory>\n"
+            "    <exclude>tests/Integration</exclude>\n"
+            "  </testsuite>\n</testsuites>"
+        ),
+        story=(
+            "The project gate runs `./vendor/bin/phpunit` and passes: the suite "
+            "declared in `phpunit.xml` leaves `tests/Integration` out. The task's "
+            "verify command runs `./vendor/bin/phpunit tests`; a path argument "
+            "makes PHPUnit ignore the configured test suites and run every test "
+            "under it, so the integration tests come along — they need a database "
+            'the sandbox does not have and fail with "SQLSTATE[HY000] [2002] '
+            f'Connection refused" on every attempt. {_REMEDY} and letting the '
+            "configuration choose the suites."
+        ),
+    ),
+    ConfigOverrideExample(
+        language="dotnet",
+        fence="json",
+        config=(
+            "// App.slnf\n{\n"
+            '  "solution": {\n'
+            '    "path": "App.sln",\n'
+            '    "projects": ["src/App/App.csproj", "tests/App.Tests/App.Tests.csproj"]\n'
+            "  }\n}"
+        ),
+        story=(
+            "The project gate runs `dotnet test App.slnf` and passes: the solution "
+            "filter lists the projects CI builds, and `tests/App.Integration` is "
+            "not among them. The task's verify command runs `dotnet test "
+            "tests/App.Integration/App.Integration.csproj`; naming the project "
+            "reaches past the filter, and that project's fixtures start a "
+            'container the sandbox cannot run, so it fails with "Cannot connect to '
+            'the Docker daemon" on every attempt. '
+            f"{_REMEDY} — the filter the gate names."
+        ),
+    ),
+    ConfigOverrideExample(
+        language="cpp",
+        fence="json",
+        config=(
+            "// CMakePresets.json\n{\n"
+            '  "testPresets": [{\n'
+            '    "name": "default", "configurePreset": "default",\n'
+            '    "filter": { "exclude": { "label": "integration" } }\n'
+            "  }]\n}"
+        ),
+        story=(
+            "The project gate runs `ctest --preset default` and passes: the "
+            "preset's `filter` excludes every test labelled `integration`. The "
+            "task's verify command runs `ctest --test-dir build`; without the "
+            "preset there is no filter, so the labelled tests run too — they "
+            "connect to a broker the sandbox does not have and fail with "
+            '"Connection refused" on every attempt. '
+            f"{_REMEDY}, the preset the gate names."
+        ),
+    ),
+)
+# A JavaScript client resolves as its own toolchain (#627) but its projects
+# read the JavaScript story.
+_EXAMPLE_ALIASES = {"bun": "javascript"}
 
-    The first language in ``languages`` that has an example wins, so a mixed
-    repository reads the example for its primary toolchain; a run whose
-    languages carry none (or no languages at all) reads the Python one, the
-    ecosystem the lint itself checks.
-    """
+
+def _override_examples() -> dict[str, ConfigOverrideExample]:
     by_language = {
         tool.example.language: tool.example
         for tool in CONFIG_SCOPED_TOOLS.values()
         if tool.example is not None
     }
-    for language in languages or ():
+    for example in _STANDALONE_EXAMPLES:
+        by_language[example.language] = example
+    return by_language
+
+
+def config_override_example(languages: Sequence[str] | None = None) -> str:
+    """The rendered config-override example for a run's resolved toolchains.
+
+    Every ecosystem in the toolchain registry has a story of its own (#690):
+    the first language in ``languages`` that carries one wins, so a mixed
+    repository reads the example for its primary toolchain — except that a
+    repository which resolved TypeScript reads the `tsc` story whichever
+    order the set came in, because TypeScript pulls JavaScript in as a
+    requirement and the TypeScript compiler is the gate such a project
+    actually runs. A run with no languages at all reads the Python one, the
+    ecosystem the lint itself checks.
+    """
+    by_language = _override_examples()
+    names = [_EXAMPLE_ALIASES.get(language, language) for language in languages or ()]
+    for language in sorted(names, key=lambda name: name != "typescript"):
         if language in by_language:
             return by_language[language].render()
     return by_language["python"].render()
@@ -990,11 +1399,16 @@ _RUNNER_PREFIXES: tuple[tuple[str, ...], ...] = (
     ("hatch", "run"),
     ("pipenv", "run"),
     ("npx",),
+    ("npx", "--no-install"),
     ("npm", "exec"),
     ("pnpm", "exec"),
+    ("pnpm", "run"),
     ("pnpm",),
     ("yarn", "run"),
     ("yarn",),
+    ("bun", "run"),
+    ("bun", "x"),
+    ("bunx",),
     ("bundle", "exec"),
     ("dotnet", "tool", "run"),
     ("dotnet",),

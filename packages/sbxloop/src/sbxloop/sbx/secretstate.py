@@ -428,3 +428,143 @@ def verify_secret_visibility(
             cli.rm(name)
         except SbxError:
             log.warning("secret.visibility_check_remove_failed", sandbox=name, exc_info=True)
+
+
+# -- what the CLI and the console both show -----------------------------------------
+
+
+def secrets_context(config: Config, cli: SbxCLI | None = None) -> tuple[SbxCLI, set[str]]:
+    """The sbx handle and the live sbxloop sandbox scopes every secrets
+    command judges registrations against."""
+    cli = cli or SbxCLI(app_name=config.app_name or None)
+    live = {i.name for i in cli.ls() if i.name.startswith(SANDBOX_SCOPE_PREFIX)}
+    return cli, live
+
+
+class SecretRow(BaseModel):
+    """One tracked secret as ``sbxloop secrets list`` shows it."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    env: str
+    host: str
+    state: CustomSecretState
+    judgement: Assessment
+
+    @property
+    def expected(self) -> str:
+        return f"custom @ {self.host} (per-run scope)"
+
+    @property
+    def actual(self) -> str:
+        state = self.state
+        if state.exists:
+            actual = f"scope {state.scope or '(unknown)'}"
+            if state.hosts:
+                actual += f" @ {', '.join(state.hosts)}"
+            return actual
+        if state.exists is None:
+            return "(undetermined)"
+        return "not registered"
+
+
+def secret_rows(
+    config: Config, cli: SbxCLI, live: set[str], *, probe: bool = True
+) -> list[SecretRow]:
+    rows: list[SecretRow] = []
+    for env, host in tracked_custom_secrets(config):
+        state = inspect_custom_secret(cli, env, host=host, probe=probe)
+        judgement = assess(state, canonical_host=host, live_sandboxes=live)
+        rows.append(SecretRow(env=env, host=host, state=state, judgement=judgement))
+    return rows
+
+
+class CleanOutcome(BaseModel):
+    """What ``secrets clean`` did (or, dry, would do) for one secret."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    env: str
+    message: str
+    #: A removal happened (apply) or would (dry run).
+    removed: bool = False
+    #: sbx rejected every removal.
+    failed: bool = False
+
+
+def clean_secrets(
+    config: Config, cli: SbxCLI, live: set[str], *, apply: bool, all_: bool
+) -> list[CleanOutcome]:
+    """Remove stale sbxloop-owned registrations (every owned one with
+    ``all_``); dry unless ``apply``. Never a foreign scope, never the
+    built-in ``github`` service secret."""
+    outcomes: list[CleanOutcome] = []
+    for env, host in tracked_custom_secrets(config):
+        state = inspect_custom_secret(cli, env, host=host)
+        judgement = assess(state, canonical_host=host, live_sandboxes=live)
+        if not (judgement.stale or (all_ and judgement.owned)):
+            outcomes.append(CleanOutcome(env=env, message=f"nothing to clean ({judgement.note})"))
+            continue
+        where = f"scope {state.scope or '(unknown)'}"
+        if not apply:
+            outcomes.append(
+                CleanOutcome(
+                    env=env,
+                    message=f"would remove the registration in {where} — {judgement.note}",
+                    removed=True,
+                )
+            )
+            continue
+        if any(rm() for rm in removal_ladder(cli, state, host=host)):
+            outcomes.append(
+                CleanOutcome(env=env, message=f"removed the registration in {where}", removed=True)
+            )
+        else:
+            outcomes.append(
+                CleanOutcome(
+                    env=env, message=f"sbx rejected every removal for {where}", failed=True
+                )
+            )
+    return outcomes
+
+
+def rotate_registrations(
+    config: Config, cli: SbxCLI, live: set[str], *, token: str
+) -> list[tuple[str, str]]:
+    """Replace every tracked secret's registration with a global one bound
+    to the canonical host (the rm + set-custom dance provisioning would
+    otherwise perform mid-run), and say what else the operator must do.
+    Lines are ``(kind, text)`` with kind ``ok`` / ``warn`` / ``note``; the
+    token never appears in one."""
+    from sbxloop.backends import backend_for
+
+    lines: list[tuple[str, str]] = []
+    for env, host in tracked_custom_secrets(config):
+        replace_registration(cli, env=env, host=host, token=token)
+        lines.append(("ok", f"rotated: {env} registered @ {host} (global scope)"))
+    if live:
+        lines.append(
+            (
+                "warn",
+                f"live sbxloop sandboxes exist ({', '.join(sorted(live))}) — they may still "
+                "hold the old token in their in-VM env file; remove them "
+                "(`sbxloop sandbox rm --all`, or the console's Sandboxes screen)",
+            )
+        )
+    token_env = backend_for(config).token_env
+    lines.append(
+        (
+            "warn",
+            f"runs read {token_env} from the environment at provision time — update your "
+            "export / ./.env with the new value too",
+        )
+    )
+    if config.secret_strategy == "plain-env":  # nosec B105 - strategy label
+        lines.append(
+            (
+                "note",
+                "next run: plain-env strategy (configured) — the token is written to the "
+                "in-VM env file from your environment",
+            )
+        )
+    return lines

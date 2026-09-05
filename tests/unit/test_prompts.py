@@ -5,6 +5,7 @@ from importlib import resources
 
 import pytest
 
+from sbxloop import toolchains
 from sbxloop.engine import prompts
 from sbxloop.engine.prompts import _strip_contract_header, bullet_list, render
 from sbxloop.policy import BASELINE_REGISTRY_DOMAINS, WELL_KNOWN_REGISTRY_DOMAINS
@@ -48,6 +49,26 @@ def test_decompose_asks_for_a_pr_title_in_the_repos_style() -> None:
     assert "`pr_title`" in text
     assert "git log --oneline" in text
     assert '"pr_title"' in text, "the JSON example carries the key"
+
+
+def test_decompose_carries_the_repositorys_pr_conventions_only_when_given() -> None:
+    """#678: the title lint and the template are a paragraph rendered from
+    the workspace (deliver.pr_conventions); the template itself teaches
+    neither, so a repository without them is not told it has them."""
+    from sbxloop.deliver import pr_conventions
+
+    bare = render("decompose", outcome="o", max_tasks="5", project_gate="- gate", **EXAMPLE)
+    assert "conventional commits" not in bare and "pr-body" not in bare
+    told = render(
+        "decompose",
+        outcome="o",
+        max_tasks="5",
+        project_gate="- gate",
+        pr_conventions="- This repository lints pull request titles as conventional commits",
+        **EXAMPLE,
+    )
+    assert "- This repository lints pull request titles as conventional commits" in told
+    assert pr_conventions(None) == ""
 
 
 def test_decompose_states_the_uv_project_convention() -> None:
@@ -136,7 +157,33 @@ def test_build_carries_environment_notes() -> None:
     assert "cannot edit" in build
 
 
-def test_build_shows_the_exam_and_asks_for_a_plan_first_report() -> None:
+def test_build_is_framed_as_a_branch_not_an_artifact() -> None:
+    """#689: the builder edits an existing repository on a feature branch
+    that a human reviews as a pull request — not a workspace it fills
+    with artifacts. The greenfield phrases must not come back."""
+    build = render("build", **build_context(work_dir="`/work/repo`", toolchains="python 3.13"))
+    assert "feature branch of an existing repository" in build
+    assert "checked out at\n`/work/repo`" in build or "checked out at `/work/repo`" in build
+    assert "read the diff as a\npull request" in build or "read the diff as a pull request" in build
+    assert "Resolved toolchains for this repository: python 3.13." in build
+    assert "Match the conventions of the surrounding code" in build
+    assert "Do not create top-level files unless the task asks for them" in build
+    for greenfield in ("Write all outputs", "write all outputs", "when creating the project"):
+        assert greenfield not in build, greenfield
+    # the notes point at the named set, not at "this task's toolchain"
+    assert "this task's toolchain" not in build
+
+
+def test_build_and_review_share_the_scope_rule() -> None:
+    """#689: the rule the reviewer judges by is the rule the builder is
+    given, in the same words, so scope creep is named before it is built
+    rather than only after."""
+    rule = "beyond the outcome's scope is a defect"
+    build = " ".join(render("build", **build_context()).split())
+    review = " ".join(render("review", **RENDER_CONTEXTS["review"]).split())
+    assert rule in build and rule in review
+    assert "Change only what the task requires" in build
+
     """The builder sees the decomposer-authored verify commands verbatim
     (it no longer writes them), and its report opens with the approach —
     the chronology's plan-card replacement."""
@@ -213,6 +260,40 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "daemon_notes": "- poll interval 60s",
         "trigger_label": "sbxloop:run",
     },
+    # The workload's actors (#756): the operator plans and executes, the
+    # judge decides.
+    "operator_plan": {
+        "outcome": "o",
+        "max_tasks": "3",
+        "work_dir": "/data",
+        "bounds": "Profile `p`:\n- hosts: none",
+        "user_guidance": "(none)",
+    },
+    "operator_execute": {
+        "outcome": "o",
+        "task_id": "t1",
+        "task_title": "T",
+        "task_description": "do the thing",
+        "acceptance_criteria": "- it is done",
+        "verify_commands": "(none)",
+        "needs": "(none declared)",
+        "work_dir": "/data",
+        "prior_attempt": "(first attempt)",
+        "feedback": "(none)",
+        "user_guidance": "(none)",
+    },
+    "operator_judge": {
+        "outcome": "o",
+        "task_id": "t1",
+        "task_title": "T",
+        "task_description": "do the thing",
+        "acceptance_criteria": "- it is done",
+        "work_dir": "/data",
+        "attempt": "1",
+        "report": "## Result\n\ndone",
+        "tool_digest": "1. `Bash` `ls` — ok",
+        "evidence": "(no mechanical checks declared)",
+    },
 }
 
 
@@ -246,7 +327,11 @@ def test_concierge_prompt_carries_contract() -> None:
     # the configured repositories reach the model, with their per-repo facts
     assert "owner/repo — enabled, base main" in text and "`list_repos`" in text
     # drift: the concierge reports versions, a human does the upgrading
-    assert "`version_status`" in text and "**You\n  cannot upgrade anything**" in text
+    assert "`version_status`" in text and "**You cannot upgrade\n  anything**" in text
+    # #638: no claim that the user's repository publishes sbxloop on merge,
+    # and no guessed upgrade command — the report names it or nobody does
+    assert "publishes a release" not in text and "pip install" not in text
+    assert "operator's step" in text and "do\n  not guess a command" in text
     # #524: an ask that touches persisted state files with a migration section
     assert "**Migration of existing state** section" in text
     # #535: symptom-first filing; a fix named with no symptom gets one question
@@ -362,14 +447,48 @@ def test_config_override_example_follows_the_resolved_toolchain() -> None:
         (["python"], "[tool.mypy]"),
         (["typescript"], "tsconfig.json"),
         (["node", "typescript"], "tsconfig.json"),
+        # TypeScript pulls JavaScript in as a requirement, so the resolved
+        # set arrives in registry order — the tsc story still wins (#690).
+        (["javascript", "typescript"], "tsconfig.json"),
+        (["javascript"], ".mocharc.yml"),
+        (["bun"], ".mocharc.yml"),
         (["ruby"], "--force-exclusion"),
-        (["rust"], "[tool.mypy]"),
+        (["rust"], "default-members"),
+        (["java"], "maven-surefire-plugin"),
+        (["php"], "<testsuites>"),
+        (["dotnet"], "App.slnf"),
+        (["cpp"], "CMakePresets.json"),
+        (["make"], "[tool.mypy]"),
         (["go", "python"], "go test ./..."),
     ):
         text = config_override_example(languages)
         assert marker in text, (languages, marker)
         assert "the remedy is re-authoring the command to the bare form" in text, languages
         assert text.startswith("```"), languages
+
+
+def test_every_ecosystem_has_its_own_override_story() -> None:
+    """#690: six registry ecosystems fell back to the Python story. Every
+    language toolchain reads one of its own, in the same shape — the gate
+    named, the command that reached past its configuration, the remedy —
+    and no story is another ecosystem's."""
+    task_runners = {"make", "just", "task"}
+    seen: dict[str, str] = {}
+    for language in toolchains.supported_languages():
+        if language in task_runners:
+            continue
+        text = config_override_example([language])
+        assert "The project gate runs `" in text, language
+        assert "The task's verify command runs `" in text, language
+        assert "on every attempt" in text, language
+        assert "the remedy is re-authoring the command to the bare form" in text, language
+        if language != "python":
+            assert "[tool.mypy]" not in text, language
+        seen[language] = text
+    # bun is a JavaScript client and reads the JavaScript story; every
+    # other ecosystem's is its own.
+    assert seen.pop("bun") == seen["javascript"]
+    assert len(set(seen.values())) == len(seen)
 
 
 DOMAIN_ANCHORS: tuple[str, ...] = (
@@ -527,3 +646,107 @@ def test_build_renders_standing_guidance() -> None:
 def test_bullet_list() -> None:
     assert bullet_list([]) == "(none)"
     assert bullet_list(["a", "b"]) == "- a\n- b"
+
+
+def test_decompose_scopes_verify_to_the_service_free_subset() -> None:
+    """#682: a verify command that needs a service the sandbox lacks fails
+    the same way on every attempt, so the planner is told to scope the
+    exam to what runs without it and to say so."""
+    text = render("decompose", outcome="o", max_tasks="3", project_gate="- gate rule", **EXAMPLE)
+    assert "external services the sandbox does not have" in text
+    assert "scope the\nverify command to the subset that runs without them" in text.replace(
+        "  ", ""
+    ) or "scope the verify command to the subset that runs without them" in " ".join(text.split())
+    assert "say so in the task's description" in text
+
+
+def test_review_prompt_carries_the_verification_note_when_given() -> None:
+    """#682: what the sandbox's checks did not decide is a section of the
+    review prompt under the gate, and nothing at all under `full`."""
+    note = (
+        'The operator set `verify_mode = "advisory"`: these checks failed\n'
+        "- task t1: `pytest` (exit 1)"
+    )
+    text = render("review", **RENDER_CONTEXTS["review"], verification=note)
+    assert note in text
+    gate_at = text.index("## The project's own gate")
+    rounds_at = text.index("## Earlier rounds")
+    assert gate_at < text.index(note) < rounds_at
+    plain = render("review", **RENDER_CONTEXTS["review"])
+    assert "verify_mode" not in plain
+    assert "$verification" not in plain
+
+
+# -- the workload's prompts (#756) --------------------------------------------
+
+
+def test_operator_plan_declares_needs_by_name() -> None:
+    """The plan is where a task asks for the outside: hosts and credentials
+    by name, never a value — the operator's box never holds a secret."""
+    text = " ".join(render("operator_plan", **RENDER_CONTEXTS["operator_plan"]).split())
+    assert text.startswith("# Plan a workload")
+    assert "by name" in text and "never its value" in text
+    assert "Declare it here" in text
+    assert '"needs": {"hosts": [], "credentials": [], "sink": null, "repo": null}' in text
+    assert "At most 3 tasks" in text
+
+
+def test_operator_plan_shows_what_may_be_granted() -> None:
+    """The profile's bounds (#758) reach the planner as their own section,
+    with the rule that a need outside them ends the run before any task."""
+    text = render("operator_plan", **RENDER_CONTEXTS["operator_plan"])
+    assert "## What this run may ask for" in text
+    assert "Profile `p`:\n- hosts: none" in text
+    plain = " ".join(text.split())
+    assert "a need outside it is refused and the run ends before any task runs" in plain
+
+
+def test_operator_plan_makes_criteria_the_exam() -> None:
+    text = render("operator_plan", **RENDER_CONTEXTS["operator_plan"])
+    assert "the judge's whole exam" in text
+    assert "acceptance_criteria" in text
+
+
+def test_operator_execute_declares_result() -> None:
+    """The executor's report is what the judge reads: it ends with a Result
+    section that declares the outcome per criterion, and claims nothing."""
+    text = render("operator_execute", **RENDER_CONTEXTS["operator_execute"])
+    assert text.startswith("# Execute one task")
+    assert "declare your result" in text.lower()
+    assert "Do not claim" in text
+    assert "## Result" in text
+    assert "Task t1: T" in text and "- it is done" in text
+
+
+def test_operator_execute_keeps_secrets_out_of_the_box() -> None:
+    text = render("operator_execute", **RENDER_CONTEXTS["operator_execute"])
+    assert "Credentials are never in this box" in text
+    assert "never its value" in " ".join(text.split())
+    # Host-tool sections ride in through the same seam as the build prompt.
+    tooled = render(
+        "operator_execute", **RENDER_CONTEXTS["operator_execute"], service_tools="\n\n## Tools"
+    )
+    assert tooled.rstrip().endswith("if\na criterion is not met, say so and why.")
+    assert "## Tools" in tooled and "## Tools" not in text
+    assert "$service_tools" not in text
+
+
+def test_operator_judge_reads_and_never_repairs() -> None:
+    text = render("operator_judge", **RENDER_CONTEXTS["operator_judge"])
+    assert text.startswith("# Judge one task")
+    assert "Do not modify anything" in text
+    assert "a claim" in text
+    assert "1. `Bash` `ls` — ok" in text and "## Result" in text
+    assert "(attempt 1)" in text
+
+
+def test_operator_judge_quotes_unmet_criteria() -> None:
+    text = render("operator_judge", **RENDER_CONTEXTS["operator_judge"])
+    assert "quote the criterion" in text
+    assert '"passed": false' in text and '"unmet": [' in text
+    retried = render(
+        "operator_judge",
+        **RENDER_CONTEXTS["operator_judge"],
+        retry_context="## Previous attempt was invalid",
+    )
+    assert retried.rstrip().endswith("## Previous attempt was invalid")

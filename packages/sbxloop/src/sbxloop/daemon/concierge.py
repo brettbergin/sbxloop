@@ -37,21 +37,28 @@ import time
 from collections.abc import Callable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, get_args
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
 from urllib.parse import quote
 
 from sbxloop.cli.tui import format_event
-from sbxloop.config import Config
+from sbxloop.config import BridgeBackend, Config
 from sbxloop.daemon.chat_choices import (
     ChoiceQuestion,
     PendingFiling,
     parse_choice_question,
     parse_pending_filing,
 )
-from sbxloop.daemon.control import dispatch, plain
-from sbxloop.daemon.discord_format import agent_model_label
+from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX, dispatch, format_log_tail, plain
 from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.store import ChatThread, DaemonStore
+from sbxloop.daemon.usage import (
+    SPEND_NOT_REPORTED,
+    RunUsage,
+    usage_for_run,
+    usage_lines,
+    usage_row,
+    usage_rows,
+)
 from sbxloop.daemon.versions import VersionProbe
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunState
 from sbxloop.engine.prompts import bullet_list, render
@@ -68,10 +75,9 @@ from sbxloop.errors import (
 from sbxloop.events import EventBus
 from sbxloop.ghids import issue_item_id, normalize_item_id
 from sbxloop.ids import new_job_id
-from sbxloop.log import get_logger, log_buffer
+from sbxloop.log import get_logger
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import (
-    EventTypes,
     HostToolCall,
     HostToolResponse,
     HostToolSpec,
@@ -99,8 +105,10 @@ _RUN_STATES = list(get_args(RunState))
 #: Run states that mean the run is over — nothing more will happen to it, so a
 #: watch on one of these is answered immediately instead of registered.
 _FINISHED_RUN_STATES = TERMINAL_RUN_STATES
-#: Levels ``daemon_log`` accepts, coarsest last — the filter is at-or-above.
-_LOG_LEVELS = ("DEBUG", "INFO", "WARNING", "ERROR")
+#: Verbs the in-sandbox model may not issue through ``sbx_control``: a
+#: process-level act stays with a human at a keyboard (ctl, chat, the
+#: console). ``cancel`` is the model's way to stop work.
+_DENIED_CONTROL_VERBS = frozenset({"stop"})
 # GitHub's ``state_reason`` for a close. ``completed`` means the thing was
 # actually done; ``not_planned`` is the triage verdict — duplicate, won't fix,
 # stale. Nothing else is accepted, so the model cannot invent a reason.
@@ -112,7 +120,11 @@ CLOSE_REASONS = ("completed", "not_planned")
 #: see ``ChatBridge.on_watch``.
 VIA_CONCIERGE_SUFFIX = " (via concierge)"
 #: How the prompt names the chat service, by `[chat] backend`.
-CHAT_NAMES: dict[str, str] = {"discord": "Discord", "slack": "Slack"}
+CHAT_NAMES: dict[str, str] = {
+    "discord": "Discord",
+    "slack": "Slack",
+    "local": "the operator console",
+}
 
 
 class ConciergeReply(NamedTuple):
@@ -235,8 +247,12 @@ class Concierge:
         # The active chat backend's section (prefix, threading) and its proper
         # name for the prompt; a config with no chat at all (tests, a headless
         # daemon) reads Discord's defaults so every string still renders.
-        self._chat = config.chat_settings or config.discord
-        self._chat_name = CHAT_NAMES.get(config.chat_backend or "", "chat")
+        # The surface a turn is worded for — its command prefix, threading and
+        # proper name — is the bridge the turn came in on (``submit_turn``'s
+        # ``via``); between turns, the external backend when one is
+        # configured, else the operator console.
+        self._default_via: str = config.chat_backend or "local"
+        self._turn_via: str | None = None
         self.loop = loop
         self.dstore = dstore
         self._store_factory = store_factory
@@ -246,6 +262,7 @@ class Concierge:
         # an issue they ask for records them as its requester. Turns run one
         # at a time on the executor, so one slot is enough.
         self._turn_author_id: str | None = None
+
         self.host = host
         self.bus = bus
         self.clock = clock
@@ -292,6 +309,18 @@ class Concierge:
         self._warm = threading.Thread(target=run, name="sbxloop-concierge-warmup", daemon=True)
         self._warm.start()
 
+    @property
+    def _via(self) -> str:
+        return self._turn_via or self._default_via
+
+    @property
+    def _chat(self) -> Any:
+        return self.config.chat_section(cast(BridgeBackend, self._via))
+
+    @property
+    def _chat_name(self) -> str:
+        return CHAT_NAMES.get(self._via, "chat")
+
     def submit_turn(
         self,
         text: str,
@@ -299,10 +328,12 @@ class Concierge:
         author: str,
         author_id: str | None = None,
         on_tool: ToolCallback | None = None,
+        via: str | None = None,
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
-        recorded as the requester of any issue this turn files."""
+        recorded as the requester of any issue this turn files; ``via`` is
+        the bridge the message came in on, so the reply is worded for it."""
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("concierge is closed")
@@ -312,10 +343,12 @@ class Concierge:
             with self._state_lock:
                 self._pending -= 1
             self._turn_author_id = author_id
+            self._turn_via = via
             try:
                 return self._run_turn(text, author=author, on_tool=on_tool)
             finally:
                 self._turn_author_id = None
+                self._turn_via = None
 
         return self._executor.submit(run)
 
@@ -703,11 +736,12 @@ class Concierge:
                     description=(
                         "Is this daemon running current code? Reports the installed sbxloop, "
                         "sbxloop-worker and sbx versions, the latest sbxloop/sbxloop-worker "
-                        "releases on PyPI, and whether the host is behind. Every merge to the "
-                        "project's main branch publishes a patch, while deploying to this host "
-                        "is manual, so drift is normal and worth checking. You cannot upgrade "
-                        "anything — that is a human step on the daemon host — so report what "
-                        "you find and say who has to act."
+                        "releases on PyPI (unless the operator switched that check off), and "
+                        "whether the host is behind. sbxloop's own releases ship frequently, "
+                        "while upgrading this host is an operator's step, so drift is normal "
+                        "and worth checking. You cannot upgrade anything — the report says "
+                        "what upgrading takes on the daemon host — so report what you find "
+                        "and say who has to act."
                     ),
                     parameters=_schema({}),
                 ),
@@ -754,7 +788,7 @@ class Concierge:
                     parameters=_schema(
                         {
                             "tail": {"type": "integer", "minimum": 1, "maximum": 500},
-                            "level": {"type": "string", "enum": list(_LOG_LEVELS)},
+                            "level": {"type": "string", "enum": list(LOG_LEVELS)},
                             "grep": {"type": "string"},
                         }
                     ),
@@ -1010,6 +1044,11 @@ class Concierge:
             )
         return tools
 
+    def _thread_for(self, run_id: str) -> ChatThread | None:
+        """The run's thread on the surface this turn is answered on, else
+        the one an external bridge opened."""
+        return self.dstore.chat_thread(run_id, self._via) or self.dstore.chat_thread(run_id)
+
     def _link(self, thread: ChatThread) -> str:
         if self._thread_link is not None:
             return self._thread_link(thread)
@@ -1021,9 +1060,18 @@ class Concierge:
         command = str(args.get("command", "")).strip()
         if not command:
             return "usage: sbx_control(command) — e.g. status, pause, cancel --retry, queue"
+        verb = command.split()[0].lower()
+        if verb in _DENIED_CONTROL_VERBS:
+            return (
+                f"(command not accepted) `{verb}` is an operator's verb — it stops the daemon "
+                "process itself — and is not available from here; `cancel` stops the current "
+                "run, `pause` keeps the daemon from claiming more."
+            )
         reply = dispatch(
             self.loop, command, prefix=self._chat.command_prefix, by=by, via="concierge"
         )
+        if reply.after is not None:
+            reply.after()
         text = plain(reply.text)
         if reply.status is not None:
             text += "\n" + _status_detail(reply.status)
@@ -1066,10 +1114,11 @@ class Concierge:
         item_id = self.dstore.item_for_run(run_id)
         item_id = normalize_item_id(item_id) if item_id else item_id
         item = self.dstore.get(item_id) if item_id else None
-        thread = self.dstore.chat_thread(run_id)
+        thread = self._thread_for(run_id)
         lines = [
-            f"run {run.run_id}: state={run.state}, created {_age(self.clock() - run.created_at)} "
-            f"ago, updated {_age(self.clock() - run.updated_at)} ago",
+            f"run {run.run_id}: state={run.state}, kind={run.kind}, "
+            f"created {_age(self.clock() - run.created_at)} ago, "
+            f"updated {_age(self.clock() - run.updated_at)} ago",
             f"outcome: {_one_line(run.outcome, 400)}",
             f"tasks: {report.task_summary}",
         ]
@@ -1183,7 +1232,7 @@ class Concierge:
             lines.append(f"body: {_one_line(item.body, 600)}")
         lines.append(f"runs: {', '.join(runs) if runs else '(none yet)'}")
         if runs:
-            thread = self.dstore.chat_thread(runs[-1])
+            thread = self._thread_for(runs[-1])
             if thread is not None:
                 lines.append(f"latest run's {self._chat_name} thread: {self._link(thread)}")
         return "\n".join(lines)
@@ -1197,42 +1246,10 @@ class Concierge:
         except (WorkerError, SbxError, DaemonError) as exc:
             return f"reading versions failed: {_one_line(str(exc), 300)}"
 
-    def _usage_for_run(self, run_id: str, *, since: float = 0.0) -> _RunUsage:
-        """Fold a run's ``agent.usage`` events into a total and a per-persona
-        breakdown. ``since`` drops samples older than an epoch stamp, which is
-        how ``usage_today`` attributes tokens to the day they were spent
-        rather than to the day the run started."""
-        total = Usage()
-        by_agent: dict[str, Usage] = {}
-        models: list[str] = []
-        samples = 0
-        # One `agent.usage` event is one assistant turn, and turns — not
-        # jobs — are what a run is billed and timed by: every turn re-sends
-        # the whole session context. Counting them per persona is how "where
-        # did it go?" gets an actionable answer instead of a token total.
-        turns: dict[str, int] = {}
-        jobs: dict[str, set[str]] = {}
-        for _seq, event in self.store.events(run_id, type_prefix=EventTypes.AGENT_USAGE):
-            if event.ts < since:
-                continue
-            sample = _usage_from_event(event.data)
-            total = total.merged(sample)
-            who = str(event.data.get("agent") or "unknown")
-            by_agent[who] = by_agent.get(who, Usage()).merged(sample)
-            turns[who] = turns.get(who, 0) + 1
-            if event.job_id:
-                jobs.setdefault(who, set()).add(event.job_id)
-            # Backend + model, so a GPT model served through Copilot reads
-            # differently from a Claude model served from Claude. Events that
-            # predate backend stamping render as `unknown`.
-            if sample.model or sample.backend:
-                label = agent_model_label(sample.backend, sample.model)
-                if label not in models:
-                    models.append(label)
-            samples += 1
-        return _RunUsage(
-            total, by_agent, models, samples, turns, {k: len(v) for k, v in jobs.items()}
-        )
+    def _usage_for_run(self, run_id: str, *, since: float = 0.0) -> RunUsage:
+        """One run's folded ``agent.usage`` samples — :func:`usage_for_run`,
+        the fold the console's Phases tab shows too."""
+        return usage_for_run(self.store, run_id, since=since)
 
     def _tool_run_usage(self, args: dict[str, Any], by: str) -> str:
         run_id = str(args.get("run_id", "")).strip()
@@ -1252,9 +1269,7 @@ class Concierge:
                 "or its backend does not report it — this is not the same as zero spend."
             )
         lines = [f"run {run_id} · {usage.model_line} · {usage.samples} sample(s)"]
-        lines.extend(_usage_rows(usage.by_agent, usage.turns_by_agent, usage.jobs_by_agent))
-        lines.append(_usage_row("total", usage.total, turns=usage.samples))
-        lines.append(_SPEND_NOT_REPORTED)
+        lines.extend(usage_lines(usage))
         return "\n".join(lines)
 
     def _tool_usage_today(self, args: dict[str, Any], by: str) -> str:
@@ -1301,26 +1316,11 @@ class Concierge:
         return "\n".join(lines)
 
     def _tool_daemon_log(self, args: dict[str, Any], by: str) -> str:
-        tail = _int_arg(args, "tail", 50, 1, 500)
-        level = str(args.get("level") or "").strip().upper() or None
-        grep = str(args.get("grep") or "")
-        buffer = log_buffer()
-        size = len(buffer)
-        try:
-            records = buffer.tail(tail, level=level, grep=grep or None)
-        except ValueError:
-            return f"unknown log level {level!r} — use one of {', '.join(_LOG_LEVELS)}"
-        filters: list[str] = []
-        if level:
-            filters.append(f"level={level}")
-        if grep:
-            filters.append(f"grep={grep!r}")
-        suffix = f" ({', '.join(filters)})" if filters else ""
-        if not records:
-            return f"no matching log records{suffix}; the buffer holds {size} lines"
-        head = f"showing {len(records)} of {size} buffered log records{suffix}"
-        lines = [f"{r.timestamp} {r.level} {r.logger} {_one_line(r.line, 400)}" for r in records]
-        return "\n".join([head, *lines])
+        return format_log_tail(
+            tail=_int_arg(args, "tail", 50, 1, LOG_TAIL_MAX),
+            level=str(args.get("level") or "").strip().upper() or None,
+            grep=str(args.get("grep") or "") or None,
+        )
 
     def _tool_list_repos(self, args: dict[str, Any], by: str) -> str:
         entries = self.config.github.repo_list()
@@ -1836,107 +1836,10 @@ def _int_arg(args: dict[str, Any], key: str, default: int, lo: int, hi: int) -> 
     return max(lo, min(hi, value))
 
 
-class _RunUsage(NamedTuple):
-    """One run's folded ``agent.usage`` samples."""
-
-    total: Usage
-    by_agent: dict[str, Usage]
-    models: list[str]
-    samples: int
-    # Turns and distinct jobs per persona. ``samples`` is the run's total
-    # turn count (one sample per turn); these break it down so a persona
-    # that is expensive because it takes many turns is distinguishable from
-    # one that is expensive because it runs many times. Required rather than
-    # defaulted: a shared mutable default on a NamedTuple is a trap, and the
-    # single producer always has both to hand.
-    turns_by_agent: dict[str, int]
-    jobs_by_agent: dict[str, int]
-
-    @property
-    def recorded(self) -> bool:
-        """Did the backend actually report anything? ``Usage.merged`` keeps
-        None as None, so an all-None total means "never reported" — which is
-        not the same as zero and must not be shown as it."""
-        return self.samples > 0 and (
-            self.total.input_tokens is not None or self.total.output_tokens is not None
-        )
-
-    @property
-    def model_line(self) -> str:
-        """Backend + model pairs for the run, or a plain "not reported"."""
-        return " + ".join(self.models) if self.models else "model not reported"
-
-
-# `agent.usage` payloads carry an `agent` key the host adds on the way through
-# (worker/client.py), and Usage forbids extras — so pick the fields out rather
-# than validating the whole dict.
-#
-# Spend is deliberately absent (#386, #439): the Copilot SDK reports it as a
-# per-turn constant (15.0 on every turn) of unknown unit, so lifting it out of
-# the event and folding it through `Usage.merged` made `run_usage` print
-# 147 x 15.0 = 2205.0 — a fabricated figure the concierge would repeat in
-# Discord as fact. `Usage` carries no such field at all now.
-_USAGE_FIELDS = (
-    "model",
-    "backend",
-    "input_tokens",
-    "output_tokens",
-    "cache_read_tokens",
-    "cache_write_tokens",
-)
-
-
-def _usage_from_event(data: dict[str, Any]) -> Usage:
-    return Usage(**{k: data[k] for k in _USAGE_FIELDS if k in data})
-
-
-def _tokens(value: int | None) -> str:
-    return f"{value:,}" if value is not None else "—"
-
-
-def _usage_row(
-    label: str, usage: Usage, *, turns: int | None = None, jobs: int | None = None
-) -> str:
-    """One spend line, with the turn/job and cache columns appended only when
-    they are known — a run that predates turn counting or a backend that
-    reports no cache figures must not grow empty columns."""
-    row = (
-        f"{label:<14} {_tokens(usage.input_tokens):>11} in · {_tokens(usage.output_tokens):>9} out"
-    )
-    if turns is not None:
-        row += f" · {turns} turn{'s' if turns != 1 else ''}"
-        if jobs:
-            row += f"/{jobs} job{'s' if jobs != 1 else ''}"
-    if usage.cache_read_tokens is not None:
-        row += f" · {_tokens(usage.cache_read_tokens)} cached"
-    return row
-
-
-def _usage_rows(
-    rows: dict[str, Usage],
-    turns: dict[str, int] | None = None,
-    jobs: dict[str, int] | None = None,
-) -> list[str]:
-    """Biggest spender first — the answer to "where did it go?" is the top line."""
-    ordered = sorted(
-        rows.items(), key=lambda kv: -((kv[1].input_tokens or 0) + (kv[1].output_tokens or 0))
-    )
-    return [
-        _usage_row(
-            label,
-            usage,
-            turns=None if turns is None else turns.get(label, 0),
-            jobs=None if jobs is None else jobs.get(label, 0),
-        )
-        for label, usage in ordered
-    ]
-
-
-# No backend reports a spend figure in a known unit, so every usage block ends
-# with the same plain statement rather than a number. The concierge repeats
-# this line in Discord as fact, and a zero or a fabricated figure would be
-# repeated just as confidently (#386, #439).
-_SPEND_NOT_REPORTED = "spend: not reported by the agent backend (tokens above are the whole record)"
+# The usage renderers live in daemon/usage.py, shared with the console.
+_usage_row = usage_row
+_usage_rows = usage_rows
+_SPEND_NOT_REPORTED = SPEND_NOT_REPORTED
 
 
 def _clip(text: str, limit: int) -> str:

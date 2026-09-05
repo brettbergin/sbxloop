@@ -99,8 +99,47 @@ class Gated(NamedTuple):
     head: str
 
 
+class AwaitingReview(NamedTuple):
+    """Every bar the loop can clear is cleared, and the base wants an
+    approving review the loop cannot give its own pull request (#675). Not
+    a block: a person on GitHub ends it. ``approvals_have`` counts the
+    standing human approvals (the loop's own excluded) — informational,
+    GitHub's ``mergeable_state`` is the authority.
+
+    ``draft`` is the other wait a person ends (#677): the PR is a draft the
+    loop did not make — someone converted it back — and marking it ready
+    for review is theirs to do. No approval count applies; the landing
+    resumes when the PR is ready."""
+
+    approvals_required: int
+    approvals_have: int
+    code_owners: bool
+    head: str
+    draft: bool = False
+
+    @property
+    def wanted(self) -> str:
+        """The bar, in words: "an approving review", "2 approving reviews",
+        with the code-owner review named when it is one; for a draft hold,
+        the PR marked ready for review."""
+        if self.draft:
+            return "the pull request marked ready for review (a person converted it to draft)"
+        if self.approvals_required <= 1 and not self.code_owners:
+            return "an approving review"
+        count = (
+            "an approving review"
+            if self.approvals_required <= 1
+            else f"{self.approvals_required} approving reviews"
+        )
+        return f"{count} from a code owner" if self.code_owners else count
+
+
 class Blocked(NamedTuple):
     why: str
+    # The base's rules the loop cannot satisfy, one per rule (#673) —
+    # empty when the block is not about the base's rules, or they could
+    # not be read.
+    blockers: tuple[str, ...] = ()
 
 
 class HumanObjection(NamedTuple):
@@ -139,7 +178,7 @@ class Closed(NamedTuple):
     why: str
 
 
-LandingOutcome = Landed | Gated | Blocked | NeedsFix | Closed
+LandingOutcome = Landed | Gated | AwaitingReview | Blocked | NeedsFix | Closed
 
 
 class CiTimeout(Exception):
@@ -170,9 +209,13 @@ def poll_checks(
     clock: Callable[[], float] = time.monotonic,
     settle_from: float | None = None,
     policy: CheckPolicy = NO_POLICY,
+    policy_for: PolicyFor | None = None,
 ) -> CheckJudgment:
     """Wait for the checks on ``head_sha`` to reach a final state, judged
-    under ``policy`` (:mod:`sbxloop.engine.checks`, #611).
+    under ``policy`` (:mod:`sbxloop.engine.checks`, #611) — or, when
+    ``policy_for`` is given, under what it answers for ``head_sha`` on
+    each poll: a base whose rules cannot be read learns its required
+    checks from the pull request as they report (#674).
 
     ``red`` returns immediately — the build is known broken and waiting on
     stragglers only delays the fix. ``green`` with check runs present
@@ -192,7 +235,7 @@ def poll_checks(
     last: CheckJudgment | None = None
     while True:
         verdict = ops.pr_checks(repo, head_sha)
-        checks = judge_checks(verdict, policy)
+        checks = judge_checks(verdict, policy_for(head_sha) if policy_for else policy)
         if checks != last:
             emit(
                 state=checks.state,
@@ -602,15 +645,31 @@ def land(
     bot_round_spent: bool = False,
     is_bot: bool | None = None,
     settle_from: float | None = None,
+    own_draft: bool = True,
 ) -> LandingOutcome:
     """Drive the PR to a landing decision, polling until one is reached.
 
     Returns ``Landed`` (merged — by the loop or, if someone beat it to it,
     by a human), ``Blocked`` (GitHub will not finish it and no round would
-    change that), ``NeedsFix`` (something a fix round can change: red CI, a
-    conflict with the base, a human's objection) or ``Closed`` (someone
-    closed the PR unmerged). ``ci_timeout_s`` bounds the whole wait; a
-    landing that has not settled by then is ``Blocked`` too.
+    change that), ``AwaitingReview`` (the only bar left is a review the
+    loop cannot give its own PR, #675 — a person on GitHub ends it),
+    ``NeedsFix`` (something a fix round can change: red CI, a conflict
+    with the base, a human's objection) or ``Closed`` (someone closed the
+    PR unmerged). ``ci_timeout_s`` bounds the whole wait; a landing that
+    has not settled by then is ``Blocked`` too.
+
+    A base that merges through a merge queue (#676) is not merged by the
+    loop at all: where the merge would happen, every other bar cleared,
+    the PR is enqueued and the queue is polled — see
+    :func:`_through_queue`.
+
+    ``own_draft`` is whether a draft seen on entry is the loop's own — it
+    delivered the PR as one (``deliver_draft``) and has not yet cleared
+    it. That draft is cleared, once. A draft seen after the loop cleared
+    it, or on entry when ``own_draft`` is False (a parked landing
+    re-entering, a resume after the loop's un-draft), is a person's
+    hold (#677): the landing does not un-draft over them, it parks
+    ``AwaitingReview(draft=True)`` until they mark the PR ready.
 
     ``review_posted`` is whether the round that approved this PR actually
     got its review onto GitHub. False blocks the merge: a run whose review
@@ -664,10 +723,20 @@ def land(
         if str(pr.get("state") or "") == "closed":
             return Closed("the pull request was closed without being merged")
         if pr.get("draft"):
+            if not own_draft:
+                # A draft the loop did not make (#677): a person converted
+                # the PR back, and that is a hold — un-drafting over them
+                # would be the loop overruling a human. They end it.
+                held = _head_sha(pr)
+                emit("land.held_by_draft", pr=number, head=held)
+                return AwaitingReview(0, 0, False, held, draft=True)
             ready = _undraft(ops, node_id or _str(pr.get("node_id")))
             if not ready:
                 return Blocked("its draft status could not be cleared")
             emit("land.undraft", pr=number)
+            # The loop's own draft is cleared once; a draft after this is
+            # a person's (#677).
+            own_draft = False
             # GitHub reports a draft's mergeable_state as `draft`; the real
             # merge state only becomes readable on the next read.
             tick("undraft")
@@ -749,7 +818,7 @@ def land(
                     emit=functools.partial(emit, "landing.checks", pr=number, head=head),
                     clock=clock,
                     settle_from=head_seen[1],
-                    policy=policy,
+                    policy_for=policy_for,
                 )
             except CiTimeout as exc:
                 return Blocked(str(exc))
@@ -819,7 +888,21 @@ def land(
                 blocked_at = head
                 tick("mergeability")
                 continue
-            return Blocked(blocked_reason(policy.requirements, cfg))
+            if not queue_only(policy.requirements, cfg, is_bot=is_bot):
+                return refused_by_base(
+                    ops,
+                    repo,
+                    number,
+                    policy.requirements,
+                    cfg,
+                    head=head,
+                    login=login,
+                    is_bot=is_bot,
+                )
+            # The only rule left is the merge queue itself (#676). Whether
+            # GitHub reports a queue-bound PR as `blocked` before it is
+            # queued is field-unverified; the enqueue below is GitHub's
+            # own verdict either way, and its refusal is the block.
         # #520 step 5: the last gates before the merge are about the review
         # record itself. A run that could not post its approving review has
         # no review on the PR at all (#503), and a PR whose findings are
@@ -857,6 +940,24 @@ def land(
         if bot_reviewers and ("comment", *bot_reviewers) not in bots_named:
             bots_named.add(("comment", *bot_reviewers))
             _say(ops, repo, number, bot_review_comment(bot_reviewers))
+        if policy.requirements.merge_queue:
+            # The base merges through its queue (#676): the queue's own
+            # merge method applies, and PUT /merge would only be refused.
+            return _through_queue(
+                ops,
+                repo,
+                number,
+                node_id=node_id or _str(pr.get("node_id")),
+                head=head,
+                requirements=policy.requirements,
+                cfg=cfg,
+                login=login,
+                is_bot=is_bot,
+                tick=tick,
+                emit=emit,
+                clock=clock,
+                started=started,
+            )
         if method is None:
             # Resolved once per landing, last of all (#620): an explicit
             # method the repository refuses is a block, never a substitute.
@@ -872,10 +973,38 @@ def land(
             log.info("land.merge_stale", repo=repo, pr=number, detail=outcome.reason)
             tick("merge")
             continue
+        if outcome.blocked and names_merge_queue(outcome.reason):
+            # The rules could not be read, but GitHub's refusal names the
+            # queue itself (#676): enter it rather than hand over.
+            return _through_queue(
+                ops,
+                repo,
+                number,
+                node_id=node_id or _str(pr.get("node_id")),
+                head=head,
+                requirements=policy.requirements,
+                cfg=cfg,
+                login=login,
+                is_bot=is_bot,
+                tick=tick,
+                emit=emit,
+                clock=clock,
+                started=started,
+            )
         if outcome.blocked:
             # A bare 405 says "not mergeable" and nothing more. The base's
             # rules say what (#620); GitHub's own words ride along.
-            return Blocked(blocked_reason(policy.requirements, cfg, detail=outcome.reason))
+            return refused_by_base(
+                ops,
+                repo,
+                number,
+                policy.requirements,
+                cfg,
+                head=head,
+                login=login,
+                is_bot=is_bot,
+                detail=outcome.reason,
+            )
         if cfg.delete_branch_on_merge and branch:
             try:
                 ops.branch_delete(repo, branch)
@@ -884,6 +1013,120 @@ def land(
                 # not a failure of the thing that just succeeded.
                 log.warning("land.branch_delete_failed", repo=repo, branch=branch, exc_info=True)
         return Landed(outcome.sha)
+
+
+def queue_only(requirements: BaseRequirements, cfg: LandingConfig, *, is_bot: bool | None) -> bool:
+    """Whether the merge queue is the only rule of the base the loop does
+    not satisfy on its own (#676) — every other blocker, a review the
+    loop cannot give included, comes first."""
+    return requirements.merge_queue and not base_blockers(requirements, cfg, can_sign=bool(is_bot))
+
+
+def names_merge_queue(detail: str) -> bool:
+    """Whether GitHub's refusal of a merge names the merge queue (#676).
+    The wording is GitHub's and field-unverified; the rules read from
+    the base are the primary signal, this the fallback when they could
+    not be read."""
+    return "merge queue" in detail.lower()
+
+
+def _through_queue(
+    ops: GithubOps,
+    repo: str,
+    number: int,
+    *,
+    node_id: str | None,
+    head: str,
+    requirements: BaseRequirements,
+    cfg: LandingConfig,
+    login: str,
+    is_bot: bool | None,
+    tick: Tick,
+    emit: Emit,
+    clock: Callable[[], float],
+    started: float,
+) -> Landed | Blocked | AwaitingReview | NeedsFix | Closed:
+    """Land through the base's merge queue (#676): enqueue the head the
+    landing judged, then poll the queue until it merges the PR, removes
+    it, or the landing's ``ci_timeout_s`` runs out.
+
+    A removal is the queue's verdict on the PR *combined with what is
+    ahead of it*: its checks ran on the queue's own merge-group commit,
+    not the PR's head, so that commit's red checks are what the fix round
+    gets. A removal with no red check to name is a block, not a round —
+    a human dequeued it, or the queue said something the loop cannot
+    read — because a fix round with nothing to fix is budget burn.
+
+    A timeout leaves the PR in the queue: the queue merges or removes it
+    on its own, and pulling it out would throw away a merge about to
+    happen. The run ends ``Blocked`` naming that, and the daemon's
+    settle sees the merge when it comes.
+
+    A refused enqueue is the queue's 405: when the base's other rules
+    say what GitHub wants — a review, a signature — the outcome is
+    theirs (:func:`refused_by_base`, a park or a block naming each rule)
+    with GitHub's words riding along; when the queue was the only rule
+    left, GitHub's words are all there is.
+    """
+    if not node_id:
+        return Blocked("the base uses a merge queue and the pull request's node id is unknown")
+    before = ops.pr_queue_state(repo, number)
+    if before.merged:
+        return Landed(before.merge_sha, by_human=True)
+    if before.closed:
+        return Closed("the pull request was closed without being merged")
+    if before.entry is None:
+        try:
+            entry = ops.pr_enqueue(node_id, head=head)
+        except GithubOpsError as exc:
+            detail = f"GitHub refused to enqueue the pull request: {exc}"
+            if not queue_only(requirements, cfg, is_bot=is_bot):
+                return refused_by_base(
+                    ops,
+                    repo,
+                    number,
+                    requirements,
+                    cfg,
+                    head=head,
+                    login=login,
+                    is_bot=is_bot,
+                    detail=detail,
+                )
+            return Blocked(f"the base uses a merge queue and {detail}")
+        emit("land.enqueued", pr=number, head=head, position=entry.position, resumed=False)
+    else:
+        # Already queued — a resume, or a parked landing re-entering while
+        # the queue still holds it. Watch it rather than enqueue twice.
+        entry = before.entry
+        emit("land.enqueued", pr=number, head=head, position=entry.position, resumed=True)
+    queue_head = entry.head
+    while True:
+        if clock() - started >= cfg.ci_timeout_s:
+            return Blocked(
+                f"still in the merge queue after ci_timeout_s={cfg.ci_timeout_s:g}s; the "
+                "queue merges or removes it on its own"
+            )
+        tick("queue")
+        state = ops.pr_queue_state(repo, number)
+        if state.merged:
+            return Landed(state.merge_sha)
+        if state.closed:
+            return Closed("the pull request was closed without being merged")
+        if state.entry is not None:
+            queue_head = state.entry.head or queue_head
+            continue
+        reason = state.removed_reason if state.removals > before.removals else ""
+        failed = tuple(ops.checks_failed_logs(repo, queue_head)) if queue_head else ()
+        names = [c.name for c in failed]
+        emit("land.dequeued", pr=number, head=head, reason=reason, failed=names)
+        why = "the merge queue removed the pull request" + (f" ({reason})" if reason else "")
+        if failed:
+            return NeedsFix(
+                "ci",
+                f"{why}: its checks failed in the queue — {', '.join(names)}",
+                failed_checks=failed,
+            )
+        return Blocked(f"{why}, with no failing check of its own to fix; a human has to look")
 
 
 # The repository payload's flag for each merge method (GitHub's names).
@@ -945,30 +1188,108 @@ def _repo_payload(ops: GithubOps, repo: str) -> dict[str, Any] | None:
         return None
 
 
-def blocked_reason(requirements: BaseRequirements, cfg: LandingConfig, *, detail: str = "") -> str:
-    """Why GitHub will not merge a PR whose checks are green (#620): what
-    the base's rules are known to want, else the usual suspects — and
-    the one knob that helps when a review is the bar."""
-    if requirements.requires_reviews:
-        why = (
-            "the base branch requires an approving review, which the loop cannot give "
-            "its own pull request"
+def refused_by_base(
+    ops: GithubOps,
+    repo: str,
+    number: int,
+    requirements: BaseRequirements,
+    cfg: LandingConfig,
+    *,
+    head: str,
+    login: str,
+    is_bot: bool | None,
+    detail: str = "",
+) -> AwaitingReview | Blocked:
+    """GitHub will not merge a PR whose checks are green: the base's rules
+    want something. When the *only* thing they want is a review the loop
+    cannot give its own pull request — an approval count, a code owner —
+    that is a wait for a person, not a block (#675): :class:`AwaitingReview`,
+    with the standing human approvals counted so the caller can say how
+    far along it is. Anything else the loop cannot supply, or rules it
+    could not read, is :func:`blocked_by_base` as before."""
+    can_sign = bool(is_bot)
+    if (requirements.approvals_required or requirements.code_owner_review) and not base_blockers(
+        requirements, cfg, can_sign=can_sign, can_approve=True
+    ):
+        verdicts = ops.pr_review_verdicts(repo, number, exclude=(login, is_bot))
+        have = sum(1 for v in verdicts if v.state == "APPROVED" and not v.is_bot)
+        return AwaitingReview(
+            approvals_required=requirements.approvals_required or 0,
+            approvals_have=have,
+            code_owners=requirements.code_owner_review,
+            head=head,
         )
-        if cfg.merge_gate != "chat":
-            why += ' — set `[landing] merge_gate = "chat"` to have a person approve from chat'
-    elif requirements.requires_reviews is None:
+    return blocked_by_base(requirements, cfg, detail=detail, can_sign=can_sign)
+
+
+def blocked_by_base(
+    requirements: BaseRequirements,
+    cfg: LandingConfig,
+    *,
+    detail: str = "",
+    can_sign: bool = False,
+) -> Blocked:
+    """The outcome for a PR GitHub will not merge with its checks green:
+    :func:`blocked_reason` as the run's verdict, and the base's blockers
+    (#673) for the event and the transcript."""
+    blockers = base_blockers(requirements, cfg, can_sign=can_sign)
+    return Blocked(blocked_reason(requirements, cfg, detail=detail, can_sign=can_sign), blockers)
+
+
+def base_blockers(
+    requirements: BaseRequirements,
+    cfg: LandingConfig,
+    *,
+    can_sign: bool = False,
+    can_approve: bool = False,
+) -> tuple[str, ...]:
+    """The base's rules the loop as configured cannot satisfy (#673).
+    ``can_approve`` leaves out the review rules a person on GitHub
+    satisfies (#675)."""
+    return tuple(
+        requirements.blockers(
+            can_approve=can_approve, can_sign=can_sign, merge_method=cfg.merge_method
+        )
+    )
+
+
+_UNREAD_NAMES = {"protection": "classic branch protection", "rulesets": "rulesets"}
+
+
+def blocked_reason(
+    requirements: BaseRequirements,
+    cfg: LandingConfig,
+    *,
+    detail: str = "",
+    can_sign: bool = False,
+) -> str:
+    """Why GitHub will not merge a PR whose checks are green (#620): every
+    rule of the base the loop is known not to satisfy, one per line
+    (#673); else the usual suspects. A review alone is never the reason —
+    that is a wait, not a block (:func:`refused_by_base`, #675)."""
+    blockers = base_blockers(requirements, cfg, can_sign=can_sign)
+    if blockers:
+        why = "the base branch's rules require what the loop cannot supply:\n" + "\n".join(
+            f"- {reason}" for reason in blockers
+        )
+    elif requirements.source == "unknown" or requirements.unread:
+        unread = " and ".join(_UNREAD_NAMES.get(name, name) for name in requirements.unread)
         why = (
             "GitHub reports the pull request as blocked with every check green, and the "
-            "base's protection could not be read; the usual causes are a required "
-            "review, a CODEOWNERS review, required conversation resolution, or a merge "
-            "queue"
+            f"base's {unread or 'protection'} could not be read"
+            + (
+                " (reading classic protection needs admin)"
+                if "protection" in requirements.unread
+                else ""
+            )
+            + "; the usual causes are a required review, a CODEOWNERS review, or required "
+            "conversation resolution"
         )
     else:
         why = (
             "GitHub reports the pull request as blocked with every check green; the "
-            "base's rules require something the loop cannot supply — a CODEOWNERS "
-            "review, required conversation resolution, a merge queue, or a check the "
-            "loop does not see"
+            "base's rules require something the loop cannot supply — a rule it does not "
+            "read, or a check it does not see"
         )
     if detail:
         why += f" (GitHub: {detail})"

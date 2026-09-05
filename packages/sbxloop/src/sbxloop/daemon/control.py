@@ -28,13 +28,14 @@ import os
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, get_args
 
-from sbxloop.daemon.discord_format import code, items_lines, queue_lines
+from sbxloop.daemon.discord_format import _one_line, code, items_lines, queue_lines
 from sbxloop.daemon.holds import OPERATOR_HOLD
 from sbxloop.ghids import normalize_item_id
-from sbxloop.log import get_logger
+from sbxloop.log import LogLevel, get_logger, log_buffer
 
 log = get_logger(__name__)
 
@@ -44,7 +45,7 @@ log = get_logger(__name__)
 COMMANDS: tuple[str, ...] = (
     "status",
     "pause [--hold NAME]",
-    "resume [--hold NAME|--all]",
+    "resume [<item|run>|--hold NAME|--all]",
     "cancel [--retry]",
     "queue",
     "items",
@@ -54,6 +55,8 @@ COMMANDS: tuple[str, ...] = (
     "merge <item|run>",
     "grant-rounds <run> <n>",
     "resume-repo <owner/name>",
+    "log [--tail N] [--level LEVEL] [--grep TEXT]",
+    "stop",
 )
 # Verbs that may talk to the source (GitHub through the ops sandbox —
 # seconds, not milliseconds); a surface with an event loop to protect runs
@@ -88,6 +91,13 @@ class CommandReply(NamedTuple):
     # structurally rather than sniffed out of ``text`` so the client can
     # resend without matching on prose.
     stale: bool = False
+    #: The text is a preformatted block (a log tail): chat fences it, the
+    #: CLI prints it as is.
+    preformatted: bool = False
+    #: An effect that must follow the acknowledgement — `stop` sets the
+    #: daemon's stop flag only once the reply is on its way, so a chat
+    #: bridge is not torn down under its own answer.
+    after: Callable[[], None] | None = None
 
 
 # Item verbs talk to GitHub through the ops sandbox (#229): a live `abandon`
@@ -102,7 +112,102 @@ def usage(prefix: str) -> str:
 
 # Read-only commands: answered constantly by dashboards and humans checking
 # in, so they trace at DEBUG; every mutating command is an INFO audit line.
-_READ_ONLY_COMMANDS = frozenset({"status", "queue", "items"})
+_READ_ONLY_COMMANDS = frozenset({"status", "queue", "items", "log"})
+
+#: The daemon's log levels, as ``log`` accepts them — the one list
+#: ``[daemon] log_level`` accepts, so the three surfaces cannot drift.
+LOG_LEVELS: tuple[str, ...] = tuple(get_args(LogLevel))
+#: ``log`` returns at most this many records; the ring buffer holds 2000.
+LOG_TAIL_MAX = 500
+
+
+def format_log_tail(
+    *,
+    tail: int = 50,
+    level: str | None = None,
+    grep: str | None = None,
+    line_clip: int = 400,
+    max_chars: int | None = None,
+) -> str:
+    """The daemon's recent log records from the in-process ring buffer,
+    rendered for an operator — the journal without ssh. One implementation
+    for `!sbx log`, `ctl log` and the concierge's `daemon_log` tool.
+
+    ``tail`` is clamped to ``LOG_TAIL_MAX``; ``level`` keeps records at or
+    above it (an unknown name is a message, not an exception); ``grep`` is
+    a plain case-insensitive substring, never a pattern. ``max_chars``
+    (a chat message's limit) trims the *oldest* lines until the block
+    fits — a tail asked for is the newest lines, and a transport that
+    clipped the end would show the oldest.
+    """
+    tail = max(1, min(LOG_TAIL_MAX, tail))
+    level = (level or "").strip().upper() or None
+    buffer = log_buffer()
+    size = len(buffer)
+    try:
+        records = buffer.tail(tail, level=level, grep=grep or None)
+    except ValueError:
+        return f"unknown log level {level!r} — use one of {', '.join(LOG_LEVELS)}"
+    filters: list[str] = []
+    if level:
+        filters.append(f"level={level}")
+    if grep:
+        filters.append(f"grep={grep!r}")
+    suffix = f" ({', '.join(filters)})" if filters else ""
+    if not records:
+        return f"no matching log records{suffix}; the buffer holds {size} lines"
+    lines = [f"{r.timestamp} {r.level} {r.logger} {_one_line(r.line, line_clip)}" for r in records]
+    trimmed = 0
+    if max_chars is not None:
+        budget = max(200, max_chars) - 120  # room for the head line
+        while len(lines) > 1 and sum(len(line) + 1 for line in lines) > budget:
+            lines.pop(0)
+            trimmed += 1
+    head = f"showing {len(lines)} of {size} buffered log records{suffix}"
+    if trimmed:
+        head += f"; {trimmed} older line(s) trimmed to fit the message"
+    return "\n".join([head, *lines])
+
+
+_LOG_USAGE = f"usage: log [--tail N] [--level {'|'.join(LOG_LEVELS)}] [--grep TEXT]"
+
+
+def _log_args(args: list[str]) -> tuple[int, str | None, str | None] | str:
+    """``--tail N``, ``--level L`` anywhere on the line, ``--grep TEXT…``
+    taking every word that is not one of those flags (so the flags may
+    follow it); surrounding quotes on the grep text are dropped, since
+    chat hands the line over unshelled. A usage message for anything
+    else, including a tail that is not a whole number of 1 or more."""
+    tail, level = 50, None
+    grep_words: list[str] = []
+    grepping = False
+    i = 0
+    while i < len(args):
+        word = args[i]
+        if word == "--tail":
+            if i + 1 >= len(args) or not args[i + 1].isdecimal() or int(args[i + 1]) < 1:
+                return _LOG_USAGE
+            tail = int(args[i + 1])
+            i += 2
+        elif word == "--level":
+            if i + 1 >= len(args) or args[i + 1].strip().upper() not in LOG_LEVELS:
+                return _LOG_USAGE
+            level = args[i + 1].strip().upper()
+            i += 2
+        elif word == "--grep":
+            grepping = True
+            i += 1
+        elif grepping:
+            grep_words.append(word)
+            i += 1
+        else:
+            return _LOG_USAGE
+    if grepping and not grep_words:
+        return _LOG_USAGE
+    grep = " ".join(grep_words) or None
+    if grep and len(grep) >= 2 and grep[0] == grep[-1] and grep[0] in "\"'":
+        grep = grep[1:-1] or None
+    return tail, level, grep
 
 
 def dispatch(
@@ -112,6 +217,7 @@ def dispatch(
     prefix: str = "!sbx",
     by: str | None = None,
     via: str = "ctl",
+    max_chars: int | None = None,
 ) -> CommandReply:
     """Run one operator command against the daemon loop.
 
@@ -119,7 +225,9 @@ def dispatch(
     the same control surface); ``cmd`` is the text after the prefix;
     ``prefix`` is only echoed in the usage line; ``by`` names the operator
     for the source-facing attribution of cancel/retry (#246); ``via`` says
-    which channel carried it (``ctl`` / ``discord``) for the audit line.
+    which channel carried it (``ctl`` / ``discord``) for the audit line;
+    ``max_chars`` is the carrying message's limit, for replies that must
+    fit it newest-first (``log``).
 
     Every command leaves a host-side record — who asked for what, over
     which channel, and whether it was accepted — so a cancel or abandon
@@ -128,7 +236,11 @@ def dispatch(
     words = cmd.split()
     word = words[0].lower() if words else ""
     args = words[1:]
-    reply = _dispatch(loop, word, args, prefix=prefix, by=by)
+    reply = _dispatch(loop, word, args, prefix=prefix, by=by, max_chars=max_chars)
+    if word == "log":
+        # Not traced: the trace would land in the very buffer `log` reads,
+        # and a console polling it would evict real records with echoes.
+        return reply
     level = "debug" if word in _READ_ONLY_COMMANDS and reply.ok else "info"
     getattr(log, level)(
         "operator.command",
@@ -150,15 +262,21 @@ def _tz(status: dict[str, Any]) -> str:
 
 
 def _dispatch(
-    loop: Any, word: str, args: list[str], *, prefix: str, by: str | None
+    loop: Any,
+    word: str,
+    args: list[str],
+    *,
+    prefix: str,
+    by: str | None,
+    max_chars: int | None = None,
 ) -> CommandReply:
     if word == "status":
         s = loop.status()
         cur = s["current"]
         claiming = s.get("claiming")
-        # `current:` is the line the deploy pipeline greps for idleness; a
-        # claim in progress is reported there too, so a restart is never
-        # timed into the claim window (#530).
+        # A claim in progress is reported as current too, so a reader never
+        # times a restart into the claim window (#530). Scripts read the
+        # structured dict (`ctl status --json`, #639), never this prose.
         if cur:
             current = f"{cur['run_id']} — {cur['title']}"
         elif claiming:
@@ -174,6 +292,8 @@ def _dispatch(
             f"**breaker:** {'open' if s['breaker_open'] else 'closed'} · **paused:** {s['paused']}",
             f"**holds:** {', '.join(holds) if holds else 'none'}",
         ]
+        if s.get("stopping"):
+            lines.append("**stopping:** yes — nothing new is claimed; exits after the current run")
         repos = [r for r in (s.get("repos") or []) if isinstance(r, dict)]
         unwell = [r for r in repos if r.get("state") != "ok"]
         if unwell:
@@ -201,6 +321,13 @@ def _dispatch(
             f"nothing new is claimed. holds: {', '.join(holds)}"
         )
     if word in ("resume", "unpause"):
+        if len(args) == 1 and not args[0].startswith("-"):
+            # `resume <item|run>`: a PR waiting for a review (#675) — check
+            # it now, or re-arm a wait that paused. Not the daemon's holds.
+            try:
+                return CommandReply(loop.resume_review(args[0], by))
+            except ValueError as exc:
+                return CommandReply(f"resume failed: {exc.args[0] if exc.args else exc}", ok=False)
         hold, err = _hold_arg(args, word, prefix, allow_all=True)
         if err is not None:
             return err
@@ -253,6 +380,30 @@ def _dispatch(
         except (KeyError, ValueError) as exc:
             return CommandReply(f"resume-repo failed: {exc.args[0] if exc.args else exc}", ok=False)
         return CommandReply(f"polling {code(health['repo'])} again from the next tick.")
+    if word == "log":
+        parsed = _log_args(args)
+        if isinstance(parsed, str):
+            return CommandReply(parsed, ok=False)
+        tail, level, grep = parsed
+        text = format_log_tail(tail=tail, level=level, grep=grep, max_chars=max_chars)
+        if text.startswith("unknown log level"):
+            return CommandReply(text, ok=False)
+        return CommandReply(text, preformatted=True)
+    if word == "stop":
+        if args:
+            return CommandReply(
+                "usage: stop — no arguments (use `cancel` to stop the run)", ok=False
+            )
+        # The flag is set by `after`, once the caller has the reply on its
+        # way: a chat bridge would otherwise be closed under its own answer.
+        return CommandReply(
+            "stopping: nothing new is claimed; the daemon exits once the current run and "
+            "any landing it is completing finish (`cancel` first to stop that run now). "
+            "Under a service manager that restarts it (the shipped unit does, after 30 s) "
+            "this is a restart that drops in-memory holds — `pause` keeps it off work "
+            "for good.",
+            after=loop.request_stop,
+        )
     if word in ("merge", "approve"):
         # The opt-in merge gate's approval ([landing] merge_gate). Fast:
         # it only flips the store row and spawns the landing thread, so it
@@ -292,7 +443,9 @@ def _hold_arg(
     name, ``"--all"``, or ``None`` for the operator's default hold — or a
     not-ok reply for anything else, so a typo can never become a silent
     bare pause/resume of the wrong hold."""
-    usage_line = f"usage: `{prefix} {word} [--hold NAME" + ("|--all]`" if allow_all else "]`")
+    usage_line = f"usage: `{prefix} {word} [" + (
+        "<item|run>|--hold NAME|--all]`" if allow_all else "--hold NAME]`"
+    )
     if not args:
         return None, None
     if allow_all and args == ["--all"]:
@@ -350,10 +503,14 @@ def _write_atomic(path: Path, payload: dict[str, Any]) -> None:
 def _reply_from(data: dict[str, Any]) -> CommandReply:
     """Decode a reply file. ``stale`` defaults False so a reply written by an
     older daemon (which had no such field) reads as a normal refusal rather
-    than sending the client into a resend loop."""
+    than sending the client into a resend loop; ``status`` is the structured
+    status dict when the daemon wrote one (#639) — a daemon from before that
+    answers ``status`` with prose only, and the client says so."""
+    status = data.get("status")
     return CommandReply(
         str(data.get("text", "")),
         bool(data.get("ok", True)),
+        status=status if isinstance(status, dict) else None,
         stale=bool(data.get("stale", False)),
     )
 
@@ -371,8 +528,15 @@ def _operator() -> str:
 class ControlClient:
     """The ``sbxloop daemon ctl`` side: submit a request, wait for the reply."""
 
-    def __init__(self, state_dir: Path) -> None:
+    def __init__(
+        self, state_dir: Path, *, by: str | None = None, prefix: str | None = None
+    ) -> None:
         self.dir = state_dir / CTL_SUBDIR
+        # Who the daemon attributes the request to (the source hears
+        # "cancelled by brett via sbxloop tui"); the CLI's login-name
+        # default when unset. ``prefix`` only shapes usage lines.
+        self.by = by
+        self.prefix = prefix or "sbxloop daemon ctl"
 
     def submit(self, cmd: str, *, timeout_s: float = DEFAULT_TIMEOUT_S) -> CommandReply | None:
         """Returns None when no daemon *took* the request within
@@ -434,7 +598,7 @@ class ControlClient:
             {
                 "cmd": cmd,
                 "prefix": "sbxloop daemon ctl",
-                "by": _operator(),
+                "by": self.by or _operator(),
                 "submitted_at": time.time(),
             },
         )
@@ -584,6 +748,8 @@ class ControlServer:
                 log.warning("ctl.command_crashed", by=by, command=cmd[:200], exc_info=True)
                 reply = CommandReply(f"error: {exc}", ok=False)
             self._answer(request, reply)
+            if reply.after is not None:
+                reply.after()
             served += 1
         self._sweep_replies()
         return served
@@ -591,15 +757,17 @@ class ControlServer:
     def _answer(self, request: Path, reply: CommandReply) -> None:
         stem = request.name.removesuffix(_CLAIMED_SUFFIX).removesuffix(_REQUEST_SUFFIX)
         reply_path = request.with_name(stem + _REPLY_SUFFIX)
-        _write_atomic(
-            reply_path,
-            {
-                "ok": reply.ok,
-                "text": reply.text,
-                "answered_at": time.time(),
-                "stale": reply.stale,
-            },
-        )
+        payload: dict[str, Any] = {
+            "ok": reply.ok,
+            "text": reply.text,
+            "answered_at": time.time(),
+            "stale": reply.stale,
+        }
+        if reply.status is not None:
+            # The structured twin of the prose, so `ctl status --json` (#639)
+            # gives scripts the same dict the chat card renders from.
+            payload["status"] = json.loads(json.dumps(reply.status, default=str))
+        _write_atomic(reply_path, payload)
         request.unlink(missing_ok=True)
 
     def _sweep_replies(self) -> None:

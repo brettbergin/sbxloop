@@ -284,6 +284,52 @@ class TestReadCheckPolicy:
         assert len(protection_reads) == 1
         assert fake.checks_calls == ["base123", "base123"]
 
+    def test_an_unreadable_base_learns_its_required_checks_from_the_pr(self) -> None:
+        """#674: classic protection is admin-only; with the PR's number the
+        reader asks the rollup which checks GitHub holds the merge for —
+        and asks again on every poll, since the rollup only lists what has
+        reported so far."""
+        fake = FakeGithub()
+        fake.protection_forbidden = True
+        fake.rollup_required = ("ci",)
+        policy_for = check_policy_reader(fake, "o/r", "main", cfg=LandingConfig(), number=7)
+        first = policy_for("head1")
+        assert first.requirements.required_contexts == ("ci",)
+        assert first.requirements.source == "pr-rollup"
+        assert first.requirements.unread == ("protection",)
+        assert first.baseline_sha == "base123", "the baseline is read as before"
+        fake.rollup_required = ("ci", "lint")
+        assert policy_for("head1").requirements.required_contexts == ("ci", "lint")
+        assert fake.rollup_calls == 2
+        assert fake.checks_calls == ["base123"], "the baseline stays cached per head"
+        judged = judge_checks(verdict(passed=("ci",), pending=("docs",)), policy_for("head1"))
+        assert judged.source == "pr-rollup"
+
+    def test_without_a_pr_number_or_a_rollup_the_base_stays_unknown(self) -> None:
+        fake = FakeGithub()
+        fake.protection_forbidden = True
+        fake.rollup_required = ("ci",)
+        assert (
+            check_policy_reader(fake, "o/r", "main", cfg=LandingConfig())("h").requirements.source
+            == "unknown"
+        )
+        assert fake.rollup_calls == 0
+        fake.rollup_required = None
+        policy_for = check_policy_reader(fake, "o/r", "main", cfg=LandingConfig(), number=7)
+        assert policy_for("h").requirements.source == "unknown"
+        assert (
+            judge_checks(verdict(passed=("ci",), pending=("docs",)), policy_for("h")).state
+            == "pending"
+        )
+
+    def test_a_readable_base_never_asks_the_rollup(self) -> None:
+        fake = FakeGithub()
+        fake.protection = {"required_status_checks": {"contexts": ["ci"]}}
+        fake.rollup_required = ("lint",)
+        policy_for = check_policy_reader(fake, "o/r", "main", cfg=LandingConfig(), number=7)
+        assert policy_for("h").requirements.required_contexts == ("ci",)
+        assert fake.rollup_calls == 0
+
     def test_no_policy_is_the_pre_611_judgment(self) -> None:
         assert NO_POLICY.baseline is None
         assert NO_POLICY.requirements.source == "unknown"

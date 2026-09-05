@@ -19,7 +19,12 @@ tests/unit/test_prompts.py):
 
 Variables: $outcome, $max_tasks, $project_gate, $config_override_example
 (rendered by verifylint.config_override_example for the run's resolved
-toolchains, #634); $retry_context (defaulted to "" by render());
+toolchains, #634); $pr_conventions (deliver.pr_conventions, #678 — defaulted
+to "" by render(), a paragraph only when the workspace has a title lint or a
+pull request template); $repo_conventions (engine.repocontext, #688 —
+defaulted to "" by render(), the repository's own instruction files under a
+heading when the workspace has any); $retry_context (defaulted to "" by
+render());
 $baseline_registries and $declarable_registries are injected from policy.py,
 never hardcoded (test_registry_tiers_are_injected_not_hardcoded).
 Examples are domain-neutral on purpose (#634): no issue or PR numbers, no
@@ -40,7 +45,9 @@ Section rules:
   (test_decompose_demands_an_upgrade_path_task_for_persisted_state, #524).
   The symptom-is-the-spec paragraph ("Symptom (as observed)", "Requested
   change", "a hint") must stay (test_decompose_treats_the_symptom_as_the_spec,
-  #535).
+  #535). The service-scoping rule ("external services the sandbox does not
+  have") must stay (test_decompose_scopes_verify_to_the_service_free_subset,
+  #682).
 -->
 
 # Decompose an outcome into a task graph
@@ -62,6 +69,16 @@ that does, and say so in the task description. A plan that deletes the
 retry loop when the person is seeing duplicate emails — sent by a second
 worker, not by retries — has done the wrong thing correctly.
 
+A **Discussion** section is the thread under the issue, oldest first, and
+a **Linked issues** section is what the thread refers to. Read them as a
+maintainer would: a later comment that narrows, corrects or re-scopes the
+body wins over the body, a linked issue's excerpt says how a related
+problem was framed or solved, and a clipping note means the thread is
+longer than what you see — plan against what is shown, not against a
+guess about the rest.
+
+$repo_conventions
+
 ## Rules
 
 - At most $max_tasks tasks. Prefer fewer, larger, coherent tasks over many
@@ -81,9 +98,9 @@ worker, not by retries — has done the wrong thing correctly.
   revision budget against something no revision can fix. They run under
   POSIX `sh -c` (not bash) from the **workspace root**: if the work lands
   in a subdirectory, every command must name it explicitly
-  (`cd app && .venv/bin/pytest`); a bare `test -f requirements.txt` fails
-  when the file lives one level down, and a test runner aimed at a
-  directory holding no project can exit 0 having tested nothing. Write
+  (`cd app && <test runner>`); a bare `test -f <manifest>` fails when the
+  file lives one level down, and a test runner aimed at a directory
+  holding no project can exit 0 having tested nothing. Write
   portable shell — `[ ]` not `[[ ]]`, `printf` for escape sequences, no
   here-strings, and never wrap a check in a shell of its own (no
   `sh -c`, `bash -c`, `sh -lc`, in any quoting: the runner already provides
@@ -102,19 +119,34 @@ worker, not by retries — has done the wrong thing correctly.
   flips — `uv run pytest` (`uv run …`) is required and `.venv/bin/...` is
   rejected, because uv builds the locked environment itself. Ruby:
   `bundle exec rspec`, never bare `rspec`/`rake`. PHP:
-  `./vendor/bin/phpunit`, never bare `phpunit`. Go/Rust/.NET/Node commands
-  are correctly bare (`go test`, `cargo test`, `dotnet test`, `npm test`).
+  `./vendor/bin/phpunit`, never bare `phpunit`. JavaScript: the client
+  and its scripts (`npm test`, `pnpm run lint`, `yarn run lint`,
+  `bun run lint` — whichever client the lockfile names) or
+  `npx --no-install <bin>`, never bare `eslint`/`jest`/`vitest`/`tsc`/
+  `prettier`/`mocha`. Go/Rust/.NET commands are correctly bare
+  (`go test`, `cargo test`, `dotnet test`).
   Never `sudo` or `apt` in a verify command: verification checks the work,
   it does not build the environment. Never `gh`, and never `curl`/`wget`
   against anything but a local address: a verify command judges the
   workspace, not the network — an API rate limit or a flake must not be
   able to fail work that is done. Check the local files or run the local
   tests instead.
+- If the suite needs **external services the sandbox does not have** — a
+  database, a broker, a browser, anything a compose file, a test-container
+  dependency or a `services:` block in the CI workflow provides — scope the
+  verify command to the subset that runs without them (a marker or tag
+  exclusion, a unit-only target, a directory the service-backed tests are
+  not in) and say so in the task's description. A verify command that
+  needs a service the sandbox lacks fails the same way on every attempt,
+  and the builder cannot change it.
   $project_gate
 - Never pass explicit paths to a config-driven tool whose file set is already
   pinned in the project's configuration (mypy `files`, ruff `include`/`src`,
   pytest `testpaths`; tsc's `include`; rubocop's `AllCops`/`Exclude`; a Go
-  build constraint and the tag that lifts it). An explicit path argument
+  build constraint and the tag that lifts it; mocha's `spec`; a Cargo
+  workspace's `default-members`; surefire's `excludes`; PHPUnit's
+  `<testsuites>`; a .NET solution filter; a CTest preset's `filter`). An
+  explicit path argument
   **overrides the configured file set** and drags in modules the project
   deliberately excludes — build hooks, generated code, vendored trees,
   integration suites — whose dependencies are not installed, so the command
@@ -132,6 +164,8 @@ worker, not by retries — has done the wrong thing correctly.
   a length limit, whatever they do). Say what the change does, not that
   it was automated. Leave it `null` when the workspace has no history to
   learn from.
+
+$pr_conventions
 
 ## The config-override, worked
 

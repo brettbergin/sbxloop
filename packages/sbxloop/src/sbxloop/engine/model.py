@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import fnmatch
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from graphlib import CycleError, TopologicalSorter
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+# What a run is for (#755). `code` is the developer loop: a task graph that
+# ends in a pull request. `workload` runs the operator persona through the
+# same run shape — sandboxes, store, events, thread — but its stages are
+# plan → execute → judge → publish, and its result is whatever the ask
+# named, not a PR. Persisted with the run; a resume never re-derives it.
+RunKind = Literal["code", "workload"]
 
 RunState = Literal[
     # the task graph
@@ -24,6 +32,12 @@ RunState = Literal[
     "fixing",
     "awaiting_ci",
     "landing",
+    # the workload stages (#755): the operator's plan, its execution, the
+    # judgment against the ask, and the publication of the result
+    "planning",
+    "executing",
+    "judging",
+    "publishing",
     # terminal
     "merged",
     "completed",
@@ -31,6 +45,7 @@ RunState = Literal[
     "blocked",
     "cancelled",
     "gated",
+    "awaiting_review",
 ]
 
 # The post-build stages in order. `runs.stage` records the last non-terminal
@@ -43,6 +58,17 @@ PIPELINE_STAGES: tuple[str, ...] = (
     "fixing",
     "awaiting_ci",
     "landing",
+)
+
+# A `workload` run's stages in order (#755). `planning` and `executing` are
+# the task graph under other names — a resume from either re-enters the
+# graph where it stopped, exactly as `decomposing`/`building` do for a code
+# run; `judging` and `publishing` re-enter themselves.
+WORKLOAD_STAGES: tuple[str, ...] = (
+    "planning",
+    "executing",
+    "judging",
+    "publishing",
 )
 
 TaskState = Literal[
@@ -67,8 +93,13 @@ TERMINAL_TASK_STATES: frozenset[str] = frozenset({"done", "failed", "skipped"})
 # cleared every bar and parked awaiting one human approval; the daemon's
 # approve path completes the landing with gh ops alone — no engine is
 # resurrected — so the state is terminal and deliberately NOT resumable.
+# `awaiting_review` (#675) is the run parked on a base that requires an
+# approving review the loop cannot give its own PR: every bar it can clear
+# is cleared, no sandbox is kept, and a person on GitHub ends the wait.
+# Terminal for liveness; resumable, because a reviewer's changes-requested
+# is a fix round the engine runs (`resume` re-enters the landing stage).
 TERMINAL_RUN_STATES: frozenset[str] = frozenset(
-    {"merged", "completed", "failed", "blocked", "cancelled", "gated"}
+    {"merged", "completed", "failed", "blocked", "cancelled", "gated", "awaiting_review"}
 )
 RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
     {
@@ -77,13 +108,30 @@ RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
         "decomposing",
         "building",
         *PIPELINE_STAGES,
+        *WORKLOAD_STAGES,
         "failed",
         "blocked",
         "cancelled",
+        "awaiting_review",
     }
 )
 
-Phase = Literal["decompose", "build", "verify", "gate", "review", "steer", "followup"]
+Phase = Literal[
+    "decompose",
+    "build",
+    "verify",
+    "gate",
+    "review",
+    "steer",
+    "followup",
+    # A workload's own phases: the operator's plan and execute rows, and
+    # the judge — per task (with a task_id) as the LLM verdict on one
+    # task's work, and once at the end (task_id None) as the mechanical
+    # re-check over the finished workspace.
+    "plan",
+    "execute",
+    "judge",
+]
 
 # What a fix round is for. `review` rounds are charged to the review budget;
 # everything else — a red gate, red CI, a base conflict, a human objecting on
@@ -122,6 +170,42 @@ class EgressSpec(_Model):
         return value
 
 
+class TaskNeeds(_Model):
+    """What a workload task declares it will need, by name — the operator's
+    plan asking, never taking.
+
+    ``hosts`` are domains the task will reach (the shape of ``egress``);
+    ``credentials`` are catalogue names, each a request for a grant on the
+    service sandbox — a credential is never a value in the agent's box;
+    ``sink`` names where the result should go and ``repo`` a repository it
+    needs. The plan records the needs; whether they are met is decided by
+    the run's profile, which is a later concern than the plan.
+    """
+
+    hosts: list[str] = Field(default_factory=list)
+    credentials: list[str] = Field(default_factory=list)
+    sink: str | None = None
+    repo: str | None = None
+
+    @field_validator("hosts")
+    @classmethod
+    def _check_hosts(cls, value: list[str]) -> list[str]:
+        from sbxloop.policy import valid_pattern
+
+        hosts = [host.strip().lower() for host in value]
+        bad = [host for host in hosts if not valid_pattern(host)]
+        if bad:
+            raise ValueError(
+                f"needs.hosts must be domains or *.domain wildcards (no scheme/path/port), "
+                f"got {bad!r}"
+            )
+        return hosts
+
+    @property
+    def empty(self) -> bool:
+        return not (self.hosts or self.credentials or self.sink or self.repo)
+
+
 class TaskSpec(_Model):
     """One unit of the decomposed outcome (agent-authored, engine-validated)."""
 
@@ -134,6 +218,9 @@ class TaskSpec(_Model):
     # External domains this task's BUILD needs beyond the baseline, with
     # justification. Decomposer-authored, like the verify commands.
     egress: list[EgressSpec] = Field(default_factory=list)
+    # A workload task's declared needs (operator-authored); a code run's
+    # tasks leave it empty.
+    needs: TaskNeeds = Field(default_factory=TaskNeeds)
 
 
 class TaskGraph(_Model):
@@ -189,6 +276,45 @@ class TaskGraph(_Model):
         return 1 + max(self._depth(by_id[d], by_id) for d in task.depends_on)
 
 
+class WorkloadPlan(TaskGraph):
+    """The operator's plan: the same task graph the engine schedules, under
+    a run title instead of a pull request's, each task carrying its
+    acceptance criteria as the judge's whole exam and its declared needs."""
+
+    title: str | None = None
+
+    @field_validator("title")
+    @classmethod
+    def _fold_run_title(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        folded = " ".join(str(value).split())
+        return folded or None
+
+
+class JudgeVerdict(_Model):
+    """The judge's answer on one task: whether every acceptance criterion
+    is met, the ones that are not (quoted, so the next attempt knows what
+    to fix), and its notes. ``unmet`` empty with ``passed`` false is a
+    verdict that names nothing to fix — rejected, so a judge cannot fail
+    work without saying why."""
+
+    passed: bool
+    unmet: list[str] = Field(default_factory=list)
+    notes: str = ""
+
+    @field_validator("unmet")
+    @classmethod
+    def _strip_unmet(cls, value: list[str]) -> list[str]:
+        return [" ".join(str(item).split()) for item in value if str(item).strip()]
+
+    @model_validator(mode="after")
+    def _check_verdict(self) -> JudgeVerdict:
+        if not self.passed and not self.unmet:
+            raise ValueError("a failing verdict must name at least one unmet criterion")
+        return self
+
+
 SteerAction = Literal["continue", "steer_task", "steer_run"]
 
 
@@ -220,6 +346,71 @@ class SteerVerdict(_Model):
         return self
 
 
+# How many of a task's files an output lists by path; the rest are counted.
+MAX_OUTPUT_FILES = 200
+MAX_SUMMARY_CHARS = 200
+# The heading operator_execute.md asks the report to end with; matched as a
+# line so a "## Result" the prose mentions inline does not cut the text.
+_RESULT_HEADING = re.compile(r"^#{1,6}\s*results?\b[^\n]*\n", re.IGNORECASE | re.MULTILINE)
+
+
+class TaskOutput(_Model):
+    """What one workload task produced (#757): the operator's own account
+    of the result and the files it left in the data directory.
+
+    ``text`` is the report's ``## Result`` section (the whole report when
+    the operator wrote none), ``summary`` its first line; ``files`` are the
+    data-directory paths the task's attempts touched, listed mechanically
+    rather than as the report names them, so the sinks (#759) publish what
+    is there and not what was claimed. Replaced on every attempt: the task
+    holds one output, its latest.
+    """
+
+    summary: str = ""
+    text: str = ""
+    files: list[str] = Field(default_factory=list)
+    # Files past MAX_OUTPUT_FILES: counted, never silently dropped (#67).
+    more_files: int = 0
+    # Reserved for structured results a sink can carry whole (#759).
+    data: dict[str, Any] = Field(default_factory=dict)
+
+    @property
+    def file_count(self) -> int:
+        return len(self.files) + self.more_files
+
+    @classmethod
+    def from_report(
+        cls, report: str, *, files: Sequence[str] = (), more_files: int = 0
+    ) -> TaskOutput:
+        """Cut the output from the operator's report: the text under its
+        last ``## Result`` heading (the whole report when it wrote none —
+        the judge decides what that is worth, not the parser), the first
+        non-empty line of that as the summary."""
+        text = report.strip()
+        match = _RESULT_HEADING.split(text)
+        if len(match) > 1:
+            text = match[-1].strip()
+        first = next((line.strip() for line in text.splitlines() if line.strip()), "")
+        summary = " ".join(first.split())
+        if len(summary) > MAX_SUMMARY_CHARS:
+            summary = summary[: MAX_SUMMARY_CHARS - 1] + "…"
+        return cls(summary=summary, text=text, files=list(files), more_files=more_files)
+
+
+class Published(_Model):
+    """One place a workload's result went (#759): the sink and where it
+    landed — an issue's URL, the artifacts directory, ``chat`` for the
+    reply posted where the run was asked for (the thread, the terminal).
+    Persisted on the run row, so a resume at publishing skips what already
+    landed and the record says where a result is."""
+
+    sink: str
+    location: str
+    # What the sink carried, for the record: task ids and a file count.
+    tasks: list[str] = Field(default_factory=list)
+    files: int = 0
+
+
 class TaskRecord(_Model):
     """Persisted per-task state."""
 
@@ -236,6 +427,9 @@ class TaskRecord(_Model):
     # Set once a fingerprint repeats: the check, not the code, is the thing
     # to change, and no further identical revision is spent.
     verify_suspect: bool = False
+    # A workload task's result (#757); None for a code run's tasks, whose
+    # result is the tree the build left behind.
+    output: TaskOutput | None = None
 
     @property
     def terminal(self) -> bool:
@@ -246,6 +440,10 @@ class RunRecord(_Model):
     run_id: str
     outcome: str
     state: RunState
+    # `code` for every run the developer loop drives — and for every row a
+    # database from before #755 holds, which the migration reads back as
+    # such; `workload` for a run of the operator persona.
+    kind: RunKind = "code"
     created_at: float
     updated_at: float
     # Host workspace directory and whether it was live-mounted into the
@@ -289,6 +487,15 @@ class RunRecord(_Model):
     # the daemon grants `retry_rounds` once, an operator grants more.
     exhausted: str | None = None
     granted_rounds: int = 0
+    # The `[[credentials]]` names this run is granted (#765): what its
+    # service sandbox holds and what `call_service` may name. Persisted so
+    # a resume re-provisions the same sandbox; empty for every run that
+    # asked for none — which is every `code` run today.
+    credentials: list[str] = Field(default_factory=list)
+    # Where a workload's result went (#759), sink by sink, as it lands;
+    # empty for a code run (its result is the pull request) and for a
+    # workload that has not published yet.
+    published: list[Published] = Field(default_factory=list)
 
 
 class RunResult(_Model):
@@ -296,6 +503,7 @@ class RunResult(_Model):
 
     run_id: str
     state: RunState
+    kind: RunKind = "code"
     tasks: list[TaskRecord] = Field(default_factory=list)
     workspace: Path | None = None
     mounted: bool = False
@@ -309,11 +517,47 @@ class RunResult(_Model):
     reason: str | None = None
     # The fix-round budget that ran out, when that is why the run failed.
     exhausted: str | None = None
+    # A workload's closing line (#757), composed from its tasks' outputs;
+    # None for a code run, whose result is the pull request.
+    summary: str | None = None
+    # Where the result went (#759), for a workload that published.
+    published: list[Published] = Field(default_factory=list)
 
     @property
     def succeeded(self) -> bool:
         return self.state in ("merged", "completed")
 
+    @property
+    def outputs(self) -> list[tuple[str, TaskOutput]]:
+        """(task id, output) for every task that produced one."""
+        return [(t.spec.id, t.output) for t in self.tasks if t.output is not None]
+
+
+def workload_summary(tasks: Sequence[TaskRecord], title: str | None = None) -> str:
+    """A workload's closing line (#757): what was asked, how many tasks
+    the judge passed, and what each produced — composed from the tasks'
+    persisted outputs so the engine's result and the daemon's report read
+    the same store row the same way, with no extra model turn."""
+    done = sum(1 for t in tasks if t.state == "done")
+    head = f"{done}/{len(tasks)} task(s) passed the judge" if tasks else "no tasks ran"
+    if title:
+        head = f"{title} — {head}"
+    lines = [head]
+    for t in tasks:
+        if t.output is None:
+            continue
+        line = f"{t.spec.id}: {t.output.summary or '(no result reported)'}"
+        if count := t.output.file_count:
+            line += f" ({count} file{'s' if count != 1 else ''})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+# Where the agent leaves the pull request's description (#678): under the
+# workspace's `.sbxloop/`, which delivery never ships (it is the first
+# exclude below), read by the engine before the delivery — the body's twin
+# of `engine.review.PR_TITLE_FILE`.
+PR_BODY_FILE = ".sbxloop/pr-body"
 
 # Path components excluded from artifact listings, harvest and delivery by
 # default. A denylist, not "anything dot-prefixed": agents legitimately
@@ -402,9 +646,13 @@ GITIGNORED = "gitignored"
 def scan_artifacts(
     root: Path, exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDES, *, gitignore: bool = True
 ) -> ArtifactScan:
-    """Regular files under root, sorted for stable output, partitioned into
-    kept files and per-entry counts of files whose path contains an excluded
-    component (at any depth, so vendored nested .git dirs are caught too).
+    """Regular files and symlinks under root, sorted for stable output,
+    partitioned into kept files and per-entry counts of files whose path
+    contains an excluded component (at any depth, so vendored nested .git
+    dirs are caught too). A symlink is kept as the link itself — whatever
+    it points at, resolving or not — because that is what git tracks and
+    what a snapshot delivery must reproduce (#695); nothing is followed
+    into a symlinked directory.
 
     Entries containing a glob metacharacter match components via fnmatch
     (``*.egg-info`` — dynamically named directories that no exact name can
@@ -417,7 +665,7 @@ def scan_artifacts(
     ``.gitignore`` does (#249). Name-based entries take precedence in the
     tally; ``exclude`` stays the operator's override on top of both.
     """
-    candidates = [p for p in sorted(root.rglob("*")) if p.is_file()]
+    candidates = [p for p in sorted(root.rglob("*")) if p.is_symlink() or p.is_file()]
     ignored: frozenset[str] = frozenset()
     if gitignore and ((root / ".git").exists() or any(p.name == ".gitignore" for p in candidates)):
         # Local import: hostgit pulls in GitPython, which this pure model
@@ -470,9 +718,16 @@ def artifacts_dir(run: RunRecord | RunResult, state_dir: Path) -> Path | None:
     harvested to ``runs/<run>/artifacts``. Every reader (run summary,
     ``sbxloop artifacts``, delivery) resolves through here. None means the
     run never got as far as provisioning a workspace.
+
+    A workload's artifacts are what its ``artifact`` sink delivered (#759)
+    — the files its tasks declared, copied to ``runs/<run>/artifacts``
+    mounted or not — never its whole data directory, so the listing is
+    the result and not the working state around it.
     """
     if run.workspace is None:
         return None
+    if run.kind == "workload":
+        return state_dir / "runs" / run.run_id / "artifacts"
     if run.mounted:
         return run.workspace
     return state_dir / "runs" / run.run_id / "artifacts"

@@ -42,8 +42,12 @@ Failure semantics:
 
 from __future__ import annotations
 
+import contextlib
 import json
 import queue
+import shlex
+import shutil
+import sqlite3
 import tarfile
 import tempfile
 import threading
@@ -59,9 +63,25 @@ from urllib.parse import quote
 from pydantic import ValidationError
 
 from sbxloop import hostgit
-from sbxloop.config import Config, RepoConfig, _flatten, load_config, load_dotenv_file
-from sbxloop.deliver import deliver_workspace, ensure_repository, render_naming
-from sbxloop.engine.checks import CheckJudgment, check_policy_reader, read_check_policy
+from sbxloop.config import (
+    DEFAULT_PR_TITLE_TEMPLATE,
+    GITHUB_SINKS,
+    Config,
+    RepoConfig,
+    VerifyMode,
+    _flatten,
+    load_config,
+    load_dotenv_file,
+)
+from sbxloop.deliver import (
+    conventional_title,
+    conventional_titles,
+    deliver_workspace,
+    ensure_repository,
+    render_naming,
+)
+from sbxloop.engine import sinks
+from sbxloop.engine.checks import CheckJudgment, check_policy_reader
 from sbxloop.engine.followups import (
     Candidate,
     checklist_comment,
@@ -70,12 +90,14 @@ from sbxloop.engine.followups import (
     marker_key,
 )
 from sbxloop.engine.landing import (
+    AwaitingReview,
     Blocked,
     CiTimeout,
     Closed,
     Gated,
     HumanObjection,
     Landed,
+    LandingOutcome,
     NeedsFix,
     UpdateState,
     land,
@@ -83,22 +105,31 @@ from sbxloop.engine.landing import (
     resolve_identity,
 )
 from sbxloop.engine.model import (
+    MAX_OUTPUT_FILES,
     PIPELINE_STAGES,
+    PR_BODY_FILE,
     RESUMABLE_RUN_STATES,
     TERMINAL_RUN_STATES,
     FixKind,
+    Published,
+    RunKind,
     RunRecord,
     RunResult,
     RunState,
     SteerVerdict,
+    TaskGraph,
+    TaskOutput,
     TaskRecord,
     TaskSpec,
     TaskState,
+    artifacts_dir,
     scan_artifacts,
+    workload_summary,
 )
 from sbxloop.engine.phases import (
     VERIFY_FAILURE_PREFIX,
     PhaseRunner,
+    ToolDigest,
     VerifyFailure,
     clip,
     clip_head_tail,
@@ -132,10 +163,14 @@ from sbxloop.engine.review import (
     split_carried,
     unanswered_findings,
 )
+from sbxloop.engine.service import ServiceOps
 from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import (
     BudgetExceededError,
+    ConfigError,
     GithubOpsError,
+    InvalidOutputTwice,
+    ProvisionError,
     RunCancelledError,
     SbxError,
     SbxloopError,
@@ -158,16 +193,29 @@ from sbxloop.gh.ops import (
 )
 from sbxloop.ids import branch_name, new_message_id, new_run_id
 from sbxloop.log import get_logger
-from sbxloop.policy import EgressGranter
+from sbxloop.policy import EgressGranter, egress_rejection
+from sbxloop.sbx import registries
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import SBXLOOP_DIR
+from sbxloop.verifylint import services_evidence
 from sbxloop.worker.client import WorkerClient
 
 log = get_logger(__name__)
 
 GithubOpsFactory = Callable[[WorkerClient, str], GithubOps]
+ServiceOpsFactory = Callable[..., ServiceOps]  # ServiceOps.__init__'s signature
+
+
+class _Reprovision(Exception):
+    """Internal: the run's grants changed what its sandboxes must be (a
+    workload's plan was granted a credential, #758) — leave this pair and
+    drive again from ``stage`` on a fresh one, the way a resume does."""
+
+    def __init__(self, stage: str) -> None:
+        super().__init__(stage)
+        self.stage = stage
 
 
 class ChatMessage(NamedTuple):
@@ -201,6 +249,18 @@ class Pipeline:
     # the gate, `completed`.
     ops: GithubOps | None
     repo: str | None
+    # Which stage list drives the run (#755): the developer pipeline for
+    # `code`, plan → execute → judge → publish for `workload`.
+    kind: RunKind = "code"
+    # The service sandbox's ops (#765); None for a run granted no
+    # credential, which then has no service sandbox at all.
+    service: ServiceOps | None = None
+    # The provisioner the pair came from — a workload's plan may ask for a
+    # repository checkout after the pair is up (#758).
+    provisioner: Provisioner | None = None
+    # Why the workload's plan was refused (#758), when it was: the run's
+    # reason, in place of a task's failure.
+    needs_refused: str | None = None
     # The run's repository entry (per-repo deliver_base, token_env, …) with
     # the daemon-wide [github] defaults already folded in; None when the run
     # has no repository.
@@ -256,6 +316,7 @@ class LoopEngine:
         install_workers: bool | None = None,
         clock: Callable[[], float] = time.monotonic,
         github_ops: GithubOpsFactory | None = None,
+        service_ops: ServiceOpsFactory | None = None,
         trigger_label: str | None = None,
     ) -> None:
         # Library parity with the CLI: a ./.env supplies tokens/settings even
@@ -286,6 +347,8 @@ class LoopEngine:
         # The seam a test uses to script GitHub: every github.op the run
         # makes goes through the ops this factory returns.
         self._github_ops: GithubOpsFactory = github_ops or GithubOps
+        # Same seam for the service sandbox's ops (#765).
+        self._service_ops: ServiceOpsFactory = service_ops or ServiceOps
         # In-process cancellation (Ctrl-C in the TUI): checked at the same
         # phase boundaries as the store's cancelled state, but leaves the
         # persisted run state alone so the run stays resumable.
@@ -357,6 +420,10 @@ class LoopEngine:
         repo: str | None = None,
         prior_branch: str | None = None,
         prior_pr: int | None = None,
+        workspace_source: str | None = None,
+        credentials: Sequence[str] = (),
+        kind: RunKind = "code",
+        profile: str | None = None,
     ) -> RunResult:
         """Drive a fresh run all the way through.
 
@@ -374,13 +441,70 @@ class LoopEngine:
         that one repository for the whole run (and is persisted with the
         run, so a resume routes there too); ``None`` keeps the configured
         default, which is the only repository when just one is configured.
+
+        ``workspace_source`` labels where the run's tree came from for the
+        first event — a caller that chose it (the CLI's ``--workspace`` or
+        the git checkout around the command) says so; otherwise the config
+        speaks for itself. The workspace path itself always rides along, so
+        a run that is about to work on nothing announces it up front.
+
+        ``credentials`` names the ``[[credentials]]`` this run is granted
+        (#765): they are provisioned into a third, service sandbox, and the
+        build session gets the ``call_service`` tool for them. Every name
+        must be in the catalogue — checked here, before the run row exists.
+        Empty (every ``code`` run) changes nothing.
+
+        ``kind`` (#755) picks the stage list: ``code`` is the developer
+        pipeline above; ``workload`` runs the operator persona — plan,
+        execute, judge, publish — in its own per-run data directory, on
+        the agent sandbox alone (no github sandbox, no clone). It is
+        persisted with the run, so a resume re-enters the same stages
+        whatever the on-disk config says by then.
+
+        ``profile`` names the ``[[workloads]]`` profile a workload runs
+        under (#758) — the `[workload] default` when None; a run with no
+        profile at all may declare no needs. It is pinned into the run's
+        persisted config with its budget overrides applied, so a resume
+        runs under the same bounds.
         """
         run_id = run_id or new_run_id()
+        if profile is not None and kind != "workload":
+            raise ConfigError("a workload profile applies to `--kind workload` runs only")
         self._select_repo(repo)
-        self.store.create_run(run_id, outcome, self.config.model_dump_json())
+        if kind == "workload":
+            self.config = self.config.for_workload_profile(profile)
+        granted = [c.name for c in self.config.credentials_named(credentials)]
+        self.store.create_run(
+            run_id, outcome, self.config.model_dump_json(), credentials=granted, kind=kind
+        )
         if tasks:
             self.store.save_tasks(run_id, list(tasks))
-        self.bus.emit(HostEventTypes.RUN_START, run_id, outcome=outcome, seeded=len(tasks or ()))
+        if kind == "workload":
+            # The data dir is cut at provisioning (`sandbox.workspace_mount`
+            # names it); the start event says only that no checkout is in
+            # play. A code run's event is untouched — its `kind` is implied,
+            # as it is for every run recorded before there were two.
+            self.bus.emit(
+                HostEventTypes.RUN_START,
+                run_id,
+                outcome=outcome,
+                seeded=len(tasks or ()),
+                kind=kind,
+                workspace=None,
+                workspace_source="data-dir",
+            )
+            self._prior = PriorArtifacts(branch=None, pr_number=None)
+            return self._drive(run_id, outcome)
+        workspace = self.config.workspace_for_repo(self.config.github.repo)
+        self.bus.emit(
+            HostEventTypes.RUN_START,
+            run_id,
+            outcome=outcome,
+            seeded=len(tasks or ()),
+            workspace=str(workspace) if workspace is not None else None,
+            workspace_source=workspace_source
+            or self.config.workspace_source(self.config.github.repo),
+        )
         self._prior = PriorArtifacts(branch=prior_branch, pr_number=prior_pr)
         return self._drive(run_id, outcome)
 
@@ -437,8 +561,24 @@ class LoopEngine:
             # earns its own or ends merged.
             self.store.set_run_reason(run_id, None)
         self._rehydrate_config(run_id)
-        self.bus.emit(HostEventTypes.RUN_START, run_id, outcome=run.outcome, resumed=True)
-        return self._drive(run_id, run.outcome, workspace=run.workspace, stage=stage)
+        self.bus.emit(
+            HostEventTypes.RUN_START,
+            run_id,
+            outcome=run.outcome,
+            resumed=True,
+            # The persisted kind, never the on-disk config's idea (#755).
+            **({"kind": run.kind} if run.kind != "code" else {}),
+        )
+        # The first provisioning decided whether the agent must see this
+        # workspace; a harvest-mode run resumes as one instead of failing
+        # the mount check its empty per-run dir was never going to pass.
+        return self._drive(
+            run_id,
+            run.outcome,
+            workspace=run.workspace,
+            stage=stage,
+            expects_mount=run.mounted if run.workspace is not None else None,
+        )
 
     def _refuse_if_pruned(self, run_id: str) -> None:
         if workspace_pruned(self.store, run_id):
@@ -520,7 +660,14 @@ class LoopEngine:
                 "keep_on_failure": self.config.keep_on_failure,
             }
         )
-        drift = self._config_drift(stored, self.config)
+        current = self.config
+        if stored.workload.default is not None:
+            # The run was pinned to a profile (#758): the live config under
+            # that same profile is the fair comparison; a profile that is
+            # gone by now shows as drift, which it is.
+            with contextlib.suppress(ConfigError):
+                current = current.for_workload_profile(stored.workload.default)
+        drift = self._config_drift(stored, current)
         if drift:
             message = (
                 "resuming with the run's original config; the current config "
@@ -562,6 +709,7 @@ class LoopEngine:
         *,
         workspace: Path | None = None,
         stage: str | None = None,
+        expects_mount: bool | None = None,
     ) -> RunResult:
         self._waited_s = 0.0
         deadline = self.clock() + self.config.budgets.max_wall_clock_s
@@ -575,8 +723,20 @@ class LoopEngine:
         # A resumed run's workspace is pinned from the runs table — never
         # recomputed from config, which would silently relocate it (#60).
         # The run's repository (its config was narrowed to it in
-        # _select_repo) scopes the github sandbox's token and remote.
-        pair = provisioner.ensure_pair(run_id, workspace, self.config.github.repo)
+        # _select_repo) scopes the github sandbox's token and remote. The
+        # credentials the run was granted (#765) are read back from the
+        # run row so a resume re-provisions the same service sandbox — and
+        # so is its kind (#755), which decides the sandboxes it gets.
+        run_row = self.store.get_run(run_id)
+        credentials, kind = run_row.credentials, run_row.kind
+        pair = provisioner.ensure_pair(
+            run_id,
+            workspace,
+            self.config.github.repo,
+            expects_mount=expects_mount,
+            credentials=credentials,
+            kind=kind,
+        )
         assert pair.workspace is not None
         self._confirm_prior_checkout(run_id, pair)
         if workspace is not None and pair.workspace != workspace:
@@ -591,6 +751,7 @@ class LoopEngine:
             self.store.set_run_kept(run_id, "manual")
         state: RunState
         reason: str | None
+        again: _Reprovision | None = None
         try:
             with pair:
                 try:
@@ -604,7 +765,9 @@ class LoopEngine:
                         limits=self.config.limits,
                         # Per-job stdin delivery when provisioning chose it;
                         # None keeps the launch exactly as before (#592).
-                        job_env=provisioner.job_env("agent", sandbox=pair.agent),
+                        job_env=provisioner.job_env(
+                            "agent", self.config.github.repo, sandbox=pair.agent
+                        ),
                     )
                     github = (
                         WorkerClient(
@@ -627,8 +790,49 @@ class LoopEngine:
                         if pair.github is not None
                         else None
                     )
+                    service_client = (
+                        WorkerClient(
+                            pair.service,
+                            self.bus,
+                            transport=self.config.worker_transport,
+                            python=self.worker_python,
+                            role="service",
+                            limits=self.config.limits,
+                            # The credentials — and the registries' (#766)
+                            # — ride the same non-proxy road as GH_TOKEN
+                            # (#765): per job over stdin when this sbx
+                            # passes it, else the in-VM env file.
+                            job_env=provisioner.job_env(
+                                "service",
+                                self.config.github.repo,
+                                sandbox=pair.service,
+                                credentials=credentials,
+                            ),
+                        )
+                        if pair.service is not None
+                        else None
+                    )
+                    service = (
+                        self._service_ops(
+                            service_client,
+                            run_id,
+                            self.bus,
+                            self.config.credentials_named(credentials),
+                            self.config.credentialed_registries_for(self.config.github.repo),
+                            workdir=pair.service_workdir,
+                            workspace=pair.workspace,
+                        )
+                        if service_client is not None
+                        else None
+                    )
                     if self.install_workers:
-                        self._install_workers(run_id, pair, agent, github)
+                        self._install_workers(run_id, pair, agent, github, service_client)
+                    if service is not None:
+                        self._fetch_dependencies(run_id, service)
+                    if kind == "code":
+                        # `setup_commands` prepare a cloned checkout; a
+                        # workload has none to prepare (#755).
+                        self._run_setup_commands(run_id, pair, agent)
                     repo_config = self.config.github.effective_repo(None)
                     ops = (
                         self._github_ops(github, run_id)
@@ -644,6 +848,17 @@ class LoopEngine:
                         workdir=pair.agent_workdir,
                         workspace=pair.workspace,
                         languages=pair.languages.languages,
+                        versions=pair.languages.versions,
+                        # The build session's `call_service` (#765) and
+                        # `fetch_dependencies` (#766) tools, answered on the
+                        # host through the service sandbox.
+                        host_tools=service.tool_specs() if service is not None else (),
+                        tool_handler=service.handler(phase="build" if kind == "code" else "execute")
+                        if service is not None
+                        else None,
+                        # The judge's tool digest is read off the bus (#756);
+                        # a code run's phases never ask for one.
+                        bus=self.bus if kind == "workload" else None,
                     )
                     # Replay persisted chat guidance (steer_run verdicts)
                     # so a resumed run keeps the direction the user set.
@@ -652,13 +867,22 @@ class LoopEngine:
                     pipeline = Pipeline(
                         run_id=run_id,
                         outcome=outcome,
+                        kind=kind,
                         pair=pair,
                         phases=phases,
                         granter=EgressGranter(
-                            self.sbx, self.config, self.bus, run_id, pair.agent.name
+                            self.sbx,
+                            self.config,
+                            self.bus,
+                            run_id,
+                            pair.agent.name,
+                            repo=self.config.github.repo,
+                            # A workload's profile bounds its hosts (#758).
+                            extra_allow=self._profile_egress(kind),
                         ),
                         deadline=deadline,
                         ops=ops,
+                        service=service,
                         repo=repo_config.repo if ops is not None and repo_config else None,
                         repo_config=repo_config if ops is not None else None,
                         bot_login=(
@@ -667,25 +891,46 @@ class LoopEngine:
                             else None
                         ),
                         issues_enabled=issues_enabled,
+                        provisioner=provisioner,
                     )
                     try:
                         self._adopt_prior_artifacts(pipeline)
                         state, reason = self._run_pipeline(pipeline, stage)
+                    except _Reprovision as exc:
+                        again, state, reason = exc, "provisioning", None
                     finally:
                         # Harvest even when a stage raised: the sandbox is
                         # still alive here, and partial artifacts beat none.
-                        self._harvest(run_id, pair)
-                        self._report_artifacts(run_id, pair)
+                        self._harvest(run_id, pair, kind)
+                        self._report_artifacts(run_id, pair, kind)
                 except SbxloopError:
                     # Infra failures (install, worker, sbx) are exactly what
                     # gets diagnosed in-sandbox; decide keep before pair exit.
                     self._keep_on_failure(run_id, pair)
                     raise
-                if state not in ("merged", "completed", "gated"):
+                if again is None and state not in (
+                    "merged",
+                    "completed",
+                    "gated",
+                    "awaiting_review",
+                ):
                     self._keep_on_failure(run_id, pair)
         except SbxloopError:
             # State is already persisted; the exception is the kill signal.
             raise
+        if again is not None:
+            # The grants changed the sandbox set (#758): this pair held
+            # nothing worth keeping (a plan, persisted), so it goes even
+            # under keep_sandboxes, and the run re-enters on a pair
+            # provisioned from the run row — credentials included.
+            pair.cleanup()
+            return self._drive(
+                run_id,
+                outcome,
+                workspace=pair.workspace,
+                stage=again.stage,
+                expects_mount=pair.mounted,
+            )
         if reason:
             self.store.set_run_reason(run_id, reason)
         self._set_run_state(run_id, state)
@@ -703,6 +948,7 @@ class LoopEngine:
         return RunResult(
             run_id=run_id,
             state=state,
+            kind=kind,
             exhausted=run.exhausted,
             tasks=tasks,
             workspace=pair.workspace,
@@ -711,6 +957,8 @@ class LoopEngine:
             pr_number=run.pr_number,
             pr_url=run.pr_url,
             reason=reason,
+            summary=workload_summary(tasks, run.pr_title) if kind == "workload" else None,
+            published=list(run.published),
         )
 
     def _install_workers(
@@ -719,22 +967,27 @@ class LoopEngine:
         pair: SandboxPair,
         agent: WorkerClient,
         github: WorkerClient | None,
+        service: WorkerClient | None = None,
     ) -> None:
-        """Install the worker into both sandboxes, concurrently when the pair
-        exists — the installs share nothing in-sandbox, and each is seconds
-        of exec round-trips that would otherwise stack serially (#127).
+        """Install the worker into every sandbox, concurrently when there is
+        more than one — the installs share nothing in-sandbox, and each is
+        seconds of exec round-trips that would otherwise stack serially
+        (#127).
 
         A configured template is expected to be prebaked (`sbxloop bake`):
         install() probes it and skips the ladder on success, falling back
-        when stale. ensure_dev_tools is agent-only — the agent builds
-        projects in its VM, so it gets the run's resolved toolchains
-        (`[sandbox] languages`, or what the workspace declares); the github
-        sandbox only runs API ops. Both installs always run to
-        completion before any failure
-        propagates, so an error never unwinds into pair teardown while the
-        other install is still mid-exec.
+        when stale. ensure_dev_tools is for the sandboxes that run a
+        toolchain: the agent builds projects in its VM, so it gets the run's
+        resolved toolchains (`[sandbox] languages`, or what the workspace
+        declares); the service sandbox gets the package managers of the
+        run's credentialed registries (#766) — it fetches, the agent builds
+        offline — and the github sandbox, which only runs API ops, gets
+        none. Every install always runs to completion before any failure
+        propagates, so an error never unwinds into pair teardown while
+        another install is still mid-exec.
         """
         prebaked_expected = bool(self.config.sandbox.template)
+        roles: list[str] = ["agent"]
         installs: list[Callable[[], None]] = [
             partial(
                 agent.install,
@@ -751,10 +1004,31 @@ class LoopEngine:
                 # install provisions the interpreter the project asked for.
                 versions=pair.languages.versions,
                 expect_prebaked=prebaked_expected,
+                # The operator's OS packages (#681) beside the toolchains;
+                # a template baked with them makes this a dpkg probe.
+                apt_packages=self.config.apt_packages_for(self.config.github.repo),
             )
         ]
         if github is not None:
+            roles.append("github")
             installs.append(partial(github.install, extras="", expect_prebaked=prebaked_expected))
+        if service is not None:
+            roles.append("service")
+            fetch_languages = registries.languages(
+                self.config.credentialed_registries_for(self.config.github.repo)
+            )
+            installs.append(
+                partial(
+                    service.install,
+                    extras="",
+                    ensure_dev_tools=bool(fetch_languages),
+                    languages=fetch_languages,
+                    versions={
+                        k: v for k, v in pair.languages.versions.items() if k in fetch_languages
+                    },
+                    expect_prebaked=prebaked_expected,
+                )
+            )
         if len(installs) == 1:
             installs[0]()
         else:
@@ -763,7 +1037,7 @@ class LoopEngine:
             ) as pool:
                 futures = [pool.submit(fn) for fn in installs]
                 errors: list[Exception] = []
-                for role, future in zip(("agent", "github"), futures, strict=True):
+                for role, future in zip(roles, futures, strict=True):
                     try:
                         future.result()
                     except Exception as exc:
@@ -780,7 +1054,52 @@ class LoopEngine:
                 if errors:
                     raise errors[0]
         if prebaked_expected:
-            self._emit_prebaked(run_id, pair, agent, github)
+            self._emit_prebaked(run_id, pair, agent, github, service)
+        if agent.apt_installed:
+            self.bus.emit(
+                HostEventTypes.SANDBOX_SETUP,
+                run_id,
+                sandbox=pair.agent.name,
+                apt_packages=list(agent.apt_installed),
+                rc=0,
+                message=f"installed apt packages {', '.join(agent.apt_installed)}"
+                + (
+                    " the template lacked (re-run `sbxloop bake` to stop paying this "
+                    "on every provision)"
+                    if prebaked_expected
+                    else ""
+                ),
+            )
+
+    def _fetch_dependencies(self, run_id: str, service: ServiceOps) -> None:
+        """The setup-time fetch (#766): one ``service.fetch`` per credentialed
+        ecosystem the workspace has a manifest for, so the agent's first
+        offline install finds its dependencies in the shared cache. A
+        non-zero exit fails provisioning the way a failed setup command
+        does — the run cannot build without its dependencies, and the
+        event carries the package manager's output."""
+        for kind in service.kinds:
+            manifests = service.manifests(kind)
+            if not manifests:
+                continue
+            result = service.fetch(kind, manifests=manifests, phase="setup")
+            if result["exit_code"] != 0:
+                tail = result["output"][-2000:]
+                raise ProvisionError(
+                    f"dependency fetch for {kind} failed in the service sandbox "
+                    f"(exit {result['exit_code']}): {' '.join(result['argv'])}\n{tail}"
+                )
+
+    def _run_setup_commands(self, run_id: str, pair: SandboxPair, agent: WorkerClient) -> None:
+        """The operator's `setup_commands` (#681) in the cloned workspace,
+        after the toolchains, registries and environment are in place and
+        before the first phase. A failure raises out of provisioning — the
+        sandbox is kept under keep_on_failure like any install failure, and
+        the run's events name the command and its output."""
+        commands = self.config.setup_commands_for(self.config.github.repo)
+        if not commands:
+            return
+        agent.run_setup(commands, run_id=run_id, cwd=pair.agent_workdir)
 
     def _emit_prebaked(
         self,
@@ -788,12 +1107,15 @@ class LoopEngine:
         pair: SandboxPair,
         agent: WorkerClient,
         github: WorkerClient | None,
+        service: WorkerClient | None = None,
     ) -> None:
         """One event per sandbox saying whether the configured template's
         baked worker was used, or was stale and the install ladder ran."""
         clients = [(pair.agent.name, agent)]
         if github is not None and pair.github is not None:
             clients.append((pair.github.name, github))
+        if service is not None and pair.service is not None:
+            clients.append((pair.service.name, service))
         for name, client in clients:
             if not client.prebaked:
                 message = (
@@ -820,7 +1142,7 @@ class LoopEngine:
 
     @staticmethod
     def _pair_names(pair: SandboxPair) -> list[str]:
-        return [s.name for s in (pair.agent, pair.github) if s is not None]
+        return [s.name for s in (pair.agent, pair.github, pair.service) if s is not None]
 
     def _keep_on_failure(self, run_id: str, pair: SandboxPair) -> None:
         """Flip the pair to kept when configured, so a failed run's evidence
@@ -841,7 +1163,7 @@ class LoopEngine:
             ),
         )
 
-    def _harvest(self, run_id: str, pair: SandboxPair) -> None:
+    def _harvest(self, run_id: str, pair: SandboxPair, kind: RunKind = "code") -> None:
         """Copy the in-VM work dir out to the host (unmounted runs only).
 
         Best-effort by design: a failed copy must never fail the run.  Uses
@@ -849,31 +1171,22 @@ class LoopEngine:
         so that ``.git``, venvs, and other heavy dirs are never transferred —
         the excluded content is not delivered anyway.  The tarball is staged in
         the VM's ``.sbxloop`` dir, copied out, and extracted on the host.
+
+        A workload's harvest is its data directory's salvage, kept apart
+        (``runs/<run>/data``) from ``runs/<run>/artifacts``, which holds
+        what its ``artifact`` sink delivered (#759) and nothing else.
         """
         if pair.mounted:
             return
-        target = self.config.state_dir / "runs" / run_id / "artifacts"
+        target = self.config.state_dir / "runs" / run_id
+        target /= "data" if kind == "workload" else "artifacts"
         target.mkdir(parents=True, exist_ok=True)
         exclude = self.config.artifacts.exclude
         # Build tar exclude flags: --exclude=<name> for each entry.
         exclude_args = [arg for name in exclude for arg in ("--exclude", name)]
-        vm_tar = f"{SBXLOOP_DIR}/harvest.tar"
         started = time.monotonic()
         try:
-            result = pair.agent.exec(
-                ["tar", "-cf", vm_tar, "-C", pair.agent_workdir, *exclude_args, "."]
-            )
-            if not result.ok:
-                raise SbxError(
-                    f"tar failed (exit {result.returncode})",
-                    argv=result.argv,
-                    stderr=result.stderr,
-                )
-            with tempfile.TemporaryDirectory() as tmpdir:
-                host_tar = Path(tmpdir) / "harvest.tar"
-                pair.agent.cp_out(vm_tar, host_tar)
-                with tarfile.open(host_tar) as tf:
-                    tf.extractall(target, filter="data")
+            self._copy_out(pair, target, [*exclude_args, "."])
         except SbxError:
             log.warning(
                 "run.harvest_failed",
@@ -890,16 +1203,42 @@ class LoopEngine:
             duration_s=round(time.monotonic() - started, 1),
         )
 
-    def _artifact_source(self, run_id: str, pair: SandboxPair) -> Path | None:
-        target = (
-            pair.workspace
-            if pair.mounted
-            else self.config.state_dir / "runs" / run_id / "artifacts"
-        )
+    def _copy_out(self, pair: SandboxPair, target: Path, tar_args: Sequence[str]) -> None:
+        """Bring files out of the agent sandbox: ``tar`` in the VM over
+        ``tar_args`` (relative to the work dir), copied out and extracted
+        under ``target`` on the host. Raises ``SbxError`` when the VM's tar
+        or the copy fails; the callers decide what that costs."""
+        vm_tar = f"{SBXLOOP_DIR}/harvest.tar"
+        result = pair.agent.exec(["tar", "-cf", vm_tar, "-C", pair.agent_workdir, *tar_args])
+        if not result.ok:
+            raise SbxError(
+                f"tar failed (exit {result.returncode})",
+                argv=result.argv,
+                stderr=result.stderr,
+            )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            host_tar = Path(tmpdir) / "harvest.tar"
+            pair.agent.cp_out(vm_tar, host_tar)
+            with tarfile.open(host_tar) as tf:
+                tf.extractall(target, filter="data")
+
+    def _artifact_source(
+        self, run_id: str, pair: SandboxPair, kind: RunKind = "code"
+    ) -> Path | None:
+        target: Path | None
+        if kind == "workload":
+            # What the artifact sink delivered (#759), when it did.
+            target = self.config.state_dir / "runs" / run_id / "artifacts"
+        else:
+            target = (
+                pair.workspace
+                if pair.mounted
+                else self.config.state_dir / "runs" / run_id / "artifacts"
+            )
         return target if target is not None and target.is_dir() else None
 
-    def _report_artifacts(self, run_id: str, pair: SandboxPair) -> None:
-        target = self._artifact_source(run_id, pair)
+    def _report_artifacts(self, run_id: str, pair: SandboxPair, kind: RunKind = "code") -> None:
+        target = self._artifact_source(run_id, pair, kind)
         if target is None:
             return
         scan = scan_artifacts(target, self.config.artifacts.exclude)
@@ -1036,7 +1375,7 @@ class LoopEngine:
         base = p.repo_config.deliver_base if p.repo_config else self.config.github.deliver_base
         try:
             if base is None:
-                base = str(ops.repo_get(repo).get("default_branch") or "main")
+                base = ops.default_branch(repo)
             head_sha = ops.ref_lookup(repo, f"heads/{branch}")
             if head_sha is None:
                 self._prior_unusable(p, branch, "the branch is no longer on origin")
@@ -1121,11 +1460,45 @@ class LoopEngine:
     def _run_pipeline(self, p: Pipeline, stage: str | None) -> tuple[RunState, str | None]:
         """Drive the run from ``stage`` (None: the beginning) to a terminal
         state; returns it with the reason the run stopped short of merged."""
-        state, reason = self._stages(p, stage)
+        state, reason = (
+            self._workload_stages(p, stage) if p.kind == "workload" else self._stages(p, stage)
+        )
         # A message that arrived during the last wait or stage still gets
         # answered — as steer_run; there is nothing left to steer.
         self._process_chat(p.run_id, p.phases, None, stage=f"finished ({state})")
         return state, reason
+
+    def _workload_stages(self, p: Pipeline, stage: str | None) -> tuple[RunState, str | None]:
+        """A ``workload`` run's life (#755): plan → execute → judge → publish.
+
+        Plan and execute are the task graph — the same shape a code run
+        walks, with the operator's prompts in place of the developer's and
+        the judge's verdict in place of the verify phase (#756) — so the
+        revision budget applies unchanged. The judging stage re-runs every
+        task's declared checks over the finished workspace, the way the
+        gate re-runs the project's; publish hands the result to its sinks.
+        A red judgment ends the run named; so does a sink that could not
+        take the result (#759).
+        """
+        if stage not in ("judging", "publishing"):
+            failed = self._run_phases(p)
+            if failed:
+                return "failed", p.needs_refused or self._failure_reason(p.run_id)
+            stage = "judging"
+        while True:
+            self._check_cancelled_and_clock(p.run_id, p.deadline)
+            if stage == "judging":
+                reason = self._stage_judge(p)
+                if reason is not None:
+                    return "failed", reason
+                stage = "publishing"
+            elif stage == "publishing":
+                reason = self._stage_publish(p)
+                if reason is not None:
+                    return "failed", reason
+                return "completed", None
+            else:  # pragma: no cover - defensive
+                raise StateError(f"run {p.run_id} in unexpected workload stage {stage}")
 
     def _stages(self, p: Pipeline, stage: str | None) -> tuple[RunState, str | None]:
         if stage not in PIPELINE_STAGES:
@@ -1198,6 +1571,17 @@ class LoopEngine:
                     return "gated", (
                         "parked by [landing] merge_gate — ready to merge, awaiting human approval"
                     )
+                if isinstance(outcome, AwaitingReview):
+                    if outcome.draft:
+                        return "awaiting_review", (
+                            "ready to merge — a person converted the PR to draft; awaiting "
+                            "it being marked ready for review"
+                        )
+                    return "awaiting_review", (
+                        f"ready to merge — the base requires {outcome.wanted} "
+                        f"({outcome.approvals_have}/{outcome.approvals_required} so far), "
+                        "awaiting a reviewer on GitHub"
+                    )
                 if isinstance(outcome, Blocked):
                     return "blocked", outcome.why
                 if isinstance(outcome, Closed):
@@ -1241,17 +1625,60 @@ class LoopEngine:
                 f"its result across attempts — the check looks unpassable and "
                 f"needs re-authoring: {commands}"
             )
+        judged = self._judged_failure_reason(run_id)
+        if judged is not None:
+            return judged
         return "a task failed or was skipped"
+
+    def _judged_failure_reason(self, run_id: str) -> str | None:
+        """A workload task the judge failed (#756): the last verdict, or the
+        judge's own failure to reach one, is the reason a human reads."""
+        for task in self.store.get_tasks(run_id):
+            if task.state != "failed":
+                continue
+            output = self.store.latest_phase_output(run_id, task.spec.id, "judge")
+            if output is None:
+                continue
+            verdict = json.loads(output)
+            if verdict.get("degraded"):
+                return (
+                    f"the judge could not reach a verdict on task {task.spec.id} "
+                    f"({verdict.get('error') or 'no usable verdict'}); the run fails closed"
+                )
+            unmet = [str(item) for item in verdict.get("unmet") or []]
+            if unmet:
+                attempts = int(verdict.get("attempt") or task.revisions or 1)
+                return (
+                    f"task {task.spec.id} failed the judgment after {attempts} attempt(s) — "
+                    f"unmet: {unmet[0]}" + (f" (+{len(unmet) - 1} more)" if len(unmet) > 1 else "")
+                )
+        return None
 
     def _run_phases(self, p: Pipeline) -> bool:
         """DECOMPOSE (unless seeded or resumed) and the task graph; True when
         a task failed or was skipped."""
         run_id, phases = p.run_id, p.phases
+        # The graph is the graph; a workload only calls its stages by the
+        # operator's names (#755).
+        planning: RunState
+        executing: RunState
+        planning, executing = (
+            ("planning", "executing") if p.kind == "workload" else ("decomposing", "building")
+        )
         tasks = [t for t in self.store.get_tasks(run_id) if not is_fix_task(t.spec.id)]
         if not tasks:
-            self._set_run_state(run_id, "decomposing")
+            self._set_run_state(run_id, planning)
             started = time.time()
-            graph = phases.decompose()
+            graph: TaskGraph
+            if p.kind == "workload":
+                # The operator's plan (#756): the same graph, under the
+                # judge's criteria rather than a repository's checks.
+                plan = phases.plan_workload()
+                graph, title, phase = plan, plan.title, "plan"
+            else:
+                self._hint_services(run_id, phases.workspace)
+                graph = phases.decompose()
+                title, phase = graph.pr_title, "decompose"
             if len(graph.tasks) > self.config.budgets.max_tasks:
                 raise BudgetExceededError(
                     f"decomposition produced {len(graph.tasks)} tasks "
@@ -1259,12 +1686,12 @@ class LoopEngine:
                 )
             ordered = graph.topo_order()
             self.store.save_tasks(run_id, ordered)
-            if graph.pr_title:
-                self.store.set_run_title(run_id, graph.pr_title)
+            if title:
+                self.store.set_run_title(run_id, title)
             spend = phases.drain_spend()
             self.store.record_phase(
                 run_id,
-                "decompose",
+                phase,
                 task_id=None,
                 attempt=1,
                 status="ok",
@@ -1274,14 +1701,291 @@ class LoopEngine:
                 turns=spend.turns,
             )
             tasks = self.store.get_tasks(run_id)
+            if p.kind == "workload" and self._grant_needs(p, tasks) is not None:
+                return True
 
-        self._set_run_state(run_id, "building")
+        self._set_run_state(run_id, executing)
         self._announce_roster(run_id, tasks)
         failed_ids, skipped_ids = self._schedule_tasks(p, tasks)
         # Messages that arrived during the last phase still get answered
         # (as steer_run — there is no task left to steer).
         self._process_chat(run_id, phases, None, stage="between the task graph and the gate")
         return bool(failed_ids or skipped_ids)
+
+    # -- a workload's needs (#758) -----------------------------------------
+
+    def _profile_egress(self, kind: RunKind) -> list[str]:
+        """The hosts a workload's profile lets its plan ask for; nothing for
+        a code run, whose bounds are `[policy]` alone."""
+        if kind != "workload":
+            return []
+        profile = self.config.workload_profile()
+        return list(profile.egress) if profile is not None else []
+
+    def _grant_needs(self, p: Pipeline, tasks: Sequence[TaskRecord]) -> str | None:
+        """Hold the plan's declared needs to the run's profile (#758).
+
+        Every need is answered before any task runs: a host must be inside
+        the profile's egress (or already in the operator's bounds) and not
+        denied; a credential must be one the profile names; a sink one it
+        lists (the `chat` sink is the default and needs no granting, #759);
+        a repository allowed by it and configured under `[github]`.
+        The first need outside the profile fails the run closed — every
+        refusal is on the record as ``run.needs_refused`` naming the
+        sbxloop.toml key that would allow it, and nothing was granted.
+
+        Granted needs: hosts are applied at each task's execute entry (the
+        granter); a repository is cloned into the data directory now; a
+        credential goes on the run row, and since the service sandbox that
+        holds it is stamped at creation the run re-provisions from the
+        executing stage — one extra boot, only when a plan asked for one.
+        Returns the refusal reason, None when everything was granted (or
+        nothing was asked).
+        """
+        run_id = p.run_id
+        profile = self.config.workload_profile()
+        pname = profile.name if profile is not None else None
+        hosts: list[tuple[str, str]] = []
+        credentials: list[tuple[str, str]] = []
+        sink_needs: list[tuple[str, str]] = []
+        repos: list[tuple[str, str]] = []
+        for task in tasks:
+            needs = task.spec.needs
+            hosts += [(h, task.spec.id) for h in needs.hosts]
+            credentials += [(c, task.spec.id) for c in needs.credentials]
+            if needs.sink and needs.sink != sinks.DEFAULT_SINK:
+                sink_needs.append((needs.sink, task.spec.id))
+            if needs.repo:
+                repos.append((needs.repo, task.spec.id))
+        if not (hosts or credentials or sink_needs or repos):
+            return None
+
+        refusals: list[str] = []
+
+        def refuse(need: str, value: str, task_id: str, key: str | None, why: str) -> None:
+            fix = f"; `{key}` in sbxloop.toml would allow it" if key else ""
+            message = f"task {task_id} needs {need} `{value}` — {why}{fix}"
+            refusals.append(message)
+            self.bus.emit(
+                HostEventTypes.RUN_NEEDS_REFUSED,
+                run_id,
+                profile=pname,
+                need=need,
+                value=value,
+                task_id=task_id,
+                key=key,
+                message=message,
+            )
+
+        no_profile = (
+            "the run has no workload profile" if pname is None else None,
+            "workload.default",
+        )
+        allow, deny = p.granter.allow, p.granter.deny
+        for host, task_id in hosts:
+            if no_profile[0]:
+                refuse("host", host, task_id, no_profile[1], no_profile[0])
+                continue
+            assert profile is not None
+            rejection = egress_rejection(host, allow, deny)
+            if rejection is not None and "deny" in rejection:
+                refuse("host", host, task_id, None, rejection)
+            elif rejection is not None and not profile.covers_host(host):
+                refuse(
+                    "host", host, task_id, f"workloads.{pname}.egress", f"outside profile {pname!r}"
+                )
+        for name, task_id in credentials:
+            if no_profile[0]:
+                refuse("credential", name, task_id, no_profile[1], no_profile[0])
+            elif name not in (profile.credentials if profile is not None else ()):
+                key = f"workloads.{pname}.credentials"
+                why = f"not granted by profile {pname!r}"
+                if self.config.credential(name) is None:
+                    key, why = "credentials", "not in the [[credentials]] catalogue"
+                refuse("credential", name, task_id, key, why)
+        for sink, task_id in sink_needs:
+            if no_profile[0]:
+                refuse("sink", sink, task_id, no_profile[1], no_profile[0])
+            elif sink not in (profile.sinks if profile is not None else ()):
+                refuse(
+                    "sink", sink, task_id, f"workloads.{pname}.sinks", f"not in profile {pname!r}"
+                )
+            elif sink == "pr":
+                refuse("sink", sink, task_id, None, "the pr sink is not available yet")
+            elif sink in GITHUB_SINKS and p.ops is None:
+                refuse(
+                    "sink",
+                    sink,
+                    task_id,
+                    "github.repo",
+                    "no repository is configured to publish to",
+                )
+            elif sink == "issue" and p.issues_enabled is False:
+                refuse(
+                    "sink",
+                    sink,
+                    task_id,
+                    None,
+                    f"{self.config.github.repo} has Issues disabled",
+                )
+        for repo, task_id in repos:
+            if no_profile[0]:
+                refuse("repo", repo, task_id, no_profile[1], no_profile[0])
+            elif profile is not None and not profile.repo:
+                refuse(
+                    "repo",
+                    repo,
+                    task_id,
+                    f"workloads.{pname}.repo",
+                    f"profile {pname!r} allows none",
+                )
+            elif self.config.github.effective_repo(repo) is None:
+                refuse("repo", repo, task_id, "github.repos", "not a configured repository")
+            elif not p.pair.mounted:
+                refuse(
+                    "repo",
+                    repo,
+                    task_id,
+                    None,
+                    "the data directory is not mounted in the agent sandbox, so a checkout "
+                    "there would never be seen (see the sandbox row of `sbxloop doctor`)",
+                )
+        if refusals:
+            more = f" (+{len(refusals) - 1} more)" if len(refusals) > 1 else ""
+            p.needs_refused = f"the plan's needs were refused: {refusals[0]}{more}"
+            log.info("run.needs_refused", run=run_id, profile=pname, refusals=refusals)
+            return p.needs_refused
+
+        granted_hosts = list(dict.fromkeys(h for h, _ in hosts))
+        granted_creds = list(dict.fromkeys(c for c, _ in credentials))
+        granted_sinks = list(dict.fromkeys(s for s, _ in sink_needs))
+        granted_repos = list(dict.fromkeys(r for r, _ in repos))
+        run_row = self.store.get_run(run_id)
+        new_creds = [c for c in granted_creds if c not in run_row.credentials]
+        parts = [
+            f"{label} {', '.join(f'`{v}`' for v in values)}"
+            for label, values in (
+                ("hosts", granted_hosts),
+                ("credentials", granted_creds),
+                ("sinks", granted_sinks),
+                ("repos", granted_repos),
+            )
+            if values
+        ]
+        message = f"granted under profile {pname!r}: " + "; ".join(parts)
+        if new_creds:
+            message += " — re-provisioning with the service sandbox that holds the credentials"
+        self.bus.emit(
+            HostEventTypes.RUN_NEEDS_GRANTED,
+            run_id,
+            profile=pname,
+            hosts=granted_hosts,
+            credentials=granted_creds,
+            sinks=granted_sinks,
+            repos=granted_repos,
+            message=message,
+        )
+        log.info("run.needs_granted", run=run_id, profile=pname, message=message)
+        assert p.pair.workspace is not None
+        for repo in granted_repos:
+            assert p.provisioner is not None
+            p.provisioner.clone_repo_into_data_dir(run_id, p.pair.workspace, repo)
+        if new_creds:
+            self.store.set_run_credentials(run_id, [*run_row.credentials, *new_creds])
+            raise _Reprovision("executing")
+        return None
+
+    @property
+    def _verify_mode(self) -> VerifyMode:
+        """What this run's verify phase and gate decide (#682)."""
+        return self.config.verify_mode_for(self.config.github.repo)
+
+    def _hint_services(self, run_id: str, workspace: Path | None) -> None:
+        """Name the evidence of a service-backed suite (#682) before the plan
+        is written, under the one mode where it costs the run something.
+
+        A hint, not a switch: a compose file for local development says
+        nothing certain about the unit suite, and an operator who set
+        `advisory` or `ci-only` already knows. Under `full` the gate is
+        mandatory and a `connection refused` from pytest spends revisions
+        and a replan on a check no revision can pass — this is the moment
+        a human can still change the knob.
+        """
+        if self._verify_mode != "full":
+            return
+        evidence = services_evidence(workspace)
+        if not evidence:
+            return
+        log.info("verify.services_detected", run=run_id, evidence=evidence)
+        self.bus.emit(
+            HostEventTypes.VERIFY_SERVICES_DETECTED,
+            run_id,
+            evidence=evidence,
+            hint=(
+                "the suite may need services the sandbox does not have; `[sandbox] "
+                'verify_mode = "advisory"` reports a failing verify without spending '
+                'the budget on it, `"ci-only"` leaves the judging to the pull request\'s '
+                "checks (a `[[github.repos]]` entry sets either per repository)"
+            ),
+        )
+
+    def _verification_note(self, run_id: str) -> str:
+        """What the review and the pull request are told about verification
+        that did not gate (#682): each advisory failure still standing, or
+        that nothing ran under `ci-only`. Empty under `full`, where a green
+        verify is the precondition of getting here.
+
+        Read from the phase rows rather than in-memory state, so a resumed
+        run tells the same story — and only the latest attempt of each
+        check counts: a failure a later attempt cleared is not evidence.
+        """
+        mode = self._verify_mode
+        if mode == "ci-only":
+            return (
+                'The operator set `verify_mode = "ci-only"`: no verify command and no '
+                "project gate ran in the sandbox. The pull request's own checks are the "
+                "verification."
+            )
+        if mode != "advisory":
+            return ""
+        latest: dict[tuple[str, str | None], sqlite3.Row] = {}
+        for row in self.store.phase_attempts(run_id):
+            if row["phase"] in ("verify", "gate"):
+                latest[(str(row["phase"]), row["task_id"])] = row
+        lines: list[str] = []
+        for (phase, task_id), row in latest.items():
+            if row["status"] != "advisory":
+                continue
+            try:
+                data = json.loads(row["output_json"] or "{}")
+            except ValueError:
+                continue
+            if phase == "gate":
+                first = next(
+                    (ln for ln in str(data.get("output") or "").splitlines() if ln.strip()), ""
+                )
+                lines.append(
+                    f"- project gate `{data.get('command')}` exit {data.get('exit_code')}"
+                    + (f": {first[:200]}" if first else "")
+                )
+            else:
+                feedback = str(data.get("feedback") or "")
+                for chunk in feedback.split(VERIFY_FAILURE_PREFIX):
+                    head = chunk.strip().splitlines()
+                    if head:
+                        lines.append(f"- task {task_id}: {head[0][:200]}")
+        if not lines:
+            return (
+                'The operator set `verify_mode = "advisory"`: every verify command and '
+                "the project gate ran in the sandbox and passed."
+            )
+        return (
+            'The operator set `verify_mode = "advisory"`: these checks failed in the '
+            "sandbox and blocked nothing. Weigh each as evidence — a failure the "
+            "sandbox explains (a service it does not have: `connection refused`, a "
+            "missing database or browser) is not a finding; one the diff explains "
+            "is.\n" + "\n".join(lines)
+        )
 
     def _announce_roster(self, run_id: str, tasks: Sequence[TaskRecord]) -> None:
         # Announce the full roster up front (with titles) so UIs can show
@@ -1391,6 +2095,205 @@ class LoopEngine:
             raise failure
         return failed_ids, skipped_ids
 
+    # -- workload stages (#755) ---------------------------------------------
+
+    def _stage_judge(self, p: Pipeline) -> str | None:
+        """Re-run every task's checks over the finished workspace.
+
+        Each task was judged as it finished (#756), its declared checks
+        among the evidence; a later task can undo an earlier one's proof,
+        so the mechanical part of that judgment is taken once more on the
+        tree as it stands. Returns the reason the run failed, or None to
+        publish. A red check here ends the run rather than spending a fix
+        round: the per-task revisions are where the work gets its retries.
+        """
+        run_id, phases = p.run_id, p.phases
+        self._set_run_state(run_id, "judging")
+        commands = list(
+            dict.fromkeys(
+                c
+                for t in self.store.get_tasks(run_id)
+                if not is_fix_task(t.spec.id)
+                for c in t.spec.verify_commands
+            )
+        )
+        # The run's own judge rows carry no task; the per-task verdicts
+        # (#756) are the judge's, under the same phase name.
+        attempt = 1 + sum(
+            1
+            for row in self.store.phase_attempts(run_id)
+            if row["phase"] == "judge" and row["task_id"] is None
+        )
+        started = time.time()
+        results = phases.shell_batch(commands) if commands else []
+        failed = [
+            (command, result)
+            for command, result in zip(commands, results, strict=True)
+            if result.exit_code != 0
+        ]
+        status = "ok" if not failed else "failed"
+        self.store.record_phase(
+            run_id,
+            "judge",
+            task_id=None,
+            attempt=attempt,
+            status=status,
+            output_json=json.dumps(
+                {
+                    "commands": commands,
+                    "failed": [
+                        {
+                            "command": command,
+                            "exit_code": result.exit_code,
+                            "output": clip_head_tail(result.output),
+                        }
+                        for command, result in failed
+                    ],
+                }
+            ),
+            started_at=started,
+        )
+        if not failed:
+            message = (
+                f"{len(commands)} check(s) passed on the finished workspace"
+                if commands
+                else "no task declared a check; nothing to re-run"
+            )
+        else:
+            command, result = failed[0]
+            first_line = next(
+                (line for line in (result.output or "").splitlines() if line.strip()), ""
+            )
+            message = f"`{command}` exit {result.exit_code}: {first_line}"
+        self.bus.emit(
+            HostEventTypes.PHASE_END,
+            run_id,
+            task_id=None,
+            phase="judge",
+            status=status,
+            attempt=attempt,
+            message=message,
+        )
+        if not failed:
+            return None
+        named = ", ".join(f"`{command}` (exit {result.exit_code})" for command, result in failed)
+        return f"the judgment failed: {len(failed)} of {len(commands)} check(s) red — {named}"
+
+    def _stage_publish(self, p: Pipeline) -> str | None:
+        """Hand the result to its sinks (#759).
+
+        Each task's output goes to the sink its plan declared — the
+        ``artifact`` directory, a result issue in the delivery repository,
+        the chat reply — in that order, so the chat line can name what the
+        others delivered. Every delivery is recorded on the run row
+        (``published``) before the next begins, so a resume at
+        ``publishing`` skips what already landed: one issue per run,
+        however many times the stage is entered. A sink that cannot take
+        the result fails the run, named — the work is judged and on the
+        row, and a result nobody received is not a completed run.
+        Returns the reason the run failed, or None once every sink has it.
+        """
+        run_id = p.run_id
+        self._set_run_state(run_id, "publishing")
+        run = self.store.get_run(run_id)
+        tasks = self.store.get_tasks(run_id)
+        landed = {entry.sink for entry in run.published}
+        for sink in sinks.PUBLISH_ORDER:
+            carried = sinks.tasks_for(tasks, sink)
+            if not carried or sink in landed:
+                continue
+            try:
+                if sink == "artifact":
+                    entry = self._publish_artifact(p, run, carried)
+                elif sink == "issue":
+                    entry = self._publish_issue(p, run, tasks, carried)
+                else:
+                    entry = self._publish_chat(run, tasks, carried)
+            except (SbxError, GithubOpsError, OSError, sinks.PublishError) as exc:
+                log.warning("run.publish_failed", run=run_id, sink=sink, exc_info=True)
+                return f"publishing to {sink} failed: {exc}"
+            self.store.add_run_published(run_id, entry)
+            self.bus.emit(
+                HostEventTypes.RUN_PUBLISHED,
+                run_id,
+                sink=entry.sink,
+                location=entry.location,
+                tasks=entry.tasks,
+                files=entry.files,
+                message=(
+                    sinks.chat_text(tasks, run.pr_title, carried)
+                    if sink == "chat"
+                    else sinks.published_line(entry)
+                ),
+            )
+        return None
+
+    def _publish_artifact(
+        self, p: Pipeline, run: RunRecord, carried: Sequence[TaskRecord]
+    ) -> Published:
+        """Copy the files the tasks declared — only those — out to
+        ``runs/<run>/artifacts``: a host copy from a mounted workspace, a
+        tar of the listed paths from an unmounted one."""
+        target = artifacts_dir(run, self.config.state_dir)
+        assert target is not None
+        files = sinks.declared_files(carried)
+        target.mkdir(parents=True, exist_ok=True)
+        if files:
+            if p.pair.mounted:
+                assert p.pair.workspace is not None
+                for rel in files:
+                    dest = target / rel
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(p.pair.workspace / rel, dest)
+            else:
+                self._copy_out(p.pair, target, files)
+        return Published(
+            sink="artifact",
+            location=str(target),
+            tasks=[t.spec.id for t in carried],
+            files=len(files),
+        )
+
+    def _publish_issue(
+        self,
+        p: Pipeline,
+        run: RunRecord,
+        tasks: Sequence[TaskRecord],
+        carried: Sequence[TaskRecord],
+    ) -> Published:
+        """File the result as one issue in the delivery repository, under
+        the `[workload] result_label` (ensured best-effort, like the
+        follow-up label: an issue GitHub cannot label is still filed)."""
+        assert p.ops is not None and p.repo is not None
+        label = sinks.result_label(self.config.workload.result_label)
+        ensure_label(p.ops, p.repo, label)
+        ref = p.ops.issue_create(
+            p.repo,
+            sinks.issue_title(run.pr_title, p.outcome),
+            sinks.issue_body(tasks, run.pr_title, carried, run_id=run.run_id, outcome=p.outcome),
+            labels=[label.name],
+        )
+        return Published(
+            sink="issue",
+            location=ref.url,
+            tasks=[t.spec.id for t in carried],
+            files=sum(t.output.file_count for t in carried if t.output is not None),
+        )
+
+    def _publish_chat(
+        self, run: RunRecord, tasks: Sequence[TaskRecord], carried: Sequence[TaskRecord]
+    ) -> Published:
+        """The chat sink is the ``run.published`` event itself: its
+        ``message`` is the reply, posted where the run was asked for by
+        whoever drives the engine (the daemon's thread, the CLI's
+        terminal). Nothing to deliver from here but the record."""
+        return Published(
+            sink="chat",
+            location="chat",
+            tasks=[t.spec.id for t in carried],
+            files=sum(t.output.file_count for t in carried if t.output is not None),
+        )
+
     # -- post-build stages -------------------------------------------------
 
     def _stage_gate(self, p: Pipeline) -> str | None:
@@ -1406,28 +2309,50 @@ class LoopEngine:
         run_id, phases = p.run_id, p.phases
         self._set_run_state(run_id, "gating")
         gate = phases.project_gate()
+        mode = self._verify_mode
         attempt = 1 + sum(1 for row in self.store.phase_attempts(run_id) if row["phase"] == "gate")
         started = time.time()
-        if not gate:
+        if not gate or mode == "ci-only":
+            # Under `ci-only` (#682) the gate is the pull request's checks:
+            # the same command CI runs, on the runner that has the services.
+            reason_skipped = (
+                "the project declares no gate"
+                if not gate
+                else 'verify_mode = "ci-only": the pull request\'s checks are the gate'
+            )
             self.store.record_phase(
                 run_id,
                 "gate",
                 task_id=None,
                 attempt=attempt,
                 status="skipped",
-                output_json=json.dumps({"reason": "the project declares no gate"}),
+                output_json=json.dumps({"reason": reason_skipped, "command": gate}),
                 started_at=started,
             )
+            if gate:
+                self.bus.emit(
+                    HostEventTypes.PHASE_END,
+                    run_id,
+                    task_id=None,
+                    phase="gate",
+                    status="skipped",
+                    attempt=attempt,
+                    message=f"`{gate}` not run ({reason_skipped})",
+                )
             return None
         result = phases.shell_batch([gate])[0]
         passed = result.exit_code == 0
         output = clip_head_tail(result.output)
+        # An advisory failure (#682) is recorded as its own status, not as
+        # `failed`: it blocked nothing, and `_verification_note` reads the
+        # rows back to tell the review and the pull request what stood.
+        status = "ok" if passed else ("advisory" if mode == "advisory" else "failed")
         self.store.record_phase(
             run_id,
             "gate",
             task_id=None,
             attempt=attempt,
-            status="ok" if passed else "failed",
+            status=status,
             output_json=json.dumps(
                 {"command": gate, "exit_code": result.exit_code, "output": output}
             ),
@@ -1439,13 +2364,18 @@ class LoopEngine:
             run_id,
             task_id=None,
             phase="gate",
-            status="ok" if passed else "failed",
+            status=status,
             attempt=attempt,
             message=f"`{gate}` passed"
             if passed
-            else f"`{gate}` exit {result.exit_code}: {first_line}",
+            else f"`{gate}` exit {result.exit_code}: {first_line}"
+            + (
+                ' (advisory: verify_mode = "advisory", not blocking)'
+                if status == "advisory"
+                else ""
+            ),
         )
-        if passed:
+        if passed or status == "advisory":
             return None
         reason = self._fix_round(
             p,
@@ -1481,7 +2411,8 @@ class LoopEngine:
         title = self._retitled(p, run.pr_title)
         if title != run.pr_title:
             self.store.set_run_title(run_id, title)
-        pr_title, commit_message = self._naming(p, title)
+        pr_title, commit_message = self._naming(p, title, source)
+        authored_body = self._authored_body(p)
         # Only the first delivery of an adopted branch continues its
         # history; once this run has delivered, later rounds force-move
         # onto their own head as they always did.
@@ -1512,6 +2443,8 @@ class LoopEngine:
             parent=parent,
             title=pr_title,
             commit_message=commit_message,
+            authored_body=authored_body,
+            verification=self._verification_note(run_id),
         )
         data = ops.pr_get(repo, pr.number)
         head = data.get("head")
@@ -1547,9 +2480,13 @@ class LoopEngine:
             round=round_no,
         )
 
-    def _naming(self, p: Pipeline, title: str | None) -> tuple[str, str]:
+    def _naming(self, p: Pipeline, title: str | None, source: Path) -> tuple[str, str]:
         """The PR title and commit message from the `[github]` templates
-        (#621) — the repo entry's own when it overrides them."""
+        (#621) — the repo entry's own when it overrides them. A repository
+        that lints titles as conventional commits (#678) and a title
+        template nobody set get the bare conventional title instead of
+        `sbxloop: {title}`, which no such lint accepts; a template the
+        operator wrote is theirs and stands."""
         assert p.repo is not None
         gh = self.config.github
         entry = p.repo_config
@@ -1563,7 +2500,35 @@ class LoopEngine:
                 template, title=title, outcome=p.outcome, run_id=p.run_id, repo=str(p.repo)
             )
 
-        return render(title_template), render(message_template)
+        pr_title = render(title_template)
+        if title_template == DEFAULT_PR_TITLE_TEMPLATE:
+            evidence = conventional_titles(source)
+            if evidence:
+                pr_title = conventional_title(render("{title}"))
+                log.info(
+                    "deliver.conventional_title",
+                    run=p.run_id,
+                    evidence=evidence,
+                    title=pr_title,
+                )
+        return pr_title, render(message_template)
+
+    def _authored_body(self, p: Pipeline) -> str | None:
+        """The pull request description the agent wrote, if any: the whole
+        of ``.sbxloop/pr-body`` under the workspace (#678) — the
+        repository's template filled in, or a fix round's corrected body —
+        read and taken away like the title file, so it names one round."""
+        path = f"{p.pair.agent_workdir}/{PR_BODY_FILE}"
+        try:
+            result = p.pair.agent.exec(["sh", "-c", 'cat "$1" && rm -f "$1"', "sh", path])
+        except SbxError:
+            log.warning("deliver.body_file_unread", run=p.run_id, path=path, exc_info=True)
+            return None
+        body = result.stdout.strip() if result.returncode == 0 else ""
+        if not body:
+            return None
+        log.info("deliver.body_from_workspace", run=p.run_id, chars=len(body))
+        return body
 
     def _retitled(self, p: Pipeline, current: str | None) -> str | None:
         """The PR title after a fix round: a round that had to retitle
@@ -1619,6 +2584,7 @@ class LoopEngine:
             tasks=self.store.get_tasks(run_id),
             history=render_review_history(rounds),
             refuted=closed_anchors(rounds),
+            verification=self._verification_note(run_id),
         )
         # Round n+1's word on a finding an earlier round raised belongs in
         # that finding's own thread, not restated in a fresh review body
@@ -2173,6 +3139,12 @@ class LoopEngine:
                 rounds[-1] = ReviewRound(last.round, last.verdict, str(report))
         return rounds
 
+    def _undrafted(self, run_id: str) -> bool:
+        """Whether this run's landing has already taken its PR out of draft
+        (#677): the ``land.undraft`` event is on the run's record. After
+        it, a draft is a person's hold, not the loop's to clear."""
+        return any(True for _seq, _event in self.store.events(run_id, type_prefix="land.undraft"))
+
     def _review_posted(self, run_id: str) -> bool:
         """Whether the most recent review round got its record onto GitHub.
 
@@ -2350,6 +3322,7 @@ class LoopEngine:
                 history=render_fix_history(rounds_so_far),
                 unanswered=unanswered_findings(rounds_so_far),
                 preexisting=checks.preexisting if checks is not None else (),
+                gate=gate,
             ),
             verify_commands=verify_commands,
             failed_checks=failed_checks,
@@ -2397,13 +3370,17 @@ class LoopEngine:
         return True
 
     def _base_branch(self, p: Pipeline) -> str:
-        """The branch the PR targets: configured, else the repository's default."""
+        """The branch the PR targets: configured, else the repository's default.
+
+        Never a guess (#672): a run with no repository has no branch to
+        target, and every caller checks for one before asking.
+        """
         base = p.repo_config.deliver_base if p.repo_config else self.config.github.deliver_base
         if base:
             return base
-        if p.ops is not None and p.repo is not None:
-            return str(p.ops.repo_get(p.repo).get("default_branch") or "main")
-        return "main"
+        if p.ops is None or p.repo is None:
+            raise StateError(f"run {p.run_id} has no GitHub repository to take a base branch from")
+        return p.ops.default_branch(p.repo)
 
     def _merge_base_into_clone(self, p: Pipeline) -> hostgit.MergeResult | None:
         """Before a fix round: bring the current base into the run's clone,
@@ -2412,7 +3389,7 @@ class LoopEngine:
         None when the run has no mounted clone to merge into; a fetch/merge
         failure is logged and the round proceeds on the tree as it is."""
         workspace = p.pair.workspace
-        if workspace is None or not p.pair.mounted or p.ops is None:
+        if workspace is None or not p.pair.mounted or p.ops is None or p.repo is None:
             return None
         base = self._base_branch(p)
         try:
@@ -2462,14 +3439,6 @@ class LoopEngine:
                 HostEventTypes.CI_STATUS, run_id, pr=run.pr_number, round=round_no, **data
             )
 
-        policy = read_check_policy(
-            ops,
-            repo,
-            self._base_branch(p),
-            run.head_sha,
-            cfg=self.config.landing,
-            advisory_spent=self.store.advisory_rounds(run_id),
-        )
         try:
             checks = poll_checks(
                 ops,
@@ -2480,7 +3449,14 @@ class LoopEngine:
                 emit=emit,
                 clock=self.clock,
                 settle_from=p.delivered_at,
-                policy=policy,
+                policy_for=check_policy_reader(
+                    ops,
+                    repo,
+                    self._base_branch(p),
+                    cfg=self.config.landing,
+                    advisory_spent=self.store.advisory_rounds(run_id),
+                    number=run.pr_number,
+                ),
             )
         except CiTimeout as exc:
             return Blocked(str(exc))
@@ -2499,7 +3475,7 @@ class LoopEngine:
             )
         return None
 
-    def _stage_land(self, p: Pipeline) -> Landed | Gated | Blocked | NeedsFix | Closed:
+    def _stage_land(self, p: Pipeline) -> LandingOutcome:
         run_id, ops, repo = p.run_id, p.ops, p.repo
         assert ops is not None and repo is not None
         self._set_run_state(run_id, "landing")
@@ -2545,8 +3521,12 @@ class LoopEngine:
                 self._base_branch(p),
                 cfg=self.config.landing,
                 advisory_spent=self.store.advisory_rounds(run_id),
+                number=number,
             ),
             bot_round_spent=self.store.bot_round_spent(run_id),
+            # The loop's own draft is the one it delivered and has not yet
+            # cleared (#677); after its un-draft, any draft is a person's.
+            own_draft=self.config.landing.deliver_draft and not self._undrafted(run_id),
         )
         if isinstance(outcome, Landed):
             log.info(
@@ -2580,10 +3560,48 @@ class LoopEngine:
             # them is alive. Gate is not blocked: every bar was cleared, and
             # follow-ups carry the follow-up label, never the trigger label.
             self._file_followups(p, run)
-        elif isinstance(outcome, Blocked):
-            log.warning("run.blocked", run=run_id, pr=number, why=outcome.why)
+        elif isinstance(outcome, AwaitingReview):
+            log.info(
+                "run.awaiting_review",
+                run=run_id,
+                pr=number,
+                head=outcome.head,
+                approvals_required=outcome.approvals_required,
+                approvals_have=outcome.approvals_have,
+                draft=outcome.draft,
+            )
             self.bus.emit(
-                HostEventTypes.RUN_BLOCKED, run_id, pr=number, url=run.pr_url, why=outcome.why
+                HostEventTypes.RUN_AWAITING_REVIEW,
+                run_id,
+                pr=number,
+                url=run.pr_url,
+                sha=outcome.head,
+                approvals_required=outcome.approvals_required,
+                approvals_have=outcome.approvals_have,
+                code_owners=outcome.code_owners,
+                draft=outcome.draft,
+                review_rounds=run.review_rounds,
+                ci_rounds=run.ci_rounds,
+            )
+            # As for the gate: the daemon finishes an approved landing with
+            # gh ops alone, so the follow-ups are filed while the machinery
+            # is alive. Idempotent — a resume that merges files nothing twice.
+            self._file_followups(p, run)
+        elif isinstance(outcome, Blocked):
+            log.warning(
+                "run.blocked",
+                run=run_id,
+                pr=number,
+                why=outcome.why,
+                blockers=list(outcome.blockers),
+            )
+            self.bus.emit(
+                HostEventTypes.RUN_BLOCKED,
+                run_id,
+                pr=number,
+                url=run.pr_url,
+                why=outcome.why,
+                blockers=list(outcome.blockers),
             )
         return outcome
 
@@ -2883,7 +3901,16 @@ class LoopEngine:
                 task.last_feedback = abort_reason
                 self._set_task_state(run_id, task, "failed")
                 break
-            if task.state == "executing":
+            if p.kind == "workload":
+                # The operator executes and the judge decides (#756); the
+                # task walks the same two states a code run's does.
+                if task.state == "executing":
+                    self._phase_execute(run_id, phases, task, granter, pair)
+                elif task.state == "verifying":
+                    self._phase_judge(run_id, phases, task)
+                else:  # pragma: no cover - defensive
+                    raise StateError(f"task {task.spec.id} in unexpected state {task.state}")
+            elif task.state == "executing":
                 self._phase_build(run_id, phases, task, granter)
             elif task.state == "verifying":
                 self._phase_verify(run_id, phases, task)
@@ -2898,7 +3925,7 @@ class LoopEngine:
             # Copies the whole workspace out of the shared sandbox; two lanes
             # harvesting at once would interleave into the same directory.
             with self._sandbox_lock:
-                self._harvest(run_id, pair)
+                self._harvest(run_id, pair, p.kind)
         self._emit_task_end(run_id, task)
 
     def _phase_build(
@@ -3006,6 +4033,267 @@ class LoopEngine:
         task.last_feedback = ""
         self._set_task_state(run_id, task, "verifying")
 
+    def _phase_execute(
+        self,
+        run_id: str,
+        phases: PhaseRunner,
+        task: TaskRecord,
+        granter: EgressGranter,
+        pair: SandboxPair,
+    ) -> None:
+        """One operator session on one workload task (#756): the build
+        phase's shape — grants, session resume, the prior report — with the
+        session's tool calls digested for the judge and persisted beside
+        the report, so a resumed run judges the same evidence.
+
+        The task's output (#757) is cut here too: the report's result
+        section, and the data-directory files newer than the marker the
+        task's first attempt set — listed, not claimed.
+        """
+        with self._sandbox_lock:
+            granter.apply(
+                task.spec.id,
+                [(egress.domain, egress.reason) for egress in task.spec.egress]
+                # The plan's declared hosts (#758), checked against the
+                # profile after planning; applied here, at the tightest
+                # point sbx's grant-only policy model permits.
+                + [(host, "declared in the plan's needs") for host in task.spec.needs.hosts],
+            )
+        started = time.time()
+        self._mark_task_start(run_id, pair, task)
+        resume = task.session_id if task.session_id in self._live_sessions else None
+        digest = ToolDigest()
+        result = phases.execute(
+            task,
+            prior_report=self._prior_attempt_report(run_id, task, phase="execute"),
+            resume_session_id=resume,
+            digest=digest,
+        )
+        if resume and result.session_id != resume:
+            log.info(
+                "phase.resume_missed",
+                run=run_id,
+                task=task.spec.id,
+                requested=resume,
+                got=result.session_id,
+                hint="the SDK could not resume; the prior report still carried the context",
+            )
+        task.session_id = result.session_id
+        if result.session_id:
+            self._live_sessions.add(result.session_id)
+        report = clip(result.output_text)
+        spend = phases.drain_spend()
+        self.store.record_phase(
+            run_id,
+            "execute",
+            task_id=task.spec.id,
+            attempt=task.revisions + 1,
+            status="ok",
+            output_json=json.dumps(
+                {
+                    "report": report,
+                    "session_id": result.session_id,
+                    "tools": digest.render(),
+                    "tool_calls": digest.total,
+                }
+            ),
+            started_at=started,
+            usage=spend.usage,
+            turns=spend.turns,
+        )
+        headline = " ".join((result.output_text or "").split())
+        self.bus.emit(
+            HostEventTypes.PHASE_END,
+            run_id,
+            task_id=task.spec.id,
+            phase="execute",
+            status="ok",
+            attempt=task.revisions + 1,
+            message=headline[:300] or "(the operator produced no report)",
+        )
+        earlier = task.output.files if task.output is not None else []
+        files, more = self._task_files(run_id, pair, task, earlier)
+        task.output = TaskOutput.from_report(report, files=files, more_files=more)
+        self.bus.emit(
+            HostEventTypes.TASK_OUTPUT,
+            run_id,
+            task_id=task.spec.id,
+            attempt=task.revisions + 1,
+            summary=task.output.summary,
+            files=task.output.file_count,
+        )
+        task.last_feedback = ""
+        self._set_task_state(run_id, task, "verifying")
+
+    @staticmethod
+    def _task_marker(task: TaskRecord) -> str:
+        # Under the VM's own `.sbxloop`, never the data directory: the
+        # marker is not an output and needs no exclude.
+        return f"{SBXLOOP_DIR}/task-{task.spec.id}.start"
+
+    def _mark_task_start(self, run_id: str, pair: SandboxPair, task: TaskRecord) -> None:
+        """Set the task's marker before its FIRST attempt only, so a
+        revision's listing still covers what the earlier attempts left."""
+        marker = shlex.quote(self._task_marker(task))
+        try:
+            result = pair.agent.exec(
+                [
+                    "sh",
+                    "-c",
+                    f"mkdir -p {shlex.quote(SBXLOOP_DIR)} && [ -e {marker} ] || : > {marker}",
+                ]
+            )
+            ok, detail = result.ok, result.stderr
+        except SbxError as exc:
+            ok, detail = False, str(exc)
+        if not ok:
+            log.warning("task.mark_failed", run=run_id, task=task.spec.id, detail=detail[-300:])
+
+    def _task_files(
+        self, run_id: str, pair: SandboxPair, task: TaskRecord, earlier: Sequence[str] = ()
+    ) -> tuple[list[str], int]:
+        """The data-directory files the task's attempts touched: everything
+        newer than its marker, under the same excludes the harvest and the
+        artifact listing apply, plus the files an earlier attempt listed
+        that still exist — a resumed run's fresh sandbox has a fresh marker,
+        and the persisted output is what remembers the attempts before it.
+        Best-effort like the harvest — a failed listing is logged and the
+        output says no files, never the run."""
+        prune = " -o ".join(f"-name {shlex.quote(name)}" for name in self.config.artifacts.exclude)
+        prune_expr = f"\\( {prune} \\) -prune -o " if prune else ""
+        keep = ""
+        if earlier:
+            names = " ".join(shlex.quote(name) for name in earlier)
+            keep = f'for f in {names}; do [ -f "$f" ] && printf "%s\\n" "$f"; done; '
+        script = (
+            f"cd {shlex.quote(pair.agent_workdir)} && {keep}find . {prune_expr}"
+            f"-type f -newer {shlex.quote(self._task_marker(task))} -print"
+        )
+        try:
+            result = pair.agent.exec(["sh", "-c", script])
+        except SbxError as exc:
+            log.warning("task.files_failed", run=run_id, task=task.spec.id, detail=str(exc)[-300:])
+            return [], 0
+        if not result.ok:
+            log.warning(
+                "task.files_failed", run=run_id, task=task.spec.id, detail=result.stderr[-300:]
+            )
+            return [], 0
+        paths = sorted(
+            {
+                line[2:] if line.startswith("./") else line
+                for line in result.stdout.splitlines()
+                if line.strip()
+            }
+        )
+        return paths[:MAX_OUTPUT_FILES], max(0, len(paths) - MAX_OUTPUT_FILES)
+
+    def _phase_judge(self, run_id: str, phases: PhaseRunner, task: TaskRecord) -> None:
+        """The judge's verdict on the task's last execute attempt (#756).
+
+        Passed → done. Failed → the unmet criteria are the next attempt's
+        feedback, under ``max_revisions_per_task``; past it the task fails
+        and the verdict becomes the run's reason. A judge that produced no
+        usable verdict twice running is a degraded judge: the task fails
+        closed, named as such — silence is never a pass.
+        """
+        started = time.time()
+        attempt = task.revisions + 1
+        output = self.store.latest_phase_output(run_id, task.spec.id, "execute")
+        executed = json.loads(output) if output else {}
+        report = executed.get("report")
+        tools = executed.get("tools")
+        report = report if isinstance(report, str) else ""
+        tools = tools if isinstance(tools, str) else ""
+        evidence = phases.verify(task).results if task.spec.verify_commands else ""
+        try:
+            verdict = phases.judge(
+                task, attempt=attempt, report=report, tool_digest=tools, evidence=evidence
+            )
+        except InvalidOutputTwice as exc:
+            spend = phases.drain_spend()
+            self.store.record_phase(
+                run_id,
+                "judge",
+                task_id=task.spec.id,
+                attempt=attempt,
+                status="failed",
+                output_json=json.dumps({"degraded": True, "error": str(exc)}),
+                started_at=started,
+                usage=spend.usage,
+                turns=spend.turns,
+            )
+            log.warning("judge.degraded", run=run_id, task=task.spec.id, error=str(exc)[:300])
+            self.bus.emit(
+                HostEventTypes.JUDGE_DEGRADED,
+                run_id,
+                task_id=task.spec.id,
+                attempt=attempt,
+                error=str(exc),
+            )
+            self.bus.emit(
+                HostEventTypes.PHASE_END,
+                run_id,
+                task_id=task.spec.id,
+                phase="judge",
+                status="failed",
+                attempt=attempt,
+                message="the judge produced no usable verdict twice; failing closed",
+            )
+            task.last_feedback = f"the judge could not reach a verdict: {exc}"
+            self._set_task_state(run_id, task, "failed")
+            return
+        spend = phases.drain_spend()
+        self.store.record_phase(
+            run_id,
+            "judge",
+            task_id=task.spec.id,
+            attempt=attempt,
+            status="ok" if verdict.passed else "failed",
+            output_json=json.dumps({"degraded": False, "attempt": attempt, **verdict.model_dump()}),
+            started_at=started,
+            usage=spend.usage,
+            turns=spend.turns,
+        )
+        self.bus.emit(
+            HostEventTypes.JUDGE_VERDICT,
+            run_id,
+            task_id=task.spec.id,
+            attempt=attempt,
+            passed=verdict.passed,
+            unmet=list(verdict.unmet),
+            notes=verdict.notes,
+        )
+        if verdict.passed:
+            self.bus.emit(
+                HostEventTypes.PHASE_END,
+                run_id,
+                task_id=task.spec.id,
+                phase="judge",
+                status="ok",
+                attempt=attempt,
+                message=" ".join(verdict.notes.split())[:300] or "every criterion met",
+            )
+            self._set_task_state(run_id, task, "done")
+            return
+        first = verdict.unmet[0]
+        more = len(verdict.unmet) - 1
+        self.bus.emit(
+            HostEventTypes.PHASE_END,
+            run_id,
+            task_id=task.spec.id,
+            phase="judge",
+            status="failed",
+            attempt=attempt,
+            message=f"unmet: {first}" + (f" (+{more} more)" if more else ""),
+        )
+        feedback = "the judge found these acceptance criteria unmet:\n" + "\n".join(
+            f"- {item}" for item in verdict.unmet
+        )
+        if verdict.notes:
+            feedback += f"\n\nJudge's notes: {verdict.notes}"
+        self._register_revision(run_id, task, feedback)
+
     def _phase_verify(
         self,
         run_id: str,
@@ -3013,17 +4301,54 @@ class LoopEngine:
         task: TaskRecord,
     ) -> None:
         started = time.time()
+        mode = self._verify_mode
+        if mode == "ci-only":
+            # No verify job at all (#682): the pull request's checks judge
+            # the work in landing, on a runner that has the services. The
+            # row and the event keep the skip visible — a resumed run and a
+            # reader of the chronology both see that nothing ran.
+            self.store.record_phase(
+                run_id,
+                "verify",
+                task_id=task.spec.id,
+                attempt=task.revisions + 1,
+                status="skipped",
+                output_json=json.dumps(
+                    {
+                        "passed": None,
+                        "reason": 'verify_mode = "ci-only"',
+                        "commands": list(task.spec.verify_commands),
+                    }
+                ),
+                started_at=started,
+            )
+            self.bus.emit(
+                HostEventTypes.PHASE_END,
+                run_id,
+                task_id=task.spec.id,
+                phase="verify",
+                status="skipped",
+                message=(
+                    f"{len(task.spec.verify_commands)} verify command(s) not run "
+                    '(verify_mode = "ci-only": the pull request\'s checks are the '
+                    "verification)"
+                ),
+            )
+            self._set_task_state(run_id, task, "done")
+            return
         outcome = phases.verify(task)
         passed, feedback, results = outcome.passed, outcome.feedback, outcome.results
+        advisory = not passed and mode == "advisory"
         # `results` (the full command transcript) is persisted so a resumed
         # run reads the evidence from phase_attempts rather than in-memory
-        # state (#61).
+        # state (#61). An advisory failure (#682) gets its own status: it
+        # blocked nothing, and `_verification_note` reads the rows back.
         self.store.record_phase(
             run_id,
             "verify",
             task_id=task.spec.id,
             attempt=task.revisions + 1,
-            status="ok" if passed else "failed",
+            status="ok" if passed else ("advisory" if advisory else "failed"),
             output_json=json.dumps(
                 {"passed": passed, "feedback": clip(feedback), "results": results}
             ),
@@ -3037,15 +4362,29 @@ class LoopEngine:
         # in the phase_attempts table.
         failure_count = feedback.count(VERIFY_FAILURE_PREFIX)
         first_line = feedback.splitlines()[0] if feedback else "verify failed"
+        message = first_line if failure_count <= 1 else f"{first_line} (+{failure_count - 1} more)"
+        if advisory:
+            # The task is done on the builder's word (#682): the failure is
+            # evidence for the review and the pull request, never a
+            # revision or a replan. `verify_fingerprints` stays untouched —
+            # the suspect machinery is for checks that gate.
+            self.bus.emit(
+                HostEventTypes.PHASE_END,
+                run_id,
+                task_id=task.spec.id,
+                phase="verify",
+                status="advisory",
+                message=f'{message} (advisory: verify_mode = "advisory", not blocking)',
+            )
+            self._set_task_state(run_id, task, "done")
+            return
         self.bus.emit(
             HostEventTypes.PHASE_END,
             run_id,
             task_id=task.spec.id,
             phase="verify",
             status="failed",
-            message=(
-                first_line if failure_count <= 1 else f"{first_line} (+{failure_count - 1} more)"
-            ),
+            message=message,
         )
         repeated = self._record_verify_failures(task, outcome.failures)
         if repeated and task.verify_suspect:
@@ -3138,7 +4477,7 @@ class LoopEngine:
         task.revisions = 0
         task.session_id = None
 
-    def _prior_attempt_report(self, run_id: str, task: TaskRecord) -> str:
+    def _prior_attempt_report(self, run_id: str, task: TaskRecord, *, phase: str = "build") -> str:
         """What the previous BUILD attempt on this task said it did.
 
         Field failure (run rrhb28j7n, task t5): five executor sessions each
@@ -3153,7 +4492,7 @@ class LoopEngine:
         Read from the store rather than kept in memory so a resumed run's
         revision gets the same context a fresh one would.
         """
-        output = self.store.latest_phase_output(run_id, task.spec.id, "build")
+        output = self.store.latest_phase_output(run_id, task.spec.id, phase)
         if output is None:
             return ""
         report = json.loads(output).get("report")

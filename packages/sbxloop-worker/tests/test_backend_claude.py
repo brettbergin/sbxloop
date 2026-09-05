@@ -297,6 +297,34 @@ class TestOptions:
             "append": "be terse",
         }
 
+    def test_declining_the_preset_sends_the_message_as_the_whole_prompt(
+        self, sdk: types.ModuleType
+    ) -> None:
+        """An operator session is not a coding agent: with the preset
+        declined its system message is the system prompt, not an appendix
+        to Claude Code's — and with no message at all the SDK's own default
+        stands rather than the preset."""
+        sdk.script = [ResultMessage(session_id="s", result="ok")]
+        _, emit = collect_emit()
+        ClaudeBackend().run_session(
+            job(system_message="you run workloads", system_preset=False), emit
+        )
+        assert sdk.opened_with[0].kwargs["system_prompt"] == "you run workloads"
+        sdk.script = [ResultMessage(session_id="s", result="ok")]
+        ClaudeBackend().run_session(job(system_preset=False), emit)
+        assert sdk.opened_with[1].kwargs["system_prompt"] is None
+
+    def test_filesystem_settings_are_declared_off_not_inherited(
+        self, sdk: types.ModuleType
+    ) -> None:
+        """#688: the repository's CLAUDE.md reaches the model through the
+        prompt's conventions block, so the session loads no filesystem
+        settings — stated, not left to whatever the SDK's default is."""
+        sdk.script = [ResultMessage(session_id="s", result="ok")]
+        _, emit = collect_emit()
+        ClaudeBackend().run_session(job(), emit)
+        assert sdk.opened_with[0].kwargs["setting_sources"] == []
+
     def test_auto_model_is_left_to_the_sdk(self, sdk: types.ModuleType) -> None:
         sdk.script = [ResultMessage(session_id="s", result="ok")]
         _, emit = collect_emit()

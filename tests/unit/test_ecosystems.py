@@ -3,8 +3,8 @@ must not mistake for a Python repo, walked through every generalization
 surface that has landed.
 
 Today's columns: language detection (#624), the toolchain series each
-declares (#627), the installer allowlist (#616), the project gate
-(#625/#626) and the config-override lint (#628).
+declares (#627/#686), the installer allowlist (#616), the project gate
+(#625/#626, below the root #687) and the config-override lint (#628).
 Later work adds its column here rather than a test of its own, so "does a
 Go repo work?" stays one table, and a regression names the decision that
 changed.
@@ -60,6 +60,30 @@ EXPECTATIONS: dict[str, Expectation] = {
             ("uv run pytest -q", False),
         ),
     ),
+    # A Python project whose .gitattributes routes *.png through Git LFS
+    # (#693): git-lfs rides along as a workspace tool — resolved for the
+    # sandbox and the LFS hosts opened — without being a language.
+    "python-lfs": Expectation(
+        ("python", "git-lfs"),
+        "detected",
+        versions={"python": ("3.13", "pyproject.toml")},
+        allowed=("release-assets.githubusercontent.com", "github-cloud.githubusercontent.com"),
+        not_allowed=("nodejs.org", "go.dev"),
+        gate=None,
+        lint=(("uv run pytest -q", False),),
+    ),
+    # A Python project whose version comes from git tags via setuptools-scm
+    # (#694): detected like any other Python project; the run clone is
+    # given the repository's tags (see test_tag_version_markers).
+    "python-scm": Expectation(
+        ("python",),
+        "detected",
+        versions={"python": ("3.13", "pyproject.toml")},
+        allowed=("release-assets.githubusercontent.com",),
+        not_allowed=("nodejs.org", "go.dev"),
+        gate=None,
+        lint=(("uv run pytest -q", False),),
+    ),
     # A pnpm monorepo: the root package.json fires javascript; the
     # workspace package's tsconfig.json, two levels down, fires typescript.
     "node-pnpm": Expectation(
@@ -76,6 +100,57 @@ EXPECTATIONS: dict[str, Expectation] = {
             ("pnpm exec tsc --noEmit", False),
             ("pnpm exec tsc -b packages/web", False),
         ),
+    ),
+    # yarn rides on the corepack shim the javascript toolchain enables; the
+    # lockfile alone selects the client (#684)
+    "node-yarn": Expectation(
+        ("javascript",),
+        "detected",
+        versions={"javascript": ("24", "package.json")},
+        allowed=("nodejs.org", "registry.npmjs.org"),
+        not_allowed=("go.dev", "static.rust-lang.org"),
+        gate="yarn run ci",
+        lint=(("yarn run ci", False),),
+    ),
+    # bun is its own toolchain, selected by the lockfile and pinned to the
+    # packageManager declaration (#684)
+    "node-bun": Expectation(
+        ("javascript", "bun"),
+        "detected",
+        versions={"javascript": ("24", "default"), "bun": ("1.3.5", "package.json")},
+        allowed=("nodejs.org", "registry.npmjs.org"),
+        not_allowed=("go.dev", "static.rust-lang.org"),
+        gate="bun run check",
+        lint=(("bun run check", False),),
+    ),
+    # task runners are toolchains the manifest selects (#685): the gate the
+    # detector emits is one the resolved set can run
+    "python-make": Expectation(
+        ("python", "make"),
+        "detected",
+        versions={"python": ("3.13", "pyproject.toml")},
+        allowed=("release-assets.githubusercontent.com",),
+        not_allowed=("nodejs.org", "go.dev"),
+        gate="make check",
+        lint=(("make check", False),),
+    ),
+    "go-just": Expectation(
+        ("go", "just"),
+        "detected",
+        versions={},
+        allowed=("go.dev", "github.com", "release-assets.githubusercontent.com"),
+        not_allowed=("nodejs.org",),
+        gate="just ci",
+        lint=(("just ci", False),),
+    ),
+    "node-task": Expectation(
+        ("javascript", "task"),
+        "detected",
+        versions={"javascript": ("24", "default")},
+        allowed=("nodejs.org", "github.com", "release-assets.githubusercontent.com"),
+        not_allowed=("go.dev",),
+        gate="task verify",
+        lint=(("task verify", False),),
     ),
     "go": Expectation(
         ("go",),
@@ -100,21 +175,44 @@ EXPECTATIONS: dict[str, Expectation] = {
         gate="cargo test",
         lint=(("cargo test -p fixture", False),),
     ),
-    # apt-only toolchain: nothing beyond the always-reachable mirrors
+    # The default JDK comes from apt; the allowlist still carries the hosts
+    # a pinned major fetches from, since it is computed from the default
+    # entry before the workspace is read (#686)
     "java-gradle": Expectation(
         ("java",),
         "detected",
-        versions={},
-        allowed=(),
+        versions={"java": ("21", "default")},
+        allowed=("api.foojay.io", "github.com"),
         not_allowed=("nodejs.org", "go.dev", "static.rust-lang.org"),
         gate="./gradlew check",
         lint=(("./gradlew check", False),),
     ),
+    # a Gradle toolchain block is an exact JDK major (#686)
+    "java-gradle-toolchain": Expectation(
+        ("java",),
+        "detected",
+        versions={"java": ("17", "build.gradle.kts")},
+        allowed=("api.foojay.io", "github.com"),
+        not_allowed=("nodejs.org", "go.dev"),
+        gate="./gradlew check",
+        lint=(("./gradlew check", False),),
+    ),
+    # `global.json` pins the SDK band; rollForward decides which pinned
+    # SDK admits it (#686)
+    "dotnet": Expectation(
+        ("dotnet",),
+        "detected",
+        versions={"dotnet": ("8", "global.json")},
+        allowed=("builds.dotnet.microsoft.com",),
+        not_allowed=("nodejs.org", "go.dev"),
+        gate="dotnet test",
+        lint=(("dotnet test", False),),
+    ),
     "ruby": Expectation(
         ("ruby",),
         "detected",
-        versions={},
-        allowed=(),
+        versions={"ruby": ("distro", "default")},
+        allowed=("github.com", "cache.ruby-lang.org"),
         not_allowed=("nodejs.org", "go.dev"),
         gate="bundle exec rake default",
         lint=(
@@ -123,7 +221,75 @@ EXPECTATIONS: dict[str, Expectation] = {
             ("bundle exec rubocop", False),
         ),
     ),
+    # `.ruby-version` is an exact release, compiled with ruby-build; the
+    # Gemfile's `ruby file:` defers to it (#686)
+    "ruby-pinned": Expectation(
+        ("ruby",),
+        "detected",
+        versions={"ruby": ("3.2.2", ".ruby-version")},
+        allowed=("github.com", "codeload.github.com", "cache.ruby-lang.org"),
+        not_allowed=("nodejs.org", "go.dev"),
+        gate="bundle exec rake default",
+        lint=(("bundle exec rake default", False),),
+    ),
     # both, in registry order — union, never "best guess"
+    # composer.json's `scripts.check` is the gate; composer itself comes
+    # from getcomposer.org, PHP from apt
+    "php": Expectation(
+        ("php",),
+        "detected",
+        versions={},
+        allowed=("getcomposer.org",),
+        not_allowed=("nodejs.org", "go.dev", "static.rust-lang.org"),
+        gate="composer run check",
+        lint=(("composer run check", False),),
+    ),
+    # apt-only: the toolchain opens no installer host, and CMake declares
+    # no gate of its own (a build is not a check)
+    "cpp": Expectation(
+        ("cpp",),
+        "detected",
+        versions={},
+        allowed=(),
+        not_allowed=("nodejs.org", "go.dev", "static.rust-lang.org"),
+        gate=None,
+        lint=(("cmake --build build", False),),
+    ),
+    # a wrapper is preferred over the toolchain's mvn; the pom's
+    # compiler release is the floor the series is read from (#686)
+    "java-maven": Expectation(
+        ("java",),
+        "detected",
+        versions={"java": ("21", "pom.xml")},
+        allowed=("api.foojay.io", "github.com"),
+        not_allowed=("nodejs.org", "go.dev", "static.rust-lang.org"),
+        gate="./mvnw -q verify",
+        lint=(("./mvnw -q verify", False),),
+    ),
+    # No manifest at the root at all: the packages two levels down carry
+    # both the language and the gate, run under the client the root's
+    # lockfile pins (#687)
+    "monorepo": Expectation(
+        ("javascript",),
+        "detected",
+        versions={"javascript": ("24", "default")},
+        allowed=("nodejs.org", "registry.npmjs.org"),
+        not_allowed=("go.dev", "static.rust-lang.org"),
+        gate="cd packages/api && pnpm run check",
+        lint=(("cd packages/api && pnpm run check", False),),
+    ),
+    # A package.json with a latin-1 byte in its author field: detection,
+    # the engines reader and the gate detector decode it leniently
+    # instead of failing the provision (#687)
+    "bad-encoding": Expectation(
+        ("javascript",),
+        "detected",
+        versions={"javascript": ("22", "package.json")},
+        allowed=("nodejs.org", "registry.npmjs.org"),
+        not_allowed=("go.dev", "static.rust-lang.org"),
+        gate="npm run check",
+        lint=(("npm run check", False),),
+    ),
     "polyglot": Expectation(
         ("python", "javascript"),
         "detected",
@@ -203,3 +369,15 @@ def test_config_override_lint(fixture: str) -> None:
     for command, flagged in expected.lint:
         problems = config_override_problems(command, FIXTURES / fixture)
         assert bool(problems) is flagged, (command, problems)
+
+
+# Which fixtures derive their version from git tags (#694): exactly the one
+# built for it. Every other fixture keeps the bare --no-tags clone.
+TAG_VERSIONED = {"python-scm": ("pyproject.toml", "setuptools_scm")}
+
+
+@pytest.mark.parametrize("fixture", sorted(EXPECTATIONS))
+def test_tag_version_markers(fixture: str) -> None:
+    markers = toolchains.tag_version_markers(FIXTURES / fixture)
+    expected = TAG_VERSIONED.get(fixture)
+    assert markers == ((toolchains.TagMarker(*expected),) if expected else ())

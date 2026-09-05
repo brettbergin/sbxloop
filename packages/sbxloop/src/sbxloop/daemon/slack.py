@@ -37,6 +37,7 @@ come from ``SLACK_BOT_TOKEN`` (``xoxb-…``) and ``SLACK_APP_TOKEN``
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
@@ -73,6 +74,7 @@ _ROUTABLE_SUBTYPES = frozenset({"", "thread_broadcast", "file_share"})
 # Web API errors that mean the control channel is misconfigured, reported
 # once with the fix rather than on every flush.
 _CHANNEL_ERRORS = frozenset({"channel_not_found", "not_in_channel", "is_archived"})
+_SLACK_USER_RE = re.compile(r"^[UW][A-Z0-9]+$")
 
 
 @dataclass(frozen=True)
@@ -399,6 +401,10 @@ class SlackBridge(ChatBridge):
 
     def _handle_id(self, target: Any) -> str:
         return str(getattr(target, "id", "") or "")
+
+    def _owns_user_id(self, user_id: str) -> bool:
+        # A Slack member id: U… (or W… for an enterprise grid user).
+        return bool(_SLACK_USER_RE.match(user_id))
 
     def thread_link(self, thread: ChatThread) -> str:
         if thread.thread_id == thread.channel_id:

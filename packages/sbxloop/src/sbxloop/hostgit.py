@@ -23,7 +23,8 @@ and hundreds of branches the rest is dead weight copied per run. This is
 safe because nothing downstream reads another branch out of the clone —
 :func:`merge_from_base` fetches the base branch *explicitly* before every
 fix round, and :func:`resolve_diff_base` then finds the merge base through
-that fetch, the ``CLONE_BASE_REF`` pin, or ``origin/HEAD``.
+that fetch, the ``CLONE_BASE_REF`` pin, or ``origin/HEAD``. The one thing
+a clone does read from tags is its own version — see "Tags" below.
 
 What is deliberately NOT done:
 
@@ -34,21 +35,95 @@ What is deliberately NOT done:
 * ``--filter=blob:none`` by default. A partial clone keeps history but
   fetches blobs *lazily*, from inside the sandbox VM, the moment the agent
   touches a file whose blob is missing (``git checkout``, ``git diff``,
-  ``git log -p`` …). The VM holds no git credential, so on a private
-  remote that is a mid-task git failure with no useful message; even on a
-  public one every such blob is a network round trip in the agent's
-  critical path. It is therefore opt-in — ``[sandbox] clone_filter =
-  "blob:none"`` — and applies only to :func:`clone_from_remote`, the
-  credential-free public-remote path where lazy fetches can succeed at
-  all (git ignores filters on local path clones anyway). A git too old to
-  know ``--filter`` falls back to an unfiltered clone with a log line
+  ``git log -p`` …). The VM holds no git credential — the run's token
+  authenticates the *host* clone only (#683) — so on a private remote
+  that is a mid-task git failure with no useful message; even on a public
+  one every such blob is a network round trip in the agent's critical
+  path. It is therefore opt-in — ``[sandbox] clone_filter = "blob:none"``
+  — and applies only to :func:`clone_from_remote`, the remote path where
+  lazy fetches can succeed at all (git ignores filters on local path
+  clones anyway), and only sensibly on a public repository. A git too old
+  to know ``--filter`` falls back to an unfiltered clone with a log line
   rather than failing the run.
+
+Cloning a private remote (#683)
+-------------------------------
+:func:`clone_from_remote` takes the run's GitHub token — the same PAT or
+App installation token the github sandbox delivers with — and hands it to
+git through a one-shot ``credential.helper`` set in the *environment*
+(``GIT_CONFIG_COUNT``/``GIT_CONFIG_KEY_n``, git ≥ 2.31). The token never
+appears on the command line, never lands in ``.git/config`` or the remote
+URL, and is gone once the clone returns; any helper the host user has
+configured is switched off for that one process so the clone can only ever
+authenticate as the run. ``x-access-token`` is the username GitHub accepts
+for both credential kinds.
+
+Submodules (#692)
+-----------------
+A run clone is populated after it is cut (:func:`populate_submodules`),
+never through ``--recurse-submodules``: git would clone every submodule
+from its ``.gitmodules`` URL, which for a repository the host has checked
+out is a needless network round trip — and on a private remote a failing
+one. Each submodule is instead cloned from the host checkout's own copy
+when that copy holds the recorded commit, falling back to the remote with
+the run's token otherwise; the remote path is the only path a repository
+without a host checkout has. Nested submodules populate the same way,
+level by level. Populating happens only on a *fresh* clone: a resume
+re-entering a clone must never ``submodule update`` over a commit the
+agent moved a submodule to.
+
+Delivery reads modes from ``git diff --raw`` rather than the filesystem,
+so a submodule — a gitlink, mode ``160000``, which ``stat`` sees as a
+plain directory — is delivered as the commit it now points at, not as the
+deletion of the directory. What a run changed *inside* a submodule is not
+delivered at all: the pull request is against the superproject, and the
+submodule's own repository is not the one the run is for. Such changes
+are named in the delivery (see ``notes`` on :func:`changes_since`) rather
+than silently dropped.
+
+Git LFS (#693)
+--------------
+Every clone runs with ``GIT_LFS_SKIP_SMUDGE=1``: a host whose git has the
+LFS filters installed would otherwise try to download every LFS object
+during the checkout — from the host checkout's path, which serves none —
+and a host without them writes pointer files anyway. The clone therefore
+always starts as pointers, and :func:`populate_lfs` turns them into the
+objects on purpose: the LFS filters are configured in the clone itself
+(``git lfs install --local``, so ``git status`` in the sandbox compares
+cleaned content and an untouched asset is not "modified"), the objects the
+host checkout already has are hard-linked out of its store, and whatever
+is still missing is fetched from the repository's LFS endpoint with the
+run's token through the same one-shot helper the clone uses. That needs
+``git-lfs`` on the host, and a repository that uses LFS fails to provision
+without it — said with the package name — rather than starting a run on
+pointer files. ``[sandbox] clone_lfs = false`` is the deliberate way to run
+on pointers.
+
+Delivery does not push LFS objects. A file the run added or changed under
+an ``filter=lfs`` attribute is left out of the pull request and named in
+its **Not delivered** line (:func:`lfs_tracked`): committing the bytes as a
+plain blob is exactly the mistake such repositories forbid.
+
+Tags (#694)
+-----------
+A ``--no-tags`` clone has no tags for a build that derives its version from
+them — ``setuptools_scm``, ``hatch-vcs``, ``GitVersion``, a Makefile's
+``git describe`` — and such a build fails or, worse, quietly reports
+``0.0.0``. :func:`fetch_tags` brings the repository's tags into a fresh
+clone when :func:`sbxloop.toolchains.tag_version_markers` finds such a
+marker in the workspace's manifests (or ``[sandbox] fetch_tags = "always"``
+says so): from the host checkout when it has tags — its tags are consistent
+with the clone's history and cost no network — else ``git fetch --tags
+origin`` under the run's credential. A tag that points off the branch's
+history brings its objects along; that is the price of a correct
+``git describe`` and still far short of a full clone.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -75,15 +150,57 @@ CLONE_OPTIONS = ("--single-branch", "--no-tags")
 ChangeStatus = Literal["added", "modified", "deleted"]
 
 
+GITLINK_MODE = "160000"
+SYMLINK_MODE = "120000"
+EXECUTABLE_MODE = "100755"
+REGULAR_MODE = "100644"
+_NULL_SHA = "0" * 40
+
+
+def tree_mode(full: Path) -> str:
+    """The git tree mode ``git add`` would record for a path on disk:
+    ``120000`` for a symlink (whatever it points at, or whether it resolves),
+    ``100755`` for an executable, ``100644`` otherwise. Shared by the
+    git-diff and snapshot delivery plans (#695) so neither flattens what
+    the other keeps."""
+    if full.is_symlink():
+        return SYMLINK_MODE
+    return EXECUTABLE_MODE if full.stat().st_mode & 0o111 else REGULAR_MODE
+
+
+def blob_content(full: Path, mode: str) -> bytes:
+    """What the blob for ``full`` uploads: a symlink's target string (git
+    stores the link, not what it points at), a file's bytes otherwise."""
+    return str(full.readlink()).encode() if mode == SYMLINK_MODE else full.read_bytes()
+
+
 @dataclass(frozen=True)
 class WorkspaceChange:
     """One path the run changed relative to its base commit. ``mode`` is the
-    git tree mode to commit (``100644``/``100755``/``120000``); empty for
-    deletions."""
+    git tree mode to commit (``100644``/``100755``/``120000``, or
+    ``160000`` for a submodule gitlink); empty for a deleted file. ``sha``
+    is set only for a gitlink: the submodule commit the path now points at
+    (a gitlink has no content to upload — the sha *is* the entry)."""
 
     path: str
     status: ChangeStatus
     mode: str
+    sha: str = ""
+
+    @property
+    def is_gitlink(self) -> bool:
+        return self.mode == GITLINK_MODE
+
+
+@dataclass(frozen=True)
+class Submodule:
+    """One ``.gitmodules`` entry: its config ``name``, the ``path`` it is
+    checked out at (relative, POSIX) and the ``url`` it is fetched from as
+    written — possibly relative to the superproject's own remote."""
+
+    name: str
+    path: str
+    url: str
 
 
 @dataclass(frozen=True)
@@ -116,6 +233,50 @@ def repo_toplevel(path: Path) -> Path | None:
     except (InvalidGitRepositoryError, NoSuchPathError):
         return None
     return Path(top) if top else None
+
+
+def is_tracked(repo_root: Path, path: Path) -> bool | None:
+    """Whether ``path`` (inside the checkout at ``repo_root``) is in git's
+    index — a file the repository carries, as opposed to one the operator
+    dropped into the tree (``sbxloop init``, an ignored ``sbxloop.toml``).
+
+    None when git is unavailable or the probe fails, so the caller decides
+    what "could not tell" means for it. The checkout may be one a sandbox
+    agent has written to, so its config is untrusted: ``core.fsmonitor``
+    (a hook git would run) is forced off on the command line, and inherited
+    ``GIT_*`` variables are dropped so they cannot point git elsewhere.
+    ``ls-files`` never executes anything else.
+    """
+    git = find_git()
+    if git is None:
+        return None
+    try:
+        relative = path.resolve().relative_to(repo_root.resolve())
+    except ValueError:
+        return False
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+    try:
+        proc = subprocess.run(  # nosec B603 - list argv, git binary, no shell
+            [git, "-c", "core.fsmonitor=false", "ls-files", "--error-unmatch", "--", str(relative)],
+            cwd=repo_root,
+            env=env,
+            capture_output=True,
+            check=False,
+        )
+    except OSError:
+        log.debug("git.is_tracked_probe_failed", root=str(repo_root), exc_info=True)
+        return None
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    log.debug(
+        "git.is_tracked_probe_failed",
+        root=str(repo_root),
+        rc=proc.returncode,
+        stderr=proc.stderr.decode("utf-8", "replace")[-400:],
+    )
+    return None
 
 
 def head_commit(repo_path: Path) -> str | None:
@@ -243,7 +404,9 @@ def clone_for_run(source: Path, target: Path, branch: str) -> str:
     raw_upstream = origin_url(source)
     upstream = public_remote_url(raw_upstream) if raw_upstream is not None else None
     try:
-        with Repo.clone_from(str(source), str(target), multi_options=list(CLONE_OPTIONS)) as clone:
+        with Repo.clone_from(
+            str(source), str(target), env=_local_clone_env(), multi_options=list(CLONE_OPTIONS)
+        ) as clone:
             clone.git.checkout("-b", branch)
             if upstream is not None:
                 clone.git.remote("set-url", "origin", upstream)
@@ -265,15 +428,18 @@ def clone_from_remote(
     *,
     existing: bool = False,
     clone_filter: str | None = None,
+    token: str | None = None,
 ) -> str:
     """Clone a *remote* URL into ``target`` on a fresh ``branch``; return sha.
 
     The no-local-checkout path of per-repo workspace resolution: a repo
     entry configured without a workspace has no host tree to clone, so the
-    run's tree comes from the remote itself. Only credential-free (public)
-    remotes can work here — the host deliberately holds no git credential
-    (#46) — so the clone runs with terminal and credential-helper prompting
-    disabled and fails loudly rather than hanging on an auth prompt.
+    run's tree comes from the remote itself. The host holds no git
+    credential of its own (#46): the clone runs with terminal and
+    credential-helper prompting disabled and fails loudly rather than
+    hanging on an auth prompt. ``token`` — the run's GitHub credential —
+    authenticates this one clone through an environment-scoped helper (see
+    the module docstring, #683); without it only a public remote can work.
 
     With ``existing`` the clone is cut *on* ``branch`` (``--branch``): under
     ``--single-branch`` that is the only way ``origin/<branch>`` exists in
@@ -289,11 +455,7 @@ def clone_from_remote(
     ``ProvisionError`` on any failure; a half-created target is removed so a
     retry starts clean. Never falls back to another tree.
     """
-    env = {
-        "GIT_TERMINAL_PROMPT": "0",
-        "GIT_ASKPASS": "",
-        "GCM_INTERACTIVE": "never",
-    }
+    env = _clone_env(token)
     options = list(CLONE_OPTIONS)
     if existing:
         options.append(f"--branch={branch}")
@@ -314,6 +476,55 @@ def clone_from_remote(
         raise ProvisionError(
             f"cloning {public_remote_url(repo_url)} into {target} failed: {_describe(exc)}"
         ) from exc
+
+
+# The environment variable the one-shot credential helper reads the run's
+# token from. It exists only in the clone's process environment.
+CLONE_TOKEN_ENV = "SBXLOOP_GIT_TOKEN"  # nosec B105 - env var name, not a secret
+_CLONE_CREDENTIAL_HELPER = (
+    '!f() { echo username=x-access-token; echo "password=$' + CLONE_TOKEN_ENV + '"; }; f'
+)
+
+
+# Git LFS objects are never fetched by a clone's checkout (#693): the host
+# populates them afterwards, deliberately — see the module docstring.
+_SKIP_LFS_SMUDGE = {"GIT_LFS_SKIP_SMUDGE": "1"}
+
+
+def _local_clone_env() -> dict[str, str]:
+    """The environment a clone of a host checkout runs under."""
+    return dict(_SKIP_LFS_SMUDGE)
+
+
+def _clone_env(token: str | None) -> dict[str, str]:
+    """The environment a remote clone runs under.
+
+    Prompting is off in every form so a missing or rejected credential
+    fails the clone instead of hanging. With ``token`` git additionally
+    gets two config entries through ``GIT_CONFIG_*`` — an empty
+    ``credential.helper`` that clears whatever helpers the host user has
+    (a keychain must not answer for the run), then the one-shot helper
+    that answers with the token from :data:`CLONE_TOKEN_ENV`. Neither the
+    helper nor the token touches argv, ``.git/config`` or the URL.
+    """
+    env = {
+        "GIT_TERMINAL_PROMPT": "0",
+        "GIT_ASKPASS": "",
+        "GCM_INTERACTIVE": "never",
+        **_SKIP_LFS_SMUDGE,
+    }
+    if token:
+        env.update(
+            {
+                "GIT_CONFIG_COUNT": "2",
+                "GIT_CONFIG_KEY_0": "credential.helper",
+                "GIT_CONFIG_VALUE_0": "",
+                "GIT_CONFIG_KEY_1": "credential.helper",
+                "GIT_CONFIG_VALUE_1": _CLONE_CREDENTIAL_HELPER,
+                CLONE_TOKEN_ENV: token,
+            }
+        )
+    return env
 
 
 def _clone_remote(
@@ -368,7 +579,9 @@ def clone_existing_branch(source: Path, target: Path, branch: str) -> str:
     upstream = public_remote_url(raw_upstream) if raw_upstream is not None else None
     remote_ref = f"origin/{branch}"
     try:
-        with Repo.clone_from(str(source), str(target), multi_options=list(CLONE_OPTIONS)) as clone:
+        with Repo.clone_from(
+            str(source), str(target), env=_local_clone_env(), multi_options=list(CLONE_OPTIONS)
+        ) as clone:
             if remote_ref not in {r.name for r in clone.refs}:
                 # A single-branch clone of a clone carries only the source's
                 # HEAD branch as `origin/<head>`, never its remote-tracking
@@ -398,6 +611,437 @@ def clone_existing_branch(source: Path, target: Path, branch: str) -> str:
         raise ProvisionError(
             f"cloning workspace {source} into {target} on branch {branch} failed: {_describe(exc)}"
         ) from exc
+
+
+_SUBMODULE_CONFIG_RE = re.compile(r"^submodule\.(.+)\.(path|url) (.*)$")
+
+
+def list_submodules(repo_path: Path) -> list[Submodule]:
+    """The submodules ``repo_path``'s ``.gitmodules`` declares, in file
+    order; empty when there is no such file. A checkout is not needed —
+    the file is read with ``git config -f`` — so this also answers for a
+    workspace whose submodules were never populated."""
+    modules = repo_path / ".gitmodules"
+    if not modules.is_file():
+        return []
+    try:
+        with Repo(repo_path) as repo:
+            listing = repo.git.config(
+                "-f", str(modules), "--get-regexp", r"^submodule\..*\.(path|url)$"
+            )
+    except GitCommandError as exc:
+        if exc.status == 1:
+            return []  # no matching keys
+        raise ProvisionError(f"reading {modules} failed: {_describe(exc)}") from exc
+    except (InvalidGitRepositoryError, NoSuchPathError, ValueError) as exc:
+        raise ProvisionError(f"reading {modules} failed: {exc}") from exc
+    found: dict[str, dict[str, str]] = {}
+    for line in listing.splitlines():
+        match = _SUBMODULE_CONFIG_RE.match(line)
+        if match:
+            name, key, value = match.groups()
+            found.setdefault(name, {})[key] = value.strip()
+    return [
+        Submodule(name=name, path=entry["path"], url=entry.get("url", ""))
+        for name, entry in found.items()
+        if entry.get("path")
+    ]
+
+
+def populate_submodules(
+    clone: Path, *, source: Path | None, token: str | None
+) -> list[tuple[str, str]]:
+    """Check out every submodule of a freshly cut run ``clone`` (#692),
+    nested ones included; returns ``(path, how)`` per submodule populated,
+    ``how`` being ``"local"`` or ``"remote"``.
+
+    With ``source`` — the host checkout the clone was cut from — each
+    submodule is first cloned from the source's own populated copy of it,
+    which costs no network and needs no credential. That copy is usable
+    only when it holds the commit the superproject records; when it does
+    not (the host checkout's submodule is stale or was never initialised),
+    or is absent, the submodule comes from its ``.gitmodules`` URL, with the
+    run's ``token`` answering a credential challenge exactly as the
+    superproject's remote clone does. Either way the submodule's ``origin``
+    ends up at the ``.gitmodules`` URL (``git submodule sync``), so nothing
+    in the clone points back at a host path.
+
+    Only for a fresh clone: a resumed run's clone must keep whatever commit
+    the agent moved a submodule to. ``ProvisionError`` names the submodule
+    and its URL when neither route can populate it — a run that started on
+    an empty directory where a dependency should be would fail later and
+    worse.
+    """
+    populated: list[tuple[str, str]] = []
+    for sub in list_submodules(clone):
+        if not _is_gitlink_in_index(clone, sub.path):
+            # A ``.gitmodules`` entry whose gitlink was removed from the tree
+            # (a half-finished ``git rm``): nothing to check out, and
+            # ``submodule update`` would refuse the pathspec.
+            log.info(
+                "workspace.submodule_not_in_tree",
+                submodule=sub.path,
+                detail=f".gitmodules names {sub.path} but the tree has no gitlink there",
+            )
+            continue
+        local = source / sub.path if source is not None else None
+        how = "remote"
+        if local is not None and (local / ".git").exists():
+            try:
+                _submodule_update(clone, sub, local_source=local)
+            except GitCommandError as exc:
+                log.info(
+                    "workspace.submodule_local_source_unusable",
+                    submodule=sub.path,
+                    source=str(local),
+                    detail=_describe(exc),
+                    fallback=f"cloning it from {public_remote_url(sub.url)}",
+                )
+                _discard_half_populated(clone, sub.path)
+            else:
+                how = "local"
+        if how == "remote":
+            try:
+                _submodule_update(clone, sub, token=token)
+            except GitCommandError as exc:
+                raise ProvisionError(
+                    f"populating submodule {sub.path} of {clone} from "
+                    f"{public_remote_url(sub.url)} failed: {_describe(exc)}. The run's "
+                    "GitHub credential must be able to read that repository too; "
+                    "set [sandbox] clone_submodules = false to run without submodules"
+                ) from exc
+        populated.append((sub.path, how))
+        # A submodule's own submodules: same routes, one level down.
+        nested = populate_submodules(
+            clone / sub.path, source=local if how == "local" else None, token=token
+        )
+        populated.extend((f"{sub.path}/{path}", nested_how) for path, nested_how in nested)
+    return populated
+
+
+def _is_gitlink_in_index(clone: Path, path: str) -> bool:
+    entry: str = Repo(clone).git.ls_files("--stage", "--", path)
+    return entry.startswith(f"{GITLINK_MODE} ")
+
+
+def _submodule_update(
+    clone: Path, sub: Submodule, *, local_source: Path | None = None, token: str | None = None
+) -> None:
+    """``git submodule update --init`` for one submodule. With
+    ``local_source`` the clone reads that path instead of the ``.gitmodules``
+    URL — an override given on the command line so it is never written to
+    the clone's config — and ``submodule sync`` then points the submodule's
+    ``origin`` at the URL ``.gitmodules`` names, as a remote populate would
+    have. Without it the remote is used, under the run's credential."""
+    with Repo(clone) as repo:
+        if local_source is not None:
+            repo.git(
+                c=[
+                    f"submodule.{sub.name}.url={local_source}",
+                    "protocol.file.allow=always",
+                ]
+            ).submodule("update", "--init", "--", sub.path, env=_clone_env(None))
+            # `init` under the override wrote no URL to the clone's config
+            # (the override already answered), and `sync` only touches a
+            # registered submodule: register it now, from .gitmodules, then
+            # sync so the submodule's origin follows.
+            repo.git.submodule("init", "--", sub.path)
+            repo.git.submodule("sync", "--", sub.path)
+        else:
+            repo.git.submodule("update", "--init", "--", sub.path, env=_clone_env(token))
+
+
+def _discard_half_populated(clone: Path, path: str) -> None:
+    """Undo a failed local populate so the remote attempt starts clean: the
+    submodule's working tree and the ``.git/modules`` store git made for
+    it. The superproject's own config entry is left — ``submodule update
+    --init`` rewrites it."""
+    with contextlib.suppress(OSError):
+        shutil.rmtree(clone / path)
+        (clone / path).mkdir(parents=True)
+    with Repo(clone) as repo:
+        name = next((s.name for s in list_submodules(clone) if s.path == path), path)
+        store = Path(repo.git_dir) / "modules" / name
+        shutil.rmtree(store, ignore_errors=True)
+        with contextlib.suppress(GitCommandError):
+            repo.git.config("--unset", f"submodule.{name}.url")
+
+
+def submodule_hosts(repo_path: Path) -> list[str]:
+    """The hosts ``repo_path``'s submodules are fetched from, for the run's
+    egress allow list (#692): the agent may need to fetch inside a
+    submodule (``git submodule update`` after a bump, a ``git fetch`` to
+    look at upstream). Scheme URLs and scp-style ssh URLs contribute their
+    host; a relative URL (``../lib.git``) resolves against the checkout's
+    ``origin`` and so contributes *its* host; a local path contributes
+    nothing. Deduped, first occurrence winning; empty when there is no
+    ``.gitmodules`` or it cannot be read."""
+    try:
+        subs = list_submodules(repo_path)
+    except ProvisionError:
+        return []
+    origin = origin_url(repo_path)
+    hosts: list[str] = []
+    for sub in subs:
+        url = sub.url
+        if url.startswith(("./", "../")):
+            if origin is None:
+                continue
+            url = origin
+        host = url_host(url)
+        if host and host not in hosts:
+            hosts.append(host)
+    return hosts
+
+
+def url_host(url: str) -> str | None:
+    """The host of a git URL — scheme (``https://user@host:443/o/r``) or
+    scp-style (``git@host:o/r``) — or None for a local path."""
+    _scheme, sep, rest = url.partition("://")
+    if sep:
+        authority = rest.partition("/")[0]
+    else:
+        userinfo, at, remainder = url.rpartition("@")
+        if not at or "/" in userinfo or ":" not in remainder:
+            return None  # a local path, or something no fetch would resolve
+        authority = remainder.partition(":")[0]
+    _userinfo, _at, hostport = authority.rpartition("@")
+    if hostport.startswith("["):  # bracketed IPv6 literal
+        return hostport[1:].partition("]")[0] or None
+    return hostport.partition(":")[0] or None
+
+
+# ---------------------------------------------------------------------------
+# Git LFS (#693)
+
+
+@dataclass(frozen=True)
+class LfsPopulation:
+    """What :func:`populate_lfs` did: LFS-tracked files in the checkout,
+    how many objects came out of the host checkout's store, and how many
+    were fetched from the repository's LFS endpoint."""
+
+    files: int
+    linked: int
+    fetched: int
+
+
+def lfs_version() -> str | None:
+    """The host's ``git lfs version`` line, or None when git-lfs is not
+    installed (git then does not know the subcommand)."""
+    git = find_git()
+    if git is None:
+        return None
+    try:
+        proc = subprocess.run(  # nosec B603 - list argv, git binary, no shell
+            [git, "lfs", "version"], capture_output=True, text=True, check=False
+        )
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.strip() or None
+
+
+def lfs_endpoint(repo_url: str) -> str:
+    """The Git LFS batch endpoint for a GitHub-style https clone URL:
+    ``<url>.git/info/lfs`` — where git-lfs itself would look for a remote
+    at that URL, given here explicitly because a clone cut from a host
+    checkout has the host path as its origin."""
+    url = repo_url.rstrip("/")
+    if not url.endswith(".git"):
+        url += ".git"
+    return f"{url}/info/lfs"
+
+
+def populate_lfs(
+    clone: Path, *, source: Path | None, lfs_url: str | None, token: str | None
+) -> LfsPopulation:
+    """Turn the pointer files of a freshly cut run ``clone`` into their
+    LFS objects (#693), and configure the clone so git treats them as LFS
+    from then on.
+
+    ``source`` is the host checkout the clone was cut from: every object
+    its LFS store holds is hard-linked into the clone's (a copy when the
+    two are on different filesystems), which is the whole population for a
+    checkout that was itself pulled — no network, no credential, and
+    nothing written to the source. What is still a pointer afterwards is
+    fetched from ``lfs_url`` (see :func:`lfs_endpoint`) with ``token``
+    answering the credential challenge exactly as a remote clone does.
+
+    ``ProvisionError`` when git-lfs is not installed on the host, when
+    objects are missing and there is no endpoint to fetch them from, or
+    when the fetch fails or leaves pointers behind — each naming the fix. A
+    run that started on pointer files would fail later and worse. Only for
+    a fresh clone: a resumed clone keeps whatever the agent did.
+    """
+    if lfs_version() is None:
+        raise ProvisionError(
+            f"{clone} uses Git LFS (.gitattributes routes files through filter=lfs) but "
+            "git-lfs is not installed on the host: install it (apt install git-lfs / "
+            "brew install git-lfs) or set [sandbox] clone_lfs = false to run on the "
+            "pointer files"
+        )
+    repo = Repo(clone)
+    # The clean/smudge filters in the clone's own config — not the host's
+    # global one, which the run must not depend on — and no hooks: the
+    # pre-push hook pushes objects, and nothing pushes from a run clone.
+    repo.git.lfs("install", "--local", "--skip-repo")
+    pointers = _lfs_pointers(repo)
+    if not pointers:
+        return LfsPopulation(len(_lfs_files(repo)), 0, 0)
+    linked = 0
+    if source is not None:
+        linked = _link_lfs_objects(source, clone, [oid for oid, _path in pointers])
+        if linked:
+            repo.git.lfs("checkout", env=_local_clone_env())
+            pointers = _lfs_pointers(repo)
+    fetched = 0
+    if pointers:
+        if lfs_url is None:
+            raise ProvisionError(
+                f"{len(pointers)} Git LFS object(s) of {clone} are not in the host checkout's "
+                f"LFS store ({', '.join(path for _oid, path in pointers[:5])}"
+                f"{', …' if len(pointers) > 5 else ''}) and the run has no GitHub repository "
+                "to fetch them from: `git lfs pull` in the host checkout, or set "
+                "[sandbox] clone_lfs = false to run on the pointer files"
+            )
+        try:
+            repo.git(c=[f"lfs.url={lfs_url}"]).lfs("pull", env=_clone_env(token))
+        except GitCommandError as exc:
+            raise ProvisionError(
+                f"fetching {len(pointers)} Git LFS object(s) for {clone} from {lfs_url} "
+                f"failed: {_describe(exc)}. The run's GitHub credential must be able to "
+                "read the repository's LFS store; set [sandbox] clone_lfs = false to run "
+                "on the pointer files"
+            ) from exc
+        fetched = len(pointers)
+        remaining = _lfs_pointers(repo)
+        if remaining:
+            raise ProvisionError(
+                f"{len(remaining)} Git LFS object(s) of {clone} are still pointer files "
+                f"after `git lfs pull` from {lfs_url}: "
+                + ", ".join(path for _oid, path in remaining[:5])
+            )
+    return LfsPopulation(len(_lfs_files(repo)), linked, fetched)
+
+
+def _lfs_files(repo: Repo) -> list[tuple[str, str, str]]:
+    """``(oid, marker, path)`` for every LFS-tracked file in the checkout —
+    the marker ``*`` when the object is checked out, ``-`` for a pointer."""
+    out: str = repo.git.lfs("ls-files", "--long")
+    files: list[tuple[str, str, str]] = []
+    for line in out.splitlines():
+        oid, _sp, rest = line.partition(" ")
+        marker, _sp, path = rest.partition(" ")
+        if oid and marker in ("*", "-") and path:
+            files.append((oid, marker, path))
+    return files
+
+
+def _lfs_pointers(repo: Repo) -> list[tuple[str, str]]:
+    return [(oid, path) for oid, marker, path in _lfs_files(repo) if marker == "-"]
+
+
+def _lfs_store(repo_path: Path) -> Path:
+    """The checkout's LFS object store (``lfs/objects`` under the common
+    git dir — a linked worktree shares its main checkout's)."""
+    common: str = Repo(repo_path).git.rev_parse("--git-common-dir")
+    return (repo_path / common).resolve() / "lfs" / "objects"
+
+
+def _link_lfs_objects(source: Path, clone: Path, oids: Sequence[str]) -> int:
+    """Hard-link the objects ``source``'s store has among ``oids`` into the
+    clone's store (copying where linking is refused); returns how many."""
+    try:
+        store = _lfs_store(source)
+    except (GitCommandError, InvalidGitRepositoryError, NoSuchPathError):
+        return 0
+    target_store = clone / ".git" / "lfs" / "objects"
+    linked = 0
+    for oid in oids:
+        obj = store / oid[:2] / oid[2:4] / oid
+        if not obj.is_file():
+            continue
+        dest = target_store / oid[:2] / oid[2:4] / oid
+        if dest.exists():
+            linked += 1
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(obj, dest)
+        except OSError:
+            shutil.copy2(obj, dest)
+        linked += 1
+    return linked
+
+
+def lfs_tracked(repo_path: Path, paths: Sequence[str]) -> list[str]:
+    """Those of ``paths`` the checkout's attributes route through Git LFS
+    (``filter=lfs``), from ``git check-attr`` — the working tree's
+    ``.gitattributes`` included, so a pattern the run itself added counts."""
+    if not paths:
+        return []
+    out: str = Repo(repo_path).git.check_attr("-z", "filter", "--", *paths)
+    fields = out.split("\0")
+    tracked: list[str] = []
+    for i in range(0, len(fields) - 2, 3):
+        path, _attr, value = fields[i], fields[i + 1], fields[i + 2]
+        if value == "lfs" and path not in tracked:
+            tracked.append(path)
+    return tracked
+
+
+# ---------------------------------------------------------------------------
+# Tags (#694)
+
+
+@dataclass(frozen=True)
+class TagFetch:
+    """What :func:`fetch_tags` did: how many tags the clone holds now and
+    where they came from — ``local`` (the host checkout), ``remote`` (the
+    clone's origin under the run's credential)."""
+
+    tags: int
+    source: str
+
+
+def fetch_tags(clone: Path, *, source: Path | None, token: str | None) -> TagFetch:
+    """Give a ``--no-tags`` run ``clone`` the repository's tags (#694).
+
+    Local first: when ``source`` — the host checkout the clone was cut
+    from — has tags, they are fetched from it (no network, no credential;
+    its tags are consistent with the history the clone has). Otherwise
+    from the clone's ``origin``, which :func:`clone_for_run` points at the
+    upstream URL, with ``token`` answering the credential challenge as a
+    remote clone does. Tags whose commits the single branch lacks bring
+    those objects along; that is the price of a build that reads
+    ``git describe``, and paid only by projects that do.
+
+    A remote with no tags is not an error — a project on setuptools-scm
+    before its first release is legitimately ``0.1.dev``. A fetch that
+    fails is ``ProvisionError``: the build that needs the tags would fail
+    later and worse, and ``[sandbox] fetch_tags = "never"`` is the opt-out.
+    """
+    try:
+        with Repo(clone) as repo:
+            if source is not None and tag_count(source):
+                repo.git.fetch("--tags", str(source), env=_local_clone_env())
+                return TagFetch(tag_count(clone), "local")
+            repo.git.fetch("--tags", "origin", env=_clone_env(token))
+            return TagFetch(tag_count(clone), "remote")
+    except (GitCommandError, InvalidGitRepositoryError, NoSuchPathError, OSError) as exc:
+        raise ProvisionError(
+            f"fetching tags into {clone} failed: {_describe(exc)}. The workspace derives its "
+            'version from git tags; set [sandbox] fetch_tags = "never" to run without them'
+        ) from exc
+
+
+def tag_count(repo_path: Path) -> int:
+    """How many tags ``repo_path`` holds."""
+    with Repo(repo_path) as repo:
+        listing: str = repo.git.tag("--list")
+    return len(listing.split()) if listing else 0
 
 
 def gitignored_files(root: Path) -> frozenset[str] | None:
@@ -526,7 +1170,9 @@ def _merge_base(repo: Repo, ref: str, head: str) -> str | None:
         return None
 
 
-def changes_since(repo_path: Path, base: str) -> list[WorkspaceChange]:
+def changes_since(
+    repo_path: Path, base: str, *, notes: list[str] | None = None
+) -> list[WorkspaceChange]:
     """What the working tree changed relative to ``base``: tracked paths
     from ``git diff`` (committed or not — the agent may do either) plus
     untracked-but-not-ignored files, sorted by path.
@@ -535,13 +1181,26 @@ def changes_since(repo_path: Path, base: str) -> list[WorkspaceChange]:
     git tree, which has no rename concept. Modes come from the working tree
     (what ``git add`` itself would record) so an executable script keeps
     ``100755``; symlinks are ``120000`` with the link target as content.
+
+    Submodules (#692) are told apart by the mode git reports (``160000``),
+    never by looking at the filesystem, where a gitlink is just a directory.
+    A moved gitlink comes back with the commit it now points at — read from
+    the submodule's HEAD when the agent moved it without staging, the one
+    case where git's own diff shows no new sha. What cannot be delivered is
+    *skipped*, and each skip is explained in ``notes`` when the caller
+    passes a list: work inside a submodule (its own tree is not the
+    superproject's), and a gitlink pointing at a commit the submodule's
+    remote does not have (a pointer nobody else could resolve).
     """
     changes: dict[str, WorkspaceChange] = {}
+    skipped = notes if notes is not None else []
     try:
         with Repo(repo_path) as repo:
-            listing = repo.git.diff("--name-status", "--no-renames", "-z", base)
-            for status, path in _pairs(listing):
-                changes[path] = _describe_change(repo_path, path, status)
+            listing = repo.git.diff("--raw", "--no-renames", "--abbrev=40", "-z", base)
+            for meta, path in _pairs(listing):
+                change = _change_from_raw(repo_path, path, meta, skipped)
+                if change is not None:
+                    changes[path] = change
             untracked = repo.git.ls_files("--others", "--exclude-standard", "-z")
             for path in untracked.split("\0"):
                 if path:
@@ -549,6 +1208,75 @@ def changes_since(repo_path: Path, base: str) -> list[WorkspaceChange]:
     except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError) as exc:
         raise DeliveryError(f"git diff failed in {repo_path}: {exc}") from exc
     return [changes[path] for path in sorted(changes)]
+
+
+def _change_from_raw(
+    repo_path: Path, path: str, meta: str, notes: list[str]
+) -> WorkspaceChange | None:
+    """One ``git diff --raw`` record — ``:<old mode> <new mode> <old sha>
+    <new sha> <status>`` — as a change, or None for a submodule change that
+    is not deliverable (explained in ``notes``)."""
+    fields = meta.lstrip(":").split()
+    if len(fields) < 5:
+        raise DeliveryError(f"unexpected git diff --raw record in {repo_path}: {meta!r}")
+    old_mode, new_mode, old_sha, new_sha, status = fields[:5]
+    if GITLINK_MODE not in (old_mode, new_mode):
+        return _describe_change(repo_path, path, status)
+    if new_mode != GITLINK_MODE:
+        # The submodule is gone: removed outright (the tree drops the path)
+        # or replaced by a file, which git reports as one type-change record
+        # — the file is then an ordinary blob at the same path.
+        if new_mode == "000000":
+            return WorkspaceChange(path=path, status="deleted", mode=GITLINK_MODE)
+        return _describe_change(repo_path, path, status)
+    sub = repo_path / path
+    dirty = submodule_is_dirty(sub)
+    if new_sha == _NULL_SHA:
+        # Moved in the working tree without `git add`: the diff shows no
+        # commit, the submodule's HEAD is where it points now.
+        new_sha = head_commit(sub) or ""
+    if not new_sha or new_sha == old_sha:
+        # Nothing to point the superproject at that it does not already
+        # point at: the only change is inside the submodule.
+        if dirty or not new_sha:
+            notes.append(f"changes inside submodule `{path}` are not delivered")
+        return None
+    if dirty:
+        notes.append(f"changes inside submodule `{path}` are not delivered")
+    if not _commit_is_published(sub, new_sha):
+        notes.append(
+            f"submodule `{path}` points at commit {new_sha[:12]}, which its remote "
+            "does not have; that gitlink is not delivered (push the submodule first)"
+        )
+        return None
+    change_status: ChangeStatus = "added" if status.startswith("A") else "modified"
+    return WorkspaceChange(path=path, status=change_status, mode=GITLINK_MODE, sha=new_sha)
+
+
+def submodule_is_dirty(sub: Path) -> bool:
+    """Whether a populated submodule's working tree has changes of its own
+    (tracked edits or untracked files). An unpopulated or unreadable
+    submodule is not dirty: there is nothing in it to lose."""
+    try:
+        with Repo(sub) as repo:
+            return bool(repo.git.status("--porcelain").strip())
+    except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError, ValueError):
+        return False
+
+
+def _commit_is_published(sub: Path, sha: str) -> bool:
+    """Whether ``sha`` is reachable from any remote-tracking ref or tag of
+    the submodule — the evidence that it exists somewhere other than this
+    clone. A submodule whose repository cannot be read is taken at its
+    word: the gitlink is delivered rather than second-guessed."""
+    try:
+        with Repo(sub) as repo:
+            listing = repo.git.for_each_ref(
+                f"--contains={sha}", "refs/remotes", "refs/tags", "--format=%(refname)"
+            )
+            return bool(listing.strip())
+    except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError, ValueError):
+        return True
 
 
 def diff_text(repo_path: Path, remote_base_sha: str | None) -> str | None:
@@ -607,19 +1335,17 @@ def _pairs(listing: str) -> list[tuple[str, str]]:
 
 
 def _describe_change(repo_path: Path, path: str, git_status: str) -> WorkspaceChange:
-    """``git_status`` is git's name-status letter (A/M/D/T...)."""
+    """``git_status`` is git's name-status letter (A/M/D/T...). For blobs
+    only — a gitlink never reaches this (see :func:`_change_from_raw`)."""
     if git_status.startswith("D"):
         return WorkspaceChange(path=path, status="deleted", mode="")
     status: ChangeStatus = "added" if git_status.startswith("A") else "modified"
     full = repo_path / path
-    if full.is_symlink():
-        return WorkspaceChange(path=path, status=status, mode="120000")
-    if not full.is_file():
+    if not full.is_symlink() and not full.is_file():
         # Gone from disk but still in the index (rm without git rm): git
         # diff against a commit still lists it; the tree must drop it.
         return WorkspaceChange(path=path, status="deleted", mode="")
-    executable = bool(full.stat().st_mode & 0o111)
-    return WorkspaceChange(path=path, status=status, mode="100755" if executable else "100644")
+    return WorkspaceChange(path=path, status=status, mode=tree_mode(full))
 
 
 def _fetch_branch_from_source(clone: Repo, source: Path, branch: str) -> None:
@@ -824,8 +1550,15 @@ def merge_from_base(repo_path: Path, base_branch: str, *, remote: str = "origin"
 
 def _describe(exc: Exception) -> str:
     stderr = getattr(exc, "stderr", None)
-    if isinstance(stderr, str) and stderr.strip():
-        return stderr.strip().splitlines()[-1]
+    if isinstance(stderr, str):
+        # GitPython hands stderr over as "\n  stderr: '<text>'"; the last
+        # non-empty line inside the quotes is the reason git gave.
+        text = stderr.strip()
+        if text.startswith("stderr: '") and text.endswith("'"):
+            text = text[len("stderr: '") : -1]
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        if lines:
+            return lines[-1]
     return str(exc)
 
 
@@ -840,3 +1573,24 @@ def current_branch(repo_path: Path) -> str | None:
             return str(repo.active_branch.name)
     except (InvalidGitRepositoryError, NoSuchPathError, TypeError, ValueError):
         return None
+
+
+def exclude_from_git(root: Path, pattern: str) -> bool:
+    """Add ``pattern`` to ``root``'s ``.git/info/exclude`` — the checkout's
+    private ignore list, never committed — so a directory the loop keeps
+    inside a workspace (the dependency cache, #766) is not something the
+    agent can ``git add``. Idempotent; a no-op (False) when ``root`` is not
+    a checkout with a ``.git`` directory of its own."""
+    info = root / ".git" / "info"
+    if not (root / ".git").is_dir():
+        return False
+    exclude = info / "exclude"
+    text = exclude.read_text() if exclude.is_file() else ""
+    if pattern in text.splitlines():
+        return True
+    info.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a") as fh:
+        if text and not text.endswith("\n"):
+            fh.write("\n")
+        fh.write(pattern + "\n")
+    return True

@@ -11,9 +11,10 @@ import tomllib
 from pathlib import Path
 from typing import Any
 
+import pytest
 from pydantic import BaseModel
 
-from sbxloop.cli.app import DEFAULT_CONFIG_TOML
+from sbxloop.cli.app import DEFAULT_CONFIG_TOML, config_presets, render_config_template
 from sbxloop.config import Config, load_dotenv_file
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -70,6 +71,82 @@ def test_sbxloop_init_renders_the_example_file(tmp_path: Path, monkeypatch: Any)
     written = (tmp_path / "sbxloop.toml").read_text()
     assert _key_paths(tomllib.loads(written)) == _key_paths(tomllib.loads(EXAMPLE.read_text()))
     assert written == EXAMPLE.read_text()
+
+
+PRESETS_DIR = REPO_ROOT / "packages" / "sbxloop" / "src" / "sbxloop" / "data" / "presets"
+
+
+class TestPresets:
+    """#636: presets are package data, applied by `sbxloop init --preset`, so
+    they work from a wheel and nothing `init` writes points at a checkout."""
+
+    def test_presets_ship_as_package_data_and_the_contrib_path_is_an_alias(self) -> None:
+        assert (PRESETS_DIR / "large-repo.toml").is_file()
+        assert config_presets().keys() == {"large-repo"}
+        alias = REPO_ROOT / "contrib" / "presets" / "large-repo.toml"
+        assert alias.is_symlink()
+        assert alias.resolve() == (PRESETS_DIR / "large-repo.toml").resolve()
+
+    def test_every_preset_is_a_valid_config_on_its_own_and_appended(self) -> None:
+        for name, fragment in config_presets().items():
+            Config.model_validate(tomllib.loads(fragment))
+            merged = tomllib.loads(render_config_template(name))
+            Config.model_validate(merged)
+            # the template's own tables are all commented, so the preset's
+            # live sections are the only ones and survive the merge intact
+            for table, values in tomllib.loads(fragment).items():
+                assert merged[table] == values, (name, table)
+
+    def test_large_repo_preset_sizes_for_a_slow_gate(self) -> None:
+        config = Config.model_validate(tomllib.loads(render_config_template("large-repo")))
+        assert config.budgets.max_wall_clock_s == 14400.0
+        assert config.budgets.max_tool_calls_per_phase == 80
+        assert config.limits.mem_abort == 97.0
+        header = config_presets()["large-repo"]
+        assert "two minutes or more" in header  # framed by measured gate duration
+        assert "sbxloop init --preset large-repo" in header
+
+    def test_nothing_init_writes_references_a_path_outside_the_project(self) -> None:
+        for name in (None, *config_presets()):
+            text = render_config_template(name)
+            for needle in ("contrib/", "packages/sbxloop", "#25"):
+                assert needle not in text, (name, needle)
+
+    def test_unknown_preset_is_a_key_error(self) -> None:
+        with pytest.raises(KeyError):
+            render_config_template("not-a-preset")
+
+    def test_sbxloop_init_preset_writes_one_self_contained_file(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        from typer.testing import CliRunner
+
+        from sbxloop.cli.app import app
+
+        monkeypatch.chdir(tmp_path)
+        result = CliRunner().invoke(app, ["init", "--preset", "large-repo"])
+        assert result.exit_code == 0, result.output
+        written = (tmp_path / "sbxloop.toml").read_text()
+        assert written == render_config_template("large-repo")
+        assert written.startswith(EXAMPLE.read_text().rstrip("\n"))
+        assert Config.model_validate(tomllib.loads(written)).budgets.max_wall_clock_s == 14400.0
+        streamed = CliRunner().invoke(app, ["init", "--stdout", "--preset", "large-repo"])
+        assert streamed.exit_code == 0, streamed.output
+        assert streamed.output == written
+
+    def test_sbxloop_init_rejects_an_unknown_preset_before_writing(
+        self, tmp_path: Path, monkeypatch: Any
+    ) -> None:
+        from typer.testing import CliRunner
+
+        from sbxloop.cli.app import app
+
+        monkeypatch.chdir(tmp_path)
+        result = CliRunner().invoke(app, ["init", "--preset", "huge-repo"])
+        assert result.exit_code == 2, result.output
+        assert "unknown preset 'huge-repo'" in result.output
+        assert "large-repo" in result.output  # names what does exist
+        assert not (tmp_path / "sbxloop.toml").exists()
 
 
 # Derived internals the engine sets on a narrowed config; never configured.
@@ -296,11 +373,16 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             parsed = tomllib.loads(f"{key} = {value}")
         except tomllib.TOMLDecodeError:
             continue  # a multi-line value (the exclude list); covered below
+        if section in ("registries", "credentials", "workloads"):
+            continue  # array-of-tables entries load as whole blocks, below
         if section == "github.repos":
             doc: dict[str, Any] = {"github": {"repos": [{"repo": "you/your-repo", **parsed}]}}
         elif section == "github":
             # `[github]` needs a repository before any other key is meaningful.
             doc = {"github": {"repo": "you/your-repo", **parsed}}
+        elif section == "workload":
+            # `[workload] default` names a profile that must exist.
+            doc = {"workload": parsed, "workloads": [{"name": parsed.get("default", "p")}]}
         elif section == "chat":
             # `[chat] backend` names a section that must carry a channel_id.
             doc = {
@@ -313,3 +395,77 @@ def test_every_commented_key_is_a_real_config_key() -> None:
         Config.model_validate(doc)
         checked += 1
     assert checked > 50, f"expected the example to document many keys, saw {checked}"
+
+
+def test_example_registry_entries_load_together() -> None:
+    """A `[[registries]]` entry's keys are coupled by `kind` (a go entry takes
+    no url, a pypi entry needs auth_user), so the commented entries are
+    validated as whole blocks — uncommenting all of them loads as one list."""
+    blocks: list[str] = []
+    for line in EXAMPLE.read_text().splitlines():
+        stripped = re.sub(r"^#\s?", "", line)
+        if stripped == "[[registries]]":
+            blocks.append("")
+        elif blocks and line.startswith("#") and re.match(r"^[a-z_]+ = ", stripped):
+            blocks[-1] += stripped + "\n"
+        elif blocks and not line.strip():
+            break
+    entries = [tomllib.loads(block) for block in blocks]
+    assert len(entries) >= 4
+    assert {entry["kind"] for entry in entries} >= {"npm", "pypi", "cargo", "go"}
+    config = Config.model_validate({"registries": entries})
+    assert [r.kind for r in config.registries] == [entry["kind"] for entry in entries]
+
+
+def test_example_workload_profile_loads_with_its_credential() -> None:
+    """The commented `[[workloads]]` entry loads as one block beside the
+    `[[credentials]]` entry it names, and `[workload] default` finds it —
+    uncommenting the three together is a working configuration."""
+
+    def block_after(header: str) -> dict[str, Any]:
+        text = ""
+        in_block = False
+        for line in EXAMPLE.read_text().splitlines():
+            stripped = re.sub(r"^#\s?", "", line)
+            if stripped == header:
+                in_block = True
+            elif in_block and line.startswith("#") and re.match(r"^[a-z_]+ = ", stripped):
+                text += stripped + "\n"
+            elif in_block and stripped.startswith("["):
+                break
+        return tomllib.loads(text)
+
+    profile = block_after("[[workloads]]")
+    credential = block_after("[[credentials]]")
+    section = block_after("[workload]")
+    config = Config.model_validate(
+        {"credentials": [credential], "workloads": [profile], "workload": section}
+    )
+    (entry,) = config.workloads
+    assert entry.name == profile["name"] == section["default"]
+    assert entry.credentials == [credential["name"]]
+    assert entry.budgets.set_keys == sorted(profile["budgets"])
+    assert config.workload_profile() is entry
+
+
+def test_example_credential_entry_loads() -> None:
+    """The commented `[[credentials]]` entry loads as one block: its keys
+    are coupled (a bare `X-Api-Key` header wants `scheme = ""`), so it is
+    validated whole rather than key by key."""
+    block = ""
+    in_block = False
+    for line in EXAMPLE.read_text().splitlines():
+        stripped = re.sub(r"^#\s?", "", line)
+        if stripped == "[[credentials]]":
+            in_block = True
+        elif in_block and line.startswith("#") and re.match(r"^[a-z_]+ = ", stripped):
+            block += stripped + "\n"
+        elif in_block and not line.strip():
+            break
+    entry = tomllib.loads(block)
+    config = Config.model_validate({"credentials": [entry]})
+    (cred,) = config.credentials
+    assert cred.name == entry["name"]
+    assert cred.host == entry["host"]
+    assert cred.header == entry["header"]
+    assert cred.scheme == entry["scheme"]

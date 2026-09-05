@@ -523,6 +523,25 @@ def test_daemon_log_level_and_format(tmp_path: Path) -> None:
         load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__LOG_FORMAT": "xml"})
 
 
+def test_daemon_version_check_and_upgrade_command(tmp_path: Path) -> None:
+    """#641: the release check is on by default and switchable off; #638: the
+    upgrade advice comes from `upgrade_command` when the operator sets one."""
+    config = load_config(cwd=tmp_path, env={})
+    assert config.daemon.version_check is True
+    assert config.daemon.upgrade_command is None
+    (tmp_path / "sbxloop.toml").write_text(
+        '[daemon]\nversion_check = false\nupgrade_command = "  pipx upgrade sbxloop "\n'
+    )
+    config = load_config(cwd=tmp_path, env={})
+    assert config.daemon.version_check is False
+    assert config.daemon.upgrade_command == "pipx upgrade sbxloop"
+    over = load_config(cwd=tmp_path, env={"SBXLOOP_DAEMON__VERSION_CHECK": "true"})
+    assert over.daemon.version_check is True
+    (tmp_path / "sbxloop.toml").write_text('[daemon]\nupgrade_command = "   "\n')
+    with pytest.raises(ConfigError, match="upgrade_command"):
+        load_config(cwd=tmp_path, env={})
+
+
 def test_run_cap_timezone_defaults_to_utc(tmp_path: Path) -> None:
     config = load_config(cwd=tmp_path, env={})
     assert config.daemon.run_cap_timezone == "UTC"
@@ -673,4 +692,660 @@ class TestCloneFilter:
     def test_refuses_anything_but_one_filter_spec(self, tmp_path: Path, bad: str) -> None:
         (tmp_path / "sbxloop.toml").write_text(f'[sandbox]\nclone_filter = "{bad}"\n')
         with pytest.raises(ConfigError, match="clone_filter must be a git filter spec"):
+            load_config(cwd=tmp_path, env={})
+
+
+class TestConfigDiscovery:
+    """Where the file layers come from, and how far each is trusted (#671).
+
+    Discovery walks from the cwd up to the enclosing checkout's top level.
+    A config file the repository *carries* (tracked in git) is project
+    config and may set only ``PROJECT_LAYER_KEYS``; a file the operator put
+    there (untracked, or outside any checkout) is honoured in full.
+    """
+
+    @staticmethod
+    def _events(caplog: pytest.LogCaptureFixture, name: str) -> list[str]:
+        return [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "sbxloop.config" and f"'event': '{name}'" in r.getMessage()
+        ]
+
+    def test_subdirectory_of_a_checkout_finds_the_root_config(self, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import git, make_repo
+
+        root = make_repo(tmp_path)
+        (root / "sbxloop.toml").write_text('model = "from-root"\n[sandbox]\nlanguages = ["go"]\n')
+        # Untracked: the operator's file, not the repository's.
+        nested = root / "packages" / "foo"
+        nested.mkdir(parents=True)
+        git("status", cwd=root)  # keep the index fresh
+        config, sources = load_config_with_sources(cwd=nested, env={})
+        assert config.model == "from-root"
+        assert config.sandbox.languages == ["go"]
+        assert sources["model"] == "sbxloop.toml"
+
+    def test_nearest_config_wins_and_the_walk_stops_at_the_checkout(self, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        (tmp_path / "sbxloop.toml").write_text('model = "above-the-checkout"\n')
+        root = make_repo(tmp_path)
+        (root / "sbxloop.toml").write_text('model = "root"\n')
+        pkg = root / "pkg"
+        pkg.mkdir()
+        (pkg / "sbxloop.toml").write_text('model = "pkg"\n')
+        assert load_config(cwd=pkg, env={}).model == "pkg"
+        (root / "other").mkdir()
+        assert load_config(cwd=root / "other", env={}).model == "root"
+        # Outside a checkout nothing walks: the parent's file is never seen.
+        elsewhere = tmp_path / "elsewhere"
+        elsewhere.mkdir()
+        assert load_config(cwd=elsewhere, env={}).model == "auto"
+
+    def test_tracked_config_may_only_set_project_keys(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from tests.unit.test_hostgit import git, make_repo
+
+        root = make_repo(tmp_path)
+        (root / "sbxloop.toml").write_text(
+            'state_dir = "/tmp/elsewhere"\n'
+            "[sandbox]\n"
+            'languages = ["javascript"]\n'
+            'gate_command = "npm test"\n'
+            'extra_allow_domains = ["evil.example"]\n'
+            "[policy]\n"
+            'allow = ["*"]\n'
+            "[landing]\n"
+            'merge_gate = "chat"\n'
+        )
+        git("add", "sbxloop.toml", cwd=root)
+        git("commit", "-m", "carry config", cwd=root)
+        with caplog.at_level(logging.WARNING):
+            config, sources = load_config_with_sources(cwd=root, env={})
+        assert config.sandbox.languages == ["javascript"]
+        assert config.sandbox.gate_command == "npm test"
+        assert sources["sandbox.languages"] == "sbxloop.toml (project)"
+        assert config.sandbox.extra_allow_domains == []
+        assert config.policy.allow == Config().policy.allow
+        assert config.landing.merge_gate == Config().landing.merge_gate
+        assert config.state_dir != Path("/tmp/elsewhere")
+        (ignored,) = self._events(caplog, "config.project_layer.ignored")
+        for key in (
+            "'landing.merge_gate'",
+            "'policy.allow'",
+            "'sandbox.extra_allow_domains'",
+            "'state_dir'",
+        ):
+            assert key in ignored
+        assert "sandbox.languages" not in ignored
+
+    def test_tracked_pyproject_section_is_project_config_too(self, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import git, make_repo
+
+        root = make_repo(tmp_path)
+        (root / "pyproject.toml").write_text(
+            '[tool.sbxloop]\nmodel = "not-yours"\n[tool.sbxloop.github]\nbranch_prefix = "bot/"\n'
+        )
+        git("add", "pyproject.toml", cwd=root)
+        git("commit", "-m", "pyproject", cwd=root)
+        config, sources = load_config_with_sources(cwd=root, env={})
+        assert config.model == "auto"
+        assert config.github.branch_prefix == "bot/"
+        assert sources["github.branch_prefix"] == "pyproject.toml (project)"
+
+    def test_untracked_config_in_a_checkout_is_the_operators(self, tmp_path: Path) -> None:
+        """`sbxloop init` in a checkout writes an untracked file: that is the
+        operator's, and every key it sets is honoured (the daemon's runner
+        directory is the common shape of this)."""
+        from tests.unit.test_hostgit import make_repo
+
+        root = make_repo(tmp_path)
+        (root / "sbxloop.toml").write_text(
+            '[policy]\nallow = ["pypi.org"]\n[landing]\nmerge_gate = "chat"\n'
+        )
+        config, sources = load_config_with_sources(cwd=root, env={})
+        assert config.landing.merge_gate == "chat"
+        assert "pypi.org" in config.policy.allow
+        assert sources["landing.merge_gate"] == "sbxloop.toml"
+
+    def test_config_outside_any_checkout_is_the_operators(self, tmp_path: Path) -> None:
+        work = tmp_path / "runner"
+        work.mkdir()
+        (work / "sbxloop.toml").write_text(
+            '[landing]\nmerge_gate = "chat"\n[budgets]\nmax_tasks = 2\n'
+        )
+        config, sources = load_config_with_sources(cwd=work, env={})
+        assert config.landing.merge_gate == "chat"
+        assert config.budgets.max_tasks == 2
+        assert sources["budgets.max_tasks"] == "sbxloop.toml"
+
+    def test_relative_state_dir_anchors_at_the_discovered_root(self, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        root = make_repo(tmp_path)
+        (root / "sbxloop.toml").write_text('state_dir = ".sbxloop"\n')
+        nested = root / "src" / "deep"
+        nested.mkdir(parents=True)
+        config = load_config(cwd=nested, env={})
+        assert config.state_dir == root.resolve() / ".sbxloop"
+
+    def test_unknown_tracking_reads_as_the_repositorys_file(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fail closed: when git cannot say whether the checkout carries the
+        file, it is treated as project config."""
+        from sbxloop import hostgit
+        from tests.unit.test_hostgit import make_repo
+
+        root = make_repo(tmp_path)
+        (root / "sbxloop.toml").write_text(
+            '[landing]\nmerge_gate = "chat"\n[sandbox]\nlanguages = ["go"]\n'
+        )
+        monkeypatch.setattr(hostgit, "is_tracked", lambda repo_root, path: None)
+        config = load_config(cwd=root, env={})
+        assert config.landing.merge_gate == "off"
+        assert config.sandbox.languages == ["go"]
+
+
+class TestCredentials:
+    """`[[credentials]]` (#765): the catalogue a run's service sandbox may
+    hold — names the operator grants per run, never secrets themselves."""
+
+    def test_unset_by_default(self, tmp_path: Path) -> None:
+        config = load_config(cwd=tmp_path, env={})
+        assert config.credentials == []
+        assert config.credential("weather") is None
+        assert config.credentials_named([]) == []
+
+    def test_entries_parse_with_defaults_and_overrides(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[[credentials]]\n"
+            'name = "weather"\n'
+            'env = "WEATHER_API_KEY"\n'
+            'host = "API.Weather.Example.com"\n'
+            'description = "forecasts"\n'
+            "\n"
+            "[[credentials]]\n"
+            'name = "keyed"\n'
+            'env = "KEYED_TOKEN"\n'
+            'host = "keyed.example.com"\n'
+            'header = "X-Api-Key"\n'
+            'scheme = ""\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        weather, keyed = config.credentials
+        assert (weather.host, weather.header, weather.scheme) == (
+            "api.weather.example.com",
+            "Authorization",
+            "Bearer",
+        )
+        assert weather.description == "forecasts"
+        assert (keyed.header, keyed.scheme) == ("X-Api-Key", "")
+        assert weather.catalogue_entry() == {
+            "name": "weather",
+            "env": "WEATHER_API_KEY",
+            "host": "api.weather.example.com",
+            "header": "Authorization",
+            "scheme": "Bearer",
+        }
+        assert config.credential("keyed") is keyed
+
+    def test_credentials_named_keeps_order_and_dedupes(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            '[[credentials]]\nname = "a"\nenv = "A"\nhost = "a.example.com"\n\n'
+            '[[credentials]]\nname = "b"\nenv = "B"\nhost = "b.example.com"\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        assert [c.name for c in config.credentials_named(["b", "a", "b"])] == ["b", "a"]
+
+    def test_credentials_named_refuses_an_undeclared_name(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            '[[credentials]]\nname = "a"\nenv = "A"\nhost = "a.example.com"\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        with pytest.raises(
+            ConfigError, match=r"'zed' is not declared under \[\[credentials\]\].*a"
+        ):
+            config.credentials_named(["zed"])
+
+    @pytest.mark.parametrize(
+        ("field", "value", "problem"),
+        [
+            ("name", "Weather", "name"),
+            ("name", "", "name"),
+            ("env", "weather-key", r"credentials\[\]\.env"),
+            ("host", "https://api.example.com", "host"),
+            ("host", "api.example.com/v1", "host"),
+            ("header", "X Api Key", "header"),
+            ("scheme", "Bearer token", "scheme"),
+        ],
+    )
+    def test_malformed_entries_are_refused(
+        self, tmp_path: Path, field: str, value: str, problem: str
+    ) -> None:
+        entry = {"name": "weather", "env": "WEATHER_API_KEY", "host": "api.example.com"}
+        entry[field] = value
+        body = "[[credentials]]\n" + "".join(f'{k} = "{v}"\n' for k, v in entry.items())
+        (tmp_path / "sbxloop.toml").write_text(body)
+        with pytest.raises(ConfigError, match=problem):
+            load_config(cwd=tmp_path, env={})
+
+    def test_duplicate_names_are_refused(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            '[[credentials]]\nname = "a"\nenv = "A"\nhost = "a.example.com"\n\n'
+            '[[credentials]]\nname = "a"\nenv = "B"\nhost = "b.example.com"\n'
+        )
+        with pytest.raises(ConfigError, match="'a' is declared twice"):
+            load_config(cwd=tmp_path, env={})
+
+
+class TestWorkloads:
+    """`[[workloads]]` profiles and `[workload] default` (#758): what a
+    workload run's plan may ask for, validated whole at load time."""
+
+    CATALOGUE = (
+        '[[credentials]]\nname = "weather"\nenv = "WEATHER_API_KEY"\n'
+        'host = "api.weather.example.com"\n\n'
+    )
+
+    def test_unset_by_default(self, tmp_path: Path) -> None:
+        config = load_config(cwd=tmp_path, env={})
+        assert config.workloads == []
+        assert config.workload.default is None
+        assert config.workload_profile() is None
+        assert config.for_workload_profile(None) is config
+
+    def test_profile_parses_with_defaults_and_overrides(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            self.CATALOGUE + "[[workloads]]\n"
+            'name = "research"\n'
+            'description = "reads the web"\n'
+            'egress = ["*.Example.com", " data.example.org "]\n'
+            'credentials = ["weather", "weather"]\n'
+            'sinks = ["chat", "artifact", "chat"]\n'
+            "repo = true\n"
+            "budgets = { max_tasks = 3, max_wall_clock_s = 60.0 }\n"
+            "\n"
+            "[[workloads]]\n"
+            'name = "bare"\n'
+            "\n"
+            "[workload]\n"
+            'default = "research"\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        research, bare = config.workloads
+        assert research.egress == ["*.example.com", "data.example.org"]
+        assert research.credentials == ["weather"]
+        assert research.sinks == ["chat", "artifact"]
+        assert research.repo is True
+        assert research.publish == "auto"
+        assert research.budgets.set_keys == ["max_tasks", "max_wall_clock_s"]
+        assert research.covers_host("api.example.com")
+        assert research.covers_host("data.example.org")
+        assert not research.covers_host("other.example.org")
+        assert (bare.egress, bare.credentials, bare.sinks, bare.repo) == ([], [], [], False)
+        assert bare.budgets.set_keys == []
+        assert config.workload_profile() is research
+        assert config.workload_profile("bare") is bare
+
+    def test_for_workload_profile_pins_the_choice_and_applies_budgets(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[budgets]\nmax_tasks = 12\nmax_revisions_per_task = 4\n\n"
+            "[[workloads]]\n"
+            'name = "research"\n'
+            "budgets = { max_tasks = 3 }\n"
+            "\n"
+            "[[workloads]]\n"
+            'name = "bare"\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        narrowed = config.for_workload_profile("research")
+        assert narrowed.workload.default == "research"
+        assert narrowed.budgets.max_tasks == 3
+        assert narrowed.budgets.max_revisions_per_task == 4
+        # the profile list itself is untouched, so the persisted config still
+        # dumps what the operator wrote and a resume sees no drift
+        assert narrowed.workloads == config.workloads
+        assert config.workload.default is None
+        assert config.budgets.max_tasks == 12
+        # a profile without overrides pins the name and keeps the budgets
+        bare = config.for_workload_profile("bare")
+        assert bare.workload.default == "bare"
+        assert bare.budgets == config.budgets
+
+    def test_unknown_profile_name_is_a_config_error(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text('[[workloads]]\nname = "research"\n')
+        config = load_config(cwd=tmp_path, env={})
+        with pytest.raises(ConfigError, match=r"'nope' is not declared.*declared: research"):
+            config.workload_profile("nope")
+        with pytest.raises(ConfigError, match="'nope'"):
+            config.for_workload_profile("nope")
+
+    @pytest.mark.parametrize(
+        ("body", "problem"),
+        [
+            (
+                '[[workloads]]\nname = "research"\ncredentials = ["weather"]\n',
+                "workloads.research.credentials names 'weather', which is not declared "
+                r"under \[\[credentials\]\] \(declared: none\)",
+            ),
+            (
+                '[[workloads]]\nname = "research"\n\n[workload]\ndefault = "nope"\n',
+                r"\[workload\] default = 'nope' names no \[\[workloads\]\] profile "
+                r"\(declared: research\)",
+            ),
+            (
+                '[[workloads]]\nname = "research"\n\n[[workloads]]\nname = "research"\n',
+                "profile 'research' is declared twice",
+            ),
+            (
+                '[[workloads]]\nname = "Research Team"\n',
+                "workloads\\[\\].name must be lowercase",
+            ),
+            (
+                '[[workloads]]\nname = "research"\negress = ["https://example.com/path"]\n',
+                "workloads\\[\\].egress patterns must be domains",
+            ),
+            (
+                '[[workloads]]\nname = "research"\nsinks = ["email"]\n',
+                "sinks",
+            ),
+            (
+                '[[workloads]]\nname = "research"\npublish = "hold"\n',
+                'publish = "hold" is not available yet',
+            ),
+            (
+                '[[workloads]]\nname = "research"\nbudgets = { max_tasks = 0 }\n',
+                "max_tasks",
+            ),
+            (
+                '[[workloads]]\nname = "research"\nbudgets = { max_turns = 3 }\n',
+                "max_turns",
+            ),
+        ],
+    )
+    def test_unsound_profiles_are_refused(self, tmp_path: Path, body: str, problem: str) -> None:
+        (tmp_path / "sbxloop.toml").write_text(body)
+        with pytest.raises(ConfigError, match=problem):
+            load_config(cwd=tmp_path, env={})
+
+    def test_unknown_default_without_profiles_lists_none(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text('[workload]\ndefault = "research"\n')
+        with pytest.raises(
+            ConfigError, match=r"names no \[\[workloads\]\] profile \(declared: none\)"
+        ):
+            load_config(cwd=tmp_path, env={})
+
+
+class TestRegistries:
+    """`[[registries]]` (#680): private package registries, per repository."""
+
+    def test_unset_by_default(self, tmp_path: Path) -> None:
+        config = load_config(cwd=tmp_path, env={})
+        assert config.registries == []
+        assert config.registries_for(None) == []
+        assert config.registry_auth_envs_for(None) == []
+
+    def test_entries_parse_and_auth_envs_are_collected(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[[registries]]\n"
+            'kind = "npm"\n'
+            'host = "artifactory.example.com"\n'
+            'url = "https://artifactory.example.com/api/npm/npm-virtual/"\n'
+            'auth_env = "NPM_TOKEN"\n'
+            'scope = "@example"\n'
+            "\n"
+            "[[registries]]\n"
+            'kind = "go"\n'
+            'host = "github.example.com"\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        assert [r.kind for r in config.registries] == ["npm", "go"]
+        assert config.registries[0].scope == "@example"
+        assert config.registry_auth_envs_for(None) == ["NPM_TOKEN"]
+
+    def test_a_repository_override_replaces_the_global_list(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[[registries]]\n"
+            'kind = "go"\n'
+            'host = "github.example.com"\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "owner/inherits"\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "owner/own"\n'
+            "[[github.repos.registries]]\n"
+            'kind = "pypi"\n'
+            'host = "pypi.example.com"\n'
+            'url = "https://pypi.example.com/simple"\n'
+            'auth_env = "PYPI_TOKEN"\n'
+            'auth_user = "svc"\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "owner/none"\n'
+            "registries = []\n"
+        )
+        config = load_config(cwd=tmp_path, env={})
+        assert [r.host for r in config.registries_for("owner/inherits")] == ["github.example.com"]
+        assert [r.host for r in config.registries_for("owner/own")] == ["pypi.example.com"]
+        assert config.registry_auth_envs_for("owner/own") == ["PYPI_TOKEN"]
+        assert config.registries_for("owner/none") == []
+
+    def test_one_default_per_ecosystem(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[[registries]]\n"
+            'kind = "pypi"\n'
+            'host = "a.example.com"\n'
+            'url = "https://a.example.com/simple"\n'
+            "[[registries]]\n"
+            'kind = "pypi"\n'
+            'host = "b.example.com"\n'
+            'url = "https://b.example.com/simple"\n'
+        )
+        with pytest.raises(ConfigError, match="more than one 'pypi' registry"):
+            load_config(cwd=tmp_path, env={})
+
+    def test_a_credential_name_cannot_also_be_plain_env(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[sandbox]\n"
+            'env = { NPM_TOKEN = "literal" }\n'
+            "[[registries]]\n"
+            'kind = "npm"\n'
+            'host = "a.example.com"\n'
+            'url = "https://a.example.com/npm/"\n'
+            'auth_env = "NPM_TOKEN"\n'
+        )
+        with pytest.raises(
+            ConfigError, match=r"env and a registry's auth_env both name \['NPM_TOKEN'\]"
+        ):
+            load_config(cwd=tmp_path, env={})
+
+
+class TestSandboxEnv:
+    """`[sandbox] env` (#679): plain values, per repository. Its old
+    secret counterpart `secret_env` is refused by name (#766): the only
+    credential in the agent sandbox is the agent's own."""
+
+    def test_unset_by_default(self, tmp_path: Path) -> None:
+        config = load_config(cwd=tmp_path, env={})
+        assert config.sandbox.env == {}
+        assert config.sandbox_env_for(None) == {}
+
+    def test_plain_values_parse(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[sandbox]\n"
+            'env = { RAILS_ENV = "test", DATABASE_URL = "postgres://localhost/app_test" }\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        assert config.sandbox.env == {
+            "RAILS_ENV": "test",
+            "DATABASE_URL": "postgres://localhost/app_test",
+        }
+
+    def test_a_repository_override_replaces_the_global_setting(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[sandbox]\n"
+            'env = { RAILS_ENV = "test" }\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "o/rails"\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "o/go"\n'
+            'env = { GOFLAGS = "-mod=vendor" }\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        assert config.sandbox_env_for("o/rails") == {"RAILS_ENV": "test"}
+        # The override REPLACES: the Go repository does not get RAILS_ENV.
+        assert config.sandbox_env_for("o/go") == {"GOFLAGS": "-mod=vendor"}
+        # A repository without an entry falls back to the global setting.
+        assert config.sandbox_env_for("o/unknown") == {"RAILS_ENV": "test"}
+
+    @pytest.mark.parametrize(
+        ("body", "match"),
+        [
+            ('[sandbox]\nenv = { "1BAD" = "x" }\n', "not an environment variable name"),
+            ('[sandbox]\nenv = { GH_TOKEN = "x" }\n', "delivered by sbxloop itself"),
+            ('[sandbox]\nenv = { SBXLOOP_WORKER_BACKEND = "echo" }\n', "delivered by sbxloop"),
+            (
+                '[sandbox]\nenv = { NPM_TOKEN = "x" }\n\n'
+                '[[registries]]\nkind = "npm"\nhost = "npm.example.com"\n'
+                'url = "https://npm.example.com/"\nauth_env = "NPM_TOKEN"\n',
+                "env and a registry's auth_env both name",
+            ),
+            ('[[github.repos]]\nrepo = "o/r"\nenv = { GITHUB_TOKEN = "x" }\n', "github.repos"),
+        ],
+    )
+    def test_refuses_names_the_loop_owns_or_that_are_not_names(
+        self, tmp_path: Path, body: str, match: str
+    ) -> None:
+        (tmp_path / "sbxloop.toml").write_text(body)
+        with pytest.raises(ConfigError, match=match):
+            load_config(cwd=tmp_path, env={})
+
+    @pytest.mark.parametrize(
+        ("body", "where"),
+        [
+            ('[sandbox]\nsecret_env = ["NPM_TOKEN"]\n', r"\[sandbox\]"),
+            (
+                '[[github.repos]]\nrepo = "o/r"\nsecret_env = ["NPM_TOKEN"]\n',
+                r"\[\[github.repos\]\]",
+            ),
+            # Even empty: the key itself is the mistake to name.
+            ("[sandbox]\nsecret_env = []\n", r"\[sandbox\]"),
+        ],
+    )
+    def test_secret_env_is_refused_by_name_with_the_way_forward(
+        self, tmp_path: Path, body: str, where: str
+    ) -> None:
+        """`secret_env` put an operator secret in the agent's sandbox; #766
+        removed it. The refusal names the key, not `extra="forbid"`'s
+        generic "extra inputs", and says where each kind of secret now
+        belongs."""
+        (tmp_path / "sbxloop.toml").write_text(body)
+        with pytest.raises(ConfigError, match=f"{where} secret_env is no longer supported") as info:
+            load_config(cwd=tmp_path, env={})
+        message = str(info.value)
+        assert "[[registries]]" in message and "auth_env" in message
+        assert "[[credentials]]" in message
+        assert "ci-only" in message
+        assert "Extra inputs" not in message
+
+
+class TestAptPackagesAndSetupCommands:
+    """`[sandbox] apt_packages` / `setup_commands` (#681): OS packages beside
+    the toolchains and pre-run commands, per repository."""
+
+    def test_unset_by_default(self, tmp_path: Path) -> None:
+        config = load_config(cwd=tmp_path, env={})
+        assert config.sandbox.apt_packages == []
+        assert config.sandbox.setup_commands == []
+        assert config.apt_packages_for(None) == []
+        assert config.setup_commands_for(None) == []
+
+    def test_lists_parse_and_a_repository_override_replaces_them(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[sandbox]\n"
+            'apt_packages = ["libpq-dev", "protobuf-compiler", "libpq-dev", "ffmpeg=7:6.1-1"]\n'
+            'setup_commands = ["npx playwright install --with-deps chromium", '
+            '"pre-commit install-hooks"]\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "o/web"\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "o/go"\n'
+            "apt_packages = []\n"
+            'setup_commands = ["go mod download"]\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        # duplicates collapse, order kept; an apt version pin is a package
+        assert config.sandbox.apt_packages == ["libpq-dev", "protobuf-compiler", "ffmpeg=7:6.1-1"]
+        assert config.setup_commands_for("o/web") == [
+            "npx playwright install --with-deps chromium",
+            "pre-commit install-hooks",
+        ]
+        assert config.apt_packages_for("o/web") == config.sandbox.apt_packages
+        # The override REPLACES: an empty list is a real "nothing extra".
+        assert config.apt_packages_for("o/go") == []
+        assert config.setup_commands_for("o/go") == ["go mod download"]
+        assert config.apt_packages_for("o/unknown") == config.sandbox.apt_packages
+
+    @pytest.mark.parametrize(
+        ("body", "match"),
+        [
+            ('apt_packages = ["libpq-dev; rm -rf /"]', "is not an apt package name"),
+            ('apt_packages = ["Lib PQ"]', "is not an apt package name"),
+            ('apt_packages = [""]', "is not an apt package name"),
+            ('setup_commands = ["  "]', "cannot be empty"),
+            ('setup_commands = ["make\\nmake test"]', "one command per entry"),
+        ],
+    )
+    def test_refusals(self, tmp_path: Path, body: str, match: str) -> None:
+        (tmp_path / "sbxloop.toml").write_text(f"[sandbox]\n{body}\n")
+        with pytest.raises(ConfigError, match=match):
+            load_config(cwd=tmp_path, env={})
+
+    def test_repository_entries_are_checked_the_same_way(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            '[[github.repos]]\nrepo = "o/web"\napt_packages = ["$(evil)"]\n'
+        )
+        with pytest.raises(ConfigError, match=r"github.repos\[\].apt_packages"):
+            load_config(cwd=tmp_path, env={})
+
+
+class TestVerifyMode:
+    """`[sandbox] verify_mode` (#682): full by default, a `[[github.repos]]`
+    entry overrides it, and the vocabulary is closed."""
+
+    def test_full_by_default(self, tmp_path: Path) -> None:
+        config = load_config(cwd=tmp_path, env={})
+        assert config.sandbox.verify_mode == "full"
+        assert config.verify_mode_for(None) == "full"
+
+    def test_global_and_per_repository(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text(
+            "[sandbox]\n"
+            'verify_mode = "advisory"\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "o/web"\n'
+            "\n"
+            "[[github.repos]]\n"
+            'repo = "o/api"\n'
+            'verify_mode = "ci-only"\n'
+        )
+        config = load_config(cwd=tmp_path, env={})
+        assert config.verify_mode_for("o/web") == "advisory"
+        assert config.verify_mode_for("o/api") == "ci-only"
+        assert config.verify_mode_for(None) == "advisory"
+
+    def test_unknown_mode_is_refused(self, tmp_path: Path) -> None:
+        (tmp_path / "sbxloop.toml").write_text('[sandbox]\nverify_mode = "skip"\n')
+        with pytest.raises(ConfigError, match="verify_mode"):
             load_config(cwd=tmp_path, env={})

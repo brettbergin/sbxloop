@@ -1,7 +1,7 @@
 """Layer-neutral bounded output excerpting.
 
 The line-selection half of the tool-output excerpt policy, shared by every
-renderer (Discord threads, the ``sbxloop watch`` TUI) so there is exactly one
+renderer (Discord threads, the ``sbxloop run`` transcript, the console) so there is exactly one
 copy of the truncation rules. Presentation-specific caps -- Discord's
 per-message limit, fencing, colours -- stay in the layer that needs them.
 

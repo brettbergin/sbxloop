@@ -160,7 +160,12 @@ class FakeSbx:
 
 
 def probe(
-    latest: dict[str, str | None], *, sbx: Any = None, now: list[float] | None = None
+    latest: dict[str, str | None],
+    *,
+    sbx: Any = None,
+    now: list[float] | None = None,
+    check_pypi: bool = True,
+    upgrade_command: str | None = None,
 ) -> tuple[VersionProbe, list[str]]:
     """A probe whose PyPI answers are canned; returns it plus the call log."""
     calls: list[str] = []
@@ -170,7 +175,13 @@ def probe(
         return latest.get(name)
 
     clock = (lambda: now[0]) if now is not None else (lambda: 1000.0)
-    return VersionProbe(sbx=sbx, clock=clock, fetch=fetch), calls
+    return VersionProbe(
+        sbx=sbx,
+        clock=clock,
+        fetch=fetch,
+        check_pypi=check_pypi,
+        upgrade_command=upgrade_command,
+    ), calls
 
 
 class TestProbe:
@@ -240,8 +251,41 @@ class TestSummary:
         )
         assert "sbxloop-worker  0.7.12 installed · 0.7.15 on PyPI · BEHIND" in text
         assert "sbx CLI         0.38.1" in text
-        assert "pip install --upgrade sbxloop" in text
+        # #638: no install method is guessed — pip is one of several.
+        assert "pip install --upgrade" not in text
+        assert "depends on how sbxloop was installed" in text
+        assert "operator's step on the daemon host" in text
         assert "You cannot do it from here" in text
+
+    def test_behind_names_the_configured_upgrade_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #638/#641: `[daemon] upgrade_command` is what the advice says to run.
+        monkeypatch.setattr(sbxloop, "__version__", "0.7.12")
+        monkeypatch.setattr(versions.sbxloop_worker, "__version__", "0.7.12")
+        p, _ = probe(
+            {"sbxloop": "0.7.15", "sbxloop-worker": "0.7.15"},
+            upgrade_command="pipx upgrade sbxloop",
+        )
+        text = p.summary()
+        assert "run `pipx upgrade sbxloop`, then restart the daemon" in text
+        assert "depends on how sbxloop was installed" not in text
+
+    def test_check_off_asks_nothing_and_advises_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #641: `[daemon] version_check = false` — zero outbound HTTP, the
+        # installed half still answers, and no upgrade is inferred.
+        monkeypatch.setattr(sbxloop, "__version__", "0.7.12")
+        monkeypatch.setattr(versions.sbxloop_worker, "__version__", "0.7.12")
+        p, calls = probe({"sbxloop": "0.7.15", "sbxloop-worker": "0.7.15"}, check_pypi=False)
+        text = p.summary()
+        assert calls == []
+        assert "sbxloop         0.7.12 installed · PyPI not checked" in text
+        assert "[daemon] version_check = false" in text
+        assert "could not reach PyPI" not in text
+        assert "BEHIND" not in text and "depends on how" not in text
+        assert p.drift_notice() is None and calls == []
 
     def test_current_says_so_without_an_upgrade_hint(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(sbxloop, "__version__", "0.7.15")
@@ -249,7 +293,7 @@ class TestSummary:
         p, _ = probe({"sbxloop": "0.7.15", "sbxloop-worker": "0.7.15"})
         text = p.summary()
         assert "up to date" in text
-        assert "pip install --upgrade" not in text
+        assert "operator's step" not in text
 
     def test_a_dev_build_never_advises_an_upgrade(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(sbxloop, "__version__", "0.7.12.dev0")
@@ -257,7 +301,7 @@ class TestSummary:
         p, _ = probe({"sbxloop": "0.7.12", "sbxloop-worker": "0.7.12"})
         text = p.summary()
         assert "a development build, not a release" in text
-        assert "pip install --upgrade" not in text
+        assert "operator's step" not in text
         assert "up to date" not in text  # the trap: 0.7.12.dev0 is NOT 0.7.12
 
     def test_unreachable_pypi_keeps_the_installed_half(
@@ -268,7 +312,7 @@ class TestSummary:
         text = p.summary()
         assert "0.7.12 installed · could not reach PyPI" in text
         assert "the installed versions are still accurate" in text
-        assert "pip install --upgrade" not in text
+        assert "operator's step" not in text
 
     def test_an_unbuilt_tree_says_so(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(sbxloop, "__version__", UNBUILT)
@@ -276,7 +320,7 @@ class TestSummary:
         p, _ = probe({"sbxloop": "0.7.15", "sbxloop-worker": "0.7.15"})
         text = p.summary()
         assert "never built" in text
-        assert "pip install --upgrade" not in text
+        assert "operator's step" not in text
 
 
 class TestDriftNotice:
@@ -287,7 +331,17 @@ class TestDriftNotice:
         assert notice is not None
         assert "0.7.12" in notice and "0.7.15" in notice
         assert "3 patch releases behind" in notice
-        assert "pip install --upgrade sbxloop" in notice
+        assert "pip install --upgrade" not in notice
+        assert "depends on how sbxloop was installed" in notice
+
+    def test_the_notice_names_the_configured_upgrade_command(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(sbxloop, "__version__", "0.7.12")
+        p, _ = probe({"sbxloop": "0.7.15"}, upgrade_command="~/bin/upgrade-sbxloop")
+        notice = p.drift_notice()
+        assert notice is not None
+        assert "run `~/bin/upgrade-sbxloop`" in notice
 
     @pytest.mark.parametrize(
         ("installed", "latest"),

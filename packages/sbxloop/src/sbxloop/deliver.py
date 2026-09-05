@@ -13,13 +13,19 @@ Two ways of building that tree (#248):
   from ``hostgit.clone_for_run``, or an in-place checkout), only what the
   run changed relative to its base commit is committed: added/modified
   files as blobs with their real mode (``100755`` kept), deletions as
-  ``sha: null`` tree entries. A snapshot overlay could never delete or
-  rename a file and flipped every executable to ``100644`` — silently
-  wrong PRs against an existing repository, the one failure a reviewer
-  may not notice.
+  ``sha: null`` tree entries. A snapshot overlay can never delete or
+  rename a file — silently wrong PRs against an existing repository, the
+  one failure a reviewer may not notice.
 - **snapshot** — every kept file layered onto the base tree; the right
   answer for greenfield workspaces (no git history to diff against), and
   the fallback when a checkout carries no usable base commit.
+
+Both plans record what is on disk (#695): an executable script is
+``100755`` and a symlink is ``120000`` with its target as content,
+whichever way the tree was built — a harvested ``bin/`` entrypoint used to
+arrive non-executable and a symlinked config de-linked, because the
+snapshot wrote ``100644`` for everything. ``FILE_MODE`` remains only for
+deletions, where the mode is a formality.
 
 Scaffold status: this is a real, unit-tested code path (stubbed GithubOps),
 but per the project pattern — unverified external behaviors get a seam and
@@ -53,13 +59,20 @@ The worker performs the per-file blob POSTs in-sandbox and streams
 from __future__ import annotations
 
 import base64
+import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
 from sbxloop import hostgit
-from sbxloop.engine.model import DEFAULT_ARTIFACT_EXCLUDES, exclusion_hit, scan_artifacts
+from sbxloop.engine.model import (
+    DEFAULT_ARTIFACT_EXCLUDES,
+    PR_BODY_FILE,
+    exclusion_hit,
+    scan_artifacts,
+)
 from sbxloop.errors import DeliveryError, GithubOpsError
 from sbxloop.gh.ops import GithubOps, PrRef
 from sbxloop.ids import branch_name as branch_name  # re-export; shared with hostgit isolation
@@ -69,6 +82,56 @@ log = get_logger(__name__)
 
 FILE_MODE = "100644"
 BODY_FILE_LIST_CAP = 50
+# The places GitHub reads a pull request template from (#678), in the
+# order it prefers them; the first that exists is the one a human opening
+# a PR in the browser would be handed. A template *directory* holds
+# alternatives GitHub only applies by query parameter, so it is not one.
+PR_TEMPLATE_PATHS = (
+    ".github/PULL_REQUEST_TEMPLATE.md",
+    ".github/pull_request_template.md",
+    "PULL_REQUEST_TEMPLATE.md",
+    "pull_request_template.md",
+    "docs/PULL_REQUEST_TEMPLATE.md",
+    "docs/pull_request_template.md",
+)
+PR_TEMPLATE_CAP = 16 * 1024
+# What says a repository lints pull-request titles as conventional commits
+# (#678): commitlint's config files, a `commitlint` key in package.json,
+# or a workflow running one of the two common title actions.
+_COMMITLINT_FILES = (
+    "commitlint.config.js",
+    "commitlint.config.cjs",
+    "commitlint.config.mjs",
+    "commitlint.config.ts",
+    "commitlint.config.json",
+    "commitlint.config.yaml",
+    "commitlint.config.yml",
+    ".commitlintrc",
+    ".commitlintrc.json",
+    ".commitlintrc.yaml",
+    ".commitlintrc.yml",
+    ".commitlintrc.js",
+    ".commitlintrc.cjs",
+    ".commitlintrc.ts",
+)
+_TITLE_ACTIONS = ("amannn/action-semantic-pull-request", "wagoid/commitlint-github-action")
+# A conventional-commit subject: `type(scope)!: summary`, the type one of
+# config-conventional's default `type-enum` — the set the lints enforce
+# unless a repository extends it, so `sbxloop: …` is not one.
+CONVENTIONAL_TYPES = (
+    "build",
+    "chore",
+    "ci",
+    "docs",
+    "feat",
+    "fix",
+    "perf",
+    "refactor",
+    "revert",
+    "style",
+    "test",
+)
+CONVENTIONAL_TITLE = re.compile(r"^(" + "|".join(CONVENTIONAL_TYPES) + r")(\([^()]*\))?!?: \S")
 TITLE_CLIP = 72
 # Cap on base64 payload bytes per blobs.create_many job. The manifest rides
 # inside the job JSON (staged into the sandbox with one `sbx cp`), so this
@@ -91,6 +154,70 @@ def _is_ref_refusal(exc: GithubOpsError) -> bool:
     text = str(exc)
     is_422 = exc.http_status == 422 or "HTTP 422" in text
     return is_422 and "already exists" not in text.lower()
+
+
+# GitHub's answer to a draft PR on a plan or instance without drafts —
+# private repositories on GitHub Free, GHE instances predating the
+# feature (#677). Matched case-insensitively; the wording is GitHub's.
+_DRAFT_UNSUPPORTED = "draft pull requests are not supported"
+
+
+def _is_draft_unsupported(exc: GithubOpsError) -> bool:
+    """Whether a PR create was refused because the repository has no draft
+    pull requests at all — a 422 saying so, which no lookup and no retry
+    of the same request would change."""
+    text = str(exc)
+    is_422 = exc.http_status == 422 or "HTTP 422" in text
+    return is_422 and _DRAFT_UNSUPPORTED in text.lower()
+
+
+# A refs POST 422 that is not "already exists", by what GitHub's message
+# says (#677): (needle in the lowercased message, the advice). The first
+# match wins; a message none of these fit is quoted as it came — every
+# 422 used to be "the branch name", which sent an operator whose base
+# wants signed commits off to change `branch_prefix`.
+_REF_REFUSALS: tuple[tuple[str, str], ...] = (
+    (
+        "signature",
+        "the base requires signed commits; GitHub signs commits the loop creates through "
+        "its API only when it authenticates as a GitHub App (GITHUB_APP_ID + private key)",
+    ),
+    (
+        "signed",
+        "the base requires signed commits; GitHub signs commits the loop creates through "
+        "its API only when it authenticates as a GitHub App (GITHUB_APP_ID + private key)",
+    ),
+    (
+        "locked",
+        "the repository is locked (a migration in progress, or archived) — nothing the "
+        "loop does changes that",
+    ),
+    (
+        "archived",
+        "the repository is archived — nothing the loop does changes that",
+    ),
+    (
+        "branch name",
+        "the repository's rules do not admit that branch name — set `[github] "
+        "branch_prefix` (or the [[github.repos]] entry's) to a prefix its rulesets allow",
+    ),
+    (
+        "creations being restricted",
+        "the repository's rules do not admit that branch name — set `[github] "
+        "branch_prefix` (or the [[github.repos]] entry's) to a prefix its rulesets allow",
+    ),
+)
+
+
+def _explain_ref_refusal(exc: GithubOpsError) -> str:
+    """The advice for a refs POST GitHub refused, from its own words; a
+    message none of :data:`_REF_REFUSALS` fits gets no advice beyond the
+    quote — a wrong knob named is worse than none."""
+    text = str(exc).lower()
+    for needle, advice in _REF_REFUSALS:
+        if needle in text:
+            return advice
+    return "GitHub's refusal is quoted above; the repository's rules or state say why"
 
 
 def _is_pr_collision(exc: GithubOpsError) -> bool:
@@ -221,8 +348,19 @@ def deliver_workspace(
     parent: str | None = None,
     title: str | None = None,
     commit_message: str | None = None,
+    authored_body: str | None = None,
+    verification: str | None = None,
 ) -> PrRef:
     """Publish source_dir as one commit on a branch and open (or update) a PR.
+
+    ``authored_body`` is the description the agent wrote (``.sbxloop/pr-body``
+    under the workspace, #678): it becomes the PR's body on the create, or
+    replaces the open PR's body on a re-delivery. Without it the body is the
+    repository's own pull request template, when ``source_dir`` has one,
+    followed by the loop's summary. ``verification`` is what the sandbox's
+    checks did not decide (#682) — advisory failures, or that nothing ran
+    under `ci-only` — and closes the body as its own section, whichever
+    way the body was written.
 
     ``branch`` overrides the per-run branch name so a fix round lands on the
     pull request it was fixing: the existing branch is looked up and
@@ -260,7 +398,7 @@ def deliver_workspace(
         plan = _plan_snapshot(source_dir, exclude)
 
     if base is None:
-        base = str(ops.repo_get(repo).get("default_branch") or "main")
+        base = ops.default_branch(repo)
     base_sha = _base_commit_sha(ops, repo, base)
     if base_sha is None:
         log.warning(
@@ -345,17 +483,60 @@ def deliver_workspace(
         _retitle(
             ops, repo, pr_number, current=str(data.get("title") or ""), wanted=title, run_id=run_id
         )
+        if authored_body and authored_body.strip():
+            _rebody(
+                ops,
+                repo,
+                pr_number,
+                body=_body(
+                    run_id,
+                    outcome,
+                    plan,
+                    closes=closes,
+                    authored=authored_body,
+                    verification=verification,
+                ),
+                run_id=run_id,
+            )
         return PrRef(number=pr_number, url=url)
+    template = pr_template(source_dir)
+    if template is not None:
+        log.info("deliver.pr_template", run=run_id, repo=repo, path=template[0])
+    body = _body(
+        run_id,
+        outcome,
+        plan,
+        closes=closes,
+        template=template[1] if template else None,
+        authored=authored_body,
+        verification=verification,
+    )
     try:
         pr = ops.pr_create(
             repo,
             base=base,
             head=branch,
             title=title,
-            body=_body(run_id, outcome, plan, closes=closes),
+            body=body,
             draft=draft,
         )
     except GithubOpsError as exc:
+        if draft and _is_draft_unsupported(exc):
+            # No drafts on this plan or instance (#677): one retry as a
+            # ready PR. The landing's un-draft step then has nothing to
+            # do; `deliver_draft` was a preference, not a requirement.
+            log.info(
+                "deliver.draft_unsupported",
+                run=run_id,
+                repo=repo,
+                hint="the repository has no draft pull requests; opening the PR ready for review",
+            )
+            draft = False
+            pr = ops.pr_create(repo, base=base, head=branch, title=title, body=body, draft=False)
+            log.info(
+                "deliver.pr_opened", run=run_id, repo=repo, pr=pr.number, url=pr.url, draft=False
+            )
+            return pr
         if not _is_pr_collision(exc):
             raise
         existing = _find_open_pr(ops, repo, branch)
@@ -410,13 +591,12 @@ def _point_branch(
     except GithubOpsError as exc:
         if _is_ref_refusal(exc):
             # A 422 that is not "already exists" is the repository refusing
-            # the name itself — a ruleset or protection admitting only
-            # certain branch patterns (#621). No retry changes that; say
-            # which knob does.
+            # the ref: a ruleset admitting only certain branch patterns
+            # (#621), a base that wants signed commits, a locked repository
+            # (#677). No retry changes any of these; the advice comes from
+            # GitHub's own words, never a knob its message does not name.
             raise DeliveryError(
-                f"{repo} refused to create branch {branch!r}: {exc}. The repository's "
-                "rules do not admit that branch name — set `[github] branch_prefix` "
-                "(or the [[github.repos]] entry's) to a prefix its rulesets allow"
+                f"{repo} refused to create branch {branch!r}: {exc}. {_explain_ref_refusal(exc)}"
             ) from exc
         if not _is_ref_collision(exc):
             raise
@@ -483,14 +663,35 @@ def _plan_snapshot(source_dir: Path, exclude: Sequence[str]) -> DeliveryPlan:
     scan = scan_artifacts(source_dir, exclude)
     if not scan.files:
         raise DeliveryError(f"nothing to deliver: no files in {source_dir}")
-    rel = [f.relative_to(source_dir).as_posix() for f in scan.files]
+    changes = [
+        hostgit.WorkspaceChange(
+            path=f.relative_to(source_dir).as_posix(), status="added", mode=hostgit.tree_mode(f)
+        )
+        for f in scan.files
+    ]
+    entries: list[dict[str, Any]] = []
+    uploads: dict[str, bytes] = {}
+    for change in changes:
+        entry, content = _blob_upload(source_dir, change)
+        entries.append(entry)
+        uploads[change.path] = content
     return DeliveryPlan(
         mode="snapshot",
-        entries=[{"path": path, "mode": FILE_MODE, "type": "blob"} for path in rel],
-        uploads={path: file.read_bytes() for path, file in zip(rel, scan.files, strict=True)},
-        lines=[f"- `{path}`" for path in rel],
+        entries=entries,
+        uploads=uploads,
+        lines=[f"- `{change.path}`" for change in changes],
         excluded_note=scan.excluded_note,
     )
+
+
+def _blob_upload(source_dir: Path, change: hostgit.WorkspaceChange) -> tuple[dict[str, Any], bytes]:
+    """The tree entry and blob content for an added or modified path — the
+    one tree builder both plans share (#695), so a symlink uploads its
+    target string under ``120000`` and an executable keeps ``100755``
+    whether the plan came from ``git diff`` or a walk of the tree."""
+    full = source_dir / change.path
+    entry = {"path": change.path, "mode": change.mode, "type": "blob"}
+    return entry, hostgit.blob_content(full, change.mode)
 
 
 def _plan_git_diff(source_dir: Path, base_sha: str, exclude: Sequence[str]) -> DeliveryPlan | None:
@@ -506,40 +707,89 @@ def _plan_git_diff(source_dir: Path, base_sha: str, exclude: Sequence[str]) -> D
         return None
     excluded: dict[str, int] = {}
     kept: list[hostgit.WorkspaceChange] = []
-    for change in hostgit.changes_since(source_dir, diff_base):
+    skipped_notes: list[str] = []
+    for change in hostgit.changes_since(source_dir, diff_base, notes=skipped_notes):
         hit = exclusion_hit(change.path.split("/"), exclude)
         if hit is None:
             kept.append(change)
         else:
             excluded[hit] = excluded.get(hit, 0) + 1
+    for note in skipped_notes:
+        # Work inside a submodule, or a gitlink at a commit nobody else can
+        # fetch (#692): not the superproject's to deliver, said in the PR
+        # body and the log rather than dropped in silence.
+        log.warning("deliver.submodule_change_skipped", detail=note)
+    kept = _without_lfs_changes(source_dir, kept, skipped_notes)
     if not kept:
-        raise DeliveryError(
-            f"nothing to deliver: {source_dir} has no changes relative to {diff_base[:12]}"
-        )
+        why = f"{source_dir} has no changes relative to {diff_base[:12]}"
+        if skipped_notes:
+            why += " that can be delivered: " + "; ".join(skipped_notes)
+        raise DeliveryError(f"nothing to deliver: {why}")
     entries: list[dict[str, Any]] = []
     uploads: dict[str, bytes] = {}
+    lines: list[str] = []
     for change in kept:
+        if change.is_gitlink:
+            # A submodule pointer: the tree entry IS the commit sha, there is
+            # no blob to upload. A removed submodule drops its path the same
+            # way a removed file does.
+            sha = change.sha if change.status != "deleted" else None
+            entries.append({"path": change.path, "mode": change.mode, "type": "commit", "sha": sha})
+            lines.append(
+                f"- {STATUS_MARKER[change.status]} `{change.path}`"
+                + (f" (submodule → {change.sha[:12]})" if sha else " (submodule)")
+            )
+            continue
+        lines.append(f"- {STATUS_MARKER[change.status]} `{change.path}`")
         if change.status == "deleted":
             entries.append({"path": change.path, "mode": FILE_MODE, "type": "blob", "sha": None})
             continue
-        entries.append({"path": change.path, "mode": change.mode, "type": "blob"})
-        full = source_dir / change.path
-        uploads[change.path] = (
-            str(full.readlink()).encode() if change.mode == "120000" else full.read_bytes()
+        entry, content = _blob_upload(source_dir, change)
+        entries.append(entry)
+        uploads[change.path] = content
+    not_delivered: list[str] = []
+    if excluded:
+        not_delivered.append(
+            f"{sum(excluded.values())} file(s) excluded ({', '.join(sorted(excluded))})"
         )
-    excluded_note = (
-        f"{sum(excluded.values())} file(s) excluded ({', '.join(sorted(excluded))})"
-        if excluded
-        else None
-    )
+    not_delivered.extend(skipped_notes)
     return DeliveryPlan(
         mode="git-diff",
         entries=entries,
         uploads=uploads,
-        lines=[f"- {STATUS_MARKER[c.status]} `{c.path}`" for c in kept],
-        excluded_note=excluded_note,
+        lines=lines,
+        excluded_note="; ".join(not_delivered) or None,
         note=f"delivered as the workspace's git diff against `{diff_base[:12]}`",
     )
+
+
+def _without_lfs_changes(
+    source_dir: Path, changes: list[hostgit.WorkspaceChange], notes: list[str]
+) -> list[hostgit.WorkspaceChange]:
+    """Drop added/modified files that ``.gitattributes`` routes through
+    ``filter=lfs`` (#693). The delivery API writes blobs; a real-bytes
+    upload of an LFS-tracked path would commit the asset itself where the
+    repository expects a pointer, and this run pushes nothing to the LFS
+    store. Refused with a note rather than delivered wrong. Deletions still
+    deliver — dropping a pointer needs no object behind it."""
+    candidates = [c.path for c in changes if c.status != "deleted" and not c.is_gitlink]
+    if not candidates:
+        return changes
+    tracked = set(hostgit.lfs_tracked(source_dir, candidates))
+    if not tracked:
+        return changes
+    kept: list[hostgit.WorkspaceChange] = []
+    for change in changes:
+        if change.path not in tracked:
+            kept.append(change)
+            continue
+        note = (
+            f"LFS-tracked file `{change.path}` is not delivered: .gitattributes routes it "
+            "through filter=lfs, and this run does not push objects to the repository's LFS store"
+        )
+        notes.append(note)
+        log.warning("deliver.lfs_change_skipped", path=change.path, status=change.status)
+    return kept
 
 
 def _bootstrap_empty_repo(
@@ -665,7 +915,98 @@ def _retitle(
     log.info("deliver.title_changed", run=run_id, repo=repo, pr=number, old=current, new=wanted)
 
 
-def _body(run_id: str, outcome: str, plan: DeliveryPlan, *, closes: int | None = None) -> str:
+def pr_template(root: Path) -> tuple[str, str] | None:
+    """The repository's pull request template (#678): ``(path, text)`` for
+    the first of :data:`PR_TEMPLATE_PATHS` under ``root`` with any text in
+    it, else ``None``. Read as bytes and decoded leniently — a template is
+    prose, and one odd byte must not fail a delivery."""
+    for rel in PR_TEMPLATE_PATHS:
+        path = root / rel
+        try:
+            if not path.is_file():
+                continue
+            text = path.read_bytes()[:PR_TEMPLATE_CAP].decode("utf-8", "replace").strip()
+        except OSError:
+            continue
+        if text:
+            return rel, text
+    return None
+
+
+def conventional_titles(root: Path) -> str | None:
+    """What, if anything, says this repository lints pull-request titles as
+    conventional commits (#678): the path of the evidence, else ``None``.
+    A workflow counts only when it runs one of the known title actions;
+    reading it is bounded to the workflows directory, never the tree."""
+    for rel in _COMMITLINT_FILES:
+        if (root / rel).is_file():
+            return rel
+    package = root / "package.json"
+    if package.is_file():
+        try:
+            data = json.loads(package.read_bytes()[: PR_TEMPLATE_CAP * 4])
+        except (OSError, ValueError):
+            data = None
+        if isinstance(data, dict) and "commitlint" in data:
+            return "package.json (commitlint)"
+    workflows = root / ".github" / "workflows"
+    if workflows.is_dir():
+        for path in sorted(workflows.iterdir()):
+            if path.suffix not in (".yml", ".yaml") or not path.is_file():
+                continue
+            try:
+                text = path.read_bytes()[: PR_TEMPLATE_CAP * 4].decode("utf-8", "replace")
+            except OSError:
+                continue
+            for action in _TITLE_ACTIONS:
+                if action in text:
+                    return f".github/workflows/{path.name} ({action})"
+    return None
+
+
+def conventional_title(title: str) -> str:
+    """``title`` as a conventional-commit subject (#678): kept when it
+    already is one (the planner read the repository's history), else
+    ``chore:`` + the subject lowercased at its first letter — the guess
+    config-conventional's default rules accept (a sentence-case subject
+    is itself a violation), and a red title check is still a fix round
+    away via ``.sbxloop/pr-title``."""
+    title = " ".join(title.split())
+    if CONVENTIONAL_TITLE.match(title):
+        return title
+    return f"chore: {title[:1].lower()}{title[1:]}" if title else "chore: deliver artifacts"
+
+
+def pr_conventions(root: Path | None) -> str:
+    """The decompose prompt's paragraph on this repository's pull-request
+    conventions (#678): its title lint, its template — or nothing, when
+    the workspace declares neither, so the model is not taught a
+    convention the repository does not have."""
+    if root is None:
+        return ""
+    lines: list[str] = []
+    evidence = conventional_titles(root)
+    if evidence:
+        lines.append(
+            f"- This repository lints pull request titles as conventional commits "
+            f"(`{evidence}`): `pr_title` MUST read `type(scope): summary` — a lowercase "
+            f"type from feat, fix, docs, refactor, test, chore, build, ci, perf; the "
+            f"scope optional; the summary lowercase, imperative, without a trailing period."
+        )
+    template = pr_template(root)
+    if template:
+        lines.append(
+            f"- This repository has a pull request template (`{template[0]}`). The last "
+            f"task MUST write the template filled in for this change — each section "
+            f"answered, each checklist item ticked only when it is true — to "
+            f"`{PR_BODY_FILE}` under the workspace root, alone in that file; the loop "
+            f"uses it as the pull request's description. It is never delivered as a "
+            f"file, and a task must not commit it."
+        )
+    return "\n".join(lines)
+
+
+def _summary(run_id: str, outcome: str, plan: DeliveryPlan) -> str:
     listed = plan.lines[:BODY_FILE_LIST_CAP]
     if plan.count > BODY_FILE_LIST_CAP:
         listed.append(f"- … +{plan.count - BODY_FILE_LIST_CAP} more")
@@ -679,6 +1020,49 @@ def _body(run_id: str, outcome: str, plan: DeliveryPlan, *, closes: int | None =
         body += f"\n**Not delivered:** {plan.excluded_note}\n"
     if plan.note:
         body += f"\n_{plan.note}_\n"
-    if closes is not None:
-        body += f"\nCloses #{closes}\n"
     return body
+
+
+def _body(
+    run_id: str,
+    outcome: str,
+    plan: DeliveryPlan,
+    *,
+    closes: int | None = None,
+    template: str | None = None,
+    authored: str | None = None,
+    verification: str | None = None,
+) -> str:
+    """The pull request's description (#678). The agent's own
+    ``.sbxloop/pr-body`` wins outright — it filled the repository's
+    template in — with the run's provenance and ``Closes`` after a rule;
+    otherwise a repository template opens the body verbatim, so a check
+    that parses it (danger, a PR lint) sees the sections it expects, and
+    the loop's summary follows. A ``verification`` note (#682: what the
+    sandbox's checks did not decide) is its own section before the
+    footer, so a reviewer reads it whichever way the body was written.
+    ``Closes #N`` is always the last line: it is what settles the issue."""
+    footer = f"\nCloses #{closes}\n" if closes is not None else ""
+    if verification and verification.strip():
+        footer = f"\n**Verification:** {verification.strip()}\n" + footer
+    if authored and authored.strip():
+        return (
+            f"{authored.strip()}\n\n---\n\nArtifacts produced by sbxloop run `{run_id}`.\n" + footer
+        )
+    summary = _summary(run_id, outcome, plan)
+    if template:
+        return f"{template.strip()}\n\n---\n\n{summary}{footer}"
+    return summary + footer
+
+
+def _rebody(ops: GithubOps, repo: str, number: int, *, body: str, run_id: str) -> None:
+    """Replace the open PR's description when a fix round authored one
+    (#678) — a check that judges the body is otherwise incurable. Best
+    effort, like the retitle: a refused edit must not fail a delivery
+    that landed."""
+    try:
+        ops.raw("PATCH", f"/repos/{repo}/pulls/{number}", {"body": body})
+    except GithubOpsError:
+        log.warning("deliver.body_unchanged", run=run_id, repo=repo, pr=number, exc_info=True)
+        return
+    log.info("deliver.body_changed", run=run_id, repo=repo, pr=number, chars=len(body))

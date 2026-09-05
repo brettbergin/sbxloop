@@ -206,6 +206,31 @@ class TestMint:
 
         assert token.expires_at == datetime.fromisoformat("2026-08-30T22:14:10+00:00").timestamp()
 
+    def test_mint_keeps_the_installation_permissions(
+        self, rsa_key: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The mint response names what the installation may do (#696);
+        doctor compares it to what a run needs, so it rides on the token."""
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda request, timeout: _Resp(
+                {
+                    "token": "ghs_x",
+                    "expires_at": "2026-08-30T22:14:10Z",
+                    "permissions": {"contents": "write", "checks": "read", "odd": 3},
+                }
+            ),
+        )
+        token = mint_installation_token(self.creds(rsa_key), now=1000.0)
+        assert token.permissions == {"contents": "write", "checks": "read"}
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda request, timeout: _Resp(
+                {"token": "ghs_y", "expires_at": "2026-08-30T22:14:10Z"}
+            ),
+        )
+        assert mint_installation_token(self.creds(rsa_key), now=1000.0).permissions is None
+
     def test_unparseable_expiry_falls_back_early(
         self, rsa_key: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -259,6 +284,20 @@ class TestAppTokenSource:
         assert source.refresh_due()
         assert source.current() == "ghs_2"
         assert minted == [0.0, 3001.0]
+
+    def test_permissions_come_from_the_current_mint(self) -> None:
+        minted: list[int] = []
+
+        def mint(creds: AppCredentials) -> InstallationToken:
+            minted.append(len(minted))
+            return InstallationToken("ghs_1", 3600.0, {"contents": "write"})
+
+        creds = AppCredentials("1", "2", "-----BEGIN PRIVATE KEY-----")
+        source = AppTokenSource(creds, clock=lambda: 0.0, mint=mint)
+        assert source.permissions() == {"contents": "write"}  # mints on first ask
+        assert source.current() == "ghs_1"
+        assert source.permissions() == {"contents": "write"}
+        assert minted == [0], "one mint serves the token and its permissions"
 
 
 class TestApiUrl:

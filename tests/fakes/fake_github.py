@@ -57,6 +57,8 @@ from sbxloop.gh.ops import (
     MergeOutcome,
     PostedFinding,
     PrRef,
+    QueueEntry,
+    QueueState,
     ReviewComment,
     ReviewEvent,
     ReviewThread,
@@ -155,7 +157,15 @@ class FakeGithub(GithubOps):
         # 404, unprotected) and the rulesets list.
         self.protection: dict[str, Any] | None = None
         self.rules: list[dict[str, Any]] = []
+        # A token without admin: classic protection answers 403 (#674).
+        self.protection_forbidden = False
+        # What the PR's own rollup marks required (#674): the names GitHub
+        # would hold the merge for among the checks that have reported.
+        # None = the rollup cannot be read (GraphQL refused, say).
+        self.rollup_required: tuple[str, ...] | None = ()
+        self.rollup_calls = 0
         self.failed_logs: list[FailedCheck] = []
+        self.failed_logs_calls: list[str] = []
         self.reviews_payload: list[dict[str, Any]] = []
         self.comments_payload: list[dict[str, Any]] = []
         self.feedback = ""
@@ -165,6 +175,14 @@ class FakeGithub(GithubOps):
         # diff — every event, COMMENT included. True models that.
         self.refuse_inline_comments = False
         self.merge_outcomes: list[MergeOutcome] = []
+        # The base's merge queue (#676). ``queue_states`` is the script the
+        # queue reads consume (the last one sticks, like ``checks``); empty
+        # = "not queued, not merged". ``enqueue_ok`` False refuses the
+        # enqueue the way GitHub does (a GraphQL error).
+        self.queue_states: list[QueueState] = []
+        self.enqueue_ok = True
+        self.enqueued: list[tuple[str, str]] = []
+        self.queue_reads = 0
         # Anchors whose individual review comment GitHub refuses (422 "line
         # could not be resolved") in comment mode — per anchor, unlike
         # ``refuse_inline_comments`` which fails a whole review.
@@ -363,6 +381,11 @@ class FakeGithub(GithubOps):
         self._record_failed_job(op, method, path, exc)
         return exc
 
+    def token_scopes(self) -> tuple[str, ...] | None:
+        # Only `sbxloop doctor` asks (#696); the fake's credential is a
+        # fine-grained one with nothing to report.
+        return None
+
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         self.raw_calls.append((method, path, body))
         self._maybe_fail("raw")
@@ -421,6 +444,12 @@ class FakeGithub(GithubOps):
         if method == "GET" and path.endswith("/pulls") and "state=open&head=" in query:
             return [dict(self.pr)] if self.pr_created else []
         if method == "GET" and "/branches/" in path and path.endswith("/protection"):
+            if self.protection_forbidden:
+                raise GithubOpsError(
+                    "github op raw.api failed: GithubOpError: gh api GET "
+                    f"{path} failed (rc=1): Resource not accessible by integration (HTTP 403)",
+                    http_status=403,
+                )
             if self.protection is None:
                 raise GithubOpsError(
                     "github op raw.api failed: GithubOpError: gh api GET "
@@ -474,6 +503,14 @@ class FakeGithub(GithubOps):
             return {"name": body["name"]}
         if method == "GET" and path.endswith("/issues") and "labels=" in query:
             return list(self.existing_issues)
+        if method == "POST" and path.endswith("/requested_reviewers"):
+            # A review request (#675): recorded on the PR as GitHub does.
+            assert body is not None
+            requested = self.pr.setdefault("requested_reviewers", [])
+            requested.extend({"login": login} for login in body.get("reviewers", ()))
+            teams = self.pr.setdefault("requested_teams", [])
+            teams.extend({"slug": slug} for slug in body.get("team_reviewers", ()))
+            return dict(self.pr)
         if method == "POST" and path.endswith("/pulls/" + str(self.number) + "/comments"):
             # One review comment, standalone (#513): a thread of its own.
             assert body is not None
@@ -520,6 +557,12 @@ class FakeGithub(GithubOps):
         self._maybe_fail("pr_get")
         return {**self.pr, "head": dict(self.pr["head"])}
 
+    def pr_required_checks(self, repo: str, number: int) -> tuple[str, ...]:
+        self.rollup_calls += 1
+        if self.rollup_required is None:
+            raise GithubOpsError("statusCheckRollup failed: [{'type': 'FORBIDDEN'}]")
+        return tuple(self.rollup_required)
+
     def pr_checks(self, repo: str, sha: str) -> ChecksVerdict:
         self.checks_calls.append(sha)
         self._maybe_fail("pr_checks")
@@ -532,6 +575,7 @@ class FakeGithub(GithubOps):
     def checks_failed_logs(
         self, repo: str, sha: str, *, max_chars: int = 6000
     ) -> list[FailedCheck]:
+        self.failed_logs_calls.append(sha)
         return list(self.failed_logs)
 
     @property
@@ -653,6 +697,32 @@ class FakeGithub(GithubOps):
             self.pr["merged"] = True
             self.pr["merge_commit_sha"] = outcome.sha
         return outcome
+
+    def pr_enqueue(self, node_id: str, *, head: str = "") -> QueueEntry:
+        self.enqueued.append((node_id, head))
+        self._maybe_fail("pr_enqueue")
+        if not self.enqueue_ok:
+            raise GithubOpsError(
+                "enqueuePullRequest failed: [{'type': 'UNPROCESSABLE', 'message': "
+                "'Pull request is not mergeable'}]"
+            )
+        return QueueEntry(id="MQE_1", state="QUEUED", position=1, head="queue0")
+
+    def pr_queue_state(self, repo: str, number: int) -> QueueState:
+        self.queue_reads += 1
+        self._maybe_fail("pr_queue_state")
+        if not self.queue_states:
+            return QueueState(
+                merged=bool(self.pr.get("merged")),
+                closed=str(self.pr.get("state") or "") == "closed",
+                entry=None,
+                merge_sha=str(self.pr.get("merge_commit_sha") or ""),
+            )
+        state = self.queue_states.pop(0) if len(self.queue_states) > 1 else self.queue_states[0]
+        if state.merged:
+            self.pr["merged"] = True
+            self.pr["merge_commit_sha"] = state.merge_sha
+        return state
 
     def pr_update_branch(self, repo: str, number: int, *, expected_head_sha: str = "") -> bool:
         self.updates.append((number, expected_head_sha))

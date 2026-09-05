@@ -214,6 +214,17 @@ def render_event(event: Event) -> RenderableType | None:
             padding=(0, 1),
         )
 
+    if event.type == HostEventTypes.RUN_PUBLISHED and data.get("sink") == "chat":
+        # The chat sink's reply (#759) is the result itself: rendered like
+        # the agent's reply to a steer, not as a lifecycle line.
+        return Panel(
+            Markdown(str(data.get("message", "")).strip() or "*(no result reported)*"),
+            title=f"[bold cyan]result[/] [dim]{_stamp(event)}[/]",
+            title_align="left",
+            border_style="cyan",
+            padding=(0, 1),
+        )
+
     if event.type == HostEventTypes.CHAT_ACTION:
         return Text(
             f"{_stamp(event)}  ↪ {data.get('message', 'user steering applied')}",
@@ -226,7 +237,9 @@ def render_event(event: Event) -> RenderableType | None:
         style = "dim"
         if event.type == HostEventTypes.TASK_STATE:
             style = TASK_STATE_STYLES.get(str(data.get("state", "")), "dim")
-        elif event.type == HostEventTypes.PHASE_END and data.get("status") == "failed":
+        elif (
+            event.type == HostEventTypes.PHASE_END and data.get("status") == "failed"
+        ) or event.type == HostEventTypes.RUN_NEEDS_REFUSED:
             style = "red"
         elif (
             "fallback" in event.type

@@ -10,11 +10,13 @@ for the full suite and refreshes the version-keyed verdict cache.
 
 from __future__ import annotations
 
+import getpass
 import json
+import os
 import shutil
 import sqlite3
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -31,6 +33,13 @@ from sbxloop.engine.store import StateStore
 from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError
 from sbxloop.gh.labels import lifecycle_specs, missing_labels
 from sbxloop.gh.ops import GithubOps
+from sbxloop.gh.permissions import (
+    NEEDS,
+    Need,
+    missing_from_app,
+    missing_from_scopes,
+    split_required,
+)
 from sbxloop.gh.protection import read_base_requirements
 from sbxloop.sbx.bake import load_bake_record
 from sbxloop.sbx.cli import SbxCLI
@@ -81,22 +90,45 @@ class RepoProbeUnavailable(Exception):
     """
 
 
+@dataclass(frozen=True)
+class RepoCi:
+    """What the repository's own Actions look like (#696): how many
+    workflows are active, and the latest run on the delivery base."""
+
+    workflows: int
+    base: str = ""
+    latest: str | None = None
+
+
 @dataclass
 class RepoProbe:
     """What an out-of-process probe learned about one repository.
 
     ``reachable`` is the repository lookup (404/permission denied → False);
-    ``missing_permissions`` lists the scopes the token lacks; ``creatable``
-    is only meaningful for a repo configured with ``create_repo``.
+    ``missing_permissions`` names each permission the token lacks that a
+    run needs, with the feature that first needs it (#696) —
+    ``optional_permissions`` the ones a repository may never need;
+    ``creatable`` is only meaningful for a repo configured with
+    ``create_repo``.
     """
 
     reachable: bool
     detail: str = ""
     missing_permissions: tuple[str, ...] = ()
     creatable: bool | None = None
-    # Whether the delivery base requires approving reviews to merge — the
-    # repo config that 405s every loop merge. None = unverifiable.
-    review_protected: bool | None = None
+    optional_permissions: tuple[str, ...] = ()
+    # Where the permissions verdict came from: the classic PAT's scopes,
+    # the App installation's grant, or a fine-grained PAT asked endpoint by
+    # endpoint. Empty = not checked.
+    permissions_source: str = ""
+    # The repository's Actions, for the CI row. None = could not be listed.
+    ci: RepoCi | None = None
+    # The delivery base's rules the loop cannot satisfy (#673) — each one
+    # 405s every loop merge. Empty = none known; None = unverifiable.
+    base_blockers: tuple[str, ...] | None = None
+    # The sources of the base's rules this token could not read (#674):
+    # "protection" (classic, admin-only) and/or "rulesets".
+    base_unread: tuple[str, ...] = ()
     # The merge methods the repository allows, in the loop's order of
     # preference (#620). None = the payload did not say.
     merge_methods: tuple[MergeMethod, ...] | None = None
@@ -116,23 +148,36 @@ def _repo_token_status(entry: RepoConfig, env: dict[str, str]) -> tuple[bool, st
     return status.ok, status.detail
 
 
+def _login_name() -> str:
+    """Who runs the console by default; a uid where no login name resolves
+    (a container running as an arbitrary user), never an exception."""
+    try:
+        return getpass.getuser()
+    except (OSError, KeyError, ImportError):
+        return str(os.getuid()) if hasattr(os, "getuid") else "operator"
+
+
+def _daemon_state_path(config: Config, sources: dict[str, str], env: dict[str, str]) -> Path:
+    """Where `sbxloop daemon` keeps its state — the same rule the daemon
+    and `sbxloop tui` apply — falling back to the configured state dir."""
+    from sbxloop.daemon.paths import resolve_state_dir
+
+    try:
+        return resolve_state_dir(config, sources, cwd=Path.cwd(), env=env, home=Path.home()).path
+    except Exception:
+        return config.state_dir
+
+
 def daemon_repo_health(
     config: Config, sources: dict[str, str], env: dict[str, str]
 ) -> dict[str, dict[str, Any]]:
     """Per-repository polling health the running daemon persisted (#516),
     by repository, from the daemon's own state db — read only when that
     file exists, so doctor never creates one."""
-    from sbxloop.daemon.paths import resolve_state_dir
     from sbxloop.daemon.sources import REPO_HEALTH_KEY
     from sbxloop.daemon.store import DaemonStore
 
-    try:
-        state_dir = resolve_state_dir(
-            config, sources, cwd=Path.cwd(), env=env, home=Path.home()
-        ).path
-    except Exception:
-        return {}
-    db = state_dir / "state.db"
+    db = _daemon_state_path(config, sources, env) / "state.db"
     if not db.is_file():
         return {}
     out: dict[str, dict[str, Any]] = {}
@@ -230,7 +275,11 @@ def repo_checks(
             rows.append(Check(name, False, "; ".join(notes)))
             continue
         if result.missing_permissions:
-            notes.append(f"token missing {', '.join(result.missing_permissions)}")
+            notes.append(
+                "token missing "
+                + "; ".join(result.missing_permissions)
+                + f" — see docs/permissions.md{_source_note(result)}"
+            )
             rows.append(Check(name, False, "; ".join(notes)))
             continue
         notes.append(result.detail or "reachable, token has the required permissions")
@@ -239,6 +288,18 @@ def repo_checks(
         rows.append(Check(name, True, "; ".join(notes)))
         if merge_row is not None:
             rows.append(merge_row)
+        if result.optional_permissions:
+            rows.append(
+                Check(
+                    f"{name} workflows",
+                    False,
+                    "token lacks "
+                    + "; ".join(result.optional_permissions)
+                    + f" — a run whose changes stay out of .github/workflows is unaffected; "
+                    f"see docs/permissions.md{_source_note(result)}",
+                    hard=False,
+                )
+            )
         if result.issues_enabled is False:
             rows.append(
                 Check(
@@ -263,19 +324,63 @@ def repo_checks(
                     hard=False,
                 )
             )
-        if result.review_protected:
+        if result.base_blockers:
             rows.append(
                 Check(
                     f"{name} branch protection",
                     False,
-                    "the delivery base requires approving reviews — the loop cannot "
-                    "approve its own pull request, so every merge is refused "
-                    "(HTTP 405) and runs end blocked; drop the required-review rule "
-                    "(incompatible with human-out-of-the-loop operation)",
+                    "the delivery base has rules the loop cannot satisfy, so every merge "
+                    "is refused (HTTP 405) and runs end blocked:\n"
+                    + "\n".join(f"- {reason}" for reason in result.base_blockers),
                     hard=False,
                 )
             )
+        if result.base_unread:
+            rows.append(Check(f"{name} required checks", True, _unread_note(result.base_unread)))
+        if result.ci is not None:
+            rows.append(_ci_row(name, result.ci))
     return rows
+
+
+def _source_note(result: RepoProbe) -> str:
+    return f" (per {result.permissions_source})" if result.permissions_source else ""
+
+
+def _ci_row(name: str, ci: RepoCi) -> Check:
+    """The repository's CI as the loop will meet it (#696): the CI stage
+    waits for the check runs on the delivered head, so a repository with
+    no workflow of its own has nothing to wait for unless another app
+    reports checks."""
+    if ci.workflows == 0:
+        return Check(
+            f"{name} ci",
+            True,
+            "no active Actions workflows — the CI stage has nothing of the repository's "
+            "own to wait for and passes on the delivered head; check runs another app "
+            "reports (a status check installed on the repository) still count",
+            hard=False,
+        )
+    latest = (
+        f"; latest run on {ci.base}: {ci.latest}" if ci.latest else f"; no run yet on {ci.base}"
+    )
+    return Check(f"{name} ci", True, f"{ci.workflows} active Actions workflow(s){latest}")
+
+
+def _unread_note(unread: tuple[str, ...]) -> str:
+    """What the loop does about a base whose rules this token cannot read
+    (#674): the required checks come from each pull request's own rollup
+    — what GitHub itself holds the merge for — so a bot with write but not
+    admin still gates only on what the base requires."""
+    if "protection" in unread:
+        what = "classic branch protection is not readable with this token (GitHub needs admin)"
+        if "rulesets" in unread:
+            what += " and the rulesets could not be read either"
+    else:
+        what = "the base's rulesets could not be read"
+    return (
+        f"{what}; the required checks will be read from each pull request's own rollup, "
+        "and a rule other than a check the base enforces shows up only as a blocked run"
+    )
 
 
 def _merge_method_status(
@@ -357,17 +462,45 @@ def workspace_origin_checks(config: Config) -> list[Check]:
     ]
 
 
-REQUIRED_REPO_PERMISSIONS = ("issues", "contents", "pull_requests")
+def host_lfs_check(config: Config) -> Check:
+    """Whether the host can populate a Git LFS checkout (#693).
+
+    A repository whose ``.gitattributes`` routes files through
+    ``filter=lfs`` provisions from the host's git-lfs; without it the run
+    fails closed at clone time. Soft: repositories that never use LFS are
+    unaffected, and ``[sandbox] clone_lfs = false`` opts out explicitly.
+    """
+    from sbxloop import hostgit
+
+    version = hostgit.lfs_version()
+    if version is not None:
+        return Check("host git-lfs", True, f"found {version}", hard=False)
+    if not config.sandbox.clone_lfs:
+        return Check(
+            "host git-lfs",
+            True,
+            "not on PATH; [sandbox] clone_lfs = false, so LFS-tracked files stay pointer files",
+            hard=False,
+        )
+    return Check(
+        "host git-lfs",
+        False,
+        "not on PATH — a repository whose .gitattributes uses filter=lfs fails to provision "
+        "until git-lfs is installed (apt install git-lfs / brew install git-lfs); set "
+        "[sandbox] clone_lfs = false to run with pointer files instead",
+        hard=False,
+    )
 
 
-def _missing_permissions(data: dict[str, object]) -> tuple[str, ...]:
-    """Permissions the token lacks, from a ``GET /repos/{repo}`` payload.
+def _missing_from_push_bit(data: dict[str, object]) -> tuple[Need, ...]:
+    """The write needs a token lacks, from a ``GET /repos/{repo}`` payload.
 
     GitHub reports the *authenticated* token's effective access on the
     repository as ``permissions: {admin, maintain, push, triage, pull}``.
-    sbxloop needs to read the tree, open pull requests and drive issue
-    labels/comments — all of which are the ``push`` (write) level; anything
-    less can only read.
+    Every write a run does — delivering, the pull request, the labels — is
+    the ``push`` (write) level; anything less can only read. This is the
+    coarse answer for a credential that names its permissions no other way
+    (a fine-grained PAT).
     """
     perms = data.get("permissions")
     if not isinstance(perms, dict):
@@ -383,21 +516,124 @@ def _missing_permissions(data: dict[str, object]) -> tuple[str, ...]:
         # the installation, not the user-centric repo payload. Do not
         # invent a failure the first daemon write would disprove.
         return ()
-    return tuple(f"{kind}:write" for kind in REQUIRED_REPO_PERMISSIONS)
+    return tuple(n for n in NEEDS if n.level == "write" and n.required)
 
 
-def _requires_approving_reviews(ops: Any, repo: str, base: str) -> bool | None:
-    """Whether ``base`` requires approving reviews to merge.
+# The read a fine-grained PAT is asked to prove each permission with
+# (#696): GitHub answers 401/403 when the permission is not on the token,
+# and anything else — 200, an empty list, 404 on an empty repository, 422
+# — means the permission is there. ``{repo}`` and ``{base}`` are filled in;
+# a probe naming ``{base}`` is skipped when the repository has no base yet.
+_READ_PROBES: tuple[tuple[str, str], ...] = (
+    ("contents", "/repos/{repo}/commits?per_page=1&sha={base}"),
+    ("issues", "/repos/{repo}/issues?per_page=1"),
+    ("pull_requests", "/repos/{repo}/pulls?per_page=1"),
+    ("checks", "/repos/{repo}/commits/{base}/check-runs?per_page=1"),
+    ("actions", "/repos/{repo}/actions/runs?per_page=1"),
+)
 
-    That protection is the one repository setting incompatible with
-    human-out-of-the-loop operation: the loop cannot approve its own pull
-    request, so GitHub answers every merge with a 405 and the run ends
-    blocked. Read by :func:`sbxloop.gh.protection.read_base_requirements`
-    — the same reading the landing gate uses for required checks (#611) —
-    ``None`` when GitHub would not say (a token without admin on classic
-    protection, say): unverifiable is not a verdict.
+
+def _missing_from_probes(ops: GithubOps, repo: str, base: str) -> tuple[Need, ...]:
+    """The needs a fine-grained PAT fails a read for. A permission the
+    token lacks entirely fails its read; a read-only grant on a write need
+    is the push bit's business (:func:`_missing_from_push_bit`)."""
+    by_permission = {n.permission: n for n in NEEDS}
+    missing: list[Need] = []
+    for permission, template in _READ_PROBES:
+        if "{base}" in template and not base:
+            continue
+        try:
+            ops.raw("GET", template.format(repo=repo, base=base))
+        except GithubOpsError as exc:
+            if exc.http_status in (401, 403):
+                missing.append(by_permission[permission])
+    return tuple(missing)
+
+
+def _credential_needs(
+    ops: GithubOps,
+    app_permissions: Mapping[str, str] | None,
+    repo: str,
+    base: str,
+    data: dict[str, Any],
+) -> tuple[tuple[Need, ...], tuple[Need, ...], str]:
+    """``(required, optional, source)`` — what the credential lacks of
+    :data:`NEEDS`, judged from whichever source describes it (#696): the
+    App installation's grant, a classic PAT's scopes, or — a fine-grained
+    PAT, which reports neither — the push bit plus one read per permission.
     """
-    return read_base_requirements(ops, repo, base).requires_reviews
+    if app_permissions is not None:
+        # The installation's grant is the whole story: it is not a user.
+        missing = missing_from_app(app_permissions)
+        source = "the App installation's permissions"
+    else:
+        # A PAT is capped twice: by what the token was granted, and by what
+        # its user may do on this repository (the payload's push bit).
+        scopes = ops.token_scopes()
+        if scopes is not None:
+            found = (
+                *missing_from_scopes(scopes, private=bool(data.get("private"))),
+                *_missing_from_push_bit(data),
+            )
+            source = f"the classic PAT's scopes {', '.join(scopes) or '(none)'}"
+        else:
+            found = (*_missing_from_push_bit(data), *_missing_from_probes(ops, repo, base))
+            source = "a fine-grained PAT, asked endpoint by endpoint; workflows:write unverifiable"
+        lacking = {n.permission for n in found}
+        missing = tuple(n for n in NEEDS if n.permission in lacking)
+    required, optional = split_required(missing)
+    return required, optional, source
+
+
+def _ci_summary(ops: GithubOps, repo: str, base: str) -> RepoCi | None:
+    """The repository's active Actions workflows and its latest run on
+    ``base`` (#696); None when they could not be listed (actions:read
+    missing is reported as a permission, not here)."""
+    try:
+        listing = ops.raw("GET", f"/repos/{repo}/actions/workflows?per_page=100")
+    except GithubOpsError:
+        return None
+    workflows = listing.get("workflows") if isinstance(listing, dict) else None
+    if not isinstance(workflows, list):
+        return None
+    active = sum(1 for w in workflows if isinstance(w, dict) and w.get("state") == "active")
+    latest: str | None = None
+    if active and base:
+        try:
+            runs = ops.raw("GET", f"/repos/{repo}/actions/runs?branch={base}&per_page=1")
+        except GithubOpsError:
+            runs = None
+        listed = runs.get("workflow_runs") if isinstance(runs, dict) else None
+        if isinstance(listed, list) and listed and isinstance(listed[0], dict):
+            run = listed[0]
+            outcome = str(run.get("conclusion") or run.get("status") or "unknown")
+            latest = f"{run.get('name') or 'workflow'} {outcome}"
+    return RepoCi(workflows=active, base=base, latest=latest)
+
+
+def _base_blockers(
+    ops: GithubOps, repo: str, base: str, config: Config, *, can_sign: bool
+) -> tuple[tuple[str, ...] | None, tuple[str, ...]]:
+    """The rules of ``base`` the loop cannot satisfy (#673).
+
+    A required review is the classic one — the loop cannot approve its own
+    pull request — and a code-owner review, approval of the last push,
+    signed commits or a required deployment refuse a merge the same way
+    (HTTP 405, the run ends blocked); a merge queue is not one — the loop
+    enqueues (#676). Read by
+    :func:`sbxloop.gh.protection.read_base_requirements` — the same reading
+    the landing gate uses for required checks (#611) — and judged by the
+    same :func:`sbxloop.engine.landing.base_blockers` the run would report.
+    ``None`` when GitHub would not say (a token without admin on classic
+    protection, say): unverifiable is not a verdict. The second element
+    names the sources that could not be read (#674).
+    """
+    from sbxloop.engine.landing import base_blockers
+
+    requirements = read_base_requirements(ops, repo, base)
+    if requirements.source == "unknown" and not requirements.blockers():
+        return None, requirements.unread
+    return base_blockers(requirements, config.landing, can_sign=can_sign), requirements.unread
 
 
 def credential_key(entry: RepoConfig) -> str:
@@ -463,14 +699,36 @@ def sandbox_repo_probe(
             return RepoProbe(
                 reachable=False, detail="not found with this token", creatable=creatable
             )
-        missing = _missing_permissions(data)
         base = entry.deliver_base or str(data.get("default_branch") or "")
+        required, optional, source = _credential_needs(
+            ops, box.provisioner.gh_app_permissions(entry.repo), entry.repo, base, data
+        )
         has_issues = data.get("has_issues")
+        blockers, unread = (
+            _base_blockers(
+                ops,
+                entry.repo,
+                base,
+                config,
+                # A GitHub App's API commits arrive signed by GitHub.
+                can_sign=box.provisioner.gh_bot_login(entry.repo) is not None,
+            )
+            if base
+            else (None, ())
+        )
         return RepoProbe(
             reachable=True,
-            detail="reachable, token has the required permissions" if not missing else "reachable",
-            missing_permissions=missing,
-            review_protected=_requires_approving_reviews(ops, entry.repo, base) if base else None,
+            detail=(
+                f"reachable, token has the required permissions (per {source})"
+                if not required
+                else "reachable"
+            ),
+            missing_permissions=tuple(n.describe() for n in required),
+            optional_permissions=tuple(n.describe() for n in optional),
+            permissions_source=source,
+            ci=_ci_summary(ops, entry.repo, base),
+            base_blockers=blockers,
+            base_unread=unread,
             merge_methods=allowed_merge_methods(data),
             missing_labels=_missing_repo_labels(ops, config, entry),
             issues_enabled=has_issues if isinstance(has_issues, bool) else None,
@@ -490,6 +748,91 @@ def _missing_repo_labels(
         return tuple(missing_labels(ops, entry.repo, specs))
     except GithubOpsError:
         return None
+
+
+def registry_credential_checks(config: Config, env: dict[str, str]) -> list[Check]:
+    """One row when a `[[registries]]` entry (or a repository's override)
+    has an `auth_env` (#680): every name must be set in the daemon's
+    environment, or provisioning fails by name before a sandbox boots —
+    this row says so before the first run does. The names go to the
+    service sandbox, which fetches the dependencies; the agent's sandbox
+    never sees them (#766). Values are never shown."""
+    scopes: list[tuple[str, list[str]]] = [
+        # (no brackets: the detail is rich markup on the way to the table)
+        ("registries", [r.auth_env for r in config.registries if r.auth_env]),
+    ]
+    scopes.extend(
+        (f"{entry.repo} registries", [r.auth_env for r in entry.registries if r.auth_env])
+        for entry in config.github.repos
+        if entry.registries is not None
+    )
+    names = sorted({name for _scope, listed in scopes for name in listed})
+    if not names:
+        return []
+    unset = [name for name in names if not env.get(name)]
+    if not unset:
+        return [Check("registry credentials", True, f"set: {', '.join(names)} (service sandbox)")]
+    where = "; ".join(
+        f"{scope}: {', '.join(n for n in listed if n in unset)}"
+        for scope, listed in scopes
+        if any(n in unset for n in listed)
+    )
+    return [
+        Check(
+            "registry credentials",
+            False,
+            f"not set in the daemon's environment — {where}; export them where the "
+            "daemon reads its secrets, or drop the auth_env (runs that need them "
+            "fail at provisioning)",
+        )
+    ]
+
+
+def credentials_checks(config: Config, env: dict[str, str]) -> list[Check]:
+    """One row when `[[credentials]]` declares anything (#765): every
+    entry's `env` must be set in the daemon's environment, or a run
+    granted it fails at provisioning by name — this row says so before
+    the first run does. Values are never shown; the hosts are, since
+    they are what the service sandbox may reach."""
+    if not config.credentials:
+        return []
+    unset = [c for c in config.credentials if not env.get(c.env)]
+    listed = ", ".join(f"{c.name} → {c.host} ({c.env})" for c in config.credentials)
+    if not unset:
+        return [Check("service credentials", True, f"set: {listed}")]
+    missing = ", ".join(f"{c.name} ({c.env})" for c in unset)
+    return [
+        Check(
+            "service credentials",
+            False,
+            f"not set in the daemon's environment — {missing}; export them where the "
+            "daemon reads its secrets, or drop the entries (a run granted one fails "
+            "at provisioning)",
+        )
+    ]
+
+
+def workload_profile_checks(config: Config) -> list[Check]:
+    """One row when `[[workloads]]` declares anything (#758): the profiles
+    by name with what each bounds, and which one runs by default. The
+    config loader already refused a profile naming an unknown credential
+    or a default naming no profile; this row is the at-a-glance view."""
+    if not config.workloads:
+        return []
+    listed = "; ".join(
+        f"{p.name}"
+        + (" (default)" if p.name == config.workload.default else "")
+        + f": hosts {', '.join(p.egress) or '-'}, credentials "
+        + f"{', '.join(p.credentials) or '-'}, sinks {', '.join(p.sinks) or '-'}, "
+        + f"repo {'yes' if p.repo else 'no'}"
+        for p in config.workloads
+    )
+    if config.workload.default is None:
+        listed += (
+            " — no \\[workload] default: a run names one with --profile or runs "
+            "without a profile (every declared need refused)"
+        )
+    return [Check("workload profiles", True, listed)]
 
 
 def collect_checks(
@@ -707,6 +1050,9 @@ def collect_checks(
             "set" if agent.has_token(env) else agent.missing_token_detail,
         )
     )
+    checks.extend(registry_credential_checks(config, env))
+    checks.extend(credentials_checks(config, env))
+    checks.extend(workload_profile_checks(config))
     # A github credential matters only when the GitHub integration is
     # configured; an unconfigured integration is a valid (GitHub-less)
     # setup, not a failure. A PAT or GitHub App credentials both satisfy it;
@@ -721,8 +1067,8 @@ def collect_checks(
                 f"{cred.detail} (github integration: {configured})"
                 if cred.ok
                 else f"{cred.detail} — github repositories {configured} are "
-                "configured: create a fine-grained PAT (issues:write, "
-                "contents:read, ...) and export GH_TOKEN, or set GITHUB_APP_ID, "
+                "configured: create a fine-grained PAT with the permissions in "
+                "docs/permissions.md and export GH_TOKEN, or set GITHUB_APP_ID, "
                 "GITHUB_APP_INSTALLATION_ID and GITHUB_APP_PRIVATE_KEY[_PATH]",
             )
         )
@@ -836,30 +1182,44 @@ def collect_checks(
                 hard=False,
             )
         )
-        # ...and its concierge: an agent session on the daemon host's behalf,
-        # so the agent token must be here (the run pair needs it too, but a
-        # chat-only operator may not have noticed). *Which* token follows
-        # [agent] backend, exactly like the credential row above (#533): the
-        # concierge box authenticates with ANTHROPIC_API_KEY under the claude
-        # backend, so naming COPILOT_GITHUB_TOKEN here warned that "mentions
-        # will fail" on a host where nothing was wrong.
-        if config.concierge.enabled:
-            token_env = agent.token_env
-            has_token = agent.has_token(env)
-            checks.append(
-                Check(
-                    "chat concierge",
-                    has_token,
-                    f"model {config.concierge.model or config.model}, "
-                    f"{config.concierge.timeout_s:.0f}s per message: "
-                    + (
-                        f"{token_env} present"
-                        if has_token
-                        else f"{token_env} not set (mentions will fail)"
-                    ),
-                    hard=False,
-                )
+    # The operator console's local bridge is always on: its mailbox lives in
+    # the daemon's state.db and the console attaches as the login user.
+    tui_state = _daemon_state_path(config, sources, env)
+    operator = config.tui.operator_id or _login_name()
+    checks.append(
+        Check(
+            "operator console",
+            True,
+            f"`sbxloop tui` attaches to {tui_state}/state.db as {operator}; "
+            f"unit {config.tui.daemon_unit}",
+            hard=False,
+        )
+    )
+    # ...and the concierge: an agent session on the daemon host's behalf,
+    # so the agent token must be here (the run pair needs it too, but a
+    # chat-only operator may not have noticed). *Which* token follows
+    # [agent] backend, exactly like the credential row above (#533): the
+    # concierge box authenticates with ANTHROPIC_API_KEY under the claude
+    # backend, so naming COPILOT_GITHUB_TOKEN here warned that "mentions
+    # will fail" on a host where nothing was wrong. It answers the console
+    # too, so the row is not gated on a chat backend.
+    if config.concierge.enabled:
+        token_env = agent.token_env
+        has_token = agent.has_token(env)
+        checks.append(
+            Check(
+                "chat concierge",
+                has_token,
+                f"model {config.concierge.model or config.model}, "
+                f"{config.concierge.timeout_s:.0f}s per message: "
+                + (
+                    f"{token_env} present"
+                    if has_token
+                    else f"{token_env} not set (mentions will fail)"
+                ),
+                hard=False,
             )
+        )
 
     # worker wheel
     wheel = resolve_worker_wheel()
@@ -871,6 +1231,8 @@ def collect_checks(
             hard=False,
         )
     )
+
+    checks.append(host_lfs_check(config))
 
     # state dir writable
     try:
@@ -967,6 +1329,86 @@ def render_conformance(console: Console, report: ConformanceReport) -> None:
         console.print(f"[bold yellow]{report.deep_run_hint}[/]", highlight=False)
 
 
+@dataclass
+class DoctorReport:
+    """What one doctor pass found: the host checks and, when sbx was usable,
+    the conformance suite — the data behind ``sbxloop doctor``'s tables and
+    the console's Doctor screen."""
+
+    checks: list[Check]
+    conformance: ConformanceReport | None
+    #: Why there is no conformance report (sbx missing, the suite failed).
+    conformance_note: str | None
+    checked_at: float
+    deep: bool
+    probe: bool
+
+    @property
+    def ready(self) -> bool:
+        return all(check.ok or not check.hard for check in self.checks)
+
+    @property
+    def drifted(self) -> bool:
+        return self.conformance is not None and bool(self.conformance.unverified)
+
+
+def doctor_report(
+    env: dict[str, str] | None = None,
+    *,
+    deep: bool = False,
+    probe: bool = False,
+    progress: ProgressFn | None = None,
+    on_checks: Callable[[list[Check]], None] | None = None,
+) -> DoctorReport:
+    """Run the host checks and the conformance suite; the report, not the
+    rendering. ``probe`` asks GitHub itself about each configured repository
+    from a github-ops sandbox — one microVM per distinct credential (#515);
+    ``deep`` implies it, since that already boots a sandbox. ``on_checks``
+    hears the host checks as soon as they are in — before a deep run boots
+    its sandbox, so a failing check is never withheld for minutes."""
+    import os
+
+    env = dict(os.environ) if env is None else env
+    config = load_config(env=env)
+    cli = SbxCLI(app_name=config.app_name or None)
+    report = progress or (lambda _message: None)
+
+    # Reachability and token permissions are answered by GitHub, and the
+    # host has no token — so the probe runs in a github-ops sandbox, one per
+    # distinct credential. Only when asked (or under --deep): the default
+    # doctor provisions nothing. Torn down again before the table is printed.
+    boxes: dict[str, DaemonGithub] = {}
+    probe_repo = (
+        sandbox_repo_probe(config, cli, boxes=boxes)
+        if config.github.enabled and (probe or deep)
+        else None
+    )
+    try:
+        checks = collect_checks(env, cli=cli, progress=report, probe_repo=probe_repo)
+    finally:
+        for box in boxes.values():
+            box.close()
+    if on_checks is not None:
+        on_checks(checks)
+    conformance: ConformanceReport | None = None
+    note: str | None = None
+    sbx_present = any(check.name == "sbx binary" and check.ok for check in checks)
+    if not sbx_present:
+        note = "sbx conformance skipped: no usable sbx binary"
+    else:
+        try:
+            conformance = run_conformance(
+                cli,
+                config.state_dir,
+                deep=deep,
+                template=config.sandbox.template,
+                progress=report,
+            )
+        except SbxError as exc:
+            note = f"sbx conformance suite failed to run: {_clean(str(exc))}"
+    return DoctorReport(checks, conformance, note, time.time(), deep, probe)
+
+
 def run_doctor(
     console: Console,
     env: dict[str, str] | None = None,
@@ -990,66 +1432,45 @@ def run_doctor(
     work); CI lanes whose whole job is catching sbx drift ahead of a field
     failure pass the flag (#226).
     """
-    import os
-
-    env = dict(os.environ) if env is None else env
-    config = load_config(env=env)
-    cli = SbxCLI(app_name=config.app_name or None)
 
     def progress(message: str) -> None:
         console.print(f"[dim]\u2026 {message}[/dim]", highlight=False)
 
-    # Reachability and token permissions are answered by GitHub, and the
-    # host has no token — so the probe runs in a github-ops sandbox, one per
-    # distinct credential. Only when asked (or under --deep): the default
-    # doctor provisions nothing. Torn down again before the table is printed.
-    boxes: dict[str, DaemonGithub] = {}
-    probe_repo = (
-        sandbox_repo_probe(config, cli, boxes=boxes)
-        if config.github.enabled and (probe or deep)
-        else None
-    )
-    try:
-        checks = collect_checks(env, cli=cli, progress=progress, probe_repo=probe_repo)
-    finally:
-        for box in boxes.values():
-            box.close()
-    table = Table(title="sbxloop doctor")
-    table.add_column("check", no_wrap=True)
-    table.add_column("status", no_wrap=True)
-    table.add_column("detail", overflow="fold")
-    for check in checks:
-        status = (
-            "[green]ok[/]" if check.ok else ("[red]FAIL[/]" if check.hard else "[yellow]warn[/]")
-        )
-        table.add_row(check.name, status, _clean(check.detail))
-    console.print(table)
-    ready = all(check.ok or not check.hard for check in checks)
+    def show_checks(checks: list[Check]) -> None:
+        table = Table(title="sbxloop doctor")
+        table.add_column("check", no_wrap=True)
+        table.add_column("status", no_wrap=True)
+        table.add_column("detail", overflow="fold")
+        for check in checks:
+            status = (
+                "[green]ok[/]"
+                if check.ok
+                else ("[red]FAIL[/]" if check.hard else "[yellow]warn[/]")
+            )
+            table.add_row(check.name, status, _clean(check.detail))
+        console.print(table)
 
-    sbx_present = any(check.name == "sbx binary" and check.ok for check in checks)
-    if not sbx_present:
-        console.print("[dim]sbx conformance skipped: no usable sbx binary[/]", highlight=False)
+    report = doctor_report(env, deep=deep, probe=probe, progress=progress, on_checks=show_checks)
+    ready = report.ready
+
+    if report.conformance is None:
+        if report.conformance_note and report.conformance_note.startswith(
+            "sbx conformance skipped"
+        ):
+            console.print(f"[dim]{report.conformance_note}[/]", highlight=False)
+        elif report.conformance_note:
+            console.print(f"[yellow]{report.conformance_note}[/]", highlight=False)
         return ready and not fail_on_drift
-    try:
-        report = run_conformance(
-            cli,
-            config.state_dir,
-            deep=deep,
-            template=config.sandbox.template,
-            progress=progress,
-        )
-    except SbxError as exc:
-        console.print(f"[yellow]sbx conformance suite failed to run:[/] {_clean(str(exc))}")
-        return ready and not fail_on_drift
-    render_conformance(console, report)
+    render_conformance(console, report.conformance)
     # By default drift is a loud warning, not a failure: the dependent code
     # paths all probe-don't-assume at runtime, so runs may still work \u2014 but
     # the verdict snapshot above is exactly what a bug report should include.
-    if fail_on_drift and report.unverified:
+    if fail_on_drift and report.conformance.unverified:
+        unverified = len(report.conformance.unverified)
+        version = report.conformance.version or "(unknown)"
         console.print(
-            f"[bold red]sbx conformance gate failed:[/] {len(report.unverified)} probe(s) "
-            f"drifted, errored, or are unprobed under sbx {report.version or '(unknown)'} "
-            "(--fail-on-drift)",
+            f"[bold red]sbx conformance gate failed:[/] {unverified} probe(s) "
+            f"drifted, errored, or are unprobed under sbx {version} (--fail-on-drift)",
             highlight=False,
         )
         return False

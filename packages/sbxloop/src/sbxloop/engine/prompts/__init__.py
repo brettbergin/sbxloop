@@ -51,6 +51,25 @@ def render(name: str, **context: str) -> str:
     declares a domain that needs no declaration or omits one that does.
     """
     context.setdefault("retry_context", "")
+    # The repository's PR conventions (#678) are a paragraph only when the
+    # workspace declares some; most render calls have none to give.
+    context.setdefault("pr_conventions", "")
+    # The repository's own instruction files (#688): a heading and their
+    # text when the workspace has any, else nothing — a render call with
+    # no workspace (a unit test, the concierge) gives none.
+    context.setdefault("repo_conventions", "")
+    # Where the builder is and what it has (#689): the checkout path and
+    # the resolved toolchain set, rendered by the phase from the run.
+    context.setdefault("work_dir", "the current working directory")
+    context.setdefault("toolchains", "(none)")
+    # What the sandbox's verification did not decide (#682): advisory
+    # failures, or that nothing ran under `ci-only`. Empty under `full`.
+    context.setdefault("verification", "")
+    # The run's service credentials (#765): a section naming the
+    # `call_service` tool and the granted names when the run has any,
+    # rendered by the build phase; nothing — not even a blank line — for
+    # the runs that have none, which is every `code` run.
+    context.setdefault("service_tools", "")
     context.setdefault("baseline_registries", _domain_list(BASELINE_REGISTRY_DOMAINS))
     context.setdefault("declarable_registries", _domain_list(WELL_KNOWN_REGISTRY_DOMAINS))
     return _template(name).substitute(context)

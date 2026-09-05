@@ -8,19 +8,25 @@ from pydantic import ValidationError
 from sbxloop.engine.model import (
     DEFAULT_ARTIFACT_EXCLUDES,
     GITIGNORED,
+    MAX_SUMMARY_CHARS,
     PIPELINE_STAGES,
     RESUMABLE_RUN_STATES,
     TERMINAL_RUN_STATES,
     EgressSpec,
+    JudgeVerdict,
     RunRecord,
     RunResult,
     SteerVerdict,
     TaskGraph,
+    TaskNeeds,
+    TaskOutput,
     TaskRecord,
     TaskSpec,
+    WorkloadPlan,
     artifact_files,
     artifacts_dir,
     scan_artifacts,
+    workload_summary,
 )
 
 
@@ -214,6 +220,25 @@ class TestArtifactFiles:
         # Round-trips through validation unchanged.
         echoed = ArtifactsConfig(exclude=list(DEFAULT_ARTIFACT_EXCLUDES))
         assert tuple(echoed.exclude) == DEFAULT_ARTIFACT_EXCLUDES
+
+
+class TestSymlinksInScan:
+    """#695: a symlink is an artifact in its own right — git tracks the link,
+    so the scan keeps it as itself, target resolving or not — and nothing is
+    followed into a symlinked directory."""
+
+    def test_symlinks_are_kept_as_themselves(self, tmp_path: Path) -> None:
+        root = tmp_path / "ws"
+        (root / "shared").mkdir(parents=True)
+        (root / "shared" / "a.txt").write_text("a\n")
+        (root / "cfg.txt").write_text("c\n")
+        (root / "cfg.link").symlink_to("cfg.txt")
+        (root / "shared.link").symlink_to("shared")
+        (root / "dangling").symlink_to("nowhere")
+        rels = [p.relative_to(root).as_posix() for p in artifact_files(root)]
+        assert rels == ["cfg.link", "cfg.txt", "dangling", "shared/a.txt", "shared.link"]
+        # the directory symlink is listed once, not walked into
+        assert "shared.link/a.txt" not in rels
 
 
 class TestDefaultBuildOutputExcludes:
@@ -440,6 +465,68 @@ class TestSteerVerdict:
             SteerVerdict(reply="ok", action="abort_everything", guidance="g")
 
 
+class TestWorkloadPlan:
+    """#756: the operator's plan is a task graph with a run title and, per
+    task, the needs it declares by name."""
+
+    def test_needs_default_empty_and_persist_on_the_spec(self) -> None:
+        task = TaskSpec.model_validate(spec("t1"))
+        assert task.needs.empty
+        assert task.needs == TaskNeeds()
+        loaded = TaskSpec.model_validate_json(task.model_dump_json())
+        assert loaded.needs.empty
+
+    def test_needs_are_names_never_values(self) -> None:
+        needs = TaskNeeds.model_validate(
+            {
+                "hosts": [" API.Example.com ", "*.data.example.org"],
+                "credentials": ["example-api"],
+                "sink": "chat",
+                "repo": "owner/name",
+            }
+        )
+        assert needs.hosts == ["api.example.com", "*.data.example.org"]
+        assert needs.credentials == ["example-api"]
+        assert not needs.empty
+        with pytest.raises(ValidationError, match=r"needs\.hosts"):
+            TaskNeeds(hosts=["https://api.example.com/v1"])
+        with pytest.raises(ValidationError, match=r"needs\.hosts"):
+            TaskNeeds(hosts=["*"])
+        with pytest.raises(ValidationError):
+            TaskNeeds.model_validate({"credentials": ["x"], "token": "sk-live"})
+
+    def test_plan_title_folds_like_the_pr_title(self) -> None:
+        plan = WorkloadPlan.model_validate(
+            {"title": "  Count the  widgets ", "tasks": [spec("t1")]}
+        )
+        assert plan.title == "Count the widgets"
+        assert WorkloadPlan.model_validate({"title": "   ", "tasks": [spec("t1")]}).title is None
+        assert WorkloadPlan.model_validate({"tasks": [spec("t1")]}).title is None
+        assert plan.topo_order()[0].id == "t1"
+
+    def test_plan_validates_the_graph(self) -> None:
+        with pytest.raises(ValidationError):
+            WorkloadPlan.model_validate({"tasks": [spec("t1", ["t2"]), spec("t2", ["t1"])]})
+
+
+class TestJudgeVerdict:
+    def test_passed_needs_nothing_else(self) -> None:
+        verdict = JudgeVerdict(passed=True)
+        assert verdict.unmet == [] and verdict.notes == ""
+
+    def test_a_failing_verdict_names_a_criterion(self) -> None:
+        with pytest.raises(ValidationError, match="unmet"):
+            JudgeVerdict(passed=False)
+        with pytest.raises(ValidationError, match="unmet"):
+            JudgeVerdict(passed=False, unmet=["  ", ""])
+        verdict = JudgeVerdict(passed=False, unmet=["  the file\n exists ", ""], notes="n")
+        assert verdict.unmet == ["the file exists"]
+
+    def test_unknown_fields_are_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            JudgeVerdict.model_validate({"passed": True, "score": 10})
+
+
 class TestRunStates:
     """One run carries its work to a merged PR: the pipeline stages are
     run states, every one resumable, and the terminal set is what liveness
@@ -465,12 +552,15 @@ class TestRunStates:
             "blocked",
             "cancelled",
             "gated",
+            "awaiting_review",
         } == TERMINAL_RUN_STATES
         # A finished run is finished; a stopped one may be picked up again.
         # `gated` is finished too: the approve path lands the PR with gh ops
-        # alone, never by resuming an engine.
+        # alone, never by resuming an engine. `awaiting_review` is both: an
+        # approval lands it with gh ops, a changes-requested review resumes
+        # it for a fix round (#675).
         assert {"merged", "completed", "gated"}.isdisjoint(RESUMABLE_RUN_STATES)
-        assert {"failed", "blocked", "cancelled"} <= RESUMABLE_RUN_STATES
+        assert {"failed", "blocked", "cancelled", "awaiting_review"} <= RESUMABLE_RUN_STATES
         assert {"created", "provisioning", "decomposing", "building"} <= RESUMABLE_RUN_STATES
 
     def test_legacy_state_names_are_gone(self) -> None:
@@ -517,3 +607,90 @@ class TestRunResult:
         assert result.pr_number == 9
         assert result.reason == "its draft status could not be cleared"
         assert [t.state for t in result.tasks] == ["done"]
+
+
+class TestTaskOutput:
+    def test_cuts_the_result_section_and_leads_with_its_first_line(self) -> None:
+        report = (
+            "I'll count the lines.\n\n"
+            "## Approach\n\nread every file.\n\n"
+            "## Result\n\n"
+            "wrote `summary.csv` with 3 rows\n\n- one\n- two\n"
+        )
+        out = TaskOutput.from_report(report, files=["summary.csv"])
+        assert out.summary == "wrote `summary.csv` with 3 rows"
+        assert out.text == "wrote `summary.csv` with 3 rows\n\n- one\n- two"
+        assert out.files == ["summary.csv"]
+        assert out.file_count == 1
+
+    def test_the_last_results_heading_wins_at_any_level(self) -> None:
+        report = "### Results\nfirst\n\ntext\n\n# RESULT: final\nsecond line\n"
+        assert TaskOutput.from_report(report).summary == "second line"
+
+    def test_a_report_without_a_result_heading_is_taken_whole(self) -> None:
+        out = TaskOutput.from_report("\n\n  nothing to report  \nmore\n")
+        assert out.text == "nothing to report  \nmore"
+        assert out.summary == "nothing to report"
+
+    def test_an_empty_report_has_an_empty_summary(self) -> None:
+        out = TaskOutput.from_report("   \n\n")
+        assert out.summary == "" and out.text == "" and out.files == []
+
+    def test_the_summary_is_one_clipped_line(self) -> None:
+        long = "word " * 100
+        out = TaskOutput.from_report("## Result\n" + long + "\nsecond")
+        assert len(out.summary) == MAX_SUMMARY_CHARS
+        assert out.summary.endswith("…")
+        assert "\n" not in out.summary
+        assert "  " not in TaskOutput.from_report("## Result\na   b\tc").summary
+
+    def test_more_files_counts_toward_the_file_count(self) -> None:
+        out = TaskOutput.from_report("x", files=["a", "b"], more_files=5)
+        assert out.file_count == 7
+
+    def test_round_trips_through_json(self) -> None:
+        out = TaskOutput.from_report("## Result\nok", files=["a"], more_files=1)
+        assert TaskOutput.model_validate_json(out.model_dump_json()) == out
+
+
+class TestWorkloadSummary:
+    @staticmethod
+    def _task(id: str, state: str, summary: str | None, files: int = 0) -> TaskRecord:
+        record = TaskRecord(spec=TaskSpec(id=id, title=id.upper()), state=state)  # type: ignore[arg-type]
+        if summary is not None:
+            record.output = TaskOutput(summary=summary, files=[f"f{i}" for i in range(files)])
+        return record
+
+    def test_counts_the_passed_tasks_and_lists_each_result(self) -> None:
+        tasks = [
+            self._task("t1", "done", "wrote the csv", files=2),
+            self._task("t2", "failed", "could not reach the host"),
+            self._task("t3", "skipped", None),
+        ]
+        # a task that never reported (skipped) has no line; an empty summary does
+        tasks[1].output = TaskOutput(summary="", files=["log"])
+        assert workload_summary(tasks) == (
+            "1/3 task(s) passed the judge\n"
+            "t1: wrote the csv (2 files)\n"
+            "t2: (no result reported) (1 file)"
+        )
+
+    def test_the_title_leads_when_the_plan_named_the_work(self) -> None:
+        tasks = [self._task("t1", "done", "ok")]
+        text = workload_summary(tasks, "Count the lines")
+        assert text.startswith("Count the lines — 1/1 task(s) passed the judge")
+
+    def test_no_tasks(self) -> None:
+        assert workload_summary([]) == "no tasks ran"
+        assert workload_summary([], "Title") == "Title — no tasks ran"
+
+
+class TestRunResultOutputs:
+    def test_outputs_pairs_each_task_with_its_output(self) -> None:
+        out = TaskOutput(summary="done")
+        t1 = TaskRecord(spec=TaskSpec(id="t1", title="A"), state="done", output=out)
+        t2 = TaskRecord(spec=TaskSpec(id="t2", title="B"), state="skipped")
+        result = RunResult(run_id="r1", state="completed", tasks=[t1, t2], summary="s")
+        assert result.outputs == [("t1", out)]
+        assert result.summary == "s"
+        assert RunResult(run_id="r1", state="merged").summary is None

@@ -1,6 +1,12 @@
-name: Deploy to db
+name: Deploy the daemon
 
-# Deploys the release that Release just published to the daemon host (db), a
+# sbxloop's OWN deploy — the instance of the drain / hold / upgrade /
+# health-check / roll-back pattern that keeps the dogfood daemon current.
+# The reusable pattern, with nothing of this host in it, is
+# contrib/workflows/deploy-daemon.yml.example (docs/deploy.md); what is
+# specific to this host is docs/self-deploy.md.
+#
+# Deploys the release that Release just published to the daemon host, a
 # self-hosted runner. Merge to main -> Release tags + publishes to PyPI (~4 min)
 # -> this takes a named pause hold on the daemon, waits — without a cap — for
 # the run in flight to finish, upgrades to that exact version, restarts the
@@ -14,13 +20,19 @@ name: Deploy to db
 # doing. The only bound on the wait is this job's timeout-minutes; on timeout
 # nothing has been installed or restarted and the hold is released.
 #
+# THE HOST IS ONE VARIABLE (#640): the runner label — also the name the
+# notices call the host — is the repository variable SBXLOOP_DEPLOY_HOST
+# (default `db`). Every path is derived from the runner user's $HOME in the
+# first step. Nothing else here names a machine or a user.
+#
 # SECURITY INVARIANT — DO NOT BREAK:
 #   No job carrying the `self-hosted` label may be reachable from a
 #   fork-triggerable event (pull_request, pull_request_target, issue_comment).
-#   This repo is PUBLIC and the runner's user has passwordless root on db, so a
-#   fork-triggered job on this runner would be a full host compromise. The two
-#   triggers below are safe: `workflow_run` fires only from Release (push to
-#   main only, base-repo context), and `workflow_dispatch` needs write access.
+#   This repo is PUBLIC and the runner's user has passwordless root on the
+#   host, so a fork-triggered job on this runner would be a full host
+#   compromise. The two triggers below are safe: `workflow_run` fires only
+#   from Release (push to main only, base-repo context), and
+#   `workflow_dispatch` needs write access.
 
 on:
   workflow_run:
@@ -38,7 +50,7 @@ on:
 # keeps at most one *pending* job per group: a third release cancels the
 # second's pending deploy and deploys itself, which is the right version.)
 concurrency:
-  group: deploy-db
+  group: deploy-daemon
   cancel-in-progress: false
 
 permissions:
@@ -48,7 +60,7 @@ jobs:
   deploy:
     # A failed/cancelled Release has nothing to deploy.
     if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
-    runs-on: [self-hosted, db]
+    runs-on: [self-hosted, "${{ vars.SBXLOOP_DEPLOY_HOST || 'db' }}"]
     # Bounds the idle wait. 1.0 runs take 14–180 min (#512 ran 182); the
     # engine's own wall clock ([budgets] max_wall_clock_s, 2 h by default)
     # does not cover CI and landing waits. A timeout here installs nothing:
@@ -57,34 +69,54 @@ jobs:
 
     defaults:
       run:
-        # Explicit: the runner user's login shell is zsh, where `status` is a
-        # read-only special variable. Actions defaults to bash on Linux anyway.
+        # Explicit: the runner user's login shell may be zsh, where `status`
+        # is a read-only special variable. Actions defaults to bash on Linux
+        # anyway.
         shell: bash
 
-    # No actions/checkout: the deploy installs from PyPI and needs nothing from
-    # the tree. Skipping it keeps the runner's _work empty and removes the
-    # largest supply-chain surface on a root-equivalent host.
+    # No actions/checkout: the deploy installs from the release and needs
+    # nothing from the tree. Skipping it keeps the runner's _work empty and
+    # removes the largest supply-chain surface on a root-equivalent host.
 
     env:
-      # Every host path the deploy touches, in one place.
-      VENV_PIP: /home/bergs/.sbxloop-venv/bin/pip
-      VENV_SBXLOOP: /home/bergs/.sbxloop-venv/bin/sbxloop
-      # The wrapper: sources ~/.config/sbxloop/env.sh for PATH (/usr/sbin for
-      # mkfs.ext4), dbus and secrets. `doctor` and `ctl` need it; pip does not.
-      SBXLOOP: /home/bergs/.local/bin/sbxloop
-      WORKDIR: /home/bergs/sbxloop-work
+      # The host, as the notices name it (and the runner label above).
+      HOST: ${{ vars.SBXLOOP_DEPLOY_HOST || 'db' }}
       UNIT: sbxloop-daemon
-      SECRETS_ENV: /home/bergs/.config/sbxloop/secrets.env
       # This deploy's pause hold (#534). The operator's own `pause` is a
       # separate hold: it survives the deploy, and we release only ours.
       HOLD: deploy-${{ github.run_id }}
+      # How `ctl status --json` reads: the run in flight, else the claim in
+      # progress (a restart there orphans the issue, #530), else idle.
+      CURRENT_JQ: >-
+        if .current != null then "\(.current.run_id) — \(.current.title)"
+        elif (.claiming // null) != null then "claiming \(.claiming)"
+        else "idle" end
 
     steps:
+      - name: Resolve host paths
+        # Every path the deploy touches, derived from the runner user's home
+        # (the layout contrib/systemd/README.md sets up). Written to
+        # GITHUB_ENV because a job-level `env:` value is a literal — the
+        # shell would not expand a ${HOME} inside it.
+        run: |
+          set -euo pipefail
+          {
+            echo "VENV_PIP=${HOME}/.sbxloop-venv/bin/pip"
+            echo "VENV_SBXLOOP=${HOME}/.sbxloop-venv/bin/sbxloop"
+            # The wrapper: sources ~/.config/sbxloop/env.sh for PATH
+            # (/usr/sbin for mkfs.ext4), dbus and the chat/GitHub tokens.
+            # `doctor`, `ctl` and `notify` need it; pip does not.
+            echo "SBXLOOP=${HOME}/.local/bin/sbxloop"
+            # `ctl` and `notify` resolve config and state_dir from the cwd.
+            echo "WORKDIR=${HOME}/sbxloop-work"
+          } >> "$GITHUB_ENV"
+
       - name: Resolve the target version
         id: target
         env:
-          # The host's secrets.env also exports GH_TOKEN (a PAT). Set it
-          # explicitly so gh talks to the API as this workflow, not as the host.
+          # The host's environment may export its own GH_TOKEN (a PAT). Set
+          # it explicitly so gh talks to the API as this workflow, not as
+          # the host.
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           INPUT_VERSION: ${{ inputs.version }}
@@ -124,7 +156,7 @@ jobs:
           echo "current=${current}" >> "$GITHUB_OUTPUT"
           if [ "${current}" = "${{ steps.target.outputs.version }}" ]; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::db is already at ${current} — nothing to deploy."
+            echo "::notice::${HOST} is already at ${current} — nothing to deploy."
           else
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "::notice::deploying ${current} -> ${{ steps.target.outputs.version }}"
@@ -141,12 +173,12 @@ jobs:
           # notices a daemon that never answers, and the health check is
           # the thing that fails if it never comes up.
           "${SBXLOOP}" daemon ctl pause --hold "${HOLD}" --timeout 30 || true
-          ctl_out="$("${SBXLOOP}" daemon ctl status --timeout 30 || true)"
-          echo "${ctl_out}"
-          current="$(grep -i '^current:' <<<"${ctl_out}" | sed 's/^current: *//' || true)"
+          status="$("${SBXLOOP}" daemon ctl status --json --timeout 30 || true)"
+          echo "${status}"
+          current="$(jq -r "${CURRENT_JQ}" <<<"${status}" 2>/dev/null || true)"
           echo "current=${current:-unknown}" >> "$GITHUB_OUTPUT"
 
-      - name: Announce in Discord
+      - name: Announce
         if: steps.installed.outputs.changed == 'true'
         env:
           VERSION: ${{ steps.target.outputs.version }}
@@ -157,27 +189,13 @@ jobs:
         run: |
           set -euo pipefail
           if [ "${CURRENT}" = "idle" ] || [ "${CURRENT}" = "unknown" ]; then
-            MSG="🚀 deploying sbxloop \`${FROM}\` → \`${VERSION}\` on \`db\` — [run](<${RUN_URL}>)"
+            MSG="🚀 deploying sbxloop \`${FROM}\` → \`${VERSION}\` on \`${HOST}\` — [run](${RUN_URL})"
           else
-            MSG="🚀 sbxloop \`${FROM}\` → \`${VERSION}\` staged on \`db\` — restart deferred until the daemon is idle (now: ${CURRENT}); hold \`${HOLD}\` — [run](<${RUN_URL}>)"
+            MSG="🚀 sbxloop \`${FROM}\` → \`${VERSION}\` staged on \`${HOST}\` — restart deferred until the daemon is idle (now: ${CURRENT}); hold \`${HOLD}\` — [run](${RUN_URL})"
           fi
-          # Inlined rather than a script: this job has no checkout, so nothing
-          # from the repo tree exists on the runner. Reuses the bot already in
-          # the channel — no new webhook or repo secret to manage.
-          # Sourced in a subshell so shell quoting is handled natively and no
-          # other secret leaks into this step's environment.
-          tok="$(set -a; . "${SECRETS_ENV}"; printf '%s' "${DISCORD_BOT_TOKEN:-}")"
-          ch="$(sed -n 's/^[[:space:]]*channel_id[[:space:]]*=[[:space:]]*//p' "${WORKDIR}/sbxloop.toml" | head -n1 | tr -dc '0-9')"
-          if [ -z "${tok}" ] || [ -z "${ch}" ]; then
-            echo "no discord bot token or channel_id — skipping notification"
-            exit 0
-          fi
-          echo "::add-mask::${tok}"
-          curl -sS -X POST \
-            -H "Authorization: Bot ${tok}" \
-            -H 'Content-Type: application/json' \
-            -d "$(jq -nc --arg c "${MSG}" '{content:$c}')" \
-            "https://discord.com/api/v10/channels/${ch}/messages" >/dev/null
+          # Through the configured [chat] backend, with the bot already in
+          # the channel: this job reads no secrets file and no config (#639).
+          cd "${WORKDIR}" && "${SBXLOOP}" daemon notify "${MSG}"
 
       - name: Fetch the release wheels
         id: wheels
@@ -217,25 +235,35 @@ jobs:
           cd "${WORKDIR}"
           # No cap (#534): a restart under a live run kills its in-flight task
           # and spends a resume-budget slot the item did nothing to deserve.
-          # With the hold taken, nothing new is claimed, so once `current:`
-          # reads idle it stays idle. `claiming <item>` counts as busy: a
+          # With the hold taken, nothing new is claimed, so once the status
+          # reads idle it stays idle. A claim in progress counts as busy: a
           # restart in the claim window orphans the issue (#530).
           # Poll no faster than 15s: issue #309, status() mutates the circuit
           # breaker (it half-opens and decrements consecutive_failures).
           # A daemon that answers nothing for 5 minutes straight has nothing
           # to drain — the restart (and health check) is what fixes it.
+          # Exit 1 is neither: the daemon answered, but not with JSON (it
+          # predates `ctl status --json`) or not in time. Fail here, before
+          # anything is installed, rather than guess at its state.
           waited=0
           misses=0
           while :; do
-            if ctl_out="$("${SBXLOOP}" daemon ctl status --timeout 30)"; then
+            set +e
+            status="$("${SBXLOOP}" daemon ctl status --json --timeout 30)"
+            rc=$?
+            set -e
+            if [ "${rc}" -eq 0 ]; then
               misses=0
-              current="$(grep -i '^current:' <<<"${ctl_out}" | sed 's/^current: *//' || true)"
+              current="$(jq -r "${CURRENT_JQ}" <<<"${status}")"
               if [ "${current}" = "idle" ]; then
                 echo "daemon is idle after ${waited}s — safe to restart"
                 echo "waited_s=${waited}" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
-              echo "not idle (${current:-unknown}) — waiting (${waited}s so far)"
+              echo "not idle (${current}) — waiting (${waited}s so far)"
+            elif [ "${rc}" -eq 1 ]; then
+              echo "::error::the daemon answered ctl status but gave no structured status — upgrade it by hand once (contrib/systemd/README.md), then redeploy"
+              exit 1
             else
               misses=$((misses + 1))
               echo "no answer from the daemon (${misses}/20)"
@@ -278,17 +306,11 @@ jobs:
           # them. Read them *now*, not at the start of the job: an operator
           # who paused during the wait must still be paused afterwards.
           # Ours is dropped from the list — the restart releases it.
-          ctl_out="$(cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --timeout 30 || true)"
-          echo "${ctl_out}"
-          holds="$(grep -i '^holds:' <<<"${ctl_out}" | sed 's/^holds: *//' | tr ',' ' ' || true)"
-          if [ -z "${holds}" ] && grep -qi '^paused: true' <<<"${ctl_out}"; then
-            # A daemon from before named holds: its one boolean is the
-            # operator's hold. (Only the first deploy after the cutover.)
-            holds="operator"
-          fi
+          status="$(cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --json --timeout 30 || true)"
+          echo "${status}"
+          holds="$(jq -r '.holds // [] | .[]' <<<"${status}" 2>/dev/null | tr '\n' ' ' || true)"
           keep=""
           for h in ${holds}; do
-            [ "${h}" = "none" ] && continue
             [ "${h}" = "${HOLD}" ] && continue
             keep="${keep} ${h}"
           done
@@ -325,7 +347,7 @@ jobs:
 
           # Never --deep here: that boots a microVM. Plain doctor covers exactly
           # what a restart can break — sbx login, tokens, template, worker
-          # wheel, state dir, discord bridge.
+          # wheel, state dir, chat bridge.
           (cd "${WORKDIR}" && "${SBXLOOP}" doctor) || fail "sbxloop doctor is unhappy"
 
           # ctl exit 2 = nothing claimed the request, i.e. the daemon never came up.
@@ -335,8 +357,8 @@ jobs:
           # a concierge sandbox to re-provision) against a 60s budget. The
           # client resends across that window rather than reporting the
           # refusal, so the only thing left to get wrong is being too stingy
-          # here — 300s is well inside the job's 60 min.
-          (cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --timeout 300) || fail "daemon did not answer ctl status"
+          # here — 300s is well inside the job's timeout.
+          (cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --json --timeout 300 >/dev/null) || fail "daemon did not answer ctl status"
 
           # Let it settle, then prove it is not crash-looping.
           before="$(systemctl --user show "${UNIT}" -p NRestarts --value)"
@@ -345,7 +367,7 @@ jobs:
           after="$(systemctl --user show "${UNIT}" -p NRestarts --value)"
           [ "${before}" = "${after}" ] || fail "unit restarted ${before} -> ${after} within 45s (crash loop)"
 
-          echo "::notice::db is healthy on ${VERSION}"
+          echo "::notice::${HOST} is healthy on ${VERSION}"
 
       - name: Roll back
         # Only once the upgrade ran: a failure before it (wheels, the wait)
@@ -359,13 +381,15 @@ jobs:
           echo "::error::deploy failed — rolling back to ${PREV}"
           # PyPI is safe here: PREV has been published for a while, so its index
           # page is long since warm. No just-published version to race.
-          "${VENV_PIP}" install --upgrade "sbxloop[discord]==${PREV}" "sbxloop-worker==${PREV}"
+          # The same extras as the upgrade (#619): a rollback that drops one
+          # rolls a host on that backend back to a build that cannot start.
+          "${VENV_PIP}" install --upgrade "sbxloop[discord,slack]==${PREV}" "sbxloop-worker==${PREV}"
           systemctl --user reset-failed "${UNIT}" || true
           timeout 300 systemctl --user restart "${UNIT}"
           sleep 15
           systemctl --user is-active --quiet "${UNIT}" \
             && echo "rolled back to $("${VENV_SBXLOOP}" --version | awk '{print $2}')" \
-            || echo "::error::ROLLBACK ALSO FAILED — db needs a human"
+            || echo "::error::ROLLBACK ALSO FAILED — ${HOST} needs a human"
 
       - name: Restore the other holds
         # Runs after a rollback too: whatever version is live, the operator's
@@ -400,7 +424,7 @@ jobs:
         if: always() && steps.wheels.outputs.dist != ''
         run: rm -rf -- "${{ steps.wheels.outputs.dist }}"
 
-      - name: Report to Discord
+      - name: Report
         if: always() && steps.installed.outputs.changed == 'true'
         env:
           VERSION: ${{ steps.target.outputs.version }}
@@ -417,26 +441,12 @@ jobs:
             waited=" after waiting $((WAITED_S / 60)) min for the daemon to go idle"
           fi
           if [ "${RESULT}" = "success" ]; then
-            MSG="✅ \`db\` restarted on sbxloop \`${VERSION}\`${waited} — [run](<${RUN_URL}>)"
+            MSG="✅ \`${HOST}\` restarted on sbxloop \`${VERSION}\`${waited} — [run](${RUN_URL})"
           elif [ "${UPGRADED}" = "skipped" ]; then
-            MSG="❌ deploy of sbxloop \`${VERSION}\` to \`db\` **${RESULT}** before anything was installed — still on \`${FROM}\`, daemon untouched. [run](<${RUN_URL}>)"
+            MSG="❌ deploy of sbxloop \`${VERSION}\` to \`${HOST}\` **${RESULT}** before anything was installed — still on \`${FROM}\`, daemon untouched. [run](${RUN_URL})"
           else
-            MSG="❌ deploy of sbxloop \`${VERSION}\` to \`db\` **${RESULT}** — rolled back to \`${FROM}\`. [run](<${RUN_URL}>)"
+            MSG="❌ deploy of sbxloop \`${VERSION}\` to \`${HOST}\` **${RESULT}** — rolled back to \`${FROM}\`. [run](${RUN_URL})"
           fi
-          # Inlined rather than a script: this job has no checkout, so nothing
-          # from the repo tree exists on the runner. Reuses the bot already in
-          # the channel — no new webhook or repo secret to manage.
-          # Sourced in a subshell so shell quoting is handled natively and no
-          # other secret leaks into this step's environment.
-          tok="$(set -a; . "${SECRETS_ENV}"; printf '%s' "${DISCORD_BOT_TOKEN:-}")"
-          ch="$(sed -n 's/^[[:space:]]*channel_id[[:space:]]*=[[:space:]]*//p' "${WORKDIR}/sbxloop.toml" | head -n1 | tr -dc '0-9')"
-          if [ -z "${tok}" ] || [ -z "${ch}" ]; then
-            echo "no discord bot token or channel_id — skipping notification"
-            exit 0
-          fi
-          echo "::add-mask::${tok}"
-          curl -sS -X POST \
-            -H "Authorization: Bot ${tok}" \
-            -H 'Content-Type: application/json' \
-            -d "$(jq -nc --arg c "${MSG}" '{content:$c}')" \
-            "https://discord.com/api/v10/channels/${ch}/messages" >/dev/null
+          # Through the configured [chat] backend (#639); the wrapper carries
+          # the bot token, this job reads no secrets file and no config.
+          cd "${WORKDIR}" && "${SBXLOOP}" daemon notify "${MSG}"

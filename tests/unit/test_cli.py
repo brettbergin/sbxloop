@@ -16,10 +16,11 @@ from typer.testing import CliRunner
 import sbxloop
 from sbxloop.cli.app import app
 from sbxloop.cli.doctor import Check
+from sbxloop.config import Config, GithubConfig, RepoConfig, SandboxConfig
 from sbxloop.daemon.model import WorkItem
 from sbxloop.deliver import RepositoryProbe
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import GithubOpsError
+from sbxloop.errors import GithubOpsError, SbxloopError
 from sbxloop.events import Event
 from sbxloop_worker.protocol import Event as ProtocolEvent
 from tests.conftest import FakeSbx
@@ -315,6 +316,20 @@ class TestArtifactsCommand:
         assert ".gitignore" in result.output
         assert "1 file(s) excluded (.git)" in result.output
 
+    def test_symlinks_list_as_themselves(self, workdir: Path) -> None:
+        """#695: a symlink — even one that does not resolve — is an
+        artifact, listed in both shapes rather than crashing the listing."""
+        workspace = self.seed_with_workspace(workdir, mounted=True)
+        (workspace / "cfg.yml").write_text("a: 1\n")
+        (workspace / "cfg.link").symlink_to("cfg.yml")
+        (workspace / "dangling").symlink_to("nowhere")
+        for flag in ([], ["--tree"]):
+            result = runner.invoke(app, ["artifacts", "rseeded11", *flag])
+            assert result.exit_code == 0, result.output
+            assert "3 file(s)" in result.output
+            assert "cfg.link" in result.output
+            assert "dangling" in result.output
+
     def test_missing_directory_errors(self, workdir: Path) -> None:
         workspace = self.seed_with_workspace(workdir, mounted=True)
         workspace.rmdir()
@@ -332,6 +347,55 @@ class TestConfigAndInit:
         assert "gpt-5" in result.output
         assert "sbxloop.toml" in result.output
         assert "env" in result.output
+
+    def test_config_show_lists_credentials_and_profiles_without_values(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`[[credentials]]` and `[[workloads]]` (#758) get their own tables:
+        a credential shows set/unset and its host, never the value; a
+        profile shows what it bounds and which one is the default."""
+        monkeypatch.setenv("WEATHER_API_KEY", "value_never_shown")
+        monkeypatch.delenv("MAIL_TOKEN", raising=False)
+        (workdir / "sbxloop.toml").write_text(
+            "[[credentials]]\n"
+            'name = "weather"\n'
+            'env = "WEATHER_API_KEY"\n'
+            'host = "api.weather.example.com"\n'
+            'description = "forecasts"\n'
+            "\n"
+            "[[credentials]]\n"
+            'name = "mail"\n'
+            'env = "MAIL_TOKEN"\n'
+            'host = "mail.example.com"\n'
+            "\n"
+            "[[workloads]]\n"
+            'name = "research"\n'
+            'egress = ["*.example.com"]\n'
+            'credentials = ["weather"]\n'
+            'sinks = ["chat", "artifact"]\n'
+            "budgets = { max_tasks = 4 }\n"
+            "\n"
+            "[[workloads]]\n"
+            'name = "bare"\n'
+            "\n"
+            "[workload]\n"
+            'default = "research"\n'
+        )
+        result = runner.invoke(app, ["config", "show"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0, result.output
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "credentials (values never shown)" in plain
+        assert "value_never_shown" not in plain
+        rows = [line for line in plain.splitlines() if "weather" in line or "mail" in line]
+        assert any("WEATHER_API_KEY" in r and "set" in r and "forecasts" in r for r in rows)
+        assert any("MAIL_TOKEN" in r and "unset" in r for r in rows)
+        assert "workload profiles" in plain
+        (research,) = [line for line in plain.splitlines() if "research (default)" in line]
+        assert "*.example.com" in research and "chat, artifact" in research
+        assert "max_tasks=4" in research and "weather" in research
+        assert any(line.strip("│ ").startswith("bare") for line in plain.splitlines())
+        # the flattened dump does not repeat the tables' rows
+        assert "workloads" not in [line.split()[0] for line in plain.splitlines() if line.strip()]
 
     def test_config_policy_defaults(self, workdir: Path) -> None:
         result = runner.invoke(app, ["config", "policy"])
@@ -434,7 +498,7 @@ class TestShellCommand:
     def test_invalid_role_errors(self, workdir: Path) -> None:
         result = runner.invoke(app, ["shell", "rseeded11", "--role", "bogus"])
         assert result.exit_code == 2
-        assert "agent or github" in result.output
+        assert "agent, github or service" in result.output
 
     def test_missing_sandbox_errors_with_keep_hint(self, workdir: Path, fake_sbx: FakeSbx) -> None:
         seed_store(workdir)
@@ -528,6 +592,54 @@ class TestDaemonCommand:
         assert "tick:" in result.output and "no_work" in result.output
         assert "daemon.tick" in result.output  # and the structured record
 
+    def test_once_runs_the_local_bridge_and_names_it_in_the_summary(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A headless daemon still has the operator console's bridge: the
+        startup summary says so, the store gains the mailbox, and the
+        liveness stamp lands before the tick."""
+        from sbxloop.daemon.store import LOCAL_STARTED_KEY, DaemonStore
+
+        self.offline(monkeypatch)
+        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
+        assert result.exit_code == 0, result.output
+        assert "tui=on" in result.output
+        assert "chat=off" in result.output
+        # The daemon's anchored XDG state dir (#255), as the item controls use.
+        state = workdir / "xdg-state" / "sbxloop" / workdir.name
+        dstore = DaemonStore(state / "state.db")
+        try:
+            assert dstore.get_value(LOCAL_STARTED_KEY) is not None
+        finally:
+            dstore.close()
+
+    def test_the_concierge_is_wanted_headless(self) -> None:
+        """The change that un-gated the concierge from a chat backend: a
+        headless long-lived daemon builds it; `--once` never does."""
+        from sbxloop.cli.app import concierge_wanted
+
+        headless = Config.model_validate({})
+        assert concierge_wanted(headless, once=False)
+        assert not concierge_wanted(headless, once=True)
+        off = Config.model_validate({"concierge": {"enabled": False}})
+        assert not concierge_wanted(off, once=False)
+
+    def test_tui_help_and_a_missing_store_are_actionable(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`sbxloop tui` explains itself, and with no daemon state on the
+        host it says what to do rather than open an empty console."""
+        result = runner.invoke(app, ["tui", "--help"])
+        assert result.exit_code == 0, result.output
+        plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
+        assert "--run" in plain and "--read-only" in plain and "--state-dir" in plain
+        assert "--unit" in plain
+        result = runner.invoke(
+            app, ["tui", "--state-dir", str(workdir / "nowhere")], env={"COLUMNS": "300"}
+        )
+        assert result.exit_code == 2
+        assert "does not exist" in result.output and "sbxloop daemon" in result.output
+
     def test_once_never_starts_the_version_check(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -543,6 +655,34 @@ class TestDaemonCommand:
         result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
         assert result.exit_code == 0, result.output
         assert started == []
+
+    def test_version_check_off_reaches_the_probe(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#641: `[daemon] version_check = false` is wired into the probe the
+        concierge's `version_status` uses too, so the whole daemon makes zero
+        release lookups — not just the startup drift check; #638: the
+        operator's `upgrade_command` rides along for the advice text."""
+        from sbxloop.cli import app as app_mod
+        from sbxloop.daemon.versions import VersionProbe
+
+        built: list[VersionProbe] = []
+
+        def capture(*args: object, **kwargs: object) -> VersionProbe:
+            probe = VersionProbe(*args, **kwargs)  # type: ignore[arg-type]
+            built.append(probe)
+            return probe
+
+        monkeypatch.setattr(app_mod, "VersionProbe", capture)
+        (workdir / "sbxloop.toml").write_text(
+            '[daemon]\nversion_check = false\nupgrade_command = "pipx upgrade sbxloop"\n'
+        )
+        self.offline(monkeypatch)
+        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
+        assert result.exit_code == 0, result.output
+        (probe,) = built
+        assert probe.check_pypi is False
+        assert probe.upgrade_command == "pipx upgrade sbxloop"
 
     def test_state_dir_defaults_outside_cwd_and_is_announced(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
@@ -852,6 +992,37 @@ class TestDoctor:
         )
         assert not [c for c in collect_checks(env) if c.name == "chat concierge"]
 
+    def test_doctor_reports_the_console_and_the_concierge_headless(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """No chat backend at all: the operator console's row is there, and
+        the concierge row is too — it answers the console."""
+        from sbxloop.cli.doctor import collect_checks
+
+        env = {"GH_TOKEN": "tok", "COPILOT_GITHUB_TOKEN": "tok"}
+        checks = collect_checks(env)
+        (console,) = [c for c in checks if c.name == "operator console"]
+        assert console.ok and not console.hard
+        assert "sbxloop tui" in console.detail and "sbxloop-daemon" in console.detail
+        (row,) = [c for c in checks if c.name == "chat concierge"]
+        assert row.ok
+        assert not [c for c in checks if c.name.startswith("chat bridge")]
+
+    def test_doctor_survives_a_host_without_a_login_name(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import getpass
+
+        from sbxloop.cli.doctor import collect_checks
+
+        def no_user() -> str:
+            raise OSError("No username set in the environment")
+
+        monkeypatch.setattr(getpass, "getuser", no_user)
+        env = {"GH_TOKEN": "tok", "COPILOT_GITHUB_TOKEN": "tok"}
+        (console,) = [c for c in collect_checks(env) if c.name == "operator console"]
+        assert console.ok
+
     def test_concierge_row_names_the_configured_backends_credential(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -941,6 +1112,99 @@ class TestDoctor:
         result = runner.invoke(app, ["doctor"])
         assert result.exit_code == 1
         assert "FAIL" in result.output
+
+    def test_doctor_refuses_secret_env_with_the_way_forward(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`[sandbox] secret_env` is gone (#766): doctor, like every command,
+        fails the config by name and says where the secret now belongs."""
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        (workdir / "sbxloop.toml").write_text('[sandbox]\nsecret_env = ["NPM_TOKEN"]\n')
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code != 0
+        output = result.output + str(result.exception or "")
+        assert "[sandbox] secret_env is no longer supported" in output
+        assert "auth_env" in output and "[[credentials]]" in output
+
+    def test_doctor_names_an_unset_registry_credential(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `[[registries]]` auth_env is a secret the daemon must hold
+        (#680) for the service sandbox (#766); the row says so and never
+        shows a value."""
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        monkeypatch.delenv("ARTIFACTORY_TOKEN", raising=False)
+        (workdir / "sbxloop.toml").write_text(
+            "[[registries]]\n"
+            'kind = "npm"\n'
+            'host = "artifactory.example.com"\n'
+            'url = "https://artifactory.example.com/api/npm/npm-virtual/"\n'
+            'auth_env = "ARTIFACTORY_TOKEN"\n'
+        )
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 1
+        assert "registry credentials" in result.output
+        assert "ARTIFACTORY_TOKEN" in result.output
+        monkeypatch.setenv("ARTIFACTORY_TOKEN", "value_never_shown")
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert "set: ARTIFACTORY_TOKEN" in result.output
+        assert "value_never_shown" not in result.output
+
+    def test_doctor_names_an_unset_service_credential(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A `[[credentials]]` env (#765) is a secret only the service
+        sandbox ever holds; its own row names the unset ones, and the hosts
+        those credentials may reach, never a value."""
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        monkeypatch.delenv("WEATHER_API_KEY", raising=False)
+        (workdir / "sbxloop.toml").write_text(
+            "[[credentials]]\n"
+            'name = "weather"\n'
+            'env = "WEATHER_API_KEY"\n'
+            'host = "api.weather.example.com"\n'
+        )
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 1
+        assert "service credentials" in result.output
+        assert "weather (WEATHER_API_KEY)" in result.output
+        monkeypatch.setenv("WEATHER_API_KEY", "value_never_shown")
+        result = runner.invoke(app, ["doctor"])
+        assert result.exit_code == 0, result.output
+        assert "set: weather" in result.output and "api.weather.example.com" in result.output
+        assert "value_never_shown" not in result.output
+
+    def test_doctor_lists_workload_profiles(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`[[workloads]]` (#758) gets an informational row: each profile
+        and what it bounds, the default marked, and a note when no default
+        is set."""
+        monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
+        monkeypatch.setenv("GH_TOKEN", "tok")
+        (workdir / "sbxloop.toml").write_text(
+            '[[workloads]]\nname = "research"\negress = ["*.example.com"]\nsinks = ["chat"]\n'
+        )
+        result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0, result.output
+        assert "workload profiles" in result.output
+        assert "research: hosts *.example.com, credentials -, sinks chat, repo no" in result.output
+        assert "no [workload] default" in result.output
+        (workdir / "sbxloop.toml").write_text(
+            '[[workloads]]\nname = "research"\n\n[workload]\ndefault = "research"\n'
+        )
+        result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
+        assert result.exit_code == 0, result.output
+        assert "research (default): hosts -" in result.output
+        assert "no [workload] default" not in result.output
+        # nothing declared, no row
+        (workdir / "sbxloop.toml").write_text("")
+        result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
+        assert "workload profiles" not in result.output
 
     def _bake_record(
         self,
@@ -1152,6 +1416,50 @@ class TestDoctor:
         assert "novel-kind" in check.detail
         assert "read" in check.detail
 
+    def _lfs_check(self, fake_sbx: FakeSbx) -> Check:
+        from sbxloop.cli.doctor import collect_checks
+        from sbxloop.sbx.cli import SbxCLI
+
+        checks = collect_checks(
+            {"COPILOT_GITHUB_TOKEN": "tok"}, cli=SbxCLI(binary=str(fake_sbx.binary))
+        )
+        return {c.name: c for c in checks}["host git-lfs"]
+
+    def test_doctor_host_git_lfs_found(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop import hostgit
+
+        monkeypatch.setattr(hostgit, "lfs_version", lambda: "git-lfs/3.8.0 (GitHub; linux amd64)")
+        check = self._lfs_check(fake_sbx)
+        assert check.ok and not check.hard
+        assert "git-lfs/3.8.0" in check.detail
+
+    def test_doctor_host_git_lfs_missing_is_soft_warn_naming_the_package(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #693: a repository on LFS fails to provision without it — said
+        # here, before a run finds out; soft because most repositories
+        # never use LFS.
+        from sbxloop import hostgit
+
+        monkeypatch.setattr(hostgit, "lfs_version", lambda: None)
+        check = self._lfs_check(fake_sbx)
+        assert not check.ok and not check.hard
+        assert "apt install git-lfs" in check.detail
+        assert "clone_lfs = false" in check.detail
+
+    def test_doctor_host_git_lfs_missing_is_fine_when_opted_out(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop import hostgit
+
+        monkeypatch.setattr(hostgit, "lfs_version", lambda: None)
+        (workdir / "sbxloop.toml").write_text("[sandbox]\nclone_lfs = false\n")
+        check = self._lfs_check(fake_sbx)
+        assert check.ok and not check.hard
+        assert "pointer files" in check.detail
+
     def test_doctor_without_sbx(self, workdir: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("PATH", str(workdir))  # nothing on PATH
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
@@ -1299,6 +1607,77 @@ class TestBakeCommand:
         assert "bake failed" in result.output
 
 
+class TestResolveRunWorkspace:
+    """`_resolve_run_workspace`: the flag, then the config, then the checkout
+    around the current directory; nothing anywhere is harvest mode."""
+
+    def test_flag_pins_the_directory_on_the_config(self, tmp_path: Path) -> None:
+        from sbxloop.cli.app import _resolve_run_workspace
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        config = Config(github=GithubConfig(repo="octo/app"))
+        pinned, chosen, source = _resolve_run_workspace(config, ws, cwd=tmp_path)
+        assert (chosen, source) == (ws.resolve(), "--workspace")
+        assert pinned.sandbox.workspace == ws.resolve()
+        assert pinned.workspace_for_repo("octo/app") == ws.resolve()
+        assert pinned.github.repos[0].workspace == ws.resolve()
+
+    def test_flag_must_exist(self, tmp_path: Path) -> None:
+        from sbxloop.cli.app import _resolve_run_workspace
+
+        with pytest.raises(SbxloopError, match="is not a directory"):
+            _resolve_run_workspace(Config(), tmp_path / "nope", cwd=tmp_path)
+
+    def test_configured_workspace_wins_over_the_cwd(self, tmp_path: Path) -> None:
+        from sbxloop.cli.app import _resolve_run_workspace
+        from tests.unit.test_hostgit import make_repo
+
+        ws = tmp_path / "ws"
+        ws.mkdir()
+        root = make_repo(tmp_path)
+        config = Config(sandbox=SandboxConfig(workspace=ws))
+        same, chosen, source = _resolve_run_workspace(config, None, cwd=root)
+        assert (chosen, source) == (ws, "configured")
+        assert same is config
+
+    def test_checkout_configured_for_another_repository_means_a_clone(self, tmp_path: Path) -> None:
+        from sbxloop.cli.app import _resolve_run_workspace
+        from tests.unit.test_hostgit import make_repo
+
+        other = tmp_path / "other"
+        other.mkdir()
+        root = make_repo(tmp_path)
+        config = Config(
+            github=GithubConfig(
+                repo="octo/app",
+                repos=[
+                    RepoConfig(repo="octo/app"),
+                    RepoConfig(repo="octo/other", workspace=other),
+                ],
+            )
+        )
+        same, chosen, source = _resolve_run_workspace(config, None, cwd=root)
+        assert (chosen, source) == (None, "remote")
+        assert same is config
+
+    def test_enclosing_checkout_is_used(self, tmp_path: Path) -> None:
+        from sbxloop.cli.app import _resolve_run_workspace
+        from tests.unit.test_hostgit import make_repo
+
+        root = make_repo(tmp_path)
+        sub = root / "a" / "b"
+        sub.mkdir(parents=True)
+        pinned, chosen, source = _resolve_run_workspace(Config(), None, cwd=sub)
+        assert (chosen, source) == (root.resolve(), "cwd-checkout")
+        assert pinned.sandbox.workspace == root.resolve()
+
+    def test_nothing_anywhere_is_harvest_mode(self, tmp_path: Path) -> None:
+        from sbxloop.cli.app import _resolve_run_workspace
+
+        assert _resolve_run_workspace(Config(), None, cwd=tmp_path)[1:] == (None, "none")
+
+
 class TestRunCommand:
     def make_run_env(
         self, workdir: Path, monkeypatch: pytest.MonkeyPatch, responses: list[dict[str, Any]]
@@ -1338,9 +1717,233 @@ class TestRunCommand:
         )
         result = runner.invoke(app, ["run", "make it so", "--no-tui"])
         assert result.exit_code == 0, result.output
+        # Nothing configured and tmp_path is not a checkout: the run says so
+        # up front instead of quietly working on an empty directory (#670).
+        assert "workspace: none" in result.output
+        assert "harvested as artifacts" in result.output
         assert "finished" in result.output
         assert "completed" in result.output
         assert "t1: done" in result.output
+
+    def _run_start(self, workdir: Path) -> dict[str, Any]:
+        store = StateStore(workdir / ".sbxloop" / "state.db")
+        (run,) = store.list_runs()
+        (start,) = [event for _, event in store.events(run.run_id) if event.type == "run.start"]
+        return dict(start.data)
+
+    def test_run_workspace_flag_names_the_checkout(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        ws = workdir / "ws"
+        ws.mkdir()
+        result = runner.invoke(app, ["run", "make it so", "--no-tui", "--workspace", "ws"])
+        assert result.exit_code == 0, result.output
+        # Long tmp paths soft-wrap at the console width.
+        assert f"workspace: {ws.resolve()} (from --workspace)" in result.output.replace("\n", "")
+        store = StateStore(workdir / ".sbxloop" / "state.db")
+        (run,) = store.list_runs()
+        assert run.workspace == ws.resolve()
+        assert run.mounted
+        start = self._run_start(workdir)
+        assert start["workspace"] == str(ws.resolve())
+        assert start["workspace_source"] == "--workspace"
+
+    def test_run_kind_workload_is_one_box_in_a_data_dir(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--kind workload` (#755): the agent box alone, its own data
+        directory, the operator's stages, and the run says what it is."""
+        # A workload's task is executed, then judged (#756); the executor's
+        # report and what it left in the data directory are its output (#757).
+        execute = {
+            "text": "on it\n\n## Result\n\nwrote `hello.txt` with one line",
+            "files": {"hello.txt": "hi\n"},
+        }
+        verdict = {"json": {"passed": True, "unmet": [], "notes": ""}}
+        self.make_run_env(workdir, monkeypatch, [self.HAPPY_RUN[0], execute, verdict])
+        result = runner.invoke(app, ["run", "count the things", "--kind", "workload", "--no-tui"])
+        assert result.exit_code == 0, result.output
+        plain = result.output.replace("\n", "")
+        assert "workspace: a per-run data directory" in plain
+        assert "kind: workload" in plain
+        assert "completed" in result.output and "t1: done" in result.output
+        assert "run.state judging" in plain and "run.state publishing" in plain
+        created = [" ".join(map(str, c)) for c in fake_sbx.invocations("create")]
+        assert len(created) == 1 and "-agent" in created[0], created
+        store = StateStore(workdir / ".sbxloop" / "state.db")
+        (run,) = store.list_runs()
+        assert run.kind == "workload" and run.state == "completed"
+        assert run.workspace == (workdir / ".sbxloop" / "runs" / run.run_id / "workspace").resolve()
+        start = self._run_start(workdir)
+        assert start["kind"] == "workload" and start["workspace_source"] == "data-dir"
+        # The run's closing summary and each task's output line, at the end
+        # of the run and again under `status` (#757).
+        assert "1/1 task(s) passed the judge" in plain
+        assert "wrote `hello.txt` with one line" in plain and "(1 file)" in plain
+        # The result went to chat — the terminal, here (#759): the reply
+        # itself in the event stream, and the record of it at the end.
+        assert re.search(r"╭─ result \S+ ─", plain) and "Files: hello.txt" in plain
+        assert "published: result posted to chat" in plain
+        assert run.published[0].sink == "chat" and run.published[0].tasks == ["t1"]
+        detail = runner.invoke(app, ["status", run.run_id])
+        assert detail.exit_code == 0, detail.output
+        detail_plain = re.sub(r"\x1b\[[0-9;]*m", "", detail.output)
+        assert "kind: workload" in detail_plain
+        assert "output" in detail_plain and "wrote `hello.txt`" in detail_plain
+        assert "published: result posted to chat" in detail_plain
+        as_json = runner.invoke(app, ["status", run.run_id, "--json"])
+        assert as_json.exit_code == 0, as_json.output
+        doc = json.loads(as_json.output)
+        assert doc["run"]["run_id"] == run.run_id and doc["run"]["kind"] == "workload"
+        assert doc["run"]["published"] == [
+            {"sink": "chat", "location": "chat", "tasks": ["t1"], "files": 1}
+        ]
+        assert doc["summary"] == (
+            "1/1 task(s) passed the judge\nt1: wrote `hello.txt` with one line (1 file)"
+        )
+        (task,) = doc["tasks"]
+        assert task["state"] == "done"
+        assert task["output"]["summary"] == "wrote `hello.txt` with one line"
+        assert task["output"]["files"] == ["hello.txt"]
+        listed = runner.invoke(app, ["status"])
+        assert listed.exit_code == 0, listed.output
+        assert "kind" in listed.output and "workload" in listed.output
+        no_id = runner.invoke(app, ["status", "--json"])
+        assert no_id.exit_code == 2 and "needs a run id" in no_id.output
+
+    def test_run_kind_workload_refuses_repository_flags(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        for flags in (["--repo", "o/r"], ["--workspace", "."], ["--create-repo"]):
+            result = runner.invoke(app, ["run", "x", "--kind", "workload", "--no-tui", *flags])
+            assert result.exit_code == 2, result.output
+            assert "cannot be combined with --kind workload" in result.output.replace("\n", "")
+            assert flags[0] in result.output
+        assert fake_sbx.invocations("create") == []
+
+    def test_run_profile_chooses_the_workload_profile(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--profile` (#758) names a `[[workloads]]` profile for the run;
+        the run says which, and pins it into its config for a resume."""
+        execute = {"text": "on it\n\n## Result\n\ndone"}
+        verdict = {"json": {"passed": True, "unmet": [], "notes": ""}}
+        self.make_run_env(workdir, monkeypatch, [self.HAPPY_RUN[0], execute, verdict])
+        (workdir / "sbxloop.toml").write_text(
+            '[[workloads]]\nname = "research"\n\n'
+            '[[workloads]]\nname = "bare"\nbudgets = { max_tasks = 2 }\n\n'
+            '[workload]\ndefault = "research"\n'
+        )
+        result = runner.invoke(
+            app, ["run", "count", "--kind", "workload", "--profile", "bare", "--no-tui"]
+        )
+        assert result.exit_code == 0, result.output
+        plain = result.output.replace("\n", "")
+        assert "profile: bare" in plain
+        store = StateStore(workdir / ".sbxloop" / "state.db")
+        (run,) = store.list_runs()
+        stored = json.loads(store.get_run_config(run.run_id))
+        assert stored["workload"]["default"] == "bare"
+        assert stored["budgets"]["max_tasks"] == 2
+
+    def test_run_without_a_profile_says_so(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        execute = {"text": "on it\n\n## Result\n\ndone"}
+        verdict = {"json": {"passed": True, "unmet": [], "notes": ""}}
+        self.make_run_env(workdir, monkeypatch, [self.HAPPY_RUN[0], execute, verdict])
+        result = runner.invoke(app, ["run", "count", "--kind", "workload", "--no-tui"])
+        assert result.exit_code == 0, result.output
+        assert "profile: none (no needs can be granted)" in result.output.replace("\n", "")
+
+    def test_run_profile_refusals(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A profile on a code run, or one the config does not declare, is
+        a usage error before any sandbox."""
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        (workdir / "sbxloop.toml").write_text('[[workloads]]\nname = "research"\n')
+        result = runner.invoke(app, ["run", "x", "--profile", "research", "--no-tui"])
+        assert result.exit_code == 2, result.output
+        assert "--profile cannot be combined with --kind code" in result.output.replace("\n", "")
+        result = runner.invoke(
+            app, ["run", "x", "--kind", "workload", "--profile", "nope", "--no-tui"]
+        )
+        assert result.exit_code == 2, result.output
+        plain = result.output.replace("\n", "")
+        assert "'nope' is not declared" in plain and "research" in plain
+        assert fake_sbx.invocations("create") == []
+
+    def test_run_kind_must_be_known(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        result = runner.invoke(app, ["run", "x", "--kind", "bogus", "--no-tui"])
+        assert result.exit_code == 2, result.output
+        assert "invalid --kind" in result.output
+        assert fake_sbx.invocations("create") == []
+
+    def test_run_workspace_flag_must_be_a_directory(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        result = runner.invoke(app, ["run", "make it so", "--no-tui", "--workspace", "missing"])
+        assert result.exit_code == 2, result.output
+        assert "invalid --workspace" in result.output
+        assert "is not a directory" in result.output
+        assert fake_sbx.invocations("create") == []
+
+    def test_run_inside_a_checkout_works_on_that_checkout(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`sbxloop run` typed from anywhere inside a git checkout means that
+        checkout (#670); the state dir still resolves under $HOME."""
+        from tests.unit.test_hostgit import make_repo
+
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        root = make_repo(workdir)
+        sub = root / "pkg"
+        sub.mkdir()
+        monkeypatch.chdir(sub)
+        result = runner.invoke(app, ["run", "make it so", "--no-tui"])
+        assert result.exit_code == 0, result.output
+        assert (
+            f"workspace: {root.resolve()} (the git checkout enclosing the current directory)"
+            in result.output.replace("\n", "")
+        )
+        start = self._run_start(workdir)
+        assert start["workspace"] == str(root.resolve())
+        assert start["workspace_source"] == "cwd-checkout"
+
+    def test_run_configured_workspace_is_reported_as_configured(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        ws = workdir / "configured-ws"
+        ws.mkdir()
+        monkeypatch.setenv("SBXLOOP_SANDBOX__WORKSPACE", str(ws))
+        result = runner.invoke(app, ["run", "make it so", "--no-tui"])
+        assert result.exit_code == 0, result.output
+        assert f"workspace: {ws} (configured)" in result.output.replace("\n", "")
+        assert self._run_start(workdir)["workspace_source"] == "configured"
+
+    def test_run_configured_workspace_that_never_mounts_stops(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A checkout the agent cannot see is a failed run, not a green run
+        on an empty directory (#670)."""
+        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        ws = workdir / "ws"
+        ws.mkdir()
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        result = runner.invoke(app, ["run", "make it so", "--no-tui", "--workspace", str(ws)])
+        assert result.exit_code == 2, result.output
+        assert "run failed:" in result.output
+        assert "was not visible inside the agent sandbox" in result.output
+        assert "sbxloop doctor" in result.output
+        assert "t1: done" not in result.output
 
     HAPPY_RUN: ClassVar[list[dict[str, Any]]] = [
         {
@@ -2427,6 +3030,20 @@ class TestMultiRepoCli:
         assert "unknown repository" in result.output
 
 
+class PatProvisioner:
+    """The provisioner a doctor Box stand-in carries: PAT mode, no bot
+    login, no App permissions to report (#696)."""
+
+    bot_login: str | None = None
+    app_permissions: dict[str, str] | None = None
+
+    def gh_bot_login(self, repo: str | None = None) -> str | None:
+        return self.bot_login
+
+    def gh_app_permissions(self, repo: str | None = None) -> dict[str, str] | None:
+        return self.app_permissions
+
+
 class TestDoctorRepoChecks:
     def _config(self, toml: str, workdir: Path) -> Any:
         from sbxloop.config import load_config
@@ -2514,7 +3131,7 @@ class TestDoctorRepoChecks:
         assert row.ok and not row.hard and "unverified" in row.detail
 
     def test_probe_reads_permissions_from_the_repo_payload(self) -> None:
-        from sbxloop.cli.doctor import _missing_permissions
+        from sbxloop.cli.doctor import _missing_from_push_bit as _missing_permissions
 
         assert _missing_permissions({"permissions": {"push": True}}) == ()
         assert _missing_permissions({"permissions": {"admin": True}}) == ()
@@ -2527,7 +3144,9 @@ class TestDoctorRepoChecks:
         # ...while a genuinely read-only token (pull works, push denied)
         # still flags.
         assert _missing_permissions({"permissions": {"pull": True, "push": False}}) != ()
-        missing = _missing_permissions({"permissions": {"pull": True, "push": False}})
+        missing = [
+            n.label for n in _missing_permissions({"permissions": {"pull": True, "push": False}})
+        ]
         assert "issues:write" in missing and "contents:write" in missing
 
     def test_sandbox_probe_calls_repo_lookup_in_a_scoped_box(
@@ -2545,10 +3164,15 @@ class TestDoctorRepoChecks:
                 seen["looked_up"] = repo
                 return {"permissions": {"push": True}}
 
+            def token_scopes(self) -> tuple[str, ...] | None:
+                return None  # a fine-grained PAT
+
             def raw(self, method: str, path: str, body: Any = None) -> Any:
-                return []  # no labels on the repository
+                return []  # no labels on the repository, every read allowed
 
         class FakeBox:
+            provisioner = PatProvisioner()
+
             def __init__(self, *_a: Any, repo: str | None = None, **_kw: Any) -> None:
                 seen["scoped_to"] = repo
                 self.closed = False
@@ -2609,6 +3233,8 @@ class TestDoctorProbeCost:
         instances: ClassVar[list[Any]] = []
         fail_names: ClassVar[set[str]] = set()
 
+        provisioner = PatProvisioner()
+
         def __init__(self, config: Any, cli: Any, bus: Any, **kw: Any) -> None:
             self.name = kw.get("name")
             self.repo = kw.get("repo")
@@ -2627,6 +3253,9 @@ class TestDoctorProbeCost:
                 def repo_lookup(self, repo: str) -> dict[str, Any]:
                     box.lookups.append(repo)
                     return {"permissions": {"push": True, "pull": True}}
+
+                def token_scopes(self) -> tuple[str, ...] | None:
+                    return None
 
                 def raw(self, method: str, path: str, body: Any = None) -> Any:
                     return []
@@ -2780,8 +3409,8 @@ class TestDoctorRepoHealthRow:
 
 
 class TestDoctorBranchProtection:
-    """Approving-review branch protection 405s every loop merge: doctor
-    surfaces it as advice (human-out-of-the-loop doctrine)."""
+    """Rules of the base the loop cannot satisfy 405 every loop merge:
+    doctor lists them as advice (human-out-of-the-loop doctrine, #673)."""
 
     def _config(self, toml: str, workdir: Path) -> Any:
         from sbxloop.config import load_config
@@ -2796,25 +3425,98 @@ class TestDoctorBranchProtection:
         rows = repo_checks(
             config,
             {"GH_TOKEN": "tok"},
-            probe=lambda _e: RepoProbe(reachable=True, review_protected=True),
+            probe=lambda _e: RepoProbe(
+                reachable=True,
+                base_blockers=(
+                    "the base requires an approving review, which the loop cannot give "
+                    "its own pull request",
+                    "the base requires signed commits; GitHub signs commits the loop "
+                    "creates through its API only when it authenticates as a GitHub App",
+                ),
+            ),
         )
         main, protection = rows
         assert main.ok
         assert protection.name == "github repo acme/alpha branch protection"
         assert not protection.ok and not protection.hard
         assert "HTTP 405" in protection.detail
-        assert "human-out-of-the-loop" in protection.detail
+        # One blocker per line, every one of them.
+        assert "\n- the base requires an approving review" in protection.detail
+        assert "\n- the base requires signed commits" in protection.detail
 
     def test_unverifiable_protection_adds_no_row(self, workdir: Path) -> None:
         from sbxloop.cli.doctor import RepoProbe, repo_checks
 
         config = self._config('[[github.repos]]\nrepo = "acme/alpha"\n', workdir)
-        (row,) = repo_checks(
-            config,
-            {"GH_TOKEN": "tok"},
-            probe=lambda _e: RepoProbe(reachable=True, review_protected=None),
-        )
-        assert row.ok
+        for probe in (
+            RepoProbe(reachable=True, base_blockers=None),
+            RepoProbe(reachable=True, base_blockers=()),
+        ):
+            (row,) = repo_checks(config, {"GH_TOKEN": "tok"}, probe=lambda _e, p=probe: p)
+            assert row.ok
+
+    def test_the_sandbox_probe_lists_every_blocker_of_the_base(self, workdir: Path) -> None:
+        """#673: the probe reads the base's rulesets and reports each rule
+        the loop cannot satisfy; a PAT cannot sign, a GitHub App can."""
+        from sbxloop.cli.doctor import sandbox_repo_probe
+
+        rules = [
+            {
+                "type": "pull_request",
+                "parameters": {
+                    "required_approving_review_count": 0,
+                    "require_last_push_approval": True,
+                },
+            },
+            {"type": "required_signatures"},
+        ]
+
+        class Box:
+            provisioner = PatProvisioner()
+
+            def __init__(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def ops(self) -> Any:
+                class Ops:
+                    def repo_lookup(self, repo: str) -> dict[str, Any]:
+                        return {"default_branch": "main"}
+
+                    def token_scopes(self) -> tuple[str, ...] | None:
+                        return None
+
+                    def raw(self, method: str, path: str, body: Any = None) -> Any:
+                        from sbxloop.errors import GithubOpsError
+
+                        if path.endswith("/labels?per_page=100&page=1"):
+                            return []
+                        if path.endswith("/rules/branches/main"):
+                            return rules
+                        raise GithubOpsError("no protection", http_status=404)
+
+                return Ops()
+
+        import sbxloop.daemon.github as github_module
+
+        config = self._config('[[github.repos]]\nrepo = "acme/alpha"\n', workdir)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(github_module, "DaemonGithub", Box)
+            probe = sandbox_repo_probe(config, cli=None, boxes={})  # type: ignore[arg-type]
+            result = probe(config.github.repo_list()[0])
+            assert result.base_blockers is not None
+            assert [b.split(",")[0] for b in result.base_blockers] == [
+                "the base requires approval of the last push (require_last_push_approval)",
+                "the base requires signed commits; GitHub signs commits the loop creates "
+                "through its API only when it authenticates as a GitHub App",
+            ]
+            # The same base seen through a GitHub App: its commits are signed.
+            Box.provisioner = PatProvisioner()
+            Box.provisioner.bot_login = "acme-loop[bot]"
+            probe = sandbox_repo_probe(config, cli=None, boxes={})  # type: ignore[arg-type]
+            signed = probe(config.github.repo_list()[0])
+            assert signed.base_blockers is not None
+            assert len(signed.base_blockers) == 1
+            assert "signed commits" not in signed.base_blockers[0]
 
     def test_the_repo_row_says_how_the_loop_will_merge(self, workdir: Path) -> None:
         """#620: `auto` resolves against what the repository allows; an
@@ -2854,6 +3556,8 @@ class TestDoctorBranchProtection:
         from sbxloop.cli.doctor import sandbox_repo_probe
 
         class Box:
+            provisioner = PatProvisioner()
+
             def __init__(self, *a: Any, **kw: Any) -> None:
                 pass
 
@@ -2866,6 +3570,9 @@ class TestDoctorBranchProtection:
                             "allow_merge_commit": True,
                             "allow_rebase_merge": False,
                         }
+
+                    def token_scopes(self) -> tuple[str, ...] | None:
+                        return None
 
                     def raw(self, method: str, path: str, body: Any = None) -> Any:
                         from sbxloop.errors import GithubOpsError
@@ -2892,6 +3599,8 @@ class TestDoctorBranchProtection:
         from sbxloop.cli.doctor import sandbox_repo_probe
 
         class Box:
+            provisioner = PatProvisioner()
+
             def __init__(self, *a: Any, **kw: Any) -> None:
                 pass
 
@@ -2900,9 +3609,14 @@ class TestDoctorBranchProtection:
                     def repo_lookup(self, repo: str) -> dict[str, Any]:
                         return {"has_issues": False}
 
+                    def token_scopes(self) -> tuple[str, ...] | None:
+                        return None
+
                     def raw(self, method: str, path: str, body: Any = None) -> Any:
-                        assert path == "/repos/acme/alpha/labels?per_page=100&page=1"
-                        return [{"name": "SBXLOOP:RUN"}, {"name": "loop:done"}]
+                        if path == "/repos/acme/alpha/labels?per_page=100&page=1":
+                            return [{"name": "SBXLOOP:RUN"}, {"name": "loop:done"}]
+                        assert path.startswith("/repos/acme/alpha/"), path
+                        return []  # the permission reads (#696): every one allowed
 
                 return Ops()
 
@@ -2954,8 +3668,9 @@ class TestDoctorBranchProtection:
         )
         assert [row.name for row in clean] == ["github repo acme/alpha"]
 
-    def test_requires_approving_reviews_reads_both_sources(self) -> None:
-        from sbxloop.cli.doctor import _requires_approving_reviews
+    def test_base_blockers_read_both_sources(self) -> None:
+        from sbxloop.cli.doctor import _base_blockers
+        from sbxloop.config import Config
         from sbxloop.errors import GithubOpsError
 
         class Ops:
@@ -2968,17 +3683,267 @@ class TestDoctorBranchProtection:
                     raise answer
                 return answer
 
+        config = Config()
+
+        def blockers(ops: Any) -> tuple[str, ...] | None:
+            return _base_blockers(ops, "o/r", "main", config, can_sign=False)[0]  # type: ignore[arg-type]
+
         classic = Ops({"required_pull_request_reviews": {"required_approving_review_count": 1}}, [])
-        assert _requires_approving_reviews(classic, "o/r", "main") is True
+        assert blockers(classic) == (
+            "the base requires an approving review, which the loop cannot give its own "
+            "pull request",
+        )
         unprotected = Ops(GithubOpsError("x", http_status=404), [])
-        assert _requires_approving_reviews(unprotected, "o/r", "main") is False
+        assert blockers(unprotected) == ()
+        # A conclusive rule from the readable source is reported even when
+        # the other source is admin-only.
         ruleset = Ops(
             GithubOpsError("x", http_status=403),
             [{"type": "pull_request", "parameters": {"required_approving_review_count": 2}}],
         )
-        assert _requires_approving_reviews(ruleset, "o/r", "main") is True
+        assert blockers(ruleset) == (
+            "the base requires 2 approving reviews, which the loop cannot give its own "
+            "pull request",
+        )
         unknown = Ops(GithubOpsError("x", http_status=403), GithubOpsError("x", http_status=403))
-        assert _requires_approving_reviews(unknown, "o/r", "main") is None
+        assert blockers(unknown) is None
+        # The probe also names which sources the token could not read (#674).
+        assert _base_blockers(ruleset, "o/r", "main", config, can_sign=False)[1] == (  # type: ignore[arg-type]
+            "protection",
+        )
+        assert _base_blockers(unknown, "o/r", "main", config, can_sign=False)[1] == (  # type: ignore[arg-type]
+            "protection",
+            "rulesets",
+        )
+        assert _base_blockers(classic, "o/r", "main", config, can_sign=False)[1] == ()  # type: ignore[arg-type]
+
+    def test_unreadable_classic_protection_says_the_checks_come_from_the_pr(
+        self, workdir: Path
+    ) -> None:
+        """#674: a write-not-admin token cannot read classic protection;
+        doctor says so, and that the required checks come from the PR's
+        rollup, instead of printing "unknown" or nothing."""
+        from sbxloop.cli.doctor import RepoProbe, repo_checks
+
+        config = self._config('[[github.repos]]\nrepo = "acme/alpha"\n', workdir)
+        main, row = repo_checks(
+            config,
+            {"GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(
+                reachable=True, base_blockers=None, base_unread=("protection",)
+            ),
+        )
+        assert main.ok and row.ok
+        assert row.name == "github repo acme/alpha required checks"
+        assert "classic branch protection is not readable with this token" in row.detail
+        assert "needs admin" in row.detail
+        assert "read from each pull request's own rollup" in row.detail
+        # Both unread: says so; only rulesets unread: names them.
+        (_, both) = repo_checks(
+            config,
+            {"GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(
+                reachable=True, base_blockers=None, base_unread=("protection", "rulesets")
+            ),
+        )
+        assert "rulesets could not be read either" in both.detail
+        (_, rules) = repo_checks(
+            config,
+            {"GH_TOKEN": "tok"},
+            probe=lambda _e: RepoProbe(
+                reachable=True, base_blockers=None, base_unread=("rulesets",)
+            ),
+        )
+        assert rules.detail.startswith("the base's rulesets could not be read;")
+
+
+class TestDoctorPermissions:
+    """Doctor names the permission a run's credential lacks and the
+    feature that first needs it, from whichever source describes the token
+    (#696) — so the failure is a doctor row, not a mid-run 403."""
+
+    FULL_APP: ClassVar[dict[str, str]] = {
+        "metadata": "read",
+        "contents": "write",
+        "pull_requests": "write",
+        "issues": "write",
+        "checks": "read",
+        "actions": "read",
+        "workflows": "write",
+    }
+    ONE_WORKFLOW: ClassVar[dict[str, Any]] = {
+        "total_count": 1,
+        "workflows": [{"name": "ci", "state": "active"}],
+    }
+
+    def _config(self, workdir: Path) -> Any:
+        from sbxloop.config import load_config
+
+        (workdir / "sbxloop.toml").write_text('[[github.repos]]\nrepo = "acme/alpha"\n')
+        return load_config()
+
+    def _rows(
+        self,
+        workdir: Path,
+        *,
+        scopes: tuple[str, ...] | None = None,
+        app_permissions: dict[str, str] | None = None,
+        forbidden: tuple[str, ...] = (),
+        workflows: Any = None,
+        latest_run: Any = None,
+        private: bool = True,
+        push: bool = True,
+    ) -> tuple[list[Any], list[str]]:
+        """Doctor's repo rows for a token described by ``scopes`` (classic),
+        ``app_permissions`` (App) or neither (fine-grained), whose reads of
+        the paths in ``forbidden`` 403; plus the GET paths asked."""
+        from sbxloop.cli.doctor import repo_checks, sandbox_repo_probe
+        from sbxloop.errors import GithubOpsError
+
+        asked: list[str] = []
+        listing = self.ONE_WORKFLOW if workflows is None else workflows
+
+        class Ops:
+            def repo_lookup(self, repo: str) -> dict[str, Any]:
+                return {
+                    "default_branch": "main",
+                    "permissions": {"push": push, "pull": True},
+                    "private": private,
+                }
+
+            def token_scopes(self) -> tuple[str, ...] | None:
+                asked.append("token.scopes")
+                return scopes
+
+            def raw(self, method: str, path: str, body: Any = None) -> Any:
+                asked.append(path)
+                if any(path.endswith(suffix) for suffix in forbidden):
+                    raise GithubOpsError("Resource not accessible", http_status=403)
+                if path.endswith("/labels?per_page=100&page=1"):
+                    return [{"name": "sbxloop:run"}]
+                if path.endswith("/rules/branches/main"):
+                    return []
+                if path.endswith("/actions/workflows?per_page=100"):
+                    return listing
+                if path.endswith("/actions/runs?branch=main&per_page=1"):
+                    return {"workflow_runs": [latest_run] if latest_run else []}
+                if path.endswith("/protection"):
+                    raise GithubOpsError("admin only", http_status=403)
+                return []
+
+        class Box:
+            provisioner = PatProvisioner()
+            provisioner.app_permissions = app_permissions
+
+            def __init__(self, *a: Any, **kw: Any) -> None:
+                pass
+
+            def ops(self) -> Ops:
+                return Ops()
+
+        import sbxloop.daemon.github as github_module
+
+        config = self._config(workdir)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(github_module, "DaemonGithub", Box)
+            probe = sandbox_repo_probe(config, cli=None, boxes={})  # type: ignore[arg-type]
+            return repo_checks(config, {"GH_TOKEN": "tok"}, probe=probe), asked
+
+    def test_a_fine_grained_pat_lacking_checks_read_fails_naming_the_feature(
+        self, workdir: Path
+    ) -> None:
+        """Acceptance (#696): a token that cannot read check runs would have
+        hung the CI stage; doctor says which permission and which stage."""
+        rows, asked = self._rows(workdir, forbidden=("/commits/main/check-runs?per_page=1",))
+        repo = rows[0]
+        assert repo.name == "github repo acme/alpha" and not repo.ok and repo.hard
+        assert (
+            "token missing checks:read (waiting for check runs at the CI and landing" in repo.detail
+        )
+        assert "docs/permissions.md" in repo.detail and "fine-grained PAT" in repo.detail
+        assert "actions:read" not in repo.detail, "only the read that failed is named"
+        # A fine-grained PAT is asked one read per permission.
+        assert "/repos/acme/alpha/issues?per_page=1" in asked
+        assert "/repos/acme/alpha/actions/runs?per_page=1" in asked
+
+    def test_a_fine_grained_pat_with_every_read_passes(self, workdir: Path) -> None:
+        rows, _asked = self._rows(workdir)
+        repo = rows[0]
+        assert repo.ok and "token has the required permissions" in repo.detail
+        assert not any(r.name.endswith(" workflows") for r in rows), "nothing to warn about"
+        assert rows[-1].name == "github repo acme/alpha ci", "the CI row closes the repository"
+
+    def test_an_app_missing_workflows_write_warns(self, workdir: Path) -> None:
+        """Acceptance (#696): the loop runs without it, but a delivery that
+        touches a workflow file is refused — a WARN row says so up front."""
+        granted = {k: v for k, v in self.FULL_APP.items() if k != "workflows"}
+        rows, asked = self._rows(workdir, app_permissions=granted)
+        repo = rows[0]
+        assert repo.ok and "App installation" in repo.detail
+        assert "token.scopes" not in asked, "the App's grant answers; no header read"
+        assert "/repos/acme/alpha/issues?per_page=1" not in asked, "no read probes either"
+        (warn,) = [r for r in rows if r.name == "github repo acme/alpha workflows"]
+        assert not warn.ok and not warn.hard
+        assert "workflows:write" in warn.detail and ".github/workflows" in warn.detail
+        assert "docs/permissions.md" in warn.detail
+
+    def test_an_app_missing_a_required_permission_fails(self, workdir: Path) -> None:
+        granted = {k: v for k, v in self.FULL_APP.items() if k != "actions"}
+        rows, _asked = self._rows(workdir, app_permissions=granted)
+        repo = rows[0]
+        assert not repo.ok and repo.hard
+        assert "actions:read (reading workflow runs and failed-job logs" in repo.detail
+
+    def test_a_classic_pat_is_judged_by_its_scopes(self, workdir: Path) -> None:
+        rows, asked = self._rows(workdir, scopes=("repo", "workflow"))
+        assert rows[0].ok and "classic PAT's scopes repo, workflow" in rows[0].detail
+        assert "/repos/acme/alpha/issues?per_page=1" not in asked, "scopes answer; no probes"
+        rows, _asked = self._rows(workdir, scopes=("repo",))
+        assert rows[0].ok
+        assert any(r.name.endswith(" workflows") and not r.ok and not r.hard for r in rows)
+        rows, _asked = self._rows(workdir, scopes=("public_repo",))
+        assert not rows[0].ok and "contents:write" in rows[0].detail
+        rows, _asked = self._rows(workdir, scopes=("public_repo",), private=False)
+        assert rows[0].ok, "public_repo is enough for a public repository"
+
+    def test_a_classic_pat_is_also_capped_by_its_users_access(self, workdir: Path) -> None:
+        """`repo` on the token, read-only on the repository: the scopes
+        pass, the push bit fails — the write needs are still named."""
+        rows, _asked = self._rows(workdir, scopes=("repo", "workflow"), push=False)
+        assert not rows[0].ok and rows[0].hard
+        assert "contents:write" in rows[0].detail and "checks:read" not in rows[0].detail
+
+    def test_zero_workflows_says_the_ci_stage_has_nothing_to_wait_for(self, workdir: Path) -> None:
+        """Acceptance (#696): a repository without Actions is not a failure
+        — the CI stage passes on the delivered head — but doctor says so,
+        so an empty CI stage is not a surprise on the first run."""
+        rows, _asked = self._rows(workdir, workflows={"total_count": 0, "workflows": []})
+        (ci,) = [r for r in rows if r.name == "github repo acme/alpha ci"]
+        assert ci.ok and not ci.hard
+        assert "no active Actions workflows" in ci.detail and "nothing" in ci.detail
+        assert "another app" in ci.detail
+
+    def test_the_ci_row_names_the_latest_run_on_the_base(self, workdir: Path) -> None:
+        rows, _asked = self._rows(
+            workdir,
+            latest_run={"name": "ci", "status": "completed", "conclusion": "failure"},
+        )
+        (ci,) = [r for r in rows if r.name == "github repo acme/alpha ci"]
+        assert ci.ok and ci.hard
+        assert ci.detail == "1 active Actions workflow(s); latest run on main: ci failure"
+        rows, _asked = self._rows(workdir)
+        (ci,) = [r for r in rows if r.name == "github repo acme/alpha ci"]
+        assert ci.detail == "1 active Actions workflow(s); no run yet on main"
+
+    def test_a_listing_the_token_cannot_read_drops_the_ci_row(self, workdir: Path) -> None:
+        """actions:read missing is the permission row's finding; the CI row
+        does not guess."""
+        rows, _asked = self._rows(
+            workdir,
+            forbidden=("/actions/workflows?per_page=100", "/actions/runs?per_page=1"),
+        )
+        assert not rows[0].ok and "actions:read" in rows[0].detail
+        assert not any(r.name.endswith(" ci") for r in rows)
 
 
 class TestInitRepo:

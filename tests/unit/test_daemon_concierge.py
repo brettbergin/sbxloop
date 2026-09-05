@@ -345,6 +345,17 @@ class TestTools:
         assert "{" not in status.text and "consecutive failures: 0" in status.text
         assert "paused: True" in status.text
 
+    def test_sbx_control_refuses_the_process_level_stop(self, tmp_path: Path) -> None:
+        """`stop` ends the daemon process: an operator's verb, never the
+        in-sandbox model's — a user's "stop it" must not become an exit."""
+        concierge, client, _, loop, _ = make(
+            tmp_path, [{"calls": [("sbx_control", {"command": "stop"})]}]
+        )
+        turn(concierge, "stop it")
+        (resp,) = client.responses
+        assert resp.text.startswith("(command not accepted)") and "cancel" in resp.text
+        assert not getattr(loop, "stopped", False)
+
     def test_sbx_control_bad_verb_is_not_accepted(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(
             tmp_path, [{"calls": [("sbx_control", {"command": "explode"})]}]
@@ -2409,3 +2420,29 @@ class TestAssumedFiling:
         assert filed.ok and filed.text.startswith("created and queued issue")
         (_, _title, body, _labels) = github.created[0]
         assert body.startswith("## Symptom (assumed)\n\ngrey preview cards")
+
+
+class TestSurface:
+    def test_a_turn_is_worded_for_the_bridge_it_came_in_on(self, tmp_path: Path) -> None:
+        """Discord and the console share one concierge; a console operator
+        must not be told to type Discord's prefix or hear "on Discord"."""
+        concierge, _, _, _, _ = make(
+            tmp_path,
+            [{"text": "ok"}],
+            config={"discord": {"channel_id": 42, "command_prefix": "!bot"}},
+        )
+        cfg = concierge.config
+        assert concierge._chat is cfg.discord and concierge._chat_name == "Discord"
+        concierge._turn_via = "local"
+        assert concierge._chat is cfg.tui and concierge._chat_name == "the operator console"
+        assert concierge._chat.command_prefix == "!sbx"
+        concierge._turn_via = None
+        assert concierge._chat is cfg.discord
+
+    def test_headless_wording_is_the_console(self, tmp_path: Path) -> None:
+        concierge, _, _, _, _ = make(
+            tmp_path, [{"text": "ok"}], config={"discord": {"channel_id": None}}
+        )
+        assert concierge.config.chat_backend is None
+        assert concierge._chat is concierge.config.tui
+        assert concierge._chat_name == "the operator console"

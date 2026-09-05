@@ -384,3 +384,100 @@ class TestPersistentEnvFile:
             assert os.environ["SBXLOOP_TEST_PERSISTENT_SENTINEL"] == "from-persistent"
         finally:
             os.environ.pop("SBXLOOP_TEST_PERSISTENT_SENTINEL", None)
+
+    def test_operator_env_from_the_env_file_reaches_the_jobs_subprocess(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`[sandbox] env` / `secret_env` arrive as exports in the env file
+        (#679); the worker loads them into its own environment, which every
+        job's subprocess — the agent CLI, a verify command — inherits."""
+        monkeypatch.delenv("SBXLOOP_TEST_OPERATOR_ENV", raising=False)
+        env_file = tmp_path / "env.sh"
+        env_file.write_text("export SBXLOOP_TEST_OPERATOR_ENV='from operator'\n")
+        job_path = tmp_path / "job.json"
+        job_path.write_text(
+            JobRequest(
+                job_id="j3",
+                run_id="r1",
+                kind="shell.check",
+                argv=["sh", "-c", 'printf %s "$SBXLOOP_TEST_OPERATOR_ENV"'],
+            ).model_dump_json()
+        )
+        result_path = tmp_path / "r.json"
+        code = main(
+            [
+                "run",
+                "--job",
+                str(job_path),
+                "--events",
+                str(tmp_path / "e.jsonl"),
+                "--result",
+                str(result_path),
+                "--heartbeat",
+                "0",
+                "--env-file",
+                str(env_file),
+            ]
+        )
+        try:
+            assert code == 0
+            result = json.loads(result_path.read_text())
+            assert result["exit_code"] == 0
+            assert result["output_text"] == "from operator"
+        finally:
+            os.environ.pop("SBXLOOP_TEST_OPERATOR_ENV", None)
+
+
+class TestServiceFetch:
+    """`service.fetch` (#766): the host-composed argv runs in the given
+    directory; the exit code and output come back; the values of the named
+    secret variables never leave in the output."""
+
+    def fetch_job(self, argv: list[str], cwd: Path, **params: object) -> JobRequest:
+        return JobRequest(
+            job_id="f1",
+            run_id="r1",
+            kind="service.fetch",
+            argv=argv,
+            cwd=str(cwd),
+            params={"ecosystem": "npm", "verb": "fetch", **params},
+        )
+
+    def test_runs_the_argv_in_the_workdir_and_reports_the_exit(self, tmp_path: Path) -> None:
+        job = self.fetch_job(["sh", "-c", "pwd; echo fetched >&2; exit 3"], tmp_path)
+        result, events = run_job(tmp_path, job)
+        assert result.status == "ok"  # type: ignore[attr-defined]
+        assert result.exit_code == 3  # type: ignore[attr-defined]
+        assert str(tmp_path.resolve()) in result.output_text  # type: ignore[attr-defined]
+        assert "fetched" in result.output_text  # type: ignore[attr-defined]
+        start = next(e for e in events if e.type == EventTypes.SERVICE_FETCH_START)
+        end = next(e for e in events if e.type == EventTypes.SERVICE_FETCH_END)
+        assert (start.data["ecosystem"], start.data["verb"]) == ("npm", "fetch")
+        assert end.data["exit_code"] == 3 and end.data["argv"] == job.argv
+
+    def test_scrubs_the_named_secrets_from_the_output(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("REG_TOKEN", "registry-token-4f2c")
+        monkeypatch.setenv("SHORT", "abc")  # too short to blank safely
+        job = self.fetch_job(
+            ["sh", "-c", 'echo "GET https://u:$REG_TOKEN@reg.example.com/ $SHORT"'],
+            tmp_path,
+            scrub_env=["REG_TOKEN", "SHORT", "UNSET_NAME"],
+        )
+        result, _ = run_job(tmp_path, job)
+        assert result.exit_code == 0  # type: ignore[attr-defined]
+        assert "registry-token-4f2c" not in result.output_text  # type: ignore[attr-defined]
+        assert "u:***@reg.example.com" in result.output_text  # type: ignore[attr-defined]
+        assert "abc" in result.output_text  # type: ignore[attr-defined]
+
+    def test_a_missing_tool_is_an_error_result_not_a_crash(self, tmp_path: Path) -> None:
+        result, _ = run_job(tmp_path, self.fetch_job(["no-such-package-manager-xyz"], tmp_path))
+        assert result.status == "error"  # type: ignore[attr-defined]
+        assert result.error.type == "FileNotFoundError"  # type: ignore[attr-defined]
+
+    def test_the_kind_needs_argv_and_the_ecosystem(self) -> None:
+        with pytest.raises(ValueError, match="argv"):
+            JobRequest(job_id="f", run_id="r", kind="service.fetch", params={"ecosystem": "npm"})
+        with pytest.raises(ValueError, match="ecosystem"):
+            JobRequest(job_id="f", run_id="r", kind="service.fetch", argv=["npm", "ci"])

@@ -42,7 +42,8 @@ from sbxloop.daemon.discord_format import (
     summary_embed,
     summary_text,
 )
-from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
+from sbxloop.daemon.model import DaemonNotice, RunReport, TaskOutcome, WorkItem
+from sbxloop.engine.model import Published
 from sbxloop.events import Event
 
 
@@ -323,6 +324,46 @@ class TestFormat:
             )
         ) == ["🔨 **build** · task `t2` — added the parser and its tests"]
         assert format_for_discord(ev("phase.end", task_id="t2", phase="verify", status="ok")) == []
+        # A workload's operator (#756) reports the way the builder does; the
+        # judge's verdict is its own line, so a passing judge phase is quiet.
+        assert texts(
+            format_for_discord(
+                ev("phase.end", task_id="t1", phase="execute", status="ok", message="wrote it")
+            )
+        ) == ["🛠 **execute** · task `t1` — wrote it"]
+        assert (
+            format_for_discord(
+                ev("phase.end", task_id="t1", phase="judge", status="ok", message="all met")
+            )
+            == []
+        )
+        assert texts(
+            format_for_discord(
+                ev("phase.end", task_id="t1", phase="judge", status="failed", message="unmet: x")
+            )
+        ) == ["✗ **judge** · task `t1` — unmet: x"]
+        # An advisory failure (#682) blocked nothing, and the human is who it
+        # is evidence for: a warning line at every level.
+        advisory = ev(
+            "phase.end",
+            task_id="t2",
+            phase="verify",
+            status="advisory",
+            message="verify command failed: `pytest` (exit 1) (advisory, not blocking)",
+        )
+        assert texts(format_for_discord(advisory)) == [
+            "⚠ **verify** · task `t2` — verify command failed: `pytest` (exit 1) "
+            "(advisory, not blocking)"
+        ]
+        assert texts(format_for_discord(advisory, level="quiet")) == texts(
+            format_for_discord(advisory)
+        )
+        # a skip under ci-only stays verbose-only, like any other non-failure
+        skipped = ev("phase.end", task_id="t2", phase="verify", status="skipped", message="not run")
+        assert format_for_discord(skipped) == []
+        assert texts(format_for_discord(skipped, level="verbose")) == [
+            "· verify · task `t2` — not run"
+        ]
 
     def test_newly_surfaced_events_and_levels(self) -> None:
         err = format_for_discord(ev("worker.error", message="job died"))
@@ -337,6 +378,17 @@ class TestFormat:
         warn = ev("sandbox.tooling_warning", message="node missing")
         assert texts(format_for_discord(warn)) == ["⚠ tooling: node missing"]
         assert format_for_discord(warn, level="quiet") == []
+        services = ev(
+            "verify.services_detected",
+            evidence=["docker-compose.yml (compose file)", "uv.lock mentions testcontainers"],
+            hint="set verify_mode",
+        )
+        assert texts(format_for_discord(services)) == [
+            "⚠ verify: the suite may need services the sandbox does not have "
+            "(`docker-compose.yml (compose file)`, `uv.lock mentions testcontainers`) "
+            "— set verify_mode"
+        ]
+        assert format_for_discord(services, level="quiet") == []
         cap = ev("agent.tool_cap", cap=40)
         assert texts(format_for_discord(cap)) == [
             "⛔ tool-call ceiling (40) reached — further calls are turned away; the agent was "
@@ -595,6 +647,21 @@ class TestSteerProgress:
         p.observe(ev("task.end", task_id="t2", title="Wire CLI", state="done"))
         assert p.render() == "⏳ steer queued; answered at the next checkpoint"
 
+    def test_a_workload_names_its_own_phases(self) -> None:
+        """The same task states under the operator's names (#756): the run's
+        kind, carried on `run.start`, picks the vocabulary."""
+        p = SteerProgress(cap=40)
+        p.observe(ev("run.start", outcome="o", kind="workload"))
+        p.observe(ev("task.state", task_id="t1", state="executing", revisions=0))
+        p.observe(ev("task.start", task_id="t1", title="Count"))
+        assert "mid-**execute** on `t1` · Count" in p.render()
+        p.observe(ev("task.state", task_id="t1", state="verifying", revisions=0))
+        assert "mid-**judge** on `t1` · Count" in p.render()
+        code = SteerProgress(cap=40)
+        code.observe(ev("run.start", outcome="o"))
+        code.observe(ev("task.state", task_id="t1", state="executing", revisions=0))
+        assert "mid-**build**" in code.render()
+
     def test_production_event_order_keeps_the_build_phase(self) -> None:
         # LoopEngine._run_task emits task.state=executing BEFORE task.start
         # (and the persisted phase first on resume); the start must not
@@ -729,6 +796,103 @@ class TestEmbeds:
         # A merged run's reason (none) is not a field.
         assert "Reason" not in {n for n, _, _ in card.fields}
 
+    def test_finish_card_for_a_workload_lists_each_tasks_result(self) -> None:
+        """#757: a workload has no PR to show; its card carries every task's
+        own result line, its file count, and the judge's verdict where it
+        was not a pass — the whole run view in one field."""
+        item = WorkItem(item_id="discord:m1", source_key="m1", title="Count the lines")
+        outputs = (
+            TaskOutcome("t1", "Fetch the files", "done", "fetched 3 files", 3, "passed"),
+            TaskOutcome(
+                "t2",
+                "Count them",
+                "failed",
+                "counts written",
+                1,
+                "failed — unmet: `summary.csv` holds one row per file — every count is 0",
+            ),
+            TaskOutcome("t3", "Report", "skipped", "", 0, None),
+        )
+        report = RunReport(
+            "r1",
+            "completed",
+            "1/3 tasks done",
+            kind="workload",
+            outputs=outputs,
+            summary="Count the lines — 1/3 task(s) passed the judge",
+        )
+        card = finish_embed(item, report, "completed")
+        assert card.title == "✅ finished: completed"
+        names = [n for n, _, _ in card.fields]
+        assert names == ["Tasks"]
+        tasks = {n: v for n, v, _ in card.fields}["Tasks"]
+        assert tasks.splitlines() == [
+            "✅ `t1` Fetch the files — fetched 3 files (3 files)",
+            "❌ `t2` Count them — counts written (1 file)",
+            "  ⚖️ failed — unmet: `summary.csv` holds one row per file — every count is 0",
+            "⏭ `t3` Report",
+        ]
+        assert finish_text("completed", report) == "**finished: completed** — 1/3 tasks done"
+        # A long plan is clipped to the first eight tasks and counted.
+        many = tuple(TaskOutcome(f"t{i}", f"T{i}", "done", "ok", 0, "passed") for i in range(11))
+        long = finish_embed(item, report._replace(outputs=many), "completed")
+        text = {n: v for n, v, _ in long.fields}["Tasks"]
+        assert text.count("\n") == 8 and text.endswith("… and 3 more task(s)")
+
+    def test_run_published_posts_the_chat_result_whole_and_names_the_rest(self) -> None:
+        """#759: the chat sink's message is the result — posted as blocks
+        like a steering reply; another sink gets one 📤 line."""
+        text = "Digest — 2/2 task(s) passed the judge\nt1: wrote a\n\n## t1: A\n\nwrote a"
+        chat = format_for_discord(
+            ev("run.published", sink="chat", location="chat", tasks=["t1"], files=0, message=text)
+        )
+        assert [c.text for c in chat] == [f"📣 **result**\n{text}"]
+        assert chat[0].flush
+        (filed,) = format_for_discord(
+            ev(
+                "run.published",
+                sink="issue",
+                location="https://github.com/o/r/issues/9",
+                tasks=["t1"],
+                files=0,
+                message="result filed as https://github.com/o/r/issues/9",
+            )
+        )
+        assert filed.text == "📤 published: result filed as https://github.com/o/r/issues/9"
+        long = "x" * 5000
+        parts = format_for_discord(ev("run.published", sink="chat", location="chat", message=long))
+        assert len(parts) > 1 and all(len(p.text) <= 1900 for p in parts)
+
+    def test_finish_card_names_where_a_workload_published(self) -> None:
+        item = WorkItem(item_id="discord:m1", source_key="m1", title="Digest")
+        report = RunReport(
+            "r1",
+            "completed",
+            "2/2 tasks done",
+            kind="workload",
+            published=(
+                Published(sink="artifact", location="/state/runs/r1/artifacts", files=3),
+                Published(sink="issue", location="https://github.com/o/r/issues/9"),
+                Published(sink="chat", location="chat"),
+            ),
+        )
+        card = finish_embed(item, report, "completed")
+        assert {n: v for n, v, _ in card.fields}["Published"].splitlines() == [
+            "📤 artifact: 3 files — `sbxloop artifacts r1`",
+            "📤 issue: [https://github.com/o/r/issues/9](https://github.com/o/r/issues/9)",
+            "📣 chat: posted above",
+        ]
+
+    def test_task_output_event_line(self) -> None:
+        line = texts(
+            format_for_discord(
+                ev("task.output", task_id="t1", attempt=1, summary="wrote `a.csv`", files=2)
+            )
+        )
+        assert line == ["📦 output: task `t1` — wrote `a.csv` · 2 files"]
+        bare = texts(format_for_discord(ev("task.output", task_id="t2", attempt=2, files=0)))
+        assert bare == ["📦 output: task `t2` — (no result reported)"]
+
     def test_finish_card_for_operator_cancel_says_who_and_how_to_continue(self) -> None:
         """#246: a cancel is not a failure; the card must name the requester
         and tell the human the run is resumable (or already re-queued)."""
@@ -806,6 +970,14 @@ class TestEmbeds:
             "⏳ **awaiting ci**"
         ]
         assert format_for_discord(ev("run.state", state="building")) == []
+        # A workload's own stages (#755) — its graph stages render like a
+        # code run's: nothing, the task lines carry that.
+        assert texts(format_for_discord(ev("run.state", state="judging"))) == ["⚖️ **judging**"]
+        assert texts(format_for_discord(ev("run.state", state="publishing"))) == [
+            "📤 **publishing**"
+        ]
+        assert format_for_discord(ev("run.state", state="planning")) == []
+        assert format_for_discord(ev("run.state", state="executing")) == []
         verdict = format_for_discord(
             ev("review.verdict", round=2, verdict="request_changes", findings=3, url="https://r")
         )
@@ -816,6 +988,71 @@ class TestEmbeds:
         assert texts(
             format_for_discord(ev("review.verdict", round=3, verdict="approve", findings=0))
         ) == ["🔍 review round 3: **approved** · 0 finding(s)"]
+        # The judge's verdicts (#756): the first unmet criterion is the
+        # line, since it is the next attempt's whole brief.
+        passed = format_for_discord(
+            ev("judge.verdict", task_id="t1", attempt=1, passed=True, unmet=[], notes="fine")
+        )
+        assert texts(passed) == ["⚖️ judge: task `t1` **passed**"] and passed[0].flush
+        failed = format_for_discord(
+            ev(
+                "judge.verdict",
+                task_id="t2",
+                attempt=2,
+                passed=False,
+                unmet=["the file exists — it does not", "the count matches"],
+                notes="",
+            )
+        )
+        assert texts(failed) == [
+            "⚖️ judge: task `t2` **failed** (attempt 2) · 2 unmet — the file exists — it does not"
+        ]
+        degraded = format_for_discord(
+            ev("judge.degraded", task_id="t2", attempt=1, error="produced invalid output twice")
+        )
+        assert texts(degraded) == [
+            "🛑 judge: task `t2` — no usable verdict twice; the task fails closed "
+            "(produced invalid output twice)"
+        ]
+        assert degraded[0].flush
+        # A workload's needs against its profile (#758): what was granted,
+        # by name and host only, or the first refusal with the key that
+        # would allow it.
+        granted = format_for_discord(
+            ev(
+                "run.needs_granted",
+                profile="research",
+                hosts=["data.example.com"],
+                credentials=["weather"],
+                sinks=[],
+                repos=["o/docs"],
+                message="granted under profile 'research': hosts `data.example.com`",
+            )
+        )
+        assert texts(granted) == [
+            "🔐 needs granted under profile `research`: hosts `data.example.com`; "
+            "credentials `weather`; repos `o/docs`"
+        ]
+        assert granted[0].flush
+        refused = format_for_discord(
+            ev(
+                "run.needs_refused",
+                profile="research",
+                need="host",
+                value="other.example.org",
+                task_id="t1",
+                key="workloads.research.egress",
+                message=(
+                    "task t1 needs host `other.example.org` — outside profile 'research'; "
+                    "`workloads.research.egress` in sbxloop.toml would allow it"
+                ),
+            )
+        )
+        assert texts(refused) == [
+            "🚫 need refused: task t1 needs host `other.example.org` — outside profile "
+            "'research'; `workloads.research.egress` in sbxloop.toml would allow it"
+        ]
+        assert refused[0].flush
         reconciled = format_for_discord(
             ev(
                 "review.reconciled",
@@ -851,6 +1088,22 @@ class TestEmbeds:
         assert texts(format_for_discord(ev("land.update", pr=9, attempt=1))) == [
             "🚀 PR #9 updated from its base (attempt 1)"
         ]
+        assert texts(format_for_discord(ev("land.enqueued", pr=9, position=2, resumed=False))) == [
+            "🚀 PR #9 entered the merge queue at position 2"
+        ]
+        assert texts(
+            format_for_discord(ev("land.enqueued", pr=9, position=None, resumed=True))
+        ) == ["🚀 PR #9 already in the merge queue"]
+        dequeued = format_for_discord(
+            ev("land.dequeued", pr=9, reason="CI_FAILED", failed=["integration"])
+        )
+        assert texts(dequeued) == [
+            "🚧 PR #9 removed from the merge queue (CI_FAILED) — failing: integration"
+        ]
+        assert dequeued[0].flush
+        assert texts(format_for_discord(ev("land.dequeued", pr=9, reason="", failed=[]))) == [
+            "🚧 PR #9 removed from the merge queue"
+        ]
         merged = format_for_discord(ev("run.merged", pr=9, url="https://x/pull/9"))
         assert texts(merged) == ["🎉 **merged** PR [#9](https://x/pull/9)"] and merged[0].flush
         assert texts(
@@ -862,6 +1115,41 @@ class TestEmbeds:
         assert texts(
             format_for_discord(ev("run.deliver", repo="o/r", pr=9, url="https://x/pull/9", round=2))
         ) == ["🔀 PR [#9 · o/r](https://x/pull/9) (round 2)"]
+        waiting = format_for_discord(
+            ev(
+                "run.awaiting_review",
+                pr=9,
+                url="https://x/pull/9",
+                approvals_required=2,
+                code_owners=True,
+            )
+        )
+        assert texts(waiting) == [
+            "👀 **awaiting review** PR [#9](https://x/pull/9) — the base requires 2 approving "
+            "review(s) from a code owner (0/2 so far); waiting for a reviewer on GitHub"
+        ]
+        assert waiting[0].flush
+        drafted = format_for_discord(ev("land.held_by_draft", pr=9, head="abc"))
+        assert texts(drafted) == [
+            "✋ PR #9 was converted to draft by a person — holding until it is marked ready "
+            "for review"
+        ]
+        assert drafted[0].flush
+        held = format_for_discord(
+            ev(
+                "run.awaiting_review",
+                pr=9,
+                url="https://x/pull/9",
+                approvals_required=0,
+                code_owners=False,
+                draft=True,
+            )
+        )
+        assert texts(held) == [
+            "✋ **held in draft** PR [#9](https://x/pull/9) — a person converted it to draft; "
+            "waiting for it to be marked ready for review"
+        ]
+        assert held[0].flush
 
 
 def tev(ts: float, type: str, **data: Any) -> Event:
@@ -934,6 +1222,30 @@ class TestRunSummary:
         work = fields["Needed work"]
         assert "• `t2` verify: **failed** — verify command failed: `pytest -q` (exit 1)" in work
         assert "• 1 policy denial(s)" in work
+
+    def test_summary_card_speaks_of_the_judge_for_a_workload(self) -> None:
+        """#757: the same ledgers, in the workload's words — the run.start
+        kind decides, so a resumed workload reads the same way."""
+        stats = RunStats()
+        for event in (
+            tev(100.0, "run.start", outcome="count things", kind="workload", resumed=True),
+            tev(101.0, "run.tasks", tasks=[{"id": "t1"}, {"id": "t2"}]),
+            tev(120.0, "task.output", task_id="t1", attempt=1, summary="ok", files=1),
+            tev(161.0, "task.state", task_id="t1", state="done", revisions=0),
+            tev(162.0, "task.end", task_id="t2", state="done", revisions=1),
+            tev(220.0, "run.end", state="completed"),
+        ):
+            stats.observe(event)
+        assert stats.kind == "workload"
+        for i in range(5):
+            stats.rework.append((f"t{i}", "judge", "failed", "nope"))
+        report = RunReport("r1", "completed", "2/2 tasks done", kind="workload")
+        card = summary_embed(stats, report, "completed")
+        fields = {n: v for n, v, _ in card.fields}
+        assert "PR" not in fields["Went well"]
+        assert "• 1 task(s) passed the judge without revision" in fields["Went well"]
+        assert "• … and 1 more judge failure(s)" in fields["Needed work"]
+        assert RunStats().kind == "code"
 
     def test_summary_card_degrades_without_stats(self) -> None:
         """A run the pump never saw events for still gets a summary; unknown
@@ -1364,10 +1676,25 @@ class TestStatusLineStages:
         assert s.render().startswith("🚀 landing · merging")
         s.observe(ev("land.undraft", pr=9))
         assert s.render().startswith("🚀 landing · out of draft")
+        s.observe(ev("land.held_by_draft", pr=9, head="abc"))
+        assert s.render().startswith("🚀 landing · held in draft by a person")
         s.observe(ev("land.update", pr=9, attempt=1, accepted=True))
         assert "updating from base (attempt 1)" in s.render()
         s.observe(ev("run.state", state="merged"))
         assert s.render().startswith("🎉 finished · 2/2 tasks done")
+
+    def test_workload_stages(self) -> None:
+        """A workload (#755) walks executing → judging → publishing: the
+        graph stage clears the line, the two after it name themselves."""
+        s = self._built()
+        s.observe(ev("run.state", state="executing"))
+        assert s.render() == "⏳ 1 task(s) planned\n✅ 1 done"
+        s.observe(ev("run.state", state="judging"))
+        assert s.render().startswith("⚖️ judging · re-running every task's check")
+        s.observe(ev("run.state", state="publishing"))
+        assert s.render().startswith("📤 publishing")
+        s.observe(ev("run.state", state="completed"))
+        assert s.render().startswith("✅ finished · 1/1 tasks done")
 
     def test_ci_red_and_blocked(self) -> None:
         s = self._built()

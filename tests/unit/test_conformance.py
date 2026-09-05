@@ -291,7 +291,8 @@ class TestSecretValueStdinProbe:
         outcome = by_id(report)[PROBE_SECRET_VALUE_STDIN]
         assert outcome.verdict == "stdin-available"
         assert outcome.drifts
-        assert any("#57" in drift for drift in outcome.drifts)
+        assert any("close the ps window" in drift for drift in outcome.drifts)
+        assert not any("#57" in drift for drift in outcome.drifts)  # no bare #N (#635)
 
     def test_unrecognized_help_is_visible_not_fatal(
         self, fake_sbx: FakeSbx, tmp_path: Path

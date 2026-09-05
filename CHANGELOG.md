@@ -8,6 +8,189 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **Console chat: one line per short message.** Every message was drawn
+  as a header line (time, author, reactions) with its text on the line
+  below, so a channel of one-liners read at half density. A short message
+  now reads as one line, as the design and Discord do; cards, code and
+  multi-line bodies still drop below their header.
+
+### Added
+
+- **Console config, secrets and doctor screens** (#774). The last
+  operator acts outside the console were editing the configuration,
+  judging the secret registrations and running the doctor. **Config**
+  (`7`) shows the resolved configuration with the layer that set each key,
+  the effective egress policy and the repositories, and edits
+  `sbxloop.toml`: a draft is validated by the real loader (against a
+  scratch copy, the user and environment layers applied) before it is
+  saved atomically with a timestamped backup, a restart is offered, and a
+  draft the loader refuses is never written; `$EDITOR` is a key away.
+  **Doctor** (`8`) runs the host checks and the sbx conformance probes in
+  the background with their progress, cached with their age; the live
+  probes and the GitHub probe ask first. **Secrets** (`S` from Doctor, or
+  the palette) lists the tracked registrations as `sbxloop secrets list`
+  judges them, cleans the stale ones after a dry run (typed) and rotates
+  the agent credential's registration from a hidden prompt (typed). The
+  CLI and the console now render from one fold each:
+  `sbxloop.cli.doctor.doctor_report` (which hands the host checks over
+  before the conformance suite runs, so `sbxloop doctor --deep` prints
+  its table before booting the sandbox), `sbxloop.cli.policyview.policy_view`,
+  and `secrets_context` / `secret_rows` / `clean_secrets` /
+  `rotate_registrations` in `sbxloop.sbx.secretstate`. A draft is
+  validated in place of the daemon's `sbxloop.toml` at the real discovered
+  root — the project cut-down included, so a repository-carried file's
+  ignored keys are named instead of "loads" — and the editor follows the
+  directory the daemon reports in `status` (`cwd`), not the console's.
+
+- **Console admin: sandboxes, daemon control, the journal, run operations,
+  a command palette** (#773). The console could watch and chat but every
+  operator act still meant leaving it for the CLI, `systemctl` or
+  `journalctl`. Every admin verb now runs through one path — refused
+  read-only, refused without a live daemon when the daemon must execute
+  it, confirmed by tier (`y`/`n`, or the target's name typed for the
+  destructive ones), run off the UI thread, reported, re-polled. A run's
+  header offers cancel (the daemon's current run through `ctl`, any other
+  through the `sbxloop cancel` store write), retry / requeue / abandon /
+  check-review / approve-merge / grant-rounds on its item, a detached
+  `sbxloop resume` for a run with no item, and a shell in either sandbox
+  with the terminal handed over. The Queue screen carries the item verbs
+  (with the CLI's row-only twin when no daemon runs) and a new run the
+  daemon's way (the concierge files the issue) or a detached `sbxloop run`.
+  **Sandboxes** (`5`) is `sbx ls` classified as `sandbox prune` classifies
+  it plus the run directories `gc` would remove; shell, stop, remove,
+  prune and gc behind typed confirmations. **Daemon** (`6`) is the systemd
+  user unit (`[tui] daemon_unit`, `--unit`) with start / stop / restart,
+  the process behind `status`, pause / resume / cancel / graceful stop,
+  versions with `[daemon] upgrade_command`, per-repository health with
+  resume, and the journal streamed through the credential redactor with a
+  grep and a level floor; with no unit, `D` spawns a supervised
+  `sbxloop daemon` from the console. `ctrl+p` opens a command palette of
+  every screen and argument-less verb. `ControlClient` takes a `by` so the
+  source reads "cancelled by brett via sbxloop tui"; the concierge's
+  per-run usage fold is now `sbxloop.daemon.usage.usage_for_run`, shared
+  with the Phases tab's per-persona lines; the interactive shell argv is
+  `sbxloop.sbx.cli.INTERACTIVE_SHELL_ARGV`.
+
+- **`log` and `stop` operator commands** (#772). The daemon's recent log
+  lines were reachable only through the concierge's tool or `journalctl`
+  over ssh, and stopping the daemon gracefully was a signal. `!sbx log [--tail N] [--level L] [--grep TEXT]` and `sbxloop daemon ctl log` answer
+  from the in-process ring buffer — one rendering shared with the
+  concierge's `daemon_log` tool, so the three cannot drift — and `stop`
+  asks the daemon to claim nothing new and exit once the current run —
+  and any approved merge it is still landing — finishes (`cancel` first
+  to stop that run now); like every ctl request it is served only by a
+  live daemon, refused when stale, and audited. A log tail sent to chat
+  drops its oldest lines to fit the message, never its newest; `--tail`
+  and `--level` may follow `--grep`; `status` says when a stop is under
+  way; the stop flag goes up only once the reply is on its way, so a chat
+  bridge is not closed under its own answer; and the concierge's
+  `sbx_control` tool refuses `stop` — ending the process stays with a
+  person. Under a service manager that restarts the daemon (the shipped
+  unit does) `stop` is a restart that drops in-memory holds: `pause` is
+  the way to keep it off work.
+
+- **Console chat: the control channel and run threads** (#771). With the
+  shell alone an operator could watch a run but not speak to it. The Chat
+  screen and a run's Thread tab now show the daemon's local chat bridge —
+  the rows Discord or Slack would show — and the form under them writes
+  to it: `!sbx` verbs, concierge turns and steers by the bridge's own
+  routing rules (`@sbx`, the sticky `ctrl+t` address gesture, or `r` to
+  reply to the bot's latest row; plain text is left alone), a button per
+  clarifying-choice answer, the approve button on a merge gate. Edits,
+  reactions and resolved gates repaint in place; own rows show dimmed
+  until the daemon claims them; the bar counts unread control-channel
+  rows; `--read-only` disables the form.
+
+- **`sbxloop tui`: the operator console** (#770). A person on the daemon
+  host had the CLI's one-shot commands and journald. `sbxloop tui` is a
+  terminal console that reads the daemon's `state.db` read-only and asks
+  the daemon `status` through the `ctl` queue every few seconds: an
+  Overview (the run in flight, the queue, who waits on a human, recent
+  runs), Runs with a per-run screen (the `sbxloop run` transcript tailed
+  from the store, tasks, every phase attempt with its tokens and turns —
+  never a currency, landing state and the newest landing events,
+  artifacts, the dense event lines with a type filter), the Queue, and
+  Help. `--run` opens a run at once, `--read-only` removes every action,
+  `--state-dir` overrides the daemon's rule. Textual is a core dependency.
+  `docs/tui.md` documents the layout and keys; the docs' mention of a
+  `sbxloop watch` TUI that never shipped now names this. The chat screens
+  and the admin screens follow.
+
+- **The daemon always runs a local chat bridge for the operator console**
+  (#769). A person on the daemon host had the CLI and journald; everything
+  a run *shows* — the headline, the thread, the status line and tool digest
+  edited in place, steering, the concierge, clarifying-choice buttons, the
+  merge-gate approve button — existed only on Discord or Slack, and a
+  headless daemon had no concierge at all. The daemon now runs a
+  `LocalBridge` beside whatever `[chat] backend` names, through one
+  fan-out frontend: a third `ChatBridge` whose transport is a mailbox in
+  the daemon's own `state.db` (`daemon_local_messages`) — every message
+  the bridge would post becomes a row, edits rewrite it, reactions
+  decorate it, and what an operator types in `sbxloop tui` arrives as a
+  row the bridge claims, the same file-drop shape as the ctl queue. A row
+  typed before the daemon started is refused with a note, never executed.
+  The concierge is built whenever `[concierge] enabled`, headless
+  included — a headless host now boots the concierge sandbox at start and
+  needs the agent credential. `[tui]` carries the console's knobs
+  (`operator_id`, `emoji`, `daemon_unit`, `refresh_s`, `retention_days`)
+  beside the shared rendering ones; `[chat] backend` still names only the
+  external service. `sbxloop.daemon.mailbox.MailboxClient` is the
+  console's handle: read-only for state, one kind of write, no schema
+  statement — so a console never migrates a store under a running daemon.
+  Both stores open read-only for it (`readonly=True`: a `mode=ro` URI,
+  no schema statement). With two bridges up, each renders only the
+  requester and watcher ids it owns (a snowflake is Discord's, a member
+  id Slack's, a login name the console's), and the concierge words each
+  reply for the surface the message came in on. `ctl status` reports
+  `pid`, `started_at` and `version`; `sbxloop doctor` shows an `operator console` row and its concierge row no longer needs a chat backend. The
+  console itself (`sbxloop tui`) follows.
+
+### Changed
+
+- **Chat state is keyed by backend** (#768). The daemon is about to run
+  the operator console's local chat bridge beside Discord or Slack, and
+  the store assumed one bridge: `daemon_chat_threads` was keyed by run
+  alone, a run's watchers were one list that the first bridge to finish
+  drained, the merge gate's prompt location lived on the gate row, and
+  every bridge's clarification sweeper fired every backend's due asks.
+  Threads are now `(run, backend)` (the bare lookup prefers the external
+  backend's thread, what a link in prose points at), watches carry their
+  backend, gate prompts live in `daemon_gate_prompts` per backend, and a
+  sweep takes only its own backend's asks, and the clarification cap
+  counts one backend's asks. An existing store is rebuilt on open, once,
+  with the indexes recreated inside the rebuild's own transaction; a
+  pre-upgrade watch or gate prompt is filed under the backend that opened
+  the run's thread — a Slack daemon's under `slack` — and the gate row's
+  old prompt columns are cleared once carried, so the step is idempotent
+  through a rollback. Nothing changes for a one-bridge daemon.
+  `tests/fakes/legacy_db.py` freezes the shape before this as
+  `pre_local_bridge`.
+
+### Fixed
+
+- **No bare sbxloop issue numbers reach users** (#635). A provisioning
+  error ended "(see #46)", doctor's conformance drift rows carried
+  "(#57)", "(#250)", "(issue #122)", "(#592)", and the files
+  `sbxloop init` writes into the user's project said "(#533)" and
+  "(#568)" — references into sbxloop's tracker that read as noise, or as
+  the user's own repository's #N, to anyone not developing sbxloop. All
+  stripped; code comments and docstrings keep theirs.
+
+- **CI runs once per pull request** (#643). `ci.yml`'s push trigger was
+  `[main, "sbx/**"]` — a personal branch convention, and one that made
+  every job run twice on such a branch's PR (push and `pull_request`
+  both fire). It is `[main]` alone now; working branches are built
+  through their pull request. The loop's own `sbxloop/<run>` delivery
+  branches were never in the filter and stay that way, for the same
+  reason.
+
+- **Rollback keeps both chat extras** (#619). The deploy pipeline's rollback
+  reinstalled `sbxloop[discord]` while the upgrade installs
+  `sbxloop[discord,slack]`, so a rolled-back Slack host would have lost its
+  bridge. Both lines now install `[discord,slack]`, and
+  `test_deploy_workflow.py` asserts the two stay in step — in the
+  repository's own workflow and in the contrib example alike.
+
 - **Host commands follow `[agent] backend`** (#617). One descriptor
   (`sbxloop.backends`) says what each backend needs — credential env var
   and sbx binding host, the network hosts that credential path reaches,
@@ -60,7 +243,116 @@ All notable changes to sbxloop are documented here. The project adheres to
   instruction. No new knob: `[sandbox] extra_allow_domains` is where a CI
   host worth reading goes.
 
-### Added
+### Changed
+
+- **The version story no longer assumes the user's repository publishes
+  sbxloop** (#638). The concierge prompt, the `version_status` tool
+  description and `daemon/versions.py` said "the main branch publishes a
+  release on every merge" and told the operator to
+  `pip install --upgrade` in a venv — sbxloop's own release cadence and its
+  own install layout, presented to every host. They now say that
+  sbxloop's releases ship frequently while upgrading a host is an
+  operator's step, and the upgrade instruction renders from
+  `[daemon] upgrade_command` when set — otherwise "the exact command
+  depends on how sbxloop was installed (pip in a venv, pipx, `uv tool`, a
+  container image, a deploy pipeline)". The prompt's "the configured
+  repository" is now "a configured repository" (there may be several).
+
+- **The large-repo preset is package data, framed by gate duration**
+  (#636). `contrib/presets/large-repo.toml` moved to
+  `sbxloop/data/presets/large-repo.toml` inside the wheel (the contrib
+  path is a symlink to it), and its header no longer cites sbxloop's own
+  numbers as the reference case: the trigger is a repository whose gate
+  command takes two minutes or more, whatever its size. The template's
+  `[budgets]` comment and the README point at
+  `sbxloop init --preset large-repo` instead of a checkout path, so
+  nothing `sbxloop init` writes references a file outside the user's
+  project. (Recording observed gate duration so a second run self-sizes
+  its budgets stays a separate follow-up.)
+
+- **The deploy pipeline reads structured control, not files** (#639).
+  `deploy.yml` drives the daemon with `ctl status --json` + `jq` and posts
+  with `daemon notify`; no step sources `secrets.env`, parses
+  `sbxloop.toml` or calls the Discord API — a Slack-backend host deploys
+  unchanged. **Cutover:** the drain step fails closed when the running
+  daemon answers without a structured status, which a daemon older than
+  this release does, so the first deploy after it lands stops at "Wait for
+  the daemon to go idle" *before installing anything*. Upgrade once by hand
+  (contrib/systemd/README.md, "Upgrading"); every deploy after that is
+  unattended again.
+
+- **The deploy host is one variable** (#640). `deploy.yml` targets
+  `runs-on: [self-hosted, "${{ vars.SBXLOOP_DEPLOY_HOST || 'db' }}"]` and
+  derives every path from `$HOME` (job-level `env:` values are literals, so
+  a first step writes them to `$GITHUB_ENV`); moving the daemon is setting
+  the repository variable and registering a runner with that label — no
+  edit to the workflow, nothing `make check` runs. The
+  drain/hold/upgrade/health-check/rollback pattern ships as
+  `contrib/workflows/deploy-daemon.yml.example` (`schedule` +
+  `workflow_dispatch`, installs from PyPI, names nothing), and
+  `test_deploy_workflow.py` checks both files for the security invariant,
+  the extras parity and the absence of names.
+
+- **Deploy docs split** (#642). `docs/deploy.md` is now the generic "run the
+  daemon as a service and upgrade it" guide — no hostnames, usernames or
+  repository slugs, enforced by a test — and `docs/self-deploy.md` the
+  clearly labelled reference for how sbxloop deploys its own host, with the
+  cutover notes. The systemd README's upgrade section leads with the
+  two-command manual path (hold, wait for idle via `ctl status --json`,
+  pin, `reset-failed` + restart) and mentions the workflow as optional
+  automation; `github-runner.service` is marked as needed only for it. The
+  1.0 cutover steps moved from `docs/deploy.md` to this file (below).
+
+- **A gate against self-references in user-facing surfaces** (#645).
+  `scripts/check_self_references.py` (stdlib only; run by `make lint` and
+  the CI lint job, and by the unit suite) fails with `path:line: rule: text` on a bare `#N` in a prompt body below its contract header, in any
+  `raise`'s message in either package, in the CLI package's and the
+  conformance table's string literals, or in a file `sbxloop init`
+  writes; on an sbxloop source path inside a prompt body; and on a
+  maintainer or deploy-host identifier in any tracked file outside
+  `contrib/`, `docs/`, `.github/`, package metadata and tests. Comments
+  and docstrings are not surfaces. Deliberate exceptions live in one
+  reviewed file, `scripts/self-references.allow` (today: the concierge
+  prompt's worked-example numbers); an entry that matches nothing fails
+  the gate too, so the list cannot rot.
+
+- **`[daemon] version_check` and `[daemon] upgrade_command`** (#641, #638).
+  `version_check = false` switches the PyPI release lookup off for the
+  whole daemon — no startup drift check, no drift notice, and the
+  concierge's `version_status` reports the installed versions without
+  looking "latest" up (zero outbound HTTP, alongside the existing `.dev`
+  skip) — for hosts a pipeline upgrades, which retires the contradiction
+  between `docs/deploy.md` and the drift notice. `upgrade_command`
+  (e.g. `"pipx upgrade sbxloop"`) is what the drift notice and the
+  concierge's report tell the operator to run; unset, they say the command
+  depends on how sbxloop was installed. Both are `SBXLOOP_DAEMON__*`
+  overridable; a blank `upgrade_command` is a config error. Operators of
+  the self-deploy pipeline in `docs/self-deploy.md`: set
+  `version_check = false` on that host.
+
+- **`sbxloop init --preset NAME`** (#636) appends a packaged preset's live
+  sections to the starter file (`--stdout` streams the same), so
+  `sbxloop init --preset large-repo` yields one self-contained
+  `sbxloop.toml` from a wheel with no checkout around. Every table in the
+  template is commented out, so the appended `[budgets]`/`[limits]` are
+  the only live ones. An unknown name exits 2 naming the presets that
+  exist.
+
+- **`sbxloop daemon ctl status --json`** (#639) — the daemon's status as one
+  JSON object (`current`, `claiming`, `holds`, `paused`, `queued`, …) for
+  scripts, instead of grepping the prose, which is now free to change. The
+  reply carries the structured dict alongside the text; a daemon that
+  predates the flag answers prose only and `ctl` exits 1 ("answered without
+  a structured status") — distinct from exit 2, no daemon.
+
+- **`sbxloop daemon notify "<text>"`** (#639) — post one message to the
+  control channel through the configured `[chat] backend`, from the host
+  and without the daemon, so a deploy script can say "rollback also failed"
+  while the daemon is down. Reads the channel from `sbxloop.toml` and the
+  bot token from the environment (`DISCORD_BOT_TOKEN` / `SLACK_BOT_TOKEN`,
+  the working directory's `.env` included); Slack text is re-dialected the
+  way the bridge does it; link previews and pings are suppressed; a
+  headless daemon cannot notify and says so.
 
 - **`[github] api_url`** (#623) — the GitHub REST root
   (`https://api.github.com`; `https://ghe.example.com/api/v3` for GitHub
@@ -343,8 +635,6 @@ All notable changes to sbxloop are documented here. The project adheres to
   and tells the fixer to reproduce the failure with the project's own
   gate before changing anything. Every failing check's `details_url` /
   `target_url` is now in the brief.
-
-### Added
 
 - **The toolchain series a run provisions comes from the workspace** (#627).
   Every Python project got Python 3.13 and every Node project Node 24,
@@ -795,8 +1085,6 @@ All notable changes to sbxloop are documented here. The project adheres to
   removing the symptom is `request_changes` on the plan. Plain `body`
   filing still works.
 
-### Added
-
 - **Follow-up issues from a landed run** (#517). The reviewer's out-of-scope
   notes used to be prose in a review body nobody reads after the merge
   (run rfxja288b left two, both worth issues, both filed by hand).
@@ -953,8 +1241,6 @@ All notable changes to sbxloop are documented here. The project adheres to
   only once the upgrade step has, and the Discord deploy notices say whether
   the restart was deferred behind a run and how long it waited.
 
-### Added
-
 - **Review findings are reconciled on the pull request** (#520): between a
   fix round's re-delivery and the next review, the engine now speaks the
   fixer's per-finding answer back onto the review's own threads. Each
@@ -1027,8 +1313,6 @@ All notable changes to sbxloop are documented here. The project adheres to
 ### Changed
 
 - **Reverted #525** ("Remove Discord embeds from daemon bridge output in favour of plain markdown", #519): the plain-markdown bridge output read worse in the field than the embeds it replaced. Embeds, the `[discord]` keys #525 removed, and the previous rendering tests are back exactly as they were.
-
-### Added
 
 - **One daemon can tend several GitHub repositories** (#511). `sbxloop.toml`
   accepts an array of `[[github.repos]]` entries, each carrying its own
@@ -1166,7 +1450,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   that tolerance — `Config.retired_keys`, the `config.retired_keys`
   warning, the `retired config keys` doctor row — is gone, and an unknown
   key fails config loading like any other. Edit `sbxloop.toml` before
-  upgrading a 0.7.x host straight to 1.0 (docs/deploy.md, "1.0 cutover").
+  upgrading a 0.7.x host straight to 1.0 ("1.0 cutover", below).
 
 - **The run thread follows the pipeline.** The per-run status line now says
   which stage the run is in once its tasks are built — `🚦 gate`,
@@ -1245,7 +1529,7 @@ All notable changes to sbxloop are documented here. The project adheres to
 - **State cutover.** The daemon's tables changed shape (no PR-state,
   review, audit, post-mortem or backlog tables; one item kind). A pre-1.0
   `state.db` is moved aside to `state.db.pre-1.0` on first start rather
-  than migrated (docs/deploy.md, "1.0 cutover").
+  than migrated ("1.0 cutover", below).
 
 - **Removed with the above:** `sbxloop deliver` (resume at `delivering` is
   the retry path), `sbxloop run --report/--deliver/--deliver-draft`, the
@@ -1255,7 +1539,36 @@ All notable changes to sbxloop are documented here. The project adheres to
   transport does not forward the bearer token on the redirect to blob
   storage) and `GithubOps.checks_failed_logs` / `pr_review_feedback`.
 
-### Added
+### 1.0 cutover
+
+The 1.0 pipeline (one run from issue to merged PR; no self-filed audits,
+post-mortems or backlog issues; landing under `[landing]`) changes what the
+daemon keeps on disk and which config keys exist. Because a daemon host may
+deploy unattended, none of that may fail the restart:
+
+- **State.** A pre-1.0 `state.db` carries the old lanes' tables and item
+  kinds. On its first start the new daemon moves the whole file aside to
+  `state.db.pre-1.0` (plus `-wal`/`-shm`; a timestamp is appended if that
+  name is taken), logs `store.archived_legacy`, tells the control channel, and starts
+  with empty tables. Engine run history goes with it — both stores share the
+  file. Nothing is migrated; renaming the file back restores the old world
+  for a 0.7.x rollback.
+
+- **Config.** The retired keys — `[daemon] inbox_dir, backlog*, audits, audit_dir, audit_label, backlog_label, delivered_label, postmortems*, review_deliveries, await_review, review_rounds, tool_repo, tracking_issue, close_on_success, auto_merge` and `[github] report, deliver` — are unknown keys since 1.0.0 and fail config loading like any
+  other (`Extra inputs are not permitted`). The `deliver_draft`,
+  `merge_method`, `delete_branch_on_merge` and `merge_update_attempts`
+  knobs live under `[landing]`. The two releases before 1.0.0 (0.7.55,
+  0.7.56) tolerated them with a `config.retired_keys` warning and a
+  `sbxloop doctor` row precisely so an unattended deploy could not fail on
+  them; a host that skipped those releases must edit `sbxloop.toml` before
+  installing 1.0, or the daemon will not start (an automated deploy's
+  health check then rolls back).
+
+- **Issues and labels.** The old loop's `sbxloop:backlog` / `sbxloop:audit`
+  issues are closed by hand at cutover (`gh issue close --reason "not planned"`), those two labels and `sbxloop:delivered` deleted, and
+  `sbxloop:blocked` created. Any of the old loop's PRs still open
+  (`gh pr list --search "head:sbxloop/ is:open"`) are merged or closed by
+  hand — their items went with the archived state.
 
 - **The loop can land its own pull request (`[daemon] auto_merge`, default
   off).** *(Superseded above before release: landing is now unconditional
@@ -1269,6 +1582,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   `squash`), `delete_branch_on_merge` (default `true`), and
   `merge_update_attempts` (default 3, `0` disables branch updating).
   Details:
+
   - Off by default on purpose. Merging is the only irreversible thing
     sbxloop does to a repository, and on a repo whose merges publish — this
     one releases to PyPI and redeploys the daemon host on every merge to
@@ -1521,8 +1835,6 @@ All notable changes to sbxloop are documented here. The project adheres to
   spending an engine run — the field case burned three items and four runs
   auditing a PR that had already landed.
 
-### Added
-
 - **Per-phase usage columns on `phase_attempts`.** Every phase attempt row
   now bills the tokens and model turns its agent sessions actually spent:
   `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`,
@@ -1657,8 +1969,6 @@ All notable changes to sbxloop are documented here. The project adheres to
   the daemon's checkout, which fetched it but never checked it out. The clone
   therefore asks the source for that exact ref rather than mutating it.
 
-### Added
-
 - **A delivered item is not done until its PR is accepted.** `_settle` used to
   call `mark_done` the moment a run succeeded and a PR existed. Nothing looked
   at CI: PR #389 was settled as done with `mdformat` and `security` failing,
@@ -1721,8 +2031,6 @@ All notable changes to sbxloop are documented here. The project adheres to
 
   The ordinary backlog lane is untouched: an item with no recorded review
   target files exactly as before.
-
-### Added
 
 - **The concierge can read the daemon's recent log lines in chat.** "Why is
   nothing running?" used to be answerable only over ssh — the state store
@@ -1842,8 +2150,6 @@ All notable changes to sbxloop are documented here. The project adheres to
   definition current. A daemon that never starts still fails, at the deadline.
   The deploy's own `ctl status` budget goes 60s → 300s to cover a slow
   recovery.
-
-### Added
 
 - **Run cost is governed by turns, not jobs** — and four changes act on that.
   Field measurement of run `rews3ssdn` (7 tasks, 272 assistant turns across 25
@@ -2234,8 +2540,6 @@ All notable changes to sbxloop are documented here. The project adheres to
   `git status | awk '{print $2}'` guard printed whole lines and failed every
   revision and the replan of a correct change. The plan prompt says so too.
 
-### Added
-
 - **Discovery lane for the daemon**: issues carrying `[daemon] audit_label`
   (`sbxloop:audit`) are charters — the run investigates and files findings
   as `sbxloop:backlog` issues (evidence / repro / proposal / size / kind
@@ -2245,6 +2549,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   contract in the outcome text, and an audit-success comment that names what
   it filed (`RunReport.filed`) and always closes the audit issue. Discord
   cards and `daemon items` show the kind. Promotion stays a human label swap.
+
 - **Post-mortems the daemon files itself** (`[daemon] postmortems`, default
   on): when a patch item is abandoned or completes without delivering, the
   daemon opens a `sbxloop:audit` issue carrying a dossier — plan and verify
@@ -2252,6 +2557,7 @@ All notable changes to sbxloop are documented here. The project adheres to
   and the `SBXLOOP_STATE_DIR=… sbxloop logs <run>` line — so the discovery
   lane turns its own failures into evidenced findings. Once per run, never
   for audit items (no recursion), `postmortems_per_day` (3) cap.
+
 - **Scheduled area audits, charters versioned in the repo** (`[daemon] audits = true`, `audit_dir = ".github/sbxloop/audits"`): each
   `<name>.md` with front-matter `every: 7d` (and optional `enabled`) is a
   charter the daemon opens as an `audit: <name>` issue when due. GitHub is
@@ -2259,11 +2565,13 @@ All notable changes to sbxloop are documented here. The project adheres to
   created within the interval counts), the store is a cache; broken charters
   are reported once and skipped. sbxloop's own repo ships four:
   verify-lint-vs-prompts, daemon-guardrails, e2e-markers, test-flakes.
+
 - **Delivery reviews** (`[daemon] review_deliveries`, default on): after a
   patch item delivers a PR, the daemon opens `review: PR #N` as an audit
   charter — the loop evaluating the code it just wrote (defects, missing
   edge cases, scope drift, unjustified claims) and filing findings for a
   human to promote. Once per run, `reviews_per_day` (5) cap.
+
 - **Findings about the tool are routed, never dumped on the project.** The
   audit contract asks the agent to put findings about sbxloop itself
   (planner, prompts, lint, delivery, daemon) under

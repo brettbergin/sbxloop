@@ -24,7 +24,7 @@ subdomain), or the operator-only ``*`` (covers everything).
 from __future__ import annotations
 
 import re
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 
 from sbxloop.config import Config
 from sbxloop.errors import SbxError
@@ -196,18 +196,23 @@ def egress_rejection(domain: str, allow: list[str], deny: list[str]) -> str | No
     return None
 
 
-def effective_egress_bounds(config: Config) -> tuple[list[str], list[str]]:
+def effective_egress_bounds(config: Config, repo: str | None = None) -> tuple[list[str], list[str]]:
     """The (allow, deny) bounds plan-declared egress is checked against.
 
     The allow side is the operator's ``[policy] allow`` plus everything the
-    agent sandbox can already reach (its provision-time baseline and the
-    prompt-advertised hosts) — declaring an already-reachable domain must
-    never fail a plan. ``[policy] deny`` still wins over all of it.
+    agent sandbox can already reach (its provision-time baseline, the
+    prompt-advertised hosts and ``repo``'s private registries, #680) —
+    declaring an already-reachable domain must never fail a plan.
+    ``[policy] deny`` still wins over all of it.
     """
+    from sbxloop.sbx import registries
     from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS
 
     allow = [
         *AGENT_ALLOW_DOMAINS,
+        # Open registries only: a credentialed one is the service
+        # sandbox's, and the agent never reaches it (#766).
+        *registries.domains(config.open_registries_for(repo)),
         *config.sandbox.extra_allow_domains,
         *PROMPT_ADVERTISED_DOMAINS,
         *WELL_KNOWN_REGISTRY_DOMAINS,
@@ -228,14 +233,27 @@ class EgressGranter:
     (e.g. across a resume).
     """
 
-    def __init__(self, cli: SbxCLI, config: Config, bus: EventBus, run_id: str, sandbox: str):
+    def __init__(
+        self,
+        cli: SbxCLI,
+        config: Config,
+        bus: EventBus,
+        run_id: str,
+        sandbox: str,
+        repo: str | None = None,
+        extra_allow: Sequence[str] = (),
+    ):
+        from sbxloop.sbx import registries
         from sbxloop.sbx.provision import AGENT_ALLOW_DOMAINS
 
         self.cli = cli
         self.bus = bus
         self.run_id = run_id
         self.sandbox = sandbox
-        self.allow, self.deny = effective_egress_bounds(config)
+        self.allow, self.deny = effective_egress_bounds(config, repo)
+        # A workload profile's egress (#758) widens what its plan may ask
+        # for; `[policy] deny` still wins.
+        self.allow += [p.lower() for p in extra_allow]
         self._granted = {
             d.lower()
             for d in (
@@ -245,6 +263,7 @@ class EgressGranter:
                 # granted" (``apply`` refuses it on the deny check first
                 # either way, but the set should describe reality).
                 *baseline_allows(PROMPT_ADVERTISED_DOMAINS, self.deny),
+                *registries.domains(config.open_registries_for(repo)),
                 *config.sandbox.extra_allow_domains,
             )
         }

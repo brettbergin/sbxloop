@@ -25,6 +25,7 @@ from tests.fakes.legacy_db import (
     engine_db,
     every_daemon_row,
     insert_phase_row,
+    insert_row,
     insert_run_row,
     raw_daemon_rows,
 )
@@ -84,6 +85,70 @@ class TestDaemonShapes:
             assert store.upsert_new(item("4", item_id="gh:o/b:issue:4", repo="o/b"), 1.0)
             store.close()
 
+    def test_pre_local_bridge_chat_state_survives(self, tmp_path: Path) -> None:
+        """Threads, watches and the gate prompt written by a one-bridge
+        daemon read back under the backend they were recorded for once the
+        tables are keyed per backend, and a reopen changes nothing."""
+        path = daemon_db(tmp_path, "pre_local_bridge")
+        insert_row(
+            path,
+            "daemon_chat_threads",
+            run_id="r1",
+            backend="discord",
+            channel_id="42",
+            thread_id="4242",
+            headline_id="100",
+            status_id=None,
+        )
+        insert_row(
+            path,
+            "daemon_chat_threads",
+            run_id="r2",
+            backend="slack",
+            channel_id="C1",
+            thread_id="1724968573.123456",
+            headline_id="1724968573.123456",
+            status_id="1724968574.000100",
+        )
+        insert_row(path, "daemon_run_watches", run_id="r1", watcher_id="u1", created_at=1.0)
+        insert_row(
+            path,
+            "daemon_merge_gates",
+            run_id="r_gate",
+            item_id="gh:issue:3",
+            repo="o/r",
+            pr_number=9,
+            custom_id="tok",
+            prompt_channel_id="42",
+            prompt_message_id="555",
+            created_at=1.0,
+        )
+        insert_row(
+            path,
+            "daemon_chat_threads",
+            run_id="r_gate",
+            backend="discord",
+            channel_id="42",
+            thread_id="4343",
+        )
+        for _ in range(2):
+            store = DaemonStore(path)
+            assert store.chat_thread("r1") == ("42", "4242", "100", None, "discord")
+            assert store.chat_thread("r2", "slack") == (
+                "C1",
+                "1724968573.123456",
+                "1724968573.123456",
+                "1724968574.000100",
+                "slack",
+            )
+            assert store.chat_thread("r1", "local") is None
+            assert store.run_for_thread("1724968573.123456", "slack") == "r2"
+            assert store.all_run_watches("discord") == {"r1": ["u1"]}
+            assert store.all_run_watches("local") == {}
+            assert store.gate_prompt("r_gate", "discord") == ("42", "555")
+            assert store.gate_prompt("r_gate", "local") is None
+            store.close()
+
 
 class TestEngineShapes:
     @pytest.mark.parametrize("shape", sorted(ENGINE_SHAPES))
@@ -110,8 +175,11 @@ class TestEngineShapes:
         assert (run.review_rounds, run.ci_rounds, run.granted_rounds) == (0, 0, 0)
         assert run.exhausted is None and run.stage is None and run.pr_number is None
         assert store.get_run_guidance("old") == []
+        assert run.credentials == []
         if shape == "pre_usage":
             assert store.phase_attempts("old")[0]["input_tokens"] is None
         # The new columns are writable, and a reopen does not re-apply the ALTERs.
         assert store.grant_rounds("old", 1) == 1
-        assert StateStore(path).get_run("old").granted_rounds == 1
+        store.set_run_credentials("old", ["weather"])
+        reopened = StateStore(path).get_run("old")
+        assert (reopened.granted_rounds, reopened.credentials) == (1, ["weather"])

@@ -18,9 +18,16 @@ import pytest
 from sbxloop import hostgit
 from sbxloop.config import Config
 from sbxloop.daemon.loop import DaemonLoop, RunHandle, day_window
-from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
+from sbxloop.daemon.model import DaemonNotice, RunReport, TaskOutcome, WorkItem
+from sbxloop.daemon.sources import IssueComment, IssueContext, LinkedIssue
 from sbxloop.daemon.store import DaemonStore
-from sbxloop.engine.model import TERMINAL_RUN_STATES, RunResult, TaskRecord, TaskSpec
+from sbxloop.engine.model import (
+    TERMINAL_RUN_STATES,
+    RunResult,
+    TaskOutput,
+    TaskRecord,
+    TaskSpec,
+)
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
@@ -177,10 +184,29 @@ class Harness:
                 reason=reason,
                 exhausted="review",
             )
-        if kind in ("merged", "blocked", "gated"):
+        if kind in ("merged", "blocked", "gated", "awaiting_review", "held_by_draft"):
             self.store.set_run_pr(
                 run_id, number=9, url=PR_URL, branch=f"sbxloop/{run_id}", head_sha="abc"
             )
+        if kind in ("awaiting_review", "held_by_draft"):
+            # The engine's record of the park (#675): what the base wants —
+            # or, `held_by_draft`, a person's draft hold (#677).
+            draft = kind == "held_by_draft"
+            self.store.append_event(
+                Event(
+                    ts=self.clock(),
+                    run_id=run_id,
+                    job_id=None,
+                    type="run.awaiting_review",
+                    data={
+                        "pr": 9,
+                        "approvals_required": 0 if draft else 2,
+                        "code_owners": False,
+                        "draft": draft,
+                    },
+                )
+            )
+            kind = "awaiting_review"
         if kind == "blocked":
             reason = "GitHub would not merge it: a protection rule wants an approval"
             self.store.set_run_reason(run_id, reason)
@@ -507,6 +533,146 @@ class TestOutcomeAndConfig:
         assert "GitHub issue #4 in o/r (https://x/issues/4)" in text
         assert "sbxloop-claim" not in text
         assert "backlog" not in text and "AUDIT" not in text
+        # A source with no discussion to offer changes nothing.
+        assert "Discussion" not in text and "Linked" not in text
+
+
+class ContextSource(FakeSource):
+    """A source whose issues carry a discussion (#691)."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.context = IssueContext(
+            comments=(
+                IssueComment("alice", "2026-08-30", "Actually the repro is `make check`."),
+                IssueComment("bob", "2026-08-31", "Keep the API shape from #9."),
+                IssueComment("carol", "2026-09-01", "Agreed; ship it."),
+            ),
+            omitted=0,
+            linked=(
+                LinkedIssue(123, "The earlier fix", "closed", "We did it this way.", "issue"),
+                LinkedIssue(9, "API reshape", "open", "", "pull request"),
+            ),
+        )
+        self.asked: list[tuple[str, Any]] = []
+        self.fail: Exception | None = None
+
+    def issue_context(self, item: WorkItem, **kwargs: Any) -> IssueContext:
+        self.asked.append((item.item_id, kwargs.get("own")))
+        if self.fail is not None:
+            raise self.fail
+        return self.context
+
+
+class TestOutcomeContext:
+    """The outcome carries the issue's discussion and linked issues (#691):
+    the substance of a real tracker's issue is in its comments."""
+
+    def harness(self, tmp_path: Path, **budgets: Any) -> Harness:
+        cfg = Config.model_validate(
+            {"state_dir": str(tmp_path / "state"), "github": {"repo": "o/r"}, "budgets": budgets}
+        )
+        h = Harness(tmp_path, cfg)
+        h.source = ContextSource()
+        h.loop.source = h.source
+        return h
+
+    def test_the_discussion_and_the_links_follow_the_body(self, tmp_path: Path) -> None:
+        h = self.harness(tmp_path)
+        text = h.loop.outcome_text(gh_item("4", title="Fix it", body="details"))
+        assert text.startswith("Fix it\n\ndetails\n\n## Discussion (3 comments)\n\n")
+        assert "**@alice** (2026-08-30): Actually the repro is `make check`." in text
+        assert "**@carol** (2026-09-01): Agreed; ship it." in text
+        assert "## Linked issues\n- #123 (closed) — The earlier fix: We did it this way.\n" in text
+        assert "- #9 (open pull request) — API reshape\n" in text
+        assert text.endswith(
+            "---\nThis work item came from: GitHub issue #4 in o/r (https://x/issues/4)."
+        )
+        # Without a GitHub client the loop has no identity to hand the
+        # source: it asks with the unknown one rather than not at all.
+        assert h.source.asked == [("gh:issue:4", ("", None))]
+
+    def test_the_loops_identity_is_handed_to_the_source(self, tmp_path: Path) -> None:
+        """With a GitHub client the loop resolves who it is — the App slug
+        here — so the source can leave its comments out; a client that
+        cannot answer costs the run nothing but that exclusion."""
+
+        class Provisioner:
+            login: str | None = "sbxloop[bot]"
+
+            def gh_bot_login(self, repo: str | None = None) -> str | None:
+                return self.login
+
+        class Ops:
+            def raw(self, method: str, path: str, body: Any = None) -> Any:
+                raise WorkerError("sandbox gone")
+
+        class Github:
+            provisioner = Provisioner()
+            failures: list[str] = []  # noqa: RUF012 - per-test scripting
+
+            def ops(self) -> Any:
+                return Ops()
+
+            def note_failure(self, exc: BaseException) -> bool:
+                self.failures.append(str(exc))
+                return False
+
+        h = self.harness(tmp_path)
+        h.loop.github = Github()  # type: ignore[assignment]
+        h.loop.outcome_text(gh_item("4"))
+        assert h.source.asked[-1] == ("gh:issue:4", ("sbxloop[bot]", True))
+        assert Github.failures == []
+        Github.provisioner.login = None
+        text = h.loop.outcome_text(gh_item("4"))
+        assert h.source.asked[-1] == ("gh:issue:4", ("", None))
+        assert Github.failures == ["sandbox gone"]
+        assert "**@alice**" in text
+
+    def test_omitted_comments_are_counted(self, tmp_path: Path) -> None:
+        h = self.harness(tmp_path)
+        h.source.context = h.source.context._replace(omitted=7, linked=())
+        text = h.loop.outcome_text(gh_item("4"))
+        assert (
+            "## Discussion (10 comments)\n\n(7 earlier comments omitted; the latest are shown)"
+            in text
+        )
+        assert "Linked issues" not in text
+
+    def test_the_budget_cuts_the_discussion_and_says_so(self, tmp_path: Path) -> None:
+        h = self.harness(tmp_path, outcome_max_chars=1_000)
+        h.source.context = h.source.context._replace(
+            comments=tuple(IssueComment("alice", "2026-08-30", "x" * 300) for _ in range(6))
+        )
+        body = "b" * 200
+        text = h.loop.outcome_text(gh_item("4", title="Fix it", body=body))
+        assert len(text) <= 1_000
+        assert text.startswith(f"Fix it\n\n{body}\n\n## Discussion (6 comments)")
+        assert "(discussion clipped by [budgets] outcome_max_chars=1000: " in text
+        assert "chars not shown — the issue on GitHub has the rest)" in text
+        assert text.endswith(
+            "This work item came from: GitHub issue #4 in o/r (https://x/issues/4)."
+        )
+        # Linked issues sit after the discussion, so they are what the cut takes first.
+        assert "Linked issues" not in text
+
+    def test_the_body_is_never_cut_even_past_the_budget(self, tmp_path: Path) -> None:
+        h = self.harness(tmp_path, outcome_max_chars=1_000)
+        body = "b" * 1_500
+        text = h.loop.outcome_text(gh_item("4", title="Fix it", body=body))
+        assert body in text
+        assert "(discussion clipped by [budgets] outcome_max_chars=1000: " in text
+        assert "**@alice**" not in text
+
+    def test_an_unreadable_discussion_is_said_not_hidden(self, tmp_path: Path) -> None:
+        h = self.harness(tmp_path)
+        h.source.fail = SbxError("github op raw.api failed: HTTP 502")
+        text = h.loop.outcome_text(gh_item("4", title="Fix it", body="details"))
+        assert text.startswith(
+            "Fix it\n\ndetails\n\n(The issue's comments could not be read — SbxError: "
+        )
+        assert "HTTP 502" in text and "the title and body above are the whole ask" in text
+        assert text.endswith("(https://x/issues/4).")
 
     def test_item_config_pins_the_issue_and_nothing_else(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
@@ -2714,3 +2880,114 @@ class TestRepoHealthSurface:
         assert h.loop.status()["repos"] == []
         with pytest.raises(ValueError, match="only a multi-repository daemon"):
             h.loop.resume_repo("o/a")
+
+
+class TestWorkloadReport:
+    """#757: the report the frontends get for a workload carries each task's
+    output and the judge's verdict, and the same closing line the engine's
+    RunResult does, read from the same store rows."""
+
+    @staticmethod
+    def _seed(h: Harness, run_id: str = "w1") -> None:
+        h.store.create_run(run_id, "count the lines", kind="workload")
+        h.store.set_run_title(run_id, "Count the lines")
+        h.store.save_tasks(
+            run_id,
+            [
+                TaskSpec(id="t1", title="Fetch"),
+                TaskSpec(id="t2", title="Count"),
+                TaskSpec(id="t3", title="Report"),
+            ],
+        )
+        t1, t2, t3 = h.store.get_tasks(run_id)
+        t1.state, t1.output = "done", TaskOutput(summary="fetched 3 files", files=["a", "b", "c"])
+        t2.state, t2.output = "failed", TaskOutput(summary="counts written", files=["x"])
+        t3.state = "skipped"
+        for t in (t1, t2, t3):
+            h.store.update_task(run_id, t)
+        h.store.record_phase(
+            run_id,
+            "judge",
+            task_id="t1",
+            attempt=1,
+            status="ok",
+            output_json='{"passed": true, "unmet": [], "notes": ""}',
+            started_at=1.0,
+        )
+        for attempt, row in enumerate(
+            (
+                '{"passed": true, "unmet": []}',
+                '{"passed": false, "unmet": ["`summary.csv` has one row per file", "sorted"]}',
+            ),
+            start=1,
+        ):
+            h.store.record_phase(
+                run_id,
+                "judge",
+                task_id="t2",
+                attempt=attempt,
+                status="ok",
+                output_json=row,
+                started_at=float(attempt),
+            )
+        h.store.set_run_state(run_id, "completed")
+
+    def test_report_carries_outputs_verdicts_and_the_closing_line(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        self._seed(h)
+        report = h.loop._report("w1", None)
+        assert report.kind == "workload" and report.state == "completed"
+        assert report.task_summary == "1/3 tasks done"
+        assert report.pr is None and report.branch is None
+        assert report.outputs == (
+            TaskOutcome("t1", "Fetch", "done", "fetched 3 files", 3, "passed"),
+            TaskOutcome(
+                "t2",
+                "Count",
+                "failed",
+                "counts written",
+                1,
+                "failed — unmet: `summary.csv` has one row per file (+1 more)",
+            ),
+            TaskOutcome("t3", "Report", "skipped", "", 0, None),
+        )
+        assert report.summary == (
+            "Count the lines — 1/3 task(s) passed the judge\n"
+            "t1: fetched 3 files (3 files)\n"
+            "t2: counts written (1 file)"
+        )
+
+    def test_a_degraded_judge_row_reads_as_failed_closed(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        self._seed(h)
+        h.store.record_phase(
+            "w1",
+            "judge",
+            task_id="t2",
+            attempt=3,
+            status="failed",
+            output_json='{"passed": false, "unmet": [], "degraded": true}',
+            started_at=3.0,
+        )
+        outcomes = {o.task_id: o.verdict for o in h.loop._report("w1", None).outputs}
+        assert outcomes["t2"] == "no usable verdict — failed closed"
+        h.store.record_phase(
+            "w1", "judge", task_id="t2", attempt=4, status="ok", output_json="{", started_at=4.0
+        )
+        assert {o.task_id: o.verdict for o in h.loop._report("w1", None).outputs}["t2"] == "failed"
+
+    def test_a_code_run_report_has_no_outputs(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [gh_item()]
+        assert h.loop.tick().outcome == "done"
+        run_id = h.runs[0][0]
+        report = h.loop._report(run_id, None)
+        assert report.kind == "code" and report.outputs == () and report.summary is None
+
+    def test_result_from_record_keeps_the_kind_and_the_summary(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        self._seed(h)
+        result = h.loop._result_from_record("w1")
+        assert result.kind == "workload" and result.state == "completed"
+        assert result.summary == h.loop._report("w1", None).summary
+        assert [tid for tid, _ in result.outputs] == ["t1", "t2"]
