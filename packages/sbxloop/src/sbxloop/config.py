@@ -55,9 +55,10 @@ ENV_PREFIX = "SBXLOOP_"
 RESERVED_ENV_KEYS = frozenset({"worker_backend", "echo_script"})
 
 # Environment the loop delivers to a sandbox itself (#679): the credentials
-# it mints and the worker's own selectors. Operator `[sandbox] env` /
-# `secret_env` may not name them — a config that did would either clobber
-# the run's credential or be clobbered silently, and neither is a setting.
+# it mints and the worker's own selectors. Operator `[sandbox] env` and a
+# registry's `auth_env` may not name them — a config that did would either
+# clobber the run's credential or be clobbered silently, and neither is a
+# setting.
 LOOP_MANAGED_ENV = frozenset(
     {"GH_TOKEN", "GITHUB_TOKEN", "GH_REPO", COPILOT_TOKEN_ENV, ANTHROPIC_TOKEN_ENV}
 )
@@ -97,6 +98,25 @@ def _check_env_names(names: Sequence[str], key: str) -> None:
             raise ValueError(
                 f"{key}: {name} is delivered by sbxloop itself and cannot be configured"
             )
+
+
+_REMOVED_KEY_GUIDANCE = (
+    "{where} secret_env is no longer supported (#766): the only credential in the "
+    "agent sandbox is the agent's own. A registry credential belongs on its "
+    "[[registries]] entry as auth_env (used in the service sandbox, which fetches "
+    "the dependencies), a key a workload calls with belongs under [[credentials]] "
+    "(used through the service sandbox), and a secret only the test suite needs "
+    'belongs to CI (verify_mode = "ci-only" or "advisory")'
+)
+
+
+def _refuse_secret_env(data: Any, where: str) -> Any:
+    """Fail a `secret_env` key by name, before `extra="forbid"` reduces it to
+    "Extra inputs are not permitted": the operator is told where each kind
+    of secret goes now."""
+    if isinstance(data, Mapping) and "secret_env" in data:
+        raise ValueError(_REMOVED_KEY_GUIDANCE.format(where=where))
+    return data
 
 
 WorkerTransport = Literal["stream", "poll"]
@@ -227,19 +247,14 @@ class SandboxConfig(_ConfigModel):
     fetch_tags: FetchTags = "auto"
     extra_allow_domains: list[str] = Field(default_factory=list)
     languages: list[str] = Field(default_factory=list)
-    # Operator environment for the agent sandbox (#679). `env` holds plain
-    # values — `RAILS_ENV`, `DATABASE_URL`, a `PIP_INDEX_URL` — written as
-    # given and visible wherever the config is; `secret_env` names variables
-    # whose VALUES are read from the daemon's own environment at provision
-    # time (an `NPM_TOKEN`) and delivered the way the loop delivers its own
-    # credentials: the 0600 in-VM env file or per-job stdin, never an `sbx`
-    # argument, event, or log line. A named secret the daemon does not hold
-    # fails provisioning by name (`sbxloop doctor` lists them first).
-    # Neither may name a variable the loop delivers itself (`GH_TOKEN`, the
-    # agent credential, `SBXLOOP_*`). A `[[github.repos]]` entry replaces
-    # either setting for its own runs.
+    # Operator environment for the agent sandbox (#679): plain values —
+    # `RAILS_ENV`, `DATABASE_URL`, a `PIP_INDEX_URL` — written as given and
+    # visible wherever the config is. It may not name a variable the loop
+    # delivers itself (`GH_TOKEN`, the agent credential, `SBXLOOP_*`). A
+    # `[[github.repos]]` entry replaces it for its own runs. There is no
+    # secret counterpart (#766): the only credential in the agent sandbox
+    # is the agent's own — see `_no_secret_env`.
     env: dict[str, str] = Field(default_factory=dict)
-    secret_env: list[str] = Field(default_factory=list)
     # OS packages and pre-run setup the toolchains do not cover (#681).
     # `apt_packages` join the resolved toolchains' apt install (a `libpq-dev`,
     # `protobuf-compiler`, a JDK for a Python project) — probed with `dpkg`
@@ -279,21 +294,10 @@ class SandboxConfig(_ConfigModel):
     def _check_setup_commands(cls, value: list[str]) -> list[str]:
         return _check_setup_commands(value, "sandbox.setup_commands")
 
-    @field_validator("secret_env")
+    @model_validator(mode="before")
     @classmethod
-    def _check_secret_env(cls, value: list[str]) -> list[str]:
-        _check_env_names(value, "sandbox.secret_env")
-        return list(dict.fromkeys(value))
-
-    @model_validator(mode="after")
-    def _env_and_secret_env_are_disjoint(self) -> SandboxConfig:
-        both = sorted(set(self.env) & set(self.secret_env))
-        if both:
-            raise ValueError(
-                f"sandbox.env and sandbox.secret_env both name {both}: a variable is "
-                "either a plain value or a secret read from the daemon's environment"
-            )
-        return self
+    def _no_secret_env(cls, data: Any) -> Any:
+        return _refuse_secret_env(data, "[sandbox]")
 
     @field_validator("clone_filter")
     @classmethod
@@ -357,19 +361,20 @@ _REGISTRY_NAME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*$")
 
 
 class RegistryConfig(_ConfigModel):
-    """One private package registry the agent sandbox must reach (#680).
+    """One private package registry a run's dependencies come from (#680).
 
-    `host` joins the sandbox's network allowlist; `kind` picks the client
-    file or environment sbxloop writes so the ecosystem's tooling actually
-    uses the registry (`~/.npmrc`, `PIP_INDEX_URL`, `GOPRIVATE`,
-    `~/.cargo/config.toml`, `~/.m2/settings.xml`, `NuGet.Config`,
-    `BUNDLE_*`) — see ``sbxloop.sbx.registries`` for what each kind
-    writes. `auth_env` names the daemon-environment variable holding the
-    credential; it is delivered like `[sandbox] secret_env` (never an
-    `sbx` argument, event, or log line) and referenced from the client
-    file by name wherever the ecosystem expands environment variables, so
-    only the `.netrc` kinds hold the value at rest (0600, in a VM the
-    agent owns anyway).
+    `kind` picks the client file or environment sbxloop writes so the
+    ecosystem's tooling actually uses the registry (`~/.npmrc`,
+    `PIP_INDEX_URL`, `GOPRIVATE`, `~/.cargo/config.toml`,
+    `~/.m2/settings.xml`, `NuGet.Config`, `BUNDLE_*`) — see
+    ``sbxloop.sbx.registries`` for what each kind writes. Without
+    `auth_env` the registry is the agent sandbox's own: `host` joins its
+    allowlist and the client file lands in its `$HOME`. With `auth_env`
+    (the daemon-environment variable holding the credential) the registry
+    belongs to the SERVICE sandbox (#766): host, credential and client file
+    go there, the dependencies are fetched there into a cache in the shared
+    workspace, and the agent sandbox — which never sees the credential —
+    builds offline from that cache.
     """
 
     kind: RegistryKind
@@ -377,8 +382,9 @@ class RegistryConfig(_ConfigModel):
     # The registry endpoint; required for every kind but `go` and `generic`,
     # which are host-only (a module path / any other host).
     url: str | None = None
-    # Daemon-environment variable holding the credential (delivered as a
-    # secret, #679) and, for the kinds that pair a login with it, the login.
+    # Daemon-environment variable holding the credential (delivered to the
+    # service sandbox, #766) and, for the kinds that pair a login with it,
+    # the login.
     auth_env: str | None = None
     auth_user: str | None = None
     # npm only: `@scope` served from this registry; unset → the default
@@ -747,7 +753,6 @@ class RepoConfig(_ConfigModel):
     # `[sandbox]` value, and a set value REPLACES it (restate what the
     # global setting held and this repository still needs).
     env: dict[str, str] | None = None
-    secret_env: list[str] | None = None
     # This repository's private registries (#680); None → the top-level
     # `[[registries]]`, and a set list REPLACES it.
     registries: list[RegistryConfig] | None = None
@@ -791,13 +796,10 @@ class RepoConfig(_ConfigModel):
             _check_env_names(list(value), "github.repos[].env")
         return value
 
-    @field_validator("secret_env")
+    @model_validator(mode="before")
     @classmethod
-    def _check_secret_env(cls, value: list[str] | None) -> list[str] | None:
-        if value is None:
-            return None
-        _check_env_names(value, "github.repos[].secret_env")
-        return list(dict.fromkeys(value))
+    def _no_secret_env(cls, data: Any) -> Any:
+        return _refuse_secret_env(data, "[[github.repos]]")
 
     @field_validator("registries")
     @classmethod
@@ -1943,15 +1945,6 @@ class Config(_ConfigModel):
             return dict(entry.env)
         return dict(self.sandbox.env)
 
-    def secret_env_for(self, repo: str | None = None) -> list[str]:
-        """The names whose values ``repo``'s agent sandbox receives from the
-        daemon's environment (#679): the entry's own list when set, else
-        `[sandbox] secret_env`."""
-        entry = self.github.effective_repo(repo)
-        if entry is not None and entry.secret_env is not None:
-            return list(entry.secret_env)
-        return list(self.sandbox.secret_env)
-
     @field_validator("registries")
     @classmethod
     def _check_registries(cls, value: list[RegistryConfig]) -> list[RegistryConfig]:
@@ -1983,16 +1976,28 @@ class Config(_ConfigModel):
         return entries
 
     def registries_for(self, repo: str | None = None) -> list[RegistryConfig]:
-        """The private registries ``repo``'s agent sandbox is configured for
-        (#680): the entry's own list when set, else `[[registries]]`."""
+        """The private registries ``repo``'s run is configured for (#680):
+        the entry's own list when set, else `[[registries]]`."""
         entry = self.github.effective_repo(repo)
         if entry is not None and entry.registries is not None:
             return list(entry.registries)
         return list(self.registries)
 
+    def credentialed_registries_for(self, repo: str | None = None) -> list[RegistryConfig]:
+        """The registries with an ``auth_env`` — the service sandbox's (#766):
+        it holds the credential and fetches from them. A registry without
+        one stays the agent sandbox's own; there is no secret to keep from
+        it."""
+        return [r for r in self.registries_for(repo) if r.auth_env is not None]
+
+    def open_registries_for(self, repo: str | None = None) -> list[RegistryConfig]:
+        """The registries without a credential, configured in the agent
+        sandbox as they always were."""
+        return [r for r in self.registries_for(repo) if r.auth_env is None]
+
     def registry_auth_envs_for(self, repo: str | None = None) -> list[str]:
         """The daemon-environment names the registries' credentials come
-        from — delivered as secrets beside :meth:`secret_env_for`."""
+        from — delivered to the service sandbox, never the agent's."""
         return list(
             dict.fromkeys(r.auth_env for r in self.registries_for(repo) if r.auth_env is not None)
         )
@@ -2022,17 +2027,11 @@ class Config(_ConfigModel):
         return self.sandbox.verify_mode
 
     @model_validator(mode="after")
-    def _repo_env_and_secret_env_are_disjoint(self) -> Config:
-        """A repository's *effective* pair must be disjoint too: an entry
-        that overrides only one of them can collide with the global other."""
-        for entry in self.github.repos:
-            both = sorted(
-                set(self.sandbox_env_for(entry.repo)) & set(self.secret_env_for(entry.repo))
-            )
-            if both:
-                raise ValueError(f"github.repos[{entry.repo}]: env and secret_env both name {both}")
-        # A registry's credential is a secret too (#680): plain env must not
-        # name it, in the global scope or any repository's effective one.
+    def _env_and_registry_credentials_are_disjoint(self) -> Config:
+        """A registry's credential is a secret (#680): plain env must not
+        name it, in the global scope or any repository's effective one (an
+        entry that overrides only one side can collide with the global
+        other)."""
         for scope in (None, *(entry.repo for entry in self.github.repos)):
             both = sorted(
                 set(self.sandbox_env_for(scope)) & set(self.registry_auth_envs_for(scope))

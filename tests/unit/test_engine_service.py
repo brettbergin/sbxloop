@@ -27,6 +27,7 @@ from sbxloop_worker.protocol import EventTypes
 from sbxloop_worker.serviceops import CATALOGUE_ENV, FAKE_ENV
 from tests.conftest import FakeSbx
 from tests.unit.test_engine import HAPPY_TASK, Harness, task, taskgraph
+from tests.unit.test_hostgit import git, make_repo
 
 VALUE = "wx-secret-value-9f8e7d"
 WEATHER = {
@@ -287,6 +288,247 @@ class TestUncredentialedRun:
             assert job.get("host_tools_dir") is None
             assert "Services you may call" not in job["prompt"]
             assert "call_service" not in job["prompt"]
+
+
+NPM_SECRET = "npm-registry-token-1a2b3c"  # nosec B105 - test fixture
+NPM_REGISTRY = {
+    "kind": "npm",
+    "host": "npm.example.com",
+    "url": "https://npm.example.com/npm/",
+    "auth_env": "NPM_TOKEN",
+}
+FETCH = {
+    "name": "fetch_dependencies",
+    "arguments": {"ecosystem": "npm", "packages": ["left-pad@1.3.0"]},
+    "call_id": "f1",
+}
+
+
+def build_with_fetch(*calls: dict[str, Any]) -> dict[str, Any]:
+    return {"text": "fetched what I needed", "host_tool_calls": list(calls)}
+
+
+@pytest.fixture
+def fake_npm(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """An `npm` on the fake sandbox's PATH that records what it was asked
+    (argv, cwd, the environment it saw) and echoes a registry URL with the
+    token in it — what a real npm does in verbose output."""
+    bin_dir = tmp_path / "npm-bin"
+    bin_dir.mkdir()
+    log = tmp_path / "npm-calls.jsonl"
+    npm = bin_dir / "npm"
+    npm.write_text(
+        "#!/bin/sh\n"
+        f'printf \'{{"argv": "%s", "cwd": "%s", "cache": "%s", "token": "%s"}}\\n\' '
+        f'"$*" "$PWD" "$npm_config_cache" "$NPM_TOKEN" >> "{log}"\n'
+        'echo "npm http fetch GET https://u:$NPM_TOKEN@npm.example.com/npm/left-pad"\n'
+        'echo "added 1 package"\n'
+    )
+    npm.chmod(0o755)
+    monkeypatch.setenv("SBX_FAKE_PROFILE", f'export PATH="{bin_dir}:$PATH"\n')
+    monkeypatch.setenv("NPM_TOKEN", NPM_SECRET)
+    return log
+
+
+def npm_calls(log: Path) -> list[dict[str, Any]]:
+    if not log.is_file():
+        return []
+    return [json.loads(line) for line in log.read_text().splitlines()]
+
+
+class TestCredentialedRegistryRun:
+    """`[[registries]]` with `auth_env` (#766): the service sandbox holds the
+    credential and fetches; the agent sandbox is offline for the ecosystem
+    and asks through `fetch_dependencies`."""
+
+    def workspace(self, harness: Harness, *, lockfile: bool = False) -> Path:
+        source = make_repo(harness.tmp_path)
+        (source / "package.json").write_text('{"name": "app", "dependencies": {}}\n')
+        if lockfile:
+            (source / "package-lock.json").write_text("{}\n")
+        git("add", ".", cwd=source)
+        git("commit", "-m", "npm project", cwd=source)
+        return source
+
+    def test_setup_fetches_in_the_service_box_and_the_agent_builds_offline(
+        self, harness: Harness, fake_npm: Path
+    ) -> None:
+        source = self.workspace(harness, lockfile=True)
+        harness.script([taskgraph(task("t1")), build_with_fetch(FETCH), *HAPPY_TASK[1:]])
+        engine = harness.engine(
+            registries=[NPM_REGISTRY], sandbox={"workspace": str(source)}, keep_sandboxes=True
+        )
+        result = engine.start("add left-pad")
+        assert result.succeeded, result.reason
+        run_id = result.run_id
+        created = {c[1].removeprefix("--name=") for c in harness.fake_sbx.invocations("create")}
+        assert created == {f"sbxloop-{run_id}-agent", f"sbxloop-{run_id}-service"}
+
+        # Two fetches ran, both in the service sandbox's workspace, both
+        # with scripts off: the setup one from the lockfile, the tool one
+        # naming the package. The credential was in their environment.
+        calls = npm_calls(fake_npm)
+        assert [c["argv"] for c in calls] == [
+            "ci --ignore-scripts",
+            "install --ignore-scripts left-pad@1.3.0",
+        ]
+        clone = result.workspace
+        assert clone is not None
+        for call in calls:
+            assert Path(call["cwd"]).resolve() == clone.resolve()
+            assert call["token"] == NPM_SECRET
+            assert call["cache"] == "/home/agent/.sbxloop/deps/npm"
+        fs = harness.fake_sbx.sandbox_fs(f"sbxloop-{run_id}-service")
+        kinds = [
+            json.loads(p.read_text())["kind"] for p in (fs / "home/agent/.sbxloop/jobs").iterdir()
+        ]
+        assert sorted(kinds) == ["service.fetch", "service.fetch"]
+
+        # The ledger: one sandbox.fetch per fetch, argv and exit, no value.
+        fetches = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_FETCH]
+        assert [(e.data["verb"], e.data["phase"], e.data["exit_code"]) for e in fetches] == [
+            ("fetch", "setup", 0),
+            ("add", "build", 0),
+        ]
+        assert fetches[1].data["ecosystem"] == "npm"
+        for event in harness.events:
+            assert NPM_SECRET not in json.dumps(event.data, default=str), event.type
+        # The tool text carried npm's output, the token blanked out of it.
+        (response,) = [e for e in harness.events if e.type == EventTypes.AGENT_TOOL_RESPONSE]
+        assert (response.data["name"], response.data["ok"]) == ("fetch_dependencies", True)
+        (message,) = [
+            e
+            for e in harness.events
+            if e.type == EventTypes.AGENT_MESSAGE and "added 1 package" in e.data.get("content", "")
+        ]
+        assert NPM_SECRET not in message.data["content"]
+        assert "u:***@npm.example.com" in message.data["content"]
+
+        # The agent sandbox: offline for npm, no credential, the tool on
+        # the build job only.
+        agent_home = harness.fake_sbx.sandbox_fs(f"sbxloop-{run_id}-agent") / "home/agent"
+        agent_sh = (agent_home / ".sbxloop/env.sh").read_text()
+        assert "export npm_config_offline=true\n" in agent_sh
+        assert "NPM_TOKEN" not in agent_sh
+        assert not (agent_home / ".npmrc").exists()
+        jobs = [job for job in harness.agent_jobs(run_id) if job.get("kind") == "agent.session"]
+        (build,) = [job for job in jobs if job.get("host_tools")]
+        assert [tool["name"] for tool in build["host_tools"]] == ["fetch_dependencies"]
+        assert build["host_tools"][0]["parameters"]["properties"]["ecosystem"]["enum"] == ["npm"]
+        assert "Services you may call" not in build["prompt"]
+        assert "## Dependencies" in build["prompt"] and "Ecosystems: npm" in build["prompt"]
+        # And the cache is one directory for both, kept out of git.
+        assert (clone / ".sbxloop" / "deps").is_dir()
+        assert ".sbxloop/" in (clone / ".git/info/exclude").read_text()
+
+    def test_a_refetch_after_a_manifest_edit_reconciles_the_lockfile(
+        self, harness: Harness, fake_npm: Path
+    ) -> None:
+        """The tool's no-package form after the agent edited package.json:
+        `npm ci` would refuse the outdated lockfile, so the tool path runs
+        `npm install`; the setup fetch keeps `ci`."""
+        source = self.workspace(harness, lockfile=True)
+        refetch = {**FETCH, "arguments": {"ecosystem": "npm"}, "call_id": "f4"}
+        harness.script([taskgraph(task("t1")), build_with_fetch(refetch), *HAPPY_TASK[1:]])
+        engine = harness.engine(registries=[NPM_REGISTRY], sandbox={"workspace": str(source)})
+        assert engine.start("bump deps").succeeded
+        assert [c["argv"] for c in npm_calls(fake_npm)] == [
+            "ci --ignore-scripts",
+            "install --ignore-scripts",
+        ]
+
+    def test_no_manifest_no_setup_fetch(self, harness: Harness, fake_npm: Path) -> None:
+        source = make_repo(harness.tmp_path)  # no package.json
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(registries=[NPM_REGISTRY], sandbox={"workspace": str(source)})
+        assert engine.start("plain").succeeded
+        assert npm_calls(fake_npm) == []
+        assert not [e for e in harness.events if e.type == HostEventTypes.SANDBOX_FETCH]
+
+    def test_a_failed_setup_fetch_fails_the_run_at_provisioning(
+        self, harness: Harness, fake_npm: Path
+    ) -> None:
+        npm = fake_npm.parent / "npm-bin" / "npm"
+        npm.write_text('#!/bin/sh\necho "npm ERR! 401 Unauthorized" >&2\nexit 1\n')
+        source = self.workspace(harness)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(registries=[NPM_REGISTRY], sandbox={"workspace": str(source)})
+        with pytest.raises(ProvisionError, match="dependency fetch for npm failed") as excinfo:
+            engine.start("add left-pad")
+        assert "npm install --ignore-scripts" in str(excinfo.value)
+        assert "401 Unauthorized" in str(excinfo.value)
+        assert harness.consumed() == 0  # no agent phase ran
+        # Left in provisioning like any infra failure: resumable once the
+        # credential (or the registry) is fixed.
+        assert harness.run_states() == ["provisioning"]
+        assert harness.sandboxes_left() == []
+        (fetch,) = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_FETCH]
+        assert fetch.data["exit_code"] == 1 and fetch.data["phase"] == "setup"
+
+    def test_a_request_outside_the_recipe_is_refused_without_a_job(
+        self, harness: Harness, fake_npm: Path
+    ) -> None:
+        source = make_repo(harness.tmp_path)
+        bad = {
+            **FETCH,
+            "arguments": {"ecosystem": "npm", "packages": ["--registry=https://evil.example"]},
+            "call_id": "f2",
+        }
+        other = {**FETCH, "arguments": {"ecosystem": "pypi"}, "call_id": "f3"}
+        harness.script([taskgraph(task("t1")), build_with_fetch(bad, other), *HAPPY_TASK[1:]])
+        engine = harness.engine(registries=[NPM_REGISTRY], sandbox={"workspace": str(source)})
+        assert engine.start("try").succeeded
+        assert npm_calls(fake_npm) == []
+        refused = [e for e in harness.events if e.type == HostEventTypes.SANDBOX_FETCH]
+        assert [e.data["error"] for e in refused] == [
+            "'--registry=https://evil.example' is not a package spec",
+            "no credentialed registry of kind 'pypi' for run "
+            f"{engine.store.list_runs()[0].run_id} (configured: npm)",
+        ]
+        responses = [e for e in harness.events if e.type == EventTypes.AGENT_TOOL_RESPONSE]
+        assert [r.data["ok"] for r in responses] == [False, False]
+
+    def test_no_workspace_view_in_the_service_box_fails_closed(
+        self, harness: Harness, fake_npm: Path
+    ) -> None:
+        harness.monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        source = self.workspace(harness)
+        harness.script([taskgraph(task("t1")), *HAPPY_TASK])
+        engine = harness.engine(registries=[NPM_REGISTRY], sandbox={"workspace": str(source)})
+        with pytest.raises(ProvisionError, match=r"was not visible inside the .* sandbox"):
+            engine.start("add left-pad")
+        assert harness.consumed() == 0
+
+    def test_credentials_and_registries_share_the_one_service_box(
+        self, harness: Harness, fake_npm: Path, fake_service: Path
+    ) -> None:
+        source = self.workspace(harness)
+        harness.script([taskgraph(task("t1")), build_with_call(CALL), *HAPPY_TASK[1:]])
+        engine = harness.engine(
+            registries=[NPM_REGISTRY],
+            credentials=[WEATHER],
+            sandbox={"workspace": str(source)},
+            keep_sandboxes=True,
+        )
+        result = engine.start("weather", credentials=["weather"])
+        assert result.succeeded, result.reason
+        run_id = result.run_id
+        created = {c[1].removeprefix("--name=") for c in harness.fake_sbx.invocations("create")}
+        assert len(created) == 2
+        assert [c["argv"] for c in npm_calls(fake_npm)] == ["install --ignore-scripts"]
+        assert len(requests_sent(fake_service)) == 1
+        jobs = [job for job in harness.agent_jobs(run_id) if job.get("kind") == "agent.session"]
+        (build,) = [job for job in jobs if job.get("host_tools")]
+        assert [tool["name"] for tool in build["host_tools"]] == [
+            "call_service",
+            "fetch_dependencies",
+        ]
+        rules = {
+            rule[2]
+            for rule in harness.fake_sbx.policies()
+            if f"sbxloop-{run_id}-service" in rule and rule[1] == "network"
+        }
+        assert {"api.weather.example.com", "npm.example.com", "registry.npmjs.org"} <= rules
 
 
 class TestServiceOps:

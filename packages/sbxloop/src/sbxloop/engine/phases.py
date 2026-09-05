@@ -42,6 +42,7 @@ from sbxloop.engine.model import SteerVerdict, TaskGraph, TaskRecord
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.repocontext import repo_conventions
 from sbxloop.engine.review import ReviewGuard, ReviewVerdict
+from sbxloop.engine.service import FETCH_TOOL_NAME
 from sbxloop.errors import WorkerError
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
@@ -346,18 +347,33 @@ class PhaseRunner:
         return bullet_list(self.user_guidance)
 
     def _service_tools_section(self) -> str:
-        """The build prompt's credentials section (#765), or "" — with its
-        own leading blank lines, so the template stays byte-identical for
-        a run that has no host tools."""
+        """The build prompt's host-tool sections — credentials (#765) and
+        the dependency fetcher (#766) — or "" — with their own leading
+        blank lines, so the template stays byte-identical for a run that
+        has no host tools."""
         if not self.host_tools:
             return ""
-        lines = [f"- `{tool.name}`: {tool.description}" for tool in self.host_tools]
-        return (
-            "\n\n## Services you may call\n\n"
-            "You hold no credential and cannot reach these hosts yourself; the run's "
-            "service sandbox makes each request for you through these tools. Every "
-            "call is logged by name, method and path:\n\n" + "\n".join(lines)
-        )
+        fetchers = [tool for tool in self.host_tools if tool.name == FETCH_TOOL_NAME]
+        services = [tool for tool in self.host_tools if tool.name != FETCH_TOOL_NAME]
+        text = ""
+        if services:
+            lines = [f"- `{tool.name}`: {tool.description}" for tool in services]
+            text += (
+                "\n\n## Services you may call\n\n"
+                "You hold no credential and cannot reach these hosts yourself; the run's "
+                "service sandbox makes each request for you through these tools. Every "
+                "call is logged by name, method and path:\n\n" + "\n".join(lines)
+            )
+        if fetchers:
+            lines = [f"- `{tool.name}`: {tool.description}" for tool in fetchers]
+            text += (
+                "\n\n## Dependencies\n\n"
+                "This project's private registries are reached only from the run's "
+                "service sandbox, which holds the credential; this sandbox is offline "
+                "for those ecosystems and installs from the shared cache. Ask for "
+                "packages through this tool; every fetch is logged:\n\n" + "\n".join(lines)
+            )
+        return text
 
     def _lint_verify_commands(self, commands: Sequence[str]) -> list[str]:
         """Verify-command lint under this run's toolchains and project shape.

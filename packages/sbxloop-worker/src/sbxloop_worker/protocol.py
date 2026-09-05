@@ -22,7 +22,9 @@ PROTOCOL_VERSION = 1
 # they are kept to a conservative identifier alphabet.
 HOST_TOOL_NAME_RE = r"^[A-Za-z0-9_-]{1,64}$"
 
-JobKind = Literal["agent.session", "shell.check", "shell.batch", "github.op", "service.http"]
+JobKind = Literal[
+    "agent.session", "shell.check", "shell.batch", "github.op", "service.http", "service.fetch"
+]
 JobStatus = Literal["ok", "error", "timeout"]
 PermissionMode = Literal["auto", "read_only"]
 ExpectMode = Literal["text", "json"]
@@ -207,7 +209,10 @@ class JobRequest(ProtocolModel):
     # built-ins (host tools only). Host tool names are always allowed.
     available_tools: list[str] | None = None
 
-    # kind == "shell.check"
+    # kind == "shell.check"; kind == "service.fetch": the package manager's
+    # argv as the host composed it from the ecosystem's fixed recipe (#766),
+    # run in the service sandbox with ``params`` naming the ecosystem and
+    # verb for the events — never a shell, never an argv the model wrote.
     argv: list[str] | None = None
 
     # kind == "shell.batch": shell command strings, each run via ``sh -c``
@@ -220,9 +225,9 @@ class JobRequest(ProtocolModel):
     # always bounds the job as a whole).
     command_timeout_s: float | None = None
 
-    # agent.session + shell.check: in-sandbox working directory. The worker
-    # process chdirs here (via --cwd) so agent sessions and shell commands
-    # run in the run's canonical workspace.
+    # agent.session + shell.check + service.fetch: in-sandbox working
+    # directory. The worker process chdirs here (via --cwd) so agent
+    # sessions and shell commands run in the run's canonical workspace.
     cwd: str | None = None
 
     # kind == "github.op": the op name and its parameters.
@@ -282,6 +287,14 @@ class JobRequest(ProtocolModel):
                 raise ValueError("service.http must not set op")
             if self.prompt is not None or self.argv is not None or self.commands is not None:
                 raise ValueError("service.http must not set prompt, argv, or commands")
+        elif self.kind == "service.fetch":
+            if not self.argv:
+                raise ValueError("service.fetch requires a non-empty argv")
+            missing = [k for k in ("ecosystem", "verb") if not self.params.get(k)]
+            if missing:
+                raise ValueError(f"service.fetch requires params {missing}")
+            if self.prompt is not None or self.commands is not None or self.op is not None:
+                raise ValueError("service.fetch must not set prompt, commands, or op")
         return self
 
 
@@ -389,6 +402,11 @@ class EventTypes:
     # and where it went (method, path, status) — never the header it sent.
     SERVICE_HTTP_START = "service.http_start"
     SERVICE_HTTP_END = "service.http_end"
+    # A service.fetch job in the service sandbox (#766): which ecosystem
+    # and verb, the argv, and how it ended — never the environment it ran
+    # with (the credential is in it).
+    SERVICE_FETCH_START = "service.fetch_start"
+    SERVICE_FETCH_END = "service.fetch_end"
 
     # Resource telemetry sampled on the heartbeat cadence. Worker-emitted,
     # but sandbox-scoped: the host enriches these with the sandbox role.

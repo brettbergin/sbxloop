@@ -1506,7 +1506,7 @@ def config_policy() -> None:
         raise typer.Exit(2) from exc
 
     extra = [
-        *registry_domains(config.registries_for()),
+        *registry_domains(config.open_registries_for()),
         *config.sandbox.extra_allow_domains,
     ]
     baseline = ", ".join(
@@ -1558,6 +1558,20 @@ def config_policy() -> None:
     if config.github.enabled:
         gh_domains = ", ".join(github_policy_allows(config))
         console.print(f"github sandbox (all phases, no task grants): {gh_domains}")
+    credentialed = config.credentialed_registries_for()
+    if credentialed:
+        from sbxloop.sbx.provision import service_policy_allows
+        from sbxloop.sbx.registries import languages as registry_languages
+
+        svc_domains = ", ".join(
+            service_policy_allows(
+                (), credentialed, registry_languages(credentialed), config.policy.deny
+            )
+        )
+        console.print(
+            "service sandbox (fetches from the credentialed registries; the agent "
+            f"reaches none of them): {svc_domains}"
+        )
     console.print("audit trail: [cyan]sbxloop logs RUN_ID --type policy.[/]")
 
 

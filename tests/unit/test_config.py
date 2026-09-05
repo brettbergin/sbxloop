@@ -1029,35 +1029,30 @@ class TestRegistries:
 
 
 class TestSandboxEnv:
-    """`[sandbox] env` / `secret_env` (#679): plain values and names whose
-    values the daemon's environment holds, per repository."""
+    """`[sandbox] env` (#679): plain values, per repository. Its old
+    secret counterpart `secret_env` is refused by name (#766): the only
+    credential in the agent sandbox is the agent's own."""
 
     def test_unset_by_default(self, tmp_path: Path) -> None:
         config = load_config(cwd=tmp_path, env={})
         assert config.sandbox.env == {}
-        assert config.sandbox.secret_env == []
         assert config.sandbox_env_for(None) == {}
-        assert config.secret_env_for(None) == []
 
-    def test_plain_and_secret_names_parse(self, tmp_path: Path) -> None:
+    def test_plain_values_parse(self, tmp_path: Path) -> None:
         (tmp_path / "sbxloop.toml").write_text(
             "[sandbox]\n"
             'env = { RAILS_ENV = "test", DATABASE_URL = "postgres://localhost/app_test" }\n'
-            'secret_env = ["NPM_TOKEN", "PIP_INDEX_URL", "NPM_TOKEN"]\n'
         )
         config = load_config(cwd=tmp_path, env={})
         assert config.sandbox.env == {
             "RAILS_ENV": "test",
             "DATABASE_URL": "postgres://localhost/app_test",
         }
-        # duplicates collapse, order kept
-        assert config.sandbox.secret_env == ["NPM_TOKEN", "PIP_INDEX_URL"]
 
     def test_a_repository_override_replaces_the_global_setting(self, tmp_path: Path) -> None:
         (tmp_path / "sbxloop.toml").write_text(
             "[sandbox]\n"
             'env = { RAILS_ENV = "test" }\n'
-            'secret_env = ["NPM_TOKEN"]\n'
             "\n"
             "[[github.repos]]\n"
             'repo = "o/rails"\n'
@@ -1065,15 +1060,11 @@ class TestSandboxEnv:
             "[[github.repos]]\n"
             'repo = "o/go"\n'
             'env = { GOFLAGS = "-mod=vendor" }\n'
-            "secret_env = []\n"
         )
         config = load_config(cwd=tmp_path, env={})
         assert config.sandbox_env_for("o/rails") == {"RAILS_ENV": "test"}
-        assert config.secret_env_for("o/rails") == ["NPM_TOKEN"]
-        # The override REPLACES: the Go repository gets neither RAILS_ENV
-        # nor NPM_TOKEN — an empty list is a real "this repo needs no secret".
+        # The override REPLACES: the Go repository does not get RAILS_ENV.
         assert config.sandbox_env_for("o/go") == {"GOFLAGS": "-mod=vendor"}
-        assert config.secret_env_for("o/go") == []
         # A repository without an entry falls back to the global setting.
         assert config.sandbox_env_for("o/unknown") == {"RAILS_ENV": "test"}
 
@@ -1081,15 +1072,13 @@ class TestSandboxEnv:
         ("body", "match"),
         [
             ('[sandbox]\nenv = { "1BAD" = "x" }\n', "not an environment variable name"),
-            ('[sandbox]\nsecret_env = ["NO-DASH"]\n', "not an environment variable name"),
             ('[sandbox]\nenv = { GH_TOKEN = "x" }\n', "delivered by sbxloop itself"),
-            ('[sandbox]\nsecret_env = ["COPILOT_GITHUB_TOKEN"]\n', "delivered by sbxloop itself"),
             ('[sandbox]\nenv = { SBXLOOP_WORKER_BACKEND = "echo" }\n', "delivered by sbxloop"),
-            ('[sandbox]\nenv = { A = "1" }\nsecret_env = ["A"]\n', "both name"),
             (
-                '[sandbox]\nsecret_env = ["A"]\n\n'
-                '[[github.repos]]\nrepo = "o/r"\nenv = { A = "1" }\n',
-                r"github.repos\[o/r\]: env and secret_env both name",
+                '[sandbox]\nenv = { NPM_TOKEN = "x" }\n\n'
+                '[[registries]]\nkind = "npm"\nhost = "npm.example.com"\n'
+                'url = "https://npm.example.com/"\nauth_env = "NPM_TOKEN"\n',
+                "env and a registry's auth_env both name",
             ),
             ('[[github.repos]]\nrepo = "o/r"\nenv = { GITHUB_TOKEN = "x" }\n', "github.repos"),
         ],
@@ -1100,6 +1089,34 @@ class TestSandboxEnv:
         (tmp_path / "sbxloop.toml").write_text(body)
         with pytest.raises(ConfigError, match=match):
             load_config(cwd=tmp_path, env={})
+
+    @pytest.mark.parametrize(
+        ("body", "where"),
+        [
+            ('[sandbox]\nsecret_env = ["NPM_TOKEN"]\n', r"\[sandbox\]"),
+            (
+                '[[github.repos]]\nrepo = "o/r"\nsecret_env = ["NPM_TOKEN"]\n',
+                r"\[\[github.repos\]\]",
+            ),
+            # Even empty: the key itself is the mistake to name.
+            ("[sandbox]\nsecret_env = []\n", r"\[sandbox\]"),
+        ],
+    )
+    def test_secret_env_is_refused_by_name_with_the_way_forward(
+        self, tmp_path: Path, body: str, where: str
+    ) -> None:
+        """`secret_env` put an operator secret in the agent's sandbox; #766
+        removed it. The refusal names the key, not `extra="forbid"`'s
+        generic "extra inputs", and says where each kind of secret now
+        belongs."""
+        (tmp_path / "sbxloop.toml").write_text(body)
+        with pytest.raises(ConfigError, match=f"{where} secret_env is no longer supported") as info:
+            load_config(cwd=tmp_path, env={})
+        message = str(info.value)
+        assert "[[registries]]" in message and "auth_env" in message
+        assert "[[credentials]]" in message
+        assert "ci-only" in message
+        assert "Extra inputs" not in message
 
 
 class TestAptPackagesAndSetupCommands:

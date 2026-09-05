@@ -230,6 +230,10 @@ class HostEventTypes:
     # behalf (#765): `credential`, `method`, `path`, `status` (or `error`),
     # `duration_s`, `phase`, `task_id`. Never the body, never a header.
     SERVICE_CALL = "service.call"
+    # One dependency fetch the service sandbox ran for the agent (#766):
+    # `ecosystem`, `verb`, `argv`, `exit_code` (or `error`), `duration_s`,
+    # `phase`, `task_id`. The output tail rides `detail` only on failure.
+    SANDBOX_FETCH = "sandbox.fetch"
     # The task roster as the run will work it (also re-announced on resume,
     # with each task's persisted state).
     RUN_TASKS = "run.tasks"

@@ -55,9 +55,11 @@ class SandboxSpec(BaseModel):
     secrets: list[SecretSpec] = Field(default_factory=list)
     # Plain environment: may sit in the in-VM env file under any strategy.
     persistent_env: dict[str, str] = Field(default_factory=dict)
-    # Operator secrets (`[sandbox] secret_env`, #679): values that travel
-    # only the credential's non-proxy road — per-job stdin, or the 0600 env
-    # file — and never an `sbx` argument, an event, or a log line.
+    # The service sandbox's secrets (`[[credentials]]` values and the
+    # registries' `auth_env`, #765/#766): values that travel only the
+    # credential's non-proxy road — per-job stdin, or the 0600 env file —
+    # and never an `sbx` argument, an event, or a log line. Empty for the
+    # agent role: its only credential is the agent's own, in `secrets`.
     secret_env: dict[str, str] = Field(default_factory=dict)
     # Client files for the configured registries (`[[registries]]`, #680):
     # in-VM path → contents, delivered with `sbx cp` and chmod 600. The

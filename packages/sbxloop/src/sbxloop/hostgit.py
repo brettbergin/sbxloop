@@ -1573,3 +1573,24 @@ def current_branch(repo_path: Path) -> str | None:
             return str(repo.active_branch.name)
     except (InvalidGitRepositoryError, NoSuchPathError, TypeError, ValueError):
         return None
+
+
+def exclude_from_git(root: Path, pattern: str) -> bool:
+    """Add ``pattern`` to ``root``'s ``.git/info/exclude`` — the checkout's
+    private ignore list, never committed — so a directory the loop keeps
+    inside a workspace (the dependency cache, #766) is not something the
+    agent can ``git add``. Idempotent; a no-op (False) when ``root`` is not
+    a checkout with a ``.git`` directory of its own."""
+    info = root / ".git" / "info"
+    if not (root / ".git").is_dir():
+        return False
+    exclude = info / "exclude"
+    text = exclude.read_text() if exclude.is_file() else ""
+    if pattern in text.splitlines():
+        return True
+    info.mkdir(parents=True, exist_ok=True)
+    with exclude.open("a") as fh:
+        if text and not text.endswith("\n"):
+            fh.write("\n")
+        fh.write(pattern + "\n")
+    return True

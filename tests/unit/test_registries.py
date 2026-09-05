@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
-from sbxloop.config import RegistryConfig
+from sbxloop.config import USERNAME_REGISTRY_KINDS, RegistryConfig
 from sbxloop.sbx import registries
 from sbxloop.sbx.registries import (
     CARGO_CONFIG,
@@ -241,3 +243,143 @@ class TestConfig:
         with pytest.raises(ValueError, match="bare hostname"):
             RegistryConfig(kind="go", host="https://reg.example.com")
         assert RegistryConfig(kind="go", host=" Reg.Example.COM ").host == "reg.example.com"
+
+
+class TestFetchRecipes:
+    """The fixed fetch recipes (#766): what the service sandbox runs per
+    ecosystem, and what the agent sandbox is told so it builds offline
+    from the shared cache."""
+
+    def test_kinds_and_languages_follow_the_registries_generic_excluded(self) -> None:
+        regs = [
+            registry("npm", auth_env="T", url="https://reg.example.com/npm/"),
+            registry("generic"),
+            registry("pypi", auth_env="T", auth_user="u", url="https://reg.example.com/simple/"),
+        ]
+        assert registries.kinds(regs) == ["npm", "pypi"]
+        assert registries.languages(regs) == ["node", "python"]
+        assert registries.kinds([]) == [] and registries.languages([]) == []
+
+    @pytest.mark.parametrize(
+        ("kind", "manifests", "argv"),
+        [
+            ("npm", ["package.json"], ("npm", "install", "--ignore-scripts")),
+            ("npm", ["package.json", "package-lock.json"], ("npm", "ci", "--ignore-scripts")),
+            (
+                "pypi",
+                ["requirements.txt"],
+                ("pip", "download", "-d", f"{registries.DEPS_HOME}/pypi", "-r", "requirements.txt"),
+            ),
+            (
+                "pypi",
+                ["pyproject.toml"],
+                ("pip", "download", "-d", f"{registries.DEPS_HOME}/pypi", "."),
+            ),
+            ("go", ["go.mod"], ("go", "mod", "download")),
+            ("cargo", ["Cargo.toml"], ("cargo", "fetch")),
+            (
+                "maven",
+                ["pom.xml"],
+                (
+                    "mvn",
+                    "-B",
+                    "dependency:go-offline",
+                    f"-Dmaven.repo.local={registries.DEPS_HOME}/maven",
+                ),
+            ),
+            (
+                "nuget",
+                ["*.csproj"],
+                ("dotnet", "restore", "--packages", f"{registries.DEPS_HOME}/nuget"),
+            ),
+            ("gem", ["Gemfile"], ("bundle", "cache", "--all", "--no-install")),
+        ],
+    )
+    def test_fetch_from_the_manifest(self, kind: str, manifests: list[str], argv: tuple) -> None:
+        plan = registries.fetch_plan(kind, "fetch", manifests=manifests)  # type: ignore[arg-type]
+        assert plan.argv == argv
+        assert plan.manifest == manifests[0]
+
+    def test_fetch_needs_a_manifest(self) -> None:
+        with pytest.raises(ValueError, match=r"no package\.json in the workspace"):
+            registries.fetch_plan("npm", "fetch", manifests=[])
+
+    @pytest.mark.parametrize(
+        ("kind", "argv"),
+        [
+            ("npm", ("npm", "install", "--ignore-scripts", "left-pad@1.3.0", "@ex/lib")),
+            (
+                "pypi",
+                (
+                    "pip",
+                    "download",
+                    "-d",
+                    f"{registries.DEPS_HOME}/pypi",
+                    "left-pad@1.3.0",
+                    "@ex/lib",
+                ),
+            ),
+            ("go", ("go", "mod", "download", "left-pad@1.3.0", "@ex/lib")),
+        ],
+    )
+    def test_add_names_packages_with_scripts_off(self, kind: str, argv: tuple) -> None:
+        plan = registries.fetch_plan(kind, "add", ["left-pad@1.3.0", "@ex/lib"])  # type: ignore[arg-type]
+        assert plan.argv == argv
+
+    @pytest.mark.parametrize(
+        ("kind", "verb", "packages", "match"),
+        [
+            ("cargo", "add", ["serde"], "takes no package list"),
+            ("npm", "add", [], "at least one package"),
+            ("npm", "fetch", ["left-pad"], "packages"),
+            ("npm", "install", [], "unknown fetch verb"),
+            ("generic", "fetch", [], "nothing to fetch"),
+            ("npm", "add", ["--registry=https://evil.example.com"], "not a package spec"),
+            ("npm", "add", ["left-pad; rm -rf /"], "not a package spec"),
+            ("npm", "add", [""], "not a package spec"),
+        ],
+    )
+    def test_refusals(self, kind: str, verb: str, packages: list[str], match: str) -> None:
+        with pytest.raises(ValueError, match=match):
+            registries.fetch_plan(kind, verb, packages, manifests=["package.json"])  # type: ignore[arg-type]
+
+    def test_workspace_manifests_report_what_is_present(self, tmp_path: Path) -> None:
+        (tmp_path / "package.json").write_text("{}")
+        (tmp_path / "package-lock.json").write_text("{}")
+        (tmp_path / "app.csproj").write_text("<Project/>")
+        assert registries.workspace_manifests(tmp_path, "npm") == [
+            "package.json",
+            "package-lock.json",
+        ]
+        assert registries.workspace_manifests(tmp_path, "nuget") == ["*.csproj"]
+        assert registries.workspace_manifests(tmp_path, "pypi") == []
+
+    def test_offline_env_points_every_kind_at_the_cache_and_fetch_env_fills_it(self) -> None:
+        regs = [
+            registry(
+                k,
+                auth_env="T",
+                auth_user="u" if k in USERNAME_REGISTRY_KINDS else None,
+                url=None if k == "go" else f"https://reg.example.com/{k}/",
+            )
+            for k in ("npm", "pypi", "go", "cargo", "maven", "nuget", "gem")
+        ]
+        offline = registries.offline_env(regs)
+        assert offline["npm_config_offline"] == "true"
+        assert offline["npm_config_cache"] == f"{registries.DEPS_HOME}/npm"
+        assert offline["PIP_NO_INDEX"] == "1"
+        assert offline["PIP_FIND_LINKS"] == f"{registries.DEPS_HOME}/pypi"
+        assert offline["UV_NO_INDEX"] == "1"
+        assert offline["GOPROXY"] == "off"
+        assert offline["GOMODCACHE"] == f"{registries.DEPS_HOME}/go"
+        assert offline["CARGO_NET_OFFLINE"] == "true"
+        assert offline["MAVEN_ARGS"] == f"-o -Dmaven.repo.local={registries.DEPS_HOME}/maven"
+        assert offline["NUGET_PACKAGES"] == f"{registries.DEPS_HOME}/nuget"
+        assert offline["BUNDLE_LOCAL"] == "true"
+        fetch = registries.fetch_env(regs)
+        # The fetcher fills the same cache locations, and is not offline.
+        assert fetch["npm_config_cache"] == offline["npm_config_cache"]
+        assert fetch["GOMODCACHE"] == offline["GOMODCACHE"]
+        assert fetch["CARGO_HOME"] == offline["CARGO_HOME"]
+        assert not any(k in fetch for k in ("npm_config_offline", "GOPROXY", "PIP_NO_INDEX"))
+        assert registries.offline_env([]) == {} and registries.fetch_env([]) == {}
