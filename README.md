@@ -323,10 +323,22 @@ agent sandbox alone (no repository, no GitHub box, no delivery), works in a
 per-run data directory that is harvested as artifacts, and walks the
 operator's stages instead of the developer's: `planning`, `executing`,
 `judging` (every task's declared check re-run on the finished workspace; one
-red check fails the run naming it), `publishing`. `status` shows a run's
-kind; a code run's trail is byte-identical with the flag absent. The
-operator persona, an LLM judge, output sinks, workload profiles and
-scheduled intake land on this base in later pull requests.
+red check fails the run naming it), `publishing`. Two actors run inside it:
+the **operator** plans the outcome into tasks — each with acceptance
+criteria and the `needs` it declares by name (hosts, credentials from the
+catalogue, a sink, a repository); a credential is never a value in its box
+— and executes each task in the data directory, ending with a `## Result`
+report; the **judge** then holds that task to its criteria in a read-only
+session, reading the report as a claim against the data directory, the
+record of the operator's tool calls and the task's declared checks, and
+answers with a verdict (`judge.verdict`). A failing verdict quotes the
+unmet criteria, which become the next attempt's brief under
+`max_revisions_per_task`; past the budget the run fails naming the
+criterion, and a judge that produces no usable verdict twice fails the
+task closed (`judge.degraded`) — silence is never a pass. `status` shows a
+run's kind; a code run's trail is byte-identical with the flag absent.
+Output sinks, workload profiles and scheduled intake land on this base in
+later pull requests.
 
 ## CLI reference
 

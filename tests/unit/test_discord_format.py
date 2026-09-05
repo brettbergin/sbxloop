@@ -323,6 +323,24 @@ class TestFormat:
             )
         ) == ["🔨 **build** · task `t2` — added the parser and its tests"]
         assert format_for_discord(ev("phase.end", task_id="t2", phase="verify", status="ok")) == []
+        # A workload's operator (#756) reports the way the builder does; the
+        # judge's verdict is its own line, so a passing judge phase is quiet.
+        assert texts(
+            format_for_discord(
+                ev("phase.end", task_id="t1", phase="execute", status="ok", message="wrote it")
+            )
+        ) == ["🛠 **execute** · task `t1` — wrote it"]
+        assert (
+            format_for_discord(
+                ev("phase.end", task_id="t1", phase="judge", status="ok", message="all met")
+            )
+            == []
+        )
+        assert texts(
+            format_for_discord(
+                ev("phase.end", task_id="t1", phase="judge", status="failed", message="unmet: x")
+            )
+        ) == ["✗ **judge** · task `t1` — unmet: x"]
         # An advisory failure (#682) blocked nothing, and the human is who it
         # is evidence for: a warning line at every level.
         advisory = ev(
@@ -628,6 +646,21 @@ class TestSteerProgress:
         p.observe(ev("task.end", task_id="t2", title="Wire CLI", state="done"))
         assert p.render() == "⏳ steer queued; answered at the next checkpoint"
 
+    def test_a_workload_names_its_own_phases(self) -> None:
+        """The same task states under the operator's names (#756): the run's
+        kind, carried on `run.start`, picks the vocabulary."""
+        p = SteerProgress(cap=40)
+        p.observe(ev("run.start", outcome="o", kind="workload"))
+        p.observe(ev("task.state", task_id="t1", state="executing", revisions=0))
+        p.observe(ev("task.start", task_id="t1", title="Count"))
+        assert "mid-**execute** on `t1` · Count" in p.render()
+        p.observe(ev("task.state", task_id="t1", state="verifying", revisions=0))
+        assert "mid-**judge** on `t1` · Count" in p.render()
+        code = SteerProgress(cap=40)
+        code.observe(ev("run.start", outcome="o"))
+        code.observe(ev("task.state", task_id="t1", state="executing", revisions=0))
+        assert "mid-**build**" in code.render()
+
     def test_production_event_order_keeps_the_build_phase(self) -> None:
         # LoopEngine._run_task emits task.state=executing BEFORE task.start
         # (and the persisted phase first on resume); the start must not
@@ -857,6 +890,33 @@ class TestEmbeds:
         assert texts(
             format_for_discord(ev("review.verdict", round=3, verdict="approve", findings=0))
         ) == ["🔍 review round 3: **approved** · 0 finding(s)"]
+        # The judge's verdicts (#756): the first unmet criterion is the
+        # line, since it is the next attempt's whole brief.
+        passed = format_for_discord(
+            ev("judge.verdict", task_id="t1", attempt=1, passed=True, unmet=[], notes="fine")
+        )
+        assert texts(passed) == ["⚖️ judge: task `t1` **passed**"] and passed[0].flush
+        failed = format_for_discord(
+            ev(
+                "judge.verdict",
+                task_id="t2",
+                attempt=2,
+                passed=False,
+                unmet=["the file exists — it does not", "the count matches"],
+                notes="",
+            )
+        )
+        assert texts(failed) == [
+            "⚖️ judge: task `t2` **failed** (attempt 2) · 2 unmet — the file exists — it does not"
+        ]
+        degraded = format_for_discord(
+            ev("judge.degraded", task_id="t2", attempt=1, error="produced invalid output twice")
+        )
+        assert texts(degraded) == [
+            "🛑 judge: task `t2` — no usable verdict twice; the task fails closed "
+            "(produced invalid output twice)"
+        ]
+        assert degraded[0].flush
         reconciled = format_for_discord(
             ev(
                 "review.reconciled",

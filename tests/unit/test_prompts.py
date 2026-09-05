@@ -260,6 +260,39 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "daemon_notes": "- poll interval 60s",
         "trigger_label": "sbxloop:run",
     },
+    # The workload's actors (#756): the operator plans and executes, the
+    # judge decides.
+    "operator_plan": {
+        "outcome": "o",
+        "max_tasks": "3",
+        "work_dir": "/data",
+        "user_guidance": "(none)",
+    },
+    "operator_execute": {
+        "outcome": "o",
+        "task_id": "t1",
+        "task_title": "T",
+        "task_description": "do the thing",
+        "acceptance_criteria": "- it is done",
+        "verify_commands": "(none)",
+        "needs": "(none declared)",
+        "work_dir": "/data",
+        "prior_attempt": "(first attempt)",
+        "feedback": "(none)",
+        "user_guidance": "(none)",
+    },
+    "operator_judge": {
+        "outcome": "o",
+        "task_id": "t1",
+        "task_title": "T",
+        "task_description": "do the thing",
+        "acceptance_criteria": "- it is done",
+        "work_dir": "/data",
+        "attempt": "1",
+        "report": "## Result\n\ndone",
+        "tool_digest": "1. `Bash` `ls` — ok",
+        "evidence": "(no mechanical checks declared)",
+    },
 }
 
 
@@ -641,3 +674,68 @@ def test_review_prompt_carries_the_verification_note_when_given() -> None:
     plain = render("review", **RENDER_CONTEXTS["review"])
     assert "verify_mode" not in plain
     assert "$verification" not in plain
+
+
+# -- the workload's prompts (#756) --------------------------------------------
+
+
+def test_operator_plan_declares_needs_by_name() -> None:
+    """The plan is where a task asks for the outside: hosts and credentials
+    by name, never a value — the operator's box never holds a secret."""
+    text = " ".join(render("operator_plan", **RENDER_CONTEXTS["operator_plan"]).split())
+    assert text.startswith("# Plan a workload")
+    assert "by name" in text and "never its value" in text
+    assert "Declare it here" in text
+    assert '"needs": {"hosts": [], "credentials": [], "sink": null, "repo": null}' in text
+    assert "At most 3 tasks" in text
+
+
+def test_operator_plan_makes_criteria_the_exam() -> None:
+    text = render("operator_plan", **RENDER_CONTEXTS["operator_plan"])
+    assert "the judge's whole exam" in text
+    assert "acceptance_criteria" in text
+
+
+def test_operator_execute_declares_result() -> None:
+    """The executor's report is what the judge reads: it ends with a Result
+    section that declares the outcome per criterion, and claims nothing."""
+    text = render("operator_execute", **RENDER_CONTEXTS["operator_execute"])
+    assert text.startswith("# Execute one task")
+    assert "declare your result" in text.lower()
+    assert "Do not claim" in text
+    assert "## Result" in text
+    assert "Task t1: T" in text and "- it is done" in text
+
+
+def test_operator_execute_keeps_secrets_out_of_the_box() -> None:
+    text = render("operator_execute", **RENDER_CONTEXTS["operator_execute"])
+    assert "Credentials are never in this box" in text
+    assert "never its value" in " ".join(text.split())
+    # Host-tool sections ride in through the same seam as the build prompt.
+    tooled = render(
+        "operator_execute", **RENDER_CONTEXTS["operator_execute"], service_tools="\n\n## Tools"
+    )
+    assert tooled.rstrip().endswith("if\na criterion is not met, say so and why.")
+    assert "## Tools" in tooled and "## Tools" not in text
+    assert "$service_tools" not in text
+
+
+def test_operator_judge_reads_and_never_repairs() -> None:
+    text = render("operator_judge", **RENDER_CONTEXTS["operator_judge"])
+    assert text.startswith("# Judge one task")
+    assert "Do not modify anything" in text
+    assert "a claim" in text
+    assert "1. `Bash` `ls` — ok" in text and "## Result" in text
+    assert "(attempt 1)" in text
+
+
+def test_operator_judge_quotes_unmet_criteria() -> None:
+    text = render("operator_judge", **RENDER_CONTEXTS["operator_judge"])
+    assert "quote the criterion" in text
+    assert '"passed": false' in text and '"unmet": [' in text
+    retried = render(
+        "operator_judge",
+        **RENDER_CONTEXTS["operator_judge"],
+        retry_context="## Previous attempt was invalid",
+    )
+    assert retried.rstrip().endswith("## Previous attempt was invalid")

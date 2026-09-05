@@ -1676,7 +1676,9 @@ class TestRunCommand:
     ) -> None:
         """`--kind workload` (#755): the agent box alone, its own data
         directory, the operator's stages, and the run says what it is."""
-        self.make_run_env(workdir, monkeypatch, self.HAPPY_RUN)
+        # A workload's task is executed, then judged (#756).
+        verdict = {"json": {"passed": True, "unmet": [], "notes": ""}}
+        self.make_run_env(workdir, monkeypatch, [*self.HAPPY_RUN, verdict])
         result = runner.invoke(app, ["run", "count the things", "--kind", "workload", "--no-tui"])
         assert result.exit_code == 0, result.output
         plain = result.output.replace("\n", "")

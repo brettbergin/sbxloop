@@ -12,12 +12,15 @@ from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
     TERMINAL_RUN_STATES,
     EgressSpec,
+    JudgeVerdict,
     RunRecord,
     RunResult,
     SteerVerdict,
     TaskGraph,
+    TaskNeeds,
     TaskRecord,
     TaskSpec,
+    WorkloadPlan,
     artifact_files,
     artifacts_dir,
     scan_artifacts,
@@ -457,6 +460,68 @@ class TestSteerVerdict:
     def test_unknown_action_rejected(self) -> None:
         with pytest.raises(ValidationError):
             SteerVerdict(reply="ok", action="abort_everything", guidance="g")
+
+
+class TestWorkloadPlan:
+    """#756: the operator's plan is a task graph with a run title and, per
+    task, the needs it declares by name."""
+
+    def test_needs_default_empty_and_persist_on_the_spec(self) -> None:
+        task = TaskSpec.model_validate(spec("t1"))
+        assert task.needs.empty
+        assert task.needs == TaskNeeds()
+        loaded = TaskSpec.model_validate_json(task.model_dump_json())
+        assert loaded.needs.empty
+
+    def test_needs_are_names_never_values(self) -> None:
+        needs = TaskNeeds.model_validate(
+            {
+                "hosts": [" API.Example.com ", "*.data.example.org"],
+                "credentials": ["example-api"],
+                "sink": "chat",
+                "repo": "owner/name",
+            }
+        )
+        assert needs.hosts == ["api.example.com", "*.data.example.org"]
+        assert needs.credentials == ["example-api"]
+        assert not needs.empty
+        with pytest.raises(ValidationError, match=r"needs\.hosts"):
+            TaskNeeds(hosts=["https://api.example.com/v1"])
+        with pytest.raises(ValidationError, match=r"needs\.hosts"):
+            TaskNeeds(hosts=["*"])
+        with pytest.raises(ValidationError):
+            TaskNeeds.model_validate({"credentials": ["x"], "token": "sk-live"})
+
+    def test_plan_title_folds_like_the_pr_title(self) -> None:
+        plan = WorkloadPlan.model_validate(
+            {"title": "  Count the  widgets ", "tasks": [spec("t1")]}
+        )
+        assert plan.title == "Count the widgets"
+        assert WorkloadPlan.model_validate({"title": "   ", "tasks": [spec("t1")]}).title is None
+        assert WorkloadPlan.model_validate({"tasks": [spec("t1")]}).title is None
+        assert plan.topo_order()[0].id == "t1"
+
+    def test_plan_validates_the_graph(self) -> None:
+        with pytest.raises(ValidationError):
+            WorkloadPlan.model_validate({"tasks": [spec("t1", ["t2"]), spec("t2", ["t1"])]})
+
+
+class TestJudgeVerdict:
+    def test_passed_needs_nothing_else(self) -> None:
+        verdict = JudgeVerdict(passed=True)
+        assert verdict.unmet == [] and verdict.notes == ""
+
+    def test_a_failing_verdict_names_a_criterion(self) -> None:
+        with pytest.raises(ValidationError, match="unmet"):
+            JudgeVerdict(passed=False)
+        with pytest.raises(ValidationError, match="unmet"):
+            JudgeVerdict(passed=False, unmet=["  ", ""])
+        verdict = JudgeVerdict(passed=False, unmet=["  the file\n exists ", ""], notes="n")
+        assert verdict.unmet == ["the file exists"]
+
+    def test_unknown_fields_are_rejected(self) -> None:
+        with pytest.raises(ValidationError):
+            JudgeVerdict.model_validate({"passed": True, "score": 10})
 
 
 class TestRunStates:

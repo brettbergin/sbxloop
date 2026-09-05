@@ -687,8 +687,16 @@ worked example is the anchor the model pattern-matches against, and a story
 about this repository is the wrong anchor for every other one, so no prompt
 body names an issue or PR number, a path, state name or product term from
 sbxloop itself (`test_prompt_bodies_stay_domain_neutral`; the concierge, being
-the loop's own front desk, keeps its item ids and sandboxes). The one
-ecosystem-specific example — the config-override that decompose.md warns
+the loop's own front desk, keeps its item ids and sandboxes). A workload
+run (#756) renders three more: operator_plan.md (the plan, with each
+task's `needs` declared by name — "never its value" — and the criteria as
+"the judge's whole exam"), operator_execute.md (one task, ending in a
+`## Result` the judge reads) and operator_judge.md (read-only, the report
+"a claim" to check against the data directory, the tool digest and the
+mechanical evidence; a failing verdict must "quote the criterion"). They
+are sent as the whole system prompt rather than appended to the coding
+agent's preset (`JobRequest.system_preset = False`), so the operator and
+the judge present as themselves. The one ecosystem-specific example — the config-override that decompose.md warns
 against and review.md's wrong-check section describes — is rendered per run:
 `verifylint.config_override_example` picks the story for the first resolved
 language that has one (mypy `files`; `tsc` ignoring `tsconfig.json` when
