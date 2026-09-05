@@ -30,6 +30,10 @@ Section rules:
 - A failing verdict quotes the criteria it failed ("quote the criterion"),
   because `unmet` is the next attempt's whole brief
   (test_operator_judge_quotes_unmet_criteria).
+- The criteria are read against the outcome ("narrowed away from the
+  outcome"): a task whose criteria were written to fit what could be done
+  rather than what was asked fails on that, named
+  (test_operator_judge_holds_the_work_to_the_outcome).
 -->
 
 # Judge one task
@@ -54,6 +58,14 @@ $task_description
 These are the whole exam. Hold the work to each of them and to nothing
 else: an approach you would not have chosen is not a failure, and a
 criterion that is not met is one, however good the rest is.
+
+One check comes before the criteria: they must be an exam *for the
+outcome above*. A task whose criteria were **narrowed away from the
+outcome** — written to fit what could be reached or done rather than what
+was asked (a substitute source, a dropped requirement, a goal restated
+"within a constraint") — fails, and `unmet` says so by naming the part of
+the outcome the criteria no longer cover. Passing such a task would hand
+the person something shaped like their ask that is not it.
 
 $acceptance_criteria
 

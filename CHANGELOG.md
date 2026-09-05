@@ -8,6 +8,15 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ### Fixed
 
+- **A workload plan declares what the ask needs.** Shown bounds it could
+  not meet, the planner rewrote the ask to fit them ("obtain an mp3 within
+  the no-external-host constraint"), declared no need, and the judge passed
+  the substitute — the fail-closed refusal that should have named the
+  missing setting never fired. The plan prompt now forbids narrowing the
+  ask and says a refusal is the right result for a need outside the
+  bounds; the judge fails a task whose criteria were narrowed away from
+  the outcome. Field finding #800.
+
 - **Console chat: one line per short message.** Every message was drawn
   as a header line (time, author, reactions) with its text on the line
   below, so a channel of one-liners read at half density. A short message
