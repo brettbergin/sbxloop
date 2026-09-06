@@ -430,7 +430,14 @@ class TestCredentialedRegistryRun:
         assert "NPM_TOKEN" not in agent_sh
         assert not (agent_home / ".npmrc").exists()
         jobs = [job for job in harness.agent_jobs(run_id) if job.get("kind") == "agent.session"]
-        preparation, decompose, build = jobs
+        # Job files have opaque ids; filesystem iteration is not chronology.
+        (preparation,) = [
+            job
+            for job in jobs
+            if job.get("system_message") == "You prepare dependency data inside the agent sandbox."
+        ]
+        (decompose,) = [job for job in jobs if not service_tools(job)]
+        (build,) = [job for job in jobs if job is not preparation and service_tools(job)]
         assert service_tools(preparation) == ["fetch_dependencies"]
         assert service_tools(decompose) == []
         assert service_tools(build) == ["fetch_dependencies"]
