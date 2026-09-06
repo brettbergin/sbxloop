@@ -6,9 +6,12 @@ from typing import ClassVar
 
 from sbxloop.gh.permissions import (
     NEEDS,
+    WORKFLOWS_DIR,
     missing_from_app,
     missing_from_scopes,
     split_required,
+    workflow_paths,
+    workflows_write_granted,
 )
 
 LABELS = [n.label for n in NEEDS]
@@ -77,3 +80,43 @@ class TestAppPermissions:
         assert [n.label for n in required] == ["checks:read"]
         assert [n.label for n in optional] == ["workflows:write"]
         assert "CI and landing" in required[0].feature
+
+
+class TestWorkflowsWrite:
+    """The one delivery GitHub holds to a permission of its own (#752):
+    a tree entry under ``.github/workflows/``."""
+
+    def test_workflow_paths_are_the_entries_under_the_directory(self) -> None:
+        assert WORKFLOWS_DIR == ".github/workflows/"
+        paths = [
+            "README.md",
+            ".github/workflows/ci.yml",
+            ".github/dependabot.yml",
+            ".github/workflows/nested/x.yml",
+            "docs/.github/workflows/not-really.yml",
+        ]
+        assert workflow_paths(paths) == (
+            ".github/workflows/ci.yml",
+            ".github/workflows/nested/x.yml",
+        )
+
+    def test_an_app_grant_map_decides(self) -> None:
+        assert workflows_write_granted(app_permissions={"workflows": "write"}, scopes=None) is True
+        assert workflows_write_granted(app_permissions={"contents": "write"}, scopes=None) is False
+        # read is not write
+        assert workflows_write_granted(app_permissions={"workflows": "read"}, scopes=None) is False
+        # the map wins over scopes when both are given: an App is not a user
+        assert (
+            workflows_write_granted(app_permissions={"contents": "write"}, scopes=["workflow"])
+            is False
+        )
+
+    def test_classic_scopes_decide(self) -> None:
+        assert workflows_write_granted(app_permissions=None, scopes=["repo", "workflow"]) is True
+        assert workflows_write_granted(app_permissions=None, scopes=["repo"]) is False
+        assert workflows_write_granted(app_permissions=None, scopes=()) is False
+
+    def test_nothing_reported_is_unknown_not_refused(self) -> None:
+        # A fine-grained PAT reports neither: GitHub's answer at the tree is
+        # the only one, and the delivery must not refuse on a guess.
+        assert workflows_write_granted(app_permissions=None, scopes=None) is None

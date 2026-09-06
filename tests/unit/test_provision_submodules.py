@@ -82,9 +82,12 @@ def test_a_remote_clone_populates_from_the_remotes_under_the_runs_token(
     seen: list[tuple[Path | None, str | None]] = []
     real = hostgit.populate_submodules
 
-    def spy(clone: Path, *, source: Path | None, token: str | None) -> list[tuple[str, str]]:
+    def spy(
+        clone: Path, *, source: Path | None, token: str | None, credential_url: str
+    ) -> list[tuple[str, str]]:
+        assert credential_url == "https://github.com"
         seen.append((source, token))
-        return real(clone, source=source, token=token)
+        return real(clone, source=source, token=token, credential_url=credential_url)
 
     monkeypatch.setattr(hostgit, "clone_from_remote", fake_clone)
     monkeypatch.setattr(hostgit, "populate_submodules", spy)
