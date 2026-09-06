@@ -19,22 +19,34 @@ def bar_text(app: object) -> str:
     return bar.last.plain
 
 
-def test_overview_shows_the_live_run_queue_and_waits(seeded: SbxloopHome) -> None:
+def page_text(app: object) -> str:
+    """Everything the Overview's current page put on screen."""
+    from textual.containers import VerticalScroll
+
+    from sbxloop.tui.app import SbxloopTui
+
+    assert isinstance(app, SbxloopTui)
+    page = app.screen.query_one("#page", VerticalScroll)
+    return "\n".join(w.content_text for w in page.walk_children() if isinstance(w, TextPanel))
+
+
+def test_overview_reports_the_week_and_the_run_in_flight(seeded: SbxloopHome) -> None:
+    """Overview answers "is this working well": a live line for now, and a
+    page of analytics for the week. The queue, recent runs and who is
+    waiting live on the screens that own them (Queue, Runs, Daemon)."""
+
     async def scenario() -> None:
         app = make_app(seeded)
         async with app.run_test(size=(140, 45)) as pilot:
-            await pilot.pause(1.0)
+            await pilot.pause(1.5)
             bar = bar_text(app)
             assert "running" in bar and "r_live" in bar and "runs 4/12" in bar
             assert "bridge ✓" in bar and "9.9.9" in bar
-            current = app.screen.query_one("#current", TextPanel).content_text
-            assert "r_live" in current and "Add retries" in current
-            queue = app.screen.query_one("#queue", ConsoleTable)
-            assert queue.row_count == 1
-            recent = app.screen.query_one("#recent", ConsoleTable)
-            assert recent.row_count == 3
-            waits = app.screen.query_one("#notices", TextPanel).content_text
-            assert "gh:issue:40" in waits and "ready to merge" in waits
+            live = app.screen.query_one("#live", TextPanel).content_text
+            assert "running" in live and "r_live" in live
+            page = page_text(app)
+            assert "runs this week" in page, "the summary states its finding in a sentence"
+            assert "outcome" in page and "phases" in page
 
     drive(scenario)
 
@@ -43,13 +55,17 @@ def test_daemon_down_and_starting_read_in_the_bar(seeded: SbxloopHome) -> None:
     async def scenario() -> None:
         app = make_app(seeded, ctl=FakeCtl(down=True))
         async with app.run_test(size=(140, 45)) as pilot:
-            await pilot.pause(1.0)
+            await pilot.pause(1.5)
             assert "daemon down" in bar_text(app)
-            assert app.screen.query_one("#recent", ConsoleTable).row_count == 3, "history stays"
+            assert "no daemon answered" in app.screen.query_one("#live", TextPanel).content_text
+            assert "runs this week" in page_text(app), (
+                "the analytics are the store's, not the daemon's"
+            )
         app = make_app(seeded, ctl=FakeCtl(stale=True))
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause(1.0)
             assert "starting" in bar_text(app)
+            assert "starting" in app.screen.query_one("#live", TextPanel).content_text
         app = make_app(
             seeded,
             ctl=FakeCtl(live_status(paused=True, holds=["operator", "deploy-1"], current=None)),
@@ -57,6 +73,10 @@ def test_daemon_down_and_starting_read_in_the_bar(seeded: SbxloopHome) -> None:
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause(1.0)
             assert "paused (operator, deploy-1)" in bar_text(app)
+            assert (
+                "paused: operator, deploy-1"
+                in app.screen.query_one("#live", TextPanel).content_text
+            )
 
     drive(scenario)
 
@@ -155,8 +175,8 @@ def test_a_busy_daemon_reads_as_alive_not_down(seeded: SbxloopHome) -> None:
         app = make_app(seeded, ctl=Busy())  # type: ignore[arg-type]
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause(1.0)
-            current = app.screen.query_one("#current", TextPanel).content_text
-            assert "busy" in current and "down" not in current
+            live = app.screen.query_one("#live", TextPanel).content_text
+            assert "busy" in live and "down" not in live
 
     drive(scenario)
 
