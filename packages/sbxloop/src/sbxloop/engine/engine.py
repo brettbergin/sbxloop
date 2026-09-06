@@ -169,6 +169,7 @@ from sbxloop.errors import (
     BudgetExceededError,
     ConfigError,
     DeliveryError,
+    DeliveryPermissionError,
     GithubOpsError,
     InvalidOutputTwice,
     ProvisionError,
@@ -192,6 +193,7 @@ from sbxloop.gh.ops import (
     raw_pages,
     user_identity,
 )
+from sbxloop.gh.permissions import workflows_write_granted
 from sbxloop.ids import branch_name, new_message_id, new_run_id
 from sbxloop.log import get_logger
 from sbxloop.policy import EgressGranter, egress_rejection
@@ -1525,7 +1527,14 @@ class LoopEngine:
                     return "completed", None
                 stage = "delivering"
             elif stage == "delivering":
-                self._stage_deliver(p)
+                try:
+                    self._stage_deliver(p)
+                except DeliveryPermissionError as exc:
+                    # The credential cannot make this delivery and no
+                    # attempt would change that (#752): hand over with the
+                    # remedy named, the way a base rule the loop cannot
+                    # satisfy does — never a failed attempt to retry.
+                    return "blocked", str(exc)
                 self._stage_reconcile(p)
                 self._stage_reconcile_human(p)
                 stage = "reviewing"
@@ -2350,6 +2359,7 @@ class LoopEngine:
             title=pr_title,
             commit_message=commit_message,
             authored_body=sinks.pr_body(tasks, run.pr_title, carried),
+            workflows_write_granted=self._workflows_write_granted(p),
         )
         label = sinks.result_label(self.config.workload.result_label)
         try:
@@ -2516,6 +2526,27 @@ class LoopEngine:
         # (bounded: every round spends the CI budget).
         return self._stage_gate(p)
 
+    def _workflows_write_granted(self, p: Pipeline) -> Callable[[], bool | None]:
+        """Whether the run's credential may deliver a workflow file (#752),
+        answered lazily — the delivery asks only when its plan carries one.
+        An App's grant map (from the mint, cached on the token source) or
+        a classic PAT's scopes say; a fine-grained PAT says nothing
+        (``None``) and GitHub's 403 decides at the tree."""
+
+        def check() -> bool | None:
+            permissions = (
+                p.provisioner.gh_app_permissions(p.repo) if p.provisioner is not None else None
+            )
+            scopes = None
+            if permissions is None and p.ops is not None:
+                try:
+                    scopes = p.ops.token_scopes()
+                except GithubOpsError:
+                    scopes = None
+            return workflows_write_granted(app_permissions=permissions, scopes=scopes)
+
+        return check
+
     def _stage_deliver(self, p: Pipeline) -> None:
         """Open the pull request, or refresh it: the same branch every round.
 
@@ -2572,6 +2603,7 @@ class LoopEngine:
             commit_message=commit_message,
             authored_body=authored_body,
             verification=self._verification_note(run_id),
+            workflows_write_granted=self._workflows_write_granted(p),
         )
         data = ops.pr_get(repo, pr.number)
         head = data.get("head")
