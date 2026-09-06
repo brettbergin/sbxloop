@@ -1,5 +1,20 @@
 ## [Unreleased]
 
+### Fixed
+
+- **The Config screen showed `repr`, not values.** Floats carried a `.0`
+  tail every duration and interval in the config has (`60.0`, `14400.0`),
+  strings came wrapped in quotes (`'claude'`), bools were Python's
+  (`True`), an unset key spelled out `None`, and an empty string was an
+  empty cell. Values now read the way they are written in the file and
+  typed into the editor: `60`, `claude`, `true`, `—` for unset, `""` for
+  empty, a list as its items. A string that would be mistaken for another
+  type keeps its quotes, so `"60"` and `"true"` are never read as the
+  number or the bool, and whitespace collapses so a multi-line
+  commit-message template stays one row. The filter now matches what is on
+  screen rather than the `repr` behind it, and the value column is bounded
+  so the source column survives beside the console's rail at 120 columns.
+
 ### Added
 
 - **The Overview pages carry real analysis now.** They shipped filling
