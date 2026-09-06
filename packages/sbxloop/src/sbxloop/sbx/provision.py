@@ -285,12 +285,18 @@ def dedupe_domains(domains: Iterable[str]) -> list[str]:
     return seen
 
 
+#: The only session role the daemon's long-lived agent box ever runs, so
+#: it is the only one whose MCP servers it needs egress and secrets for.
+CONCIERGE_MCP_ROLES: tuple[str, ...] = ("concierge",)
+
+
 def agent_policy_allows(
     config: Config,
     languages: Sequence[str],
     repo: str | None = None,
     *,
     extra_domains: Sequence[str] = (),
+    mcp_roles: Sequence[str] | None = None,
 ) -> list[str]:
     """The agent sandbox's network allowlist for ``languages`` (and
     ``repo``'s private registries, #680; ``extra_domains`` are what the
@@ -332,6 +338,11 @@ def agent_policy_allows(
             # ones (#766): a registry with a credential is the service
             # sandbox's host, and this sandbox never speaks to it.
             *registries.domains(config.open_registries_for(repo)),
+            # The hosts the operator's [[mcp]] servers need. Declared on
+            # purpose like a registry is, so they are reachable whether or
+            # not a deny tier would otherwise have refused them; deduped
+            # with everything above because a repeated rule is fatal.
+            *config.mcp_hosts_for(mcp_roles),
             *config.sandbox.extra_allow_domains,
             *extra_domains,
         ]
@@ -470,7 +481,7 @@ class Provisioner:
                 repo,
                 extra_domains=self._submodule_hosts(run_id, workspace, languages, repo),
             ),
-            secrets=[self._agent_secret_spec()],
+            secrets=self._agent_secret_specs(),
             persistent_env=self.agent_persistent_env(repo),
             files=self.agent_files(repo),
         )
@@ -624,6 +635,42 @@ class Provisioner:
     def _agent_secret_spec(self) -> SecretSpec:
         env, host = self.backend().secret
         return SecretSpec(kind="custom", host=host, env=env)
+
+    def _agent_secret_specs(self, roles: Sequence[str] | None = None) -> list[SecretSpec]:
+        """Every custom secret the agent sandbox is registered for: the
+        backend's own credential, then one per credentialed ``[[mcp]]``
+        server, each bound to that credential's single host so the proxy
+        substitutes it only in flight to the service it belongs to.
+
+        Config validation already guarantees the env names are distinct and
+        none collides with the backend's, which matters because sbx keys
+        custom secrets by env name and refuses a second registration.
+        """
+        specs = [self._agent_secret_spec()]
+        specs += [
+            SecretSpec(kind="custom", host=host, env=env)
+            for env, host in self.config.mcp_secrets_for(roles)
+        ]
+        return specs
+
+    def mcp_secret_env(self, roles: Sequence[str] | None = None) -> dict[str, str]:
+        """The credential values for the agent sandbox's MCP servers, read
+        from the daemon's environment.
+
+        Every declared name must be set, for the same reason a registry's
+        ``auth_env`` must: the operator said a server needs it, and a run
+        without it fails later, inside a sandbox, as an authentication
+        error nothing on the host explains.
+        """
+        names = [env for env, _ in self.config.mcp_secrets_for(roles)]
+        missing = [name for name in names if not self.env.get(name)]
+        if missing:
+            raise ProvisionError(
+                f"[[mcp]] credential env names {missing} are not set in the daemon's "
+                "environment (secrets.env / the service unit); set them, or drop the "
+                "`credential` from the MCP entries that reference them"
+            )
+        return {name: self.env[name] for name in names}
 
     def gh_credential(self, repo: str | None = None) -> GhCredential:
         """The credential the github sandbox authenticates with, scoped to
@@ -1765,8 +1812,12 @@ class Provisioner:
             role="agent",
             workspace=workspace,
             template=self.config.sandbox.template,
-            policy_allows=agent_policy_allows(self.config, self.config.sandbox.effective_languages),
-            secrets=[self._agent_secret_spec()],
+            policy_allows=agent_policy_allows(
+                self.config,
+                self.config.sandbox.effective_languages,
+                mcp_roles=CONCIERGE_MCP_ROLES,
+            ),
+            secrets=self._agent_secret_specs(CONCIERGE_MCP_ROLES),
             persistent_env=self.agent_persistent_env(),
             files=self.agent_files(),
         )
@@ -2483,6 +2534,7 @@ class Provisioner:
         exports: dict[str, str] = {**spec.persistent_env, **spec.secret_env}
         if spec.role == "agent":
             exports[self.agent_token_env()] = token
+            exports.update(self.mcp_secret_env())
         elif spec.role == "github":
             exports["GH_TOKEN"] = token
             exports["GITHUB_TOKEN"] = token
@@ -2562,6 +2614,9 @@ class Provisioner:
             return lambda: {
                 **self.agent_persistent_env(repo),
                 self.agent_token_env(): self.agent_token(),
+                # The MCP servers' credentials travel the same road as the
+                # agent's own: never in the job, never in argv.
+                **self.mcp_secret_env(),
             }
         if role == "service":
             creds = self.config.credentials_named(credentials)

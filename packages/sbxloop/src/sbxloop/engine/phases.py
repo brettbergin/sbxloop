@@ -508,6 +508,12 @@ class PhaseRunner:
             # attempt's session so the work already done is not re-derived.
             resume_session_id=resume_session_id,
             host_tools=list(host_tools),
+            # Role-filtered: `[[mcp]] roles` decides which sessions get a
+            # server, and the default excludes critics — a read-only review
+            # reaching a third-party service is a capability nobody asked
+            # for, and both backends already fail closed on an unknown MCP
+            # tool in read-only mode.
+            mcp_servers=self.config.mcp_specs_for(ROLE_BY_PHASE[phase]),
         )
         started = time.monotonic()
         log.info(

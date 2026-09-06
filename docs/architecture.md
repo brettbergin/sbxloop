@@ -922,6 +922,38 @@ to set the loop up). Bodies are gated as prompt bodies are:
 `scripts/check_self_references.py` reads `skills/*/SKILL.md` alongside
 `engine/prompts/*.md`.
 
+`[[mcp]]` is the extensibility point: external MCP servers an agent session
+may use, on either backend. `McpConfig` names the server, its `transport`
+(`stdio` with a `command` argv, or `http`/`sse` with a `url`), the `hosts` it
+contacts, an optional `credential` naming a `[[credentials]]` entry, and the
+`roles` that get it — defaulting to builder and operator, never a critic,
+because a read-only review session reaching a third-party service is a
+capability nobody asked for. `Config.mcp_specs_for(role)` resolves an entry
+into the protocol's neutral `McpServerSpec`, `JobRequest.mcp_servers`
+carries it, and `sbxloop_worker.mcp.server_configs` materialises it into
+each SDK's dialect. The two agree on everything except the stdio token —
+`"stdio"` to the Claude Agent SDK, `"local"` to the Copilot SDK — which is
+the entire reason the protocol carries a neutral transport and the backends
+pass their own `stdio_type` (field-verified 2026-09-06 against
+github-copilot-sdk 1.0.8 and claude-agent-sdk 0.2.149). On the claude
+backend the operator's servers are merged *alongside* the in-process
+`sbxloop` host-tool server, never over it.
+
+Two properties make that safe to hand an unattended agent. **No secret
+travels in a job:** a spec carries `${NAME}` references, and
+`sbxloop_worker.mcp.expand_refs` resolves them inside the sandbox against an
+environment where, under the default secret strategy, the value is a proxy
+placeholder that only becomes real in flight to the credential's own host —
+so nothing secret reaches a job, an event, a log or an `sbx` argument, and
+config validation rejects a token-shaped word in `command` for the same
+reason. **The hosts are declared:** `agent_policy_allows` adds
+`config.mcp_hosts_for(roles)` to the sandbox's allowlist, deduped like every
+other tier because a repeated `sbx policy allow` is fatal, and the
+concierge's long-lived box is scoped to `CONCIERGE_MCP_ROLES` so it does not
+open hosts for servers no session there can use. A server that declares no
+hosts is a doctor failure, since it would otherwise fail at its first
+request rather than at startup.
+
 The repository's own instruction files reach every phase the same way
 (#688). `engine.repocontext.read_repo_context` reads `AGENTS.md`,
 `CLAUDE.md`, `.cursorrules`, `.github/copilot-instructions.md`, the

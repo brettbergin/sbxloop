@@ -51,6 +51,7 @@ from sbxloop.ids import DEFAULT_BRANCH_PREFIX
 from sbxloop.log import LogFormat, LogLevel, get_logger
 from sbxloop.paths import SbxloopHome, home_root_from_env, resolve_home_root
 from sbxloop.toolchains import DEFAULT_LANGUAGES, normalize_language, supported_languages
+from sbxloop_worker.protocol import McpServerSpec, McpTransport
 
 log = get_logger(__name__)
 
@@ -488,6 +489,16 @@ class RegistryConfig(_ConfigModel):
 
 _CREDENTIAL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
+# An MCP server's name reaches the model as part of every tool it exposes
+# (`mcp__<server>__<tool>`), so it is held to the protocol's tool alphabet.
+_MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Credential shapes an operator might paste into an MCP command line. Not a
+# secret scanner — a guard rail against the one mistake that would put a
+# real token into events, logs and `sbx` argv.
+_SECRET_SHAPED_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|sk-ant-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9]{32,}|xox[baprs]-[A-Za-z0-9-]{10,})"
+)
 
 
 class CredentialConfig(_ConfigModel):
@@ -1843,6 +1854,97 @@ RETIRED_PATH_KEYS: dict[str, str] = {
 }
 
 
+#: Which session roles an MCP server may be given to. A critic is
+#: deliberately absent from the default: a read-only review session reaching
+#: a third-party service is a capability nobody asked for, and both backends
+#: already fail closed on an unknown MCP tool in read-only mode.
+McpRole = Literal["planner", "builder", "critic", "operator", "concierge"]
+DEFAULT_MCP_ROLES: tuple[McpRole, ...] = ("builder", "operator")
+
+
+class McpConfig(_ConfigModel):
+    """One external MCP server the agent sandbox may be given.
+
+    The extensibility point: an operator names a server here and every
+    session whose role is listed gets it, on whichever ``[agent] backend``
+    is configured. The host resolves this into the neutral
+    ``McpServerSpec`` the worker protocol carries, and each backend
+    materialises that into its own SDK's dialect.
+
+    ``hosts`` are the domains the server needs to reach. They join the agent
+    sandbox's allowlist, which is otherwise least-privilege and would refuse
+    them: a server whose host is not declared here fails closed at its first
+    request, which reads as a hang rather than a misconfiguration, so this
+    is not optional bookkeeping.
+
+    ``credential`` names a ``[[credentials]]`` entry. Its ``env`` is set for
+    the server's process and its ``host`` is what the credential is bound
+    to, so under the default secret strategy the sandbox only ever holds a
+    proxy placeholder — the value is substituted in flight for requests to
+    that host and never appears in a job, an event or an ``sbx`` argument.
+    The credential value must therefore never be written into ``command`` or
+    ``args``, which do travel; the validator rejects the obvious spellings.
+    """
+
+    name: str
+    transport: McpTransport = "stdio"
+    command: list[str] = Field(default_factory=list)
+    url: str = ""
+    hosts: list[str] = Field(default_factory=list)
+    credential: str | None = None
+    roles: list[McpRole] = Field(default_factory=lambda: list(DEFAULT_MCP_ROLES))
+    description: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        if not _MCP_NAME_RE.match(value):
+            raise ValueError(
+                "mcp[].name must be letters, digits, '-' or '_' (it becomes the MCP "
+                f"server name the model sees), got {value!r}"
+            )
+        return value
+
+    @field_validator("hosts")
+    @classmethod
+    def _check_hosts(cls, value: list[str]) -> list[str]:
+        hosts = [host.strip().lower() for host in value]
+        bad = [host for host in hosts if not _HOST_RE.match(host)]
+        if bad:
+            raise ValueError(f"mcp[].hosts must be bare hostnames, got {bad!r}")
+        return list(dict.fromkeys(hosts))
+
+    @field_validator("roles")
+    @classmethod
+    def _dedupe_roles(cls, value: list[McpRole]) -> list[McpRole]:
+        return list(dict.fromkeys(value))
+
+    @model_validator(mode="after")
+    def _check_transport(self) -> McpConfig:
+        if self.transport == "stdio":
+            if not self.command:
+                raise ValueError(f"mcp {self.name!r}: a stdio server needs a command")
+            if self.url:
+                raise ValueError(f"mcp {self.name!r}: a stdio server takes no url")
+        else:
+            if not self.url:
+                raise ValueError(f"mcp {self.name!r}: a {self.transport} server needs a url")
+            if self.command:
+                raise ValueError(f"mcp {self.name!r}: a {self.transport} server takes no command")
+        if not self.roles:
+            raise ValueError(f"mcp {self.name!r}: names no roles, so no session would get it")
+        # A credential in argv would reach events, logs and `sbx` arguments,
+        # which is the one thing secrets never do here.
+        for word in self.command:
+            if _SECRET_SHAPED_RE.search(word):
+                raise ValueError(
+                    f"mcp {self.name!r}: command carries what looks like a secret "
+                    f"({word!r}); declare a [[credentials]] entry and reference it with "
+                    "`credential`, which is delivered as environment instead"
+                )
+        return self
+
+
 class AgentConfig(_ConfigModel):
     """Which SDK runs the agent personas inside the agent sandbox (#533).
 
@@ -2102,7 +2204,11 @@ class Config(_ConfigModel):
     registries: list[RegistryConfig] = Field(default_factory=list)
     # The credentials a run may be granted (#765): held by a per-run service
     # sandbox and used through host-driven ops; never in the agent sandbox.
+    # The one exception is an entry an [[mcp]] server references, which is
+    # bound into the agent sandbox as a proxy placeholder — see McpConfig.
     credentials: list[CredentialConfig] = Field(default_factory=list)
+    # External MCP servers the agent sessions may be given, by role.
+    mcp: list[McpConfig] = Field(default_factory=list)
     github: GithubConfig = Field(default_factory=GithubConfig)
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     budgets: Budgets = Field(default_factory=Budgets)
@@ -2125,6 +2231,123 @@ class Config(_ConfigModel):
     @classmethod
     def _expand_home(cls, value: Path) -> Path:
         return value.expanduser()
+
+    @model_validator(mode="after")
+    def _check_mcp(self) -> Config:
+        """Everything about ``[[mcp]]`` that needs the whole config.
+
+        Fails closed at load rather than at provisioning: an MCP server that
+        names a credential nobody declared, or two servers fighting over one
+        env var, would otherwise surface inside a sandbox as a server that
+        silently did not start.
+        """
+        seen: set[str] = set()
+        for server in self.mcp:
+            if server.name in seen:
+                raise ValueError(f"two [[mcp]] entries are both named {server.name!r}")
+            seen.add(server.name)
+        by_env: dict[str, str] = {}
+        for server in self.mcp:
+            if server.credential is None:
+                continue
+            entry = self.credential(server.credential)
+            if entry is None:
+                known = ", ".join(c.name for c in self.credentials) or "none"
+                raise ValueError(
+                    f"mcp {server.name!r} references credential {server.credential!r}, "
+                    f"which is not declared under [[credentials]] (declared: {known})"
+                )
+            # sbx keys custom secrets by env var name, so one env cannot be
+            # registered twice in a sandbox. A collision with the agent
+            # backend's own credential is already impossible — those names
+            # are reserved for every `[[credentials]]` entry — so only the
+            # server-to-server case needs saying here.
+            other = by_env.get(entry.env)
+            if other is not None:
+                raise ValueError(
+                    f"mcp {server.name!r} and {other!r} both bind env {entry.env}; a sandbox "
+                    "registers one secret per env var, so give them separate credentials"
+                )
+            by_env[entry.env] = server.name
+        return self
+
+    def mcp_for(self, role: str) -> list[McpConfig]:
+        """The configured servers a session running as ``role`` gets."""
+        return [server for server in self.mcp if role in server.roles]
+
+    def mcp_specs_for(self, role: str) -> list[McpServerSpec]:
+        """``mcp_for`` as the worker protocol's neutral specs.
+
+        A credentialed server carries a ``${NAME}`` reference here, never a
+        value: a job's contents reach events and logs, so the substitution
+        happens inside the sandbox (``sbxloop_worker.mcp.expand_refs``)
+        against an environment that, under the default secret strategy,
+        holds a proxy placeholder rather than the secret itself.
+
+        A stdio server gets the credential as environment; an http/sse one
+        gets it as the header the ``[[credentials]]`` entry declares, which
+        is what that entry's ``header``/``scheme`` are for.
+        """
+        specs: list[McpServerSpec] = []
+        for server in self.mcp_for(role):
+            entry = None if server.credential is None else self.credential(server.credential)
+            if server.transport == "stdio":
+                env = {entry.env: f"${{{entry.env}}}"} if entry is not None else {}
+                specs.append(
+                    McpServerSpec(
+                        name=server.name,
+                        transport="stdio",
+                        command=server.command[0],
+                        args=list(server.command[1:]),
+                        env=env,
+                    )
+                )
+            else:
+                headers: dict[str, str] = {}
+                if entry is not None:
+                    value = f"${{{entry.env}}}"
+                    headers[entry.header] = f"{entry.scheme} {value}" if entry.scheme else value
+                specs.append(
+                    McpServerSpec(
+                        name=server.name,
+                        transport=server.transport,
+                        url=server.url,
+                        headers=headers,
+                    )
+                )
+        return specs
+
+    def mcp_servers_for_roles(self, roles: Sequence[str] | None) -> list[McpConfig]:
+        """The servers reachable by any of ``roles``; ``None`` means every
+        role, which is what a run's agent sandbox needs (it runs the
+        planner, the builder and the critic in the same box)."""
+        if roles is None:
+            return list(self.mcp)
+        wanted = set(roles)
+        return [server for server in self.mcp if wanted & set(server.roles)]
+
+    def mcp_hosts_for(self, roles: Sequence[str] | None = None) -> list[str]:
+        """The hosts ``roles``' MCP servers need, deduped — what
+        ``agent_policy_allows`` adds to that sandbox's allowlist. A box that
+        runs no session able to use a server does not get its host."""
+        return list(
+            dict.fromkeys(
+                host for server in self.mcp_servers_for_roles(roles) for host in server.hosts
+            )
+        )
+
+    def mcp_secrets_for(self, roles: Sequence[str] | None = None) -> list[tuple[str, str]]:
+        """``(env, host)`` per credentialed MCP server reachable by
+        ``roles``: the custom secret registrations that sandbox needs beyond
+        the backend's own. Deduped by env, which is what sbx keys on."""
+        pairs: dict[str, str] = {}
+        for server in self.mcp_servers_for_roles(roles):
+            if server.credential is None:
+                continue
+            entry = self.credential(server.credential)
+            assert entry is not None  # _check_mcp ran at load
+            pairs.setdefault(entry.env, entry.host)
+        return list(pairs.items())
 
     @property
     def paths(self) -> SbxloopHome:
