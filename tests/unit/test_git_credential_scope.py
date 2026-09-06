@@ -8,12 +8,28 @@ from pathlib import Path
 
 import pytest
 
-from sbxloop import hostgit
+from sbxloop import gitcredentials, hostgit
 from sbxloop.errors import ProvisionError
 from tests.fakes.gitserver import PrivateGitServer, bare_from
 from tests.unit.test_hostgit import git, make_repo
 
 TOKEN = "TEST_ONLY_GITHUB_CREDENTIAL_7f19"
+
+
+@pytest.mark.parametrize("field", ["capability", "wwwauth"])
+def test_repeated_protocol_arrays_do_not_disable_valid_authentication(
+    tmp_path: Path, field: str
+) -> None:
+    result = subprocess.run(
+        ["sh", "-c", gitcredentials.HELPER[1:] + ' "$@"', "helper", "get"],
+        input=f"{field}[]=first\n{field}[]=second\nprotocol=https\nhost=github.com\n\n",
+        env={**os.environ, **hostgit._clone_env(TOKEN)},
+        cwd=tmp_path,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert f"password={TOKEN}" in result.stdout
 
 
 def credential_fill(

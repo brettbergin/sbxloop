@@ -23,9 +23,14 @@ for line in sys.stdin:
     if not line:
         break
     key, sep, value = line.partition('=')
-    if not sep or key in fields:
+    if not sep:
         sys.exit(0)
-    fields[key] = value
+    # Git may repeat array fields (capability[], wwwauth[], state[]).
+    # Only routing fields matter here; ambiguity in either fails closed.
+    if key in ('protocol', 'host'):
+        if key in fields:
+            sys.exit(0)
+        fields[key] = value
 host = fields.get('host', '')
 try:
     url = urlsplit('https://' + host)
