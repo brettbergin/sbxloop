@@ -201,7 +201,7 @@ from sbxloop.policy import EgressGranter, egress_rejection
 from sbxloop.sbx import registries
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
-from sbxloop.sbx.provision import Provisioner
+from sbxloop.sbx.provision import ContinueBranch, Provisioner
 from sbxloop.sbx.sandbox import SBXLOOP_DIR
 from sbxloop.verifylint import services_evidence
 from sbxloop.worker.client import WorkerClient
@@ -725,7 +725,7 @@ class LoopEngine:
         # work, the review diff describes it, and the delivered tree is the
         # one the agent actually built. Pinning after provisioning would
         # only change where the result lands.
-        provisioner = Provisioner(self.sbx, self._provision_config(), self.bus)
+        provisioner = Provisioner(self.sbx, self.config, self.bus)
         # A resumed run's workspace is pinned from the runs table — never
         # recomputed from config, which would silently relocate it (#60).
         # The run's repository (its config was narrowed to it in
@@ -742,6 +742,7 @@ class LoopEngine:
             expects_mount=expects_mount,
             credentials=credentials,
             kind=kind,
+            continue_branch=self._continue_branch(),
         )
         assert pair.workspace is not None
         self._confirm_prior_checkout(run_id, pair)
@@ -1384,22 +1385,18 @@ class LoopEngine:
             log.info("run.issues_disabled", run=run_id, repo=entry.repo)
         return probe.has_issues
 
-    def _provision_config(self) -> Config:
-        """The config provisioning sees: a restart's offered branch pinned
-        as ``sandbox.continue_branch`` so the run's clone is cut from the
-        previous attempt's work rather than from the base branch (#600).
+    def _continue_branch(self) -> ContinueBranch | None:
+        """A restart's offered branch, for provisioning to cut the run's
+        clone from the previous attempt's work rather than from the base
+        branch (#600) — passed as the provisioner's own parameter (#646),
+        not smuggled through the config.
 
-        The pin is *optional* — unlike a resume, a restart has published
+        The offer is *optional* — unlike a resume, a restart has published
         nothing of its own, so a branch that is gone from origin is a fresh
         start with a logged reason, not a failed provision.
         """
         branch = self._prior.branch
-        if not branch:
-            return self.config
-        sandbox = self.config.sandbox.model_copy(
-            update={"continue_branch": branch, "continue_branch_optional": True}
-        )
-        return self.config.model_copy(update={"sandbox": sandbox})
+        return ContinueBranch(branch, optional=True) if branch else None
 
     def _confirm_prior_checkout(self, run_id: str, pair: SandboxPair) -> None:
         """Keep the branch offer only if the workspace really landed on it.

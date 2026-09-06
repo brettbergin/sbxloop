@@ -227,3 +227,42 @@ class TestWorkspacePinning:
         assert run.branch == f"sbxloop/{result.run_id}"
         messages = " ".join(r.getMessage() for r in caplog.records)
         assert "continue_branch_unusable" in messages
+
+
+class TestContinueBranchParameter:
+    """#646: continuing published history is the provisioner's own
+    parameter; the config key is the operator's way to ask for the same."""
+
+    def test_the_engine_offers_a_prior_branch_as_the_parameter(self, harness: Harness) -> None:
+        from sbxloop.sbx.provision import ContinueBranch
+
+        engine = harness.engine()
+        assert engine._continue_branch() is None
+        engine._prior.branch = PRIOR_BRANCH
+        assert engine._continue_branch() == ContinueBranch(PRIOR_BRANCH, optional=True)
+        # The config is never rewritten to carry it.
+        assert engine.config.sandbox.continue_branch is None
+
+    def test_the_parameter_wins_over_the_config_knob(self, harness: Harness) -> None:
+        from sbxloop.config import Config
+        from sbxloop.events import EventBus
+        from sbxloop.sbx.cli import SbxCLI
+        from sbxloop.sbx.provision import ContinueBranch, Provisioner, continue_from_config
+
+        config = Config.model_validate(
+            {
+                "home": str(harness.home.root),
+                "sandbox": {"continue_branch": "sbxloop/by-hand", "continue_branch_optional": True},
+            }
+        )
+        assert continue_from_config(config.sandbox) == ContinueBranch("sbxloop/by-hand", True)
+        assert (
+            continue_from_config(Config.model_validate({"home": str(harness.home.root)}).sandbox)
+            is None
+        )
+        provisioner = Provisioner(SbxCLI(binary=str(harness.fake_sbx.binary)), config, EventBus())
+        # The operator's knob is the default...
+        assert provisioner._continue == ContinueBranch("sbxloop/by-hand", True)
+        # ...and an explicit parameter replaces it for that provision.
+        provisioner._continue = ContinueBranch("sbxloop/offered", optional=False)
+        assert provisioner._continue.branch == "sbxloop/offered"
