@@ -41,6 +41,7 @@ from sbxloop.tui.screens.overview import OverviewScreen
 from sbxloop.tui.screens.run_detail import RunDetailScreen
 from sbxloop.tui.screens.runs import RunsScreen
 from sbxloop.tui.screens.sandboxes import SandboxesScreen
+from sbxloop.tui.widgets.navrail import NAV
 
 #: How often the daemon is asked ``status`` (a read-only verb, but a
 #: ctl round trip; the store poll is the fast one).
@@ -65,16 +66,20 @@ class SbxloopTui(App[None]):
         "help": HelpScreen,
     }
     COMMANDS: ClassVar[set[Any]] = App.COMMANDS | {ConsoleCommands}
+    # The rail and these bindings come from one list, so a screen cannot be
+    # reachable by key and missing from the map, or the other way round.
+    # The rail shows every screen; the footer keeps its own row for the
+    # verbs of whichever screen is up, so only `r` and `q` are shown here.
     BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("1", "mode('overview')", "Overview"),
-        Binding("2", "mode('runs')", "Runs"),
-        Binding("3", "mode('items')", "Queue"),
-        Binding("4", "mode('chat')", "Chat"),
-        Binding("5", "mode('sandboxes')", "Sandboxes"),
-        Binding("6", "mode('daemon')", "Daemon"),
-        Binding("7", "mode('config')", "Config"),
-        Binding("8", "mode('doctor')", "Doctor"),
-        Binding("question_mark", "mode('help')", "Help"),
+        *(
+            Binding(
+                "question_mark" if item.key == "?" else item.key,
+                f"mode({item.mode!r})",
+                item.label,
+                show=False,
+            )
+            for item in NAV
+        ),
         Binding("r", "refresh", "Refresh"),
         Binding("q", "quit", "Quit"),
     ]
