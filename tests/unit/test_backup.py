@@ -76,8 +76,12 @@ class TestCreate:
 
     def test_label_is_validated(self, tmp_path: Path) -> None:
         home = seeded_home(tmp_path / "h")
-        with pytest.raises(BackupError, match="label"):
-            create_backup(home, label="../x")
+        for bad in ("../x", "a/b", ".hidden", "sp ace"):
+            with pytest.raises(BackupError, match="label"):
+                create_backup(home, label=bad)
+        # the deploy labels its snapshot with the version it installs
+        info = create_backup(home, label="deploy-1.0.132")
+        assert info.name.endswith("-deploy-1.0.132")
 
     def test_empty_home_still_snapshots(self, tmp_path: Path) -> None:
         home = SbxloopHome(tmp_path / "h")
