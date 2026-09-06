@@ -348,12 +348,19 @@ class HomeInit:
             with tarfile.open(tarball) as tf:
                 tf.extractall(unpacked, filter="data")
             installer = self._find_installer(unpacked)
-            # Docker's installer copies the binaries, then tries to drop an
-            # AppArmor profile into /etc — root's business, and the only
-            # step that can fail for an unprivileged user; the binaries are
-            # already in place by then.
+            # Docker's installer refuses outright when mkfs.ext4 is not on
+            # PATH — and Debian keeps /usr/sbin off a non-root PATH, which is
+            # how the field host's first migration stopped here. It then
+            # copies the binaries and tries to drop an AppArmor profile into
+            # /etc — root's business, and the only step that can fail for an
+            # unprivileged user; the binaries are already in place by then.
+            env = {
+                **self.env,
+                "PREFIX": str(self.home.sbx_prefix),
+                "PATH": "/usr/sbin:/sbin:" + self.env.get("PATH", "/usr/bin:/bin"),
+            }
             try:
-                self._run_env([str(installer)], {**self.env, "PREFIX": str(self.home.sbx_prefix)})
+                self._run_env([str(installer)], env)
             except subprocess.CalledProcessError as exc:
                 if not self.home.sbx_binary.exists():
                     raise InitError(

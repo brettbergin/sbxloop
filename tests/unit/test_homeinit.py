@@ -51,7 +51,9 @@ class FakeRun:
             (self.home.venv / "bin").mkdir(parents=True, exist_ok=True)
             self.home.venv_python.write_text("#!python\n")
         if argv[0].endswith("install.sh"):
-            # Docker's installer, honouring PREFIX from the environment.
+            # Docker's installer, honouring PREFIX from the environment; it
+            # needs mkfs.ext4 on PATH, which Debian keeps under /usr/sbin.
+            assert os.environ["PATH"].startswith("/usr/sbin:/sbin:")
             prefix = Path(os.environ["PREFIX"])
             (prefix / "bin").mkdir(parents=True, exist_ok=True)
             (prefix / "bin" / "sbx").write_text("#!sbx\n")
