@@ -1536,6 +1536,41 @@ class TestWorkloadItems:
         assert store.drop_repoless() == 0
         assert store.get(tick) is not None
 
+    def test_schedules_live_in_the_store(self, tmp_path: Path) -> None:
+        """#818: the schedule itself — profile, ask, cadence, zone, who made
+        it — is a row, beside its state; a name is unique; removing one
+        forgets its grid; a state-only row (a pre-#818 daemon's) takes the
+        spec and keeps its anchor; a row edited into nonsense fires nothing."""
+        from sbxloop.config import ScheduleConfig
+
+        store = DaemonStore(tmp_path / "state.db")
+        assert store.schedules() == [] and store.schedule("daily") is None
+        daily = ScheduleConfig(name="daily", profile="brief", ask="Morning brief", every="24h")
+        assert store.add_schedule(daily, source="chat", by="brett", now=100.0) is True
+        assert store.add_schedule(daily, source="ctl", by="ana", now=200.0) is False  # taken
+        (stored,) = store.schedules()
+        assert stored.spec == daily and stored.source == "chat"
+        assert (stored.created_by, stored.created_at) == ("brett", 100.0)
+        assert store.schedule("daily") == stored
+        assert store.schedule_rows()["daily"].anchor == 100.0
+        # A state-only row keeps its grid and takes the spec.
+        store.schedule_row("hourly", now=50.0)
+        assert [s.spec.name for s in store.schedules()] == ["daily"]
+        hourly = ScheduleConfig(name="hourly", profile="brief", ask="Check", every="1h")
+        assert store.add_schedule(hourly, source="config", by=None, now=300.0) is True
+        assert store.schedule_rows()["hourly"].anchor == 50.0
+        assert [s.spec.name for s in store.schedules()] == ["daily", "hourly"]
+        # Removing forgets the state too: a re-add starts a fresh grid.
+        assert store.remove_schedule("daily") is True
+        assert store.remove_schedule("daily") is False
+        assert "daily" not in store.schedule_rows()
+        assert store.add_schedule(daily, source="chat", by="brett", now=400.0) is True
+        assert store.schedule_rows()["daily"].anchor == 400.0
+        # Validated on the way out: a hand-edited row cannot fire nonsense.
+        store._conn.execute("UPDATE daemon_schedules SET every = 'soon' WHERE name = 'daily'")
+        store._conn.commit()
+        assert [s.spec.name for s in store.schedules()] == ["hourly"]
+
     def test_schedule_rows_record_the_grid(self, tmp_path: Path) -> None:
         """#761: a schedule's row anchors on first sight, keeps the last due
         tick and what it queued, and pauses per schedule."""

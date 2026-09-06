@@ -2167,15 +2167,6 @@ def daemon(
     # backend and no `[github]` runs on those alone.
     # (`--once` skips the concierge but still runs what one already queued.)
     chat_intake = config.chat_backend is not None and bool(config.concierge.enabled)
-    if not config.github.enabled and not chat_intake and not config.schedules:
-        log.error(
-            "daemon.no_repository",
-            hint="set --repo owner/name (or [github] repo / [[github.repos]]): the "
-            "daemon's work is the labeled issues of the configured repositories — or "
-            "configure a chat backend with the concierge on, and workloads asked for "
-            "in chat are its work — or declare [[schedules]], and their ticks are",
-        )
-        raise typer.Exit(2)
     if config.github.enabled and not config.github.enabled_repos():
         log.error(
             "daemon.no_enabled_repository",
@@ -2207,6 +2198,23 @@ def daemon(
     archived = DaemonStore.archive_legacy(db_path)
     store = _store(config)
     dstore = DaemonStore(db_path)
+    # Schedules live in the store (#818): a daemon with stored schedules
+    # and nothing else is a valid daemon, as one with `[[schedules]]` was.
+    if (
+        not config.github.enabled
+        and not chat_intake
+        and not config.schedules
+        and not dstore.schedules()
+    ):
+        log.error(
+            "daemon.no_repository",
+            hint="set --repo owner/name (or [github] repo / [[github.repos]]): the "
+            "daemon's work is the labeled issues of the configured repositories — or "
+            "configure a chat backend with the concierge on, and workloads asked for "
+            "in chat are its work — or create a schedule (`sbxloop daemon ctl schedules "
+            "add …`), and its ticks are",
+        )
+        raise typer.Exit(2)
     # Rows a single-repo daemon wrote carry no repository. Name it now, from
     # the config, rather than letting whichever repository is polled first
     # adopt them. With several repos configured there is no sole owner to
@@ -2294,21 +2302,13 @@ def daemon(
             suspend_after=config.daemon.repo_suspend_after,
             persist=persist_repo_health,
         )
-        if chat_intake or config.schedules:
-            # Chat-started (#760) and scheduled (#761) workloads ride the
-            # same queue; the composite routes each item back to where it
-            # came from.
-            source = CompositeSource(
-                source,
-                ChatSource() if chat_intake else None,
-                ScheduleSource() if config.schedules else None,
-            )
+        # Chat-started (#760) and scheduled (#761) workloads ride the same
+        # queue; the composite routes each item back to where it came
+        # from. The schedule source always rides: a schedule may be
+        # created from chat while the daemon runs (#818).
+        source = CompositeSource(source, ChatSource() if chat_intake else None, ScheduleSource())
     else:
-        source = CompositeSource(
-            None,
-            ChatSource() if chat_intake else None,
-            ScheduleSource() if config.schedules else None,
-        )
+        source = CompositeSource(None, ChatSource() if chat_intake else None, ScheduleSource())
 
     # One line an operator can read back from the journal to know exactly
     # what this daemon is: its home, what it polls, and every guardrail.
@@ -2374,7 +2374,7 @@ def daemon(
         raise typer.Exit(code)
 
     loop = DaemonLoop(config, store=store, dstore=dstore, source=source, sbx=sbx, github=github)
-    polled = source.github if isinstance(source, CompositeSource) else source
+    polled = source.github
     if isinstance(polled, MultiRepoIssueSource):
         polled.notify = loop.source_notice
     # One probe, shared: the startup drift check below warms its PyPI memo, so

@@ -1207,7 +1207,8 @@ class TestDoctor:
     def test_doctor_lists_schedules_and_where_the_daemon_gets_its_work(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """#761/#762: `[[schedules]]` gets an informational row, and a
+        """#761/#762/#818: a `[[schedules]]` entry left in the file gets a
+        warning row (schedules live in the daemon's database now), and a
         `daemon intake` row says what would be work — a config with no
         repository, no chat intake and no schedules is told the daemon
         would refuse to start (soft: a CLI-only host never starts one)."""
@@ -1221,8 +1222,9 @@ class TestDoctor:
         )
         result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.output
-        assert "daily: cron 0 7 * * mon-fri (Europe/London) → profile brief" in result.output
-        assert "hourly: every 1h (UTC) → profile brief" in result.output
+        assert "schedules in sbxloop.toml" in result.output
+        assert "daily, hourly" in result.output
+        assert "schedules live in the daemon's database now" in result.output
         assert "daemon intake" in result.output and "2 schedules" in result.output
         # the repository and chat asks are named too
         (workdir / "sbxloop.toml").write_text(
@@ -1237,7 +1239,7 @@ class TestDoctor:
         result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.output  # soft
         assert "nothing would be work" in result.output
-        assert "[[schedules]]" in result.output
+        assert "schedules add" in result.output
 
     def _bake_record(
         self,

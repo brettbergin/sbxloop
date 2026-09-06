@@ -2110,6 +2110,13 @@ class ScheduleConfig(_ConfigModel):
     tick is still live, in which case the tick is skipped and said so. A
     tick is recorded at its due time: a late daemon does not shift the
     grid, and one down for several ticks catches up with one.
+
+    Schedules live in the daemon's database (#818): the concierge's
+    ``create_schedule`` and ``schedules add`` store one there, live from
+    the next tick. This model is that row's shape, and — as
+    ``[[schedules]]`` in sbxloop.toml — the legacy way to declare one: the
+    daemon imports a file entry into its database once and ignores the
+    file's copy after that (doctor says so).
     """
 
     name: str
@@ -2224,7 +2231,8 @@ class Config(_ConfigModel):
     # default; a code run ignores both.
     workloads: list[WorkloadProfile] = Field(default_factory=list)
     workload: WorkloadConfig = Field(default_factory=WorkloadConfig)
-    # Workloads the daemon asks for by itself, on a cadence (#761).
+    # Legacy (#818): schedules live in the daemon's database; an entry here
+    # is imported into it once on daemon start and then ignored.
     schedules: list[ScheduleConfig] = Field(default_factory=list)
 
     @field_validator("home", mode="after")
