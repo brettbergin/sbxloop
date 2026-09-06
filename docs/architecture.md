@@ -1468,20 +1468,30 @@ repo-attribution passes (`backfill_repo`, `attribute_repoless`,
 queued ask. With `[chat]` configured and `[github]` absent the daemon runs on
 `ChatSource` alone.
 
-The third source is time (#761). `[[schedules]]` declares workloads the
-daemon asks for by itself: a `name`, the `profile` to run under, the `ask`,
-and one cadence — `every` (a period, `"24h"`, `"90m"`, parsed by
+The third source is time (#761). A schedule is a workload the daemon asks
+for by itself: a `name`, the `profile` to run under, the `ask`, and one
+cadence — `every` (a period, `"24h"`, `"90m"`, parsed by
 `daemon/schedule.py::parse_every`) or `cron` (five fields, `CronSpec`),
-read in `timezone` (`[daemon] run_cap_timezone` when unset). The loop's
-`tick` calls `_fire_schedules` right after the poll: for each schedule it
-reads (creating on first sight) its `daemon_schedules` row — `anchor`, the
+read in `timezone` (`[daemon] run_cap_timezone` when unset). Schedules live
+in the daemon's database (#818): the `daemon_schedules` row carries the
+schedule itself (profile, ask, cadence, zone, `source` and `created_by`)
+beside its state, `DaemonStore.add_schedule` / `remove_schedule` /
+`schedules` are the whole API, and `DaemonLoop.add_schedule` (the
+concierge's `create_schedule` tool, `ctl schedules add`) makes one live from
+the next tick with no restart. A `[[schedules]]` entry in `sbxloop.toml` is
+legacy: `DaemonLoop._import_config_schedules` stores it once at start,
+`daemon.schedules_imported` tells the operator to drop it from the file,
+and doctor's `schedules in sbxloop.toml` row says the same. The loop's
+`tick` calls `_fire_schedules` right after the poll: for each stored
+schedule it reads (creating on first sight) its row's state — `anchor`, the
 origin of an `every` grid; `last_due`, the latest due instant handled —
 and asks `Cadence.latest_due(row.base, now, tz)` for the most recent due in
 `(last_due, now]`. None: nothing. Otherwise exactly one tick is handled, at
 its *due* time: a paused schedule (`schedules pause <name>`, `paused_by` on
 the row) swallows it; a schedule whose previous tick is still live
 (`live_schedule_item`: a `sched:<name>:%` row outside the terminal states)
-skips it and says so (`daemon.schedule_skipped`); otherwise the loop
+skips it and says so (`daemon.schedule_skipped`), as does one whose profile
+the config no longer declares; otherwise the loop
 upserts `WorkItem(sched:<name>:<due UTC minute>, kind=workload, profile, body=ask)` and records the fire (`schedule_fired`). So a late daemon does
 not shift the grid, a daemon down for several ticks catches up with one,
 and `every = "1h"` restarted at *t*+1h30 after firing at *t*+1h fires next

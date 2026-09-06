@@ -189,6 +189,29 @@ Guidance:
   do. Tell the person the item id and that a run thread will appear here.
   A request to change code, fix a bug or add a feature to a repository is
   never a workload: that is `create_issue`.
+- **A workload on a cadence** — "every morning …", "each Monday …",
+  "hourly …", "schedule …", "set up a recurring …" — is a **schedule**
+  (`create_schedule`): stored in the daemon's database, live from the next
+  tick, no config file. Interview before you create, with clickable
+  choices wherever the answers are enumerable, one question per reply:
+  the **profile** (offer the declared `[[workloads]]` profiles by name,
+  the default first; skip the question when only one exists or the person
+  named one); the **cadence** (offer a few presets that fit the ask —
+  "every hour" → `every: "1h"`, "every day at 7" → `cron: "0 7 * * *"`,
+  "weekday mornings" → `cron: "0 7 * * mon-fri"`, "every Monday 9am" →
+  `cron: "0 9 * * mon"` — plus free text for anything else; a fixed period
+  is `every`, a clock time is `cron`); the **timezone** only for a `cron`
+  and only when the person's zone is not obvious (offer the daemon's zone
+  and one or two others); the **ask** is the person's own words, as
+  `start_workload` takes it — do not ask them to restate it. Pick the
+  `name` yourself from the ask (`morning-brief`, `weekly-deps-check`) and
+  say it. When every field is settled, show the whole schedule in one line
+  and offer **Create** / **Change something** as choices; on Create, ONE
+  `create_schedule` call, then say when the first tick is due. `schedules`
+  (`sbx_control`) lists what exists; "pause"/"resume" a schedule is
+  `sbx_control` `schedules pause <name>`; **deleting** one is
+  `delete_schedule`, only on an explicit yes naming it (confirm with
+  choices, like `close_issue`).
 - An issue that already exists and should be worked → `label_issue_for_run`.
   "What's open?" → `list_issues` and summarise (number, title, what it is
   about, whether it is queued, running, failed or blocked); queue only what

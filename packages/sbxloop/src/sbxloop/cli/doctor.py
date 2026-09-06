@@ -16,7 +16,7 @@ import os
 import shutil
 import sqlite3
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -900,22 +900,66 @@ def workload_profile_checks(config: Config) -> list[Check]:
     return [Check("workload profiles", True, listed)]
 
 
-def schedule_checks(config: Config) -> list[Check]:
-    """One row when `[[schedules]]` declares anything (#761): each schedule
-    with its cadence, zone and profile. The loader already refused a
-    schedule naming no profile or a cadence it cannot read; this row is
-    the at-a-glance view, and a reminder that the ticks are the daemon's."""
-    if not config.schedules:
+def stored_schedules(config: Config) -> list[Any]:
+    """The schedules the daemon fires, from its state db (#818) — read
+    only when that file exists, so doctor never creates one; an
+    unreadable db reads as none."""
+    from sbxloop.daemon.store import DaemonStore
+
+    db = config.paths.state_db
+    if not db.is_file():
         return []
-    listed = "; ".join(
-        f"{s.name}: {s.cadence_text} ({s.timezone or config.daemon.run_cap_timezone}) "
-        f"→ profile {s.profile}"
-        for s in config.schedules
-    )
-    return [Check("schedules", True, f"{listed} — fired by `sbxloop daemon`", hard=False)]
+    try:
+        store = DaemonStore(db)
+        try:
+            return list(store.schedules())
+        finally:
+            store.close()
+    except Exception:  # doctor reports, never raises: an unreadable db is "none"
+        return []
 
 
-def daemon_intake_checks(config: Config) -> list[Check]:
+def schedule_checks(config: Config, stored: Sequence[Any]) -> list[Check]:
+    """The schedules row (#761, #818): each stored schedule with its
+    cadence, zone and profile — and a warning when sbxloop.toml still
+    carries `[[schedules]]`, which the daemon imports once and then
+    ignores. A stored schedule whose profile the config no longer
+    declares is named: its ticks are skipped."""
+    checks: list[Check] = []
+    profiles = {p.name for p in config.workloads}
+    if stored:
+        listed = "; ".join(
+            f"{s.spec.name}: {s.spec.cadence_text} "
+            f"({s.spec.timezone or config.daemon.run_cap_timezone}) → profile {s.spec.profile}"
+            + (" (NOT DECLARED — ticks skipped)" if s.spec.profile not in profiles else "")
+            for s in stored
+        )
+        ok = all(s.spec.profile in profiles for s in stored)
+        checks.append(
+            Check(
+                "schedules",
+                ok,
+                f"{listed} — in the daemon's database, fired by `sbxloop daemon`",
+                hard=False,
+            )
+        )
+    if config.schedules:
+        names = ", ".join(s.name for s in config.schedules)
+        checks.append(
+            Check(
+                "schedules in sbxloop.toml",
+                False,
+                f"{names} — schedules live in the daemon's database now: the daemon "
+                "imports these once on start and ignores the file's copy after that; remove "
+                "the `\\[\\[schedules]]` entries and manage schedules from chat "
+                "(`create_schedule`) or `sbxloop daemon ctl schedules add …`",
+                hard=False,
+            )
+        )
+    return checks
+
+
+def daemon_intake_checks(config: Config, stored: Sequence[Any] = ()) -> list[Check]:
     """Where the daemon's work would come from (#762): the configured
     repositories' labeled issues, chat asks (a backend with the concierge
     on), the schedules' ticks. A daemon with none refuses to start
@@ -928,8 +972,8 @@ def daemon_intake_checks(config: Config) -> list[Check]:
     backend = config.chat_backend
     if backend is not None and config.concierge.enabled:
         sources.append(f"chat asks ({backend}, concierge on)")
-    if config.schedules:
-        count = len(config.schedules)
+    count = len({s.spec.name for s in stored} | {s.name for s in config.schedules})
+    if count:
         sources.append(f"{count} schedule{'s' if count != 1 else ''}")
     if not sources:
         return [
@@ -937,8 +981,9 @@ def daemon_intake_checks(config: Config) -> list[Check]:
                 "daemon intake",
                 False,
                 "nothing would be work: set \\[github] repo (labeled issues), a chat "
-                "backend with the concierge on (asks in chat), or \\[\\[schedules]] "
-                "(ticks) — `sbxloop daemon` refuses to start without one",
+                "backend with the concierge on (asks in chat), or a schedule (ticks; "
+                "`sbxloop daemon ctl schedules add …`) — `sbxloop daemon` refuses to "
+                "start without one",
                 hard=False,
             )
         ]
@@ -1164,7 +1209,8 @@ def collect_checks(
     checks.extend(credentials_checks(config, env))
     checks.extend(mcp_checks(config, env))
     checks.extend(workload_profile_checks(config))
-    checks.extend(schedule_checks(config))
+    stored = stored_schedules(config)
+    checks.extend(schedule_checks(config, stored))
     # A github credential matters only when the GitHub integration is
     # configured; an unconfigured integration is a valid (GitHub-less)
     # setup, not a failure. A PAT or GitHub App credentials both satisfy it;
@@ -1264,7 +1310,7 @@ def collect_checks(
             )
         )
 
-    checks.extend(daemon_intake_checks(config))
+    checks.extend(daemon_intake_checks(config, stored))
     # daemon's chat bridge (only when a backend is configured)
     backend = config.chat_backend
     if backend is not None:

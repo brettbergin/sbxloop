@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
 from urllib.parse import quote
 
 from sbxloop.cli.tui import format_event
-from sbxloop.config import SINK_NAMES, BridgeBackend, Config
+from sbxloop.config import SINK_NAMES, BridgeBackend, Config, ScheduleConfig
 from sbxloop.daemon.chat_choices import (
     ChoiceQuestion,
     PendingFiling,
@@ -671,14 +671,15 @@ class Concierge:
                         "retry <item> | requeue <item> | merge <item|run> | "
                         "release <item|run> | grant-rounds <run> <n> | "
                         "resume-repo <owner/name> | "
-                        "schedules [pause <name>|resume <name>]. Pass the "
+                        "schedules [pause <name>|resume <name>|remove <name>]. Pass the "
                         "command line without the prefix. Mutating commands take effect "
                         "immediately. merge approves a PR parked behind the merge gate; "
                         "release publishes a workload result the profile held back "
                         "(both only when the person asking clearly wants it). "
-                        "schedules lists the [[schedules]] workloads with their last fire "
-                        "and next due; schedules pause/resume parks one schedule's ticks "
-                        "without pausing the daemon. "
+                        "schedules lists the stored schedules (cadence, profile, ask, last "
+                        "fire, next due); schedules pause/resume parks one schedule's ticks "
+                        "without pausing the daemon; creating and deleting schedules are "
+                        "the `create_schedule` / `delete_schedule` tools, not this one. "
                         "grant-rounds gives a run that exhausted its fix "
                         'rounds n more and resumes it on its own PR at once ("give '
                         'rXXXX two more rounds"). Pause is a set '
@@ -856,6 +857,50 @@ class Concierge:
                     ),
                 ),
                 self._tool_start_workload,
+            ),
+            HostTool(
+                HostToolSpec(
+                    name="create_schedule",
+                    description=(
+                        "Create a SCHEDULE (#818): a workload the daemon queues by itself on "
+                        "a cadence, stored in the daemon's database and live from the next "
+                        "tick — no config file, no restart. `name` is an identifier "
+                        "(letters, digits, '.', '_', '-'); `ask` is the workload's ask in "
+                        "the person's words, as `start_workload` takes it; `profile` a "
+                        "`[[workloads]]` profile (omit for the daemon's default); exactly "
+                        'one of `every` (a period: "24h", "90m", "1h30m", at least '
+                        "1m, on a grid from now) or `cron` (five fields, names allowed: "
+                        '"0 7 * * mon-fri"); `timezone` an IANA zone the cron is read in '
+                        "(the daemon's run-cap zone when omitted). Interview first (see the "
+                        "guidance), then ONE call once every field is settled; the reply "
+                        "names the schedule and its first due tick."
+                    ),
+                    parameters=_schema(
+                        {
+                            "name": {"type": "string"},
+                            "ask": {"type": "string"},
+                            "profile": {"type": "string"},
+                            "every": {"type": "string"},
+                            "cron": {"type": "string"},
+                            "timezone": {"type": "string"},
+                        },
+                        ["name", "ask"],
+                    ),
+                ),
+                self._tool_create_schedule,
+            ),
+            HostTool(
+                HostToolSpec(
+                    name="delete_schedule",
+                    description=(
+                        "Delete a stored schedule by name (#818): no further ticks; a tick "
+                        "already queued or running is untouched. Only on an explicit yes "
+                        "naming the schedule — confirm with clickable choices first. To "
+                        "park one without deleting it, `sbx_control` `schedules pause`."
+                    ),
+                    parameters=_schema({"name": {"type": "string"}}, ["name"]),
+                ),
+                self._tool_delete_schedule,
             ),
         ]
         if self.config.github.repo_list():
@@ -1474,6 +1519,66 @@ class Concierge:
             "a run thread will appear here and the person will be pinged when the result "
             f"is published.{note}"
         )
+
+    def _tool_create_schedule(self, args: dict[str, Any], by: str) -> str:
+        name = str(args.get("name") or "").strip()
+        ask = str(args.get("ask") or "").strip()
+        if not name or not ask:
+            return "a name and an ask are required"
+        wanted = str(args.get("profile") or "").strip() or None
+        try:
+            profile = self.config.workload_profile(wanted)
+        except ConfigError as exc:
+            return str(exc)
+        if profile is None:
+            known = ", ".join(p.name for p in self.config.workloads) or "none"
+            return (
+                "a schedule needs a profile: no `[workload] default` is set, so name one "
+                f"(declared: {known})"
+            )
+        fields: dict[str, Any] = {"name": name, "profile": profile.name, "ask": ask}
+        for key in ("every", "cron", "timezone"):
+            value = str(args.get(key) or "").strip()
+            if value:
+                fields[key] = value
+        try:
+            spec = ScheduleConfig.model_validate(fields)
+        except ValueError as exc:
+            errors = getattr(exc, "errors", None)
+            first = errors()[0]["msg"] if callable(errors) else str(exc)
+            return f"that schedule is not valid: {first.removeprefix('Value error, ')}"
+        add = getattr(self.loop, "add_schedule", None)
+        if add is None:
+            return "this daemon cannot store schedules"
+        try:
+            text = str(add(spec, by, source=self._via))
+        except ValueError as exc:
+            return f"creating the schedule failed: {exc}"
+        log.info(
+            "concierge.schedule_created",
+            schedule=spec.name,
+            profile=spec.profile,
+            cadence=spec.cadence_text,
+            by=by,
+        )
+        return (
+            f"{text} `schedules` lists it; `schedules pause {spec.name}` parks it; "
+            "`delete_schedule` removes it."
+        )
+
+    def _tool_delete_schedule(self, args: dict[str, Any], by: str) -> str:
+        name = str(args.get("name") or "").strip()
+        if not name:
+            return "a schedule name is required"
+        remove = getattr(self.loop, "remove_schedule", None)
+        if remove is None:
+            return "this daemon cannot store schedules"
+        try:
+            text = str(remove(name, by))
+        except ValueError as exc:
+            return f"deleting the schedule failed: {exc}"
+        log.info("concierge.schedule_deleted", schedule=name, by=by)
+        return text
 
     def _tool_list_repos(self, args: dict[str, Any], by: str) -> str:
         entries = self.config.github.repo_list()

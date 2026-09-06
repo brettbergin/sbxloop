@@ -35,6 +35,7 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, NamedTuple
 
+from sbxloop.config import ScheduleConfig
 from sbxloop.daemon.model import ItemState, PendingReport, WorkItem
 from sbxloop.daemon.schedule import ScheduleRow
 from sbxloop.errors import DaemonError
@@ -329,12 +330,18 @@ CREATE INDEX IF NOT EXISTS idx_local_messages_updated
 CREATE INDEX IF NOT EXISTS idx_local_messages_pending
     ON daemon_local_messages(id) WHERE direction = 'in' AND taken_at IS NULL;
 
--- One row per `[[schedules]]` entry the daemon has seen (#761). anchor is
--- when it was first seen — the origin of an `every` grid; last_due the
--- latest due instant acted on (fired, skipped or swallowed while paused),
--- so a late daemon catches up with one tick and never re-fires one;
--- last_fired_at / last_item the fire that actually queued something;
--- paused_by who parked the schedule (`schedules pause <name>`).
+-- One row per schedule (#761, #818): the schedule itself — profile, ask,
+-- one cadence (every or cron), timezone, where it came from and who made
+-- it — and its state. The daemon's database is the home of schedules: a
+-- `[[schedules]]` entry in sbxloop.toml is imported into a row once and
+-- is redundant after that. anchor is when the schedule was first seen —
+-- the origin of an `every` grid; last_due the latest due instant acted on
+-- (fired, skipped or swallowed while paused), so a late daemon catches up
+-- with one tick and never re-fires one; last_fired_at / last_item the
+-- fire that actually queued something; paused_by who parked the schedule
+-- (`schedules pause <name>`). A row whose ask is NULL is state left by a
+-- schedule that was removed, or written by a daemon from before the spec
+-- lived here: it fires nothing.
 CREATE TABLE IF NOT EXISTS daemon_schedules (
     name          TEXT PRIMARY KEY,
     anchor        REAL NOT NULL,
@@ -342,7 +349,15 @@ CREATE TABLE IF NOT EXISTS daemon_schedules (
     last_fired_at REAL,
     last_item     TEXT,
     paused_by     TEXT,
-    paused_at     REAL
+    paused_at     REAL,
+    profile       TEXT,
+    ask           TEXT,
+    every         TEXT,
+    cron          TEXT,
+    timezone      TEXT,
+    source        TEXT,
+    created_by    TEXT,
+    created_at    REAL
 );
 """
 #: The schema's index statements alone, for a rebuild to recreate inside
@@ -460,6 +475,29 @@ def _row_to_schedule(row: sqlite3.Row) -> ScheduleRow:
         paused_by=None if row["paused_by"] is None else str(row["paused_by"]),
         paused_at=None if row["paused_at"] is None else float(row["paused_at"]),
     )
+
+
+def _row_to_spec(row: sqlite3.Row) -> ScheduleConfig:
+    """The schedule a row holds. Validated on the way out as on the way
+    in, so a row an operator edited by hand cannot fire a cadence the
+    daemon cannot read."""
+    return ScheduleConfig(
+        name=str(row["name"]),
+        profile=str(row["profile"]),
+        ask=str(row["ask"]),
+        every=None if row["every"] is None else str(row["every"]),
+        cron=None if row["cron"] is None else str(row["cron"]),
+        timezone=None if row["timezone"] is None else str(row["timezone"]),
+    )
+
+
+class StoredSchedule(NamedTuple):
+    """A schedule as the store holds it: the spec plus its provenance."""
+
+    spec: ScheduleConfig
+    source: str  # "config" (imported from sbxloop.toml), "chat", "ctl", …
+    created_by: str | None
+    created_at: float | None
 
 
 def _row_to_gate(row: sqlite3.Row) -> MergeGate:
@@ -944,6 +982,22 @@ class DaemonStore:
             "daemon_merge_gates",
             "kind",
             "ALTER TABLE daemon_merge_gates ADD COLUMN kind TEXT NOT NULL DEFAULT 'merge'",
+        ),
+        # The schedule itself moved into its row (#818); a daemon from
+        # before that wrote state-only rows, which the config import
+        # fills in on the next start.
+        *(
+            ("daemon_schedules", column, f"ALTER TABLE daemon_schedules ADD COLUMN {column} {kind}")
+            for column, kind in (
+                ("profile", "TEXT"),
+                ("ask", "TEXT"),
+                ("every", "TEXT"),
+                ("cron", "TEXT"),
+                ("timezone", "TEXT"),
+                ("source", "TEXT"),
+                ("created_by", "TEXT"),
+                ("created_at", "REAL"),
+            )
         ),
     )
 
@@ -2179,7 +2233,88 @@ class DaemonStore:
                 )
             ]
 
-    # -- schedules (#761) ---------------------------------------------------------
+    # -- schedules (#761, #818) ----------------------------------------------------
+
+    def schedules(self) -> list[StoredSchedule]:
+        """Every schedule the daemon fires, by name: the rows that carry a
+        spec. State-only rows (a removed schedule's, or a pre-#818
+        daemon's) are not schedules."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM daemon_schedules WHERE ask IS NOT NULL ORDER BY name"
+            ).fetchall()
+        out: list[StoredSchedule] = []
+        for row in rows:
+            try:
+                spec = _row_to_spec(row)
+            except ValueError:
+                log.warning("store.schedule_unreadable", schedule=str(row["name"]), exc_info=True)
+                continue
+            out.append(
+                StoredSchedule(
+                    spec,
+                    str(row["source"] or "config"),
+                    None if row["created_by"] is None else str(row["created_by"]),
+                    None if row["created_at"] is None else float(row["created_at"]),
+                )
+            )
+        return out
+
+    def schedule(self, name: str) -> StoredSchedule | None:
+        """The schedule called ``name``, None when there is none."""
+        return next((s for s in self.schedules() if s.spec.name == name), None)
+
+    def add_schedule(
+        self, spec: ScheduleConfig, *, source: str, by: str | None, now: float
+    ) -> bool:
+        """Persist a schedule. A name already carrying a spec is left as it
+        is (False); a state-only row of that name — a schedule removed
+        earlier, or one a pre-#818 daemon anchored — keeps its grid and
+        takes the spec. The grid of a new schedule anchors at ``now``."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT ask FROM daemon_schedules WHERE name = ?", (spec.name,)
+                ).fetchone()
+                if row is not None and row["ask"] is not None:
+                    self._conn.execute("ROLLBACK")
+                    return False
+                if row is None:
+                    self._conn.execute(
+                        "INSERT INTO daemon_schedules (name, anchor) VALUES (?, ?)",
+                        (spec.name, now),
+                    )
+                self._conn.execute(
+                    "UPDATE daemon_schedules SET profile = ?, ask = ?, every = ?, cron = ?, "
+                    "timezone = ?, source = ?, created_by = ?, created_at = ? WHERE name = ?",
+                    (
+                        spec.profile,
+                        spec.ask,
+                        spec.every,
+                        spec.cron,
+                        spec.timezone,
+                        source,
+                        by,
+                        now,
+                        spec.name,
+                    ),
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+            return True
+
+    def remove_schedule(self, name: str) -> bool:
+        """Forget a schedule, state and all: a schedule re-added under the
+        same name starts a fresh grid. False when there was none."""
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM daemon_schedules WHERE name = ? AND ask IS NOT NULL", (name,)
+            )
+            self._conn.commit()
+            return cur.rowcount == 1
 
     def schedule_row(self, name: str, now: float) -> ScheduleRow:
         """The schedule's row, created at ``now`` on first sight — the
