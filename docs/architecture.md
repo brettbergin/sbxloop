@@ -874,6 +874,22 @@ through like `uv run`. eslint and golangci-lint deliberately have no entry:
 both keep applying their configured ignores to paths given on the command
 line, so an explicit path there is a narrowing the lint must not reject.
 
+What the loop is gets said once, to every session. `engine.harness` holds
+one situation briefing — the run is a sequence of stages, each its own
+session that sees no other's transcript; the microVM is the boundary, so
+tool access is real; egress is an allowlist that fails closed; only the
+workspace survives the sandbox — plus one tail per role
+(`ROLE_BY_PHASE` maps each prompt name to `planner`, `builder`, `critic`,
+`operator` or `concierge`). `PhaseRunner._agent_job` composes it onto every
+engine session through `harness.brief_for_phase`, and the concierge prepends
+the same head to its own template, so the four personas can no longer drift
+from each other or from the machine. It rides the **system message**, not
+the prompt: identical on every turn of every stage, it caches, where the
+same text in a phase prompt is re-sent with each turn (goal 3, "spend
+scales with turns"). The briefing is domain-neutral by test — no language,
+no toolchain, no incident — and the pull-request framing appears only when
+`[github] repo` makes delivery real.
+
 The repository's own instruction files reach every phase the same way
 (#688). `engine.repocontext.read_repo_context` reads `AGENTS.md`,
 `CLAUDE.md`, `.cursorrules`, `.github/copilot-instructions.md`, the

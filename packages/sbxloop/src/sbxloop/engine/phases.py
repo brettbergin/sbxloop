@@ -38,6 +38,7 @@ from pydantic import BaseModel
 from sbxloop import toolchains
 from sbxloop.config import Config
 from sbxloop.deliver import pr_conventions
+from sbxloop.engine.harness import brief_for_phase
 from sbxloop.engine.model import JudgeVerdict, SteerVerdict, TaskGraph, TaskRecord, WorkloadPlan
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.repocontext import repo_conventions
@@ -488,7 +489,7 @@ class PhaseRunner:
             run_id=self.run_id,
             kind="agent.session",
             prompt=prompt,
-            system_message=system_message,
+            system_message=brief_for_phase(self.config, phase, system_message),
             system_preset=system_preset,
             model=self.config.model,
             permission_mode=permission_mode,

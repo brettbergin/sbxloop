@@ -61,6 +61,7 @@ from sbxloop.daemon.usage import (
     usage_rows,
 )
 from sbxloop.daemon.versions import VersionProbe
+from sbxloop.engine.harness import harness_context
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunState
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.store import StateStore
@@ -572,7 +573,12 @@ class Concierge:
             f"`{daemon.workload_label}` label) ends `completed` once its result is "
             "published; it never opens a pull request unless a task asked for the `pr` sink",
         ]
-        return render(
+        # The situation briefing first, then the concierge's own template:
+        # the head is identical to what every other session in the loop is
+        # opened with (engine.harness), so the concierge's account of the
+        # machine cannot drift from the machine's.
+        briefing = harness_context(self.config, role="concierge")
+        body = render(
             "concierge",
             chat_name=self._chat_name,
             command_prefix=self._chat.command_prefix,
@@ -589,6 +595,7 @@ class Concierge:
             ),
             daemon_notes=bullet_list(notes),
         )
+        return f"{briefing}\n{body}"
 
     def _preamble(self, author: str) -> str:
         try:
