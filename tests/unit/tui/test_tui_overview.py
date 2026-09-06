@@ -198,3 +198,58 @@ def test_an_empty_window_says_so_rather_than_drawing_nothing(tmp_path: Path) -> 
             assert "No runs in the last 7 days" in page_text(app)
 
     drive(scenario)
+
+
+def test_the_two_rails_sit_beside_each_other(seeded: SbxloopHome) -> None:
+    """Overview carries a second rail beside the console's own, and the two
+    must not share a column.
+
+    Both were docked to the screen's left edge at first, and two widgets
+    docked to the same edge of one container overlay rather than stack: the
+    page rail drew straight over Overview, Runs, Queue, Chat, Sandboxes and
+    Daemon. Geometry is the only thing that catches that — every content
+    assertion still passed while the screen was unreadable.
+    """
+    from sbxloop.tui.widgets.navrail import NavRail
+
+    async def scenario() -> None:
+        app = make_app(seeded)
+        async with app.run_test(size=(150, 30)) as pilot:
+            await pilot.pause(2.0)
+            screen = app.screen
+            assert isinstance(screen, OverviewScreen)
+            console_rail = screen.query_one("#navrail", NavRail).region
+            page_rail = screen.query_one(PageRail).region
+            page = screen.query_one("#page", VerticalScroll).region
+
+            assert console_rail.x == 0, "the console's rail owns the left edge"
+            assert page_rail.x >= console_rail.right, (
+                f"the page rail starts at x={page_rail.x}, inside the console rail "
+                f"which runs to x={console_rail.right} — they overlap"
+            )
+            assert page.x >= page_rail.right, "the page starts after its rail"
+            assert page.width > 40, "and still has room to say anything"
+            # Every console row is visible, not painted over.
+            assert console_rail.height >= 9
+
+    drive(scenario)
+
+
+def test_a_narrow_terminal_drops_the_page_rail_and_keeps_the_page(seeded: SbxloopHome) -> None:
+    """Two rails cost 26 columns before any content; below the threshold
+    both get out of the way and the letters still switch pages."""
+
+    async def scenario() -> None:
+        app = make_app(seeded)
+        async with app.run_test(size=(70, 24)) as pilot:
+            await pilot.pause(2.0)
+            screen = app.screen
+            assert isinstance(screen, OverviewScreen)
+            assert screen.has_class("-narrow")
+            assert not screen.query_one(PageRail).display
+            assert screen.query_one("#page", VerticalScroll).region.x == 0
+            await pilot.press("t")
+            await pilot.pause(0.6)
+            assert screen.page == "time", "the keys work without the rail"
+
+    drive(scenario)
