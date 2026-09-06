@@ -16,6 +16,7 @@ all the way to ``merged`` without a network.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import threading
@@ -24,7 +25,7 @@ from typing import Any, ClassVar
 
 import pytest
 
-from sbxloop import hostgit, toolchains
+from sbxloop import hostgit
 from sbxloop.config import Config
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import (
@@ -32,6 +33,7 @@ from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
     TERMINAL_RUN_STATES,
 )
+from sbxloop.engine.phases import PhaseRunner, toolchains
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
@@ -2681,15 +2683,18 @@ class TestPipeline:
         fake = FakeGithub()
         fake.pr["mergeable"] = False
         fake.pr["mergeable_state"] = "dirty"
-        merges: list[tuple[Path, str]] = []
+        merges: list[tuple[str | None, str]] = []
 
         def merge_from_base(
-            repo_path: Path, base_branch: str, *, remote: str = "origin"
+            self: PhaseRunner, base_branch: str, *, base_sha: str, bundle: Path | None = None
         ) -> hostgit.MergeResult:
-            merges.append((repo_path, base_branch))
+            merges.append((self.workdir, base_branch))
             return hostgit.MergeResult(False, ("docs/x.md",), "merged origin/main: 1 conflict")
 
-        harness.monkeypatch.setattr(hostgit, "merge_from_base", merge_from_base)
+        harness.monkeypatch.setattr(PhaseRunner, "merge_from_base", merge_from_base)
+        harness.monkeypatch.setattr(
+            hostgit, "base_bundle", lambda *a, **kw: contextlib.nullcontext(("a" * 40, None))
+        )
         harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
         engine = harness.pipeline(fake)
 
@@ -2705,7 +2710,7 @@ class TestPipeline:
         assert result.mounted and result.workspace is not None
         # The run's own clone, against the repository's default branch
         # (FakeGithub's repo_get says main; no [github] deliver_base is set).
-        assert merges == [(result.workspace, "main")]
+        assert len(merges) == 1 and merges[0][1] == "main"
         (fix_round,) = self._events(harness, HostEventTypes.FIX_ROUND)
         assert fix_round.data["kind"] == "conflict"
         assert fix_round.data["task_id"] == "fix-1"
@@ -2726,11 +2731,14 @@ class TestPipeline:
         fake.pr["mergeable_state"] = "dirty"
 
         def merge_from_base(
-            repo_path: Path, base_branch: str, *, remote: str = "origin"
+            self: PhaseRunner, base_branch: str, *, base_sha: str, bundle: Path | None = None
         ) -> hostgit.MergeResult:
             raise ProvisionError("git fetch origin main failed: no route to host")
 
-        harness.monkeypatch.setattr(hostgit, "merge_from_base", merge_from_base)
+        harness.monkeypatch.setattr(PhaseRunner, "merge_from_base", merge_from_base)
+        harness.monkeypatch.setattr(
+            hostgit, "base_bundle", lambda *a, **kw: contextlib.nullcontext(("a" * 40, None))
+        )
         harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
         engine = harness.pipeline(fake)
 

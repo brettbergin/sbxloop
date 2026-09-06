@@ -9,11 +9,13 @@ which raises instead of guessing; the scripted-echo harness from
 
 from __future__ import annotations
 
+import contextlib
 from pathlib import Path
 
 import pytest
 
 from sbxloop import hostgit
+from sbxloop.engine.phases import PhaseRunner
 from sbxloop.errors import GithubOpsError
 from sbxloop.events import Event, HostEventTypes
 from tests.conftest import FakeSbx
@@ -45,15 +47,18 @@ class TestDevelopRepository:
         fake = develop_repo()
         fake.pr["mergeable"] = False
         fake.pr["mergeable_state"] = "dirty"
-        merges: list[tuple[Path, str]] = []
+        merges: list[tuple[str | None, str]] = []
 
         def merge_from_base(
-            repo_path: Path, base_branch: str, *, remote: str = "origin"
+            self: PhaseRunner, base_branch: str, *, base_sha: str, bundle: Path | None = None
         ) -> hostgit.MergeResult:
-            merges.append((repo_path, base_branch))
+            merges.append((self.workdir, base_branch))
             return hostgit.MergeResult(True, (), f"merged origin/{base_branch}: clean")
 
-        harness.monkeypatch.setattr(hostgit, "merge_from_base", merge_from_base)
+        harness.monkeypatch.setattr(PhaseRunner, "merge_from_base", merge_from_base)
+        harness.monkeypatch.setattr(
+            hostgit, "base_bundle", lambda *a, **kw: contextlib.nullcontext(("a" * 40, None))
+        )
         harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
         engine = harness.pipeline(fake)
 
@@ -70,7 +75,7 @@ class TestDevelopRepository:
         # The PR opened against develop, the conflict round merged develop
         # into the clone, and the landing read develop's protection.
         assert fake.pr_kwargs["base"] == "develop"
-        assert merges == [(result.workspace, "develop")]
+        assert len(merges) == 1 and merges[0][1] == "develop"
         assert any(p.endswith("/branches/develop/protection") for _, p, _ in fake.raw_calls)
         assert not any("/branches/main/" in p for _, p, _ in fake.raw_calls)
 

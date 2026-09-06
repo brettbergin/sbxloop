@@ -3523,7 +3523,7 @@ class LoopEngine:
     def _merge_base_into_clone(self, p: Pipeline) -> hostgit.MergeResult | None:
         """Before a fix round: bring the current base into the run's clone,
         so the fixer works on what CI actually judges and a conflict is
-        real in its working tree (see :func:`hostgit.merge_from_base`).
+        real in its working tree. Git mutations run inside the agent VM.
         None when the run has no mounted clone to merge into; a fetch/merge
         failure is logged and the round proceeds on the tree as it is."""
         workspace = p.pair.workspace
@@ -3531,7 +3531,12 @@ class LoopEngine:
             return None
         base = self._base_branch(p)
         try:
-            result = hostgit.merge_from_base(workspace, base)
+            assert p.provisioner is not None
+            url = f"{self.config.github.web_url}/{p.repo}.git"
+            with hostgit.base_bundle(
+                workspace, url, base, token=p.provisioner.clone_token(p.repo)
+            ) as (sha, bundle):
+                result = p.phases.merge_from_base(base, base_sha=sha, bundle=bundle)
         except SbxloopError:
             log.warning("fix.merge_base_failed", run=p.run_id, base=base, exc_info=True)
             return None

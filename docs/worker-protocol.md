@@ -57,6 +57,12 @@ delivery tier provisioning chose (see docs/architecture.md):
 | `service.http`  | `params: {credential, method, path, query?, headers?, body?, timeout_s?}`                                                                    | `{credential, method, path, status, headers, body (clipped, credential value redacted), truncated, elapsed_s}` — see "Service ops"                                             |
 | `service.fetch` | `argv`, `cwd`, `params: {ecosystem, verb, scrub_env}`                                                                                        | `exit_code` + captured output with every `scrub_env` variable's value blanked — see "Service ops"; a nonzero exit is an **ok** result                                          |
 
+The `git.merge` job runs only on the agent worker. It requires `cwd` and
+`params: {base_branch, base_sha, bundle_path?}` and returns
+`{merged, conflicts, message}`. The host stages an optional Git bundle;
+the job receives no remote URL or credential and needs no authenticated
+network fetch. Repository hooks and drivers execute only in the agent VM.
+
 `system_preset` (default `true`) keeps the backend's own coding-agent system
 prompt under `system_message`; a workload's operator and judge sessions send
 `false`, so an operator does not present as a coding agent and a judge does

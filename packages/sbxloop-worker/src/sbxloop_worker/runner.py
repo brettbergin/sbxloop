@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
 import subprocess
 import threading
 import time
 import traceback
+from dataclasses import asdict
 from pathlib import Path
 
 from sbxloop_worker.backends import get_backend
@@ -118,6 +120,26 @@ class JobRunner:
             return self._run_shell_check()
         if self.job.kind == "shell.batch":
             return self._run_shell_batch()
+        if self.job.kind == "git.merge":
+            from sbxloop_worker.gitops import merge_from_base
+
+            assert self.job.cwd is not None
+            bundle = (
+                Path(self.job.params["bundle_path"]) if self.job.params.get("bundle_path") else None
+            )
+            try:
+                merged = merge_from_base(
+                    Path(self.job.cwd),
+                    self.job.params["base_branch"],
+                    timeout_s=self.job.timeout_s,
+                    base_sha=self.job.params["base_sha"],
+                    bundle_path=bundle,
+                )
+            finally:
+                if bundle is not None:
+                    with contextlib.suppress(OSError):
+                        bundle.unlink(missing_ok=True)
+            return JobResult(job_id=self.job.job_id, status="ok", output_json=asdict(merged))
         if self.job.kind == "service.http":
             return self._run_service_http(writer)
         if self.job.kind == "service.fetch":

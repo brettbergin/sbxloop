@@ -192,6 +192,19 @@ blob. A clone whose manifests name a tag-derived versioning tool
 runs `git describe` on it would otherwise report the wrong version — from the
 host checkout when it has them, else from origin under the run's credential;
 `[sandbox] fetch_tags` overrides the detection.
+Host Git reads use a temporary, host-owned metadata view (`safegit.read_repo`)
+that carries refs, index and object access but excludes the agent's config
+and hooks. Diff drivers and recursive submodule scans are disabled; each
+submodule is inspected through its own private view. LFS comparison uses a
+host-authored byte-hashing filter under isolated Python, without invoking
+the repository's configured driver. Before a fix round, the host fetches
+from the configured repository into that private view using the existing
+host clone credential source. It copies a bundle of new Git objects into
+the agent sandbox, with no token, helper or configuration. Add, commit and
+merge then run through the `git.merge` worker job, where repository hooks
+and drivers have the same authority as other agent code. This preserves
+host-initiated transport and mediation between the credential and agent
+planes; no new listener or box-to-box channel is introduced.
 The github sandbox exists only when the GitHub integration is configured
 (`[github] repo = "owner/repo"`, or at least one `[[github.repos]]` entry);
 without it, `pair.github` is `None`, `GH_TOKEN`
@@ -669,7 +682,7 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   under the same revision/replan budgets, whose exam is the union of the
   decomposer's verify commands plus the gate. Then back to GATE. Every
   round first merges the current base into the run's clone
-  (`hostgit.merge_from_base`): CI judges GitHub's test merge of the branch
+  (`git.merge`, dispatched to the agent worker): CI judges GitHub's test merge of the branch
   with its base, so a red check may exist only there, and a real conflict
   becomes markers in the fixer's working tree — delivery overlays files
   onto the current base tree and would otherwise overwrite the
