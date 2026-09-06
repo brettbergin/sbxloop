@@ -253,3 +253,89 @@ def test_a_narrow_terminal_drops_the_page_rail_and_keeps_the_page(seeded: Sbxloo
             assert screen.page == "time", "the keys work without the rail"
 
     drive(scenario)
+
+
+def test_the_pages_use_the_space_they_were_given(seeded: SbxloopHome) -> None:
+    """Five pages behind a rail only earn the rail if they have something
+    on them. They shipped at 15 to 22% of the body filled — a two-level
+    navigation for content that fitted on one screen."""
+    seed_week(seeded)
+
+    async def scenario() -> None:
+        app = make_app(seeded)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause(2.5)
+            for key in ("s", "f", "c", "t", "h"):
+                await pilot.press(key)
+                await pilot.pause(0.6)
+                page = app.screen.query_one("#page", VerticalScroll)
+                rows = sum(1 for w in page.walk_children() if isinstance(w, TextPanel))
+                assert rows >= 12, f"page {key} has only {rows} rows — it is mostly air"
+
+    drive(scenario)
+
+
+def test_cost_says_which_phase_burns_the_turns(seeded: SbxloopHome) -> None:
+    """A total says how much; only the split says where, and only the
+    split is actionable."""
+    seed_week(seeded)
+
+    async def scenario() -> None:
+        app = make_app(seeded)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause(2.5)
+            await pilot.press("c")
+            await pilot.pause(0.6)
+            cost = page_text(app)
+            assert "turns by phase" in cost
+            assert "context re-sent per phase" in cost
+            assert "ratio" in cost, "cache against fresh, per phase"
+            assert "median run" in cost and "p90" in cost
+            assert "against the week before" in cost
+
+    drive(scenario)
+
+
+def test_health_says_where_the_loop_went_round_again(seeded: SbxloopHome) -> None:
+    seed_week(seeded)
+
+    async def scenario() -> None:
+        app = make_app(seeded)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause(2.5)
+            await pilot.press("h")
+            await pilot.pause(0.6)
+            health = page_text(app)
+            assert "why runs failed" in health
+            assert "github op raw.api failed" in health, (
+                "the reason is not clipped to an id's width"
+            )
+            assert "rework" in health and "revisions" in health
+            assert "review rounds" in health
+
+    drive(scenario)
+
+
+def test_flow_says_how_long_work_took_to_land(seeded: SbxloopHome) -> None:
+    seed_week(seeded)
+
+    async def scenario() -> None:
+        app = make_app(seeded)
+        async with app.run_test(size=(150, 45)) as pilot:
+            await pilot.pause(2.5)
+            await pilot.press("f")
+            await pilot.pause(0.6)
+            flow = page_text(app)
+            assert "runs per day, by outcome" in flow
+            assert "turns/run" in flow and "parked/run" in flow
+            assert "how long work took to land" in flow
+            assert "1 day with none" in flow or "days with none" in flow
+
+    drive(scenario)
+
+
+def test_plural_counts_one_thing_once() -> None:
+    from sbxloop.tui.screens.overview import plural
+
+    assert plural(1, "day") == "1 day"
+    assert plural(0, "day") == "0 days" and plural(2, "run") == "2 runs"

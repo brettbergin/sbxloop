@@ -57,6 +57,8 @@ class WindowStore(Protocol):
 
     def phases_between(self, since: float, until: float) -> list[sqlite3.Row]: ...
 
+    def task_totals_between(self, since: float, until: float) -> sqlite3.Row: ...
+
 
 @dataclass(frozen=True)
 class Lane:
@@ -114,12 +116,53 @@ class Lane:
 
 @dataclass(frozen=True)
 class PhaseSlice:
-    """One phase's share of the window's working time."""
+    """One phase's share of the window: its time, its cost and its rework."""
 
     phase: str
     seconds: float
     attempts: int
     turns: int
+    tokens: int = 0
+    cache: int = 0
+    retries: int = 0
+
+    @property
+    def cache_ratio(self) -> float:
+        """Cache reads per fresh token. This is a *per-phase* fact — a
+        phase that re-sends a large fixed context reads far more than it
+        writes, and the phases differ by an order of magnitude."""
+        return self.cache / self.tokens if self.tokens else 0.0
+
+    @property
+    def seconds_per_attempt(self) -> float:
+        return self.seconds / self.attempts if self.attempts else 0.0
+
+
+@dataclass(frozen=True)
+class Rework:
+    """What the window's tasks cost in going round again."""
+
+    tasks: int = 0
+    revisions: int = 0
+    replans: int = 0
+    suspect: int = 0
+
+    @property
+    def retried_share(self) -> float:
+        return self.revisions / self.tasks if self.tasks else 0.0
+
+
+@dataclass(frozen=True)
+class Day:
+    """One bucket of the trend, by outcome."""
+
+    landed: int = 0
+    failed: int = 0
+    cancelled: int = 0
+
+    @property
+    def runs(self) -> int:
+        return self.landed + self.failed + self.cancelled
 
 
 @dataclass(frozen=True)
@@ -145,8 +188,20 @@ class Analytics:
     phases: tuple[PhaseSlice, ...] = ()
     costliest: tuple[RunRow, ...] = ()
     longest_parked: tuple[RunRow, ...] = ()
+    #: Every run in the window, for the distributions.
+    runs_seen: tuple[RunRow, ...] = ()
     failures: tuple[tuple[str, int], ...] = ()
     daily: dict[str, tuple[int, ...]] = field(default_factory=dict)
+    #: One entry per bucket, split by outcome — the trend as a stack
+    #: rather than a single line.
+    days: tuple[Day, ...] = ()
+    rework: Rework = field(default_factory=Rework)
+    #: Review, CI and delivery-update rounds the window's runs spent.
+    review_rounds: int = 0
+    ci_rounds: int = 0
+    #: The same window, one window earlier — what "better or worse" is
+    #: measured against. ``None`` when nothing preceded it.
+    previous: Lane | None = None
 
     @property
     def empty(self) -> bool:
@@ -179,6 +234,64 @@ class Analytics:
     def active_seconds(self) -> float:
         return sum(slice_.seconds for slice_ in self.phases)
 
+    @property
+    def phase_turns(self) -> tuple[PhaseSlice, ...]:
+        """Phases by what they cost rather than by how long they took —
+        the two orders are not the same, and cost is the one you act on."""
+        return tuple(sorted((p for p in self.phases if p.turns), key=lambda p: -p.turns))
+
+    @property
+    def retried_phases(self) -> tuple[PhaseSlice, ...]:
+        """Where the loop went round again, most first."""
+        return tuple(sorted((p for p in self.phases if p.retries), key=lambda p: -p.retries))
+
+    def delta(self, metric: str) -> float | None:
+        """This window against the one before it, as a share. ``None``
+        when there is no previous window to compare with, or it was
+        empty — a change from nothing is not a percentage."""
+        if self.previous is None:
+            return None
+        before = getattr(self.previous, metric, 0.0) or 0.0
+        after = getattr(self.total, metric, 0.0) or 0.0
+        if not before:
+            return None
+        return (after - before) / before
+
+    def spread(self, values: Sequence[float]) -> tuple[float, float]:
+        """Median and p90 — a mean hides the run that was ten times the
+        rest, and that run is the point."""
+        ordered = sorted(values)
+        if not ordered:
+            return 0.0, 0.0
+        mid = ordered[len(ordered) // 2]
+        p90 = ordered[min(len(ordered) - 1, int(len(ordered) * 0.9))]
+        return mid, p90
+
+    @property
+    def turns_spread(self) -> tuple[float, float]:
+        return self.spread([float(r.turns) for r in self.runs_seen])
+
+    @property
+    def landed_runs(self) -> tuple[RunRow, ...]:
+        """The runs that finished the way they were meant to."""
+        return tuple(r for r in self.runs_seen if r.state in LANDED)
+
+    @property
+    def cycle_spread(self) -> tuple[float, float]:
+        """How long work took to land, end to end — the number a person
+        waiting on a pull request actually feels. Elapsed, not active:
+        the wait is part of the cycle even when the loop was idle for it."""
+        return self.spread([r.active + r.parked for r in self.landed_runs])
+
+    @property
+    def slowest_to_land(self) -> tuple[RunRow, ...]:
+        """Landed runs by how long they took, slowest first."""
+        return tuple(sorted(self.landed_runs, key=lambda r: -(r.active + r.parked)))
+
+    @property
+    def active_spread(self) -> tuple[float, float]:
+        return self.spread([r.active for r in self.runs_seen])
+
 
 def _reason(raw: str | None) -> str:
     """A failure reason short enough to rank by. The tail of a reason is
@@ -195,7 +308,9 @@ def fold(
     since: float,
     until: float,
     buckets: int = BUCKETS,
-    top: int = 4,
+    top: int = 8,
+    tasks: sqlite3.Row | None = None,
+    previous: Sequence[sqlite3.Row] = (),
 ) -> Analytics:
     """Fold the window's rows into what the screen reports."""
     lanes: dict[str, Lane] = {}
@@ -203,6 +318,8 @@ def fold(
     reasons: Counter[str] = Counter()
     width = (until - since) / buckets if buckets and until > since else 0.0
     daily: dict[str, list[int]] = {"runs": [0] * buckets, "turns": [0] * buckets}
+    days: list[Day] = [Day() for _ in range(buckets)]
+    rounds = [0, 0]
 
     for row in runs:
         kind = str(row["kind"])
@@ -235,11 +352,19 @@ def fold(
         )
         if state == "failed":
             reasons[_reason(row["reason"])] += 1
+        rounds[0] += int(row["review_rounds"] or 0)
+        rounds[1] += int(row["ci_rounds"] or 0)
         if width > 0:
             index = min(buckets - 1, int((float(row["created_at"]) - since) // width))
             if 0 <= index < buckets:
                 daily["runs"][index] += 1
                 daily["turns"][index] += int(row["turns"])
+                day = days[index]
+                days[index] = Day(
+                    day.landed + (1 if state in LANDED else 0),
+                    day.failed + (1 if state == "failed" else 0),
+                    day.cancelled + (1 if state == CANCELLED else 0),
+                )
 
     costliest = tuple(sorted(rows, key=lambda r: -r.turns)[:top])
     parked = tuple(sorted(rows, key=lambda r: -r.parked)[:top])
@@ -248,14 +373,59 @@ def fold(
         until=until,
         lanes=lanes,
         phases=tuple(
-            PhaseSlice(str(p["phase"]), float(p["seconds"]), int(p["attempts"]), int(p["turns"]))
+            PhaseSlice(
+                str(p["phase"]),
+                float(p["seconds"]),
+                int(p["attempts"]),
+                int(p["turns"]),
+                int(p["tokens"]),
+                int(p["cache"]),
+                int(p["retries"]),
+            )
             for p in phases
         ),
         costliest=tuple(r for r in costliest if r.turns),
         longest_parked=tuple(r for r in parked if r.parked > 0),
+        runs_seen=tuple(rows),
         failures=tuple(reasons.most_common(top)),
         daily={key: tuple(values) for key, values in daily.items()},
+        days=tuple(days),
+        rework=(
+            Rework(
+                int(tasks["tasks"]),
+                int(tasks["revisions"]),
+                int(tasks["replans"]),
+                int(tasks["suspect"]),
+            )
+            if tasks is not None
+            else Rework()
+        ),
+        review_rounds=rounds[0],
+        ci_rounds=rounds[1],
+        previous=_lane_of(previous) if previous else None,
     )
+
+
+def _lane_of(rows: Sequence[sqlite3.Row]) -> Lane:
+    """Every kind together, for the window before this one."""
+    lane = Lane("previous")
+    for row in rows:
+        state = str(row["state"])
+        active = float(row["active"])
+        elapsed = max(float(row["updated_at"]) - float(row["created_at"]), 0.0)
+        lane = Lane(
+            "previous",
+            lane.runs + 1,
+            lane.landed + (1 if state in LANDED else 0),
+            lane.failed + (1 if state == "failed" else 0),
+            lane.cancelled + (1 if state == CANCELLED else 0),
+            lane.turns + int(row["turns"]),
+            lane.tokens + int(row["tokens"]),
+            lane.cache + int(row["cache"]),
+            lane.active + active,
+            lane.elapsed + elapsed,
+        )
+    return lane
 
 
 def compute(
@@ -274,6 +444,10 @@ def compute(
         since=since,
         until=until,
         buckets=buckets,
+        tasks=store.task_totals_between(since, until + 1.0),
+        # The window before this one, so every headline can say whether it
+        # is better or worse than it was.
+        previous=store.runs_between(since - window_s, since),
     )
 
 
@@ -308,8 +482,10 @@ __all__ = [
     "WINDOW_S",
     "Analytics",
     "Cache",
+    "Day",
     "Lane",
     "PhaseSlice",
+    "Rework",
     "RunRow",
     "WindowStore",
     "compute",
