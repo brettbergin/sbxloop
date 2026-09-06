@@ -194,7 +194,7 @@ from sbxloop.gh.ops import (
     user_identity,
 )
 from sbxloop.gh.permissions import workflows_write_granted
-from sbxloop.ids import branch_name, new_message_id, new_run_id
+from sbxloop.ids import branch_name, new_job_id, new_message_id, new_run_id
 from sbxloop.log import get_logger
 from sbxloop.policy import EgressGranter, egress_rejection
 from sbxloop.sbx import registries
@@ -204,6 +204,7 @@ from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import SBXLOOP_DIR
 from sbxloop.verifylint import services_evidence
 from sbxloop.worker.client import WorkerClient
+from sbxloop_worker.protocol import JobRequest
 
 log = get_logger(__name__)
 
@@ -823,8 +824,9 @@ class LoopEngine:
                             self.bus,
                             self.config.credentials_named(credentials),
                             self.config.credentialed_registries_for(self.config.github.repo),
-                            workdir=pair.service_workdir,
+                            workdir=pair.agent_workdir,
                             workspace=pair.workspace,
+                            agent=agent,
                         )
                         if service_client is not None
                         else None
@@ -1019,18 +1021,14 @@ class LoopEngine:
             installs.append(partial(github.install, extras="", expect_prebaked=prebaked_expected))
         if service is not None:
             roles.append("service")
-            fetch_languages = registries.languages(
-                self.config.credentialed_registries_for(self.config.github.repo)
-            )
             installs.append(
                 partial(
                     service.install,
                     extras="",
-                    ensure_dev_tools=bool(fetch_languages),
-                    languages=fetch_languages,
-                    versions={
-                        k: v for k, v in pair.languages.versions.items() if k in fetch_languages
-                    },
+                    ensure_dev_tools=False,
+                    apt_packages=["git"]
+                    if self.config.credentialed_registries_for(self.config.github.repo)
+                    else [],
                     expect_prebaked=prebaked_expected,
                 )
             )
@@ -1077,22 +1075,109 @@ class LoopEngine:
             )
 
     def _fetch_dependencies(self, run_id: str, service: ServiceOps) -> None:
-        """The setup-time fetch (#766): one ``service.fetch`` per credentialed
-        ecosystem the workspace has a manifest for, so the agent's first
-        offline install finds its dependencies in the shared cache. A
-        non-zero exit fails provisioning the way a failed setup command
-        does — the run cannot build without its dependencies, and the
-        event carries the package manager's output."""
-        for kind in service.kinds:
-            manifests = service.manifests(kind)
-            if not manifests:
-                continue
-            result = service.fetch(kind, manifests=manifests, phase="setup")
-            if result["exit_code"] != 0:
-                tail = result["output"][-2000:]
+        """Prepare dependencies in the agent, then verify its offline cache.
+
+        The service only downloads data. Resolution and metadata hooks use
+        the agent's existing toolchains, with no registry credentials.
+        """
+        plans = {
+            kind: registries.fetch_plan(kind, "fetch", manifests=service.manifests(kind))
+            for kind in service.kinds
+            if service.manifests(kind)
+        }
+        if not plans:
+            return
+        agent = service.agent
+        if agent is None or service.workdir is None:
+            raise ProvisionError("dependency preparation requires the agent workspace")
+        commands = {kind: list(plan.argv) for kind, plan in plans.items()}
+        job = JobRequest(
+            job_id=new_job_id(),
+            run_id=run_id,
+            kind="agent.session",
+            prompt=(
+                "Prepare this workspace's private dependencies before setup commands run. "
+                "Follow the target repository's conventions. You have no registry secrets. "
+                "Use fetch_dependencies to discover registry indexes, read metadata and "
+                "download artifacts or Git bundles through the host. Resolve transitive "
+                "and build dependencies here, and populate the documented offline caches. "
+                "Package managers, metadata hooks, extraction and builds run only here. "
+                "Keep the dependency declarations and lockfile versions unchanged. "
+                "Do not create listeners, proxies, sockets or cross-sandbox channels. "
+                "After preparation, the host will run these commands in this sandbox's "
+                "offline environment: " + json.dumps(commands) + ". "
+                'Return JSON {"ready": true, "reason": "evidence"} only after verifying '
+                'those commands succeed; otherwise return {"ready": false, "reason": "blocker"}.'
+                + "\nUser guidance:\n"
+                + "\n".join(self.store.get_run_guidance(run_id))
+            ),
+            system_message="You prepare dependency data inside the agent sandbox.",
+            model=self.config.model,
+            expect="json",
+            cwd=service.workdir,
+            timeout_s=self.config.budgets.per_job_timeout_s,
+            max_tool_calls=self.config.budgets.max_tool_calls_per_phase or None,
+            host_tools=[service.fetch_tool_spec()],
+            host_tool_timeout_s=service.fetch_timeout_s + 30,
+        )
+        self.bus.emit(
+            HostEventTypes.SANDBOX_FETCH,
+            run_id,
+            job_id=job.job_id,
+            verb="prepare",
+            phase="setup",
+            ecosystems=list(plans),
+        )
+        started = time.time()
+        result = agent.submit(
+            job, tool_handler=service.handler(phase="dependencies"), agent="dependency-resolver"
+        )
+        output = result.output_json
+        ready = result.status == "ok" and isinstance(output, dict) and output.get("ready") is True
+        attempt = 1 + sum(
+            row["phase"] == "dependencies" for row in self.store.phase_attempts(run_id)
+        )
+        self.store.record_phase(
+            run_id,
+            "dependencies",
+            task_id=None,
+            attempt=attempt,
+            status="ok" if ready else "error",
+            output_json=json.dumps(output),
+            started_at=started,
+            usage=result.usage,
+            turns=result.turns,
+        )
+        if result.status != "ok" or not isinstance(output, dict) or output.get("ready") is not True:
+            reason = (
+                output.get("reason", "no verified preparation result")
+                if isinstance(output, dict)
+                else "no verified preparation result"
+            )
+            raise ProvisionError(f"dependency preparation failed in the agent sandbox: {reason}")
+        for kind, plan in plans.items():
+            check = agent.submit(
+                JobRequest(
+                    job_id=new_job_id(),
+                    run_id=run_id,
+                    kind="shell.check",
+                    argv=list(plan.argv),
+                    cwd=service.workdir,
+                    timeout_s=service.fetch_timeout_s,
+                )
+            )
+            exit_code = check.exit_code if check.exit_code is not None else -1
+            self.bus.emit(
+                HostEventTypes.SANDBOX_FETCH,
+                run_id,
+                ecosystem=kind,
+                verb="verify-offline",
+                phase="setup",
+                exit_code=exit_code,
+            )
+            if check.status != "ok" or exit_code != 0:
                 raise ProvisionError(
-                    f"dependency fetch for {kind} failed in the service sandbox "
-                    f"(exit {result['exit_code']}): {' '.join(result['argv'])}\n{tail}"
+                    f"offline dependency verification for {kind} failed in the agent sandbox"
                 )
 
     def _run_setup_commands(self, run_id: str, pair: SandboxPair, agent: WorkerClient) -> None:

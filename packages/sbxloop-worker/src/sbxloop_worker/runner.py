@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import os
 import subprocess
 import threading
 import time
@@ -254,49 +253,32 @@ class JobRunner:
         return JobResult(job_id=self.job.job_id, status="ok", output_json=output)
 
     def _run_service_fetch(self, writer: EventWriter) -> JobResult:
-        """One dependency fetch in the service sandbox (#766): the argv the
-        host composed, in the workspace, with the sandbox's own environment
-        (the registry credential and the cache location are in it). Exit
-        code and output tail come back like shell.check's; the host decides
-        what a non-zero exit means."""
-        assert self.job.argv is not None
+        """Read registry bytes with fixed operations; never evaluate the project."""
+        from sbxloop_worker.registryops import execute_fetch
+
         summary = {
-            "ecosystem": self.job.params.get("ecosystem"),
-            "verb": self.job.params.get("verb"),
-            "argv": list(self.job.argv),
+            "registry": self.job.params.get("registry"),
+            "operation": self.job.params.get("operation", "download"),
+            "path": self.job.params.get("path"),
         }
         writer.emit(EventTypes.SERVICE_FETCH_START, **summary)
         started = time.monotonic()
-        # nosec below: running the host-authored fetch argv inside the
-        # sandbox IS this job kind's contract; list argv, never shell=True.
-        proc = subprocess.run(  # nosec B603
-            self.job.argv,
-            capture_output=True,
-            text=True,
-            cwd=self.job.cwd,
-            timeout=self.job.timeout_s,
-            check=False,
+        output = execute_fetch(
+            self.job.params,
+            self.result_path.with_suffix(".artifact"),
+            timeout_s=self.job.timeout_s,
         )
-        output = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
-        # The output goes back to the host and into the ledger; a package
-        # manager is free to echo a URL with the token in it. The host names
-        # the variables holding the secrets (names, not values); their
-        # values are blanked out here, where they are.
-        for name in self.job.params.get("scrub_env") or ():
-            value = os.environ.get(str(name), "")
-            if len(value) >= 8:
-                output = output.replace(value, "***")
         writer.emit(
             EventTypes.SERVICE_FETCH_END,
-            exit_code=proc.returncode,
+            bytes=output["bytes"],
+            sha256=output["sha256"],
             duration_s=round(time.monotonic() - started, 2),
             **summary,
         )
         return JobResult(
             job_id=self.job.job_id,
             status="ok",
-            exit_code=proc.returncode,
-            output_text=output[-OUTPUT_TAIL_CHARS:],
+            output_json=output,
         )
 
     # -- helpers -----------------------------------------------------------

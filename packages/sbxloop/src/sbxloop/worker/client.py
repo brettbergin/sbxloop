@@ -987,6 +987,7 @@ class WorkerClient:
 
         argv = [
             self.python,
+            *(["-I"] if self.role == "service" else []),
             "-m",
             "sbxloop_worker",
             "run",

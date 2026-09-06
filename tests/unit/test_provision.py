@@ -2227,7 +2227,7 @@ class TestPrivateRegistries:
         assert "pypi.org" in service.policy_allows
         assert len(service.policy_allows) == len(set(service.policy_allows))
 
-    def test_the_credential_and_client_files_land_in_the_service_sandbox_only(
+    def test_service_holds_credentials_and_catalogue_without_client_files(
         self, fake_sbx: FakeSbx, tmp_path: Path, caplog: pytest.LogCaptureFixture
     ) -> None:
         bus = EventBus()
@@ -2237,26 +2237,21 @@ class TestPrivateRegistries:
         workspace = self._workspace(tmp_path)
         with caplog.at_level(logging.DEBUG):
             pair = provisioner.ensure_pair("r1", workspace, repo="owner/repo")
-        assert pair.service is not None and pair.service_workdir is not None
+        assert pair.service is not None and pair.service_workdir is None
 
         service_home = fake_sbx.sandbox_fs("sbxloop-r1-service") / "home/agent"
-        npmrc = (service_home / ".npmrc").read_text()
-        assert "@example:registry=https://artifactory.example.com/api/npm/npm-virtual/\n" in npmrc
-        assert "//artifactory.example.com/api/npm/npm-virtual/:_authToken=${NPM_TOKEN}\n" in npmrc
-        assert self.SECRET not in npmrc
-        assert (service_home / ".netrc").read_text() == (
-            f"machine artifactory.example.com login svc-ci password {self.SECRET}\n"
-        )
+        assert not (service_home / ".npmrc").exists()
+        assert not (service_home / ".netrc").exists()
         service_sh = (service_home / ".sbxloop/env.sh").read_text()
         assert f"export NPM_TOKEN={self.SECRET}\n" in service_sh
-        assert (
-            "export PIP_INDEX_URL=https://artifactory.example.com/api/pypi/pypi-virtual/simple\n"
-            in service_sh
-        )
+        assert "SBXLOOP_REGISTRIES=" in service_sh
+        assert "https://artifactory.example.com/api/pypi/pypi-virtual/simple" in service_sh
+        assert "PIP_INDEX_URL" not in service_sh
+        assert "npm_config_cache" not in service_sh
         assert "GOPRIVATE" not in service_sh  # the open registry is not its business
-        # the files were staged with cp and locked down, never passed inline
+        # No package-manager client files are staged into the service.
         chmods = [c for c in fake_sbx.invocations("exec") if "chmod" in c and ".netrc" in c[-1]]
-        assert chmods and chmods[0][-2:] == ["600", "/home/agent/.netrc"]
+        assert chmods == []
 
         agent_home = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent"
         assert not (agent_home / ".npmrc").exists()
@@ -2266,7 +2261,7 @@ class TestPrivateRegistries:
         assert "PIP_INDEX_URL" not in agent_sh
         assert "artifactory.example.com" not in agent_sh
         assert "export GOPRIVATE=github.example.com\n" in agent_sh  # open: as before
-        # …and instead the offline environment pointing at the shared cache.
+        # The agent prepares and consumes its own offline cache.
         assert "export npm_config_offline=true\n" in agent_sh
         assert "export PIP_NO_INDEX=1\n" in agent_sh
         assert "export PIP_FIND_LINKS=/home/agent/.sbxloop/deps/pypi\n" in agent_sh
@@ -2279,7 +2274,7 @@ class TestPrivateRegistries:
         assert all(self.SECRET not in record.getMessage() for record in caplog.records)
         assert not (fake_sbx.sandbox_fs("sbxloop-r1-github") / "home/agent/.netrc").exists()
 
-    def test_the_cache_is_one_directory_in_both_sandboxes_and_never_committed(
+    def test_only_the_agent_gets_the_cache_link_and_it_is_never_committed(
         self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
         bus = EventBus()
@@ -2290,21 +2285,20 @@ class TestPrivateRegistries:
         pair = provisioner.ensure_pair("r1", workspace, repo="owner/repo")
         cache = workspace / ".sbxloop" / "deps"
         assert cache.is_dir()
-        for name in ("sbxloop-r1-agent", "sbxloop-r1-service"):
-            link = fake_sbx.sandbox_fs(name) / "home/agent/.sbxloop/deps"
-            assert link.is_symlink(), name
-            assert Path(link.readlink()).resolve() == cache.resolve(), name
+        link = fake_sbx.sandbox_fs("sbxloop-r1-agent") / "home/agent/.sbxloop/deps"
+        assert link.is_symlink()
+        assert Path(link.readlink()).resolve() == cache.resolve()
+        service_link = fake_sbx.sandbox_fs("sbxloop-r1-service") / "home/agent/.sbxloop/deps"
+        assert not service_link.exists() and not service_link.is_symlink()
         assert ".sbxloop/" in (workspace / ".git/info/exclude").read_text().splitlines()
         (event,) = [e for e in events if e.type == "sandbox.deps_cache"]
-        assert event.data["name"] == "sbxloop-r1-service"
-        assert event.data["workdir"] == pair.service_workdir
+        assert event.data["name"] == "sbxloop-r1-agent"
+        assert event.data["workdir"] == pair.agent_workdir
 
-    def test_a_service_sandbox_that_cannot_see_the_workspace_fails_closed(
+    def test_agent_dependency_preparation_requires_the_workspace(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The fetch lands in the service sandbox's view of the workspace;
-        with no view there is nowhere the agent would find it — not a
-        harvest-mode fallback, a provisioning failure naming the probe."""
+        """The agent needs the project mount to prepare its offline cache."""
         monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
         provisioner = self._provisioner(fake_sbx, tmp_path)
         workspace = self._workspace(tmp_path)
