@@ -52,6 +52,11 @@ from sbxloop.tui.screens.modals import ConfirmScreen, TextPromptScreen
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop.tui.widgets.tables import ConsoleTable
 
+#: How much of a value the table shows. The key column is as wide as the
+#: longest dotted path, and the source column must survive beside them
+#: both on a 120-column terminal once the console's rail has its 15.
+VALUE_WIDTH = 44
+
 
 def flatten_config(config: Config) -> dict[str, Any]:
     """Every setting as one addressable leaf: ``daemon.poll_interval_s``,
@@ -173,14 +178,21 @@ class ConfigScreen(ConsoleScreen):
         if self.error:
             rows.append(("error", ("configuration", Text(self.error, style="red"), "")))
         for dotted in sorted(self.flat):
-            value = repr(self.flat[dotted])
+            raw = self.flat[dotted]
+            value = configkeys.display(raw)
             source = configkeys.source_for(dotted, self.sources)
+            # Filter on what is on screen, not on the repr behind it: a
+            # search for `main` should find `deliver_base`.
             if needle and needle not in f"{dotted} {value} {source}".lower():
                 continue
             style = "" if source == "default" else "bold"
-            # Short enough that the source column survives an 80-column
-            # terminal; the whole value is one Enter away.
-            shown = value if len(value) <= 60 else value[:59] + "…"
+            # Short enough that the source column still fits beside the
+            # console's rail on a 120-column terminal — knowing which layer
+            # answered is the point of the row, and the whole value is one
+            # Enter away.
+            shown = Text(value if len(value) <= VALUE_WIDTH else value[: VALUE_WIDTH - 1] + "…")
+            if raw is None:
+                shown.stylize("dim")
             rows.append((dotted, (dotted, shown, Text(source, style=style))))
         self.query_one("#resolved", ConsoleTable).replace_rows(rows)
 
