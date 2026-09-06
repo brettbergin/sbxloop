@@ -389,6 +389,26 @@ class FakeGithub(GithubOps):
         # fine-grained one with nothing to report.
         return None
 
+    def raw_lookup(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        missing: Sequence[int] = (404,),
+    ) -> Any:
+        """The real one's contract (#558): a status in ``missing`` is an
+        answer (``None``) and not a failed worker job — the ledger entry
+        the raw call would have written is taken back."""
+        before = len(self.failed_jobs)
+        try:
+            return self.raw(method, path, body)
+        except GithubOpsError as exc:
+            if exc.http_status in missing:
+                del self.failed_jobs[before:]
+                return None
+            raise
+
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         self.raw_calls.append((method, path, body))
         self._maybe_fail("raw")
