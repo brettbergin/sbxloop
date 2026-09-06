@@ -35,6 +35,35 @@ def make_workspace(tmp_path: Path) -> Path:
     return root
 
 
+class TestRawLookupIsNotAFailedJob:
+    """#558: the fake's ``raw_lookup`` keeps the real one's contract — a
+    listed miss is an answer with no ledger entry, anything else records."""
+
+    def test_a_listed_miss_answers_none_without_a_ledger_entry(self) -> None:
+        fake = FakeGithub()
+        fake.fail_once["raw"] = GithubOpsError("not found", http_status=404)
+        assert fake.raw_lookup("GET", "/repos/o/r/compare/main...x") is None
+        fake.assert_no_failed_jobs()
+
+    def test_an_unlisted_status_still_records_and_raises(self) -> None:
+        fake = FakeGithub()
+        fake.fail_once["raw"] = GithubOpsError("forbidden", http_status=403)
+        with pytest.raises(GithubOpsError):
+            fake.raw_lookup("GET", "/repos/o/r/x")
+        assert fake.failed_job_paths == ["raw"]
+
+    def test_the_helper_falls_back_for_a_stand_in_without_the_method(self) -> None:
+        from sbxloop.gh.ops import raw_lookup
+
+        class Bare:
+            def raw(self, method: str, path: str, body: Any = None) -> Any:
+                raise GithubOpsError("gone", http_status=404)
+
+        assert raw_lookup(Bare(), "DELETE", "/x") is None
+        with pytest.raises(GithubOpsError):
+            raw_lookup(Bare(), "DELETE", "/x", missing=(422,))
+
+
 class TestLedgerRecordsFailures:
     """A raw() call GitHub refuses is a failed worker job, and says so."""
 
