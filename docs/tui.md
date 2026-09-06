@@ -88,10 +88,43 @@ returns.
 
 ### Overview
 
-The run in flight (state, stage, title, PR, rounds, last-event age), the
-queue in dispatch order, who is **waiting on a human** (open merge gates,
-review holds), the most recent runs, and the daemon's own answer to
-`status` when it is up. With no daemon answering, history stays browsable.
+**How the loop has been performing, a page at a time.** The screen used to
+be four panels — the run in flight, the queue, recent runs, who is waiting
+on you — three of which have their own screen (Runs, Queue, Daemon), and
+none of which answered the question you open a console with: *is this
+working well?*
+
+One live line on top (the run in flight and its stage, or idle/paused, or
+the daemon being down, starting or busy), a narrow rail of pages beside the
+console's own, and a page that states its finding in a sentence before it
+draws a bar. The pages take **letters** — the digits belong to the console's
+rail — and `o` opens the window's costliest run.
+
+- **Summary** (`s`) — the week in a sentence, then outcome, elapsed split
+  into active/parked, and where the working time went, as proportion.
+- **Flow** (`f`) — runs per day, then each kind's outcomes with its own
+  turns and active time per run. Code and workload runs differ by an order
+  of magnitude, so they are never blended.
+- **Cost** (`c`) — turns lead, because every turn re-sends the session
+  context and spend tracks turns rather than jobs; tokens per turn is the
+  number that moves when a prompt grows. The costliest runs are named and
+  ranked, so an outlier is visible instead of averaged away.
+- **Time** (`t`) — **active** is what the loop did; **parked** is what it
+  waited on a human for. These are wildly different: on this project's own
+  host active time has run at about a sixth of elapsed, so reporting
+  elapsed as "duration" says the loop is slow when the loop is fast and the
+  human is not. The runs that waited longest are named.
+- **Health** (`h`) — failures grouped by cause, so a common cause reads as
+  one row rather than several one-offs.
+
+A **cancelled** run is a decision, not an outcome: it is counted and
+reported but kept out of the success rate's denominator.
+
+The numbers are `sbxloop.tui.analytics`, folded from
+`StateStore.runs_between` / `phases_between` in one grouped pass each and
+recomputed on a slow timer of its own — nothing in a week-long window
+changes between console ticks. An empty window says so rather than drawing
+an empty screen.
 
 ### Runs and a run
 
