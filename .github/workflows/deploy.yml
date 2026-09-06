@@ -290,7 +290,9 @@ jobs:
           # A snapshot first: config, secrets, units and the state database, so a bad
           # release is one `sbxloop backup restore` away. The daily sweep
           # keeps the newest [daemon] backups_keep of these.
-          "${SBXLOOP}" backup --label "deploy-${VERSION}" --reason "deploy from ${{ steps.installed.outputs.current }}"
+          # The label is what the *installed* sbxloop accepts: letters, digits,
+          # - and _ on every release, so the dots in the version become dashes.
+          "${SBXLOOP}" backup --label "deploy-${VERSION//./-}" --reason "deploy ${{ steps.installed.outputs.current }} -> ${VERSION}"
           # Both wheels together, from the release: the host wheel pins
           # sbxloop-worker==VERSION exactly, and naming the local worker wheel
           # satisfies that pin without the index being consulted for it at all.

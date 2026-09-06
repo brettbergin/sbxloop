@@ -191,7 +191,7 @@ jobs:
           # packages pinned to the same version; both chat extras so
           # switching [chat] backend on the host is a config change. Then
           # init, idempotent: it refreshes the launchers and units.
-          "${SBXLOOP}" backup --label "deploy-${VERSION}"
+          "${SBXLOOP}" backup --label "deploy-${VERSION//./-}"
           "${UV}" pip install --python "${VENV_PYTHON}" --upgrade \
             "sbxloop[discord,slack]==${VERSION}" "sbxloop-worker==${VERSION}"
           "${VENV_SBXLOOP}" --version
