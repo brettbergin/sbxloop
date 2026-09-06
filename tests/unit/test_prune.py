@@ -10,6 +10,7 @@ from typer.testing import CliRunner
 
 from sbxloop.cli.app import app
 from sbxloop.engine.store import StateStore
+from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxInfo, SandboxSpec
 from sbxloop.sbx.prune import classify_sandboxes, format_age
@@ -150,7 +151,7 @@ class TestClassification:
 
 class TestPruneCommand:
     def seed(self, workdir: Path, fake_sbx: FakeSbx, run_id: str, state: str) -> StateStore:
-        store = StateStore(workdir / ".sbxloop" / "state.db")
+        store = StateStore(SbxloopHome(workdir / ".sbxloop").state_db)
         store.create_run(run_id, "an outcome")
         store.set_run_state(run_id, state)  # type: ignore[arg-type]
         cli = SbxCLI(binary=str(fake_sbx.binary))
@@ -232,7 +233,7 @@ class TestPruneCommand:
         assert store.get_run("rabc12345").kept_reason is None
 
     def test_unknown_sandbox_pruned_with_caveat(self, workdir: Path, fake_sbx: FakeSbx) -> None:
-        StateStore(workdir / ".sbxloop" / "state.db")  # empty DB
+        StateStore(SbxloopHome(workdir / ".sbxloop").state_db)  # empty DB
         cli = SbxCLI(binary=str(fake_sbx.binary))
         cli.create(SandboxSpec(name="sbxloop-rzzzzzzzz-agent", role="agent", workspace=workdir))
         result = runner.invoke(app, ["sandbox", "prune"])
@@ -260,7 +261,7 @@ class TestDoctorOrphans:
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
-        StateStore(workdir / ".sbxloop" / "state.db")  # empty DB → unknown sandbox
+        StateStore(SbxloopHome(workdir / ".sbxloop").state_db)  # empty DB → unknown sandbox
         SbxCLI(binary=str(fake_sbx.binary)).create(
             SandboxSpec(name="sbxloop-rzzzzzzzz-agent", role="agent", workspace=workdir)
         )

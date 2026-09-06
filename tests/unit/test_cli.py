@@ -1248,8 +1248,8 @@ class TestDoctor:
         git: bool | None = None,
         languages: list[str] | None = None,
     ) -> None:
-        state = workdir / ".sbxloop"
-        state.mkdir(exist_ok=True)
+        state = home(workdir).state
+        state.mkdir(parents=True, exist_ok=True)
         record: dict[str, object] = {
             "ref": ref,
             "worker_version": worker_version,

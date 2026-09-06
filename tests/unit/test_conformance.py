@@ -78,7 +78,7 @@ class TestDeepRun:
         self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
         cli = make_cli(fake_sbx)
-        run_conformance(cli, tmp_path / "state", deep=True)
+        run_conformance(cli, SbxloopHome(tmp_path / "state"), deep=True)
         assert cli.ls() == []
         secrets_state = fake_sbx.state / "secrets-state.json"
         state = json.loads(secrets_state.read_text())
@@ -97,7 +97,7 @@ class TestDeepRun:
 
     def test_probe_error_does_not_abort_suite(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         fake_sbx.script("ls", returncode=1, stderr="daemon unreachable")
-        report = run_conformance(make_cli(fake_sbx), tmp_path / "state", deep=True)
+        report = run_conformance(make_cli(fake_sbx), SbxloopHome(tmp_path / "state"), deep=True)
         outcomes = by_id(report)
         assert outcomes[PROBE_LS_COLUMNS].is_error
         assert "daemon unreachable" in outcomes[PROBE_LS_COLUMNS].detail
@@ -109,7 +109,7 @@ class TestDeepRun:
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
-        report = run_conformance(make_cli(fake_sbx), tmp_path / "state", deep=True)
+        report = run_conformance(make_cli(fake_sbx), SbxloopHome(tmp_path / "state"), deep=True)
         outcome = by_id(report)[PROBE_WORKSPACE_MOUNT]
         assert outcome.verdict == "not-found"
         # flipped verdict vs what the codebase depends on -> loud drift
@@ -237,7 +237,7 @@ class TestPythonVersionProbe:
 
 class TestShallowRun:
     def test_sandbox_probes_unprobed_without_cache(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
-        report = run_conformance(make_cli(fake_sbx), tmp_path / "state", deep=False)
+        report = run_conformance(make_cli(fake_sbx), SbxloopHome(tmp_path / "state"), deep=False)
         outcomes = by_id(report)
         assert outcomes[PROBE_LS_COLUMNS].verdict == "expected-columns"
         assert outcomes[PROBE_SECRET_ENV_VISIBILITY].source == "unprobed"
@@ -278,7 +278,7 @@ class TestSecretValueStdinProbe:
     an sbx upgrade makes stdin passing possible."""
 
     def test_argv_only_against_fake(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
-        report = run_conformance(make_cli(fake_sbx), tmp_path / "state", deep=False)
+        report = run_conformance(make_cli(fake_sbx), SbxloopHome(tmp_path / "state"), deep=False)
         outcome = by_id(report)[PROBE_SECRET_VALUE_STDIN]
         assert outcome.verdict == "argv-only"
         assert outcome.drifts == []
@@ -288,7 +288,7 @@ class TestSecretValueStdinProbe:
             "secret set-custom --help",
             stdout="Flags:\n      --value-stdin   Read the secret value from stdin\n",
         )
-        report = run_conformance(make_cli(fake_sbx), tmp_path / "state", deep=False)
+        report = run_conformance(make_cli(fake_sbx), SbxloopHome(tmp_path / "state"), deep=False)
         outcome = by_id(report)[PROBE_SECRET_VALUE_STDIN]
         assert outcome.verdict == "stdin-available"
         assert outcome.drifts
@@ -299,7 +299,7 @@ class TestSecretValueStdinProbe:
         self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
         fake_sbx.script("secret set-custom --help", returncode=2, stderr="unknown flag: --help\n")
-        report = run_conformance(make_cli(fake_sbx), tmp_path / "state", deep=False)
+        report = run_conformance(make_cli(fake_sbx), SbxloopHome(tmp_path / "state"), deep=False)
         outcome = by_id(report)[PROBE_SECRET_VALUE_STDIN]
         assert outcome.verdict == "help-drifted"
         assert outcome.drifts  # flipped vs expected -> loud
