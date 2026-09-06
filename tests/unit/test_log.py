@@ -399,9 +399,18 @@ class TestRedactText:
 
 
 class TestDaemonLogFile:
-    """The daemon's second copy: ``logs/daemon.log`` under the home."""
+    """The daemon's second copy: ``logs/daemon.log`` under the home.
 
-    def test_records_land_in_the_file_plain_and_rotated(self, tmp_path: Path) -> None:
+    Both tests end on ``configure_logging("WARNING")`` to prove the file
+    handler is gone, so both take ``restore_logging``: without it the root
+    logger — and the process-wide ring buffer's handler — stay at WARNING
+    for every test that runs after this file in the same worker, and a
+    later test asserting on its own INFO records finds an empty buffer.
+    """
+
+    def test_records_land_in_the_file_plain_and_rotated(
+        self, tmp_path: Path, restore_logging: None
+    ) -> None:
         import logging
 
         from sbxloop.log import configure_logging, get_logger
@@ -426,7 +435,7 @@ class TestDaemonLogFile:
             getattr(h, "baseFilename", "") == str(path) for h in logging.getLogger().handlers
         )
 
-    def test_json_format_reaches_the_file_too(self, tmp_path: Path) -> None:
+    def test_json_format_reaches_the_file_too(self, tmp_path: Path, restore_logging: None) -> None:
         import json
         import logging
 

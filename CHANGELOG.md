@@ -6,6 +6,31 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- **The console edits configuration one setting at a time.** The Config
+  screen's Resolved tab is now the place changes are made, not just read.
+  Every setting is one addressable key — arrays of tables walked down to
+  `github.repos[1].deliver_base`, free-form maps down to
+  `sandbox.env.RAILS_ENV`, so nothing is a blob you have to find in a file
+  — and `Enter` on a row (or `e`) opens that key alone: what it accepts
+  (its type, the set a `Literal` allows, the bounds the model carries),
+  what it holds now and which layer is answering, and the file the answer
+  is written to. The widget follows the type — a picker for a bool or a
+  fixed set, one item per line for a list, a line of text otherwise — so a
+  string needs no quotes and a bad value is named before the loader sees
+  it; `^U` unsets the key instead. `a` adds a key by dotted path (an index
+  one past the end appends an entry), and `Enter` on the Repos tab narrows
+  the view to that repository's keys.
+
+  The write goes into the draft at that path and nowhere else, **every
+  comment in the file kept** (`tomlkit` round-trips it), and then through
+  the same gate the whole-file editor uses: the real loader validates the
+  entire draft, and only a draft it accepts is saved — atomically, with the
+  timestamped backup, and the restart offered. A key the environment or the
+  home config also sets is still written, and the verdict says which layer
+  wins and what the loop actually sees.
+
 ### Changed
 
 - **The sbxloop home.** Everything sbxloop puts on a host now lives under
