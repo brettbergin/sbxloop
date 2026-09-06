@@ -106,6 +106,9 @@ STATE_SESSION_ID = "concierge_session_id"
 STATE_SESSION_TURNS = "concierge_session_turns"
 
 _RUN_STATES = list(get_args(RunState))
+# The daemon's view of an issue, from its lifecycle labels (#565, #609):
+# the four labels, and `backlog` for an issue carrying none of them.
+_ISSUE_STATES: tuple[str, ...] = ("queued", "running", "failed", "blocked", "backlog")
 #: Run states that mean the run is over — nothing more will happen to it, so a
 #: watch on one of these is answered immediately instead of registered.
 _FINISHED_RUN_STATES = TERMINAL_RUN_STATES
@@ -1049,8 +1052,11 @@ class Concierge:
                             "blocked), omit it for all, so the two views together cover every "
                             "issue exactly once. state narrows to one exact state: queued, "
                             "running, failed, blocked, or backlog (none of the daemon's four "
-                            "state labels); state and queued can be combined and both apply. "
-                            "Each line: number, "
+                            "state labels); states lists several (any of them matches — "
+                            "['failed', 'blocked'] is 'what needs a person'); exclude_states "
+                            "drops the listed ones (['queued', 'running'] leaves everything "
+                            "the daemon is not working on); state, states, exclude_states and "
+                            "queued can be combined and all apply. Each line: number, "
                             "title, labels, age, author, comments, url. Queue only what the "
                             "person names, with label_issue_for_run."
                         ),
@@ -1059,15 +1065,14 @@ class Concierge:
                                 "all": {"type": "boolean"},
                                 "label": {"type": "string"},
                                 "queued": {"type": "boolean"},
-                                "state": {
-                                    "type": "string",
-                                    "enum": [
-                                        "queued",
-                                        "running",
-                                        "failed",
-                                        "blocked",
-                                        "backlog",
-                                    ],
+                                "state": {"type": "string", "enum": list(_ISSUE_STATES)},
+                                "states": {
+                                    "type": "array",
+                                    "items": {"type": "string", "enum": list(_ISSUE_STATES)},
+                                },
+                                "exclude_states": {
+                                    "type": "array",
+                                    "items": {"type": "string", "enum": list(_ISSUE_STATES)},
                                 },
                                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                                 "repo": {"type": "string"},
@@ -1779,12 +1784,6 @@ class Concierge:
         queued_arg = args.get("queued")
         state_arg = str(args.get("state") or "").strip().lower()
         subset_parts: list[str] = []
-        state_labels = {
-            lifecycle.trigger,
-            lifecycle.in_progress,
-            lifecycle.failed,
-            lifecycle.blocked,
-        }
         active_labels = {lifecycle.trigger, lifecycle.in_progress}
         if queued_arg is not None:
             want_queued = bool(queued_arg)
@@ -1801,13 +1800,27 @@ class Concierge:
             "failed": lifecycle.failed,
             "blocked": lifecycle.blocked,
         }
-        if state_arg == "backlog":
-            issues = [d for d in issues if not (set(_label_names(d)) & state_labels)]
-            subset_parts.append("backlog")
-        elif state_arg in state_label_by_name:
-            wanted = state_label_by_name[state_arg]
-            issues = [d for d in issues if wanted in _label_names(d)]
-            subset_parts.append(state_arg)
+
+        def _states_of(issue: dict[str, Any]) -> set[str]:
+            labels = set(_label_names(issue))
+            found = {name for name, lb in state_label_by_name.items() if lb in labels}
+            return found or {"backlog"}
+
+        # One state, several (any matches, #609), or everything but some:
+        # "what needs a person" is failed OR blocked, which `state` alone
+        # could not say and `queued: false` says too broadly.
+        wanted_states = _state_list(args.get("states"))
+        if state_arg in _ISSUE_STATES:
+            wanted_states = [*wanted_states, state_arg]
+        excluded_states = _state_list(args.get("exclude_states"))
+        if wanted_states:
+            keep = set(wanted_states)
+            issues = [d for d in issues if _states_of(d) & keep]
+            subset_parts.append("|".join(dict.fromkeys(wanted_states)))
+        if excluded_states:
+            drop = set(excluded_states)
+            issues = [d for d in issues if not (_states_of(d) & drop)]
+            subset_parts.append("not-" + "|".join(dict.fromkeys(excluded_states)))
         subset = "".join(f" {part}" for part in subset_parts)
         if not issues:
             return f"no{subset} {openness} issues in {repo}" + (
@@ -2035,6 +2048,21 @@ def _label_names(data: Any) -> list[str]:
     if not isinstance(data, dict):
         return []
     return [str(lb.get("name")) for lb in data.get("labels") or [] if isinstance(lb, dict)]
+
+
+def _state_list(raw: Any) -> list[str]:
+    """The issue states an argument names — a list, or one name — kept to
+    the known ones, in order, without repeats."""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list | tuple):
+        return []
+    out: list[str] = []
+    for entry in raw:
+        name = str(entry or "").strip().lower()
+        if name in _ISSUE_STATES and name not in out:
+            out.append(name)
+    return out
 
 
 def _remove_label(ops: GithubOps, issue_path: str, label: str) -> None:
