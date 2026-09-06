@@ -120,7 +120,7 @@ def test_config_screen_resolves_filters_and_shows_the_policy(
             assert isinstance(app.screen, ConfigScreen)
             table = app.screen.query_one("#resolved", ConsoleTable)
             row = table.get_row_at(table.get_row_index("daemon.poll_interval_s"))
-            assert row[1] == "7.0" and str(row[2]) == FILE_LAYER
+            assert str(row[1]) == "7" and str(row[2]) == FILE_LAYER
             total = table.row_count
             await pilot.press("slash")
             await pilot.press(*"poll_interval")
@@ -224,7 +224,7 @@ def test_a_saved_key_keeps_a_backup(seeded: SbxloopHome, hermetic: None) -> None
             await pilot.pause(1.0)
             assert isinstance(app.screen, ConfigScreen)
             table = app.screen.query_one("#resolved", ConsoleTable)
-            assert table.get_row_at(table.get_row_index("daemon.poll_interval_s"))[1] == "9.0"
+            assert str(table.get_row_at(table.get_row_index("daemon.poll_interval_s"))[1]) == "9"
 
     drive(scenario)
 
@@ -449,7 +449,7 @@ def test_a_key_is_edited_from_the_resolved_view(seeded: SbxloopHome, hermetic: N
             await pilot.pause(1.0)
             assert isinstance(app.screen, ConfigScreen)
             table = app.screen.query_one("#resolved", ConsoleTable)
-            assert table.get_row_at(table.get_row_index("daemon.poll_interval_s"))[1] == "9.0"
+            assert str(table.get_row_at(table.get_row_index("daemon.poll_interval_s"))[1]) == "9"
 
             # A value the loader refuses is named and never written.
             _open_key(app.screen, "daemon.poll_interval_s")
@@ -703,7 +703,73 @@ def test_an_edit_shows_up_in_the_resolved_view_at_once(
             assert app.screen.flat["model"] == "claude-haiku-4-5-20251001"
             table = app.screen.query_one("#resolved", ConsoleTable)
             assert (
-                table.get_row_at(table.get_row_index("model"))[1] == "'claude-haiku-4-5-20251001'"
+                str(table.get_row_at(table.get_row_index("model"))[1])
+                == "claude-haiku-4-5-20251001"
             )
+
+    drive(scenario)
+
+
+def test_values_read_as_an_operator_writes_them() -> None:
+    """The table showed `repr`: floats with a `.0` tail, strings in
+    quotes, `None` spelled out. None of that is how the value is written
+    in the file or typed into the editor."""
+    d = configkeys.display
+    # Every duration and interval in this config is a float; none of them
+    # is a fraction.
+    assert d(60.0) == "60" and d(14400.0) == "14400"
+    assert d(0.5) == "0.5", "a real fraction keeps its point"
+    assert d(3) == "3"
+    # Strings lose their quotes — the point of the row is the value.
+    assert d("claude") == "claude"
+    assert d("owner/name") == "owner/name"
+    assert d("sbxloop: {title}") == "sbxloop: {title}"
+    # …except where a bare string would read as another type.
+    assert d("60") == '"60"' and d("true") == '"true"' and d("none") == '"none"'
+    assert d("") == '""', "an empty string is not an empty cell"
+    # Bools are TOML's, matching what the editor accepts.
+    assert d(True) == "true" and d(False) == "false"
+    # Unset says so rather than printing a Python singleton.
+    assert d(None) == "—"
+    # Containers read as their contents.
+    assert d([]) == "(empty)" and d({}) == "(empty)"
+    assert d(["a", "b"]) == "a, b"
+    assert d({"FOO": "bar"}) == "FOO=bar"
+    assert d([1, True, None]) == "1, true, —"
+    # One row, one line: a commit-message template carries newlines.
+    assert d("a\n\nb") == "a b"
+
+
+def test_the_resolved_table_shows_values_not_reprs(seeded: SbxloopHome, hermetic: None) -> None:
+    _seed_config(
+        seeded,
+        "[daemon]\npoll_interval_s = 60.0\n\n"
+        '[github]\nrepo = "o/r"\n\n'
+        '[policy]\nallow = ["a.com", "b.com"]\n',
+    )
+
+    async def scenario() -> None:
+        app = make_app(seeded, **REFRESH)
+        async with app.run_test(size=(160, 50)) as pilot:
+            await pilot.press("7")
+            await pilot.pause(1.5)
+            table = app.screen.query_one("#resolved", ConsoleTable)
+
+            def cell(key: str) -> str:
+                return str(table.get_row_at(table.get_row_index(key))[1])
+
+            assert cell("daemon.poll_interval_s") == "60"
+            assert cell("github.repo") == "o/r"
+            assert cell("policy.allow") == "a.com, b.com"
+            assert cell("sandbox.template") == "—"
+            assert cell("keep_sandboxes") == "false"
+            # The filter matches what is on screen, not the repr behind it:
+            # `a.com, b.com` is the display, `['a.com', 'b.com']` the repr,
+            # and this needle exists only in the first.
+            await pilot.press("slash")
+            await pilot.press(*"a.com, b.com")
+            await pilot.pause(0.4)
+            assert table.row_count == 1
+            assert table.get_row_index("policy.allow") == 0
 
     drive(scenario)
