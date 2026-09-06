@@ -1724,6 +1724,29 @@ def init(
     dry_run: Annotated[
         bool, typer.Option("--dry-run", help="Print the plan; touch nothing.")
     ] = False,
+    migrate: Annotated[
+        bool,
+        typer.Option(
+            "--migrate",
+            help="Move a pre-home installation (~/.sbxloop-venv, ~/.config/sbxloop, the "
+            "runner directory, XDG state) into the home first: back it up, carry the "
+            "config, secrets, App key and the daemon's state.db, then initialise.",
+        ),
+    ] = False,
+    purge: Annotated[
+        bool,
+        typer.Option("--purge", help="With --migrate: remove the leftovers once carried."),
+    ] = False,
+    from_db: Annotated[
+        Path | None,
+        typer.Option(
+            "--from", help="With --migrate: the state.db to carry when several are found."
+        ),
+    ] = None,
+    keep_runs: Annotated[
+        bool,
+        typer.Option("--keep-runs", help="With --migrate: keep old run directories in the home."),
+    ] = False,
 ) -> None:
     """Initialise this host's sbxloop home (~/.sbxloop, or $SBXLOOP_HOME).
 
@@ -1771,10 +1794,12 @@ def init(
         dry_run=dry_run,
         preset=preset,
     )
-    init = HomeInit(
-        home, options, say=lambda line: console.print(line, markup=False, soft_wrap=True)
-    )
+    say = lambda line: console.print(line, markup=False, soft_wrap=True)  # noqa: E731
     console.print(f"sbxloop home: {home.root}", soft_wrap=True)
+    if migrate:
+        _migrate_home(home, options, purge=purge, from_db=from_db, keep_runs=keep_runs, say=say)
+        return
+    init = HomeInit(home, options, say=say)
     try:
         report = init.execute()
     except InitError as exc:
@@ -1800,6 +1825,180 @@ def init(
     console.print(
         "next: fill in config/secrets.env, edit config/sbxloop.toml, run `sbxloop doctor`"
     )
+
+
+def _migrate_home(
+    home: SbxloopHome,
+    options: Any,
+    *,
+    purge: bool,
+    from_db: Path | None,
+    keep_runs: bool,
+    say: Any,
+) -> None:
+    from sbxloop.homeinit import HomeInit, InitError, default_runner
+    from sbxloop.homemigrate import (
+        HomeMigration,
+        MigrateError,
+        MigrateOptions,
+        discover,
+        migrate_options_for,
+        open_check,
+    )
+
+    legacy = discover(home, os.environ, cwd=Path.cwd(), run=default_runner)
+    say("found:")
+    for line in legacy.summary():
+        say(f"  {line}")
+    init_options = migrate_options_for(legacy, options)
+    init = HomeInit(home, init_options, say=say)
+    if options.dry_run:
+        for step, what in init.plan():
+            say(f"would {step}: {what}")
+        return
+    if from_db is not None:
+        open_check(from_db.expanduser().resolve())
+    migration = HomeMigration(
+        home,
+        legacy,
+        MigrateOptions(purge=purge, keep_runs=keep_runs, state_db=from_db),
+        init=init,
+        run=default_runner,
+        say=say,
+    )
+    try:
+        report = migration.execute()
+    except (InitError, MigrateError) as exc:
+        console.print(f"[bold red]migrate failed:[/] {exc}")
+        raise typer.Exit(1) from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        console.print(
+            f"[bold red]migrate failed:[/] `{shlex.join(exc.cmd)}` exited {exc.returncode}"
+        )
+        if detail:
+            console.print(detail, markup=False)
+        raise typer.Exit(1) from exc
+    if report.backup:
+        say(f"backup: {report.backup.path}")
+    for line in report.carried:
+        say(f"  carried  {line}")
+    if report.init:
+        for line in report.init.done:
+            say(f"  done     {line}")
+        for line in report.init.notes:
+            say(f"  note     {line}")
+    for line in report.removed:
+        say(f"  removed  {line}")
+    for line in report.notes:
+        say(f"  note     {line}")
+    if report.left:
+        say("left behind (run again with --purge to remove):")
+        for line in report.left:
+            say(f"  {line}")
+    if report.restarted:
+        say("daemon restarted")
+    say("next: `sbxloop doctor`")
+
+
+backup_app = typer.Typer(
+    help="Snapshots of the home's config, secrets, units and state.db.",
+    invoke_without_command=True,
+    no_args_is_help=False,
+)
+app.add_typer(backup_app, name="backup")
+
+
+@backup_app.callback()
+def backup_default(
+    ctx: typer.Context,
+    label: Annotated[
+        str, typer.Option("--label", help="A short name for this snapshot (letters, digits, -, _).")
+    ] = "",
+    reason: Annotated[str, typer.Option("--reason", help="Why it was taken.")] = "",
+) -> None:
+    """Take a snapshot now (`sbxloop backup`), or `list`, `restore`, `prune`."""
+    if ctx.invoked_subcommand is not None:
+        return
+    from sbxloop.backup import BackupError, create_backup
+
+    home = load_config().paths
+    try:
+        info = create_backup(home, label=label, reason=reason)
+    except BackupError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    console.print(f"{info.path} ({info.files} files, {format_bytes(info.bytes)})", soft_wrap=True)
+
+
+@backup_app.command("list")
+def backup_list() -> None:
+    """The snapshots under backups/, newest first."""
+    from sbxloop.backup import list_backups
+
+    home = load_config().paths
+    found = list_backups(home)
+    if not found:
+        console.print(f"no backups under {home.backups}")
+        return
+    table = Table(title=f"backups under {home.backups}")
+    for column in ("name", "created", "version", "files", "size", "label"):
+        table.add_column(column)
+    for info in found:
+        table.add_row(
+            info.name,
+            info.created_at,
+            info.sbxloop_version,
+            str(info.files),
+            format_bytes(info.bytes),
+            info.label,
+        )
+    console.print(table)
+
+
+@backup_app.command("restore")
+def backup_restore(
+    name: Annotated[str, typer.Argument(help="The snapshot's directory name, from `backup list`.")],
+    force: Annotated[
+        bool, typer.Option("--force", help="Restore even if a daemon answers on this home.")
+    ] = False,
+) -> None:
+    """Put a snapshot's config, secrets, units and state.db back. Stop the
+    daemon first: it holds state.db open."""
+    from sbxloop.backup import BackupError, restore_backup
+    from sbxloop.daemon.control import ControlClient
+
+    home = load_config().paths
+    live = False
+    if not force:
+        live = ControlClient(home).submit("status", timeout_s=2.0) is not None
+    try:
+        restored = restore_backup(home, name, daemon_live=live)
+    except BackupError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    for rel in restored:
+        console.print(f"restored {rel}")
+
+
+@backup_app.command("prune")
+def backup_prune(
+    keep: Annotated[
+        int | None,
+        typer.Option("--keep", help="How many to keep (default: [daemon] backups_keep)."),
+    ] = None,
+) -> None:
+    """Remove all but the newest snapshots."""
+    from sbxloop.backup import prune_backups
+
+    config = load_config()
+    n = config.daemon.backups_keep if keep is None else keep
+    removed = prune_backups(config.paths, keep=n)
+    if not removed:
+        console.print(f"nothing to prune (keeping {n})")
+        return
+    for info in removed:
+        console.print(f"removed {info.name}")
 
 
 @app.command("init-repo")
