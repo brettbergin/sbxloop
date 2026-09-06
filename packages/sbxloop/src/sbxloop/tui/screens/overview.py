@@ -86,8 +86,13 @@ def count(value: float) -> str:
 class PageRail(Static):
     """Overview's pages, beside the console's screens."""
 
+    # Deliberately not docked. The console's rail is already docked to this
+    # screen's left edge, and two widgets docked to the same edge of the
+    # same container overlay each other rather than stacking — this rail
+    # drew straight over that one. It sits in a Horizontal beside the page
+    # instead, in the space the docked rail left.
     DEFAULT_CSS = """
-    PageRail { dock: left; width: 11; background: $boost; padding: 1 0 0 0; }
+    PageRail { width: 11; background: $boost; padding: 1 0 0 0; }
     """
 
     def __init__(self, active: str) -> None:
@@ -115,7 +120,7 @@ class OverviewScreen(ConsoleScreen):
     ]
     DEFAULT_CSS = """
     OverviewScreen #live { height: 1; color: $text-muted; padding: 0 1; }
-    OverviewScreen #page { height: 1fr; padding: 1 2; }
+    OverviewScreen #page { width: 1fr; height: 1fr; padding: 1 2; }
     OverviewScreen .h { text-style: bold; }
     OverviewScreen .gap { height: 1; }
     OverviewScreen .r { height: 1; }
@@ -134,8 +139,9 @@ class OverviewScreen(ConsoleScreen):
     def compose(self) -> ComposeResult:
         yield from self.compose_frame()
         yield TextPanel("", id="live")
-        yield PageRail(self.page)
-        yield VerticalScroll(id="page")
+        with Horizontal(id="body"):
+            yield PageRail(self.page)
+            yield VerticalScroll(id="page")
         yield from self.compose_footer()
 
     def on_mount(self) -> None:

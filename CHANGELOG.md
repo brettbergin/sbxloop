@@ -1,5 +1,17 @@
 ## [Unreleased]
 
+### Fixed
+
+- **Overview's page rail drew on top of the console's rail.** Both were
+  docked to the screen's left edge, and two widgets docked to the same edge
+  of one container overlay each other rather than stacking — so the page
+  rail covered Overview, Runs, Queue, Chat, Sandboxes and Daemon, leaving
+  only Config, Doctor and Help visible below it. The page rail now sits in
+  a `Horizontal` beside the page, in the space the docked rail leaves. A
+  test asserts the two rails' regions do not intersect: every content
+  assertion passed while the screen was unreadable, so geometry is the only
+  thing that catches this.
+
 ### Added
 
 - **Overview reports how the loop has been performing.** The screen was
