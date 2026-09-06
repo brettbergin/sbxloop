@@ -19,7 +19,7 @@ from sbxloop.deliver import (
     deliver_workspace,
     ensure_repository,
 )
-from sbxloop.errors import DeliveryError, GithubOpsError
+from sbxloop.errors import DeliveryError, DeliveryPermissionError, GithubOpsError
 from sbxloop.gh.ops import PrRef
 from tests.fakes.github_errors import github_error
 from tests.fakes.gitserver import PrivateGitServer, bare_from
@@ -411,6 +411,117 @@ class TestDeliverWorkspace:
             source_dir=make_workspace(tmp_path),
         )
         assert len(ops.pr_kwargs["title"]) <= 72
+
+
+def make_workflow_workspace(tmp_path: Path) -> Path:
+    tmp_path.mkdir(exist_ok=True)
+    root = make_workspace(tmp_path)
+    (root / ".github" / "workflows").mkdir(parents=True)
+    (root / ".github" / "workflows" / "release-on-merge.yml").write_text("on: push\n")
+    return root
+
+
+class ForbiddenTreeOps(StubOps):
+    """GitHub's answer to a tree carrying a workflow file the credential
+    may not write (#752): the recorded 403 on the tree POST."""
+
+    def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+        if method == "POST" and path.endswith("/git/trees"):
+            self.raw_calls.append((method, path, body))
+            raise github_error("trees_forbidden_403")
+        return super().raw(method, path, body)
+
+
+class TestWorkflowPermission:
+    """A delivery touching ``.github/workflows/`` is refused up front when
+    the credential is known to lack ``workflows: write`` (#752), and
+    GitHub's 403 on the tree is read as the same answer when the grants
+    were unknown. Field: two 10-minute runs died on an opaque 403 that
+    doctor had already warned about."""
+
+    def _deliver(self, ops: StubOps, root: Path, **kwargs: Any) -> PrRef:
+        return deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r752",
+            outcome="ship a workflow",
+            source_dir=root,
+            **kwargs,
+        )
+
+    def test_known_missing_refuses_before_any_upload(self, tmp_path: Path) -> None:
+        ops = StubOps()
+        with pytest.raises(DeliveryPermissionError) as info:
+            self._deliver(
+                ops, make_workflow_workspace(tmp_path), workflows_write_granted=lambda: False
+            )
+        exc = info.value
+        text = str(exc)
+        assert "`.github/workflows/release-on-merge.yml`" in text
+        assert "`workflows: write`" in text
+        assert "Workflows: Read and write" in text and "installation" in text
+        assert "`workflow` scope" in text
+        assert "sbxloop doctor --probe" in text and "Nothing was delivered" in text
+        assert exc.paths == (".github/workflows/release-on-merge.yml",)
+        assert exc.permission == "workflows:write"
+        # Fail-closed and cheap: zero blobs, zero trees, zero commits.
+        assert ops.blob_batches == []
+        assert not [p for _, p, _ in ops.raw_calls if "/git/blobs" in p or p.endswith("/git/trees")]
+        assert not [p for _, p, _ in ops.raw_calls if p.endswith("/git/commits")]
+        assert ops.pr_kwargs == {}
+
+    def test_granted_delivers_normally(self, tmp_path: Path) -> None:
+        ops = StubOps()
+        pr = self._deliver(
+            ops, make_workflow_workspace(tmp_path), workflows_write_granted=lambda: True
+        )
+        assert pr.number == 7
+        assert ".github/workflows/release-on-merge.yml" in {e["path"] for e in tree_entries(ops)}
+
+    def test_a_plan_without_a_workflow_never_asks(self, tmp_path: Path) -> None:
+        asked: list[bool] = []
+
+        def granted() -> bool | None:
+            asked.append(True)
+            return False
+
+        ops = StubOps()
+        assert (
+            self._deliver(ops, make_workspace(tmp_path), workflows_write_granted=granted).number
+            == 7
+        )
+        assert asked == []
+
+    def test_no_answer_means_the_delivery_is_attempted(self, tmp_path: Path) -> None:
+        # Grants unknown (a fine-grained PAT) and GitHub content: delivered.
+        ops = StubOps()
+        one = make_workflow_workspace(tmp_path / "a")
+        assert self._deliver(ops, one, workflows_write_granted=None).number == 7
+        two = make_workflow_workspace(tmp_path / "b")
+        assert self._deliver(ops, two, workflows_write_granted=lambda: None).number == 7
+
+    def test_unknown_grants_read_the_403_off_the_tree(self, tmp_path: Path) -> None:
+        ops = ForbiddenTreeOps()
+        with pytest.raises(DeliveryPermissionError) as info:
+            self._deliver(
+                ops, make_workflow_workspace(tmp_path), workflows_write_granted=lambda: None
+            )
+        text = str(info.value)
+        assert "`.github/workflows/release-on-merge.yml`" in text
+        assert "`workflows: write`" in text and "403" in text
+        assert "Resource not accessible by integration" in text
+        assert info.value.paths == (".github/workflows/release-on-merge.yml",)
+        # The tree was sent once and refused; nothing after it.
+        assert len([p for _, p, _ in ops.raw_calls if p.endswith("/git/trees")]) == 1
+        assert not [p for _, p, _ in ops.raw_calls if p.endswith("/git/commits")]
+
+    def test_a_403_on_a_tree_without_a_workflow_is_not_reinterpreted(self, tmp_path: Path) -> None:
+        # Only the workflow-path + 403 combination is unambiguous; any other
+        # 403 stays what it was, for the caller to classify.
+        ops = ForbiddenTreeOps()
+        with pytest.raises(GithubOpsError) as info:
+            self._deliver(ops, make_workspace(tmp_path), workflows_write_granted=lambda: None)
+        assert not isinstance(info.value, DeliveryPermissionError)
 
 
 class MissingRepoOps(StubOps):

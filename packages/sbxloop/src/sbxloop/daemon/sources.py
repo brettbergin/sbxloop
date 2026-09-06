@@ -881,17 +881,26 @@ class GitHubIssueSource:
 
         def go(ops: GithubOps) -> bool:
             n = item.source_key
-            self._comment(
-                ops,
-                n,
-                f"sbxloop could not finish: {reason}\n\n{_pr_ref(pr_number, pr_url)} passed "
-                "the loop's own review and checks but GitHub would not let the loop land it. "
-                "A human needs to look: merge or fix it by hand and close this issue, or "
-                f"re-add `{self.labels.trigger_for(item)}` once the cause is dealt with — "
-                f"the issue does not need to be edited and `{self.labels.blocked}` does not "
-                "need removing by hand (the claim clears it), and the restart continues on "
-                "this branch and pull request.",
-            )
+            if pr_number is None:
+                # Blocked before anything reached GitHub (#752): there is no
+                # pull request to merge by hand, only a cause to remove.
+                what = (
+                    "Nothing was delivered. A human needs to act on the cause named above, "
+                    f"then re-add `{self.labels.trigger_for(item)}` — the issue does not need "
+                    f"to be edited and `{self.labels.blocked}` does not need removing by hand "
+                    "(the claim clears it)."
+                )
+            else:
+                what = (
+                    f"{_pr_ref(pr_number, pr_url)} passed the loop's own review and checks but "
+                    "GitHub would not let the loop land it. A human needs to look: merge or fix "
+                    "it by hand and close this issue, or re-add "
+                    f"`{self.labels.trigger_for(item)}` once the cause is dealt with — the "
+                    f"issue does not need to be edited and `{self.labels.blocked}` does not "
+                    "need removing by hand (the claim clears it), and the restart continues on "
+                    "this branch and pull request."
+                )
+            self._comment(ops, n, f"sbxloop could not finish: {reason}\n\n{what}")
             self._remove_label(ops, n, self.labels.in_progress)
             # A trigger label still on the issue would make the human's
             # re-add a no-op — GitHub fires no event for a label already

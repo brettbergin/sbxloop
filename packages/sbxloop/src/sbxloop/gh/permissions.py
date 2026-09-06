@@ -106,6 +106,35 @@ def missing_from_app(permissions: Mapping[str, str]) -> tuple[Need, ...]:
     return tuple(missing)
 
 
+# The one path prefix GitHub guards with a permission of its own (#752): a
+# tree carrying an entry under it is refused (a 403, "Resource not
+# accessible by integration") unless the credential holds ``workflows:
+# write`` (an App) or the ``workflow`` scope (a classic PAT).
+WORKFLOWS_DIR = ".github/workflows/"
+WORKFLOWS_NEED = next(n for n in NEEDS if n.permission == "workflows")
+
+
+def workflow_paths(paths: Iterable[str]) -> tuple[str, ...]:
+    """The entries of a delivery plan GitHub will hold to ``workflows:
+    write``: everything under :data:`WORKFLOWS_DIR`, in plan order."""
+    return tuple(p for p in paths if p.startswith(WORKFLOWS_DIR))
+
+
+def workflows_write_granted(
+    *, app_permissions: Mapping[str, str] | None, scopes: Iterable[str] | None
+) -> bool | None:
+    """Whether the credential may deliver a workflow file, from whichever
+    source describes it (#696): ``True``/``False`` when an App grant map
+    or a classic PAT's scopes say, ``None`` when neither does (a
+    fine-grained PAT reports nothing — GitHub's refusal is the only
+    answer, and :mod:`sbxloop.deliver` reads it off the tree POST)."""
+    if app_permissions is not None:
+        return WORKFLOWS_NEED not in missing_from_app(app_permissions)
+    if scopes is not None:
+        return WORKFLOWS_NEED not in missing_from_scopes(scopes)
+    return None
+
+
 def split_required(needs: Iterable[Need]) -> tuple[tuple[Need, ...], tuple[Need, ...]]:
     """``(required, optional)`` — the FAIL and WARN halves of a missing set."""
     listed = tuple(needs)

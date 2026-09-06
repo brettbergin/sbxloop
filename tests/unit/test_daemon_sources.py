@@ -466,6 +466,26 @@ class TestGitHubSource:
         assert "re-add `sbxloop:run`" in body and "!sbx retry" not in body
         assert ("DELETE", "/repos/o/r/issues/4/labels/sbxloop%3Arun", None) in ops.raw_calls
 
+    def test_report_blocked_without_a_pr_names_no_pull_request(self) -> None:
+        """Blocked before anything reached GitHub (#752: a delivery the
+        credential may not make): there is no PR to merge by hand, so the
+        comment says nothing was delivered and what re-arms the item."""
+        ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
+        reason = (
+            "delivery touches `.github/workflows/ci.yml` but the credential lacks "
+            "`workflows: write`"
+        )
+        assert self.make(ops).report_blocked(gh(), reason, None, "") is True
+        body = ops.comments[-1][1]
+        assert "workflows: write" in body and "Nothing was delivered" in body
+        assert "its pull request" not in body and "passed the loop's own review" not in body
+        assert "re-add `sbxloop:run`" in body
+        assert (
+            "POST",
+            "/repos/o/r/issues/4/labels",
+            {"labels": ["sbxloop:blocked"]},
+        ) in ops.raw_calls
+
     def test_report_blocked_failure_returns_false(self) -> None:
         ops = RecordingOps({"4": issue(4, "sbxloop:in-progress")})
         ops.fail_on = {"POST"}

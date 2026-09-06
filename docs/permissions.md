@@ -6,15 +6,15 @@ the feature that first needs each permission. This is the table
 code as `sbxloop.gh.permissions.NEEDS`, and the README and `.env.example`
 point here rather than restating it.
 
-| Permission    | Level | Classic PAT scope | Needed for                                                                                                                                                         |
-| ------------- | ----- | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| Metadata      | read  | `repo`            | looking the repository up                                                                                                                                          |
-| Contents      | write | `repo`            | delivering the run's branch and commits, merging                                                                                                                   |
-| Pull requests | write | `repo`            | opening, reviewing, un-drafting, updating and merging the pull request                                                                                             |
-| Issues        | write | `repo`            | polling issues for work, claiming them, driving the lifecycle labels, filing follow-ups                                                                            |
-| Checks        | read  | `repo`            | waiting for check runs at the CI and landing stages                                                                                                                |
-| Actions       | read  | `repo`            | reading workflow runs and the failed jobs' logs at the CI stage                                                                                                    |
-| Workflows     | write | `workflow`        | **optional** — delivering changes under `.github/workflows/`; without it GitHub refuses a delivery that touches a workflow file, and every other run is unaffected |
+| Permission    | Level | Classic PAT scope | Needed for                                                                                                                                                                                                                                      |
+| ------------- | ----- | ----------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Metadata      | read  | `repo`            | looking the repository up                                                                                                                                                                                                                       |
+| Contents      | write | `repo`            | delivering the run's branch and commits, merging                                                                                                                                                                                                |
+| Pull requests | write | `repo`            | opening, reviewing, un-drafting, updating and merging the pull request                                                                                                                                                                          |
+| Issues        | write | `repo`            | polling issues for work, claiming them, driving the lifecycle labels, filing follow-ups                                                                                                                                                         |
+| Checks        | read  | `repo`            | waiting for check runs at the CI and landing stages                                                                                                                                                                                             |
+| Actions       | read  | `repo`            | reading workflow runs and the failed jobs' logs at the CI stage                                                                                                                                                                                 |
+| Workflows     | write | `workflow`        | **optional** — delivering changes under `.github/workflows/`; without it a delivery that touches a workflow file is refused before anything is uploaded and the item ends `blocked` naming the permission (#752); every other run is unaffected |
 
 `public_repo` stands in for `repo` on a public repository only.
 
