@@ -2101,7 +2101,10 @@ def detect_languages(workspace: Path) -> dict[str, tuple[str, ...]]:
     return found
 
 
-LanguageSource = Literal["config", "detected", "default"]
+# "profile" / "none": a workload run's set is its profile's `languages`
+# list, empty by default (#801) — there is no workspace to detect from and
+# nothing to fall back to, since the operator persona needs no compiler.
+LanguageSource = Literal["config", "detected", "default", "profile", "none"]
 
 
 class LanguageResolution(NamedTuple):

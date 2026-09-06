@@ -131,8 +131,55 @@ def test_config_screen_resolves_filters_and_shows_the_policy(
             assert table.row_count == total
             policy = app.screen.query_one("#policy", TextPanel).content_text
             assert "decompose" in policy and "audit trail" in policy
+            # No profile declared (#804): the pane says what that means.
+            workloads = app.screen.query_one("#workloads", TextPanel).content_text
+            assert "no [[workloads]] profile declared" in workloads
+            assert "every need but the chat sink is refused" in workloads
             status = app.screen.query_one("#file-status", TextPanel).content_text
             assert str(seeded.config_toml) in status
+
+    drive(scenario)
+
+
+def test_config_screen_shows_the_workload_profiles(seeded: SbxloopHome, hermetic: None) -> None:
+    """#804: the bounds decide what a workload can do, and the console is
+    where an operator looks first — each profile as a card, the stored
+    schedules under the profile they name, never a credential's value."""
+    from sbxloop.config import ScheduleConfig
+    from sbxloop.daemon.store import DaemonStore
+
+    _seed_config(
+        seeded,
+        '[[credentials]]\nname = "weather"\nenv = "WEATHER_KEY"\nhost = "api.weather.example"\n\n'
+        '[[workloads]]\nname = "research"\ndescription = "reads the web"\n'
+        'egress = ["*.example.com"]\ncredentials = ["weather"]\n'
+        'sinks = ["artifact"]\n\n'
+        '[[workloads]]\nname = "quiet"\n\n[workload]\ndefault = "research"\n',
+    )
+    store = DaemonStore(seeded.state_db)
+    store.add_schedule(
+        ScheduleConfig(name="brief", profile="research", ask="Digest", every="24h"),
+        source="chat",
+        by="brett",
+        now=1.0,
+    )
+    store.close()
+
+    async def scenario() -> None:
+        app = make_app(seeded, **REFRESH)
+        async with app.run_test(size=(160, 50)) as pilot:
+            await pilot.press("7")
+            await pilot.pause(1.5)
+            assert isinstance(app.screen, ConfigScreen)
+            text = app.screen.query_one("#workloads", TextPanel).content_text
+            assert "research (default)" in text and "reads the web" in text
+            assert "*.example.com" in text
+            assert "credentials" in text and "weather" in text
+            assert "chat, artifact" in text
+            assert "brief · every 1d" in text
+            # The bare profile says what it refuses; no value ever shows.
+            assert "no host may be granted" in text
+            assert "WEATHER_KEY" not in text
 
     drive(scenario)
 
@@ -153,6 +200,7 @@ def test_the_console_has_no_file_editor(seeded: SbxloopHome, hermetic: None) -> 
             assert [pane.id for pane in screen.query(TabPane)] == [
                 "resolved-pane",
                 "policy-pane",
+                "workloads-pane",
                 "repos-pane",
             ], "no Edit tab"
             assert not screen.query(TextArea), "no draft buffer anywhere on the screen"
