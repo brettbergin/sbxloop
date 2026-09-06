@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import queue
 import shlex
 import shutil
@@ -62,7 +63,7 @@ from urllib.parse import quote
 
 from pydantic import ValidationError
 
-from sbxloop import hostgit
+from sbxloop import hostgit, repofiles
 from sbxloop.config import (
     DEFAULT_PR_TITLE_TEMPLATE,
     GITHUB_SINKS,
@@ -818,6 +819,10 @@ class LoopEngine:
                         if pair.service is not None
                         else None
                     )
+                    if service_client is not None:
+                        from sbxloop.worker.mcp import McpBroker
+
+                        agent.mcp_prepare = McpBroker(lambda: service_client).prepare
                     service = (
                         self._service_ops(
                             service_client,
@@ -861,7 +866,7 @@ class LoopEngine:
                         # host through the service sandbox.
                         host_tools=service.tool_specs() if service is not None else (),
                         tool_handler=service.handler(phase="build" if kind == "code" else "execute")
-                        if service is not None
+                        if service is not None and service.tool_specs()
                         else None,
                         # The judge's tool digest is read off the bus (#756);
                         # a code run's phases never ask for one.
@@ -2396,7 +2401,12 @@ class LoopEngine:
                 for rel in files:
                     dest = target / rel
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(p.pair.workspace / rel, dest)
+                    with (
+                        repofiles.open_file(p.pair.workspace, rel) as source,
+                        dest.open("wb") as out,
+                    ):
+                        shutil.copyfileobj(source, out)
+                        os.fchmod(out.fileno(), os.fstat(source.fileno()).st_mode & 0o777)
             else:
                 self._copy_out(p.pair, target, files)
         return target, [str(target / rel) for rel in files]

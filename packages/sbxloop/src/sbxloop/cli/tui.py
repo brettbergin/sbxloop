@@ -113,9 +113,15 @@ def render_event(event: Event) -> RenderableType | None:
             content = content[:AGENT_MESSAGE_CLIP] + "\n\n*…truncated — see `sbxloop logs`*"
         speaker = str(data.get("agent") or "agent")
         model = str(data.get("model") or "").strip()
+        backend = str(data.get("backend") or "").strip()
         title = f"[bold cyan]{speaker}[/]"
-        if model:
-            title += f" [dim]· {model}[/]"
+        if model or backend:
+            # The backend beside the model (#648), as Discord and Slack say
+            # it (#601): a model name alone does not say which provider ran.
+            # Imported here: discord_format reads this module's prefixes.
+            from sbxloop.daemon.discord_format import agent_model_label
+
+            title += f" [dim]· {agent_model_label(backend, model)}[/]"
         return Panel(
             Markdown(content),
             title=f"{title} [dim]{_stamp(event)}[/]",
