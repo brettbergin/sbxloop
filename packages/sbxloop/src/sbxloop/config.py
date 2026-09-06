@@ -1545,6 +1545,10 @@ class DaemonConfig(_ConfigModel):
     # artifacts). Swept on daemon start and daily; 0 disables. The SQLite
     # rows are never removed. See sbxloop.gc for what is exempt.
     prune_runs_after_days: float = Field(default=14.0, ge=0)
+    # How many snapshots `sbxloop backup` (and the deploy, and `init
+    # --migrate`) leave under backups/: the daily sweep removes the rest.
+    # 0 keeps every one.
+    backups_keep: int = Field(default=10, ge=0)
     # Liveness safety net for phantom active runs (#374). When the daemon has
     # no run executing, any non-terminal run whose last activity (engine
     # chronology, falling back to the run row's updated timestamp) is older

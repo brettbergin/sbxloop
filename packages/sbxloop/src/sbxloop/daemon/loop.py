@@ -1058,6 +1058,18 @@ class DaemonLoop:
 
     # -- state-dir retention -------------------------------------------------------
 
+    def _prune_backups(self) -> None:
+        """Keep the newest ``[daemon] backups_keep`` snapshots (0 keeps all)."""
+        from sbxloop.backup import prune_backups
+
+        try:
+            removed = prune_backups(self.config.paths, keep=self.config.daemon.backups_keep)
+        except Exception:
+            log.warning("daemon.backup_prune_failed", exc_info=True)
+            return
+        if removed:
+            log.info("daemon.backups_pruned", removed=[b.name for b in removed])
+
     def _maybe_gc(self, now: float) -> None:
         """Sweep runs/<id>/ on the first tick after start and once a day
         thereafter. Runs before the pause/breaker checks: retention is
@@ -1070,6 +1082,7 @@ class DaemonLoop:
     def gc(self, now: float | None = None) -> None:
         """One retention sweep (see :mod:`sbxloop.gc`); never raises — a
         failed sweep must not take the daemon down with it."""
+        self._prune_backups()
         days = self.config.daemon.prune_runs_after_days
         if days <= 0:
             return

@@ -553,6 +553,9 @@ secret_strategy = "proxy"
 # Retention for ~/.sbxloop/runs/<run>/ (workspace clones, harvested artifacts):
 # swept on daemon start and daily; `sbxloop gc` for non-daemon use. 0 disables.
 # prune_runs_after_days = 14
+# Snapshots under ~/.sbxloop/backups/ (`sbxloop backup`, the deploy, `init
+# --migrate`): the daily sweep keeps the newest this many. 0 keeps all.
+# backups_keep = 10
 # A non-terminal run idle this long while nothing is executing is reconciled
 # to a terminal state (phantom-run safety net). 0 disables.
 # run_stale_after_s = 21600.0
