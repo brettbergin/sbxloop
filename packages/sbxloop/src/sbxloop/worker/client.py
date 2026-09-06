@@ -229,6 +229,13 @@ class WorkerClient:
         # Provisioner.job_env — None means the sandbox's credentials arrive
         # another way (sbx secret proxy, or the env-file fallback).
         self.job_env = job_env
+        self.mcp_prepare: (
+            Callable[
+                [JobRequest, HostToolHandler | None],
+                contextlib.AbstractContextManager[tuple[JobRequest, HostToolHandler | None]],
+            ]
+            | None
+        ) = None
         # job_id -> agent persona (planner, executor, ...) supplied at
         # submit(); stamped onto that job's agent.* events so the transcript
         # can say who is speaking (the worker doesn't know which phase it
@@ -961,6 +968,11 @@ class WorkerClient:
         """
         if self.credential_refresh is not None:
             self.credential_refresh()
+        if any(server.mediated for server in job.mcp_servers):
+            if self.mcp_prepare is None:
+                raise WorkerError("credentialed MCP has no host mediator")
+            with self.mcp_prepare(job, tool_handler) as (prepared, handler):
+                return self.submit(prepared, agent=agent, tool_handler=handler)
         if bool(job.host_tools) != (tool_handler is not None):
             raise WorkerError(
                 "job.host_tools and tool_handler must be given together "

@@ -1877,13 +1877,9 @@ class McpConfig(_ConfigModel):
     request, which reads as a hang rather than a misconfiguration, so this
     is not optional bookkeeping.
 
-    ``credential`` names a ``[[credentials]]`` entry. Its ``env`` is set for
-    the server's process and its ``host`` is what the credential is bound
-    to, so under the default secret strategy the sandbox only ever holds a
-    proxy placeholder — the value is substituted in flight for requests to
-    that host and never appears in a job, an event or an ``sbx`` argument.
-    The credential value must therefore never be written into ``command`` or
-    ``args``, which do travel; the validator rejects the obvious spellings.
+    `credential` names a service-only credential. Such servers require
+    HTTPS Streamable HTTP and are exposed through fixed host-mediated tool
+    calls. Native credential-free servers retain the SDK transports.
     """
 
     name: str
@@ -2235,8 +2231,7 @@ class Config(_ConfigModel):
     registries: list[RegistryConfig] = Field(default_factory=list)
     # The credentials a run may be granted (#765): held by a per-run service
     # sandbox and used through host-driven ops; never in the agent sandbox.
-    # The one exception is an entry an [[mcp]] server references, which is
-    # bound into the agent sandbox as a proxy placeholder — see McpConfig.
+    # MCP entries grant scoped tool access through that same service boundary.
     credentials: list[CredentialConfig] = Field(default_factory=list)
     # External MCP servers the agent sessions may be given, by role.
     mcp: list[McpConfig] = Field(default_factory=list)
@@ -2289,6 +2284,23 @@ class Config(_ConfigModel):
                     f"mcp {server.name!r} references credential {server.credential!r}, "
                     f"which is not declared under [[credentials]] (declared: {known})"
                 )
+            if server.transport != "http":
+                raise ValueError(
+                    "credentialed MCP requires transport='http'; "
+                    "stdio and legacy SSE cannot safely carry service credentials"
+                )
+            parts = urlsplit(server.url)
+            if (
+                parts.scheme != "https"
+                or parts.hostname != entry.host
+                or parts.username
+                or parts.password
+                or parts.fragment
+            ):
+                raise ValueError(
+                    "credentialed MCP URL must use HTTPS on the credential's host, "
+                    "without userinfo or fragment"
+                )
             # sbx keys custom secrets by env var name, so one env cannot be
             # registered twice in a sandbox. A collision with the agent
             # backend's own credential is already impossible — those names
@@ -2310,41 +2322,32 @@ class Config(_ConfigModel):
     def mcp_specs_for(self, role: str) -> list[McpServerSpec]:
         """``mcp_for`` as the worker protocol's neutral specs.
 
-        A credentialed server carries a ``${NAME}`` reference here, never a
-        value: a job's contents reach events and logs, so the substitution
-        happens inside the sandbox (``sbxloop_worker.mcp.expand_refs``)
-        against an environment that, under the default secret strategy,
-        holds a proxy placeholder rather than the secret itself.
-
-        A stdio server gets the credential as environment; an http/sse one
-        gets it as the header the ``[[credentials]]`` entry declares, which
-        is what that entry's ``header``/``scheme`` are for.
+        Credentialed HTTP servers are host-mediated descriptors. Only anonymous
+        servers become native SDK configs; credentials stay in the service VM.
         """
         specs: list[McpServerSpec] = []
         for server in self.mcp_for(role):
             entry = None if server.credential is None else self.credential(server.credential)
+            if entry is not None:
+                specs.append(
+                    McpServerSpec(name=server.name, transport="http", url=server.url, mediated=True)
+                )
+                continue
             if server.transport == "stdio":
-                env = {entry.env: f"${{{entry.env}}}"} if entry is not None else {}
                 specs.append(
                     McpServerSpec(
                         name=server.name,
                         transport="stdio",
                         command=server.command[0],
                         args=list(server.command[1:]),
-                        env=env,
                     )
                 )
             else:
-                headers: dict[str, str] = {}
-                if entry is not None:
-                    value = f"${{{entry.env}}}"
-                    headers[entry.header] = f"{entry.scheme} {value}" if entry.scheme else value
                 specs.append(
                     McpServerSpec(
                         name=server.name,
                         transport=server.transport,
                         url=server.url,
-                        headers=headers,
                     )
                 )
         return specs
@@ -2364,14 +2367,16 @@ class Config(_ConfigModel):
         runs no session able to use a server does not get its host."""
         return list(
             dict.fromkeys(
-                host for server in self.mcp_servers_for_roles(roles) for host in server.hosts
+                host
+                for server in self.mcp_servers_for_roles(roles)
+                for host in server.hosts
+                if server.credential is None
             )
         )
 
     def mcp_secrets_for(self, roles: Sequence[str] | None = None) -> list[tuple[str, str]]:
         """``(env, host)`` per credentialed MCP server reachable by
-        ``roles``: the custom secret registrations that sandbox needs beyond
-        the backend's own. Deduped by env, which is what sbx keys on."""
+        ``roles``. This is metadata only; no MCP secret is registered in an agent."""
         pairs: dict[str, str] = {}
         for server in self.mcp_servers_for_roles(roles):
             if server.credential is None:
@@ -2380,6 +2385,15 @@ class Config(_ConfigModel):
             assert entry is not None  # _check_mcp ran at load
             pairs.setdefault(entry.env, entry.host)
         return list(pairs.items())
+
+    def mcp_credentials(self) -> list[CredentialConfig]:
+        return self.credentials_named(
+            list(
+                dict.fromkeys(
+                    server.credential for server in self.mcp if server.credential is not None
+                )
+            )
+        )
 
     @property
     def paths(self) -> SbxloopHome:

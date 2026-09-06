@@ -29,6 +29,7 @@ JobKind = Literal[
     "github.op",
     "service.http",
     "service.fetch",
+    "service.mcp",
     "git.merge",
 ]
 JobStatus = Literal["ok", "error", "timeout"]
@@ -169,10 +170,9 @@ class McpServerSpec(ProtocolModel):
     shape rather than either one's dialect (field-verified 2026-09-06
     against github-copilot-sdk 1.0.8 and claude-agent-sdk 0.2.149).
 
-    ``env`` carries the server's credential when it has one. That value is
-    a proxy placeholder in the sandbox under the default secret strategy,
-    exactly like the agent's own credential: the real secret never travels
-    in a job, an event, or an ``sbx`` argument.
+    Credentialed servers carry only a mediated descriptor. The host replaces
+    it with scoped host tools before dispatch, keeping credentials in the
+    service sandbox. Native SDK configs are credential-free.
     """
 
     name: str = Field(pattern=HOST_TOOL_NAME_RE)
@@ -184,6 +184,8 @@ class McpServerSpec(ProtocolModel):
     # transport in ("http", "sse")
     url: str | None = None
     headers: dict[str, str] = Field(default_factory=dict)
+    # Replaced with host tools before the job enters an agent sandbox.
+    mediated: bool = False
 
     @model_validator(mode="after")
     def _check_transport(self) -> McpServerSpec:
@@ -376,7 +378,23 @@ class JobRequest(ProtocolModel):
             ):
                 raise ValueError("service.fetch must not set argv, prompt, commands, op, or cwd")
             RegistryFetchParams.model_validate(self.params)
+        elif self.kind == "service.mcp":
+            if any(
+                value is not None
+                for value in (self.argv, self.prompt, self.commands, self.op, self.cwd)
+            ):
+                raise ValueError("service.mcp must not carry executable fields")
+            McpOpParams.model_validate(self.params)
         return self
+
+
+class McpOpParams(ProtocolModel):
+    model_config = ConfigDict(extra="forbid")
+    server: str = Field(pattern=HOST_TOOL_NAME_RE)
+    session: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,128}$")
+    action: Literal["tools/list", "tools/call", "close"]
+    tool: str | None = None
+    arguments: dict[str, Any] = Field(default_factory=dict)
 
 
 class BatchCommandResult(ProtocolModel):

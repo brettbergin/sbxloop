@@ -23,6 +23,12 @@ STDIO = {
     "command": ["npx", "-y", "weather-mcp"],
     "hosts": ["api.weather.example.com"],
 }
+HTTP = {
+    "name": "weather",
+    "transport": "http",
+    "url": "https://api.weather.example.com/mcp",
+    "hosts": ["api.weather.example.com"],
+}
 CREDENTIAL = {
     "name": "weather",
     "env": "WEATHER_API_KEY",
@@ -53,7 +59,7 @@ class TestConfigValidation:
 
     def test_an_undeclared_credential_is_refused_at_load(self) -> None:
         with pytest.raises(ValidationError, match="not declared under"):
-            config_with(mcp=[{**STDIO, "credential": "nope"}])
+            config_with(mcp=[{**HTTP, "credential": "nope"}])
 
     def test_the_agent_backends_own_credential_cannot_be_reused(self) -> None:
         """sbx registers one secret per env var, so an MCP server binding
@@ -63,7 +69,7 @@ class TestConfigValidation:
         new way to reach them."""
         with pytest.raises(ValidationError, match="delivered by sbxloop itself"):
             config_with(
-                mcp=[{**STDIO, "credential": "weather"}],
+                mcp=[{**HTTP, "credential": "weather"}],
                 credentials=[{**CREDENTIAL, "env": "ANTHROPIC_API_KEY"}],
             )
 
@@ -71,8 +77,8 @@ class TestConfigValidation:
         with pytest.raises(ValidationError, match="both bind env"):
             config_with(
                 mcp=[
-                    {**STDIO, "credential": "weather"},
-                    {**STDIO, "name": "other", "credential": "weather"},
+                    {**HTTP, "credential": "weather"},
+                    {**HTTP, "name": "other", "credential": "weather"},
                 ],
                 credentials=[CREDENTIAL],
             )
@@ -114,9 +120,9 @@ class TestSpecResolution:
     def test_a_credential_travels_as_a_reference_never_a_value(self) -> None:
         """The single most important property here: a job's contents reach
         events and logs."""
-        config = config_with(mcp=[{**STDIO, "credential": "weather"}], credentials=[CREDENTIAL])
+        config = config_with(mcp=[{**HTTP, "credential": "weather"}], credentials=[CREDENTIAL])
         (spec,) = config.mcp_specs_for("builder")
-        assert spec.env == {"WEATHER_API_KEY": "${WEATHER_API_KEY}"}
+        assert spec.mediated and spec.env == {}
         assert "secret" not in spec.model_dump_json()
 
     def test_an_http_server_gets_the_credentials_own_header(self) -> None:
@@ -133,14 +139,14 @@ class TestSpecResolution:
             credentials=[{**CREDENTIAL, "header": "X-Api-Key", "scheme": ""}],
         )
         (spec,) = config.mcp_specs_for("builder")
-        assert spec.headers == {"X-Api-Key": "${WEATHER_API_KEY}"}
+        assert spec.mediated and spec.headers == {}
 
     def test_a_bearer_scheme_is_spelled_out(self) -> None:
         config = config_with(
             mcp=[
                 {
                     "name": "weather",
-                    "transport": "sse",
+                    "transport": "http",
                     "url": "https://api.weather.example.com/mcp",
                     "hosts": ["api.weather.example.com"],
                     "credential": "weather",
@@ -149,7 +155,7 @@ class TestSpecResolution:
             credentials=[CREDENTIAL],
         )
         (spec,) = config.mcp_specs_for("builder")
-        assert spec.headers == {"Authorization": "Bearer ${WEATHER_API_KEY}"}
+        assert spec.mediated and spec.headers == {}
 
 
 class TestEgress:
@@ -173,7 +179,7 @@ class TestEgress:
 
 class TestSecretRegistrations:
     def test_a_credentialed_server_declares_one_binding(self) -> None:
-        config = config_with(mcp=[{**STDIO, "credential": "weather"}], credentials=[CREDENTIAL])
+        config = config_with(mcp=[{**HTTP, "credential": "weather"}], credentials=[CREDENTIAL])
         assert config.mcp_secrets_for() == [("WEATHER_API_KEY", "api.weather.example.com")]
 
     def test_a_credential_free_server_declares_none(self) -> None:
