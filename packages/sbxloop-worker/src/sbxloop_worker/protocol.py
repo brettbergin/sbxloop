@@ -23,7 +23,13 @@ PROTOCOL_VERSION = 1
 HOST_TOOL_NAME_RE = r"^[A-Za-z0-9_-]{1,64}$"
 
 JobKind = Literal[
-    "agent.session", "shell.check", "shell.batch", "github.op", "service.http", "service.fetch"
+    "agent.session",
+    "shell.check",
+    "shell.batch",
+    "github.op",
+    "service.http",
+    "service.fetch",
+    "git.merge",
 ]
 JobStatus = Literal["ok", "error", "timeout"]
 PermissionMode = Literal["auto", "read_only"]
@@ -344,6 +350,27 @@ class JobRequest(ProtocolModel):
                 raise ValueError("service.http must not set op")
             if self.prompt is not None or self.argv is not None or self.commands is not None:
                 raise ValueError("service.http must not set prompt, argv, or commands")
+        elif self.kind == "git.merge":
+            sha = self.params.get("base_sha")
+            if (
+                not isinstance(sha, str)
+                or len(sha) not in (40, 64)
+                or any(c not in "0123456789abcdef" for c in sha)
+            ):
+                raise ValueError("git.merge requires a full base_sha")
+            if (
+                not self.cwd
+                or not isinstance(self.params.get("base_branch"), str)
+                or not self.params["base_branch"]
+            ):
+                raise ValueError("git.merge requires cwd and base_branch")
+            if (
+                self.prompt is not None
+                or self.argv is not None
+                or self.commands is not None
+                or self.op is not None
+            ):
+                raise ValueError("git.merge must not set prompt, argv, commands, or op")
         elif self.kind == "service.fetch":
             if not self.argv:
                 raise ValueError("service.fetch requires a non-empty argv")

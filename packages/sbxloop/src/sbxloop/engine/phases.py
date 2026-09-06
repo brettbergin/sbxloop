@@ -33,7 +33,7 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import Literal, NamedTuple, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 from sbxloop import toolchains
 from sbxloop.config import Config
@@ -60,6 +60,7 @@ from sbxloop.verifylint import (
 )
 from sbxloop.worker.client import WorkerClient
 from sbxloop.worker.hosttools import HostToolHandler
+from sbxloop_worker.gitops import MergeResult
 from sbxloop_worker.protocol import (
     BatchCommandResult,
     Event,
@@ -677,6 +678,30 @@ class PhaseRunner:
             "phase.invalid_twice", run=self.run_id, prompt=prompt_name, error=str(last_error)[:300]
         )
         raise InvalidOutputTwice(f"{prompt_name} produced invalid output twice: {last_error}")
+
+    def merge_from_base(
+        self, base_branch: str, *, base_sha: str, bundle: Path | None = None
+    ) -> MergeResult:
+        """Mutate the checkout only in the agent's uncredentialed sandbox."""
+        job_id = new_job_id()
+        params = {"base_branch": base_branch, "base_sha": base_sha}
+        if bundle is not None:
+            destination = f"/tmp/sbxloop-base-{job_id}.bundle"  # nosec B108 - path inside agent VM
+            self.agent.sandbox.cp_in(bundle, destination)
+            params["bundle_path"] = destination
+        job = JobRequest(
+            job_id=job_id,
+            run_id=self.run_id,
+            kind="git.merge",
+            cwd=self.workdir,
+            params=params,
+            timeout_s=self.config.budgets.per_job_timeout_s,
+        )
+        result = self.agent.submit(job)
+        if result.status != "ok":
+            assert result.error is not None
+            raise WorkerError(f"base merge failed ({result.error.type}): {result.error.message}")
+        return TypeAdapter(MergeResult).validate_python(result.output_json)
 
     def shell_batch(
         self, commands: Sequence[str], *, cwd: str | None = None
