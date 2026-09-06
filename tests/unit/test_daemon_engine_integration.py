@@ -30,12 +30,12 @@ def test_an_issue_runs_through_the_real_engine(harness: Harness, tmp_path: Path)
     harness.script([taskgraph(task("t1")), BUILD])
     config = Config.model_validate(
         {
-            "home": str(harness.home),
+            "home": str(harness.home.root),
             "limits": {"disk_warn": 0, "disk_abort": 0, "mem_warn": 0},
         }
     )
-    store = StateStore(harness.paths.state_db)
-    dstore = DaemonStore(harness.paths.state_db)
+    store = StateStore(harness.home.state_db)
+    dstore = DaemonStore(harness.home.state_db)
     source = FakeSource([gh_item("7", title="Add a flag", body="--verbose please")])
 
     loop = DaemonLoop(
