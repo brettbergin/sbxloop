@@ -819,6 +819,10 @@ class LoopEngine:
                         if pair.service is not None
                         else None
                     )
+                    if service_client is not None:
+                        from sbxloop.worker.mcp import McpBroker
+
+                        agent.mcp_prepare = McpBroker(lambda: service_client).prepare
                     service = (
                         self._service_ops(
                             service_client,
@@ -862,7 +866,7 @@ class LoopEngine:
                         # host through the service sandbox.
                         host_tools=service.tool_specs() if service is not None else (),
                         tool_handler=service.handler(phase="build" if kind == "code" else "execute")
-                        if service is not None
+                        if service is not None and service.tool_specs()
                         else None,
                         # The judge's tool digest is read off the bus (#756);
                         # a code run's phases never ask for one.

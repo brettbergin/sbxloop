@@ -81,6 +81,7 @@ class DaemonAgent:
         self.provisioner = Provisioner(sbx, config, bus=bus)
         self._sandbox: Sandbox | None = None
         self._client: WorkerClient | None = None
+        self._mcp_client: WorkerClient | None = None
 
     @property
     def workspace(self) -> Path:
@@ -138,9 +139,56 @@ class DaemonAgent:
         """Forget the handle; the sandbox stays for the next daemon process
         (conversation memory lives inside it)."""
         self._sandbox, self._client = None, None
+        self._close_mcp()
+
+    def _close_mcp(self) -> None:
+        client, self._mcp_client = self._mcp_client, None
+        if client is not None:
+            try:
+                client.sandbox.rm()
+            except SbxError:
+                log.warning("concierge_mcp.remove_failed")
+
+    def _mcp_service(self) -> WorkerClient:
+        if self._mcp_client is None:
+            config = self.config.model_copy(
+                update={
+                    "mcp": [server for server in self.config.mcp if "concierge" in server.roles],
+                    "registries": [],
+                }
+            )
+            provisioner = Provisioner(self.sbx, config, bus=self.bus)
+            credentials = [cred.name for cred in config.mcp_credentials()]
+            clients: list[WorkerClient] = []
+
+            def install(sandbox: Sandbox, _role: str) -> None:
+                client = WorkerClient(
+                    sandbox,
+                    self.bus,
+                    transport=config.worker_transport,
+                    python=self.worker_python,
+                    role="service",
+                    limits=config.limits,
+                    job_env=provisioner.job_env(
+                        "service", sandbox=sandbox, credentials=credentials
+                    ),
+                )
+                if self.install_workers:
+                    client.install(expect_prebaked=bool(config.sandbox.template))
+                clients.append(client)
+
+            provisioner.ensure_service(
+                self.name + "-mcp",
+                self.workspace,
+                credentials,
+                post_create=install,
+            )
+            self._mcp_client = clients[0]
+        return self._mcp_client
 
     def remove(self) -> None:
         """Delete the sandbox (explicit: reprovision, operator cleanup)."""
+        self._close_mcp()
         sandbox, self._sandbox, self._client = self._sandbox, None, None
         if sandbox is None:
             sandbox = Sandbox(self.sbx, self.name)
@@ -159,7 +207,7 @@ class DaemonAgent:
     # -- provisioning ------------------------------------------------------
 
     def _make_client(self, sandbox: Sandbox) -> WorkerClient:
-        return WorkerClient(
+        client = WorkerClient(
             sandbox,
             self.bus,
             transport=self.config.worker_transport,
@@ -173,6 +221,10 @@ class DaemonAgent:
             # instead of a reused box silently losing its credential (#592).
             job_env=self.provisioner.job_env("agent", sandbox=sandbox),
         )
+        from sbxloop.worker.mcp import McpBroker
+
+        client.mcp_prepare = McpBroker(self._mcp_service).prepare
+        return client
 
     def _is_reusable(self, client: WorkerClient) -> bool:
         """Can the existing box be kept, or must it be rebuilt?
