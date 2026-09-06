@@ -8,10 +8,9 @@ tiers and the read-only refusal live in exactly one place."""
 
 from __future__ import annotations
 
-import os
 import shlex
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
@@ -661,54 +660,21 @@ def gc_run_dirs(deps: Deps, days: float) -> Action:
 # -- config, secrets ------------------------------------------------------------------
 
 
-def save_config(deps: Deps, path: Path, text: str, *, key: str | None = None) -> Action:
-    """Write a draft. Saving the whole file is the typed tier — everything
-    in the buffer lands at once. A single ``key`` the operator just typed
-    into the value dialog is its own confirmation, so it goes straight
-    through; the backup and the loader's verdict are the safety net either
-    way."""
+def save_config(deps: Deps, path: Path, text: str, *, key: str) -> Action:
+    """Write the operator config with one ``key`` changed. It goes straight
+    through: the value dialog the operator just filled in *was* the
+    confirmation, and the loader has already accepted the result. The
+    timestamped backup is the way back."""
 
     def run() -> Outcome:
         try:
             backup = save_text(path, text, now=deps.clock())
         except OSError as exc:
             return Outcome(False, f"could not write {path}: {exc}")
-        note = f"saved {path}" + (f"\nprevious kept as {backup.name}" if backup else "")
+        note = f"set {key} in {path}" + (f"\nprevious kept as {backup.name}" if backup else "")
         return Outcome(True, note + "\nthe daemon reads it at its next start: restart to apply")
 
-    if key is not None:
-        return Action(f"set {key} in {path.name}", run, confirm="none")
-    return Action(
-        f"save {path.name}",
-        run,
-        confirm="typed",
-        typed="save",
-        prompt=(
-            f"Write the draft to {path}? The current file is kept beside it as a "
-            "timestamped backup; the daemon keeps its loaded config until restarted. "
-            "Type save to confirm."
-        ),
-    )
-
-
-def editor_argv(env: Mapping[str, str]) -> tuple[str, ...]:
-    """``$VISUAL``, else ``$EDITOR``, else ``vi`` — shell-split, and ``vi``
-    again when the value is blank or unbalanced."""
-    raw = env.get("VISUAL") or env.get("EDITOR") or ""
-    try:
-        words = shlex.split(raw)
-    except ValueError:
-        words = []
-    return tuple(words) or ("vi",)
-
-
-def open_editor(path: Path) -> Action:
-    editor = editor_argv(os.environ)
-    return Action(
-        f"edit {path.name} in {editor[0]}",
-        confirm="none",
-        interactive=(*editor, str(path)),
-    )
+    return Action(f"set {key} in {path.name}", run, confirm="none")
 
 
 def clean_secret_registrations(deps: Deps, *, every: bool = False) -> Action:
@@ -778,11 +744,9 @@ __all__ = [
     "clean_secret_registrations",
     "ctl_action",
     "ctl_outcome",
-    "editor_argv",
     "gc_run_dirs",
     "grant_rounds",
     "merge",
-    "open_editor",
     "pause",
     "prune_sandboxes",
     "remove_one_sandbox",

@@ -306,6 +306,7 @@ def make_app(
     sbx: SbxCLI | None = None,
     read_only: bool = False,
     daemon: dict[str, Any] | None = None,
+    cwd: Path | None = None,
     **tui: Any,
 ) -> SbxloopTui:
     config = Config.model_validate(
@@ -322,7 +323,7 @@ def make_app(
         runner=runner or FakeRunner(),
         sbx_factory=lambda: box,
         read_only=read_only,
-        cwd=state_dir.root,
+        cwd=cwd or state_dir.root,
     )
 
 

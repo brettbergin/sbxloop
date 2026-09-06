@@ -1,12 +1,39 @@
-# Changelog
-
-All notable changes to sbxloop are documented here. The project adheres to
-[Semantic Versioning](https://semver.org/) and both distributions (`sbxloop`,
-`sbxloop-worker`) release in lockstep.
-
 ## [Unreleased]
 
-Nothing yet.
+### Removed
+
+- **The console's file editor.** The Config screen no longer carries a
+  draft buffer, a `$EDITOR` hand-off or a whole-file save (`i`, `V`, `W`,
+  `ctrl+s`, `E`, `L` are gone with it, and so is the Edit tab). Popping a
+  file and leaving the operator to find the line is what per-key editing
+  replaced; a change no key describes is made by editing
+  `~/.sbxloop/config/sbxloop.toml` on the host. Every edit now starts from
+  the file as it is on disk, so there is no buffered draft to go stale and
+  a change made outside the console is never silently overwritten.
+
+### Fixed
+
+- **The console edited a file nothing read.** On a `~/.sbxloop` home
+  install, the Config screen anchored its editor to
+  `<the daemon's directory>/sbxloop.toml` while the Resolved tab resolved
+  its configuration from the directory the console was *started* in. Those
+  are two different roots, and neither is where the operator config lives
+  (`~/.sbxloop/config/sbxloop.toml`, the home layer the loader reads
+  whatever the working directory). So a save landed in a stray
+  `~/.sbxloop/sbxloop.toml`: the resolved row kept the old value however
+  often it was refreshed, editing the key again answered "already says
+  that" (the *draft* had changed and nothing else had), and the daemon —
+  which does read that stray file, as a layer *above* the operator config
+  — would silently pick the change up at its next restart while the
+  console still showed the old value.
+
+  The console now edits the home's `config/sbxloop.toml` and resolves from
+  the home too, so the file it writes is the file it reads and the file the
+  daemon reads. A `sbxloop.toml` sitting in the home is named on the Edit
+  tab as shadowing the operator config, and a per-key edit says when it
+  still wins. **If a console before this wrote to `~/.sbxloop/sbxloop.toml`,
+  move what it says into `~/.sbxloop/config/sbxloop.toml` and delete it** —
+  the daemon is reading it today.
 
 ## [1.5.0] — 2026-09-06
 
