@@ -135,6 +135,13 @@ def sbx_asset_name_matches(name: str, *, system: str, machine: str) -> bool:
         arch_ok = "arm64" in lowered or "aarch64" in lowered
     else:
         arch_ok = arch in lowered
+    if os_ok and not arch_ok and system.lower() == "darwin":
+        # docker/sbx-releases ships one macOS tarball with no architecture in
+        # its name (DockerSandboxes-darwin.tar.gz): the darwin build is
+        # arm64-only, so a name that says darwin and nothing else is it.
+        arch_ok = arch in ("arm64", "aarch64") and not any(
+            marker in lowered for marker in ("amd64", "x86_64")
+        )
     return os_ok and arch_ok
 
 

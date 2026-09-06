@@ -350,6 +350,12 @@ class TestTemplates:
             ("sbx-0.38.0-linux-x86_64.tar.gz", "Linux", "amd64", True),
             ("sbx-0.38.0-linux-arm64.tar.gz", "Linux", "aarch64", True),
             ("sbx-0.38.0-darwin-arm64.tar.gz", "Darwin", "arm64", True),
+            # the real names on docker/sbx-releases (field-verified v0.38.0)
+            ("DockerSandboxes-linux-amd64.tar.gz", "Linux", "x86_64", True),
+            ("DockerSandboxes-darwin.tar.gz", "Darwin", "arm64", True),
+            ("DockerSandboxes-darwin.tar.gz", "Darwin", "x86_64", False),
+            ("DockerSandboxes-darwin.dmg", "Darwin", "arm64", False),
+            ("DockerSandboxes-linux-amd64-ubuntu2404.deb", "Linux", "x86_64", False),
             ("sbx-0.38.0-darwin-arm64.tar.gz", "Linux", "x86_64", False),
             ("sbx-0.38.0-linux-amd64.deb", "Linux", "x86_64", False),
             ("checksums.txt", "Linux", "x86_64", False),
