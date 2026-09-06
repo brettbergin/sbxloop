@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import logging
+from pathlib import Path
 
 import pytest
 
@@ -395,3 +396,49 @@ class TestRedactText:
         once = redact_text(f"API_KEY=abc {self.PAT} Authorization: Bearer {self.JWT}")
         assert redact_text(once) == once
         assert redact_text(None) == "None"  # type: ignore[arg-type]
+
+
+class TestDaemonLogFile:
+    """The daemon's second copy: ``logs/daemon.log`` under the home."""
+
+    def test_records_land_in_the_file_plain_and_rotated(self, tmp_path: Path) -> None:
+        import logging
+
+        from sbxloop.log import configure_logging, get_logger
+
+        path = tmp_path / "logs" / "daemon.log"
+        configure_logging("INFO", file=path, file_max_bytes=400, file_backups=2)
+        try:
+            log = get_logger("sbxloop.test.file")
+            for i in range(40):
+                log.info("daemon.tick", n=i, token="hunter2")
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+            text = path.read_text()
+            assert "daemon.tick" in text and "\x1b[" not in text  # plain, never coloured
+            assert "hunter2" not in text and "***" in text  # redacted like every sink
+            rotated = sorted(p.name for p in path.parent.iterdir())
+            assert "daemon.log" in rotated and "daemon.log.1" in rotated
+            assert "daemon.log.3" not in rotated  # backups capped
+        finally:
+            configure_logging("WARNING")  # drop the file handler
+        assert not any(
+            getattr(h, "baseFilename", "") == str(path) for h in logging.getLogger().handlers
+        )
+
+    def test_json_format_reaches_the_file_too(self, tmp_path: Path) -> None:
+        import json
+        import logging
+
+        from sbxloop.log import configure_logging, get_logger
+
+        path = tmp_path / "daemon.log"
+        configure_logging("INFO", fmt="json", file=path)
+        try:
+            get_logger("sbxloop.test.file").info("daemon.starting", home=str(tmp_path))
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+            (line,) = path.read_text().splitlines()
+            assert json.loads(line)["event"] == "daemon.starting"
+        finally:
+            configure_logging("WARNING")

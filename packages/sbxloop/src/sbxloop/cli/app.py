@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import collections
 import contextlib
 import json
 import math
@@ -2154,7 +2155,12 @@ def daemon(
         # the WARNING-level default from the app callback carries this.
         log.error("daemon.invalid_option", error=exc.errors()[0]["msg"])
         raise typer.Exit(2) from exc
-    configure_logging(config.daemon.log_level, fmt=config.daemon.log_format)
+    # stderr → journald under systemd, and the same records to the home's
+    # logs/daemon.log for a host without a journal, a tail over ssh, or the
+    # console.
+    configure_logging(
+        config.daemon.log_level, fmt=config.daemon.log_format, file=config.paths.daemon_log
+    )
 
     # Work comes from the labelled issues of the configured repositories,
     # or (#760) from workloads asked for in chat — a daemon with a chat
@@ -2739,6 +2745,37 @@ def daemon_ctl(
     console.print(plain(reply.text), markup=False, highlight=False)
     if not reply.ok:
         raise typer.Exit(1)
+
+
+@daemon_app.command("logs")
+def daemon_logs(
+    lines: Annotated[
+        int, typer.Option("--tail", "-n", help="How many of the newest lines to print.")
+    ] = 200,
+    follow: Annotated[
+        bool, typer.Option("--follow", "-f", help="Keep printing as the daemon writes.")
+    ] = False,
+) -> None:
+    """Print the daemon's log file (logs/daemon.log under the home): what
+    `journalctl --user -u sbxloop-daemon` shows, without needing a journal."""
+    path = load_config().paths.daemon_log
+    if not path.is_file():
+        console.print(f"no daemon log at {path} (has the daemon run on this home?)", soft_wrap=True)
+        raise typer.Exit(2)
+    with path.open("r", encoding="utf-8", errors="replace") as f:
+        tail = collections.deque(f, maxlen=lines)
+        for line in tail:
+            sys.stdout.write(line)
+        sys.stdout.flush()
+        if not follow:
+            return
+        while True:
+            chunk = f.readline()
+            if chunk:
+                sys.stdout.write(chunk)
+                sys.stdout.flush()
+            else:
+                time.sleep(0.5)
 
 
 @daemon_app.command("notify")

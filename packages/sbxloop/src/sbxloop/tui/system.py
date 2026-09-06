@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from pathlib import Path
 from typing import get_args
 
 from sbxloop.log import LogLevel
@@ -76,6 +77,27 @@ def unit_argv(verb: str, unit: str) -> tuple[str, ...]:
     return ("systemctl", "--user", verb, unit)
 
 
+def journal_source(
+    unit: UnitState | None,
+    unit_name: str,
+    *,
+    daemon_log: Path,
+    console_log: Path,
+    spawned: bool,
+) -> tuple[str, ...] | None:
+    """What the Daemon screen tails: the unit's journal when systemd has the
+    unit, else the home's ``logs/daemon.log`` when a daemon has written one
+    (any host, any way it was started), else the log of a daemon this
+    console spawned itself, else nothing."""
+    if unit is not None and unit.loaded:
+        return journal_argv(unit_name)
+    if daemon_log.exists():
+        return ("tail", "-n", str(JOURNAL_LINES), "-F", str(daemon_log))
+    if spawned and console_log.exists():
+        return ("tail", "-n", str(JOURNAL_LINES), "-F", str(console_log))
+    return None
+
+
 def journal_argv(unit: str) -> tuple[str, ...]:
     return ("journalctl", "--user", "-u", unit, "-n", str(JOURNAL_LINES), "-f", "-o", "short-iso")
 
@@ -141,6 +163,7 @@ __all__ = [
     "LEVELS",
     "UnitState",
     "journal_argv",
+    "journal_source",
     "level_of",
     "parse_show",
     "passes",

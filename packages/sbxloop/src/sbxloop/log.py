@@ -41,9 +41,11 @@ from __future__ import annotations
 import collections
 import contextlib
 import logging
+import logging.handlers
 import re
 import sys
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal, NamedTuple, TextIO
 
 import structlog
@@ -78,6 +80,9 @@ _HANDLER_MARK = "_sbxloop_log_handler"
 
 #: How many rendered log lines the in-process ring buffer keeps.
 LOG_BUFFER_MAXLEN = 2000
+#: The daemon's log file under the home: rotated by size, this many kept.
+DAEMON_LOG_MAX_BYTES = 20 * 1024 * 1024
+DAEMON_LOG_BACKUPS = 5
 
 
 class LogRecordLine(NamedTuple):
@@ -315,13 +320,27 @@ def _level_no_safe(level: str) -> int:
 
 
 def configure_logging(
-    level: str = "INFO", *, fmt: LogFormat = "console", stream: TextIO | None = None
+    level: str = "INFO",
+    *,
+    fmt: LogFormat = "console",
+    stream: TextIO | None = None,
+    file: Path | None = None,
+    file_max_bytes: int = DAEMON_LOG_MAX_BYTES,
+    file_backups: int = DAEMON_LOG_BACKUPS,
 ) -> None:
     """Configure structlog + the stdlib root logger. Idempotent: calling it
-    again replaces the handler it installed earlier (and nothing else — a
+    again replaces the handlers it installed earlier (and nothing else — a
     test runner's capture handlers stay put) and re-applies the level.
     With no explicit ``stream`` records go to whatever ``sys.stderr`` is at
-    emit time."""
+    emit time.
+
+    ``file`` adds a second copy of every record to that path — the daemon's
+    ``logs/daemon.log`` under the home — rotated by size
+    (``file_max_bytes`` each, ``file_backups`` kept), plain text or JSON as
+    ``fmt`` says, never coloured. stderr keeps flowing to journald under
+    systemd; the file is the copy a host without a journal, a ``tail -f``
+    over ssh, or the console reads.
+    """
     level_no = _level_no(level)
 
     shared: list[Any] = [
@@ -389,6 +408,17 @@ def configure_logging(
     ring_handler.setLevel(level_no)
     setattr(ring_handler, _HANDLER_MARK, True)
 
+    file_handler: logging.Handler | None = None
+    if file is not None:
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.handlers.RotatingFileHandler(
+            file, maxBytes=file_max_bytes, backupCount=file_backups, encoding="utf-8"
+        )
+        # The same plain rendering the ring buffer keeps: greppable, no colour.
+        file_handler.setFormatter(_formatter(buffer_tail))
+        file_handler.setLevel(level_no)
+        setattr(file_handler, _HANDLER_MARK, True)
+
     root = logging.getLogger()
     for existing in list(root.handlers):
         if getattr(existing, _HANDLER_MARK, False):
@@ -396,6 +426,8 @@ def configure_logging(
             existing.close()
     root.addHandler(handler)
     root.addHandler(ring_handler)
+    if file_handler is not None:
+        root.addHandler(file_handler)
     root.setLevel(level_no)
     third_party = logging.INFO if level_no <= logging.DEBUG else logging.WARNING
     for name in THIRD_PARTY_LOGGERS:
@@ -403,6 +435,8 @@ def configure_logging(
 
 
 __all__ = [
+    "DAEMON_LOG_BACKUPS",
+    "DAEMON_LOG_MAX_BYTES",
     "LOG_BUFFER_MAXLEN",
     "REDACTED",
     "THIRD_PARTY_LOGGERS",
