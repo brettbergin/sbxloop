@@ -36,7 +36,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import NamedTuple
 
@@ -260,7 +260,10 @@ def mint_installation_token(
         "github.app_token_minted",
         app_id=creds.app_id,
         installation_id=creds.installation_id,
-        expires_at=datetime.fromtimestamp(expires_at).isoformat(timespec="seconds"),
+        # UTC like every other timestamp in the journal (#753): a naive local
+        # rendering next to UTC log lines reads as a token expired before it
+        # was minted.
+        expires_at=datetime.fromtimestamp(expires_at, tz=UTC).isoformat(timespec="seconds"),
     )
     return InstallationToken(value=value, expires_at=expires_at, permissions=permissions)
 
