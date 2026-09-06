@@ -8,6 +8,7 @@ out of the way and the keys still reach everything.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 
 import pytest
@@ -28,6 +29,21 @@ from sbxloop.tui.widgets.navrail import (
 from tests.unit.tui.conftest import drive, make_app
 
 REFRESH = {"refresh_s": 3.0}
+
+
+async def settle(pilot: object, check: Callable[[], bool], *, limit: float = 6.0) -> None:
+    """Wait for a condition rather than for a fixed number of seconds.
+
+    The suite runs on every core, so a mode switch that takes 200ms alone
+    can take several seconds under load; a `pause(1.0)` is a coin toss
+    there, and this test flaked exactly that way."""
+    waited = 0.0
+    while waited < limit:
+        if check():
+            return
+        await pilot.pause(0.1)  # type: ignore[attr-defined]
+        waited += 0.1
+    assert check(), "condition never held"
 
 
 def test_nav_is_the_single_source_of_the_consoles_shape() -> None:
@@ -63,27 +79,30 @@ def test_the_rail_is_on_every_screen_and_follows_the_mode(
     async def scenario() -> None:
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause(1.0)
+
+            def marked() -> list[str]:
+                rail = app.screen.query_one("#navrail", NavRail)
+                return [b.item.mode for b in rail.query(NavButton) if b.active]
+
+            await settle(pilot, lambda: marked() == ["overview"])
             assert isinstance(app.screen, OverviewScreen)
             rail = app.screen.query_one("#navrail", NavRail)
             assert len(rail.query(NavButton)) == len(NAV)
-            active = [b.item.mode for b in rail.query(NavButton) if b.active]
-            assert active == ["overview"], "the screen you are on is marked"
 
             # A key switches the mode and the new screen's rail follows.
             await pilot.press("2")
-            await pilot.pause(1.0)
+            await settle(pilot, lambda: marked() == ["runs"])
             assert isinstance(app.screen, RunsScreen)
-            rail = app.screen.query_one("#navrail", NavRail)
-            assert [b.item.mode for b in rail.query(NavButton) if b.active] == ["runs"]
 
             # Clicking a rail row is the same verb as its key.
-            button = next(b for b in rail.query(NavButton) if b.item.mode == "config")
+            button = next(
+                b
+                for b in app.screen.query_one("#navrail", NavRail).query(NavButton)
+                if b.item.mode == "config"
+            )
             button.post_message(NavButton.Selected("config"))
-            await pilot.pause(1.0)
+            await settle(pilot, lambda: marked() == ["config"])
             assert app.current_mode == "config"
-            rail = app.screen.query_one("#navrail", NavRail)
-            assert [b.item.mode for b in rail.query(NavButton) if b.active] == ["config"]
 
     drive(scenario)
 
@@ -141,11 +160,14 @@ def test_every_rail_row_reaches_its_screen(seeded: SbxloopHome, key: str, mode: 
     async def scenario() -> None:
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause(1.0)
+            await pilot.pause(0.5)
             await pilot.press(key)
-            await pilot.pause(1.0)
+
+            def marked() -> list[str]:
+                rail = app.screen.query_one("#navrail", NavRail)
+                return [b.item.mode for b in rail.query(NavButton) if b.active]
+
+            await settle(pilot, lambda: marked() == [mode])
             assert app.current_mode == mode
-            rail = app.screen.query_one("#navrail", NavRail)
-            assert [b.item.mode for b in rail.query(NavButton) if b.active] == [mode]
 
     drive(scenario)

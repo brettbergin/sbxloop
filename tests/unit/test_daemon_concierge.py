@@ -1891,7 +1891,10 @@ class TestDaemonLogTool:
 
         configure_logging("DEBUG", fmt="console", stream=io.StringIO())
         yield
-        configure_logging("INFO")
+        # Back to the session default from tests/conftest.py, not to INFO:
+        # this handler is the process-wide ring buffer's, and leaving it
+        # above DEBUG silently drops later tests' records.
+        configure_logging("DEBUG")
 
     def _emit(self) -> None:
         from sbxloop.log import get_logger
