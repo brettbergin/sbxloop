@@ -135,6 +135,7 @@ from typing import Literal
 
 from git import GitCommandError, InvalidGitRepositoryError, NoSuchPathError, Repo
 
+from sbxloop import gitcredentials
 from sbxloop.errors import DeliveryError, ProvisionError
 from sbxloop.log import get_logger
 from sbxloop.safegit import read_repo
@@ -460,7 +461,7 @@ def clone_from_remote(
     ``ProvisionError`` on any failure; a half-created target is removed so a
     retry starts clean. Never falls back to another tree.
     """
-    env = _clone_env(token)
+    env = _clone_env(token, credential_url=repo_url)
     options = list(CLONE_OPTIONS)
     if existing:
         options.append(f"--branch={branch}")
@@ -485,10 +486,7 @@ def clone_from_remote(
 
 # The environment variable the one-shot credential helper reads the run's
 # token from. It exists only in the clone's process environment.
-CLONE_TOKEN_ENV = "SBXLOOP_GIT_TOKEN"  # nosec B105 - env var name, not a secret
-_CLONE_CREDENTIAL_HELPER = (
-    '!f() { echo username=x-access-token; echo "password=$' + CLONE_TOKEN_ENV + '"; }; f'
-)
+CLONE_TOKEN_ENV = gitcredentials.TOKEN_ENV
 
 
 # Git LFS objects are never fetched by a clone's checkout (#693): the host
@@ -510,7 +508,7 @@ def clone_workspace(
     ``ProvisionError`` on failure with the half-made target removed.
     Returns the head sha.
     """
-    env = _clone_env(token)
+    env = _clone_env(token, credential_url=repo_url)
     options = list(CLONE_OPTIONS)
     target.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -528,21 +526,27 @@ def _local_clone_env() -> dict[str, str]:
     return dict(_SKIP_LFS_SMUDGE)
 
 
-def _clone_env(token: str | None) -> dict[str, str]:
+def _clone_env(token: str | None, *, credential_url: str = "https://github.com") -> dict[str, str]:
     """The environment a remote clone runs under.
 
     Prompting is off in every form so a missing or rejected credential
-    fails the clone instead of hanging. With ``token`` git additionally
+    fails the clone instead of hanging. Git always clears inherited
+    credential helpers. With ``token`` git additionally
     gets two config entries through ``GIT_CONFIG_*`` — an empty
     ``credential.helper`` that clears whatever helpers the host user has
     (a keychain must not answer for the run), then the one-shot helper
-    that answers with the token from :data:`CLONE_TOKEN_ENV`. Neither the
+    that answers with the token from :data:`CLONE_TOKEN_ENV`, only for
+    ``credential_url``'s exact HTTPS authority. The scope is supplied by
+    host configuration, never a submodule URL. Neither the
     helper nor the token touches argv, ``.git/config`` or the URL.
     """
     env = {
         "GIT_TERMINAL_PROMPT": "0",
         "GIT_ASKPASS": "",
         "GCM_INTERACTIVE": "never",
+        "GIT_CONFIG_COUNT": "1",
+        "GIT_CONFIG_KEY_0": "credential.helper",
+        "GIT_CONFIG_VALUE_0": "",
         **_SKIP_LFS_SMUDGE,
     }
     if token:
@@ -552,7 +556,8 @@ def _clone_env(token: str | None) -> dict[str, str]:
                 "GIT_CONFIG_KEY_0": "credential.helper",
                 "GIT_CONFIG_VALUE_0": "",
                 "GIT_CONFIG_KEY_1": "credential.helper",
-                "GIT_CONFIG_VALUE_1": _CLONE_CREDENTIAL_HELPER,
+                "GIT_CONFIG_VALUE_1": gitcredentials.HELPER,
+                gitcredentials.AUTHORITY_ENV: gitcredentials.authority(credential_url),
                 CLONE_TOKEN_ENV: token,
             }
         )
@@ -681,7 +686,11 @@ def list_submodules(repo_path: Path) -> list[Submodule]:
 
 
 def populate_submodules(
-    clone: Path, *, source: Path | None, token: str | None
+    clone: Path,
+    *,
+    source: Path | None,
+    token: str | None,
+    credential_url: str = "https://github.com",
 ) -> list[tuple[str, str]]:
     """Check out every submodule of a freshly cut run ``clone`` (#692),
     nested ones included; returns ``(path, how)`` per submodule populated,
@@ -734,18 +743,22 @@ def populate_submodules(
                 how = "local"
         if how == "remote":
             try:
-                _submodule_update(clone, sub, token=token)
+                _submodule_update(clone, sub, token=token, credential_url=credential_url)
             except GitCommandError as exc:
                 raise ProvisionError(
                     f"populating submodule {sub.path} of {clone} from "
                     f"{public_remote_url(sub.url)} failed: {_describe(exc)}. The run's "
-                    "GitHub credential must be able to read that repository too; "
+                    "GitHub credential is restricted to the configured HTTPS host and "
+                    "must be able to read that repository too; "
                     "set [sandbox] clone_submodules = false to run without submodules"
                 ) from exc
         populated.append((sub.path, how))
         # A submodule's own submodules: same routes, one level down.
         nested = populate_submodules(
-            clone / sub.path, source=local if how == "local" else None, token=token
+            clone / sub.path,
+            source=local if how == "local" else None,
+            token=token,
+            credential_url=credential_url,
         )
         populated.extend((f"{sub.path}/{path}", nested_how) for path, nested_how in nested)
     return populated
@@ -757,7 +770,12 @@ def _is_gitlink_in_index(clone: Path, path: str) -> bool:
 
 
 def _submodule_update(
-    clone: Path, sub: Submodule, *, local_source: Path | None = None, token: str | None = None
+    clone: Path,
+    sub: Submodule,
+    *,
+    local_source: Path | None = None,
+    token: str | None = None,
+    credential_url: str = "https://github.com",
 ) -> None:
     """``git submodule update --init`` for one submodule. With
     ``local_source`` the clone reads that path instead of the ``.gitmodules``
@@ -780,7 +798,13 @@ def _submodule_update(
             repo.git.submodule("init", "--", sub.path)
             repo.git.submodule("sync", "--", sub.path)
         else:
-            repo.git.submodule("update", "--init", "--", sub.path, env=_clone_env(token))
+            repo.git.submodule(
+                "update",
+                "--init",
+                "--",
+                sub.path,
+                env=_clone_env(token, credential_url=credential_url),
+            )
 
 
 def _discard_half_populated(clone: Path, path: str) -> None:
@@ -939,7 +963,9 @@ def populate_lfs(
                 "[sandbox] clone_lfs = false to run on the pointer files"
             )
         try:
-            repo.git(c=[f"lfs.url={lfs_url}"]).lfs("pull", env=_clone_env(token))
+            repo.git(c=[f"lfs.url={lfs_url}"]).lfs(
+                "pull", env=_clone_env(token, credential_url=lfs_url)
+            )
         except GitCommandError as exc:
             raise ProvisionError(
                 f"fetching {len(pointers)} Git LFS object(s) for {clone} from {lfs_url} "
@@ -1038,7 +1064,13 @@ class TagFetch:
     source: str
 
 
-def fetch_tags(clone: Path, *, source: Path | None, token: str | None) -> TagFetch:
+def fetch_tags(
+    clone: Path,
+    *,
+    source: Path | None,
+    token: str | None,
+    credential_url: str = "https://github.com",
+) -> TagFetch:
     """Give a ``--no-tags`` run ``clone`` the repository's tags (#694).
 
     Local first: when ``source`` — the host checkout the clone was cut
@@ -1060,7 +1092,7 @@ def fetch_tags(clone: Path, *, source: Path | None, token: str | None) -> TagFet
             if source is not None and tag_count(source):
                 repo.git.fetch("--tags", str(source), env=_local_clone_env())
                 return TagFetch(tag_count(clone), "local")
-            repo.git.fetch("--tags", "origin", env=_clone_env(token))
+            repo.git.fetch("--tags", "origin", env=_clone_env(token, credential_url=credential_url))
             return TagFetch(tag_count(clone), "remote")
     except (GitCommandError, InvalidGitRepositoryError, NoSuchPathError, OSError) as exc:
         raise ProvisionError(
@@ -1558,7 +1590,7 @@ def base_bundle(
                 "--no-recurse-submodules",
                 repo_url,
                 f"+refs/heads/{base_branch}:{ref}",
-                env=_clone_env(token),
+                env=_clone_env(token, credential_url=repo_url),
             )
             sha = str(repo.git.rev_parse("--verify", ref)).strip()
             exclusions = [f"^{oid}" for oid in sorted(set(known))]

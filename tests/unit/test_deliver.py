@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -618,6 +619,7 @@ def git(*argv: str, cwd: Path) -> str:
             "GIT_COMMITTER_EMAIL": "t@example.com",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_SSL_CAINFO": os.environ.get("GIT_SSL_CAINFO", ""),
         },
     ).stdout.strip()
 

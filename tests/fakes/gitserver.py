@@ -18,6 +18,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import ssl
 import subprocess  # nosec B404 - drives git http-backend in tests
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -36,11 +37,14 @@ class PrivateGitServer:
     where what is under test is the fetch, not the credential.
     """
 
-    def __init__(self, root: Path, *, username: str, token: str, public: bool = False) -> None:
+    def __init__(
+        self, root: Path, *, username: str, token: str, public: bool = False, tls: bool = True
+    ) -> None:
         self.root = root
         self.username = username
         self.token = token
         self.public = public
+        self.tls = tls
         self.requests: list[str | None] = []
         # LFS objects by oid, served to any repository path on this host
         self.lfs_objects: dict[str, bytes] = {}
@@ -72,11 +76,16 @@ class PrivateGitServer:
             do_POST = _serve
 
         self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        if tls:
+            cert = Path(os.environ["GIT_SSL_CAINFO"])
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+            context.load_cert_chain(cert, cert.with_suffix(".key"))
+            self._server.socket = context.wrap_socket(self._server.socket, server_side=True)
         self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
 
     @property
     def url(self) -> str:
-        return f"http://127.0.0.1:{self._server.server_address[1]}"
+        return f"{'https' if self.tls else 'http'}://127.0.0.1:{self._server.server_address[1]}"
 
     def __enter__(self) -> PrivateGitServer:
         self._thread.start()

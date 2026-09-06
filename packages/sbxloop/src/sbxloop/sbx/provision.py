@@ -1126,7 +1126,10 @@ class Provisioner:
             return
         source_tags = source is not None and hostgit.tag_count(source) > 0
         fetched = hostgit.fetch_tags(
-            clone_dir, source=source, token=None if source_tags else token()
+            clone_dir,
+            source=source,
+            token=None if source_tags else token(),
+            credential_url=self.config.github.web_url,
         )
         evidence = [f"{m.path}: {m.marker}" for m in markers]
         self.bus.emit(
@@ -1221,7 +1224,9 @@ class Provisioner:
                 reason="[sandbox] clone_submodules = false",
             )
             return
-        populated = hostgit.populate_submodules(clone_dir, source=source, token=token())
+        populated = hostgit.populate_submodules(
+            clone_dir, source=source, token=token(), credential_url=self.config.github.web_url
+        )
         if not populated:
             return
         self.bus.emit(
