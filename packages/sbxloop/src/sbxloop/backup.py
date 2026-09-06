@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import sqlite3
 import time
@@ -100,8 +101,8 @@ def create_backup(
     ``extra`` names additional files to carry (``{"legacy/secrets.env":
     path}``) — what ``init --migrate`` uses to keep the pre-home files.
     """
-    if label and not label.replace("-", "").replace("_", "").isalnum():
-        raise BackupError(f"label {label!r}: letters, digits, - and _ only")
+    if label and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", label):
+        raise BackupError(f"label {label!r}: letters, digits, dots, - and _ only")
     name = stamp(clock) + (f"-{label}" if label else "")
     target = home.backups / name
     if target.exists():
