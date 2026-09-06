@@ -294,9 +294,9 @@ def make_bridge(
     tmp_path: Path, *, channel_id: int = 42, concierge: Any = None, **discord: Any
 ) -> tuple[DiscordBridge, FakeClient, FakeLoop]:
     config = Config.model_validate(
-        {"state_dir": str(tmp_path / "state"), "discord": {"channel_id": channel_id, **discord}}
+        {"home": str(tmp_path / "state"), "discord": {"channel_id": channel_id, **discord}}
     )
-    dstore = DaemonStore(config.state_dir / "state.db")
+    dstore = DaemonStore(config.paths.state_db)
     client = FakeClient(channel_id)
     floop = FakeLoop(dstore)
 
@@ -379,11 +379,11 @@ def wait_for(pred: Any, timeout: float = 5.0) -> bool:
 class TestBridge:
     def test_missing_token_is_a_daemon_error(self, tmp_path: Path) -> None:
         config = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "discord": {"channel_id": 1}}
+            {"home": str(tmp_path / "state"), "discord": {"channel_id": 1}}
         )
         bridge = DiscordBridge(
             config,
-            DaemonStore(config.state_dir / "state.db"),
+            DaemonStore(config.paths.state_db),
             client_factory=lambda b: None,
             token="",
         )
@@ -1361,7 +1361,7 @@ class TestRunWatches:
             [{"calls": [("watch_run", {"run_id_or_item_id": "r1"})]}],
             on_watch=bridge.on_watch,
         )
-        store = StateStore(tmp_path / "state" / "state.db")
+        store = StateStore(tmp_path / "state" / "state" / "state.db")
         store.create_run("r1", "Ship it")
         store.set_run_state("r1", "building")
         turn(concierge, author=author)

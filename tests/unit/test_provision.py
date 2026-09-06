@@ -11,6 +11,7 @@ import pytest
 from sbxloop.config import Config
 from sbxloop.errors import ProvisionError
 from sbxloop.events import Event, EventBus
+from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner, sandbox_name
 from sbxloop.sbx.sandbox import WORK_DIR
@@ -40,9 +41,7 @@ def make_provisioner(
     config: Config | None = None,
     bus: EventBus | None = None,
 ) -> Provisioner:
-    config = config or Config.model_validate(
-        {"state_dir": str(tmp_path / "state"), **GITHUB_ENABLED}
-    )
+    config = config or Config.model_validate({"home": str(tmp_path / "state"), **GITHUB_ENABLED})
     return Provisioner(
         SbxCLI(binary=str(fake_sbx.binary)),
         config,
@@ -174,7 +173,7 @@ class TestGithubGating:
     """Without [github].repo there is no github sandbox and no GH_TOKEN need."""
 
     def unconfigured(self, fake_sbx: FakeSbx, tmp_path: Path, **kwargs: object) -> Provisioner:
-        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        config = Config.model_validate({"home": str(tmp_path / "state")})
         assert not config.github.enabled
         return make_provisioner(fake_sbx, tmp_path, config=config, **kwargs)  # type: ignore[arg-type]
 
@@ -323,7 +322,7 @@ class TestEnsurePair:
 
     def test_plain_env_strategy_writes_env_file(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         config = Config.model_validate(
-            {"secret_strategy": "plain-env", "state_dir": str(tmp_path / "state"), **GITHUB_ENABLED}
+            {"secret_strategy": "plain-env", "home": str(tmp_path / "state"), **GITHUB_ENABLED}
         )
         provisioner = make_provisioner(fake_sbx, tmp_path, config=config)
         pair = provisioner.ensure_pair("r1")
@@ -347,9 +346,7 @@ class TestEnsurePair:
             pair.cleanup()
 
     def test_keep_sandboxes_from_config(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
-        config = Config.model_validate(
-            {"keep_sandboxes": True, "state_dir": str(tmp_path / "state")}
-        )
+        config = Config.model_validate({"keep_sandboxes": True, "home": str(tmp_path / "state")})
         provisioner = make_provisioner(fake_sbx, tmp_path, config=config)
         pair = provisioner.ensure_pair("r1")
         assert pair.keep is True
@@ -428,7 +425,7 @@ class TestEnsurePair:
         # r1's agent probe cached "invisible-under-exec"; clear it so r2
         # takes the registration path whose no-recovery property this
         # asserts (the cached path is covered by TestCachedProxyVerdictSkip).
-        shutil.rmtree(tmp_path / "state" / "conformance")
+        shutil.rmtree(SbxloopHome(tmp_path / "state").conformance)
         rm_calls_before = len(fake_sbx.invocations("secret rm"))
         pair = provisioner.ensure_pair("r2")
         assert len(fake_sbx.invocations("secret rm")) == rm_calls_before
@@ -455,7 +452,7 @@ def make_isolation_provisioner(
     if workspace is not None:
         sandbox["workspace"] = str(workspace)
     config = Config.model_validate(
-        {"state_dir": str(tmp_path / "state"), "sandbox": sandbox, **GITHUB_ENABLED}
+        {"home": str(tmp_path / "state"), "sandbox": sandbox, **GITHUB_ENABLED}
     )
     bus = EventBus()
     events: list[Event] = []
@@ -623,17 +620,14 @@ class TestWorkspaceIsolation:
     def test_stray_state_dirs_do_not_trip_the_dirty_refusal(
         self, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
-        """Running any sbxloop command from inside the checkout drops a
-        relative .sbxloop there; the tool's own state (under the default
-        name or this run's configured state-dir name) must be invisible to
-        isolation (field failure r5a1d9m9c)."""
+        """A ``.sbxloop`` inside the checkout — the agent's scratch, or a
+        leftover of the former relative state dir — is the tool's own and
+        must be invisible to isolation (field failure r5a1d9m9c)."""
         from tests.unit.test_hostgit import make_repo
 
         source = make_repo(tmp_path)
         (source / ".sbxloop").mkdir()
         (source / ".sbxloop" / "state.db").write_text("db\n")
-        (source / "state").mkdir()  # this run's state_dir is named "state"
-        (source / "state" / "junk").write_text("x\n")
         provisioner, events = make_isolation_provisioner(fake_sbx, tmp_path, source)
         pair = provisioner.ensure_pair("r1")
         try:
@@ -832,7 +826,7 @@ class TestSecretIdempotency:
         provisioner.ensure_pair("r1").cleanup()
         # r1's probe cached "invisible-under-exec"; clear it so r2 takes the
         # registration path whose collision recovery this test exercises.
-        shutil.rmtree(tmp_path / "state" / "conformance")
+        shutil.rmtree(SbxloopHome(tmp_path / "state").conformance)
         pair = provisioner.ensure_pair("r2")  # must not raise
         try:
             state = self.secret_state(fake_sbx)
@@ -862,7 +856,7 @@ class TestSecretIdempotency:
         # resume straight to the env file (see TestCachedProxyVerdictSkip's
         # rotation test); clear it so this test keeps exercising the
         # registration-collision replacement an unknown sbx version takes.
-        shutil.rmtree(tmp_path / "state" / "conformance")
+        shutil.rmtree(SbxloopHome(tmp_path / "state").conformance)
         rotated = dict(TOKENS, GH_TOKEN="github_pat_rotated")
         provisioner2 = make_provisioner(fake_sbx, tmp_path, env=rotated)
         pair = provisioner2.ensure_pair("r1")
@@ -884,7 +878,7 @@ class TestSecretIdempotency:
         first.cleanup()
         # r1's probe cached "invisible-under-exec"; clear it so r2 takes the
         # registration path this test exists to exercise.
-        shutil.rmtree(tmp_path / "state" / "conformance")
+        shutil.rmtree(SbxloopHome(tmp_path / "state").conformance)
         import logging
 
         with caplog.at_level(logging.WARNING):
@@ -1044,7 +1038,7 @@ class TestSecretEnvVerification:
             assert not [e for e in events if e.type == "sandbox.secret_probe_error"]
             from sbxloop.sbx.conformance import PROBE_SECRET_ENV_VISIBILITY, load_verdicts
 
-            cached = load_verdicts(tmp_path / "state", "0.38.0")
+            cached = load_verdicts(SbxloopHome(tmp_path / "state"), "0.38.0")
             assert cached[PROBE_SECRET_ENV_VISIBILITY].verdict == "sentinel-under-exec"
         finally:
             pair.cleanup()
@@ -1065,7 +1059,7 @@ class TestSecretEnvVerification:
             assert not [e for e in events if e.type == "sandbox.secret_env_fallback"]
             from sbxloop.sbx.conformance import PROBE_SECRET_ENV_VISIBILITY, load_verdicts
 
-            cached = load_verdicts(tmp_path / "state", "0.38.0")
+            cached = load_verdicts(SbxloopHome(tmp_path / "state"), "0.38.0")
             assert cached[PROBE_SECRET_ENV_VISIBILITY].verdict == "visible-under-exec"
         finally:
             pair.cleanup()
@@ -1088,7 +1082,7 @@ class TestSecretEnvVerification:
         monkeypatch.delenv("COPILOT_GITHUB_TOKEN", raising=False)
         monkeypatch.delenv("GH_TOKEN", raising=False)
         config = Config.model_validate(
-            {"secret_strategy": "plain-env", "state_dir": str(tmp_path / "state"), **GITHUB_ENABLED}
+            {"secret_strategy": "plain-env", "home": str(tmp_path / "state"), **GITHUB_ENABLED}
         )
         bus = EventBus()
         events: list[Event] = []
@@ -1169,7 +1163,9 @@ class TestMountDiscovery:
             assert [e.data["probe"] for e in mount_events] == ["error"]
             # and the infra failure did not clobber the conformance cache
             # with a bogus "not-found" verdict
-            assert PROBE_WORKSPACE_MOUNT not in load_verdicts(tmp_path / "state", "0.38.0")
+            assert PROBE_WORKSPACE_MOUNT not in load_verdicts(
+                SbxloopHome(tmp_path / "state"), "0.38.0"
+            )
         finally:
             pair.cleanup()
 
@@ -1303,7 +1299,7 @@ class TestConformanceRecording:
         provisioner = make_provisioner(fake_sbx, tmp_path)
         pair = provisioner.ensure_pair("r1")
         try:
-            cached = load_verdicts(tmp_path / "state", "0.38.0")
+            cached = load_verdicts(SbxloopHome(tmp_path / "state"), "0.38.0")
             assert cached[PROBE_SECRET_ENV_VISIBILITY].verdict == "invisible-under-exec"
             assert cached[PROBE_SECRET_ENV_VISIBILITY].source == "provision"
             assert cached[PROBE_WORKSPACE_MOUNT].verdict == "discoverable"
@@ -1422,7 +1418,7 @@ class TestGithubAppAuth:
 
         config = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {"repos": [{"repo": "owner/repo", "token_env": "GH_TOKEN_TWO"}]},
             }
         )
@@ -1480,7 +1476,9 @@ class TestCachedProxyVerdictSkip:
     def seed_broken_verdict(self, tmp_path: Path, verdict: str = "invisible-under-exec") -> None:
         from sbxloop.sbx.conformance import PROBE_SECRET_ENV_VISIBILITY, record_field_verdict
 
-        record_field_verdict(tmp_path / "state", "0.38.0", PROBE_SECRET_ENV_VISIBILITY, verdict)
+        record_field_verdict(
+            SbxloopHome(tmp_path / "state"), "0.38.0", PROBE_SECRET_ENV_VISIBILITY, verdict
+        )
 
     def test_cached_broken_verdict_skips_registration_and_probe(
         self, fake_sbx: FakeSbx, tmp_path: Path
@@ -1709,7 +1707,7 @@ class TestMimicSentinels:
         try:
             fallback = [e for e in events if e.type == "sandbox.secret_env_fallback"]
             assert fallback, "mimic sentinel must trigger the env-file fallback"
-            cached = load_verdicts(tmp_path / "state", "0.38.0")
+            cached = load_verdicts(SbxloopHome(tmp_path / "state"), "0.38.0")
             assert cached[PROBE_SECRET_ENV_VISIBILITY].verdict == "sentinel-under-exec"
         finally:
             pair.cleanup()
@@ -1770,7 +1768,7 @@ class TestBotLoginResolution:
     def test_a_per_repo_token_env_stays_a_pat(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         config = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {"repos": [{"repo": "owner/repo", "token_env": "GH_TOKEN_TWO"}]},
             }
         )
@@ -1879,7 +1877,7 @@ class TestStdinEnvDelivery:
         # the verdict is cached for this sbx version
         from sbxloop.sbx.conformance import PROBE_EXEC_STDIN_ENV, load_verdicts
 
-        record = load_verdicts(tmp_path / "state", "0.38.0").get(PROBE_EXEC_STDIN_ENV)
+        record = load_verdicts(SbxloopHome(tmp_path / "state"), "0.38.0").get(PROBE_EXEC_STDIN_ENV)
         assert record is not None and record.verdict == "delivers"
 
     def test_fallback_writes_env_file_when_probe_fails(
@@ -1951,7 +1949,7 @@ class TestClaudeAgentBackend:
 
     def _provisioner(self, fake_sbx: FakeSbx, tmp_path: Path, **kwargs: object) -> Provisioner:
         config = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "agent": {"backend": "claude"}, **GITHUB_ENABLED}
+            {"home": str(tmp_path / "state"), "agent": {"backend": "claude"}, **GITHUB_ENABLED}
         )
         kwargs.setdefault("env", self.CLAUDE_ENV)
         return make_provisioner(fake_sbx, tmp_path, config=config, **kwargs)  # type: ignore[arg-type]
@@ -1984,7 +1982,7 @@ class TestClaudeAgentBackend:
 
     def test_invalid_backend_fails_config_loading(self, tmp_path: Path) -> None:
         with pytest.raises(ValueError, match="backend"):
-            Config.model_validate({"state_dir": str(tmp_path), "agent": {"backend": "gemini"}})
+            Config.model_validate({"home": str(tmp_path), "agent": {"backend": "gemini"}})
 
     def test_the_allowlist_never_repeats_a_host(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         """`sbx policy allow` fails the whole call on a repeat, so a repeat
@@ -2010,7 +2008,7 @@ class TestClaudeAgentBackend:
         fail provisioning."""
         config = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "agent": {"backend": "claude"},
                 "sandbox": {
                     "languages": ["dotnet", "python"],
@@ -2062,7 +2060,7 @@ class TestOperatorSandboxEnv:
         entry: dict[str, object] = {"repo": "owner/repo", **repo_overrides}
         return Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "sandbox": {"env": {"RAILS_ENV": "test", "GREETING": "hello world"}},
                 "github": {"repos": [entry]},
             }
@@ -2139,7 +2137,7 @@ class TestOperatorSandboxEnv:
     ) -> None:
         config = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "agent": {"backend": "claude"},
                 "sandbox": {"env": {"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "0"}},
                 **GITHUB_ENABLED,
@@ -2182,7 +2180,7 @@ class TestPrivateRegistries:
     def _config(self, tmp_path: Path, **overrides: object) -> Config:
         return Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "sandbox": {"extra_allow_domains": ["mirror.example.com"]},
                 "registries": self.REGISTRIES,
                 "github": {"repos": [{"repo": "owner/repo"}]},

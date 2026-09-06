@@ -204,7 +204,7 @@ def test_composite_routes_schedule_ticks_to_the_schedule_source() -> None:
 def config_with(tmp_path: Path, *schedules: dict[str, Any], **daemon: Any) -> Config:
     return Config.model_validate(
         {
-            "state_dir": str(tmp_path / "state"),
+            "home": str(tmp_path / "state"),
             "github": {"repo": "o/r"},
             "daemon": daemon,
             "workloads": [{"name": "brief"}],

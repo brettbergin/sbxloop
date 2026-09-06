@@ -1,6 +1,11 @@
 # sbxloop configuration. Every key is optional; these are the defaults.
-# Precedence: SBXLOOP_* env vars > this file > pyproject [tool.sbxloop]
-# > ~/.config/sbxloop/sbxloop.toml (user-level defaults).
+# Precedence: SBXLOOP_* env vars > ./sbxloop.toml > pyproject [tool.sbxloop]
+# > ~/.sbxloop/config/sbxloop.toml (the host config `sbxloop init` writes).
+#
+# Where things land on disk is not a setting: runs, state, workspaces, logs
+# and this file all live under the sbxloop home, ~/.sbxloop, and the
+# SBXLOOP_HOME environment variable moves the whole home. A `state_dir` key
+# from an older file is rejected by name.
 #
 # This file is the single source of truth for `sbxloop init`: the command
 # writes this exact template. Copy it next to your project and edit:
@@ -19,8 +24,8 @@
 # checked ([sandbox] languages / gate_command), how branches and PRs are
 # named ([github] branch_prefix / *_template) and [artifacts] exclude; every
 # other key in a tracked file is ignored with a warning. Operator settings
-# ([policy], [landing], [daemon], [budgets], state_dir, the repository) come
-# from an untracked copy, ~/.config/sbxloop/sbxloop.toml or the environment.
+# ([policy], [landing], [daemon], [budgets], the repository) come from an
+# untracked copy, ~/.sbxloop/config/sbxloop.toml or the environment.
 
 # Model for agent sessions, whichever [agent] backend runs them ("auto"
 # lets the chosen SDK pick its default).
@@ -30,10 +35,6 @@ model = "auto"
 # If set, that isolated state needs its own `sbx --app-name <name> login`
 # and `sbx --app-name <name> policy init balanced`.
 app_name = ""
-# Where run state (SQLite) and per-run workspaces live. Per-user by default
-# so status/logs see the same runs from any directory; a relative path
-# (e.g. ".sbxloop") scopes state to this project instead.
-state_dir = "~/.sbxloop"
 # Keep sandboxes around after a run (for debugging).
 keep_sandboxes = false
 # Keep the pair alive only when a run fails; inspect with `sbxloop shell <run>`.
@@ -64,7 +65,7 @@ secret_strategy = "proxy"
 # per-run install out of provisioning.
 # template = "sbxloop-baked:latest"
 # Where runs execute. Unset (the default) gives every run a fresh directory
-# under state_dir. Point it at an existing project to work on that code.
+# under ~/.sbxloop/runs. Point it at an existing project to work on that code.
 # workspace = "/path/to/checkout"
 # When `workspace` is a git checkout: "auto" (default) isolates each run in
 # a per-run clone on branch sbxloop/<run_id> — the checkout and its branches
@@ -549,7 +550,7 @@ secret_strategy = "proxy"
 # max_consecutive_failures = 3     # circuit breaker ...
 # breaker_cooldown_s = 3600.0      # ... and how long it stays open
 # shutdown_grace_s = 60.0          # keep below systemd TimeoutStopSec
-# Retention for .sbxloop/runs/<run>/ (workspace clones, harvested artifacts):
+# Retention for ~/.sbxloop/runs/<run>/ (workspace clones, harvested artifacts):
 # swept on daemon start and daily; `sbxloop gc` for non-daemon use. 0 disables.
 # prune_runs_after_days = 14
 # A non-terminal run idle this long while nothing is executing is reconciled
@@ -573,12 +574,6 @@ secret_strategy = "proxy"
 # dirty tree proceeds from HEAD with a warning instead of `auto`'s refusal.
 # workspace_isolation = "clone"    # clone | auto | in-place, for daemon runs
 # refresh_workspace = true
-# Daemon state lives OUTSIDE the workspace, at an absolute path. Unset:
-# $XDG_STATE_HOME/sbxloop/<runner-dir-name> (~/.local/state/...), unless the
-# top-level state_dir is set or a legacy ./.sbxloop/state.db already exists.
-# `sbxloop daemon items|abandon|retry|requeue` follow the same rule;
-# `sbxloop status`/`logs`/`gc` need SBXLOOP_STATE_DIR pointed there.
-# state_dir = "~/.local/state/sbxloop/my-project"
 
 # [chat]
 # Which service carries the daemon's human channel — the run headline cards,

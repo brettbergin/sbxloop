@@ -12,6 +12,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from sbxloop.paths import SbxloopHome
+
 # What a run is for (#755). `code` is the developer loop: a task graph that
 # ends in a pull request. `workload` runs the operator persona through the
 # same run shape — sandboxes, store, events, thread — but its stages are
@@ -717,7 +719,7 @@ def artifact_files(root: Path, exclude: Sequence[str] = DEFAULT_ARTIFACT_EXCLUDE
     return scan_artifacts(root, exclude).files
 
 
-def artifacts_dir(run: RunRecord | RunResult, state_dir: Path) -> Path | None:
+def artifacts_dir(run: RunRecord | RunResult, home: SbxloopHome) -> Path | None:
     """The single host directory holding a run's artifacts.
 
     Mounted runs write straight into the workspace; unmounted runs are
@@ -733,7 +735,7 @@ def artifacts_dir(run: RunRecord | RunResult, state_dir: Path) -> Path | None:
     if run.workspace is None:
         return None
     if run.kind == "workload":
-        return state_dir / "runs" / run.run_id / "artifacts"
+        return home.run_artifacts(run.run_id)
     if run.mounted:
         return run.workspace
-    return state_dir / "runs" / run.run_id / "artifacts"
+    return home.run_artifacts(run.run_id)

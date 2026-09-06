@@ -39,7 +39,7 @@ from tests.unit.test_daemon_loop import Harness, gh_item
 def _fresh_daemon(h: Harness) -> Harness:
     """What a new daemon *process* sees: fresh stores and loop over the same
     state dir, as if the previous process had been killed outright."""
-    return Harness(h.tmp_path, Config.model_validate({"state_dir": str(h.config.state_dir)}))
+    return Harness(h.tmp_path, Config.model_validate({"home": str(h.config.home)}))
 
 
 def _active_runs(loop: DaemonLoop) -> set[str]:

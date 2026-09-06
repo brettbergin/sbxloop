@@ -199,7 +199,7 @@ class TestRelease:
 
         config = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {"repo": "o/r"},
                 "daemon": {"max_resumes_per_item": 0},
             }

@@ -28,6 +28,7 @@ from sbxloop.engine.model import (
     scan_artifacts,
     workload_summary,
 )
+from sbxloop.paths import SbxloopHome
 
 
 def spec(id: str, deps: list[str] | None = None) -> dict[str, object]:
@@ -425,7 +426,7 @@ class TestArtifactsDir:
             workspace=Path("/tmp/ws"),
             mounted=True,
         )
-        assert artifacts_dir(record, Path("/state")) == Path("/tmp/ws")
+        assert artifacts_dir(record, SbxloopHome(Path("/state"))) == Path("/tmp/ws")
 
     def test_unmounted_run_uses_harvest_dir(self) -> None:
         record = RunRecord(
@@ -437,13 +438,15 @@ class TestArtifactsDir:
             workspace=Path("/tmp/ws"),
             mounted=False,
         )
-        assert artifacts_dir(record, Path("/state")) == Path("/state/runs/r1/artifacts")
+        assert artifacts_dir(record, SbxloopHome(Path("/state"))) == Path(
+            "/state/runs/r1/artifacts"
+        )
 
     def test_never_provisioned_run_has_none(self) -> None:
         record = RunRecord(
             run_id="r1", outcome="x", state="created", created_at=1.0, updated_at=1.0
         )
-        assert artifacts_dir(record, Path("/state")) is None
+        assert artifacts_dir(record, SbxloopHome(Path("/state"))) is None
 
 
 class TestSteerVerdict:

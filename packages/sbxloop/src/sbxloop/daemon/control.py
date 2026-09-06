@@ -7,7 +7,7 @@ process — a remote-control script posting from the bot's own token was
 (correctly) ignored, because the bridge drops bot-authored messages to
 prevent echo loops. Rather than weaken that filter, this module gives the
 daemon a programmatic path: ``sbxloop daemon ctl <cmd>`` drops a request
-into ``state_dir/daemon/ctl/`` and the running daemon answers it. Discord's
+into the home's ``state/daemon/ctl/`` and the running daemon answers it. Discord's
 ``!sbx`` and ``ctl`` both go through :func:`dispatch`, so the two surfaces
 cannot drift.
 
@@ -36,6 +36,7 @@ from sbxloop.daemon.discord_format import _one_line, code, items_lines, queue_li
 from sbxloop.daemon.holds import OPERATOR_HOLD
 from sbxloop.ghids import normalize_item_id
 from sbxloop.log import LogLevel, get_logger, log_buffer
+from sbxloop.paths import SbxloopHome
 
 log = get_logger(__name__)
 
@@ -591,9 +592,10 @@ class ControlClient:
     """The ``sbxloop daemon ctl`` side: submit a request, wait for the reply."""
 
     def __init__(
-        self, state_dir: Path, *, by: str | None = None, prefix: str | None = None
+        self, home: SbxloopHome, *, by: str | None = None, prefix: str | None = None
     ) -> None:
-        self.dir = state_dir / CTL_SUBDIR
+        self.home = home
+        self.dir = home.ctl
         # Who the daemon attributes the request to (the source hears
         # "cancelled by brett via sbxloop tui"); the CLI's login-name
         # default when unset. ``prefix`` only shapes usage lines.
@@ -698,9 +700,10 @@ class ControlServer:
     command that must land mid-run.
     """
 
-    def __init__(self, loop: Any, state_dir: Path, *, poll_s: float = 0.5) -> None:
+    def __init__(self, loop: Any, home: SbxloopHome, *, poll_s: float = 0.5) -> None:
         self.loop = loop
-        self.dir = state_dir / CTL_SUBDIR
+        self.home = home
+        self.dir = home.ctl
         self.poll_s = poll_s
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None

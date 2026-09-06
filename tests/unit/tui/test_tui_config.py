@@ -13,6 +13,7 @@ from textual.widgets import Input, TabbedContent
 
 from sbxloop.cli.policyview import policy_view
 from sbxloop.config import Config
+from sbxloop.paths import SbxloopHome
 from sbxloop.tui.configedit import config_path, read_text, save_text, validate_text
 from sbxloop.tui.screens.config import ConfigEditor, ConfigScreen, flatten_config
 from sbxloop.tui.screens.modals import ConfirmScreen, TypedConfirmScreen
@@ -69,7 +70,7 @@ def test_validate_sees_the_repositorys_cut_down(tmp_path: Path, hermetic: None) 
 
 def test_flatten_and_policy_view_are_the_cli_folds() -> None:
     config = Config.model_validate(
-        {"state_dir": "/tmp/x", "github": {"repo": "o/r"}, "policy": {"allow": ["*.example.com"]}}
+        {"home": "/tmp/x", "github": {"repo": "o/r"}, "policy": {"allow": ["*.example.com"]}}
     )
     flat = flatten_config(config)
     assert flat["github.repo"] == "o/r" and "policy.allow" in flat
@@ -78,8 +79,10 @@ def test_flatten_and_policy_view_are_the_cli_folds() -> None:
     assert "github.com" in view.baseline and view.phases[0][0] == "decompose"
 
 
-def test_config_screen_resolves_filters_validates_and_saves(seeded: Path, hermetic: None) -> None:
-    (seeded / "sbxloop.toml").write_text("[daemon]\npoll_interval_s = 7.0\n")
+def test_config_screen_resolves_filters_validates_and_saves(
+    seeded: SbxloopHome, hermetic: None
+) -> None:
+    (seeded.root / "sbxloop.toml").write_text("[daemon]\npoll_interval_s = 7.0\n")
 
     async def scenario() -> None:
         app = make_app(seeded, **REFRESH)
@@ -110,7 +113,7 @@ def test_config_screen_resolves_filters_validates_and_saves(seeded: Path, hermet
             await pilot.press("W")
             await pilot.pause(1.5)
             assert isinstance(app.screen, ConfigScreen), "save validates first: no dialog"
-            assert "7.0" in (seeded / "sbxloop.toml").read_text()
+            assert "7.0" in (seeded.root / "sbxloop.toml").read_text()
             # A save that fails offers no restart for a file never written.
             editor.load_text("[daemon]\npoll_interval_s = 8.0\n")
 
@@ -126,7 +129,7 @@ def test_config_screen_resolves_filters_validates_and_saves(seeded: Path, hermet
                 await pilot.press("enter")
                 await pilot.pause(1.5)
             assert isinstance(app.screen, ConfigScreen), "no restart prompt after a failed save"
-            assert "7.0" in (seeded / "sbxloop.toml").read_text()
+            assert "7.0" in (seeded.root / "sbxloop.toml").read_text()
             # A draft that loads is saved under the typed word, with a
             # backup, and the restart is offered.
             editor.load_text("[daemon]\npoll_interval_s = 9.0\n")
@@ -136,8 +139,8 @@ def test_config_screen_resolves_filters_validates_and_saves(seeded: Path, hermet
             app.screen.query_one("#typed", Input).value = "save"
             await pilot.press("enter")
             await pilot.pause(1.5)
-            assert (seeded / "sbxloop.toml").read_text() == "[daemon]\npoll_interval_s = 9.0\n"
-            backups = list(seeded.glob("sbxloop.toml.bak-*"))
+            assert (seeded.root / "sbxloop.toml").read_text() == "[daemon]\npoll_interval_s = 9.0\n"
+            backups = list(seeded.root.glob("sbxloop.toml.bak-*"))
             assert len(backups) == 1 and "7.0" in backups[0].read_text()
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("n")
@@ -175,7 +178,7 @@ def test_config_screen_resolves_filters_validates_and_saves(seeded: Path, hermet
 
 
 def test_the_editor_follows_the_daemons_directory(
-    seeded: Path, hermetic: None, tmp_path: Path
+    seeded: SbxloopHome, hermetic: None, tmp_path: Path
 ) -> None:
     """The daemon says where it loaded its config: that file is edited,
     not one in whatever directory the console was started from."""
@@ -197,7 +200,7 @@ def test_the_editor_follows_the_daemons_directory(
     drive(scenario)
 
 
-def test_read_only_console_cannot_save(seeded: Path, hermetic: None) -> None:
+def test_read_only_console_cannot_save(seeded: SbxloopHome, hermetic: None) -> None:
     async def scenario() -> None:
         app = make_app(seeded, read_only=True, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
@@ -208,6 +211,6 @@ def test_read_only_console_cannot_save(seeded: Path, hermetic: None) -> None:
             await pilot.press("W")
             await pilot.pause(0.5)
             assert isinstance(app.screen, ConfigScreen)
-            assert not (seeded / "sbxloop.toml").exists()
+            assert not (seeded.root / "sbxloop.toml").exists()
 
     drive(scenario)

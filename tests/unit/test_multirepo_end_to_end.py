@@ -33,8 +33,6 @@ from .test_daemon_sources_multirepo import RouterOps
 LABELS = GitHubLabels("sbxloop:run", "sbxloop:in-progress", "sbxloop:failed")
 
 MULTI_TOML = """
-state_dir = "{state_dir}"
-
 [github]
 deliver_base = "main"
 
@@ -47,8 +45,6 @@ deliver_base = "develop"
 """
 
 SINGLE_TOML = """
-state_dir = "{state_dir}"
-
 [github]
 repo = "o/a"
 deliver_base = "main"
@@ -57,8 +53,10 @@ deliver_base = "main"
 
 def _config(tmp_path: Path, template: str) -> Config:
     path = tmp_path / "sbxloop.toml"
-    path.write_text(template.format(state_dir=(tmp_path / "state").as_posix()))
-    return Config.model_validate(tomllib.loads(path.read_text()))
+    path.write_text(template)
+    return Config.model_validate(
+        {**tomllib.loads(path.read_text()), "home": (tmp_path / "state").as_posix()}
+    )
 
 
 class RecordingRunner:
@@ -87,8 +85,8 @@ class Wiring:
     def __init__(self, tmp_path: Path, config: Config, router: RouterOps) -> None:
         self.config = config
         self.router = router
-        self.store = StateStore(config.state_dir / "state.db")
-        self.dstore = DaemonStore(config.state_dir / "state.db")
+        self.store = StateStore(config.paths.state_db)
+        self.dstore = DaemonStore(config.paths.state_db)
         self.runner = RecordingRunner(self.store)
         self.frontend = RecordingFrontend()
         self.source = build_github_source(
@@ -227,7 +225,7 @@ class TestSingleToMultiUpgrade:
         config = _config(tmp_path, MULTI_TOML)
         # Pre-upgrade state: the old daemon polled o/b and queued issue 7
         # with an unqualified id and no repository.
-        pre = DaemonStore(config.state_dir / "state.db")
+        pre = DaemonStore(config.paths.state_db)
         pre.upsert_new(
             WorkItem(item_id="gh:7", source_key="7", title="old", url="https://x/issues/7"),
             now=1.0,
@@ -289,7 +287,7 @@ class TestSingleToMultiUpgrade:
         """Same as above, but with the id stored in the bare pre-#508 form a
         deployed daemon's store actually holds. The store's own writers
         normalise ids, so the row is written raw to reach that shape."""
-        conn = sqlite3.connect(upgraded.config.state_dir / "state.db")
+        conn = sqlite3.connect(upgraded.config.paths.state_db)
         conn.execute(
             "UPDATE daemon_work_items SET item_id = 'gh:7', state = 'running', claimed = 1, "
             "run_id = 'r1' WHERE item_id = 'gh:issue:7'"

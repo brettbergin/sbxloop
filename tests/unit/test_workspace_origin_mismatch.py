@@ -21,7 +21,6 @@ runner = CliRunner()
 @pytest.fixture
 def workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
     return tmp_path
 
 

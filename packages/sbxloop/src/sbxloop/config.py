@@ -2,15 +2,20 @@
 
 Precedence (highest wins): ``SBXLOOP_*`` environment variables >
 ``./sbxloop.toml`` > ``pyproject.toml [tool.sbxloop]`` >
-``~/.config/sbxloop/sbxloop.toml`` (``$XDG_CONFIG_HOME`` honoured) >
-built-in defaults.
+``$SBXLOOP_HOME/config/sbxloop.toml`` (the host config, ``~/.sbxloop`` by
+default — see :mod:`sbxloop.paths`) > built-in defaults.
 
-The user-level file is the lowest layer so a project can always override it;
-it exists for settings that follow the operator rather than the checkout
-(``model``, ``app_name``, ``[discord]`` / ``[slack]``). It is located from the *env mapping*
-handed to the loader — never from ``os.environ`` behind the caller's back — so
-hermetic callers (tests, embedders passing ``env={}``) never read the real
-home directory.
+The host config is the lowest layer so a project can always override it; it
+is the operator's file — the repository, the daemon, the policy, the chat
+backend — and the daemon, which runs from the home, sees nothing else. It
+is located from the *env mapping* handed to the loader — never from
+``os.environ`` behind the caller's back — so hermetic callers (tests,
+embedders passing ``env={}``) never read the real home.
+
+Where things land on disk is not a setting. The former ``state_dir`` key,
+``[daemon] state_dir`` and ``SBXLOOP_STATE_DIR`` are rejected by name so an
+old file fails loudly rather than being half-honoured; ``SBXLOOP_HOME`` moves
+the whole home instead.
 
 Nested keys use ``__`` in environment variables, e.g.
 ``SBXLOOP_BUDGETS__MAX_TASKS=5``. Values are parsed as TOML scalars where
@@ -44,6 +49,7 @@ from sbxloop.backends import ANTHROPIC_TOKEN_ENV, COPILOT_TOKEN_ENV
 from sbxloop.errors import ConfigError
 from sbxloop.ids import DEFAULT_BRANCH_PREFIX
 from sbxloop.log import LogFormat, LogLevel, get_logger
+from sbxloop.paths import SbxloopHome, home_root_from_env, resolve_home_root
 from sbxloop.toolchains import DEFAULT_LANGUAGES, normalize_language, supported_languages
 
 log = get_logger(__name__)
@@ -52,7 +58,8 @@ ENV_PREFIX = "SBXLOOP_"
 
 # SBXLOOP_-prefixed variables consumed by the *worker process* rather than
 # host configuration; the env config layer must not treat them as settings.
-RESERVED_ENV_KEYS = frozenset({"worker_backend", "echo_script"})
+# `home` is SBXLOOP_HOME, read by sbxloop.paths, never a layered key.
+RESERVED_ENV_KEYS = frozenset({"worker_backend", "echo_script", "home"})
 
 # Environment the loop delivers to a sandbox itself (#679): the credentials
 # it mints and the worker's own selectors. Operator `[sandbox] env` and a
@@ -1482,16 +1489,11 @@ class DaemonConfig(_ConfigModel):
     while someone has uncommitted work in that checkout. ``refresh_workspace``
     fetches and fast-forwards the checkout before each fresh run so runs
     start from current ``origin/<branch>`` rather than a stale local HEAD.
-    ``state_dir`` anchors the daemon's state to an absolute path outside the
-    workspace; unset resolves to ``$XDG_STATE_HOME/sbxloop/<project>``
-    (``~/.local/state/...``) unless the top-level ``state_dir`` was set
-    explicitly or a legacy ``./.sbxloop/state.db`` already exists — see
-    :func:`sbxloop.daemon.paths.resolve_state_dir`.
+    The daemon's state lives under the home (:mod:`sbxloop.paths`).
     """
 
     workspace_isolation: WorkspaceIsolation = "clone"
     refresh_workspace: bool = True
-    state_dir: Path | None = None
     # Must be positive: Event.wait(<= 0) returns immediately and the loop spins.
     poll_interval_s: float = Field(default=60.0, gt=0)
     trigger_label: str = "sbxloop:run"
@@ -1822,40 +1824,19 @@ class ConciergeConfig(_ConfigModel):
     clarify_ttl_s: float = Field(default=900.0, ge=60, le=86400)
 
 
-USER_CONFIG_SUBPATH = Path("sbxloop") / "sbxloop.toml"
-
-
-def default_state_dir() -> Path:
-    """``~/.sbxloop`` — one per user, wherever the shell happens to stand.
-
-    The default used to be the *relative* ``.sbxloop``, i.e. "cwd at the
-    time": ``sbxloop status`` from another directory showed an empty world,
-    and any command run from inside a checkout dropped a state dir into it
-    (field run ``r5a1d9m9c`` — the isolation probe then refused the next run
-    as dirty). Project-scoped state remains available by setting a relative
-    ``state_dir`` explicitly.
-    """
-    return Path.home() / ".sbxloop"
-
-
-def _home_dir(env: Mapping[str, str]) -> Path:
-    """The home the *loader* should trust: ``env["HOME"]`` when the mapping
-    names one, else the process home. Keeps the default ``state_dir`` and
-    ``~`` expansion consistent with ``user_config_path`` for hermetic
-    callers (``env={"HOME": ...}``), which would otherwise read the user
-    config from the mapped home but resolve state into the real one."""
-    home = env.get("HOME")
-    return Path(home) if home else Path.home()
-
-
-def _expand_home(value: str, home: Path) -> str:
-    """``expanduser`` against an explicit ``home`` (bare ``~`` and ``~/…``
-    only; ``~user`` is left to the field validator)."""
-    if value == "~":
-        return str(home)
-    if value.startswith("~/"):
-        return str(home / value[2:])
-    return value
+#: Settings that used to say where state lives. Rejected by name (not just
+#: "unknown key") so the error says what replaced them.
+RETIRED_PATH_KEYS: dict[str, str] = {
+    "state_dir": (
+        "runs and state live under $SBXLOOP_HOME (~/.sbxloop); "
+        "set SBXLOOP_HOME to move the whole home"
+    ),
+    "daemon.state_dir": (
+        "the daemon's state lives under $SBXLOOP_HOME/state; "
+        "set SBXLOOP_HOME to move the whole home"
+    ),
+    "home": "the home is set with the SBXLOOP_HOME environment variable, never from a config file",
+}
 
 
 class AgentConfig(_ConfigModel):
@@ -2093,9 +2074,10 @@ class Config(_ConfigModel):
     # apply directly. Setting a name isolates sbxloop state, but the isolated
     # app-state needs its own `sbx --app-name <name> login` and policy init.
     app_name: str = ""
-    # A relative value is anchored at the config discovery root (the cwd
-    # ``load_config`` was given), not at the process cwd at first use.
-    state_dir: Path = Field(default_factory=default_state_dir)
+    # The sbxloop home (:mod:`sbxloop.paths`): every host path derives from
+    # it. Not a file setting — the loader takes it from SBXLOOP_HOME / HOME
+    # — but a field so a test or embedder can point a Config anywhere.
+    home: Path = Field(default_factory=resolve_home_root)
     keep_sandboxes: bool = False
     # Keep the pair alive only when a run fails, so the evidence (worker
     # stderr, install leftovers, workspace state) survives for
@@ -2135,12 +2117,15 @@ class Config(_ConfigModel):
     # Workloads the daemon asks for by itself, on a cadence (#761).
     schedules: list[ScheduleConfig] = Field(default_factory=list)
 
-    @field_validator("state_dir", mode="after")
+    @field_validator("home", mode="after")
     @classmethod
     def _expand_home(cls, value: Path) -> Path:
-        # `state_dir = "~/.sbxloop"` in TOML must mean the home directory,
-        # not a literal "~" directory under the project.
         return value.expanduser()
+
+    @property
+    def paths(self) -> SbxloopHome:
+        """Every host path, derived from ``home``."""
+        return SbxloopHome(self.home)
 
     @model_validator(mode="after")
     def _repo_labels_are_distinct(self) -> Config:
@@ -2586,7 +2571,7 @@ def _file_layers(
                     path=str(path),
                     keys=sorted(dropped),
                     hint="a repository's own config may set only project keys; "
-                    "operator settings belong in ~/.config/sbxloop/sbxloop.toml, "
+                    "operator settings belong in the home's config/sbxloop.toml, "
                     "an untracked sbxloop.toml, or the environment",
                 )
             name = f"{name} (project)"
@@ -2594,20 +2579,15 @@ def _file_layers(
     return layers
 
 
-def user_config_path(env: Mapping[str, str]) -> Path | None:
-    """``$XDG_CONFIG_HOME/sbxloop/sbxloop.toml`` (``~/.config/...`` when
-    unset), or None when ``env`` names neither — the hermetic case."""
-    xdg = env.get("XDG_CONFIG_HOME")
-    if xdg:
-        return Path(xdg) / USER_CONFIG_SUBPATH
-    home = env.get("HOME")
-    if home:
-        return Path(home) / ".config" / USER_CONFIG_SUBPATH
-    return None
+def home_config_path(env: Mapping[str, str]) -> Path | None:
+    """``$SBXLOOP_HOME/config/sbxloop.toml``, or None when ``env`` names
+    neither ``SBXLOOP_HOME`` nor ``HOME`` — the hermetic case."""
+    root = home_root_from_env(env)
+    return SbxloopHome(root).config_toml if root is not None else None
 
 
-def _user_config_layer(env: Mapping[str, str]) -> dict[str, Any]:
-    path = user_config_path(env)
+def _home_config_layer(env: Mapping[str, str]) -> dict[str, Any]:
+    path = home_config_path(env)
     if path is None or not path.is_file():
         return {}
     return _read_toml(path)
@@ -2659,41 +2639,26 @@ def _flatten(data: dict[str, Any], prefix: str = "") -> dict[str, Any]:
     return flat
 
 
-def load_dotenv_file(cwd: Path | None = None, env: Mapping[str, str] | None = None) -> Path | None:
-    """Load the operator's ``.env`` files into the process environment.
+def load_secrets_env(env: Mapping[str, str] | None = None) -> Path | None:
+    """Load the home's ``config/secrets.env`` into the process environment.
 
-    Two places, most specific first: ``<cwd>/.env`` — but only when ``cwd``
-    is not inside a git checkout, because a checkout's ``.env`` is the
-    *application's* (its own secrets, its own settings) and must never leak
-    into the loop's environment (#671) — then ``~/.config/sbxloop/.env``
-    next to the user config. Real environment variables always win
-    (``override=False``), so a ``.env`` file is a convenience layer for the
-    PATs and ``SBXLOOP_*`` settings — never a way to silently shadow explicit
-    exports. Returns the first path loaded, or None when there is none.
+    One file, one place: the tokens and any ``SBXLOOP_*`` settings the
+    operator keeps out of ``sbxloop.toml``. Real environment variables
+    always win (``override=False``), so the file is a convenience layer,
+    never a way to silently shadow an explicit export. A working-directory
+    ``.env`` is not read: a checkout's ``.env`` is the application's, and a
+    runner directory no longer exists. Returns the path loaded, or None.
     """
     from dotenv import load_dotenv
 
-    from sbxloop import hostgit
-
-    env = os.environ if env is None else env
-    cwd = cwd or Path.cwd()
-    candidates: list[Path] = []
-    local = cwd / ".env"
-    if local.is_file():
-        if hostgit.repo_toplevel(cwd) is None:
-            candidates.append(local)
-        else:
-            log.debug(
-                "config.dotenv.skipped",
-                path=str(local),
-                reason="inside a git checkout: an application's .env is never loaded",
-            )
-    user = user_config_path(env)
-    if user is not None and (user.parent / ".env").is_file():
-        candidates.append(user.parent / ".env")
-    for path in candidates:
-        load_dotenv(path, override=False)
-    return candidates[0] if candidates else None
+    root = home_root_from_env(os.environ if env is None else env)
+    if root is None:
+        return None
+    path = SbxloopHome(root).secrets_env
+    if not path.is_file():
+        return None
+    load_dotenv(path, override=False)
+    return path
 
 
 def load_config_with_sources(
@@ -2709,14 +2674,14 @@ def load_config_with_sources(
     repository-carried layer may not set."""
     cwd = cwd or Path.cwd()
     if env is None:
-        # Only consult .env when reading the real environment; explicit env
-        # mappings (tests, embedders) stay hermetic.
-        load_dotenv_file(cwd)
+        # Only consult secrets.env when reading the real environment;
+        # explicit env mappings (tests, embedders) stay hermetic.
+        load_secrets_env()
     env = os.environ if env is None else env
 
     discovery = discover_config(cwd)
     layers: list[tuple[str, dict[str, Any]]] = [
-        ("user config", _user_config_layer(env)),
+        ("home config", _home_config_layer(env)),
         *_file_layers(discovery, sbxloop_toml_text=sbxloop_toml_text, dropped_keys=dropped_keys),
         ("env", _env_layer(env)),
     ]
@@ -2727,15 +2692,14 @@ def load_config_with_sources(
         merged = _deep_merge(merged, layer)
         for dotted in _flatten(layer):
             sources[dotted] = name
+    for dotted, why in RETIRED_PATH_KEYS.items():
+        if dotted in sources:
+            raise ConfigError(f"{dotted!r} (from {sources[dotted]}) is no longer a setting: {why}")
 
-    # Resolve the home-relative parts of ``state_dir`` against the loader's
-    # HOME (not the process environment) before validation, so ``env`` fully
-    # determines where state lands.
-    home = _home_dir(env)
-    if "state_dir" not in merged:
-        merged["state_dir"] = str(home / ".sbxloop")
-    elif isinstance(merged["state_dir"], str):
-        merged["state_dir"] = _expand_home(merged["state_dir"], home)
+    # The home is the env's business, never a file's: SBXLOOP_HOME, else
+    # HOME/.sbxloop, else the process home — resolved from the mapping the
+    # loader was handed so a hermetic caller decides where state lands.
+    merged["home"] = str(resolve_home_root(env))
 
     try:
         config = Config.model_validate(merged)
@@ -2753,12 +2717,6 @@ def load_config_with_sources(
             "itself — unset GH_HOST, or point api_url at that server"
         )
 
-    if not config.state_dir.is_absolute():
-        # An explicit relative state_dir means project-scoped state: pin it
-        # to the directory the config was discovered in so its meaning
-        # cannot drift with a later chdir.
-        config = config.model_copy(update={"state_dir": discovery.root / config.state_dir})
-
     for dotted in _flatten(config.model_dump()):
         sources.setdefault(dotted, "default")
     # Which layer set which key — never the values (tokens live in env).
@@ -2767,7 +2725,7 @@ def load_config_with_sources(
         "config.loaded",
         cwd=str(cwd),
         root=str(discovery.root),
-        state_dir=str(config.state_dir),
+        home=str(config.home),
         layers={name: len(_flatten(layer)) for name, layer in layers},
         overrides=overridden,
     )

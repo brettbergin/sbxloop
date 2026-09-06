@@ -177,7 +177,7 @@ class RunDetailScreen(ConsoleScreen):
         if detail is None:
             return None, [], ""
         config = self.console_app.config
-        target = artifacts_dir(detail.record, config.state_dir)
+        target = artifacts_dir(detail.record, config.paths)
         if target is None or not target.is_dir():
             return target, [], ""
         scan = scan_artifacts(target, config.artifacts.exclude)

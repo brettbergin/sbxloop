@@ -22,6 +22,7 @@ from sbxloop.errors import DaemonError, GithubOpsError, SbxError, SbxloopError, 
 from sbxloop.events import EventBus
 from sbxloop.gh.ops import GithubOps
 from sbxloop.log import get_logger
+from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import Sandbox
@@ -41,14 +42,14 @@ DAEMON_RUN_ID = "daemon"
 REPROVISION_MIN_INTERVAL_S = 300.0
 
 
-def sandbox_name_for(state_dir: Path) -> str:
+def sandbox_name_for(home: SbxloopHome) -> str:
     """Per-instance sandbox name. The name used to be fixed, and
     ``remove_stale`` deletes a same-named sandbox at startup: a second
-    daemon on the same host (another project, another state dir) killed
-    the first's github sandbox (#254). Two daemons sharing one state dir
-    would also share a run store, which nothing supports, so the state dir
-    is the instance identity."""
-    digest = hashlib.sha256(str(state_dir.resolve()).encode()).hexdigest()[:8]
+    daemon on the same host (another home) killed
+    the first's github sandbox (#254). Two daemons sharing one home
+    would also share a run store, which nothing supports, so the home is
+    the instance identity."""
+    digest = hashlib.sha256(str(home.root.resolve()).encode()).hexdigest()[:8]
     return f"{SANDBOX_NAME_PREFIX}-{digest}"
 
 
@@ -74,7 +75,7 @@ class DaemonGithub:
         self.bus = bus
         self.worker_python = worker_python
         self.install_workers = install_workers
-        self.name = name or sandbox_name_for(config.state_dir)
+        self.name = name or sandbox_name_for(config.paths)
         self.clock = clock
         self._last_reprovision_at: float | None = None
         self.provisioner = Provisioner(sbx, config, bus=bus)
@@ -84,7 +85,7 @@ class DaemonGithub:
 
     @property
     def workspace(self) -> Path:
-        return (self.config.state_dir / "daemon" / "github-workspace").resolve()
+        return self.config.paths.github_workspace.resolve()
 
     def remove_stale(self) -> None:
         """Drop a same-named sandbox left by a previous daemon process."""

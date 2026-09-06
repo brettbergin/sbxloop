@@ -30,8 +30,8 @@ def make_bridge(
     tmp_path: Path, *, concierge: Any = None, **tui: Any
 ) -> tuple[LocalBridge, DaemonStore, FakeLoop]:
     """A headless daemon's bridge: no [chat] backend at all."""
-    config = Config.model_validate({"state_dir": str(tmp_path / "state"), "tui": tui})
-    dstore = DaemonStore(config.state_dir / "state.db")
+    config = Config.model_validate({"home": str(tmp_path / "state"), "tui": tui})
+    dstore = DaemonStore(config.paths.state_db)
     floop = FakeLoop(dstore)
     bridge = LocalBridge(config, dstore, loop_ref=floop, concierge=concierge)
     return bridge, dstore, floop

@@ -27,7 +27,6 @@ runner = CliRunner()
 @pytest.fixture
 def workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
     monkeypatch.setenv("COLUMNS", "300")
     for name in ("COPILOT_GITHUB_TOKEN", "ANTHROPIC_API_KEY"):
         monkeypatch.delenv(name, raising=False)

@@ -8,6 +8,7 @@ import math
 import os
 import queue
 import sys
+import tempfile
 import threading
 import time
 from importlib import resources
@@ -36,7 +37,7 @@ from sbxloop.config import (
     SlackConfig,
     load_config,
     load_config_with_sources,
-    load_dotenv_file,
+    load_secrets_env,
 )
 from sbxloop.daemon.control import DEFAULT_TIMEOUT_S
 from sbxloop.daemon.store import DaemonStore, apply_item_verb
@@ -57,6 +58,7 @@ from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
 from sbxloop.ghids import normalize_item_id, try_parse_gh_id
 from sbxloop.log import configure_logging, get_logger
+from sbxloop.paths import SbxloopHome, resolve_home_root
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import INTERACTIVE_SHELL_ARGV, SbxCLI
 from sbxloop.sbx.models import SandboxRole
@@ -118,9 +120,14 @@ def _main_callback(
     # through to logging's bare last-resort handler. The daemon re-configures
     # with its own level/format once its config is loaded.
     configure_logging("WARNING")
-    # Every command sees ./.env (tokens + SBXLOOP_* settings); real
-    # environment variables always take precedence.
-    load_dotenv_file()
+    # Every command sees the home's secrets.env (tokens + SBXLOOP_* settings);
+    # real environment variables always take precedence.
+    load_secrets_env()
+    # Temporary files land in the home too, once there is one (`sbxloop
+    # init`); before that the platform default stands.
+    tmp = resolve_home_root() / "tmp"
+    if tmp.is_dir():
+        tempfile.tempdir = str(tmp)
 
 
 def _config_with_overrides(**overrides: Any) -> Config:
@@ -130,36 +137,14 @@ def _config_with_overrides(**overrides: Any) -> Config:
 
 
 def _run_config() -> Config:
-    """Config for a command that reads or writes *runs*, with ``state_dir``
-    pointing where this project's runs actually live.
-
-    On a daemon host the daemon anchors its state away from the top-level
-    default (#255), so a command that trusts ``state_dir`` verbatim reports
-    an unrelated — usually stale, often empty — world: `sbxloop status` in
-    the runner directory answers about neither the daemon's runs nor
-    anything else current. ``sbxloop daemon`` and its ``ctl`` subcommands
-    already resolve this way (``_daemon_state_dir``); the run commands were
-    left behind.
-
-    Stamped onto the config rather than applied at each read, because a run
-    directory is derived from ``state_dir`` too (``LoopEngine``): resolving
-    only the store would file a run's rows in one place and its workspace
-    and artifacts in another. See ``paths.resolve_cli_state_dir`` for when
-    the redirect fires at all — never on a host with no daemon store.
-    """
-    from sbxloop.daemon.paths import resolve_cli_state_dir
-
-    config, sources = load_config_with_sources()
-    resolved = resolve_cli_state_dir(
-        config, sources, cwd=Path.cwd(), env=os.environ, home=Path.home()
-    ).path
-    if resolved == config.state_dir:
-        return config
-    return config.model_copy(update={"state_dir": resolved})
+    """Config for a command that reads or writes *runs*. Runs live under the
+    home whatever the working directory, so every command — the daemon,
+    ``status``, ``logs``, ``gc``, ``tui`` — answers about the same world."""
+    return load_config()
 
 
 def _store(config: Config) -> StateStore:
-    return StateStore(config.state_dir / "state.db")
+    return StateStore(config.paths.state_db)
 
 
 def _resolve_run_workspace(
@@ -481,7 +466,7 @@ def _artifacts_tree(root: Path, files: list[Path], cap: int = _TREE_MAX_FILES) -
 
 
 def _print_artifacts_summary(result: RunResult, config: Config) -> None:
-    target = artifacts_dir(result, config.state_dir)
+    target = artifacts_dir(result, config.paths)
     if target is None or not target.is_dir():
         return
     scan = scan_artifacts(target, config.artifacts.exclude)
@@ -1138,7 +1123,7 @@ def artifacts(
     except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
-    target = artifacts_dir(record, config.state_dir)
+    target = artifacts_dir(record, config.paths)
     if target is None:
         console.print(
             f"[bold red]run {run_id} has no artifacts:[/] it never provisioned a workspace "
@@ -1362,7 +1347,7 @@ def secrets_rotate(
             console.print(styles[kind].format(line))
         # Under plain-env the strategy line above already says it all.
         if config.secret_strategy != "plain-env" and verify:  # nosec B105 - strategy label
-            workspace = config.state_dir / "secretcheck"
+            workspace = config.paths.tmp / "secretcheck"
             workspace.mkdir(parents=True, exist_ok=True)
             visible = verify_secret_visibility(
                 cli,
@@ -1501,9 +1486,9 @@ def gc(
         console.print("[bold red]--older-than must be a finite number of days >= 0[/]")
         raise typer.Exit(2)
     store = _store(config)
-    result = prune_run_dirs(store, config.state_dir, older_than_s=days * DAY_S, dry_run=dry_run)
+    result = prune_run_dirs(store, config.paths, older_than_s=days * DAY_S, dry_run=dry_run)
     if not result.verdicts:
-        console.print(f"no run directories under {config.state_dir / 'runs'}")
+        console.print(f"no run directories under {config.paths.runs}")
         return
     table = Table(title="sbxloop gc" + (" (dry run)" if dry_run else ""))
     for column in ("run", "state", "age", "size", "verdict"):
@@ -1795,7 +1780,6 @@ def daemon(
     from sbxloop.daemon.logsink import event_log_subscriber
     from sbxloop.daemon.loop import DaemonLoop
     from sbxloop.daemon.model import DaemonNotice, WorkItem
-    from sbxloop.daemon.paths import resolve_state_dir
     from sbxloop.daemon.sources import (
         REPO_HEALTH_KEY,
         ChatSource,
@@ -1809,14 +1793,7 @@ def daemon(
 
     log = get_logger("sbxloop.daemon")
     started_at = time.monotonic()
-    config, config_sources = load_config_with_sources()
-    # The daemon's state lives at an absolute path outside the workspace
-    # (#255): a relative `.sbxloop` inside the checkout it works on would
-    # accrete a per-run clone there forever.
-    state_choice = resolve_state_dir(
-        config, config_sources, cwd=Path.cwd(), env=os.environ, home=Path.home()
-    )
-    config = config.model_copy(update={"state_dir": state_choice.path})
+    config = load_config()
     daemon_overrides = {
         k: v
         for k, v in (
@@ -1914,7 +1891,7 @@ def daemon(
             )
         raise typer.Exit(2)
 
-    db_path = config.state_dir / "state.db"
+    db_path = config.paths.state_db
     # A pre-1.0 state database carries the old daemon lanes' tables and item
     # kinds; it is moved aside rather than migrated, before the engine store
     # opens the file (both stores share it).
@@ -2025,15 +2002,12 @@ def daemon(
         )
 
     # One line an operator can read back from the journal to know exactly
-    # what this daemon is: where its state went (with the anchored default,
-    # `sbxloop status` in the runner dir shows nothing unless
-    # SBXLOOP_STATE_DIR points here), what it polls, and every guardrail.
+    # what this daemon is: its home, what it polls, and every guardrail.
     log.info(
         "daemon.starting",
         version=sbxloop.__version__,
         pid=os.getpid(),
-        state_dir=str(config.state_dir),
-        state_dir_reason=state_choice.reason,
+        home=str(config.home),
         archived_state=str(archived) if archived else None,
         repo=config.github.repo,
         repos=[r.repo for r in config.github.enabled_repos()],
@@ -2179,7 +2153,7 @@ def daemon(
             ),
         )
 
-    ctl = ControlServer(loop, config.state_dir)
+    ctl = ControlServer(loop, config.paths)
     cleanup_registry.install_handlers()
     cleanup_registry.set_quiesce(loop.quiesce)
     stop_reason = "finished"
@@ -2241,12 +2215,6 @@ def tui(
     read_only: Annotated[
         bool, typer.Option("--read-only", help="Observe only: no daemon commands, no chat.")
     ] = False,
-    state_dir: Annotated[
-        Path | None,
-        typer.Option(
-            "--state-dir", help="The daemon's state directory (default: the daemon's own rule)."
-        ),
-    ] = None,
     unit: Annotated[
         str | None,
         typer.Option(
@@ -2266,15 +2234,11 @@ def tui(
     from sbxloop.tui.app import build_app
 
     config = load_config()
-    resolved = state_dir if state_dir is not None else _daemon_state_dir()
-    # The daemon stamps its resolved state dir on its config before it
-    # harvests; the console reads artifacts through the same value.
-    config = config.model_copy(update={"state_dir": resolved})
     operator = config.tui.operator_id or getpass.getuser()
     try:
         console_app = build_app(
             config,
-            resolved,
+            config.paths,
             operator_id=operator,
             read_only=read_only,
             initial_run=run,
@@ -2295,19 +2259,13 @@ def concierge_wanted(config: Config, *, once: bool) -> bool:
     return bool(config.concierge.enabled) and not once
 
 
-def _daemon_state_dir() -> Path:
-    # Same resolution as `sbxloop daemon` itself (#255): with the anchored
-    # default the daemon's queue and control queue are not under the runner
-    # dir's `.sbxloop`, so the operator commands must follow the daemon's
-    # rule, not `_store`'s.
-    from sbxloop.daemon.paths import resolve_state_dir
-
-    config, sources = load_config_with_sources()
-    return resolve_state_dir(config, sources, cwd=Path.cwd(), env=os.environ, home=Path.home()).path
+def _home() -> SbxloopHome:
+    """The home the daemon runs against — the same one every command sees."""
+    return load_config().paths
 
 
 def _daemon_store() -> DaemonStore:
-    return DaemonStore(_daemon_state_dir() / "state.db")
+    return DaemonStore(_home().state_db)
 
 
 _ITEM_CONTROL_NOTE = (
@@ -2443,7 +2401,7 @@ def daemon_ctl(
         ),
     ] = False,
 ) -> None:
-    """Send a command to the daemon running against this state_dir — the
+    """Send a command to the daemon running against this home — the
     programmatic twin of Discord's `!sbx`, for scripts, cron and remote
     operators (the bot ignores its own messages by design)."""
     from sbxloop.daemon.control import ControlClient, plain
@@ -2451,12 +2409,12 @@ def daemon_ctl(
     if as_json and (not command or command[0].lower() != "status"):
         console.print("[bold red]--json applies to[/] [cyan]ctl status[/] only.")
         raise typer.Exit(2)
-    state_dir = _daemon_state_dir()
-    reply = ControlClient(state_dir).submit(" ".join(command), timeout_s=timeout)
+    home = _home()
+    reply = ControlClient(home).submit(" ".join(command), timeout_s=timeout)
     if reply is None:
         console.print(
             f"[bold red]no reply from the daemon[/] within {timeout:g}s — is "
-            f"[cyan]sbxloop daemon[/] running with state dir {state_dir}?"
+            f"[cyan]sbxloop daemon[/] running against {home}?"
         )
         raise typer.Exit(2)
     if reply.pending:

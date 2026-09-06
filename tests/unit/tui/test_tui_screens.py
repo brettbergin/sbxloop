@@ -2,8 +2,7 @@
 
 from __future__ import annotations
 
-from pathlib import Path
-
+from sbxloop.paths import SbxloopHome
 from sbxloop.tui.screens.run_detail import RunDetailScreen
 from sbxloop.tui.widgets.chronology import ChronologyLog
 from sbxloop.tui.widgets.panel import TextPanel
@@ -20,7 +19,7 @@ def bar_text(app: object) -> str:
     return bar.last.plain
 
 
-def test_overview_shows_the_live_run_queue_and_waits(seeded: Path) -> None:
+def test_overview_shows_the_live_run_queue_and_waits(seeded: SbxloopHome) -> None:
     async def scenario() -> None:
         app = make_app(seeded)
         async with app.run_test(size=(140, 45)) as pilot:
@@ -40,7 +39,7 @@ def test_overview_shows_the_live_run_queue_and_waits(seeded: Path) -> None:
     drive(scenario)
 
 
-def test_daemon_down_and_starting_read_in_the_bar(seeded: Path) -> None:
+def test_daemon_down_and_starting_read_in_the_bar(seeded: SbxloopHome) -> None:
     async def scenario() -> None:
         app = make_app(seeded, ctl=FakeCtl(down=True))
         async with app.run_test(size=(140, 45)) as pilot:
@@ -62,7 +61,7 @@ def test_daemon_down_and_starting_read_in_the_bar(seeded: Path) -> None:
     drive(scenario)
 
 
-def test_runs_screen_lists_filters_and_opens_a_run(seeded: Path) -> None:
+def test_runs_screen_lists_filters_and_opens_a_run(seeded: SbxloopHome) -> None:
     async def scenario() -> None:
         app = make_app(seeded)
         async with app.run_test(size=(140, 45)) as pilot:
@@ -89,7 +88,7 @@ def test_runs_screen_lists_filters_and_opens_a_run(seeded: Path) -> None:
     drive(scenario)
 
 
-def test_run_screen_tabs_render_the_store(seeded: Path) -> None:
+def test_run_screen_tabs_render_the_store(seeded: SbxloopHome) -> None:
     async def scenario() -> None:
         app = make_app(seeded, run="r_live")
         async with app.run_test(size=(140, 45)) as pilot:
@@ -121,7 +120,7 @@ def test_run_screen_tabs_render_the_store(seeded: Path) -> None:
     drive(scenario)
 
 
-def test_queue_screen_and_help(seeded: Path) -> None:
+def test_queue_screen_and_help(seeded: SbxloopHome) -> None:
     async def scenario() -> None:
         app = make_app(seeded, emoji=False)
         async with app.run_test(size=(140, 45)) as pilot:
@@ -138,7 +137,7 @@ def test_queue_screen_and_help(seeded: Path) -> None:
     drive(scenario)
 
 
-def test_a_busy_daemon_reads_as_alive_not_down(seeded: Path) -> None:
+def test_a_busy_daemon_reads_as_alive_not_down(seeded: SbxloopHome) -> None:
     """A `pending` reply is a daemon that took the request but was too busy
     to answer in time — the misread the ctl queue warns about."""
     from sbxloop.daemon.control import CommandReply
@@ -162,7 +161,7 @@ def test_a_busy_daemon_reads_as_alive_not_down(seeded: Path) -> None:
     drive(scenario)
 
 
-def test_queue_lists_the_daemons_dispatch_order_and_eligibility(seeded: Path) -> None:
+def test_queue_lists_the_daemons_dispatch_order_and_eligibility(seeded: SbxloopHome) -> None:
     """A resume-pending run goes first, a failed attempt waits its backoff:
     the daemon's own rule (`dispatch_eligible_at`), not a re-derivation."""
     import time
@@ -170,7 +169,7 @@ def test_queue_lists_the_daemons_dispatch_order_and_eligibility(seeded: Path) ->
     from sbxloop.daemon.model import WorkItem
     from sbxloop.daemon.store import DaemonStore, dispatch_eligible_at
 
-    dstore = DaemonStore(seeded / "state.db")
+    dstore = DaemonStore(seeded.state_db)
     now = time.time()
     resume = WorkItem(item_id="gh:issue:50", source_key="50", title="Resume me", repo="o/r")
     dstore.upsert_new(resume, now=now - 100)
@@ -203,7 +202,7 @@ def test_queue_lists_the_daemons_dispatch_order_and_eligibility(seeded: Path) ->
     drive(scenario)
 
 
-def test_tables_repaint_in_place_and_keep_the_cursor(seeded: Path) -> None:
+def test_tables_repaint_in_place_and_keep_the_cursor(seeded: SbxloopHome) -> None:
     async def scenario() -> None:
         app = make_app(seeded)
         async with app.run_test(size=(140, 45)) as pilot:
@@ -220,7 +219,7 @@ def test_tables_repaint_in_place_and_keep_the_cursor(seeded: Path) -> None:
     drive(scenario)
 
 
-def test_escape_clears_the_event_filter_before_leaving_the_run(seeded: Path) -> None:
+def test_escape_clears_the_event_filter_before_leaving_the_run(seeded: SbxloopHome) -> None:
     async def scenario() -> None:
         app = make_app(seeded, run="r_live")
         async with app.run_test(size=(140, 45)) as pilot:
@@ -238,7 +237,7 @@ def test_escape_clears_the_event_filter_before_leaving_the_run(seeded: Path) -> 
     drive(scenario)
 
 
-def test_events_wait_while_follow_is_off(seeded: Path) -> None:
+def test_events_wait_while_follow_is_off(seeded: SbxloopHome) -> None:
     from sbxloop.engine.store import StateStore
     from sbxloop_worker.protocol import Event
 
@@ -251,7 +250,7 @@ def test_events_wait_while_follow_is_off(seeded: Path) -> None:
             log = screen.query_one("#events-log", ChronologyLog)
             before = log.count
             await pilot.press("f")  # follow off
-            store = StateStore(seeded / "state.db")
+            store = StateStore(seeded.state_db)
             store.append_event(Event.now("policy.deny", "r_live", domain="evil.example"))
             store.close()
             screen.load()

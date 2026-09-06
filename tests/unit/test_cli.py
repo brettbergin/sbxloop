@@ -22,6 +22,7 @@ from sbxloop.deliver import RepositoryProbe
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import GithubOpsError, SbxloopError
 from sbxloop.events import Event
+from sbxloop.paths import SbxloopHome
 from sbxloop_worker.protocol import Event as ProtocolEvent
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import FakeGithub
@@ -52,14 +53,17 @@ def assert_no_silent_truncation(rendered: str) -> None:
 @pytest.fixture
 def workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.chdir(tmp_path)
-    # The daemon anchors its default state dir under XDG state home (#255);
-    # keep that inside tmp so tests never touch the real ~/.local/state.
-    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
     return tmp_path
 
 
+def home(workdir: Path) -> SbxloopHome:
+    """The home every command in these tests runs against: HOME is the
+    test's tmp dir (autouse fixture), so the home is ``<workdir>/.sbxloop``."""
+    return SbxloopHome(workdir / ".sbxloop")
+
+
 def seed_store(workdir: Path) -> StateStore:
-    store = StateStore(workdir / ".sbxloop" / "state.db")
+    store = StateStore(home(workdir).state_db)
     store.create_run("rseeded11", "make everything better")
     store.set_run_state("rseeded11", "completed")
     from sbxloop.engine.model import TaskSpec
@@ -124,32 +128,6 @@ class TestStatusAndLogs:
         assert result.exit_code == 0
         assert "rseeded11" in result.output
         assert "completed" in result.output
-
-    def test_status_follows_the_daemon_store(self, workdir: Path) -> None:
-        """A daemon anchors its state under XDG (#255), so `status` in the
-        runner directory must report the daemon's runs — not the untouched
-        `~/.sbxloop` it used to read, which shows a stale or empty world with
-        no flag to correct it.
-        """
-        daemon_dir = workdir / "xdg-state" / "sbxloop" / workdir.name
-        daemon_dir.mkdir(parents=True)
-        daemon_store = StateStore(daemon_dir / "state.db")
-        daemon_store.create_run("rdaemon01", "work the daemon claimed")
-        daemon_store.set_run_state("rdaemon01", "completed")
-        daemon_store.close()
-
-        result = runner.invoke(app, ["status"])
-        assert result.exit_code == 0
-        assert "rdaemon01" in result.output
-
-    def test_status_keeps_the_plain_default_without_a_daemon(self, workdir: Path) -> None:
-        """No daemon store: nothing is redirected, and a single-user host
-        reports exactly the runs it always did."""
-        seed_store(workdir)
-        assert not (workdir / "xdg-state").exists()
-        result = runner.invoke(app, ["status"])
-        assert result.exit_code == 0
-        assert "rseeded11" in result.output
 
     def test_status_run_detail(self, workdir: Path, fake_sbx: FakeSbx) -> None:
         seed_store(workdir)
@@ -284,7 +262,7 @@ class TestArtifactsCommand:
 
     def test_harvested_run_reads_artifacts_dir(self, workdir: Path) -> None:
         self.seed_with_workspace(workdir, mounted=False)
-        harvested = workdir / ".sbxloop" / "runs" / "rseeded11" / "artifacts"
+        harvested = home(workdir).runs / "rseeded11" / "artifacts"
         harvested.mkdir(parents=True)
         (harvested / "result.md").write_text("# out")
         result = runner.invoke(app, ["artifacts", "rseeded11"])
@@ -605,9 +583,7 @@ class TestDaemonCommand:
         assert result.exit_code == 0, result.output
         assert "tui=on" in result.output
         assert "chat=off" in result.output
-        # The daemon's anchored XDG state dir (#255), as the item controls use.
-        state = workdir / "xdg-state" / "sbxloop" / workdir.name
-        dstore = DaemonStore(state / "state.db")
+        dstore = DaemonStore(home(workdir).state_db)
         try:
             assert dstore.get_value(LOCAL_STARTED_KEY) is not None
         finally:
@@ -680,10 +656,10 @@ class TestDaemonCommand:
         result = runner.invoke(app, ["tui", "--help"])
         assert result.exit_code == 0, result.output
         plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
-        assert "--run" in plain and "--read-only" in plain and "--state-dir" in plain
-        assert "--unit" in plain
+        assert "--run" in plain and "--read-only" in plain and "--unit" in plain
+        assert "--state-dir" not in plain  # the home is the home; SBXLOOP_HOME moves it
         result = runner.invoke(
-            app, ["tui", "--state-dir", str(workdir / "nowhere")], env={"COLUMNS": "300"}
+            app, ["tui"], env={"COLUMNS": "300", "SBXLOOP_HOME": str(workdir / "nowhere")}
         )
         assert result.exit_code == 2
         assert "does not exist" in result.output and "sbxloop daemon" in result.output
@@ -732,19 +708,19 @@ class TestDaemonCommand:
         assert probe.check_pypi is False
         assert probe.upgrade_command == "pipx upgrade sbxloop"
 
-    def test_state_dir_defaults_outside_cwd_and_is_announced(
+    def test_state_lives_in_the_home_and_is_announced(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """#255: daemon state is anchored to XDG state home, not a relative
-        .sbxloop that would nest run clones inside the workspace checkout."""
+        """The daemon's state is under the home, never a relative .sbxloop
+        that would nest run clones inside the checkout, and the startup
+        line names the home."""
         self.offline(monkeypatch)
         result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
         assert result.exit_code == 0, result.output
-        expected = (workdir / "xdg-state" / "sbxloop" / workdir.name).resolve()
-        assert (expected / "state.db").is_file()
+        assert home(workdir).state_db.is_file()
         assert not (workdir / ".sbxloop" / "state.db").exists()
         assert "daemon.starting" in result.output
-        assert str(expected) in result.output.replace("\n", "")
+        assert str(home(workdir).root) in result.output.replace("\n", "")
 
     def test_startup_summary_names_the_configuration(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
@@ -766,7 +742,7 @@ class TestDaemonCommand:
             "merge_method=",
             "chat=off",
             "log_level=INFO",
-            "state_dir_reason=",
+            "home=",
         ):
             assert field in line, line
         # and the run tick + orderly shutdown follow it
@@ -816,33 +792,14 @@ class TestDaemonCommand:
         assert result.exit_code == 2
         assert "daemon.invalid_option" in result.output
 
-    def test_legacy_state_dir_keeps_being_used(
-        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        seed_store(workdir)  # an existing ./.sbxloop/state.db from before the change
-        self.offline(monkeypatch)
-        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
-        assert result.exit_code == 0, result.output
-        assert "legacy" in result.output
-        assert not (workdir / "xdg-state").exists()
-
-    def test_explicit_daemon_state_dir_wins(
-        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("SBXLOOP_DAEMON__STATE_DIR", str(workdir / "elsewhere"))
-        self.offline(monkeypatch)
-        result = runner.invoke(app, ["daemon", "--repo", "o/r", "--once"])
-        assert result.exit_code == 0, result.output
-        assert (workdir / "elsewhere" / "state.db").is_file()
-
     def test_legacy_state_db_is_archived_on_start(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """A pre-1.0 daemon database (item kinds, no schema version) is moved
         aside on the first start rather than migrated; the daemon begins
         with a fresh store next to it and says so in the journal."""
-        state = workdir / "xdg-state" / "sbxloop" / workdir.name
-        state.mkdir(parents=True)
+        state = home(workdir).state
+        state.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(state / "state.db")
         conn.execute("CREATE TABLE daemon_work_items (item_id TEXT PRIMARY KEY, kind TEXT)")
         conn.execute("CREATE TABLE daemon_state (key TEXT PRIMARY KEY, value TEXT)")
@@ -868,11 +825,8 @@ class TestDaemonItemControls:
 
     @staticmethod
     def daemon_state(workdir: Path) -> Path:
-        # Where the daemon itself keeps its queue — the anchored XDG default
-        # (#255), not the runner dir's `.sbxloop`; seeding there proves the
-        # item controls follow the daemon's state-dir rule.
-        assert not (workdir / ".sbxloop" / "state.db").exists()
-        return workdir / "xdg-state" / "sbxloop" / workdir.name
+        # Where the daemon itself keeps its queue: the home's state dir.
+        return home(workdir).state
 
     def seed(self, workdir: Path) -> None:
         from sbxloop.daemon.store import DaemonStore
@@ -1094,41 +1048,37 @@ class TestDoctor:
         (row,) = [c for c in collect_checks(env) if c.name == "chat concierge"]
         assert row.ok and "ANTHROPIC_API_KEY present" in row.detail
 
-    def test_doctor_hints_at_legacy_relative_state_dir(
+    def test_doctor_fails_hard_on_a_legacy_layout(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """#224: a ``./.sbxloop`` from the former relative default is
-        silently ignored once state_dir defaults to ``~/.sbxloop``; doctor
-        must say so (soft) — unless the operator opted in explicitly."""
+        """A leftover of the layouts the home replaced is a misconfigured
+        host, not a hint: doctor fails and names the command that moves it."""
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
         monkeypatch.setenv("GH_TOKEN", "tok")
-        monkeypatch.setenv("HOME", str(workdir / "home"))
-        (workdir / ".sbxloop").mkdir()
+        (workdir / ".config" / "sbxloop").mkdir(parents=True)
         result = runner.invoke(app, ["doctor"])
-        assert result.exit_code == 0, result.output  # warn, not FAIL
-        assert "legacy state dir" in result.output
-        # rich folds the detail column, so check the remedy text unwrapped
+        assert result.exit_code != 0, result.output
+        assert "legacy layout" in result.output
         from sbxloop.cli.doctor import collect_checks
 
-        (legacy,) = [c for c in collect_checks(dict(os.environ)) if c.name == "legacy state dir"]
-        assert not legacy.ok and not legacy.hard
-        assert 'state_dir = ".sbxloop"' in legacy.detail
+        (legacy,) = [c for c in collect_checks(dict(os.environ)) if c.name == "legacy layout"]
+        assert not legacy.ok and legacy.hard
+        assert str(workdir / ".config" / "sbxloop") in legacy.detail
+        assert "sbxloop init --migrate --purge" in legacy.detail
 
-        (workdir / "sbxloop.toml").write_text('state_dir = ".sbxloop"\n')
-        result = runner.invoke(app, ["doctor"])
-        assert result.exit_code == 0, result.output
-        assert "legacy state dir" not in result.output
-
-    def test_doctor_no_legacy_hint_when_default_is_here(
+    def test_doctor_fails_on_an_uninitialised_home(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # HOME == cwd (autouse fixture): ./.sbxloop *is* the default state dir.
         monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
         monkeypatch.setenv("GH_TOKEN", "tok")
-        (workdir / ".sbxloop").mkdir()
-        result = runner.invoke(app, ["doctor"])
-        assert result.exit_code == 0, result.output
-        assert "legacy state dir" not in result.output
+        home(workdir).record.unlink()
+        from sbxloop.cli.doctor import collect_checks
+
+        (row,) = [c for c in collect_checks(dict(os.environ)) if c.name == "home"]
+        assert not row.ok and row.hard and "sbxloop init" in row.detail
+        home(workdir).write_record(sbxloop_version="x", created_by="test")
+        (row,) = [c for c in collect_checks(dict(os.environ)) if c.name == "home"]
+        assert row.ok and "layout v1" in row.detail
 
     def test_doctor_fails_without_tokens(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
@@ -1298,8 +1248,8 @@ class TestDoctor:
         git: bool | None = None,
         languages: list[str] | None = None,
     ) -> None:
-        state = workdir / ".sbxloop"
-        state.mkdir(exist_ok=True)
+        state = home(workdir).state
+        state.mkdir(parents=True, exist_ok=True)
         record: dict[str, object] = {
             "ref": ref,
             "worker_version": worker_version,
@@ -1576,7 +1526,7 @@ class TestDoctor:
         result = runner.invoke(app, ["doctor", "--deep"])
         assert result.exit_code == 0, result.output
         assert "DRIFT" not in result.output
-        cached = load_verdicts(workdir / ".sbxloop", "0.38.0")
+        cached = load_verdicts(home(workdir), "0.38.0")
         assert set(cached) == {probe.id for probe in CATALOG}
         # the scratch sandbox is gone afterwards
         assert not list((fake_sbx.state / "sandboxes").iterdir())
@@ -1599,7 +1549,7 @@ class TestDoctor:
         # A probe that still carries an `expected`; secret-env-visibility now
         # carries None, since provisioning auto-heals every answer.
         save_verdicts(
-            workdir / ".sbxloop",
+            home(workdir),
             "0.38.0",
             {
                 PROBE_WORKSPACE_MOUNT: ProbeRecord(
@@ -1809,7 +1759,7 @@ class TestRunCommand:
         assert "t1: done" in result.output
 
     def _run_start(self, workdir: Path) -> dict[str, Any]:
-        store = StateStore(workdir / ".sbxloop" / "state.db")
+        store = StateStore(home(workdir).state_db)
         (run,) = store.list_runs()
         (start,) = [event for _, event in store.events(run.run_id) if event.type == "run.start"]
         return dict(start.data)
@@ -1824,7 +1774,7 @@ class TestRunCommand:
         assert result.exit_code == 0, result.output
         # Long tmp paths soft-wrap at the console width.
         assert f"workspace: {ws.resolve()} (from --workspace)" in result.output.replace("\n", "")
-        store = StateStore(workdir / ".sbxloop" / "state.db")
+        store = StateStore(home(workdir).state_db)
         (run,) = store.list_runs()
         assert run.workspace == ws.resolve()
         assert run.mounted
@@ -1854,10 +1804,10 @@ class TestRunCommand:
         assert "run.state judging" in plain and "run.state publishing" in plain
         created = [" ".join(map(str, c)) for c in fake_sbx.invocations("create")]
         assert len(created) == 1 and "-agent" in created[0], created
-        store = StateStore(workdir / ".sbxloop" / "state.db")
+        store = StateStore(home(workdir).state_db)
         (run,) = store.list_runs()
         assert run.kind == "workload" and run.state == "completed"
-        assert run.workspace == (workdir / ".sbxloop" / "runs" / run.run_id / "workspace").resolve()
+        assert run.workspace == (home(workdir).runs / run.run_id / "workspace").resolve()
         start = self._run_start(workdir)
         assert start["kind"] == "workload" and start["workspace_source"] == "data-dir"
         # The run's closing summary and each task's output line, at the end
@@ -1925,7 +1875,7 @@ class TestRunCommand:
         assert result.exit_code == 0, result.output
         plain = result.output.replace("\n", "")
         assert "profile: bare" in plain
-        store = StateStore(workdir / ".sbxloop" / "state.db")
+        store = StateStore(home(workdir).state_db)
         (run,) = store.list_runs()
         stored = json.loads(store.get_run_config(run.run_id))
         assert stored["workload"]["default"] == "bare"
@@ -2201,13 +2151,13 @@ class TestRunCommand:
         assert "hello.txt" in result.output
         assert "readme.md" in result.output
         # the files really are on the host, inside the run workspace
-        runs = list((workdir / ".sbxloop" / "runs").iterdir())
+        runs = list((home(workdir).runs).iterdir())
         assert len(runs) == 1
         assert (runs[0] / "workspace" / "hello.txt").read_text() == "hi"
 
         # ...and the artifacts command finds them after the run (full loop:
         # executor writes -> mount propagates -> store resolves -> CLI lists)
-        run_id = StateStore(workdir / ".sbxloop" / "state.db").list_runs()[0].run_id
+        run_id = StateStore(home(workdir).state_db).list_runs()[0].run_id
         listed = runner.invoke(app, ["artifacts", run_id])
         assert listed.exit_code == 0, listed.output
         assert "hello.txt" in listed.output
@@ -2455,8 +2405,8 @@ class TestWorkspaceCloneSummary:
         from sbxloop.config import Config
         from sbxloop.engine.model import RunResult
 
-        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
-        store = StateStore(config.state_dir / "state.db")
+        config = Config.model_validate({"home": str(tmp_path / "state")})
+        store = StateStore(config.paths.state_db)
         store.create_run("r1", "improve the project")
         store.append_event(
             Event.now(
@@ -2493,8 +2443,8 @@ class TestWorkspaceCloneSummary:
         from sbxloop.config import Config
         from sbxloop.engine.model import RunResult
 
-        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
-        StateStore(config.state_dir / "state.db").create_run("r1", "x")
+        config = Config.model_validate({"home": str(tmp_path / "state")})
+        StateStore(config.paths.state_db).create_run("r1", "x")
         with app_mod.console.capture() as capture:
             app_mod._print_workspace_clone_summary(
                 RunResult(run_id="r1", state="completed"), config
@@ -3058,8 +3008,7 @@ class TestMultiRepoCli:
     def test_daemon_items_show_their_repository(self, workdir: Path) -> None:
         from sbxloop.daemon.store import DaemonStore
 
-        state = workdir / "xdg-state" / "sbxloop" / workdir.name
-        dstore = DaemonStore(state / "state.db")
+        dstore = DaemonStore(home(workdir).state_db)
         dstore.upsert_new(
             WorkItem(
                 item_id="gh:acme/alpha:issue:7",
@@ -3471,18 +3420,14 @@ class TestDoctorRepoHealthRow:
 
         from sbxloop.cli.doctor import daemon_repo_health
         from sbxloop.config import load_config_with_sources
-        from sbxloop.daemon.paths import resolve_state_dir
         from sbxloop.daemon.sources import REPO_HEALTH_KEY
         from sbxloop.daemon.store import DaemonStore
 
-        monkeypatch.setenv("XDG_STATE_HOME", str(workdir / "xdg"))
         (workdir / "sbxloop.toml").write_text('[[github.repos]]\nrepo = "acme/alpha"\n')
         config, sources = load_config_with_sources()
         env = dict(os.environ)
         assert daemon_repo_health(config, sources, env) == {}
-        state_dir = resolve_state_dir(config, sources, cwd=workdir, env=env, home=Path.home()).path
-        state_dir.mkdir(parents=True, exist_ok=True)
-        store = DaemonStore(state_dir / "state.db")
+        store = DaemonStore(config.paths.state_db)
         store.set_value(
             REPO_HEALTH_KEY + "acme/alpha", json.dumps({"suspended": True, "reason": "x"})
         )

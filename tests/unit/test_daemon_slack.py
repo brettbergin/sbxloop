@@ -111,9 +111,9 @@ def make_bridge(
     **slack: Any,
 ) -> tuple[SlackBridge, FakeSlackClient, FakeLoop]:
     config = Config.model_validate(
-        {"state_dir": str(tmp_path / "state"), "slack": {"channel_id": CHANNEL, **slack}}
+        {"home": str(tmp_path / "state"), "slack": {"channel_id": CHANNEL, **slack}}
     )
-    dstore = DaemonStore(config.state_dir / "state.db")
+    dstore = DaemonStore(config.paths.state_db)
     floop = FakeLoop(dstore)
     holder: dict[str, FakeSlackClient] = {}
 
@@ -168,9 +168,9 @@ def thread_of(bridge: SlackBridge, run_id: str = "r1") -> ChatThread:
 class TestCredentials:
     def test_both_tokens_are_required(self, tmp_path: Path) -> None:
         config = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "slack": {"channel_id": CHANNEL}}
+            {"home": str(tmp_path / "state"), "slack": {"channel_id": CHANNEL}}
         )
-        dstore = DaemonStore(config.state_dir / "state.db")
+        dstore = DaemonStore(config.paths.state_db)
         with pytest.raises(DaemonError, match="SLACK_BOT_TOKEN is not set"):
             SlackBridge(config, dstore, bot_token="", app_token="xapp").start()
         with pytest.raises(DaemonError, match="SLACK_BOT_TOKEN and SLACK_APP_TOKEN are not set"):
@@ -182,9 +182,9 @@ class TestCredentials:
         monkeypatch.setenv("SLACK_BOT_TOKEN", "xoxb-env")
         monkeypatch.setenv("SLACK_APP_TOKEN", "xapp-env")
         config = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "slack": {"channel_id": CHANNEL}}
+            {"home": str(tmp_path / "state"), "slack": {"channel_id": CHANNEL}}
         )
-        bridge = SlackBridge(config, DaemonStore(config.state_dir / "state.db"))
+        bridge = SlackBridge(config, DaemonStore(config.paths.state_db))
         assert (bridge.bot_token, bridge.app_token) == ("xoxb-env", "xapp-env")
 
     def test_tokens_never_reach_the_log(
@@ -530,9 +530,9 @@ class TestFailures:
 
     def test_connect_failure_degrades_without_crashing(self, tmp_path: Path) -> None:
         config = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "slack": {"channel_id": CHANNEL}}
+            {"home": str(tmp_path / "state"), "slack": {"channel_id": CHANNEL}}
         )
-        dstore = DaemonStore(config.state_dir / "state.db")
+        dstore = DaemonStore(config.paths.state_db)
 
         def factory(b: SlackBridge) -> FakeSlackClient:
             client = FakeSlackClient(b)

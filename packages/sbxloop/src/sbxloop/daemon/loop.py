@@ -1077,7 +1077,7 @@ class DaemonLoop:
         try:
             result = prune_run_dirs(
                 self.store,
-                self.config.state_dir,
+                self.config.paths,
                 older_than_s=days * DAY_S,
                 now=now,
                 actor="daemon",
@@ -1085,7 +1085,7 @@ class DaemonLoop:
         except Exception:
             log.warning(
                 "daemon.gc_failed",
-                state_dir=str(self.config.state_dir),
+                home=str(self.config.home),
                 retention_days=days,
                 exc_info=True,
             )

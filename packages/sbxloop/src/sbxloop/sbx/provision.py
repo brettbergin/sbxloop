@@ -435,7 +435,7 @@ class Provisioner:
                     self._sbx_version = self.cli.version()
                     self._sbx_version_known = True
                 record_field_verdict(
-                    self.config.state_dir, self._sbx_version, probe_id, verdict, detail
+                    self.config.paths, self._sbx_version, probe_id, verdict, detail
                 )
         except Exception:
             log.debug("conformance.record_failed", probe=probe_id, verdict=verdict, exc_info=True)
@@ -841,7 +841,7 @@ class Provisioner:
         """Where a ``workload`` run works (#755): the same per-run directory
         an unconfigured code run gets, which is harvested — not mounted as
         the work — when the run ends."""
-        return (self.config.state_dir / "runs" / run_id / "workspace").resolve()
+        return self.config.paths.run_workspace(run_id).resolve()
 
     def _run_repo(self, repo: str | None) -> str | None:
         """The ``owner/name`` this run acts on, or None when there is none."""
@@ -923,14 +923,10 @@ class Provisioner:
                 f"workspace {source} is a git repository with no commits; commit "
                 "something first, or set workspace_isolation = 'in-place'"
             )
-        # The tool's own state directory is run state, not user content:
-        # any sbxloop command run from inside the checkout drops a relative
-        # ".sbxloop" there, and that must not trip the isolation refusal.
-        # Both the configured state-dir name and the default are ignored —
-        # a different invocation with default config may have dropped the
-        # default name even when this run's state_dir points elsewhere.
-        ignore = {self.config.state_dir.name, ".sbxloop"}
-        dirty = hostgit.is_dirty(source, ignore=sorted(ignore))
+        # A ".sbxloop" inside the checkout is the agent's own scratch (the
+        # PR body, the dependency cache) or a leftover of the former relative
+        # state dir, never user content: it must not trip the refusal.
+        dirty = hostgit.is_dirty(source, ignore=[".sbxloop"])
         if dirty and mode == "auto":
             raise ProvisionError(
                 f"workspace {source} has uncommitted changes; sbxloop isolates "
@@ -1985,7 +1981,7 @@ class Provisioner:
                 version = self._sbx_version
         except SbxError:
             return None  # undecided, not cached: probe as before
-        record = load_verdicts(self.config.state_dir, version).get(probe_id)
+        record = load_verdicts(self.config.paths, version).get(probe_id)
         return record.verdict if record is not None else None
 
     def _stdin_env_supported(self, sandbox: Sandbox) -> bool:

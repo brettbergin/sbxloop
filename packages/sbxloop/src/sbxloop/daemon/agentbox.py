@@ -33,6 +33,7 @@ from sbxloop.config import Config
 from sbxloop.errors import DaemonError, SbxError, SbxloopError, WorkerError
 from sbxloop.events import EventBus
 from sbxloop.log import get_logger
+from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import Sandbox
@@ -50,10 +51,10 @@ CONCIERGE_RUN_ID = "concierge"
 REPROVISION_MIN_INTERVAL_S = 300.0
 
 
-def sandbox_name_for(state_dir: Path) -> str:
-    """Per-instance sandbox name (the state dir is the daemon's identity,
+def sandbox_name_for(home: SbxloopHome) -> str:
+    """Per-instance sandbox name (the home is the daemon's identity,
     see ``sbxloop.daemon.github.sandbox_name_for``)."""
-    digest = hashlib.sha256(str(state_dir.resolve()).encode()).hexdigest()[:8]
+    digest = hashlib.sha256(str(home.root.resolve()).encode()).hexdigest()[:8]
     return f"{SANDBOX_NAME_PREFIX}-{digest}"
 
 
@@ -74,7 +75,7 @@ class DaemonAgent:
         self.bus = bus
         self.worker_python = worker_python
         self.install_workers = install_workers
-        self.name = name or sandbox_name_for(config.state_dir)
+        self.name = name or sandbox_name_for(config.paths)
         self.clock = clock
         self._last_reprovision_at: float | None = None
         self.provisioner = Provisioner(sbx, config, bus=bus)
@@ -85,7 +86,7 @@ class DaemonAgent:
     def workspace(self) -> Path:
         # Scratch: the concierge never edits code; everything it can do is
         # a host tool. sbx create still needs a workspace mount.
-        return (self.config.state_dir / "daemon" / "concierge-workspace").resolve()
+        return self.config.paths.concierge_workspace.resolve()
 
     # -- access ------------------------------------------------------------
 

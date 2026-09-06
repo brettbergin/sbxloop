@@ -26,7 +26,7 @@ pytestmark = pytest.mark.skipif(
 def _config(tmp_path: Path, repos: list[dict[str, object]], **sandbox: object) -> Config:
     return Config.model_validate(
         {
-            "state_dir": str(tmp_path / "state"),
+            "home": str(tmp_path / "state"),
             "github": {"repos": repos},
             "sandbox": {"workspace_isolation": "clone", **sandbox},
         }

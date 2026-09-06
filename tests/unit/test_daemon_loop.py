@@ -134,10 +134,10 @@ class Harness:
     def __init__(self, tmp_path: Path, config: Config | None = None) -> None:
         self.tmp_path = tmp_path
         self.config = config or Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "github": {"repo": "o/r"}}
+            {"home": str(tmp_path / "state"), "github": {"repo": "o/r"}}
         )
-        self.store = StateStore(self.config.state_dir / "state.db")
-        self.dstore = DaemonStore(self.config.state_dir / "state.db")
+        self.store = StateStore(self.config.paths.state_db)
+        self.dstore = DaemonStore(self.config.paths.state_db)
         self.clock = Clock()
         # per run: "merged" | "failed" | "blocked" | "completed" | "raise" | "die_mid_phase"
         self.outcomes: list[str] = []
@@ -278,7 +278,7 @@ class TestTick:
 
     def test_daily_cap_blocks_dispatch(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"max_runs_per_day": 1}}
+            {"home": str(tmp_path / "state"), "daemon": {"max_runs_per_day": 1}}
         )
         h = Harness(tmp_path, cfg)
         h.source.items = [gh_item("1"), gh_item("2")]
@@ -293,7 +293,7 @@ class TestTick:
     def test_retry_then_give_up_at_cap(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "daemon": {"max_attempts_per_item": 2, "retry_backoff_s": 10},
             }
         )
@@ -346,7 +346,7 @@ class TestTick:
     def test_circuit_breaker_opens_cools_and_resets(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "daemon": {
                     "max_attempts_per_item": 1,
                     "max_consecutive_failures": 2,
@@ -383,7 +383,7 @@ class TestGuardrailsAreDaemonWide:
     def _multi_repo(tmp_path: Path, daemon: dict[str, Any]) -> Config:
         return Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {"repos": [{"repo": "o/a"}, {"repo": "o/b"}]},
                 "daemon": daemon,
             }
@@ -517,7 +517,7 @@ class TestSettle:
         assert item.last_error == "run ended completed without landing"
 
     def test_completed_without_a_repository_is_done(self, tmp_path: Path) -> None:
-        cfg = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        cfg = Config.model_validate({"home": str(tmp_path / "state")})
         h = Harness(tmp_path, cfg)
         h.source.items = [gh_item()]
         h.outcomes = ["completed"]
@@ -526,7 +526,7 @@ class TestSettle:
 
     def test_a_failed_run_carries_its_reason(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
+            {"home": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
         )
         h = Harness(tmp_path, cfg)
         h.source.items = [gh_item()]
@@ -593,7 +593,7 @@ class TestOutcomeContext:
 
     def harness(self, tmp_path: Path, **budgets: Any) -> Harness:
         cfg = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "github": {"repo": "o/r"}, "budgets": budgets}
+            {"home": str(tmp_path / "state"), "github": {"repo": "o/r"}, "budgets": budgets}
         )
         h = Harness(tmp_path, cfg)
         h.source = ContextSource()
@@ -700,7 +700,7 @@ class TestOutcomeContext:
     def test_item_config_pins_the_issue_and_nothing_else(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {"repo": "o/r", "create_repo": True},
                 "keep_on_failure": True,
             }
@@ -763,7 +763,7 @@ class TestOperatorCancel:
     def test_cancel_settles_item_as_cancelled_not_failed(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "daemon": {"max_attempts_per_item": 3, "max_consecutive_failures": 1},
             }
         )
@@ -791,7 +791,7 @@ class TestOperatorCancel:
 
     def test_cancel_with_retry_requeues_without_backoff(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"retry_backoff_s": 900}}
+            {"home": str(tmp_path / "state"), "daemon": {"retry_backoff_s": 900}}
         )
         h = Harness(tmp_path, cfg)
         h.source.items = [gh_item()]
@@ -917,7 +917,7 @@ class TestOperatorCancel:
 
     def test_retry_settled_item_is_attributed(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
+            {"home": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
         )
         h = Harness(tmp_path, cfg)
         h.source.items = [gh_item()]
@@ -991,7 +991,7 @@ class TestShutdownAndRecovery:
         persisted state is still resumable is interrupted; a run that
         actually failed settles as a failure."""
         cfg = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
+            {"home": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
         )
         h = Harness(tmp_path, cfg)
         h.source.items = [gh_item()]
@@ -1199,7 +1199,7 @@ class TestShutdownAndRecovery:
         guardrail tick() enforces (#254): a daemon restarting into an open
         breaker, a spent cap, or an operator pause resumed anyway."""
         cfg = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"max_runs_per_day": 1}}
+            {"home": str(tmp_path / "state"), "daemon": {"max_runs_per_day": 1}}
         )
         h = Harness(tmp_path, cfg)
         self._interrupted(h)
@@ -1225,7 +1225,7 @@ class TestShutdownAndRecovery:
         ``max_resumes_per_item`` the interrupted run is a failed attempt."""
         cfg = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "daemon": {"max_resumes_per_item": 1, "max_attempts_per_item": 2},
             }
         )
@@ -1248,7 +1248,7 @@ class TestShutdownAndRecovery:
 
     def test_zero_resume_budget_never_resumes(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"max_resumes_per_item": 0}}
+            {"home": str(tmp_path / "state"), "daemon": {"max_resumes_per_item": 0}}
         )
         h = Harness(tmp_path, cfg)
         self._interrupted(h)
@@ -1260,7 +1260,7 @@ class TestShutdownAndRecovery:
         reset it every time and the "pause dispatch" it promised never
         happened (#254)."""
         cfg = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"max_consecutive_failures": 1}}
+            {"home": str(tmp_path / "state"), "daemon": {"max_consecutive_failures": 1}}
         )
         h = Harness(tmp_path, cfg)
         h.source.items = [gh_item("1")]
@@ -1317,7 +1317,7 @@ class TestSourceBackoff:
 
     def test_recover_failed_run_takes_failure_path(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 3}}
+            {"home": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 3}}
         )
         h = Harness(tmp_path, cfg)
         h.dstore.upsert_new(gh_item(), now=1.0)
@@ -1451,7 +1451,7 @@ class TestOperatorItemControls:
 
     def test_loop_retry_then_dispatch_is_a_fresh_plan(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
+            {"home": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
         )
         h = Harness(tmp_path, cfg)
         h.source.items = [gh_item()]
@@ -1605,7 +1605,7 @@ class TestOperatorItemControls:
         The row carries the debt; the next tick pays it before the fresh
         dispatch — once."""
         cfg = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
+            {"home": str(tmp_path / "state"), "daemon": {"max_attempts_per_item": 1}}
         )
         h = Harness(tmp_path, cfg)
         h.source.items = [gh_item()]
@@ -1677,7 +1677,7 @@ class TestWorkspacePosture:
     def _config(tmp_path: Path, workspace: Path, **daemon: Any) -> Config:
         return Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {"repo": "o/r"},
                 "sandbox": {"workspace": str(workspace)},
                 "daemon": daemon,
@@ -1930,7 +1930,7 @@ class TestRunCapDayWindow:
     def _capped_harness(tmp_path: Path, tz: str = "UTC") -> Harness:
         cfg = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "daemon": {"max_runs_per_day": 1, "run_cap_timezone": tz},
             }
         )
@@ -1955,7 +1955,7 @@ class TestRunCapDayWindow:
         """23h after a 00:30 run it is still the same calendar day, so the
         slot is not freed — a rolling window would have released it."""
         cfg = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"max_runs_per_day": 1}}
+            {"home": str(tmp_path / "state"), "daemon": {"max_runs_per_day": 1}}
         )
         h = Harness(tmp_path, cfg)
         h.clock.t = datetime(2024, 3, 5, 0, 30, tzinfo=UTC).timestamp()
@@ -1968,7 +1968,7 @@ class TestRunCapDayWindow:
 
     def test_run_just_before_boundary_does_not_free_a_slot_early(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"max_runs_per_day": 1}}
+            {"home": str(tmp_path / "state"), "daemon": {"max_runs_per_day": 1}}
         )
         h = Harness(tmp_path, cfg)
         h.clock.t = datetime(2024, 3, 5, 23, 30, tzinfo=UTC).timestamp()
@@ -2151,7 +2151,7 @@ class TestStaleRunReconciliation:
     @staticmethod
     def _stale_harness(tmp_path: Path) -> Harness:
         config = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"run_stale_after_s": 3600.0}}
+            {"home": str(tmp_path / "state"), "daemon": {"run_stale_after_s": 3600.0}}
         )
         return Harness(tmp_path, config)
 
@@ -2195,7 +2195,7 @@ class TestStaleRunReconciliation:
 
     def test_zero_threshold_disables_the_sweep(self, tmp_path: Path) -> None:
         config = Config.model_validate(
-            {"state_dir": str(tmp_path / "state"), "daemon": {"run_stale_after_s": 0}}
+            {"home": str(tmp_path / "state"), "daemon": {"run_stale_after_s": 0}}
         )
         h = Harness(tmp_path, config)
         h.store.create_run("r_stale", "x")
@@ -2239,7 +2239,7 @@ class TestMultiRepoItemRouting:
     def _harness(self, tmp_path: Path) -> Harness:
         cfg = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {
                     "repos": [
                         {"repo": "o/a"},
@@ -2294,7 +2294,7 @@ class TestPerRepoWorkspaceRefresh:
     def _two_repo_config(tmp_path: Path, ws_a: Path, ws_b: Path) -> Config:
         return Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {
                     "repos": [
                         {"repo": "o/a", "workspace": str(ws_a)},
@@ -2335,7 +2335,7 @@ class TestPerRepoWorkspaceRefresh:
         _a_up, a_ws = make_upstream_and_clone(_mkdir(tmp_path / "a"))
         cfg = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {
                     "repos": [
                         {"repo": "o/a", "workspace": str(a_ws)},
@@ -2358,7 +2358,7 @@ class TestPerRepoWorkspaceRefresh:
         git_cmd("remote", "set-url", "origin", "https://github.com/o/a", cwd=checkout)
         cfg = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {"repos": [{"repo": "o/b", "workspace": str(checkout)}]},
             }
         )
@@ -2575,7 +2575,7 @@ class TestExhaustedRuns:
     def _harness(self, tmp_path: Path, **overrides: Any) -> Harness:
         cfg = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "github": {"repo": "o/r"},
                 "daemon": {"max_attempts_per_item": 2, "retry_backoff_s": 100},
                 **overrides,
@@ -3119,7 +3119,7 @@ class TestWorkloadIntake:
         assert anonymous.endswith("a chat ask by an operator.")
 
     def test_a_chat_item_runs_to_done_without_github(self, tmp_path: Path) -> None:
-        cfg = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        cfg = Config.model_validate({"home": str(tmp_path / "state")})
         h = Harness(tmp_path, cfg)
         h.source.name = "chat"
         h.source.items = [

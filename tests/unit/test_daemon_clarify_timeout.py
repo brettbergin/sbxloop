@@ -197,12 +197,12 @@ class TestConfigDrivesTheWait:
 
         config = Config.model_validate(
             {
-                "state_dir": str(tmp_path / "state"),
+                "home": str(tmp_path / "state"),
                 "discord": {"channel_id": 42},
                 "concierge": {"clarify_ttl_s": 120},
             }
         )
-        dstore = DaemonStore(config.state_dir / "state.db")
+        dstore = DaemonStore(config.paths.state_db)
         client = FakeClient(42)
         bridge = DiscordBridge(
             config,

@@ -340,7 +340,7 @@ def test_detection(fixture: str) -> None:
 @pytest.mark.parametrize("fixture", sorted(EXPECTATIONS))
 def test_agent_allowlist(fixture: str, fake_sbx: FakeSbx, tmp_path: Path) -> None:
     expected = EXPECTATIONS[fixture]
-    config = Config.model_validate({"state_dir": str(tmp_path / "state")})
+    config = Config.model_validate({"home": str(tmp_path / "state")})
     provisioner = Provisioner(SbxCLI(binary=str(fake_sbx.binary)), config, env={})
     workspace = FIXTURES / fixture
     resolved = provisioner.resolve_languages(workspace)

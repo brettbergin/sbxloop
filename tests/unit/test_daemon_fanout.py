@@ -131,8 +131,8 @@ def test_set_concierge_reaches_every_bridge() -> None:
 
 
 def test_build_frontend_headless_is_the_local_bridge_alone(tmp_path: Path) -> None:
-    config = Config.model_validate({"state_dir": str(tmp_path / "state")})
-    dstore = DaemonStore(config.state_dir / "state.db")
+    config = Config.model_validate({"home": str(tmp_path / "state")})
+    dstore = DaemonStore(config.paths.state_db)
     frontend = build_frontend(config, dstore)
     assert [b.backend for b in frontend.bridges] == ["local"]
     assert isinstance(frontend.bridge_for("local"), LocalBridge)
@@ -142,10 +142,8 @@ def test_build_frontend_headless_is_the_local_bridge_alone(tmp_path: Path) -> No
 def test_build_frontend_starts_the_local_bridge_first(tmp_path: Path) -> None:
     """The local bridge is ready at once and must not wait behind a gateway
     connect; the external bridge is still the primary for prose links."""
-    config = Config.model_validate(
-        {"state_dir": str(tmp_path / "state"), "discord": {"channel_id": 42}}
-    )
-    dstore = DaemonStore(config.state_dir / "state.db")
+    config = Config.model_validate({"home": str(tmp_path / "state"), "discord": {"channel_id": 42}})
+    dstore = DaemonStore(config.paths.state_db)
     frontend = build_frontend(config, dstore)
     assert [b.backend for b in frontend.bridges] == ["local", "discord"]
     assert frontend.primary is not None and frontend.primary.backend == "discord"

@@ -199,7 +199,7 @@ def make(
     on_watch: Callable[[str, str], str | None] | None = None,
 ) -> tuple[Concierge, FakeClient, FakeHost, LoopWithRuns, DaemonStore]:
     raw: dict[str, Any] = {
-        "state_dir": str(tmp_path / "state"),
+        "home": str(tmp_path / "state"),
         "discord": {"channel_id": 42},
     }
     if github is not None:
@@ -212,7 +212,7 @@ def make(
         # An explicit repo list replaces the single-repo default above.
         raw["github"].pop("repo", None)
     cfg = Config.model_validate(raw)
-    dstore = DaemonStore(cfg.state_dir / "state.db")
+    dstore = DaemonStore(cfg.paths.state_db)
     loop = LoopWithRuns(dstore)
     client = FakeClient(scripts)
     host = FakeHost(client)
@@ -220,7 +220,7 @@ def make(
         cfg,
         loop=loop,  # type: ignore[arg-type]
         dstore=dstore,
-        store_factory=lambda: StateStore(cfg.state_dir / "state.db"),
+        store_factory=lambda: StateStore(cfg.paths.state_db),
         github=github,  # type: ignore[arg-type]
         host=host,
         bus=EventBus(),
@@ -367,7 +367,7 @@ class TestTools:
         assert resp.text.startswith("(command not accepted)")
 
     def _seed_run(self, tmp_path: Path, dstore: DaemonStore, loop: LoopWithRuns) -> StateStore:
-        store = StateStore(tmp_path / "state" / "state.db")
+        store = StateStore(tmp_path / "state" / "state" / "state.db")
         store.create_run("r1abcdefg", "Ship the widget")
         store.save_tasks(
             "r1abcdefg",
@@ -1952,7 +1952,7 @@ class TestWatchRun:
             [{"calls": [("watch_run", {"run_id_or_item_id": "r7abcdefg"})]}],
             on_watch=on_watch,
         )
-        store = StateStore(tmp_path / "state" / "state.db")
+        store = StateStore(tmp_path / "state" / "state" / "state.db")
         store.create_run("r7abcdefg", "Ship it")
         store.set_run_state("r7abcdefg", "building")
         turn(concierge, author="alice")
@@ -1968,7 +1968,7 @@ class TestWatchRun:
             [{"calls": [("watch_run", {"run_id_or_item_id": "r8abcdefg"})]}],
             on_watch=on_watch,
         )
-        store = StateStore(tmp_path / "state" / "state.db")
+        store = StateStore(tmp_path / "state" / "state" / "state.db")
         store.create_run("r8abcdefg", "widget shipped")
         store.set_run_state("r8abcdefg", "completed")
         loop.reports["r8abcdefg"] = RunReport(
@@ -1991,7 +1991,7 @@ class TestWatchRun:
             [{"calls": [("watch_run", {"run_id_or_item_id": "inbox:w.md"})]}],
             on_watch=on_watch,
         )
-        store = StateStore(tmp_path / "state" / "state.db")
+        store = StateStore(tmp_path / "state" / "state" / "state.db")
         for run_id in ("r1abcdefg", "r2abcdefg"):
             store.create_run(run_id, "Ship it")
         store.set_run_state("r1abcdefg", "failed")
@@ -2019,7 +2019,7 @@ class TestWatchRun:
         concierge, client, _, _, _ = make(
             tmp_path, [{"calls": [("watch_run", {"run_id_or_item_id": "r9abcdefg"})]}]
         )
-        store = StateStore(tmp_path / "state" / "state.db")
+        store = StateStore(tmp_path / "state" / "state" / "state.db")
         store.create_run("r9abcdefg", "Ship it")
         store.set_run_state("r9abcdefg", "building")
         turn(concierge)
@@ -2038,7 +2038,7 @@ class TestTypedGithubIds:
     """Item ids are rendered typed and accepted in either spelling."""
 
     def _seed(self, tmp_path: Path, dstore: DaemonStore, loop: LoopWithRuns) -> None:
-        store = StateStore(tmp_path / "state" / "state.db")
+        store = StateStore(tmp_path / "state" / "state" / "state.db")
         store.create_run("r1abcdefg", "Ship the widget")
         store.set_run_state("r1abcdefg", "building")
         item = WorkItem(item_id="gh:issue:12", source_key="12", title="Widget")

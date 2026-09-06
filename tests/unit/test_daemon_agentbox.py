@@ -47,7 +47,7 @@ def make_agent(
 ) -> DaemonAgent:
     for key, value in TOKENS.items():
         monkeypatch.setenv(key, value)
-    settings: dict[str, object] = {"state_dir": str(tmp_path / "state")}
+    settings: dict[str, object] = {"home": str(tmp_path / "state")}
     if backend is not None:
         settings["agent"] = {"backend": backend}
     config = Config.model_validate(settings)
@@ -68,14 +68,14 @@ def created_names(fake_sbx: FakeSbx) -> list[str]:
 
 class TestNaming:
     def test_name_is_per_state_dir_and_stable(self, tmp_path: Path) -> None:
-        a = Config.model_validate({"state_dir": str(tmp_path / "a")})
-        b = Config.model_validate({"state_dir": str(tmp_path / "b")})
+        a = Config.model_validate({"home": str(tmp_path / "a")})
+        b = Config.model_validate({"home": str(tmp_path / "b")})
         agent_a = DaemonAgent(a, sbx=object(), bus=EventBus(), worker_python="python3")  # type: ignore[arg-type]
         agent_b = DaemonAgent(b, sbx=object(), bus=EventBus(), worker_python="python3")  # type: ignore[arg-type]
         assert agent_a.name != agent_b.name
         assert agent_a.name.startswith(SANDBOX_NAME_PREFIX + "-")
-        assert agent_a.name == sandbox_name_for(a.state_dir)
-        assert agent_a.workspace == (a.state_dir / "daemon" / "concierge-workspace").resolve()
+        assert agent_a.name == sandbox_name_for(a.paths)
+        assert agent_a.workspace == (a.paths.daemon / "concierge-workspace").resolve()
 
 
 class TestLifecycle:

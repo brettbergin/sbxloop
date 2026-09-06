@@ -1,4 +1,5 @@
-"""`.env` loading tests: precedence, hermeticity, and the committed example."""
+"""``secrets.env`` loading: one file in the home, hermeticity, and the
+committed example."""
 
 from __future__ import annotations
 
@@ -8,7 +9,8 @@ from pathlib import Path
 import pytest
 from dotenv import dotenv_values
 
-from sbxloop.config import Config, load_config, load_dotenv_file
+from sbxloop.config import Config, load_config, load_secrets_env
+from sbxloop.paths import HOME_ENV, SbxloopHome
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -17,7 +19,7 @@ SENTINEL = "SBXLOOP_TEST_DOTENV_SENTINEL"
 
 @pytest.fixture(autouse=True)
 def _clean_sentinels(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Ensure vars our .env files set never leak across tests."""
+    """Ensure vars our secrets files set never leak across tests."""
     for name in (SENTINEL, "SBXLOOP_MODEL", "COPILOT_GITHUB_TOKEN"):
         monkeypatch.delenv(name, raising=False)
     yield  # type: ignore[misc]
@@ -25,34 +27,74 @@ def _clean_sentinels(monkeypatch: pytest.MonkeyPatch) -> None:
     os.environ.pop("SBXLOOP_MODEL", None)
 
 
-class TestLoadDotenvFile:
-    def test_loads_values_into_environ(self, tmp_path: Path) -> None:
-        (tmp_path / ".env").write_text(f"{SENTINEL}=from-dotenv\n")
-        loaded = load_dotenv_file(tmp_path)
-        assert loaded == tmp_path / ".env"
-        assert os.environ[SENTINEL] == "from-dotenv"
+def secrets_file(root: Path, text: str) -> Path:
+    home = SbxloopHome(root)
+    home.config.mkdir(parents=True, exist_ok=True)
+    home.secrets_env.write_text(text)
+    return home.secrets_env
+
+
+class TestLoadSecretsEnv:
+    def test_loads_the_homes_file_into_environ(self, tmp_path: Path) -> None:
+        # HOME is tmp_path (autouse fixture), so the home is tmp_path/.sbxloop.
+        path = secrets_file(tmp_path / ".sbxloop", f"{SENTINEL}=from-secrets\n")
+        assert load_secrets_env() == path
+        assert os.environ[SENTINEL] == "from-secrets"
 
     def test_real_environment_wins(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv(SENTINEL, "from-real-env")
-        (tmp_path / ".env").write_text(f"{SENTINEL}=from-dotenv\n")
-        load_dotenv_file(tmp_path)
+        secrets_file(tmp_path / ".sbxloop", f"{SENTINEL}=from-secrets\n")
+        load_secrets_env()
         assert os.environ[SENTINEL] == "from-real-env"
 
-    def test_missing_file_is_noop(self, tmp_path: Path) -> None:
-        assert load_dotenv_file(tmp_path) is None
+    def test_missing_file_is_noop(self) -> None:
+        assert load_secrets_env() is None
+
+    def test_sbxloop_home_relocates_the_file(self, tmp_path: Path) -> None:
+        path = secrets_file(tmp_path / "elsewhere", f"{SENTINEL}=moved\n")
+        assert load_secrets_env({HOME_ENV: str(tmp_path / "elsewhere")}) == path
+        assert os.environ[SENTINEL] == "moved"
+
+    def test_hermetic_mapping_reads_nothing(self, tmp_path: Path) -> None:
+        secrets_file(tmp_path / ".sbxloop", f"{SENTINEL}=from-secrets\n")
+        assert load_secrets_env({}) is None
+        assert SENTINEL not in os.environ
 
 
 class TestConfigIntegration:
-    def test_load_config_reads_dotenv_settings(self, tmp_path: Path) -> None:
-        (tmp_path / ".env").write_text("SBXLOOP_MODEL=dotenv-model\n")
-        config = load_config(cwd=tmp_path)  # env=None -> real environ + .env
-        assert config.model == "dotenv-model"
+    def test_load_config_reads_secrets_settings(self, tmp_path: Path) -> None:
+        secrets_file(tmp_path / ".sbxloop", "SBXLOOP_MODEL=secrets-model\n")
+        config = load_config(cwd=tmp_path)  # env=None -> real environ + secrets.env
+        assert config.model == "secrets-model"
 
     def test_explicit_env_mapping_stays_hermetic(self, tmp_path: Path) -> None:
-        (tmp_path / ".env").write_text("SBXLOOP_MODEL=dotenv-model\n")
+        secrets_file(tmp_path / ".sbxloop", "SBXLOOP_MODEL=secrets-model\n")
         config = load_config(cwd=tmp_path, env={})
-        assert config.model == "auto"  # .env not consulted
+        assert config.model == "auto"  # secrets.env not consulted
         assert "SBXLOOP_MODEL" not in os.environ  # and not loaded at all
+
+
+class TestTrustBoundary:
+    """A working-directory ``.env`` is never the loop's: a checkout's belongs
+    to the application in it, and there is no runner directory any more."""
+
+    def test_dotenv_in_the_working_directory_is_never_read(self, tmp_path: Path) -> None:
+        work = tmp_path / "work"
+        work.mkdir()
+        (work / ".env").write_text(f"{SENTINEL}=the-applications-secret\n")
+        assert load_secrets_env() is None
+        assert SENTINEL not in os.environ
+        config = load_config(cwd=work)
+        assert config.model == "auto"
+
+    def test_dotenv_inside_a_checkout_is_never_read(self, tmp_path: Path) -> None:
+        from tests.unit.test_hostgit import make_repo
+
+        root = make_repo(tmp_path)
+        (root / ".env").write_text("SBXLOOP_MODEL=from-the-app\n")
+        config = load_config(cwd=root)
+        assert config.model == "auto"
+        assert "SBXLOOP_MODEL" not in os.environ
 
 
 class TestEnvExample:
@@ -77,10 +119,11 @@ class TestEnvExample:
             assert name in text
         assert all(not v for v in values.values())  # placeholders ship empty
 
-    def test_example_documents_daemon_host_layout(self) -> None:
+    def test_example_documents_where_it_lives(self) -> None:
         text = (REPO_ROOT / ".env.example").read_text()
-        assert "~/.config/sbxloop/secrets.env" in text
+        assert "~/.sbxloop/config/secrets.env" in text
         assert "0600" in text
+        assert "~/.config/sbxloop" not in text
 
     def test_example_names_every_credential_env_var_the_code_reads(self) -> None:
         from sbxloop.daemon.discord import TOKEN_ENV as DISCORD_TOKEN_ENV
@@ -112,50 +155,3 @@ class TestEnvExample:
         config = load_config(cwd=tmp_path, env=env)
         assert isinstance(config, Config)
         assert config.github.repo == "you/your-repo"
-
-
-class TestTrustBoundary:
-    """A checkout's ``.env`` belongs to the application in it, never to the
-    loop (#671); the operator's lives next to the user config."""
-
-    def test_dotenv_inside_a_checkout_is_never_read(self, tmp_path: Path) -> None:
-        from tests.unit.test_hostgit import make_repo
-
-        root = make_repo(tmp_path)
-        (root / ".env").write_text(f"{SENTINEL}=the-applications-secret\n")
-        assert load_dotenv_file(root, env={}) is None
-        assert SENTINEL not in os.environ
-        sub = root / "src"
-        sub.mkdir()
-        (sub / ".env").write_text(f"{SENTINEL}=deeper\n")
-        assert load_dotenv_file(sub, env={}) is None
-        assert SENTINEL not in os.environ
-
-    def test_load_config_from_a_checkout_ignores_its_dotenv(self, tmp_path: Path) -> None:
-        from tests.unit.test_hostgit import make_repo
-
-        root = make_repo(tmp_path)
-        (root / ".env").write_text("SBXLOOP_MODEL=from-the-app\n")
-        config = load_config(cwd=root)  # env=None -> real environ + .env files
-        assert config.model == "auto"
-        assert "SBXLOOP_MODEL" not in os.environ
-
-    def test_user_config_dotenv_is_read(self, tmp_path: Path) -> None:
-        home = tmp_path / "home"
-        (home / ".config" / "sbxloop").mkdir(parents=True)
-        (home / ".config" / "sbxloop" / ".env").write_text(f"{SENTINEL}=from-user-config\n")
-        work = tmp_path / "work"
-        work.mkdir()
-        loaded = load_dotenv_file(work, env={"HOME": str(home)})
-        assert loaded == home / ".config" / "sbxloop" / ".env"
-        assert os.environ[SENTINEL] == "from-user-config"
-
-    def test_working_directory_dotenv_outranks_the_user_one(self, tmp_path: Path) -> None:
-        home = tmp_path / "home"
-        (home / ".config" / "sbxloop").mkdir(parents=True)
-        (home / ".config" / "sbxloop" / ".env").write_text(f"{SENTINEL}=from-user-config\n")
-        work = tmp_path / "work"
-        work.mkdir()
-        (work / ".env").write_text(f"{SENTINEL}=from-the-runner-dir\n")
-        assert load_dotenv_file(work, env={"HOME": str(home)}) == work / ".env"
-        assert os.environ[SENTINEL] == "from-the-runner-dir"

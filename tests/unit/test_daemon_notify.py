@@ -53,13 +53,13 @@ class Recorder:
 
 def _discord(tmp_path: Path, channel_id: int = 123) -> Config:
     return Config.model_validate(
-        {"state_dir": str(tmp_path / "state"), "discord": {"channel_id": channel_id}}
+        {"home": str(tmp_path / "state"), "discord": {"channel_id": channel_id}}
     )
 
 
 def _slack(tmp_path: Path) -> Config:
     return Config.model_validate(
-        {"state_dir": str(tmp_path / "state"), "slack": {"channel_id": "C0123ABCDEF"}}
+        {"home": str(tmp_path / "state"), "slack": {"channel_id": "C0123ABCDEF"}}
     )
 
 
@@ -165,7 +165,7 @@ class TestSlack:
 
 class TestRefusals:
     def test_headless_daemon_cannot_notify(self, tmp_path: Path) -> None:
-        config = Config.model_validate({"state_dir": str(tmp_path / "state")})
+        config = Config.model_validate({"home": str(tmp_path / "state")})
         opener = Recorder()
         with pytest.raises(SbxloopError, match=r"no chat backend is configured.*\[chat\] backend"):
             post_notice(config, "hi", env={"DISCORD_BOT_TOKEN": "tok"}, open_url=opener)
@@ -211,7 +211,6 @@ class TestCli:
     @pytest.fixture
     def workdir(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         monkeypatch.chdir(tmp_path)
-        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "xdg-state"))
         monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
         monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
         return tmp_path

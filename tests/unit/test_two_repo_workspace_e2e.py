@@ -46,8 +46,6 @@ LABELS = GitHubLabels("sbxloop:run", "sbxloop:in-progress", "sbxloop:failed")
 # Two repositories, each pointed at its own host checkout: the shape the
 # migration note in the README asks operators to move to.
 PER_REPO_TOML = """
-state_dir = "{state_dir}"
-
 [sandbox]
 workspace_isolation = "clone"
 
@@ -63,8 +61,6 @@ workspace = "{b}"
 # The exact field configuration that failed: one daemon-wide workspace (a
 # checkout of o/a) and two enabled repos.
 FIELD_TOML = """
-state_dir = "{state_dir}"
-
 [sandbox]
 workspace = "{a}"
 workspace_isolation = "clone"
@@ -92,14 +88,10 @@ def _config(tmp_path: Path, template: str) -> Config:
     a = _checkout(tmp_path / "trees" / "a", "o/a")
     b = _checkout(tmp_path / "trees" / "b", "o/b")
     path = tmp_path / "sbxloop.toml"
-    path.write_text(
-        template.format(
-            state_dir=(tmp_path / "state").as_posix(),
-            a=a.as_posix(),
-            b=b.as_posix(),
-        )
+    path.write_text(template.format(a=a.as_posix(), b=b.as_posix()))
+    return Config.model_validate(
+        {**tomllib.loads(path.read_text()), "home": (tmp_path / "state").as_posix()}
     )
-    return Config.model_validate(tomllib.loads(path.read_text()))
 
 
 class ProvisioningRunner:
@@ -143,8 +135,8 @@ class Wiring:
                 "o/b": RecordingOps({"7": issue(7, "sbxloop:run")}),
             }
         )
-        self.store = StateStore(config.state_dir / "state.db")
-        self.dstore = DaemonStore(config.state_dir / "state.db")
+        self.store = StateStore(config.paths.state_db)
+        self.dstore = DaemonStore(config.paths.state_db)
         self.runner = ProvisioningRunner(self.store, fake_sbx)
         self.loop = DaemonLoop(
             config,
@@ -203,7 +195,7 @@ class TestTwoRepoWorkspaces:
 
     def test_each_run_is_isolated_in_its_own_run_dir(self, per_repo: Wiring) -> None:
         per_repo.run_both()
-        runs = per_repo.config.state_dir / "runs"
+        runs = per_repo.config.paths.runs
         for repo, workspace in per_repo.runner.workspaces.items():
             assert runs in workspace.parents, repo
             # A clone, not the source checkout itself.
@@ -238,7 +230,7 @@ class TestFieldConfigurationIsRefused:
         field.run_both()
         cloned = [
             path
-            for path in (field.config.state_dir / "runs").glob("*/workspace")
+            for path in (field.config.paths.runs).glob("*/workspace")
             if (path / ".git").exists()
         ]
         # Only o/a's run — whose workspace legitimately is that checkout —
