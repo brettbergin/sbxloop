@@ -96,6 +96,38 @@ class TestRepoGet:
         }
 
 
+class TestRawApi:
+    """#558: the generic form of the probes' allow_missing — a status the
+    caller lists comes back as data, so an existence probe written as a
+    raw call costs no failed job."""
+
+    def test_listed_status_is_data(self) -> None:
+        t = ScriptedTransport({"/repos/o/r/compare/main...x": http_error(404, "Not Found")})
+        params = {"method": "GET", "path": "/repos/o/r/compare/main...x"}
+        with pytest.raises(GithubOpError, match="404"):
+            execute_op("raw.api", params, transport=t)  # not opted in: still an error
+        assert execute_op(
+            "raw.api", {**params, "allow_missing_statuses": [404, 422]}, transport=t
+        ) == {"missing": True, "http_status": 404}
+
+    def test_other_statuses_still_raise(self) -> None:
+        t = ScriptedTransport({"/repos/o/r/x": http_error(403, "forbidden")})
+        with pytest.raises(GithubOpError, match="403"):
+            execute_op(
+                "raw.api",
+                {"method": "GET", "path": "/repos/o/r/x", "allow_missing_statuses": [404]},
+                transport=t,
+            )
+
+    def test_present_passes_through(self) -> None:
+        t = ScriptedTransport({"/repos/o/r/x": {"ok": 1}})
+        assert execute_op(
+            "raw.api",
+            {"method": "GET", "path": "/repos/o/r/x", "allow_missing_statuses": [404]},
+            transport=t,
+        ) == {"ok": 1}
+
+
 class TestRefGet:
     def test_resolves_sha(self) -> None:
         t = ScriptedTransport(

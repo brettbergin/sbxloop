@@ -41,7 +41,14 @@ from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.engine.model import RunKind
 from sbxloop.engine.sinks import published_line
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
-from sbxloop.gh.ops import GithubOps, Identity, identities_match, raw_pages, user_identity
+from sbxloop.gh.ops import (
+    GithubOps,
+    Identity,
+    identities_match,
+    raw_lookup,
+    raw_pages,
+    user_identity,
+)
 from sbxloop.ghids import is_chat_id, is_schedule_id, issue_item_id, try_parse_gh_id
 from sbxloop.log import get_logger
 
@@ -293,16 +300,12 @@ class GitHubIssueSource:
             raise self._label_error(exc, number, "add", labels) from exc
 
     def _remove_label(self, ops: GithubOps, number: str, label: str) -> None:
+        # Already absent is fine (404 on the label resource) — and, since
+        # #558, not a failed job either: the miss travels as data.
         try:
-            ops.raw("DELETE", f"{self._issue_path(number)}/labels/{quote(label, safe='')}")
+            raw_lookup(ops, "DELETE", f"{self._issue_path(number)}/labels/{quote(label, safe='')}")
         except GithubOpsError as exc:
-            # Already absent is fine (404 on the label resource). Message
-            # grep is the fallback for a pre-#221 worker only.
-            missing = (
-                exc.http_status == 404 if exc.http_status is not None else "HTTP 404" in str(exc)
-            )
-            if not missing:
-                raise self._label_error(exc, number, "remove", [label]) from exc
+            raise self._label_error(exc, number, "remove", [label]) from exc
 
     def _label_error(
         self, exc: GithubOpsError, number: str, verb: str, labels: Sequence[str]
