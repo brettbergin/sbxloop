@@ -985,9 +985,25 @@ as for a code run, and the workload cases are the ones that test them:
    registry — the service box fetches, the agent box installs offline from
    the shared mount.
 
+## The home
+
+Every path sbxloop touches on a host hangs off one directory, the **home**:
+`~/.sbxloop`, or `SBXLOOP_HOME` to move the whole tree. `sbxloop.paths.SbxloopHome`
+derives all of them — `bin/` (launchers), `venv/`, `config/` (the host config, the
+secrets, the App key), `state/` (`state.db`, the conformance cache, the daemon's control
+queue and scratch workspaces), `runs/<run>/`, `workspaces/<owner>/<name>/` (the daemon's
+dedicated clones), `logs/`, `cache/`, `tmp/`, `systemd/` (the rendered units), `backups/`
+and `home.json` (what laid it out). There is no second rule: nothing resolves the working
+directory, no setting says where state lives (the former `state_dir`, `[daemon] state_dir`
+and `SBXLOOP_STATE_DIR` are refused by name), and `sbxloop doctor` fails hard on any
+leftover of the layouts the home replaced. `sbxloop init` builds it (`homeinit.py`),
+`init --migrate` moves a pre-home installation into it (`homemigrate.py`), and
+`sbxloop backup` snapshots what it cannot regenerate (`backup.py`).
+
 ## Persistence and resume
 
-`StateStore` is a WAL-mode SQLite database at `<state_dir>/state.db` with
+`StateStore` is a WAL-mode SQLite database at `~/.sbxloop/state/state.db` (the home's
+`state/`, see *The home* below) with
 four tables: `runs`, `tasks`, `phase_attempts`, `events`. A workload task's
 row also carries its `TaskOutput` (`tasks.output_json`, #757): the
 `## Result` section of the operator's report, its first line as the
@@ -1011,7 +1027,7 @@ persisting — a crash and a `kill -9` look identical to the store — and
 `resume`:
 
 1. rehydrates the config persisted at run creation (tokens still come from
-   the current environment; `state_dir` stays the one that located the run;
+   the current environment; the home stays the one that located the run;
    the `keep_sandboxes`/`keep_on_failure` debug toggles stay resume-time
    choices) and pins the workspace from the `runs` table — editing config between
    start and resume, or resuming from another directory, cannot silently

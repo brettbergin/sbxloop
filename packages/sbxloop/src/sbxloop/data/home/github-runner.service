@@ -1,8 +1,8 @@
-# github-runner.service — rendered by `sbxloop init --systemd --runner DIR`.
 # Only needed for the automated upgrade workflow (docs/deploy.md): a
 # self-hosted Actions runner on the daemon host, as the daemon's user, which
 # is what lets a workflow `systemctl --user restart sbxloop-daemon`. A host
-# upgraded by hand does not need this unit.
+# upgraded by hand does not need this unit. Rendered by
+# `sbxloop init --systemd --runner DIR` into the home's systemd/ directory.
 [Unit]
 Description=GitHub Actions runner (automated sbxloop upgrades)
 Documentation=https://github.com/brettbergin/sbxloop/blob/main/docs/deploy.md

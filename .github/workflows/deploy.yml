@@ -22,8 +22,10 @@ name: Deploy the daemon
 #
 # THE HOST IS ONE VARIABLE (#640): the runner label — also the name the
 # notices call the host — is the repository variable SBXLOOP_DEPLOY_HOST
-# (default `db`). Every path is derived from the runner user's $HOME in the
-# first step. Nothing else here names a machine or a user.
+# (default `db`). Every path is under the sbxloop home, ${HOME}/.sbxloop,
+# the layout `sbxloop init` builds (contrib/systemd/README.md). Nothing
+# else here names a machine or a user, and no step needs a working
+# directory: every command answers the same from anywhere.
 #
 # SECURITY INVARIANT — DO NOT BREAK:
 #   No job carrying the `self-hosted` label may be reachable from a
@@ -94,21 +96,24 @@ jobs:
 
     steps:
       - name: Resolve host paths
-        # Every path the deploy touches, derived from the runner user's home
-        # (the layout contrib/systemd/README.md sets up). Written to
-        # GITHUB_ENV because a job-level `env:` value is a literal — the
+        # Every path the deploy touches is under the sbxloop home. Written
+        # to GITHUB_ENV because a job-level `env:` value is a literal — the
         # shell would not expand a ${HOME} inside it.
         run: |
           set -euo pipefail
           {
-            echo "VENV_PIP=${HOME}/.sbxloop-venv/bin/pip"
-            echo "VENV_SBXLOOP=${HOME}/.sbxloop-venv/bin/sbxloop"
-            # The wrapper: sources ~/.config/sbxloop/env.sh for PATH
-            # (/usr/sbin for mkfs.ext4), dbus and the chat/GitHub tokens.
-            # `doctor`, `ctl` and `notify` need it; pip does not.
-            echo "SBXLOOP=${HOME}/.local/bin/sbxloop"
-            # `ctl` and `notify` resolve config and state_dir from the cwd.
-            echo "WORKDIR=${HOME}/sbxloop-work"
+            echo "SBXLOOP_HOME=${HOME}/.sbxloop"
+            # The launcher: binds every command to the home (PATH with
+            # /usr/sbin for mkfs.ext4, dbus, the home's tmp and caches) and
+            # execs the venv. It exports no secrets; sbxloop reads its
+            # own secrets file itself.
+            echo "SBXLOOP=${HOME}/.sbxloop/bin/sbxloop"
+            echo "VENV_SBXLOOP=${HOME}/.sbxloop/venv/bin/sbxloop"
+            echo "VENV_PYTHON=${HOME}/.sbxloop/venv/bin/python"
+            # The home's own uv, and where it keeps its cache and interpreters.
+            echo "UV=${HOME}/.sbxloop/bin/uv"
+            echo "UV_CACHE_DIR=${HOME}/.sbxloop/cache/uv"
+            echo "UV_PYTHON_INSTALL_DIR=${HOME}/.sbxloop/python"
           } >> "$GITHUB_ENV"
 
       - name: Resolve the target version
@@ -167,8 +172,6 @@ jobs:
         if: steps.installed.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          # `ctl` resolves state_dir from the cwd, so it must run in WORKDIR.
-          cd "${WORKDIR}"
           # Exit 2 = no daemon answered. Not fatal here: the wait below
           # notices a daemon that never answers, and the health check is
           # the thing that fails if it never comes up.
@@ -195,7 +198,7 @@ jobs:
           fi
           # Through the configured [chat] backend, with the bot already in
           # the channel: this job reads no secrets file and no config (#639).
-          cd "${WORKDIR}" && "${SBXLOOP}" daemon notify "${MSG}"
+          "${SBXLOOP}" daemon notify "${MSG}"
 
       - name: Fetch the release wheels
         id: wheels
@@ -232,7 +235,6 @@ jobs:
         if: steps.installed.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          cd "${WORKDIR}"
           # No cap (#534): a restart under a live run kills its in-flight task
           # and spends a resume-budget slot the item did nothing to deserve.
           # With the hold taken, nothing new is claimed, so once the status
@@ -285,6 +287,10 @@ jobs:
           DIST: ${{ steps.wheels.outputs.dist }}
         run: |
           set -euo pipefail
+          # A snapshot first: config, secrets, units and the state database, so a bad
+          # release is one `sbxloop backup restore` away. The daily sweep
+          # keeps the newest [daemon] backups_keep of these.
+          "${SBXLOOP}" backup --label "deploy-${VERSION}" --reason "deploy from ${{ steps.installed.outputs.current }}"
           # Both wheels together, from the release: the host wheel pins
           # sbxloop-worker==VERSION exactly, and naming the local worker wheel
           # satisfies that pin without the index being consulted for it at all.
@@ -292,10 +298,15 @@ jobs:
           # a config change, not a reinstall. Everything else (pydantic,
           # discord.py, slack_sdk) still resolves from PyPI, which is fine:
           # those are not racing a just-published version.
-          "${VENV_PIP}" install --upgrade \
+          "${UV}" pip install --python "${VENV_PYTHON}" --upgrade \
             "${DIST}/sbxloop_worker-${VERSION}-py3-none-any.whl" \
             "${DIST}/sbxloop-${VERSION}-py3-none-any.whl[discord,slack]"
           "${VENV_SBXLOOP}" --version
+          # Idempotent: refreshes the launchers and the rendered units for
+          # the new version, keeps config, secrets and sbx as they are.
+          "${SBXLOOP}" init --systemd
+          mkdir -p "${SBXLOOP_HOME}/logs/deploy"
+          echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ${{ steps.installed.outputs.current }} -> ${VERSION} run=${{ github.run_id }}" >> "${SBXLOOP_HOME}/logs/deploy/history.log"
 
       - name: Snapshot the holds to restore
         id: state
@@ -306,7 +317,7 @@ jobs:
           # them. Read them *now*, not at the start of the job: an operator
           # who paused during the wait must still be paused afterwards.
           # Ours is dropped from the list — the restart releases it.
-          status="$(cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --json --timeout 30 || true)"
+          status="$("${SBXLOOP}" daemon ctl status --json --timeout 30 || true)"
           echo "${status}"
           holds="$(jq -r '.holds // [] | .[]' <<<"${status}" 2>/dev/null | tr '\n' ' ' || true)"
           keep=""
@@ -347,8 +358,8 @@ jobs:
 
           # Never --deep here: that boots a microVM. Plain doctor covers exactly
           # what a restart can break — sbx login, tokens, template, worker
-          # wheel, state dir, chat bridge.
-          (cd "${WORKDIR}" && "${SBXLOOP}" doctor) || fail "sbxloop doctor is unhappy"
+          # wheel, the home and its units, chat bridge.
+          "${SBXLOOP}" doctor || fail "sbxloop doctor is unhappy"
 
           # ctl exit 2 = nothing claimed the request, i.e. the daemon never came up.
           # The budget has to cover the daemon's whole startup, not just the
@@ -358,7 +369,7 @@ jobs:
           # client resends across that window rather than reporting the
           # refusal, so the only thing left to get wrong is being too stingy
           # here — 300s is well inside the job's timeout.
-          (cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --json --timeout 300 >/dev/null) || fail "daemon did not answer ctl status"
+          "${SBXLOOP}" daemon ctl status --json --timeout 300 >/dev/null || fail "daemon did not answer ctl status"
 
           # Let it settle, then prove it is not crash-looping.
           before="$(systemctl --user show "${UNIT}" -p NRestarts --value)"
@@ -383,7 +394,8 @@ jobs:
           # page is long since warm. No just-published version to race.
           # The same extras as the upgrade (#619): a rollback that drops one
           # rolls a host on that backend back to a build that cannot start.
-          "${VENV_PIP}" install --upgrade "sbxloop[discord,slack]==${PREV}" "sbxloop-worker==${PREV}"
+          "${UV}" pip install --python "${VENV_PYTHON}" --upgrade "sbxloop[discord,slack]==${PREV}" "sbxloop-worker==${PREV}"
+          "${SBXLOOP}" init --systemd || true
           systemctl --user reset-failed "${UNIT}" || true
           timeout 300 systemctl --user restart "${UNIT}"
           sleep 15
@@ -400,7 +412,6 @@ jobs:
           HOLDS: ${{ steps.state.outputs.holds }}
         run: |
           set -euo pipefail
-          cd "${WORKDIR}"
           # Must run AFTER the restart: ControlServer refuses any request
           # stamped before the daemon started ("resend it").
           for h in ${HOLDS}; do
@@ -415,7 +426,6 @@ jobs:
         if: always() && steps.hold.outcome == 'success'
         run: |
           set -euo pipefail
-          cd "${WORKDIR}"
           "${SBXLOOP}" daemon ctl resume --hold "${HOLD}" --timeout 60 \
             || echo "::warning::could not release hold ${HOLD}"
           "${SBXLOOP}" daemon ctl status --timeout 60 || true
@@ -447,6 +457,6 @@ jobs:
           else
             MSG="❌ deploy of sbxloop \`${VERSION}\` to \`${HOST}\` **${RESULT}** — rolled back to \`${FROM}\`. [run](${RUN_URL})"
           fi
-          # Through the configured [chat] backend (#639); the wrapper carries
-          # the bot token, this job reads no secrets file and no config.
-          cd "${WORKDIR}" && "${SBXLOOP}" daemon notify "${MSG}"
+          # Through the configured [chat] backend (#639): sbxloop reads its
+          # own secrets file; this job reads no secrets and no config.
+          "${SBXLOOP}" daemon notify "${MSG}"

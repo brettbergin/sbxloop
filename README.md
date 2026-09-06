@@ -81,13 +81,21 @@ models, and `--model` help says so.
 
 ## Quickstart
 
+Everything sbxloop puts on a host lives under one directory, the **home**:
+`~/.sbxloop` (`SBXLOOP_HOME` moves it). One command builds it — the
+interpreter, the launchers, Docker's `sbx`, the config and secrets files,
+and on Linux the systemd units:
+
 ```bash
-pip install sbxloop
+curl -fsSL https://raw.githubusercontent.com/brettbergin/sbxloop/main/scripts/install.sh | sh
+export PATH="$HOME/.sbxloop/bin:$PATH"
+# (or, from an existing `pip install sbxloop`: `sbxloop init`)
 
 # one-time host setup
+$EDITOR ~/.sbxloop/config/secrets.env   # the tokens; sbxloop reads this file itself
 sbx login
 sbx policy init balanced
-sbxloop doctor          # verifies sbx, policy, tokens, worker wheel
+sbxloop doctor          # verifies the home, sbx, policy, tokens, worker wheel
 sbxloop doctor --deep   # + full sbx conformance suite in a scratch sandbox
 
 # go
@@ -135,7 +143,7 @@ Wondering what to put in `model = "..."` (or `--model`)? Ask the configured
 backend which models your credential can actually use:
 
 ```bash
-pip install 'sbxloop[copilot]'   # copilot: the SDK is optional on the host
+~/.sbxloop/bin/uv pip install --python ~/.sbxloop/venv/bin/python 'sbxloop[copilot]'   # copilot: the SDK is optional on the host
 sbxloop list-models              # id, billing multiplier, context, reasoning, policy
 sbxloop list-models --json       # machine-readable, for scripting
 ```
@@ -447,28 +455,30 @@ daemon may run on schedules alone. `!sbx schedules` (or `sbxloop daemon ctl sche
 
 ## CLI reference
 
-| Command                                         | What it does                                                                                                                                                                                                                                                                                                                                               |
-| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `sbxloop run "OUTCOME"`                         | Start a run; with a repository it carries the work through to the merge. Options: `--kind code\|workload`, `--profile` (a `[[workloads]]` profile, workload runs only), `--workspace`, `--repo`, `--deliver-base`, `--create-repo`, `--create-public`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`, `--no-chat`.                        |
-| `sbxloop daemon`                                | The always-on outer loop: claim labeled issues, run each one through to a merged PR, settle the issue, mirror to chat (Discord or Slack). Options: `--repo`, `--max-runs-per-day`, `--poll-interval`, `--discord-channel`, `--slack-channel`, `--once`, `--dry-run`, `--log-level`, `--log-format`.                                                        |
-| `sbxloop daemon items\|abandon\|retry\|requeue` | Inspect and steer individual work items from another shell without stopping the daemon (see below).                                                                                                                                                                                                                                                        |
-| `sbxloop daemon ctl CMD`                        | Drive the running daemon from a script or cron: `status` (`--json` for one machine-readable object), `pause`, `resume`, `cancel`, `queue`, `log` (the daemon's recent log records, `--tail`/`--level`/`--grep`), `stop` (finish the current run, claim nothing new, exit) — the same verbs as chat's `!sbx`, over a file queue in `state_dir/daemon/ctl/`. |
-| `sbxloop daemon notify TEXT`                    | Post one message to the control channel through the configured `[chat] backend` — from the host, without the daemon, for deploy scripts and cron.                                                                                                                                                                                                          |
-| `sbxloop tui`                                   | The operator console on the daemon host: overview, runs and their threads, the queue, sandboxes, daemon control and the journal, config, secrets, doctor — and the same chat experience Discord/Slack get, through the daemon's local bridge. `--run RUN` opens a run; `--read-only` observes only; `--state-dir` overrides the daemon's rule.             |
-| `sbxloop resume RUN`                            | Re-provision sandboxes and continue a checkpointed run under its persisted config — at the task graph, or at the pipeline stage it stopped in (the retry path for a failed delivery or a `blocked` landing).                                                                                                                                               |
-| `sbxloop cancel RUN`                            | Cancel an in-flight run.                                                                                                                                                                                                                                                                                                                                   |
-| `sbxloop status [RUN]`                          | List runs, or show one run's task/phase detail.                                                                                                                                                                                                                                                                                                            |
-| `sbxloop logs RUN`                              | The persisted event stream. `--type` filters by prefix (e.g. `--type policy.`), `--task` by task id.                                                                                                                                                                                                                                                       |
-| `sbxloop artifacts RUN`                         | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).                                                                                                                                                                                                                                                 |
-| `sbxloop shell RUN`                             | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                                                                                                                                                                                                             |
-| `sbxloop init`                                  | Write a commented starter `sbxloop.toml` from `sbxloop.toml.example` (`--force` overwrites, `--stdout` prints, `--preset large-repo` appends the packaged budget preset).                                                                                                                                                                                  |
-| `sbxloop init-repo OWNER/NAME`                  | Create the labels the loop relies on in a repository — the seven lifecycle labels (with that repository's renames applied) and the follow-up label, each colored and described. Idempotent; boots one github-ops sandbox; exits 1 when the token cannot write labels.                                                                                      |
-| `sbxloop bake`                                  | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                                                                                                                        |
-| `sbxloop doctor [--deep]`                       | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                                                                                                                                                                                |
-| `sbxloop sandbox ls\|rm\|prune`                 | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                                                                                                                                                                                                                         |
-| `sbxloop gc`                                    | Remove old run directories (workspace clones, harvested artifacts) past the retention window; `--older-than DAYS`, `--dry-run`.                                                                                                                                                                                                                            |
-| `sbxloop secrets list\|clean\|rotate`           | Manage the sbx custom-secret registrations sbxloop owns.                                                                                                                                                                                                                                                                                                   |
-| `sbxloop config show\|policy`                   | Resolved configuration with per-key sources; the effective egress policy.                                                                                                                                                                                                                                                                                  |
+| Command                                         | What it does                                                                                                                                                                                                                                                                                                                                                                                                           |
+| ----------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sbxloop run "OUTCOME"`                         | Start a run; with a repository it carries the work through to the merge. Options: `--kind code\|workload`, `--profile` (a `[[workloads]]` profile, workload runs only), `--workspace`, `--repo`, `--deliver-base`, `--create-repo`, `--create-public`, `--model`, `--keep-sandboxes`, `--keep-on-failure`, `--no-tui`, `--no-chat`.                                                                                    |
+| `sbxloop daemon`                                | The always-on outer loop: claim labeled issues, run each one through to a merged PR, settle the issue, mirror to chat (Discord or Slack). Options: `--repo`, `--max-runs-per-day`, `--poll-interval`, `--discord-channel`, `--slack-channel`, `--once`, `--dry-run`, `--log-level`, `--log-format`.                                                                                                                    |
+| `sbxloop daemon items\|abandon\|retry\|requeue` | Inspect and steer individual work items from another shell without stopping the daemon (see below).                                                                                                                                                                                                                                                                                                                    |
+| `sbxloop daemon ctl CMD`                        | Drive the running daemon from a script or cron: `status` (`--json` for one machine-readable object), `pause`, `resume`, `cancel`, `queue`, `log` (the daemon's recent log records, `--tail`/`--level`/`--grep`), `stop` (finish the current run, claim nothing new, exit) — the same verbs as chat's `!sbx`, over a file queue in the home's `state/daemon/ctl/`.                                                      |
+| `sbxloop daemon notify TEXT`                    | Post one message to the control channel through the configured `[chat] backend` — from the host, without the daemon, for deploy scripts and cron.                                                                                                                                                                                                                                                                      |
+| `sbxloop daemon logs`                           | Print the daemon's log file (`~/.sbxloop/logs/daemon.log`, the journal's twin): `--tail N`, `--follow`.                                                                                                                                                                                                                                                                                                                |
+| `sbxloop tui`                                   | The operator console on the daemon host: overview, runs and their threads, the queue, sandboxes, daemon control and the journal, config, secrets, doctor — and the same chat experience Discord/Slack get, through the daemon's local bridge. `--run RUN` opens a run; `--read-only` observes only; `--state-dir` overrides the daemon's rule.                                                                         |
+| `sbxloop resume RUN`                            | Re-provision sandboxes and continue a checkpointed run under its persisted config — at the task graph, or at the pipeline stage it stopped in (the retry path for a failed delivery or a `blocked` landing).                                                                                                                                                                                                           |
+| `sbxloop cancel RUN`                            | Cancel an in-flight run.                                                                                                                                                                                                                                                                                                                                                                                               |
+| `sbxloop status [RUN]`                          | List runs, or show one run's task/phase detail.                                                                                                                                                                                                                                                                                                                                                                        |
+| `sbxloop logs RUN`                              | The persisted event stream. `--type` filters by prefix (e.g. `--type policy.`), `--task` by task id.                                                                                                                                                                                                                                                                                                                   |
+| `sbxloop artifacts RUN`                         | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).                                                                                                                                                                                                                                                                                                             |
+| `sbxloop shell RUN`                             | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                                                                                                                                                                                                                                                                         |
+| `sbxloop init`                                  | Build (or repair) the home: tree, launchers, `uv` + CPython + the venv, Docker's `sbx`, `config/sbxloop.toml` and a 0600 `config/secrets.env` written once; `--systemd` renders and enables the units; `--migrate [--purge]` moves a pre-home installation in first; `--dry-run` prints the plan; `--project` writes a repository's own `sbxloop.toml` into the current directory (`--preset large-repo`, `--stdout`). |
+| `sbxloop backup [list\|restore\|prune]`         | Snapshot the home's config, secrets, units and `state.db` into `backups/<stamp>/`; list, restore or prune the snapshots (the daily sweep keeps `[daemon] backups_keep`).                                                                                                                                                                                                                                               |
+| `sbxloop init-repo OWNER/NAME`                  | Create the labels the loop relies on in a repository — the seven lifecycle labels (with that repository's renames applied) and the follow-up label, each colored and described. Idempotent; boots one github-ops sandbox; exits 1 when the token cannot write labels.                                                                                                                                                  |
+| `sbxloop bake`                                  | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                                                                                                                                                                                    |
+| `sbxloop doctor [--deep]`                       | Verify the host setup; `--deep` boots a scratch sandbox for the full sbx conformance suite.                                                                                                                                                                                                                                                                                                                            |
+| `sbxloop sandbox ls\|rm\|prune`                 | Inspect, remove (`--run`, `--all`), or garbage-collect orphaned sbxloop sandboxes.                                                                                                                                                                                                                                                                                                                                     |
+| `sbxloop gc`                                    | Remove old run directories (workspace clones, harvested artifacts) past the retention window; `--older-than DAYS`, `--dry-run`.                                                                                                                                                                                                                                                                                        |
+| `sbxloop secrets list\|clean\|rotate`           | Manage the sbx custom-secret registrations sbxloop owns.                                                                                                                                                                                                                                                                                                                                                               |
+| `sbxloop config show\|policy`                   | Resolved configuration with per-key sources; the effective egress policy.                                                                                                                                                                                                                                                                                                                                              |
 
 ## Network egress: least privilege, by plan
 
@@ -533,12 +543,12 @@ stdin does the same job.
 Point `[sandbox] workspace` at a project and runs execute on that code. When
 the workspace is a **git checkout**, each run is isolated in a per-run clone
 (`workspace_isolation = "auto"`, the default): the run works in
-`.sbxloop/runs/<run>/workspace` on branch `sbxloop/<run>`, and your checkout —
+`~/.sbxloop/runs/<run>/workspace` on branch `sbxloop/<run>`, and your checkout —
 its working tree, branches, HEAD — is never touched. Pull the results back
 with the command the finish summary prints:
 
 ```bash
-git fetch .sbxloop/runs/<run>/workspace sbxloop/<run>
+git fetch ~/.sbxloop/runs/<run>/workspace sbxloop/<run>
 ```
 
 Dirty-tree rules: `auto` **refuses to start** when the checkout has
@@ -910,10 +920,13 @@ legacy form `gh:<number>` is still accepted everywhere as an alias for
 Everything sbxloop prints uses the typed form. See
 [Work item ids](docs/architecture.md#work-item-ids) for the full grammar.
 
-**Workspace posture for unattended runs.** Point `[sandbox] workspace` at a
-**dedicated clone nobody edits** (`git clone <repo> ~/sbxloop-runner/src`),
-not the checkout you work in. Before each fresh run the daemon
-`git fetch`es that clone and fast-forwards its branch to its upstream (the
+**Workspace posture for unattended runs.** The daemon keeps a **dedicated
+clone nobody edits** of each repository under
+`~/.sbxloop/workspaces/<owner>/<name>`, cloned on first use; point
+`[sandbox] workspace` (or a repo entry's `workspace`) at a checkout of your
+own only to use that one instead — never the checkout you work in. Before
+each fresh run the daemon `git fetch`es that clone and fast-forwards its
+branch to its upstream (the
 remote the branch tracks; `origin/<branch>` when none is configured) — never
 a merge or rebase; a diverged branch or a colliding local edit is left alone
 and logged — so runs start from the current remote branch rather than a
@@ -922,17 +935,15 @@ isolation regardless of `[sandbox] workspace_isolation` (`[daemon] workspace_iso
 HEAD with a warning, because `auto`'s refusal has no human present to answer
 it. Per-run clones point their `origin` at the source's origin URL (metadata
 only; any userinfo such as an embedded token is stripped from the URL, so
-no credentials leave the host). And the daemon keeps its state
-**outside the workspace** at an absolute path — `[daemon] state_dir`, else
-an explicitly configured `state_dir`, else a pre-existing legacy
-`./.sbxloop/state.db`, else `$XDG_STATE_HOME/sbxloop/<runner-dir-name>`
-(`~/.local/state/…`) — so a checkout never accretes one full clone per run.
-The daemon logs the resolved location at start (in its `daemon.starting`
-summary); the `sbxloop daemon items|abandon|retry|requeue` controls follow the same rule, while
-`sbxloop status`/`logs`/`gc` from the runner directory need
-`SBXLOOP_STATE_DIR` pointed at it.
+no credentials leave the host). And the daemon keeps its state under the
+home (`~/.sbxloop/state`, runs under `~/.sbxloop/runs`), never inside a
+checkout, so a checkout never accretes one full clone per run. The daemon
+logs its home at start (in its `daemon.starting` summary), and every other
+command — `status`, `logs`, `gc`, `daemon items|abandon|retry|requeue`,
+`tui` — reads the same home from any directory.
 
-The daemon's log stream (stderr → journald under systemd) is structured:
+The daemon's log stream (stderr → journald under systemd, and the same
+records in `~/.sbxloop/logs/daemon.log`, rotated by size) is structured:
 `--log-level DEBUG|INFO|WARNING|ERROR` (`[daemon] log_level`,
 `SBXLOOP_DAEMON__LOG_LEVEL`; default `INFO`) and `--log-format console|json`
 (`[daemon] log_format`; `json` is one object per line for log shippers). At
@@ -1256,12 +1267,12 @@ are not re-posted.
 ## Artifacts
 
 Every job in a run executes in the run's **workspace** — a host directory
-(`.sbxloop/runs/<run>/workspace`) that sbx mounts into the agent microVM.
+(`~/.sbxloop/runs/<run>/workspace`) that sbx mounts into the agent microVM.
 Provisioning *discovers* the in-VM mount point (marker file + bounded search)
 rather than assuming one. A run that has no checkout to work on (nothing
 configured, not started from inside one) uses an empty per-run directory
 instead; when *that* mount can't be found, jobs run in a fallback dir that is
-**harvested** to `.sbxloop/runs/<run>/artifacts` with `sbx cp` at each task
+**harvested** to `~/.sbxloop/runs/<run>/artifacts` with `sbx cp` at each task
 end and at run finalize. A configured checkout that fails to mount stops the
 run instead (`sbxloop doctor` has the workspace-mount probe). Either way the files an agent
 produces survive the sandbox:
@@ -1932,7 +1943,7 @@ non-terminal but silent past `--min-age` (default 1 hour — the persisted event
 stream, heartbeats included, is the liveness signal). Sandboxes deliberately
 kept for debugging are excluded unless you pass `--include-kept`. `sbxloop doctor` reports the current orphan-candidate count.
 
-Run directories accrete too: every run leaves `<state_dir>/runs/<run>/` — a
+Run directories accrete too: every run leaves `~/.sbxloop/runs/<run>/` — a
 full clone of the target checkout under workspace isolation, plus harvested
 artifacts — and an always-on daemon fills the disk with them. The daemon
 sweeps them on start and once a day (`[daemon] prune_runs_after_days`,
@@ -1953,25 +1964,23 @@ back within the retention window — the finish summary prints it.
 
 ## Setup
 
-1. Install [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/), then
-   `sbx login` and `sbx policy init balanced`.
+1. Build the home: `curl -fsSL …/scripts/install.sh | sh` (see
+   [Quickstart](#quickstart)), or `sbxloop init` from an existing install.
+   It installs [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/)
+   under the home too; then `sbx login` and `sbx policy init balanced`.
 
 2. Create a fine-grained GitHub PAT:
 
    - `COPILOT_GITHUB_TOKEN` — personal account, **Copilot Requests**
      permission. Used *only* by the agent sandbox.
 
-   Export it, or put it in a `.env` file (loaded from `~/.config/sbxloop/`
-   and from the working directory when that is not inside a git checkout;
-   real environment variables always win):
-
-   ```bash
-   cp sbxloop.toml.example sbxloop.toml   # every key, commented, with its default
-   cp .env.example .env                   # then fill in the token(s)
-   ```
-
-   `sbxloop.toml.example` is the file `sbxloop init` writes (`sbxloop init --stdout` prints it), and `.env.example` names every credential and
-   `SBXLOOP_*` override the code reads.
+   Export it, or put it in `~/.sbxloop/config/secrets.env` — the file
+   `sbxloop init` wrote from `.env.example`, read by sbxloop itself; real
+   environment variables always win. The config is
+   `~/.sbxloop/config/sbxloop.toml`, written from `sbxloop.toml.example`
+   (every key, commented, with its default; `sbxloop init --stdout` prints
+   it). `.env.example` names every credential and `SBXLOOP_*` override the
+   code reads.
 
 3. **Optional** — configure the [GitHub integration](#github-integration)
    (adds the second credential: the `GH_TOKEN` PAT, or
@@ -2020,15 +2029,18 @@ secret or registrations owned by other tools.
 ## Configuration
 
 Configuration resolves, in order, from `SBXLOOP_*` environment variables,
-`sbxloop.toml`, `pyproject.toml [tool.sbxloop]`, and a user-level
-`~/.config/sbxloop/sbxloop.toml` (`$XDG_CONFIG_HOME` honoured) for settings
-that follow you rather than the checkout. The two files are looked for in
-the current directory and, inside a git checkout, in each parent up to the
-checkout's top level — the nearest one wins, so a command typed from
-`packages/foo/` of a monorepo sees the root config. `sbxloop init` writes a
-commented starter file — the same `sbxloop.toml.example` committed at the
-repo root; `sbxloop config show` prints every resolved value and where it
-came from.
+`./sbxloop.toml`, `./pyproject.toml [tool.sbxloop]`, and the host config
+`~/.sbxloop/config/sbxloop.toml` (the home's; `sbxloop init` writes it from
+the committed `sbxloop.toml.example`) for everything that follows the host
+rather than a checkout — which, for the daemon, is all of it. The two
+project files are looked for in the current directory and, inside a git
+checkout, in each parent up to the checkout's top level — the nearest one
+wins, so a command typed from `packages/foo/` of a monorepo sees the root
+config. `sbxloop init --project` writes a repository's own starter file;
+`sbxloop config show` prints every resolved value and where it came from.
+Where things land on disk is not a setting: the home holds it all, and
+`SBXLOOP_HOME` moves the home (a `state_dir` key from an older file is
+refused by name).
 
 **Whose file is it.** A config file the target repository *carries* —
 tracked in git, so any merged pull request can change it, the loop's own
@@ -2036,14 +2048,12 @@ included — is project config: it may set how the tree is built and checked
 (`[sandbox] languages`, `gate_command`), how its branches and PRs are named
 (`[github] branch_prefix`, `pr_title_template`, `commit_message_template`)
 and `[artifacts] exclude`, and nothing else. Egress policy, the merge gate,
-budgets, the daemon, `state_dir`, which repository the token delivers to:
-those are honoured only from files the operator owns — the user config, an
-*untracked* `sbxloop.toml` (what `sbxloop init` writes, or a daemon's runner
-directory outside any checkout) or the environment. Keys a tracked file may
-not set are dropped with a `config.project_layer.ignored` warning naming
-them. The same boundary applies to `.env`: it is read from the working
-directory only outside a git checkout (a checkout's `.env` belongs to the
-application in it) and always from `~/.config/sbxloop/.env`.
+budgets, the daemon, which repository the token delivers to: those are
+honoured only from files the operator owns — the home's config, an
+*untracked* `sbxloop.toml`, or the environment. Keys a tracked file may not
+set are dropped with a `config.project_layer.ignored` warning naming them.
+Secrets have one place, the home's `config/secrets.env`; a checkout's
+`.env` belongs to the application in it and is never read.
 
 The notable knobs:
 
