@@ -250,7 +250,11 @@ def run() -> tuple[list[Finding], list[tuple[str, str]]]:
     used: set[tuple[str, str]] = set()
     kept: list[Finding] = []
     for finding in findings:
-        rel = str(finding.path.relative_to(ROOT))
+        # POSIX separators on both sides: the allowlist is written with "/"
+        # and str() of a relative path yields "\" on Windows, so a developer
+        # running the gate there saw every allowed entry reported twice —
+        # once as an unallowed finding, once as a stale allowlist line.
+        rel = finding.path.relative_to(ROOT).as_posix()
         hit = next(((p, t) for p, t in allow if p == rel and t == finding.text), None)
         if hit is None:
             kept.append(finding)
