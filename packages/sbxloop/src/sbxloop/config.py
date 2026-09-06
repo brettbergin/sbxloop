@@ -379,10 +379,10 @@ class RegistryConfig(_ConfigModel):
     `auth_env` the registry is the agent sandbox's own: `host` joins its
     allowlist and the client file lands in its `$HOME`. With `auth_env`
     (the daemon-environment variable holding the credential) the registry
-    belongs to the SERVICE sandbox (#766): host, credential and client file
-    go there, the dependencies are fetched there into a cache in the shared
-    workspace, and the agent sandbox — which never sees the credential —
-    builds offline from that cache.
+    belongs to the SERVICE sandbox: it downloads metadata and artifacts
+    using fixed operations. The host copies the data to the agent, where
+    native resolution and offline cache preparation run without registry
+    credentials. The service does not use package-manager client files.
     """
 
     kind: RegistryKind

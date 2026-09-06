@@ -43,7 +43,7 @@ from sbxloop.engine.model import JudgeVerdict, SteerVerdict, TaskGraph, TaskReco
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.repocontext import repo_conventions
 from sbxloop.engine.review import ReviewGuard, ReviewVerdict
-from sbxloop.engine.service import FETCH_TOOL_NAME
+from sbxloop.engine.service import FETCH_TIMEOUT_S, FETCH_TOOL_NAME
 from sbxloop.engine.skilltools import SKILL_TOOL_NAME, answer_skill_call, skill_tool_spec
 from sbxloop.errors import InvalidOutputTwice, WorkerError
 from sbxloop.events import EventBus
@@ -448,8 +448,9 @@ class PhaseRunner:
                 "\n\n## Dependencies\n\n"
                 "This project's private registries are reached only from the run's "
                 "service sandbox, which holds the credential; this sandbox is offline "
-                "for those ecosystems and installs from the shared cache. Ask for "
-                "packages through this tool; every fetch is logged:\n\n" + "\n".join(lines)
+                "for those ecosystems. Download metadata and artifacts through the host, "
+                "then resolve, populate caches and install here. Every fetch is logged:\n\n"
+                + "\n".join(lines)
             )
         return text
 
@@ -509,6 +510,13 @@ class PhaseRunner:
             # attempt's session so the work already done is not re-derived.
             resume_session_id=resume_session_id,
             host_tools=list(host_tools),
+            # Give an artifact operation time to finish and transfer its
+            # file before the agent abandons the host-tool response.
+            host_tool_timeout_s=(
+                FETCH_TIMEOUT_S + 30
+                if any(tool.name == FETCH_TOOL_NAME for tool in service_tools)
+                else 120.0
+            ),
             # Role-filtered: `[[mcp]] roles` decides which sessions get a
             # server, and the default excludes critics — a read-only review
             # reaching a third-party service is a capability nobody asked

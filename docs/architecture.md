@@ -323,46 +323,45 @@ echoed it. Each call is one `service.call` ledger event — credential name,
 method, path, status, duration; never a body or a header. The agent sandbox's
 allowlist does not carry the credential hosts: the agent never speaks to them.
 
-The same box is the run's dependency **fetcher** (#766). A `[[registries]]`
-entry with `auth_env` is a credentialed registry, and its token, client file
-(`~/.npmrc`, `~/.netrc`, …) and host go to the service sandbox only — the
-agent sandbox gets neither the file nor the host, and is configured offline
-for that ecosystem (`registries.offline_env`: `npm_config_offline`,
-`PIP_NO_INDEX`/`PIP_FIND_LINKS`, `GOPROXY=off`, `CARGO_NET_OFFLINE`,
-`MAVEN_ARGS=-o`, `NUGET_PACKAGES`, `BUNDLE_LOCAL`). Both boxes see the one
-workspace mount, and the cache is inside it — `<workspace>/.sbxloop/deps/<kind>`,
-excluded from git through `.git/info/exclude`, reached in either VM through a
-stable `~/.sbxloop/deps` symlink so the offline variables hold one path — so a
-fetch in the service box is an install in the agent box. The service box
-therefore needs the workspace view the agent's has (its own toolchains for the
-credentialed kinds too, ensured at install like the agent's) and fails
-provisioning naming the mount otherwise; its allowlist grows by the registry
-hosts and the ecosystem's public baseline (`registry.npmjs.org`, `pypi.org`,
-`proxy.golang.org`, …) so a virtual repository that proxies upstream resolves.
-It runs one more job kind, `service.fetch`: an argv the host authored from a
-fixed per-ecosystem recipe (`registries.fetch_plan` — `npm ci --ignore-scripts`
-/ `npm install --ignore-scripts [pkgs]`, `pip download -d <cache>`, `go mod download`, `cargo fetch`, `mvn -B dependency:go-offline`, `dotnet restore --packages`, `bundle cache --all --no-install`) in the workspace, never a
-shell; a package spec is one token matching `_PACKAGE_RE` (never a leading
-`-`), and an ecosystem the run has no credentialed registry for, a non-spec, or
-a package list for a manifest-only kind is refused on the host before a job
-exists. `Engine._fetch_dependencies` runs the manifest recipe for every
-credentialed kind whose manifest the workspace carries, right after the worker
-installs and before `setup_commands`; a non-zero exit is a `ProvisionError`
-carrying the argv and the output tail, and the run stays resumable like any
-infrastructure failure. The build session holds a second host tool,
-`fetch_dependencies(ecosystem, packages?)` — packages → the `add` recipe,
-none → re-fetch from the manifest the agent just edited — and reads the
-package manager's exit code and output back as the tool's answer (a failed
-fetch is an answer, not a tool error, so the agent can fix the manifest). Every
-fetch, refused or run, is one `sandbox.fetch` ledger event with the ecosystem,
-verb, argv, exit code and phase; the worker scrubs the credential's value from
-the output before it leaves the box. `sbxloop config policy` prints the service
-sandbox's allowlist as a second line; `sbxloop doctor` lists unset `auth_env`
-names in its `registry credentials` row. A registry without `auth_env` is an
-open registry and stays exactly as #680 built it: agent allowlist, agent client
-file, no service box. The `[sandbox] secret_env` key that once carried such a
-token into the agent sandbox is refused by name at config load with this
-design as the message (#766).
+The same box downloads private dependency **data**. Credentialed registries
+are a host-authored `SBXLOOP_REGISTRIES` catalogue containing each registry's
+name, ecosystem, HTTPS authority and credential environment name. The fixed
+`service.fetch` operation accepts a catalogue name and absolute URL path,
+plus an optional expected SHA-256. It streams bytes into a private artifact
+beside the worker result, with a 1 GiB bound and credential-echo detection.
+Same-authority HTTPS redirects are allowed; other authorities are refused.
+For Git dependencies, `operation=git` fetches objects into fresh bare
+metadata and returns a bundle: no checkout, hooks, submodules, repository
+configuration or credential helper is evaluated.
+
+The service never runs a package manager, reads project metadata, extracts
+an archive or writes the dependency cache. Its worker starts with Python
+isolated mode, receives no project cwd, and needs no registry client files
+or package-manager toolchains. Credentials still enter only through the
+service's per-job stdin or private env file. Host-initiated `sbx cp` moves
+the artifact through a temporary host file into the agent; the host checks
+its size and SHA-256 and removes the service copy. No response chooses a
+host path, and no listener, proxy, socket or VM-to-VM channel is involved.
+
+The agent resolves dependencies, reads downloaded metadata, extracts
+packages and runs all package managers and build hooks. Its offline cache
+remains `<workspace>/.sbxloop/deps`, excluded from Git and linked at
+`~/.sbxloop/deps` in the agent only. Before setup commands, one dependency
+preparation session receives the `fetch_dependencies` tool, the target's
+conventions and the commands the host will verify offline. Its usage is
+recorded under the `dependencies` phase. A missing preparation result or a
+failed offline verification stops provisioning with a resumable failure.
+The build/execute session keeps the tool to fetch new dependencies after
+manifest edits. Without a path, the tool returns registry discovery and
+cache information; with a path, it returns the copied file's agent path,
+byte count and SHA-256. It never claims a catalogue query installed packages.
+
+Each download is a `sandbox.fetch` event naming the registry, path,
+ecosystem, operation and result metadata, never artifact content or an
+authorization header. Open registries retain their agent-side client
+configuration and direct fetching. Native private-registry resolution
+across all supported ecosystems remains **field-unverified** until exercised
+against those registries; tests cover the isolation and transfer contracts.
 
 What the agent credential *is* — its env var, the host sbx binds it to, the
 hosts it must reach, how doctor names it when missing, where its model ids

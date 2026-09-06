@@ -566,8 +566,8 @@ class Provisioner:
         What the repository's private registries need first — the
         credential-less ones' ``GOPRIVATE`` / ``PIP_INDEX_URL`` (#680), and
         for the credentialed ones the OFFLINE configuration (#766) that
-        points each package manager at the cache the service sandbox
-        fills, so nothing in this sandbox ever asks that registry — then
+        points each package manager at the cache the agent prepares from
+        downloaded artifacts, so it never needs registry credentials — then
         the repository's ``[sandbox] env`` (#679) over it (an operator's
         explicit value wins over a derived one), and the loop's own
         selector last so nothing an operator writes can shadow it. The
@@ -620,17 +620,6 @@ class Provisioner:
             )
         values = {name: self.env[name] for name in names}
         return {**values, **registries.secret_env(regs, values)}
-
-    def registry_files(self, repo: str | None = None) -> dict[str, str]:
-        """The client files for ``repo``'s credentialed registries, for the
-        service sandbox; the netrc kinds embed the credential, so this
-        raises like :meth:`registry_secret_env` when one is unset."""
-        regs = self.config.credentialed_registries_for(repo)
-        if not regs:
-            return {}
-        return {
-            f.path: f.text for f in registries.client_files(regs, self.registry_secret_env(repo))
-        }
 
     def _agent_secret_spec(self) -> SecretSpec:
         env, host = self.backend().secret
@@ -1561,9 +1550,7 @@ class Provisioner:
                 sandboxes["agent"].mkdirs(agent_workdir)
             service_workdir: str | None = None
             if regs:
-                service_workdir = self._share_deps_cache(
-                    run_id, workspace, sandboxes["agent"], agent_workdir, sandboxes["service"]
-                )
+                self._prepare_deps_cache(run_id, workspace, sandboxes["agent"], agent_workdir)
             return SandboxPair(
                 run_id,
                 agent=sandboxes["agent"],
@@ -1678,33 +1665,28 @@ class Provisioner:
         ``repo``, its credentialed ``[[registries]]`` (#766). No proxy
         secrets, no agent; an allowlist of the credentials' and registries'
         hosts (plus the fetch baseline when there are registries); the
-        catalogue and the registries' plain environment ride the
+        catalogue and registry authority metadata ride the
         persistent env, the values ride the non-proxy road (per-job stdin,
-        or the 0600 env file) exactly as GH_TOKEN does, and the registries'
-        client files land in this sandbox's ``$HOME``."""
+        or the 0600 env file) exactly as GH_TOKEN does, with no package-manager client files."""
         regs = self.config.credentialed_registries_for(repo)
         return SandboxSpec(
             name=sandbox_name(run_id, "service"),
             role="service",
             workspace=workspace,
             template=self.config.sandbox.template,
-            policy_allows=service_policy_allows(
-                credentials, regs, registries.languages(regs), self.config.policy.deny
-            ),
+            policy_allows=service_policy_allows(credentials, regs, (), self.config.policy.deny),
             persistent_env=self.service_persistent_env(credentials, repo),
             secret_env=self.service_secret_env(credentials, repo),
-            files=self.registry_files(repo),
         )
 
     def service_persistent_env(
         self, credentials: Sequence[CredentialConfig], repo: str | None = None
     ) -> dict[str, str]:
-        """The catalogue the service worker resolves a job's credential name
-        against (JSON, non-secret, one env variable) and, for the
-        credentialed registries, the client environment and the fetch
-        environment — each package manager pointed at its cache."""
+        """Non-secret catalogues for the service's fixed HTTP and registry ops."""
         regs = self.config.credentialed_registries_for(repo)
-        env: dict[str, str] = {**registries.plain_env(regs), **registries.fetch_env(regs)}
+        env: dict[str, str] = {}
+        if regs:
+            env["SBXLOOP_REGISTRIES"] = json.dumps(registries.catalogue_entries(regs))
         if credentials:
             env[CATALOGUE_ENV] = json.dumps([cred.catalogue_entry() for cred in credentials])
         return env
@@ -1751,49 +1733,29 @@ class Provisioner:
             spec, "", reason="service", post_create=post_create, run_id=run_id
         )
 
-    def _share_deps_cache(
+    def _prepare_deps_cache(
         self,
         run_id: str,
         workspace: Path,
         agent: Sandbox,
         agent_workdir: str,
-        service: Sandbox,
-    ) -> str:
-        """Make the dependency cache one directory in both sandboxes (#766).
+    ) -> None:
+        """Prepare and Git-exclude the agent's offline dependency cache.
 
-        The service sandbox's mount is discovered like the agent's; a run
-        with credentialed registries whose workspace the service sandbox
-        cannot see fails closed here, naming the probe — a fetch into a
-        tree the agent never sees is not a fallback. Then each sandbox
-        gets the fixed link :data:`registries.DEPS_HOME` → the cache inside
-        its own view of the workspace, so the environment written before
-        the mount was known (``GOMODCACHE``, ``PIP_FIND_LINKS``, …) points
-        at the right place in both. The cache is excluded from the host
-        checkout's git so the agent never commits it. Returns the service
-        sandbox's in-VM workspace path.
+        The service receives no cache link and needs no workspace mount
+        discovery. Downloaded data arrives through host-mediated copies.
         """
-        service_workdir, why = self._discover_mount(run_id, service, workspace, expects_mount=True)
-        if service_workdir is None:
-            raise ProvisionError(
-                f"workspace {workspace} was not visible inside the service sandbox "
-                f"{service.name}: {why}. The run's [[registries]] carry a credential, "
-                "so its dependencies are fetched there and built here — both sandboxes "
-                "must see the workspace. Check the sandbox row of `sbxloop doctor` "
-                "(workspace-mount probe) and the sbx version"
-            )
-        for sandbox, workdir in ((agent, agent_workdir), (service, service_workdir)):
-            cache = f"{workdir.rstrip('/')}/{registries.DEPS_WORKSPACE_DIR}"
-            sandbox.mkdirs(cache, registries.DEPS_HOME.rsplit("/", 1)[0])
-            sandbox.exec(["ln", "-sfn", cache, registries.DEPS_HOME])
+        cache = f"{agent_workdir.rstrip('/')}/{registries.DEPS_WORKSPACE_DIR}"
+        agent.mkdirs(cache, registries.DEPS_HOME.rsplit("/", 1)[0])
+        agent.exec(["ln", "-sfn", cache, registries.DEPS_HOME])
         exclude_from_git(workspace, registries.DEPS_WORKSPACE_DIR.split("/", 1)[0] + "/")
         self.bus.emit(
             "sandbox.deps_cache",
             run_id,
-            name=service.name,
-            workdir=service_workdir,
+            name=agent.name,
+            workdir=agent_workdir,
             cache=registries.DEPS_WORKSPACE_DIR,
         )
-        return service_workdir
 
     def github_only_spec(self, name: str, workspace: Path, repo: str | None = None) -> SandboxSpec:
         """A github-role spec that is not tied to a run — the daemon's
