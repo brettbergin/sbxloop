@@ -53,7 +53,7 @@ from typing import Literal, NamedTuple
 from sbxloop import backends, hostgit, toolchains
 from sbxloop.config import Config, CredentialConfig, RegistryConfig, RepoConfig
 from sbxloop.engine.model import RunKind
-from sbxloop.errors import GithubOpsError, ProvisionError, SbxError
+from sbxloop.errors import ConfigError, GithubOpsError, ProvisionError, SbxError
 from sbxloop.events import EventBus
 from sbxloop.gh.appauth import (
     APP_ID_ENV,
@@ -520,10 +520,29 @@ class Provisioner:
             )
         return hosts
 
-    def resolve_languages(self, workspace: Path | None) -> toolchains.LanguageResolution:
+    def resolve_languages(
+        self, workspace: Path | None, *, kind: RunKind = "code"
+    ) -> toolchains.LanguageResolution:
         """The language set a run on ``workspace`` provisions (#624):
         ``[sandbox] languages`` when set, else what the workspace's manifests
-        declare, else the default."""
+        declare, else the default. A workload's set is its profile's
+        ``languages`` list (#801), empty unless the profile names some:
+        the operator persona needs its backend's runtime (ensured
+        separately) and no compiler, and the field showed every chat
+        workload spending a minute installing toolchains it never used.
+        """
+        if kind == "workload":
+            try:
+                profile = self.config.workload_profile()
+            except ConfigError:
+                profile = None
+            languages = tuple(profile.languages) if profile is not None else ()
+            return toolchains.LanguageResolution(
+                languages,
+                "profile" if languages else "none",
+                {},
+                toolchains.toolchain_versions(languages, None),
+            )
         return toolchains.resolve_languages(self.config.sandbox.languages, workspace)
 
     # -- tokens ------------------------------------------------------------
@@ -842,7 +861,7 @@ class Provisioner:
         # so "which toolchains" has to be known before the spec is built —
         # and it is decided exactly once, so the install and the lint
         # cannot disagree with the allowlist.
-        languages = self.resolve_languages(workspace if kind == "code" else None)
+        languages = self.resolve_languages(workspace if kind == "code" else None, kind=kind)
         self.bus.emit(
             "sandbox.languages",
             run_id,
