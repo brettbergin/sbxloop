@@ -401,7 +401,7 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             parsed = tomllib.loads(f"{key} = {value}")
         except tomllib.TOMLDecodeError:
             continue  # a multi-line value (the exclude list); covered below
-        if section in ("registries", "credentials", "workloads", "schedules"):
+        if section in ("registries", "credentials", "workloads", "schedules", "mcp"):
             continue  # array-of-tables entries load as whole blocks, below
         if section == "github.repos":
             doc: dict[str, Any] = {"github": {"repos": [{"repo": "you/your-repo", **parsed}]}}
@@ -489,6 +489,40 @@ def test_example_workload_profile_loads_with_its_credential() -> None:
         Config.model_validate(
             {"credentials": [credential], "workloads": [profile], "schedules": [schedule]}
         )
+
+
+def test_example_mcp_entry_loads_with_its_credential() -> None:
+    """The commented `[[mcp]]` entry loads as one block beside the
+    `[[credentials]]` entry it names: its keys are coupled by `transport`
+    (a stdio entry takes a command and no url), so it is validated whole.
+    Uncommenting the two together is a working server for the builder."""
+
+    def block_after(header: str) -> dict[str, Any]:
+        text = ""
+        in_block = False
+        for line in EXAMPLE.read_text().splitlines():
+            stripped = re.sub(r"^#\s?", "", line)
+            if stripped == header:
+                in_block = True
+            elif in_block and line.startswith("#") and re.match(r"^[a-z_]+ = ", stripped):
+                text += stripped + "\n"
+            elif in_block and not line.strip():
+                break
+        return tomllib.loads(text)
+
+    entry = block_after("[[mcp]]")
+    credential = block_after("[[credentials]]")
+    config = Config.model_validate({"credentials": [credential], "mcp": [entry]})
+    (server,) = config.mcp
+    assert server.name == entry["name"]
+    assert server.credential == credential["name"]
+    assert server.hosts == entry["hosts"] == [credential["host"]]
+    # The builder asked for it gets a spec carrying a reference, never a
+    # value; the read-only critic is not among its roles.
+    (spec,) = config.mcp_specs_for("builder")
+    assert spec.command == entry["command"][0]
+    assert spec.env == {credential["env"]: f"${{{credential['env']}}}"}
+    assert config.mcp_specs_for("critic") == []
 
 
 def test_example_credential_entry_loads() -> None:
