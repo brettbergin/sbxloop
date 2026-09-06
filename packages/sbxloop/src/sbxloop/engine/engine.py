@@ -190,6 +190,7 @@ from sbxloop.gh.ops import (
     ReviewComment,
     SubmittedReview,
     identities_match,
+    raw_lookup,
     raw_pages,
     user_identity,
 )
@@ -1512,12 +1513,7 @@ class LoopEngine:
         for "this branch is still about this repository's current line of
         work". A comparison GitHub cannot make (404 on unrelated histories)
         answers no rather than raising."""
-        try:
-            data = ops.raw("GET", f"/repos/{repo}/compare/{base}...{branch}")
-        except GithubOpsError as exc:
-            if exc.http_status == 404:
-                return False
-            raise
+        data = raw_lookup(ops, "GET", f"/repos/{repo}/compare/{base}...{branch}")
         if not isinstance(data, dict):
             return False
         merge_base = data.get("merge_base_commit")

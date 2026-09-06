@@ -310,6 +310,30 @@ class PaginationError(GithubOpsError):
     is"."""
 
 
+def raw_lookup(
+    ops: Any,
+    method: str,
+    path: str,
+    body: dict[str, Any] | None = None,
+    *,
+    missing: Sequence[int] = (404,),
+) -> Any:
+    """:meth:`GithubOps.raw_lookup` for any ops object (#558): the real one
+    asks the worker to answer the miss as data; a duck-typed stand-in
+    without the method gets the same ``None`` from its raised error."""
+    lookup = getattr(ops, "raw_lookup", None)
+    if lookup is not None:
+        return lookup(method, path, body, missing=missing)
+    try:
+        # Positional `body` only when there is one: a stand-in's `raw`
+        # may take (method, path) alone.
+        return ops.raw(method, path) if body is None else ops.raw(method, path, body)
+    except GithubOpsError as exc:
+        if exc.http_status in missing:
+            return None
+        raise
+
+
 def raw_pages(ops: GithubOps, path: str, *, key: str | None = None) -> list[Any]:
     """Every entry of a REST list endpoint, following ``page=`` until a
     short page.
@@ -898,12 +922,7 @@ class GithubOps:
         ``head``, or None when GitHub cannot compare them (unrelated
         histories, 404). What #611 folds checks on to tell a red the PR
         caused from one it inherited."""
-        try:
-            data = self.raw("GET", f"/repos/{repo}/compare/{base}...{head}")
-        except GithubOpsError as exc:
-            if exc.http_status == 404:
-                return None
-            raise
+        data = self.raw_lookup("GET", f"/repos/{repo}/compare/{base}...{head}")
         merge_base = data.get("merge_base_commit") if isinstance(data, dict) else None
         sha = merge_base.get("sha") if isinstance(merge_base, dict) else None
         return str(sha) if sha else None
@@ -1548,13 +1567,8 @@ class GithubOps:
         protected branch refuses (422). Neither should be reported as a
         failure of the merge that just succeeded.
         """
-        try:
-            self.raw("DELETE", f"/repos/{repo}/git/refs/heads/{branch}")
-        except GithubOpsError as exc:
-            if exc.http_status in (404, 422):
-                log.debug("gh.branch_already_gone", repo=repo, branch=branch, detail=str(exc))
-                return
-            raise
+        # A miss is the outcome wanted (#558): no failed job for it.
+        self.raw_lookup("DELETE", f"/repos/{repo}/git/refs/heads/{branch}", missing=(404, 422))
 
     def contents_read(self, repo: str, path: str, ref: str | None = None) -> str:
         params: dict[str, Any] = {"repo": repo, "path": path}
@@ -1651,6 +1665,39 @@ class GithubOps:
         if body is not None:
             params["body"] = body
         return self._op("raw.api", params)
+
+    def raw_lookup(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        missing: Sequence[int] = (404,),
+    ) -> Any:
+        """A REST call whose "no" is an answer (#558): a response with a
+        status in ``missing`` comes back as ``None``, and — the point —
+        never as a failed worker job, so an existence probe costs no red
+        chronology panel and no daemon WARNING. The miss travels as data
+        from the worker (``allow_missing_statuses``); a worker from before
+        that raises as it always did and the status is read off the error
+        here, so the answer is the same either way.
+        """
+        params: dict[str, Any] = {
+            "method": method,
+            "path": path,
+            "allow_missing_statuses": [int(s) for s in missing],
+        }
+        if body is not None:
+            params["body"] = body
+        try:
+            data = self._op("raw.api", params)
+        except GithubOpsError as exc:
+            if exc.http_status in missing:
+                return None
+            raise
+        if isinstance(data, dict) and data.get("missing") is True:
+            return None
+        return data
 
     def token_scopes(self) -> tuple[str, ...] | None:
         """The credential's classic OAuth scopes (``repo``, ``workflow``,
