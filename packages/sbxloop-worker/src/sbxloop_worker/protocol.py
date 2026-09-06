@@ -27,6 +27,10 @@ JobKind = Literal[
 ]
 JobStatus = Literal["ok", "error", "timeout"]
 PermissionMode = Literal["auto", "read_only"]
+#: How an external MCP server is reached. The three transports both agent
+#: SDKs express, so one spec materialises onto either backend without the
+#: host knowing which one will run it.
+McpTransport = Literal["stdio", "http", "sse"]
 ExpectMode = Literal["text", "json"]
 
 
@@ -150,6 +154,46 @@ class HostToolSpec(ProtocolModel):
     parameters: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
 
 
+class McpServerSpec(ProtocolModel):
+    """One external MCP server the agent session should be given.
+
+    The host resolves the operator's ``[[mcp]]`` entry into this; the
+    backend materialises it into whatever its SDK wants. Both SDKs express
+    the same three transports with the same fields, so this is their common
+    shape rather than either one's dialect (field-verified 2026-09-06
+    against github-copilot-sdk 1.0.8 and claude-agent-sdk 0.2.149).
+
+    ``env`` carries the server's credential when it has one. That value is
+    a proxy placeholder in the sandbox under the default secret strategy,
+    exactly like the agent's own credential: the real secret never travels
+    in a job, an event, or an ``sbx`` argument.
+    """
+
+    name: str = Field(pattern=HOST_TOOL_NAME_RE)
+    transport: McpTransport = "stdio"
+    # transport == "stdio"
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    # transport in ("http", "sse")
+    url: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _check_transport(self) -> McpServerSpec:
+        if self.transport == "stdio":
+            if not self.command:
+                raise ValueError("a stdio MCP server needs a command")
+            if self.url or self.headers:
+                raise ValueError("a stdio MCP server takes no url or headers")
+        else:
+            if not self.url:
+                raise ValueError(f"a {self.transport} MCP server needs a url")
+            if self.command or self.args or self.env:
+                raise ValueError(f"a {self.transport} MCP server takes no command, args or env")
+        return self
+
+
 class HostToolCall(ProtocolModel):
     """One host-tool invocation — the ``data`` of an ``agent.tool_request`` event."""
 
@@ -213,6 +257,10 @@ class JobRequest(ProtocolModel):
     # SDK built-in tool allowlist: None = the SDK's default set, [] = no
     # built-ins (host tools only). Host tool names are always allowed.
     available_tools: list[str] | None = None
+    # External MCP servers this session gets, already filtered by the host
+    # to the ones the phase's role may use. Empty for every run that
+    # configures none, which is the default.
+    mcp_servers: list[McpServerSpec] = Field(default_factory=list)
 
     # kind == "shell.check"; kind == "service.fetch": the package manager's
     # argv as the host composed it from the ecosystem's fixed recipe (#766),
@@ -255,7 +303,10 @@ class JobRequest(ProtocolModel):
     @property
     def _has_host_tool_fields(self) -> bool:
         return bool(
-            self.host_tools or self.host_tools_dir is not None or self.available_tools is not None
+            self.host_tools
+            or self.host_tools_dir is not None
+            or self.available_tools is not None
+            or self.mcp_servers
         )
 
     @model_validator(mode="after")
@@ -267,7 +318,8 @@ class JobRequest(ProtocolModel):
                 raise ValueError("agent.session must not set argv, commands, or op")
         elif self._has_host_tool_fields:
             raise ValueError(
-                f"{self.kind} must not set host_tools, host_tools_dir, or available_tools"
+                f"{self.kind} must not set host_tools, host_tools_dir, available_tools, "
+                "or mcp_servers"
             )
         if self.kind == "shell.check":
             if not self.argv:

@@ -25,6 +25,7 @@ from sbxloop.engine.phases import (
     OPERATOR_SYSTEM_MESSAGE,
     ToolDigest,
 )
+from sbxloop.engine.skilltools import SKILL_TOOL_NAME
 from sbxloop.errors import WorkerError
 from sbxloop.events import HostEventTypes
 from tests.conftest import FakeSbx
@@ -49,15 +50,17 @@ def jobs(harness: Harness, run_id: str, phase: str) -> list[dict[str, Any]]:
     """The agent-session jobs of one workload phase (``plan``, ``execute``,
     ``judge``), told apart by the actor's system prompt and the reply
     shape — job files carry no phase name and no order (keep_sandboxes
-    runs only)."""
+    runs only). The actor's message is the tail of a system message that
+    opens with the shared harness briefing, so it is matched by containment
+    rather than equality."""
     sessions = [j for j in harness.agent_jobs(run_id) if j["kind"] == "agent.session"]
     if phase == "judge":
-        return [j for j in sessions if j["system_message"] == JUDGE_SYSTEM_MESSAGE]
+        return [j for j in sessions if JUDGE_SYSTEM_MESSAGE in j["system_message"]]
     expect = "json" if phase == "plan" else "text"
     return [
         j
         for j in sessions
-        if j["system_message"] == OPERATOR_SYSTEM_MESSAGE and j["expect"] == expect
+        if OPERATOR_SYSTEM_MESSAGE in j["system_message"] and j["expect"] == expect
     ]
 
 
@@ -269,8 +272,12 @@ class TestOperatorAndJudge:
         assert all(j["permission_mode"] == "read_only" for j in judges)
         assert all(j["expect"] == "json" for j in judges)
         assert all(j["system_preset"] is False for j in plans + executes + judges)
-        # The judge's job carries no host tools: it reads and never calls out.
-        assert all(j["host_tools"] == [] for j in plans + judges)
+        # Neither actor gets a tool that calls out: the operator's plan
+        # stage and the judge reach nothing beyond the host. The judge does
+        # carry the skill door — a critic needs the verification procedure —
+        # and the operator has no skills of its own, so its list is empty.
+        assert all(j["host_tools"] == [] for j in plans)
+        assert all([t["name"] for t in j["host_tools"]] == [SKILL_TOOL_NAME] for j in judges)
 
     def test_a_failing_verdict_is_the_next_attempts_feedback(self, harness: Harness) -> None:
         """Judge fails once with unmet → re-executed with that feedback →

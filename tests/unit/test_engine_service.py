@@ -20,6 +20,7 @@ import pytest
 
 from sbxloop.config import Config
 from sbxloop.engine.service import ServiceOps
+from sbxloop.engine.skilltools import SKILL_TOOL_NAME
 from sbxloop.errors import ConfigError, ProvisionError, ServiceOpsError
 from sbxloop.events import EventBus, HostEventTypes
 from sbxloop.worker.hosttools import HostToolCall
@@ -46,6 +47,18 @@ CALL = {
     },
     "call_id": "c1",
 }
+
+
+def service_tools(job: dict[str, Any]) -> list[str]:
+    """The job's host tool names minus `load_skill`, which rides on every
+    agent session whatever the run was granted. These tests are about the
+    tools a service grant adds, so the skill door is not one of them."""
+    return [t["name"] for t in job.get("host_tools", []) if t["name"] != SKILL_TOOL_NAME]
+
+
+def tool_named(job: dict[str, Any], name: str) -> dict[str, Any]:
+    (spec,) = [t for t in job["host_tools"] if t["name"] == name]
+    return spec
 
 
 @pytest.fixture
@@ -130,12 +143,12 @@ class TestCredentialedRun:
         assert engine.start("weather", credentials=["weather"]).succeeded
         run_id = engine.store.list_runs()[0].run_id
         jobs = [job for job in harness.agent_jobs(run_id) if job.get("kind") == "agent.session"]
-        (build,) = [job for job in jobs if job.get("host_tools")]
-        (decompose,) = [job for job in jobs if not job.get("host_tools")]
-        assert [tool["name"] for tool in build["host_tools"]] == ["call_service"]
-        assert build["host_tools"][0]["parameters"]["properties"]["credential"]["enum"] == [
-            "weather"
-        ]
+        (build,) = [job for job in jobs if service_tools(job)]
+        (decompose,) = [job for job in jobs if not service_tools(job)]
+        assert service_tools(build) == ["call_service"]
+        assert tool_named(build, "call_service")["parameters"]["properties"]["credential"][
+            "enum"
+        ] == ["weather"]
         assert "## Services you may call" in build["prompt"]
         assert "weather" in build["prompt"] and "forecasts" in build["prompt"]
         assert "api.weather.example.com" in build["prompt"]
@@ -270,8 +283,9 @@ class TestCredentialedRun:
 class TestUncredentialedRun:
     def test_no_box_no_tool_same_prompt(self, harness: Harness, fake_service: Path) -> None:
         """Credentials declared but not granted: the run looks exactly like
-        one on a config without the section — the builder has no host tools
-        and the prompt has no services section."""
+        one on a config without the section — the builder gets no service
+        tool beyond the skill door every session carries, and the prompt has
+        no services section."""
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])
         engine = harness.engine(credentials=[WEATHER], keep_sandboxes=True)
         assert engine.start("plain").succeeded
@@ -284,8 +298,7 @@ class TestUncredentialedRun:
         jobs = [job for job in harness.agent_jobs(run_id) if job.get("kind") == "agent.session"]
         assert len(jobs) == 2  # decompose + build
         for job in jobs:
-            assert job.get("host_tools", []) == []
-            assert job.get("host_tools_dir") is None
+            assert service_tools(job) == []
             assert "Services you may call" not in job["prompt"]
             assert "call_service" not in job["prompt"]
 
@@ -412,9 +425,11 @@ class TestCredentialedRegistryRun:
         assert "NPM_TOKEN" not in agent_sh
         assert not (agent_home / ".npmrc").exists()
         jobs = [job for job in harness.agent_jobs(run_id) if job.get("kind") == "agent.session"]
-        (build,) = [job for job in jobs if job.get("host_tools")]
-        assert [tool["name"] for tool in build["host_tools"]] == ["fetch_dependencies"]
-        assert build["host_tools"][0]["parameters"]["properties"]["ecosystem"]["enum"] == ["npm"]
+        (build,) = [job for job in jobs if service_tools(job)]
+        assert service_tools(build) == ["fetch_dependencies"]
+        assert tool_named(build, "fetch_dependencies")["parameters"]["properties"]["ecosystem"][
+            "enum"
+        ] == ["npm"]
         assert "Services you may call" not in build["prompt"]
         assert "## Dependencies" in build["prompt"] and "Ecosystems: npm" in build["prompt"]
         # And the cache is one directory for both, kept out of git.
@@ -518,8 +533,8 @@ class TestCredentialedRegistryRun:
         assert [c["argv"] for c in npm_calls(fake_npm)] == ["install --ignore-scripts"]
         assert len(requests_sent(fake_service)) == 1
         jobs = [job for job in harness.agent_jobs(run_id) if job.get("kind") == "agent.session"]
-        (build,) = [job for job in jobs if job.get("host_tools")]
-        assert [tool["name"] for tool in build["host_tools"]] == [
+        (build,) = [job for job in jobs if service_tools(job)]
+        assert service_tools(build) == [
             "call_service",
             "fetch_dependencies",
         ]

@@ -874,6 +874,86 @@ through like `uv run`. eslint and golangci-lint deliberately have no entry:
 both keep applying their configured ignores to paths given on the command
 line, so an explicit path there is a narrowing the lint must not reject.
 
+What the loop is gets said once, to every session. `engine.harness` holds
+one situation briefing — the run is a sequence of stages, each its own
+session that sees no other's transcript; the microVM is the boundary, so
+tool access is real; egress is an allowlist that fails closed; only the
+workspace survives the sandbox — plus one tail per role
+(`ROLE_BY_PHASE` maps each prompt name to `planner`, `builder`, `critic`,
+`operator` or `concierge`). `PhaseRunner._agent_job` composes it onto every
+engine session through `harness.brief_for_phase`, and the concierge prepends
+the same head to its own template, so the four personas can no longer drift
+from each other or from the machine. It rides the **system message**, not
+the prompt: identical on every turn of every stage, it caches, where the
+same text in a phase prompt is re-sent with each turn (goal 3, "spend
+scales with turns"). The briefing is domain-neutral by test — no language,
+no toolchain, no incident — and the pull-request framing appears only when
+`[github] repo` makes delivery real.
+
+Procedures the agent needs *sometimes* are skills, not prompt text.
+`sbxloop.skills` ships a tree of `<name>/SKILL.md` files — YAML frontmatter
+(`name`, `description`, `roles`) over a Markdown body, deliberately the
+shape a Claude-native skills directory uses, so the same tree can later be
+handed to a backend that loads it from a filesystem without a second source
+of truth. Today the door is a host tool: `engine.skilltools.skill_tool_spec`
+builds a `load_skill` spec whose `name` enum is exactly the skills that
+role may load, and whose description carries the catalogue, so the listing
+costs the tool schema rather than a section in every phase prompt and a body
+costs nothing until it is asked for (goal 3 again). `answer_skill_call`
+answers host-side and logs `skill.loaded`; a name outside the caller's role
+is refused rather than returned, and every malformed call is answered rather
+than raised, because a model that asked for a procedure must always get
+something it can act on.
+
+A host tool rather than a file read is the floor, not a fallback: the
+concierge runs with `available_tools=[]` and `permission_mode="read_only"`,
+so it has no reader and no shell, and this is the only way it can reach a
+procedure at all. That is also why `PhaseRunner._tools_for` does **not**
+narrow the skill tool to `TOOLED_PHASES` the way the run's service tools are
+narrowed — a critic needs the verification procedure as much as the builder
+does, and unlike `call_service` the skill tool reaches nothing outside the
+host. Its consequence is that every agent job now carries at least one host
+tool, so the handler always rides along; `_tools_for` composes the run's own
+handler behind the skill one, and a run with no credentials still gets a
+working `load_skill`. The four shipped skills are `run-shape` (planner,
+builder, critic), `verify-gate` (builder, critic), `deliver-pr` (builder)
+and `operate-sbxloop` (concierge, and the one written for a human asking how
+to set the loop up). Bodies are gated as prompt bodies are:
+`scripts/check_self_references.py` reads `skills/*/SKILL.md` alongside
+`engine/prompts/*.md`.
+
+`[[mcp]]` is the extensibility point: external MCP servers an agent session
+may use, on either backend. `McpConfig` names the server, its `transport`
+(`stdio` with a `command` argv, or `http`/`sse` with a `url`), the `hosts` it
+contacts, an optional `credential` naming a `[[credentials]]` entry, and the
+`roles` that get it — defaulting to builder and operator, never a critic,
+because a read-only review session reaching a third-party service is a
+capability nobody asked for. `Config.mcp_specs_for(role)` resolves an entry
+into the protocol's neutral `McpServerSpec`, `JobRequest.mcp_servers`
+carries it, and `sbxloop_worker.mcp.server_configs` materialises it into
+each SDK's dialect. The two agree on everything except the stdio token —
+`"stdio"` to the Claude Agent SDK, `"local"` to the Copilot SDK — which is
+the entire reason the protocol carries a neutral transport and the backends
+pass their own `stdio_type` (field-verified 2026-09-06 against
+github-copilot-sdk 1.0.8 and claude-agent-sdk 0.2.149). On the claude
+backend the operator's servers are merged *alongside* the in-process
+`sbxloop` host-tool server, never over it.
+
+Two properties make that safe to hand an unattended agent. **No secret
+travels in a job:** a spec carries `${NAME}` references, and
+`sbxloop_worker.mcp.expand_refs` resolves them inside the sandbox against an
+environment where, under the default secret strategy, the value is a proxy
+placeholder that only becomes real in flight to the credential's own host —
+so nothing secret reaches a job, an event, a log or an `sbx` argument, and
+config validation rejects a token-shaped word in `command` for the same
+reason. **The hosts are declared:** `agent_policy_allows` adds
+`config.mcp_hosts_for(roles)` to the sandbox's allowlist, deduped like every
+other tier because a repeated `sbx policy allow` is fatal, and the
+concierge's long-lived box is scoped to `CONCIERGE_MCP_ROLES` so it does not
+open hosts for servers no session there can use. A server that declares no
+hosts is a doctor failure, since it would otherwise fail at its first
+request rather than at startup.
+
 The repository's own instruction files reach every phase the same way
 (#688). `engine.repocontext.read_repo_context` reads `AGENTS.md`,
 `CLAUDE.md`, `.cursorrules`, `.github/copilot-instructions.md`, the
