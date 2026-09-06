@@ -101,21 +101,31 @@ draws a bar. The pages take **letters** — the digits belong to the console's
 rail — and `o` opens the window's costliest run.
 
 - **Summary** (`s`) — the week in a sentence, then outcome, elapsed split
-  into active/parked, and where the working time went, as proportion.
-- **Flow** (`f`) — runs per day, then each kind's outcomes with its own
-  turns and active time per run. Code and workload runs differ by an order
-  of magnitude, so they are never blended.
+  into active/parked, and where the working time went, as proportion; then
+  the change against the week before, a day-by-day strip split by outcome,
+  and one "biggest lever" line naming whichever cost is furthest out of
+  proportion.
+- **Flow** (`f`) — runs per day by outcome, each kind's rates with its own
+  turns, active and parked per run, and **how long work took to land** end
+  to end (median and p90, slowest named). Code and workload runs differ by
+  an order of magnitude, so they are never blended.
 - **Cost** (`c`) — turns lead, because every turn re-sends the session
-  context and spend tracks turns rather than jobs; tokens per turn is the
-  number that moves when a prompt grows. The costliest runs are named and
-  ranked, so an outlier is visible instead of averaged away.
+  context and spend tracks turns rather than jobs. **Which phase** burns
+  them, not only how many, and **how much context each phase re-sends** —
+  the cache-to-fresh ratio is a per-phase fact and the phases differ by an
+  order of magnitude. The costliest runs are named and ranked, with the
+  median and p90 beside them, so an outlier is visible instead of averaged
+  away.
 - **Time** (`t`) — **active** is what the loop did; **parked** is what it
   waited on a human for. These are wildly different: on this project's own
   host active time has run at about a sixth of elapsed, so reporting
   elapsed as "duration" says the loop is slow when the loop is fast and the
   human is not. The runs that waited longest are named.
 - **Health** (`h`) — failures grouped by cause, so a common cause reads as
-  one row rather than several one-offs.
+  one row rather than several one-offs; **where the loop went round again**
+  (retries per phase — a phase that retries constantly is spending turns
+  nobody asked for); the phase table; and the rework the week cost in task
+  revisions, replans and review/CI rounds.
 
 A **cancelled** run is a decision, not an outcome: it is counted and
 reported but kept out of the success rate's denominator.

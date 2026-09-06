@@ -75,6 +75,10 @@ def hm(seconds: float) -> str:
     return f"{total}s"
 
 
+def plural(n: int, word: str) -> str:
+    return f"{n} {word}" if n == 1 else f"{n} {word}s"
+
+
 def count(value: float) -> str:
     if value >= 1_000_000:
         return f"{value / 1_000_000:.1f}M"
@@ -125,6 +129,7 @@ class OverviewScreen(ConsoleScreen):
     OverviewScreen .gap { height: 1; }
     OverviewScreen .r { height: 1; }
     OverviewScreen .lab { width: 13; color: $text-muted; }
+    OverviewScreen .lab-wide { width: 30; color: $text-muted; }
     OverviewScreen .val { width: 11; text-style: bold; }
     OverviewScreen Sparkline { height: 1; width: 28; }
     OverviewScreen.-narrow PageRail { display: none; }
@@ -265,20 +270,65 @@ class OverviewScreen(ConsoleScreen):
         )
 
     @staticmethod
-    def _ranked(rows: list[tuple[str, float, str]], colour: str) -> list[Any]:
-        """A short ranked list, each row a bar against the biggest."""
+    def _ranked(
+        rows: list[tuple[str, float, str]], colour: str, *, wide: bool = False
+    ) -> list[Any]:
+        """A short ranked list, each row a bar against the biggest.
+
+        ``wide`` gives the label room for a sentence rather than an id: a
+        failure reason is prose, and reads as nothing clipped to the width
+        of a run id."""
         if not rows:
             return [TextPanel(Text("nothing to rank", style="dim"))]
         peak = max(value for _label, value, _note in rows) or 1.0
+        label_class = "lab-wide" if wide else "lab"
         return [
             Horizontal(
-                TextPanel(f"{label} ", classes="lab"),
+                TextPanel(f"{label} ", classes=label_class),
                 TextPanel(note, classes="val"),
                 Band([Segment("v", value, colour), Segment("rest", peak - value, TRACK_COLOUR)]),
                 classes="r",
             )
             for label, value, note in rows
         ]
+
+    @staticmethod
+    def _delta(value: float | None, *, lower_is_better: bool = False) -> tuple[str, str]:
+        """A change against the previous window, and how to colour it."""
+        if value is None:
+            return "", "dim"
+        arrow = "▲" if value > 0 else ("▼" if value < 0 else "=")
+        good = (value < 0) if lower_is_better else (value > 0)
+        style = "dim" if abs(value) < 0.05 else (OK_COLOUR if good else WAIT_COLOUR)
+        return f" {arrow} {abs(value):.0%}", style
+
+    def _compare(self, data: Analytics, rows: list[tuple[str, str, str, bool]]) -> list[Any]:
+        """A small "against last week" block: label, value, and the change."""
+        out: list[Any] = [TextPanel("against the week before", classes="h")]
+        for label, metric, shown, lower_better in rows:
+            change, style = self._delta(data.delta(metric), lower_is_better=lower_better)
+            out.append(
+                TextPanel(
+                    Text.assemble(
+                        (f"{label:<13}", "dim"),
+                        (f"{shown:<12}", "bold"),
+                        (change, style),
+                    )
+                )
+            )
+        return out
+
+    @staticmethod
+    def _cols(widths: tuple[int, ...], *rows: tuple[str, ...], head: bool = False) -> list[Any]:
+        """A plain aligned table. Cheaper to read than a bar when the point
+        is the numbers rather than the proportion."""
+        out: list[Any] = []
+        for row in rows:
+            text = Text()
+            for cell, width in zip(row, widths, strict=False):
+                text.append(f"{cell:<{width}}", style="dim" if head else "")
+            out.append(TextPanel(text))
+        return out
 
     @staticmethod
     def _outcome(lane: Lane) -> list[Segment]:
@@ -299,7 +349,7 @@ class OverviewScreen(ConsoleScreen):
         total = data.total
         rate = total.ok_rate
         phases = self._phases(data)
-        return [
+        out: list[Any] = [
             self._say(
                 (f"{total.runs} runs this week. ", "bold"),
                 (f"{total.landed} landed, {total.failed} failed, ", ""),
@@ -328,32 +378,148 @@ class OverviewScreen(ConsoleScreen):
             TextPanel("", classes="gap"),
             self._row("phases", hm(data.active_seconds), phases),
             TextPanel(legend(phases)),
-        ]
-
-    def _flow(self, data: Analytics) -> list[Any]:
-        out: list[Any] = [
-            TextPanel("runs per day", classes="h"),
-            Sparkline([float(x) for x in data.daily["runs"]], summary_function=max),
             TextPanel("", classes="gap"),
         ]
-        for kind in sorted(data.lanes):
-            lane = data.lane(kind)
-            rate = lane.ok_rate
-            out.append(self._row(kind, f"{lane.runs} runs", self._outcome(lane)))
+        out.extend(
+            self._compare(
+                data,
+                [
+                    ("runs", "runs", str(total.runs), False),
+                    ("turns", "turns", f"{total.turns:,}", True),
+                    ("active", "active", hm(total.active), True),
+                    ("parked", "parked", hm(total.parked), True),
+                ],
+            )
+        )
+        out.append(TextPanel("", classes="gap"))
+        out.append(TextPanel("day by day", classes="h"))
+        out.extend(self._days(data))
+        lever = self._lever(data)
+        if lever is not None:
+            out.append(TextPanel("", classes="gap"))
+            out.append(lever)
+        return out
+
+    def _lever(self, data: Analytics) -> Any:
+        """The one sentence worth acting on: whichever of the week's costs
+        is furthest out of proportion. None when nothing stands out."""
+        total = data.total
+        if total.parked > total.active * 2 and total.parked > 3600:
+            return self._say(
+                ("Biggest lever: ", "dim"),
+                (f"{total.parked_share:.0%} of elapsed was waiting on you", f"bold {WAIT_COLOUR}"),
+                (f" — {hm(total.parked)} against {hm(total.active)} of work.", "dim"),
+            )
+        top = data.phase_turns[0] if data.phase_turns else None
+        if top is not None and total.turns and top.turns > total.turns * 0.5:
+            return self._say(
+                ("Biggest lever: ", "dim"),
+                (f"{top.phase} is {top.turns / total.turns:.0%} of every turn", "bold"),
+                (f" — {top.turns:,} of {total.turns:,}.", "dim"),
+            )
+        if data.costliest and total.turns and data.costliest[0].turns > total.turns * 0.25:
+            run = data.costliest[0]
+            return self._say(
+                ("Biggest lever: ", "dim"),
+                (f"{run.run_id} is {run.turns / total.turns:.0%} of the week", "bold"),
+                (" — o opens it.", "dim"),
+            )
+        return None
+
+    def _days(self, data: Analytics) -> list[Any]:
+        """The trend as a stack: each bucket split by how its runs ended."""
+        peak = max((d.runs for d in data.days), default=0) or 1
+        out: list[Any] = []
+        for offset, day in enumerate(data.days):
+            when = time.localtime(
+                data.since + (offset + 0.5) * (data.until - data.since) / max(len(data.days), 1)
+            )
+            label = time.strftime("%a %d", when)
+            segments = [
+                Segment("landed", day.landed, OK_COLOUR),
+                Segment("failed", day.failed, BAD_COLOUR),
+                Segment("cancelled", day.cancelled, IDLE_COLOUR),
+                Segment("rest", peak - day.runs, TRACK_COLOUR),
+            ]
             out.append(
-                TextPanel(
-                    Text.assemble(
-                        ("             ", ""),
-                        (f"{rate:.0%} ok" if rate is not None else "no judged runs", "dim"),
-                        (f" · {lane.turns_per_run:.0f} turns/run", "dim"),
-                        (f" · {hm(lane.active_per_run)} active/run", "dim"),
-                    )
+                Horizontal(
+                    TextPanel(label, classes="lab"),
+                    TextPanel(f"{day.runs or '—'}", classes="val"),
+                    Band(segments),
+                    classes="r",
                 )
             )
         return out
 
+    def _flow(self, data: Analytics) -> list[Any]:
+        out: list[Any] = [
+            self._say(
+                (f"{data.total.runs} runs", "bold"),
+                (" over the week — ", "dim"),
+                (f"{max((d.runs for d in data.days), default=0)} on the busiest day", "bold"),
+                (f", {plural(sum(1 for d in data.days if not d.runs), 'day')} with none.", "dim"),
+            ),
+            TextPanel("", classes="gap"),
+            TextPanel("runs per day, by outcome", classes="h"),
+        ]
+        out.extend(self._days(data))
+        out.append(TextPanel("", classes="gap"))
+        out.append(TextPanel("by kind", classes="h"))
+        out.extend(
+            self._cols(
+                (11, 8, 9, 11, 12, 12),
+                ("kind", "runs", "ok", "turns/run", "active/run", "parked/run"),
+                head=True,
+            )
+        )
+        for kind in sorted(data.lanes):
+            lane = data.lane(kind)
+            rate = lane.ok_rate
+            out.extend(
+                self._cols(
+                    (11, 8, 9, 11, 12, 12),
+                    (
+                        kind,
+                        str(lane.runs),
+                        f"{rate:.0%}" if rate is not None else "—",
+                        f"{lane.turns_per_run:.0f}",
+                        hm(lane.active_per_run),
+                        hm(lane.parked_per_run),
+                    ),
+                )
+            )
+        out.append(TextPanel("", classes="gap"))
+        median, p90 = data.cycle_spread
+        landed = data.landed_runs
+        if landed:
+            out.append(TextPanel("how long work took to land", classes="h"))
+            out.append(
+                TextPanel(
+                    Text.assemble(
+                        (f"{len(landed)} landed", "bold"),
+                        ("   ·   median ", "dim"),
+                        (hm(median), "bold"),
+                        ("   ·   p90 ", "dim"),
+                        (hm(p90), "bold"),
+                    )
+                )
+            )
+            out.extend(
+                self._ranked(
+                    [
+                        (r.run_id, r.active + r.parked, hm(r.active + r.parked))
+                        for r in data.slowest_to_land[:6]
+                    ],
+                    PALETTE[3],
+                )
+            )
+            out.append(TextPanel("", classes="gap"))
+        out.extend(self._compare(data, [("runs", "runs", str(data.total.runs), False)]))
+        return out
+
     def _cost(self, data: Analytics) -> list[Any]:
         total = data.total
+        median, p90 = data.turns_spread
         out: list[Any] = [
             self._say(
                 (f"{total.turns:,} turns", "bold"),
@@ -367,16 +533,72 @@ class OverviewScreen(ConsoleScreen):
             TextPanel("turns per day", classes="h"),
             Sparkline([float(x) for x in data.daily["turns"]], summary_function=max),
             TextPanel("", classes="gap"),
-            TextPanel("costliest runs", classes="h"),
         ]
+        # Which phase burns the turns — the total says how much, this says
+        # where, and only the second one is actionable.
+        by_turns = data.phase_turns
+        if by_turns:
+            out.append(TextPanel("turns by phase", classes="h"))
+            out.append(
+                Band(
+                    [
+                        Segment(p.phase, float(p.turns), PALETTE[i % len(PALETTE)])
+                        for i, p in enumerate(by_turns[:6])
+                    ]
+                )
+            )
+            out.append(
+                TextPanel(
+                    legend(
+                        [
+                            Segment(p.phase, float(p.turns), PALETTE[i % len(PALETTE)])
+                            for i, p in enumerate(by_turns[:6])
+                        ]
+                    )
+                )
+            )
+            out.append(TextPanel("", classes="gap"))
+            out.append(TextPanel("context re-sent per phase", classes="h"))
+            out.extend(
+                self._cols(
+                    (11, 10, 10, 10, 9),
+                    ("phase", "turns", "fresh", "cache", "ratio"),
+                    head=True,
+                )
+            )
+            for phase in by_turns[:6]:
+                out.extend(
+                    self._cols(
+                        (11, 10, 10, 10, 9),
+                        (
+                            phase.phase,
+                            f"{phase.turns:,}",
+                            count(phase.tokens),
+                            count(phase.cache),
+                            f"{phase.cache_ratio:.1f}x" if phase.tokens else "—",
+                        ),
+                    )
+                )
+            out.append(TextPanel("", classes="gap"))
+        out.append(TextPanel("costliest runs", classes="h"))
         out.extend(
             self._ranked(
                 [(r.run_id, float(r.turns), f"{r.turns} turns") for r in data.costliest], PALETTE[1]
             )
         )
+        out.append(TextPanel("", classes="gap"))
+        out.append(
+            TextPanel(
+                Text.assemble(
+                    ("median run ", "dim"),
+                    (f"{median:.0f} turns", "bold"),
+                    ("   ·   p90 ", "dim"),
+                    (f"{p90:.0f} turns", "bold"),
+                )
+            )
+        )
         if data.costliest and total.turns:
             top = data.costliest[0]
-            out.append(TextPanel("", classes="gap"))
             out.append(
                 TextPanel(
                     Text.assemble(
@@ -389,10 +611,22 @@ class OverviewScreen(ConsoleScreen):
                     )
                 )
             )
+        out.append(TextPanel("", classes="gap"))
+        out.extend(
+            self._compare(
+                data,
+                [
+                    ("turns", "turns", f"{total.turns:,}", True),
+                    ("tokens", "tokens", count(total.tokens), True),
+                    ("cache", "cache", count(total.cache), True),
+                ],
+            )
+        )
         return out
 
     def _time(self, data: Analytics) -> list[Any]:
         total = data.total
+        median, p90 = data.active_spread
         phases = self._phases(data)
         out: list[Any] = [
             self._say(
@@ -412,17 +646,59 @@ class OverviewScreen(ConsoleScreen):
                 ],
             ),
             TextPanel("", classes="gap"),
-            TextPanel("longest parked", classes="h"),
+            TextPanel("where the working time went", classes="h"),
+            Band(phases),
+            TextPanel(legend(phases)),
+            TextPanel("", classes="gap"),
         ]
+        if data.phases:
+            out.extend(
+                self._cols(
+                    (11, 10, 11, 11, 9),
+                    ("phase", "attempts", "total", "average", "turns"),
+                    head=True,
+                )
+            )
+            for phase in data.phases[:7]:
+                out.extend(
+                    self._cols(
+                        (11, 10, 11, 11, 9),
+                        (
+                            phase.phase,
+                            str(phase.attempts),
+                            hm(phase.seconds),
+                            hm(phase.seconds_per_attempt),
+                            f"{phase.turns:,}" if phase.turns else "—",
+                        ),
+                    )
+                )
+            out.append(TextPanel("", classes="gap"))
+        out.append(TextPanel("longest parked", classes="h"))
         out.extend(
             self._ranked(
                 [(r.run_id, r.parked, hm(r.parked)) for r in data.longest_parked], WAIT_COLOUR
             )
         )
         out.append(TextPanel("", classes="gap"))
-        out.append(TextPanel("where the working time went", classes="h"))
-        out.append(Band(phases))
-        out.append(TextPanel(legend(phases)))
+        out.append(
+            TextPanel(
+                Text.assemble(
+                    ("median run works ", "dim"),
+                    (hm(median), "bold"),
+                    ("   ·   p90 ", "dim"),
+                    (hm(p90), "bold"),
+                )
+            )
+        )
+        out.extend(
+            self._compare(
+                data,
+                [
+                    ("active", "active", hm(total.active), True),
+                    ("parked", "parked", hm(total.parked), True),
+                ],
+            )
+        )
         return out
 
     def _health(self, data: Analytics) -> list[Any]:
@@ -448,22 +724,67 @@ class OverviewScreen(ConsoleScreen):
             out.append(TextPanel("why runs failed", classes="h"))
             out.extend(
                 self._ranked(
-                    [
-                        (reason[:26], float(n), f"{n} run{'s' if n != 1 else ''}")
-                        for reason, n in failures
-                    ],
+                    [(reason[:28], float(n), plural(n, "run")) for reason, n in failures],
                     BAD_COLOUR,
+                    wide=True,
                 )
             )
             out.append(TextPanel("", classes="gap"))
-        out.append(TextPanel("what the week spent itself on", classes="h"))
+        # Where the loop went round again. A phase that retries constantly
+        # is costing turns nobody asked for.
+        retried = data.retried_phases
+        if retried:
+            out.append(TextPanel("where the loop went round again", classes="h"))
+            out.extend(
+                self._ranked(
+                    [
+                        (p.phase, float(p.retries), f"{p.retries} of {p.attempts}")
+                        for p in retried[:6]
+                    ],
+                    WAIT_COLOUR,
+                )
+            )
+            out.append(TextPanel("", classes="gap"))
+        out.append(TextPanel("phases, by how often they ran", classes="h"))
+        out.extend(
+            self._cols((11, 10, 10, 11), ("phase", "attempts", "retries", "turns"), head=True)
+        )
+        for phase in data.phases[:6]:
+            out.extend(
+                self._cols(
+                    (11, 10, 10, 11),
+                    (
+                        phase.phase,
+                        str(phase.attempts),
+                        str(phase.retries) if phase.retries else "—",
+                        f"{phase.turns:,}" if phase.turns else "—",
+                    ),
+                )
+            )
+        out.append(TextPanel("", classes="gap"))
+        rework = data.rework
+        out.append(TextPanel("rework", classes="h"))
         out.append(
             TextPanel(
                 Text.assemble(
-                    (f"{sum(p.attempts for p in data.phases)}", "bold"),
-                    (" phase attempts   ", "dim"),
-                    (f"{len(data.phases)}", "bold"),
-                    (" phases used   ", "dim"),
+                    (f"{rework.tasks}", "bold"),
+                    (" tasks   ", "dim"),
+                    (f"{rework.revisions}", "bold"),
+                    (" revisions   ", "dim"),
+                    (f"{rework.replans}", "bold"),
+                    (" replans   ", "dim"),
+                    (f"{rework.suspect}", "bold"),
+                    (" suspect verifies", "dim"),
+                )
+            )
+        )
+        out.append(
+            TextPanel(
+                Text.assemble(
+                    (f"{data.review_rounds}", "bold"),
+                    (" review rounds   ", "dim"),
+                    (f"{data.ci_rounds}", "bold"),
+                    (" CI rounds   ", "dim"),
                     (f"{total.cancelled}", "bold"),
                     (" cancelled by you", "dim"),
                 )
@@ -482,4 +803,4 @@ class OverviewScreen(ConsoleScreen):
         self.console_app.open_run(data.costliest[0].run_id)
 
 
-__all__ = ["PAGES", "OverviewScreen", "PageRail", "count", "hm"]
+__all__ = ["PAGES", "OverviewScreen", "PageRail", "count", "hm", "plural"]
