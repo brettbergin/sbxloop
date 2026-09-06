@@ -36,6 +36,7 @@ def git(*argv: str, cwd: Path) -> None:
             "GIT_COMMITTER_EMAIL": "t@example.com",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_SSL_CAINFO": os.environ.get("GIT_SSL_CAINFO", ""),
         },
     )
 
@@ -1115,7 +1116,7 @@ class TestPrivateRemoteClone:
         assert env["GIT_CONFIG_KEY_1"] == "credential.helper"
         assert "x-access-token" in env["GIT_CONFIG_VALUE_1"]
         assert "s3cr3t-value" not in env["GIT_CONFIG_VALUE_1"]
-        assert "GIT_CONFIG_COUNT" not in hostgit._clone_env(None)
+        assert hostgit._clone_env(None)["GIT_CONFIG_COUNT"] == "1"
 
 
 class TestIsTracked:
@@ -1256,7 +1257,9 @@ class TestSubmodules:
             with pytest.raises(ProvisionError) as excinfo:
                 hostgit.populate_submodules(clone, source=None, token=None)
             assert "vendor/lib" in str(excinfo.value)
-            populated = hostgit.populate_submodules(clone, source=None, token=token)
+            populated = hostgit.populate_submodules(
+                clone, source=None, token=token, credential_url=private.url
+            )
             assert populated == [("vendor/lib", "remote")]
             assert (clone / "vendor" / "lib" / "lib.txt").read_text() == "v1\n"
             assert token not in (clone / ".git" / "config").read_text()
@@ -1665,7 +1668,9 @@ class TestFetchTags:
             assert hostgit.tag_count(host) == 0
             clone = tmp_path / "run"
             hostgit.clone_for_run(host, clone, "sbxloop/r1")
-            fetched = hostgit.fetch_tags(clone, source=host, token="ghs_tags")
+            fetched = hostgit.fetch_tags(
+                clone, source=host, token="ghs_tags", credential_url=private.url
+            )
             assert fetched == hostgit.TagFetch(tags=1, source="remote")
             assert describe(clone) == "v2.0.0"
             assert private.requests
@@ -1683,10 +1688,12 @@ class TestFetchTags:
             clone = tmp_path / "run"
             hostgit.clone_from_remote(url, clone, "sbxloop/r1", token="ghs_tags")
             with pytest.raises(ProvisionError) as excinfo:
-                hostgit.fetch_tags(clone, source=None, token="wrong")
+                hostgit.fetch_tags(clone, source=None, token="wrong", credential_url=private.url)
             assert 'fetch_tags = "never"' in str(excinfo.value)
             assert hostgit.tag_count(clone) == 0
-            fetched = hostgit.fetch_tags(clone, source=None, token="ghs_tags")
+            fetched = hostgit.fetch_tags(
+                clone, source=None, token="ghs_tags", credential_url=private.url
+            )
             assert fetched == hostgit.TagFetch(tags=1, source="remote")
             assert describe(clone) == "v0.9"
 

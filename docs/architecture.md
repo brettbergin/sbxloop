@@ -179,7 +179,7 @@ That single answer builds the installer allowlist, drives the worker
 install, and scopes the project gate, so none of them can disagree. A fresh
 run clone has its submodules populated first (`hostgit.populate_submodules`,
 #692) — from the host checkout's copy when it has the recorded commit, else
-from the `.gitmodules` URL under the run's credential — and the hosts they
+from the `.gitmodules` URL — and the hosts they
 fetch from join that allowlist (`sandbox.submodule_hosts`). A clone whose
 `.gitattributes` routes files through Git LFS is populated the same way
 (`hostgit.populate_lfs`, #693) — the host checkout's LFS store first, the
@@ -192,6 +192,13 @@ blob. A clone whose manifests name a tag-derived versioning tool
 runs `git describe` on it would otherwise report the wrong version — from the
 host checkout when it has them, else from origin under the run's credential;
 `[sandbox] fetch_tags` overrides the detection.
+The host's one-shot Git helper releases the run's PAT or App installation
+token only to the configured GitHub HTTPS host and port. This same scope
+travels through every nested submodule; a repository-supplied URL cannot
+expand it. Other hosts can be fetched anonymously, but authentication
+challenges there fail without the GitHub token. Clone, tag, LFS and base
+fetches keep credentials in the process environment, never in Git config,
+remote URLs, command arguments or bundles.
 Host Git reads use a temporary, host-owned metadata view (`safegit.read_repo`)
 that carries refs, index and object access but excludes the agent's config
 and hooks. Diff drivers and recursive submodule scans are disabled; each
