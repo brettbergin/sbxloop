@@ -2,12 +2,8 @@
 
 The host resolves an operator's ``[[mcp]]`` entry into a
 :class:`~sbxloop_worker.protocol.McpServerSpec` and sends it in the job. It
-must not send credentials: a job's contents reach events, logs and the
-worker's own stderr. So a spec carries ``${NAME}`` references instead, and
-this module expands them **inside the sandbox**, against the process
-environment the provisioner set up — where, under the default secret
-strategy, the value is a proxy placeholder that only becomes real in flight
-to the credential's own host.
+contains only credential-free servers. Credentialed HTTP servers are replaced
+with host tools before dispatch; their secrets live only in the service VM.
 
 The two SDKs agree on the shape (a name -> config mapping, the same fields)
 and disagree on exactly one token: stdio is ``"stdio"`` to the Claude Agent
@@ -66,6 +62,8 @@ def server_configs(
     """
     configs: dict[str, dict[str, Any]] = {}
     for server in servers:
+        if server.mediated:
+            raise ValueError("credentialed MCP must be mediated by the host before dispatch")
         if server.transport == "stdio":
             config: dict[str, Any] = {"type": stdio_type, "command": server.command}
             if server.args:

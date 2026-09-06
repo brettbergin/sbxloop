@@ -452,6 +452,7 @@ class Concierge:
             expect="text",
             timeout_s=cfg.timeout_s,
             max_tool_calls=cfg.max_tool_calls,
+            mcp_servers=self.config.mcp_specs_for("concierge"),
             host_tools=[t.spec for t in self._tools.values()],
             host_tool_timeout_s=min(cfg.timeout_s, 120.0),
         )
