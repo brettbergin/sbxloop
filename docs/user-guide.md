@@ -1479,7 +1479,9 @@ replaced wholesale by a GitHub App installation — see
 token against that table before a run can fail on it (#696): a required
 permission the token lacks is a failing row naming the permission and the
 feature that first needs it, a missing `workflows:write` is a warning
-(only a delivery touching `.github/workflows/` needs it), and a
+(only a delivery touching `.github/workflows/` needs it — such a delivery
+is refused up front with the permission named and the item ends `blocked`
+rather than burning retries on GitHub's 403, #752), and a
 `github repo <r> ci` row says what Actions the repository has for the CI
 stage to wait on — or that it has none.
 

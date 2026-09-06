@@ -110,6 +110,12 @@
       "status": 422,
       "provenance": "synthetic",
       "observed": "deliberately unrecognised wording standing in for any ref refusal the classifier has no entry for (#677; deliver._explain_ref_refusal quotes GitHub and names no knob)"
+    },
+    "trees_forbidden_403": {
+      "message": "github op raw.api failed: GithubOpError: gh api POST /repos/o/r/git/trees failed (rc=1): gh: Resource not accessible by integration (HTTP 403)",
+      "status": 403,
+      "provenance": "field",
+      "observed": "run r5jeb6pa3 (2026-09-04, #752): POST git/trees on a tree carrying .github/workflows/release-on-merge.yml with a GitHub App installation token lacking workflows:write; repeated verbatim by run rc9v5ps91 15 min later; repo slug replaced with o/r"
     }
   }
 }

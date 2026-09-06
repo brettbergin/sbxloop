@@ -99,6 +99,20 @@ class DeliveryError(SbxloopError):
     """Delivering a run's workspace as a GitHub PR failed."""
 
 
+class DeliveryPermissionError(DeliveryError):
+    """A delivery the credential is known not to be allowed to make (#752):
+    the plan touches ``.github/workflows/`` and the token has no
+    ``workflows: write``. Operator-actionable and never transient — no
+    retry changes a permission grant — so the run ends ``blocked`` with
+    the remedy named, not ``failed`` with attempts to burn.
+    """
+
+    def __init__(self, message: str, *, paths: tuple[str, ...], permission: str) -> None:
+        super().__init__(message)
+        self.paths = paths
+        self.permission = permission
+
+
 class BudgetExceededError(SbxloopError):
     """A run or task exhausted one of its budgets."""
 
