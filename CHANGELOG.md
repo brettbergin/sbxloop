@@ -1,5 +1,23 @@
 ## [Unreleased]
 
+### Added
+
+- **A navigation rail down the left of the console.** Every screen with the
+  key that reaches it, the one you are on marked, and a badge where a screen
+  you are *not* on wants attention: the queue's depth, unread
+  control-channel rows, the gates and holds waiting for a human. Clicking a
+  row is the same verb as pressing its key. The screens were reachable only
+  by number keys listed in a footer that also carries whatever the current
+  screen binds, so where you *are* and where you can *go* were mixed in with
+  what you can *do*; the rail is the map and the footer keeps its row for
+  the verbs. Below 90 columns the rail hides itself and the keys still reach
+  everything.
+
+  `sbxloop.tui.widgets.navrail.NAV` is the single source of the console's
+  shape — the rail renders it and the app builds its bindings from it, so a
+  screen cannot be reachable by key and missing from the map. The rail is
+  docked, so no screen composes it and no screen body moved.
+
 ### Removed
 
 - **The console's file editor.** The Config screen no longer carries a

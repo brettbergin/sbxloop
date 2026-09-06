@@ -31,15 +31,31 @@ opens that run's screen at once; `--read-only` removes every action.
 ## Layout and navigation
 
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│ ● running  r7ab3kq2m · Add retries   queue 2   runs 4/12 UTC   failures 0  │
-│ sbxloop 1.4.2   bridge ✓   up since 2d ago   ctl 12 ms   14:02:11          │
-├────────────────────────────────────────────────────────────────────────────┤
-│                            <active screen>                                 │
-├────────────────────────────────────────────────────────────────────────────┤
-│ 1 Overview 2 Runs 3 Queue 4 Chat 5 Sandboxes 6 Daemon 7 Config 8 Doctor ? │
-└────────────────────────────────────────────────────────────────────────────┘
+┌─────────────┬──────────────────────────────────────────────────────────────┐
+│             │ ● running  r7ab3kq2m · Add retries   queue 2   runs 4/12 UTC  │
+│ 1 Overview  │ sbxloop 1.5.2   bridge ✓   up since 2d ago   ctl 12 ms        │
+│ 2 Runs      ├──────────────────────────────────────────────────────────────┤
+│ 3 Queue   2 │                                                              │
+│ 4 Chat      │                     <active screen>                          │
+│ 5 Sandboxes │                                                              │
+│ 6 Daemon  1 │                                                              │
+│ 7 Config    │                                                              │
+│ 8 Doctor    ├──────────────────────────────────────────────────────────────┤
+│ ? Help      │ / Filter  r Refresh  q Quit                     ^p palette    │
+└─────────────┴──────────────────────────────────────────────────────────────┘
 ```
+
+The **navigation rail** runs down the left of every screen: every screen
+with the key that reaches it, the one you are on marked, and a badge where
+a screen you are *not* on wants attention — the queue's depth, unread
+control-channel rows, gates and holds waiting for a human. Clicking a row
+is the same verb as pressing its key. It is the console's map; the footer
+keeps its row for the verbs of whichever screen is up. Below 90 columns the
+rail hides itself and the keys still reach everything.
+
+`sbxloop.tui.widgets.navrail.NAV` is the single source of the console's
+shape — the rail renders it and the app builds its bindings from it, so a
+screen cannot be reachable by key and missing from the map.
 
 The two-line **status bar** is on every screen: the daemon (`●` running,
 `◌` idle, `⏸` paused with its holds, `🛑` breaker open, `…` starting, `✖`
@@ -55,6 +71,7 @@ returns.
 | key               | where                       | what                                                               |
 | ----------------- | --------------------------- | ------------------------------------------------------------------ |
 | `1` … `8`         | anywhere                    | Overview, Runs, Queue, Chat, Sandboxes, Daemon, Config, Doctor     |
+| click             | the rail                    | the same as that row's key                                         |
 | `?`               | anywhere                    | Help                                                               |
 | `ctrl+p`          | anywhere                    | the command palette: screens and argument-less verbs by name       |
 | `r`               | anywhere                    | refresh now (store and `ctl status`)                               |
