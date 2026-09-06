@@ -2748,16 +2748,53 @@ class DaemonLoop:
         source = source.resolve()
         return source if hostgit.repo_toplevel(source) == source else None
 
+    def _ensure_workspace(self, repo: str | None) -> None:
+        """Clone ``repo`` into the home's ``workspaces/<owner>/<name>`` the
+        first time it is needed, when the operator pointed the daemon at no
+        checkout of their own. Never fatal: without the checkout the run
+        clones from the remote itself, as it always could."""
+        if repo is None or self.config.workspace_for_repo(repo) is not None:
+            return
+        target = self.config.default_workspace_for_repo(repo)
+        if target is None or target.exists() or hostgit.find_git() is None:
+            return
+        url = f"{self.config.github.web_url}/{repo}"
+        token = self.github.provisioner.clone_token(repo) if self.github is not None else None
+        started = time.monotonic()
+        try:
+            sha = hostgit.clone_workspace(
+                url, target, token=token, clone_filter=self.config.sandbox.clone_filter
+            )
+        except ProvisionError as exc:
+            self._notice(
+                "workspace.refresh_failed",
+                f"⚠ could not clone {repo} into {target}; runs will clone from the remote: {exc}",
+                level="warning",
+                path=str(target),
+                error=str(exc),
+                duration_s=round(time.monotonic() - started, 1),
+            )
+            return
+        self._notice(
+            "workspace.cloned",
+            f"cloned {repo} into {target} (at {sha[:12]})",
+            path=str(target),
+            commit=sha,
+            duration_s=round(time.monotonic() - started, 1),
+        )
+
     def _refresh_workspace(self, repo: str | None = None) -> None:
         """Fetch + fast-forward *the claimed repo's* source checkout so the
         run's clone starts from current ``origin/<branch>`` (#255). Never
         fatal: a stale HEAD is still a run, a failed fetch (network blip,
         remote gone) is a warning in the chronology, not a failed issue.
 
-        A repo with no workspace of its own is skipped with a log line, and
-        a checkout whose ``origin`` names a different repository is refused
-        rather than fast-forwarded (#526).
+        A repo the operator pointed at no checkout gets one cloned under the
+        home first (:meth:`_ensure_workspace`); a checkout whose ``origin``
+        names a different repository is refused rather than fast-forwarded
+        (#526).
         """
+        self._ensure_workspace(repo)
         if not self.config.daemon.refresh_workspace:
             return
         if self.config.daemon.workspace_isolation == "in-place":

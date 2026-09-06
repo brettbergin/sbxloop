@@ -235,6 +235,7 @@ NoticeKind = Literal[
     "source.repo_resumed",
     "workspace.refreshed",
     "workspace.refresh_failed",
+    "workspace.cloned",
     "item.queued",
     "item.claim_failed",
     "recovery.claim_settled",

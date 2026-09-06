@@ -444,6 +444,28 @@ def workspace_origin_mismatches(config: Config) -> list[WorkspaceOriginMismatch]
     return mismatches
 
 
+def workspace_checks(config: Config) -> list[Check]:
+    """Where each enabled repository's dedicated checkout is: the operator's
+    own, the home's (cloned by the daemon on first use), or nowhere yet."""
+    checks: list[Check] = []
+    for entry in config.github.enabled_repos():
+        path = config.workspace_for_repo(entry.repo)
+        default = config.default_workspace_for_repo(entry.repo)
+        if path is not None:
+            where = "the home's" if default is not None and path == default else "operator's"
+            checks.append(Check(f"workspace {entry.repo}", True, f"{path} ({where})", hard=False))
+        elif default is not None:
+            checks.append(
+                Check(
+                    f"workspace {entry.repo}",
+                    True,
+                    f"none yet; the daemon clones it into {default} on first use",
+                    hard=False,
+                )
+            )
+    return checks
+
+
 def workspace_origin_checks(config: Config) -> list[Check]:
     """One hard-failing :class:`Check` per origin mismatch."""
     return [
@@ -1131,6 +1153,7 @@ def collect_checks(
         # A workspace that is a checkout of another repository would build a
         # repo's runs from the wrong tree (#526): refuse before dispatch.
         checks.extend(workspace_origin_checks(config))
+        checks.extend(workspace_checks(config))
     else:
         checks.append(
             Check(

@@ -491,6 +491,33 @@ _CLONE_CREDENTIAL_HELPER = (
 _SKIP_LFS_SMUDGE = {"GIT_LFS_SKIP_SMUDGE": "1"}
 
 
+def clone_workspace(
+    repo_url: str, target: Path, *, token: str | None = None, clone_filter: str | None = None
+) -> str:
+    """Clone a remote into ``target`` as a *dedicated workspace*: the default
+    branch, tracking ``origin``, the shape :func:`refresh_from_origin`
+    fast-forwards before every run. This is the checkout the daemon keeps
+    under the home's ``workspaces/<owner>/<name>`` when the operator has
+    not pointed it at one of their own; per-run clones are then cut from
+    it locally instead of from the remote each time.
+
+    Same credential and prompting rules as :func:`clone_from_remote`;
+    ``ProvisionError`` on failure with the half-made target removed.
+    Returns the head sha.
+    """
+    env = _clone_env(token)
+    options = list(CLONE_OPTIONS)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with _clone_remote(repo_url, target, env, options, clone_filter) as clone:
+            return str(clone.head.commit.hexsha)
+    except (GitCommandError, OSError, ValueError) as exc:
+        shutil.rmtree(target, ignore_errors=True)
+        raise ProvisionError(
+            f"cloning {public_remote_url(repo_url)} into {target} failed: {_describe(exc)}"
+        ) from exc
+
+
 def _local_clone_env() -> dict[str, str]:
     """The environment a clone of a host checkout runs under."""
     return dict(_SKIP_LFS_SMUDGE)
