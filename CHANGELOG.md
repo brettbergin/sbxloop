@@ -6,6 +6,40 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- **The sbxloop home.** Everything sbxloop puts on a host now lives under
+  one directory, `~/.sbxloop` (`SBXLOOP_HOME` moves it): the interpreter
+  (`venv/`, a uv-managed CPython, `bin/uv`), the launchers (`bin/sbxloop`,
+  `bin/sbx`), Docker's `sbx` (`sbx/`), the host config and secrets
+  (`config/sbxloop.toml`, `config/secrets.env`, `config/github-app.pem`),
+  the state (`state/state.db`, the conformance cache, the daemon's control
+  queue), the runs (`runs/<run>/`), each repository's dedicated clone
+  (`workspaces/<owner>/<name>/`, cloned by the daemon on first use), the
+  logs (`logs/daemon.log`, rotated), the caches and temp files, the
+  rendered systemd units (`systemd/`) and the snapshots (`backups/`).
+  `sbxloop init` builds it; `scripts/install.sh` bootstraps a bare host to
+  it with one `curl … | sh`; `sbxloop backup` snapshots it; `sbxloop daemon logs` reads the log file. Every command answers the same from
+  any directory — there is no runner directory and no working directory
+  any more.
+
+  **Cutover.** This is a hard cut. The former `state_dir` setting,
+  `[daemon] state_dir` and `SBXLOOP_STATE_DIR` are refused by name; the
+  `~/.config/sbxloop` user config and `.env`, the `$XDG_STATE_HOME/sbxloop`
+  state directories, the `~/.sbxloop-venv` venv and the `~/.local/bin`
+  launchers are not read, and `sbxloop doctor` fails hard while any of them
+  is still on the host. A host from before the home runs, once, from its
+  old install: `sbxloop init --migrate --purge` (add `--runner DIR` for an
+  Actions runner) — it backs up every old file and every `state.db` it
+  finds to `backups/<stamp>-migrate/`, carries the daemon's `state.db`, the
+  config (retired keys dropped, configured checkouts moved under
+  `workspaces/`), the secrets and the App key into the home, lays the home
+  out, re-renders the units and restarts the daemon, then removes the
+  leftovers. Old run directories are not carried. `sbxloop init --project`
+  is the former `sbxloop init` (a repository's own `sbxloop.toml`).
+  Config: `[daemon] backups_keep` (10) is how many snapshots the daily
+  sweep keeps.
+
 ### Fixed
 
 - **A workload plan declares what the ask needs.** Shown bounds it could

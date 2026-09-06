@@ -10,13 +10,12 @@
 # previous version on any failed check; restore the operator's holds;
 # release the deploy's own hold whatever happened; tell the control channel.
 #
-# Assumes the host layout contrib/systemd/README.md sets up, relative to the
-# runner user's home: the venv at ~/.sbxloop-venv, the `sbxloop` wrapper at
-# ~/.local/bin/sbxloop (it sources the tokens — the job reads no secrets
-# file), the daemon's working directory at ~/sbxloop-runner (config and
-# state_dir resolve from there), and the user unit `sbxloop-daemon`. The
-# Actions runner runs as that same user (contrib/systemd/github-runner.service)
-# so it can `systemctl --user restart`.
+# Assumes the sbxloop home `sbxloop init --systemd` builds
+# (contrib/systemd/README.md): everything under ~/.sbxloop — the launcher
+# bin/sbxloop (it exports no secrets; sbxloop reads its own secrets file),
+# the venv, the home's uv, and the user unit `sbxloop-daemon`. No
+# step needs a working directory. The Actions runner runs as that same user
+# (`sbxloop init --systemd --runner DIR`) so it can `systemctl --user restart`.
 #
 # Two settings: the repository variable SBXLOOP_DEPLOY_HOST is the runner
 # label (register the runner with `--labels <that>`) and the name notices
@@ -72,10 +71,13 @@ jobs:
         run: |
           set -euo pipefail
           {
-            echo "VENV_PIP=${HOME}/.sbxloop-venv/bin/pip"
-            echo "VENV_SBXLOOP=${HOME}/.sbxloop-venv/bin/sbxloop"
-            echo "SBXLOOP=${HOME}/.local/bin/sbxloop"
-            echo "WORKDIR=${HOME}/sbxloop-runner"
+            echo "SBXLOOP_HOME=${HOME}/.sbxloop"
+            echo "SBXLOOP=${HOME}/.sbxloop/bin/sbxloop"
+            echo "VENV_SBXLOOP=${HOME}/.sbxloop/venv/bin/sbxloop"
+            echo "VENV_PYTHON=${HOME}/.sbxloop/venv/bin/python"
+            echo "UV=${HOME}/.sbxloop/bin/uv"
+            echo "UV_CACHE_DIR=${HOME}/.sbxloop/cache/uv"
+            echo "UV_PYTHON_INSTALL_DIR=${HOME}/.sbxloop/python"
           } >> "$GITHUB_ENV"
 
       - name: Resolve the target version
@@ -111,7 +113,6 @@ jobs:
         if: steps.installed.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          cd "${WORKDIR}"
           # Exit 2 = no daemon answered; the wait and the health check
           # below are what notice a daemon that never comes up.
           "${SBXLOOP}" daemon ctl pause --hold "${HOLD}" --timeout 30 || true
@@ -134,14 +135,13 @@ jobs:
           else
             MSG="🚀 sbxloop \`${FROM}\` → \`${VERSION}\` staged on \`${HOST}\` — restart deferred until the daemon is idle (now: ${CURRENT}); hold \`${HOLD}\` — [run](${RUN_URL})"
           fi
-          cd "${WORKDIR}" && "${SBXLOOP}" daemon notify "${MSG}"
+          "${SBXLOOP}" daemon notify "${MSG}"
 
       - name: Wait for the daemon to go idle
         id: drain
         if: steps.installed.outputs.changed == 'true'
         run: |
           set -euo pipefail
-          cd "${WORKDIR}"
           # No cap: a restart under a live run kills its in-flight task. With
           # the hold taken nothing new is claimed, so idle stays idle. Poll no
           # faster than 15 s (status() touches the circuit breaker). A daemon
@@ -187,11 +187,15 @@ jobs:
           VERSION: ${{ steps.target.outputs.version }}
         run: |
           set -euo pipefail
-          # Both packages pinned to the same version; both chat extras so
-          # switching [chat] backend on the host is a config change.
-          "${VENV_PIP}" install --upgrade \
+          # A snapshot first (config, secrets, units, the state database), then both
+          # packages pinned to the same version; both chat extras so
+          # switching [chat] backend on the host is a config change. Then
+          # init, idempotent: it refreshes the launchers and units.
+          "${SBXLOOP}" backup --label "deploy-${VERSION}"
+          "${UV}" pip install --python "${VENV_PYTHON}" --upgrade \
             "sbxloop[discord,slack]==${VERSION}" "sbxloop-worker==${VERSION}"
           "${VENV_SBXLOOP}" --version
+          "${SBXLOOP}" init --systemd
 
       - name: Snapshot the holds to restore
         id: state
@@ -202,7 +206,7 @@ jobs:
           # Read them now — an operator who paused during the wait must
           # still be paused afterwards. Ours is dropped: the restart
           # releases it.
-          status="$(cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --json --timeout 30 || true)"
+          status="$("${SBXLOOP}" daemon ctl status --json --timeout 30 || true)"
           holds="$(jq -r '.holds // [] | .[]' <<<"${status}" 2>/dev/null | tr '\n' ' ' || true)"
           keep=""
           for h in ${holds}; do
@@ -232,11 +236,11 @@ jobs:
           got="$("${VENV_SBXLOOP}" --version | awk '{print $2}')"
           [ "${got}" = "${VERSION}" ] || fail "version is ${got}, expected ${VERSION}"
           # Plain doctor only — never --deep or --probe, which boot microVMs.
-          (cd "${WORKDIR}" && "${SBXLOOP}" doctor) || fail "sbxloop doctor is unhappy"
+          "${SBXLOOP}" doctor || fail "sbxloop doctor is unhappy"
           # The control server starts only after the daemon's recovery, which
           # can take minutes on a host with orphaned runs; the client resends
           # across that window, so give it a generous budget.
-          (cd "${WORKDIR}" && "${SBXLOOP}" daemon ctl status --json --timeout 300 >/dev/null) || fail "daemon did not answer ctl status"
+          "${SBXLOOP}" daemon ctl status --json --timeout 300 >/dev/null || fail "daemon did not answer ctl status"
           before="$(systemctl --user show "${UNIT}" -p NRestarts --value)"
           sleep 45
           systemctl --user is-active --quiet "${UNIT}" || fail "unit died within 45s of starting"
@@ -254,7 +258,8 @@ jobs:
           echo "::error::deploy failed — rolling back to ${PREV}"
           # The same extras as the upgrade: dropping one rolls a host on
           # that backend back to a build that cannot start.
-          "${VENV_PIP}" install --upgrade "sbxloop[discord,slack]==${PREV}" "sbxloop-worker==${PREV}"
+          "${UV}" pip install --python "${VENV_PYTHON}" --upgrade "sbxloop[discord,slack]==${PREV}" "sbxloop-worker==${PREV}"
+          "${SBXLOOP}" init --systemd || true
           systemctl --user reset-failed "${UNIT}" || true
           timeout 300 systemctl --user restart "${UNIT}"
           sleep 15
@@ -268,7 +273,6 @@ jobs:
           HOLDS: ${{ steps.state.outputs.holds }}
         run: |
           set -euo pipefail
-          cd "${WORKDIR}"
           for h in ${HOLDS}; do
             "${SBXLOOP}" daemon ctl pause --hold "${h}" --timeout 60 \
               || echo "::warning::could not restore hold ${h}"
@@ -279,7 +283,6 @@ jobs:
         if: always() && steps.hold.outcome == 'success'
         run: |
           set -euo pipefail
-          cd "${WORKDIR}"
           "${SBXLOOP}" daemon ctl resume --hold "${HOLD}" --timeout 60 \
             || echo "::warning::could not release hold ${HOLD}"
 
@@ -306,4 +309,4 @@ jobs:
           else
             MSG="❌ deploy of sbxloop \`${VERSION}\` to \`${HOST}\` **${RESULT}** — rolled back to \`${FROM}\`. [run](${RUN_URL})"
           fi
-          cd "${WORKDIR}" && "${SBXLOOP}" daemon notify "${MSG}"
+          "${SBXLOOP}" daemon notify "${MSG}"

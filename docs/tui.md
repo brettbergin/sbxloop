@@ -15,7 +15,7 @@ host are trusted completely; the console has no authority model of its own.
   under a running daemon). Runs, tasks, phase attempts, the event tail by
   `seq`, work items, merge gates, review holds, the breaker and the local
   bridge's mailbox all come from there.
-- **Control.** The `ctl` file queue under `state_dir/daemon/ctl/` —
+- **Control.** The `ctl` file queue under the home's `state/daemon/ctl/` —
   `sbxloop.daemon.control.ControlClient`, the same dispatcher `sbxloop daemon ctl` and chat's `!sbx` use, so the console cannot drift from them.
   `status` is asked every few seconds; a `None` answer is "daemon down",
   a `stale` one is "daemon starting".
@@ -24,8 +24,8 @@ host are trusted completely; the console has no authority model of its own.
   Every message the bridge would post becomes a row; what the operator types
   is a row the bridge claims. See *Chat* below.
 
-The state directory follows the daemon's own rule (`[daemon] state_dir`,
-else the anchored XDG default); `--state-dir` overrides it. `--run RUN`
+The console reads the same home as the daemon (`~/.sbxloop`, or
+`SBXLOOP_HOME`), so it needs no flag to find the state. `--run RUN`
 opens that run's screen at once; `--read-only` removes every action.
 
 ## Layout and navigation

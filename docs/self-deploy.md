@@ -46,12 +46,11 @@ for nothing of its own doing.
 - **`GH_TOKEN` is set explicitly** on every step calling `gh`. The host's `secrets.env`
   exports its own `GH_TOKEN`, and the `sbxloop` wrapper sources it with `set -a`; without
   the override, a host PAT would be the identity for Actions API calls.
-- **Working directory** is `~/sbxloop-work`, not the `~/sbxloop-runner` the systemd README
-  sets up, and the tokens live in `~/.config/sbxloop/secrets.env` (mode 0600; shape: the
-  repo-root [`.env.example`](../.env.example), "Daemon host layout"), sourced by the wrapper
-  `~/.local/bin/sbxloop` via `~/.config/sbxloop/env.sh` — not in a cwd `.env`. The job
-  itself never reads that file (#639): `ctl status --json` and `daemon notify` go through
-  the wrapper.
+- **The home.** Everything is under `~/.sbxloop`, exactly the layout the generic guide
+  describes; the tokens live in `~/.sbxloop/config/secrets.env` (mode 0600; shape: the
+  repo-root [`.env.example`](../.env.example)), read by sbxloop itself. The job never
+  reads that file (#639): `ctl status --json`, `backup` and `daemon notify` go through the
+  launcher, from whatever directory the runner happens to be in.
 
 ## The host
 
@@ -92,7 +91,8 @@ ssh db 'systemctl --user status github-runner sbx-sandboxd sbxloop-daemon'
 
 Rolling back is just deploying the older version — the workflow pins exactly. If a deploy
 fails *and* its rollback fails, the job says `ROLLBACK ALSO FAILED — db needs a human`; fix
-by hand with the two commands in the generic guide, from `~/sbxloop-work`.
+by hand with the commands in the generic guide, from any directory. Every deploy leaves a
+snapshot under `~/.sbxloop/backups/` and a line in `~/.sbxloop/logs/deploy/history.log`.
 
 Set `[daemon] version_check = false` in this host's `sbxloop.toml` (#641): the pipeline keeps it current,
 so the daemon neither asks PyPI nor advises a hand upgrade the next deploy would undo. A
@@ -111,3 +111,12 @@ running daemon can strand it. Each one is recorded here with its manual step.
   the generic guide), and every deploy after that is unattended again.
 - **1.0 (state and config).** The steps a 0.7.x host needs are in the
   [CHANGELOG under "1.0 cutover"](../CHANGELOG.md#10-cutover).
+- **The home.** Every path moved under `~/.sbxloop` and the deploy job's paths with them,
+  so the first deploy after it lands fails at "Resolve host paths"' consumers (no
+  `~/.sbxloop/bin/sbxloop` yet) *before installing anything*. The one manual step, once,
+  as the service user: install the release into a fresh home and migrate the old
+  installation into it —
+  `SBXLOOP_VERSION=X.Y.Z SBXLOOP_INIT_ARGS="--migrate --purge --runner $HOME/actions-runner" sh <(curl -fsSL …/scripts/install.sh)`
+  — then `sbxloop doctor` and re-run the deploy. The migration backs up the old config,
+  secrets, units and every `state.db` it finds to `~/.sbxloop/backups/<stamp>-migrate/`
+  first.

@@ -33,33 +33,42 @@ this flag), `2` no daemon answered — the last one means there is nothing to dr
 
 ## Install
 
-[contrib/systemd/README.md](../contrib/systemd/README.md) walks through it. The layout it
-sets up, all relative to the service user's home, is what every upgrade path assumes:
+[contrib/systemd/README.md](../contrib/systemd/README.md) walks through it: one
+`curl … | sh` (or `sbxloop init --systemd` from any existing install) builds the **sbxloop
+home**, `~/.sbxloop` (`SBXLOOP_HOME` moves it), and that home is what every upgrade path
+assumes:
 
-|                   |                                                                                       |
-| ----------------- | ------------------------------------------------------------------------------------- |
-| Interpreter       | a venv at `~/.sbxloop-venv`, with `sbxloop[discord,slack]` and `sbxloop-worker` in it |
-| Command           | `~/.local/bin/sbxloop` — a symlink or wrapper for `~/.sbxloop-venv/bin/sbxloop`       |
-| Working directory | `~/sbxloop-runner` — `sbxloop.toml`, `.env` (tokens, mode 0600), the workspace clone  |
-| Service           | user unit `~/.config/systemd/user/sbxloop-daemon.service`                             |
-| Sandbox backend   | user unit `sbx-sandboxd.service`, which the daemon unit `Requires=`                   |
+|                 |                                                                                                          |
+| --------------- | -------------------------------------------------------------------------------------------------------- |
+| Interpreter     | `~/.sbxloop/venv` — `sbxloop[discord,slack]` and `sbxloop-worker`, uv-managed CPython                    |
+| Command         | `~/.sbxloop/bin/sbxloop` — the launcher; `~/.sbxloop/bin/sbx` wraps the home's sbx                       |
+| Config, secrets | `~/.sbxloop/config/sbxloop.toml`, `config/secrets.env` (0600), `config/github-app.pem`                   |
+| State, runs     | `~/.sbxloop/state/` (the SQLite store), `~/.sbxloop/runs/<run>/`, `~/.sbxloop/workspaces/<owner>/<name>` |
+| Logs, backups   | `~/.sbxloop/logs/daemon.log`, `~/.sbxloop/backups/<stamp>/`                                              |
+| Service         | `~/.sbxloop/systemd/*.service`, enabled into `~/.config/systemd/user` by init                            |
+| Sandbox backend | user unit `sbx-sandboxd.service`, which the daemon unit `Requires=`                                      |
 
-`ctl` resolves the config and `state_dir` from the current directory, so every `ctl` and
-`notify` call runs from the working directory. Installing both chat extras makes
-`[chat] backend` a config change, not a reinstall.
+There is no working directory: every `sbxloop` command answers the same from anywhere.
+Installing both chat extras makes `[chat] backend` a config change, not a reinstall.
 
 ## Upgrading by hand
 
 Two commands as the service user, once the daemon is idle:
 
 ```bash
-cd ~/sbxloop-runner
 sbxloop daemon ctl pause --hold upgrade
 until [ "$({ sbxloop daemon ctl status --json 2>/dev/null || echo '{}'; } | jq -r '.current // .claiming // "idle"')" = idle ]; do sleep 15; done
 
-~/.sbxloop-venv/bin/pip install --upgrade 'sbxloop[discord,slack]==X.Y.Z' 'sbxloop-worker==X.Y.Z'
+sbxloop backup --label pre-X.Y.Z
+~/.sbxloop/bin/uv pip install --python ~/.sbxloop/venv/bin/python --upgrade 'sbxloop[discord,slack]==X.Y.Z' 'sbxloop-worker==X.Y.Z'
+sbxloop init --systemd
 systemctl --user reset-failed sbxloop-daemon && systemctl --user restart sbxloop-daemon
 ```
+
+`sbxloop backup` snapshots the config, secrets, units and the state database first (`backup list`,
+`backup restore <name>`; the daily sweep keeps the newest `[daemon] backups_keep`). `init`
+is idempotent: it refreshes the launchers and the rendered units for the new version and
+keeps everything else.
 
 `reset-failed` matters: `StartLimitBurst=5` per 600 s leaves a unit that crash-looped in
 `failed`, where a plain `restart` will not revive it. The daemon comes back unpaused (holds
@@ -86,7 +95,7 @@ schedule / workflow_dispatch → self-hosted runner on the daemon host
                                 ├─ compare PyPI's latest (or the named version) with what is installed
                                 ├─ take a named pause hold (deploy-<run id>)
                                 ├─ wait — no cap — for the in-flight run to finish
-                                ├─ pip install the exact version
+                                ├─ snapshot, then install the exact version into the home's venv
                                 ├─ snapshot the operator's holds; restart the unit
                                 ├─ health check, or roll back to the previous version
                                 └─ restore the other holds; release its own; tell the control channel
@@ -102,7 +111,8 @@ Step by step:
    the daemon runs on as it was. A daemon that answers nothing for five minutes straight has
    nothing to drain and the job proceeds. To make a deploy go now, `ctl cancel` the run (it
    stays resumable; `cancel --retry` re-queues it fresh).
-3. **Upgrades** with both distributions pinned to the same version.
+3. **Snapshots** (`sbxloop backup`) and **upgrades** with both distributions pinned to the
+   same version, then re-runs `sbxloop init --systemd` so the launchers and units match.
 4. **Restarts** after `systemctl --user reset-failed`, having first snapshotted the standing
    holds — immediately before the restart, not at the start of the job, so an operator who
    paused *during* the wait is still paused afterwards.
@@ -125,17 +135,17 @@ Two settings, and no names in the file:
   label — or changing the variable; the workflow file does not change.
 - The **`schedule`** is how often the host checks PyPI.
 
-Every path is derived from `$HOME` in the job's first step (job-level `env:` values are
-literals — GitHub does not expand `${HOME}` there), so a host that follows the layout above
-needs no edits.
+Every path is under `${HOME}/.sbxloop`, resolved in the job's first step (job-level `env:`
+values are literals — GitHub does not expand `${HOME}` there), so a host `sbxloop init`
+built needs no edits.
 
 ### `sbxloop daemon notify`
 
 Posts one message to the control channel through the configured `[chat] backend`, from the
 host and without the daemon — so a script can say "rollback also failed" while the daemon
-is down. It reads the channel from `sbxloop.toml` and the bot token from the environment
-(`DISCORD_BOT_TOKEN` or `SLACK_BOT_TOKEN`, from the working directory's `.env` if present),
-so the workflow never sources a secrets file or parses the config itself. The text is the
+is down. It reads the channel from the home's `sbxloop.toml` and the bot token from the
+environment (`DISCORD_BOT_TOKEN` or `SLACK_BOT_TOKEN`, from the home's `secrets.env`), so
+the workflow never sources a secrets file or parses the config itself. The text is the
 chat's Markdown; on Slack it is re-dialected the way the bridge does it. Link previews and
 pings are suppressed. A headless daemon (no chat backend) cannot notify, and says so.
 
@@ -201,11 +211,11 @@ history instead.
 ## Multiple repositories on one host
 
 One daemon tends every repository declared in `sbxloop.toml`, so a second
-project does **not** need a second unit, state directory or control channel.
+project does **not** need a second unit, home or control channel.
 Declare them as `[[github.repos]]` entries — each with its own
 `deliver_base`, `trigger_label`, extra `labels`, `enabled` switch and
-optional `token_env` — and export any per-repo token from the host's
-`.env` alongside `GH_TOKEN`. The legacy `[github] repo = "owner/name"`
+optional `token_env` — and export any per-repo token from the home's
+`secrets.env` alongside `GH_TOKEN`. The legacy `[github] repo = "owner/name"`
 still loads unchanged and is normalised into a one-entry list; migrating is
 moving that key (and its `deliver_base` / `create_repo` / `create_public`)
 into one `[[github.repos]]` entry. The two forms may not be mixed, and a

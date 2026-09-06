@@ -67,7 +67,10 @@ Each of these has broken a real run when violated.
 `docs/architecture.md` is the map; this is the legend.
 
 - `packages/sbxloop/src/sbxloop/` — the host orchestrator.
-  - `cli/` — typer commands, `doctor`, `init`.
+  - `cli/` — typer commands, `doctor`, `init`, `backup`.
+  - `paths.py` — the home: every host path derives from `SbxloopHome`.
+    `homeinit.py` builds it, `homemigrate.py` moves an old installation
+    into it, `backup.py` snapshots it.
   - `daemon/` — the always-on outer loop: sources, store, control, chat
     bridges, the concierge.
   - `engine/` — one run: `engine.py` (stage machine), `phases.py`,
@@ -78,8 +81,8 @@ Each of these has broken a real run when violated.
   - `toolchains.py`, `verifylint.py`, `policy.py`, `deliver.py`,
     `hostgit.py`, `config.py` — toolchain series, gate detection, network
     policy, delivery, host-side git, the config model.
-  - `data/` — the example config and the `init` presets, shipped as package
-    data.
+  - `data/` — the example config and secrets file, the `init` presets and
+    the home's launcher and unit templates, shipped as package data.
 - `packages/sbxloop-worker/src/sbxloop_worker/` — runs inside the sandbox.
   `protocol.py` is the host↔worker contract; `backends/` are the agents.
 - `tests/fakes/fake_github.py` — the GitHub every test runs against.

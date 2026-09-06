@@ -194,7 +194,8 @@ class TestHostAgnostic:
         assert "/home/" not in text
         assert "bergs" not in text
         assert "ssh " not in text
-        assert "${HOME}/.sbxloop-venv" in _step(text, "Resolve host paths")
+        assert "${HOME}/.sbxloop/bin/sbxloop" in _step(text, "Resolve host paths")
+        assert "WORKDIR" not in text and 'cd "${' not in text  # the home is the home
         assert "needs a human" in _step(text, "Roll back")
         assert "${HOST} needs a human" in _step(text, "Roll back")
 
@@ -234,7 +235,9 @@ class TestDocsSplit:
     def test_systemd_upgrade_section_leads_with_the_manual_path(self, systemd_readme: str) -> None:
         section = systemd_readme.split("## Upgrading", 1)[1].split("\n## ", 1)[0]
         first_fence = section.split("```bash", 1)[1].split("```", 1)[0]
-        assert "pip install --upgrade 'sbxloop[discord,slack]==X.Y.Z'" in first_fence
+        assert "pip install --python ~/.sbxloop/venv/bin/python" in first_fence
+        assert "--upgrade 'sbxloop[discord,slack]==X.Y.Z'" in first_fence
+        assert "sbxloop backup" in first_fence and "sbxloop init --systemd" in first_fence
         assert "ctl status --json" in first_fence
         assert "reset-failed sbxloop-daemon" in first_fence
         # The workflow is the optional afterthought, below the commands.
