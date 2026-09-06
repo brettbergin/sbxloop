@@ -1,7 +1,18 @@
 """Config: the resolved configuration with the layer each key came from,
-the effective egress policy, the repositories, and an editor for
-``sbxloop.toml`` that validates a draft with the real loader before it
-is saved (atomically, with a backup) and offers the restart."""
+the effective egress policy, the repositories, and two ways to change any
+of it.
+
+The first is per key. Every setting is one row — arrays of tables walked
+down to ``github.repos[1].deliver_base``, so nothing is a blob you have to
+find in a file — and ``Enter`` on a row opens that key alone: what it
+holds, what it accepts, which layer is currently answering, and a widget
+shaped by its type. What comes back is written into the draft at that path
+and nowhere else, every comment in the file kept.
+
+The second is the file, in a text editor, for the edits no single key
+describes. Both go through the same gate: the real loader gets the whole
+draft first, and only a draft it accepts is saved — atomically, with a
+backup, and the restart offered."""
 
 from __future__ import annotations
 
@@ -15,33 +26,32 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Vertical, VerticalScroll
+from textual.notifications import SeverityLevel
 from textual.widgets import Input, TabbedContent, TabPane, TextArea
 from textual.worker import get_current_worker
 
 from sbxloop.cli.policyview import PolicyView, policy_view
 from sbxloop.config import Config, load_config_with_sources
-from sbxloop.tui import actions
-from sbxloop.tui.configedit import Verdict, config_path, read_text, validate_text
+from sbxloop.tui import actions, configkeys, configtoml
+from sbxloop.tui.configedit import (
+    FILE_LAYERS,
+    Verdict,
+    config_path,
+    read_text,
+    validate_text,
+)
 from sbxloop.tui.data import ConsoleState
 from sbxloop.tui.screens.base import ConsoleScreen
-from sbxloop.tui.screens.modals import ConfirmScreen
+from sbxloop.tui.screens.configvalue import ValueEdit, ValueScreen
+from sbxloop.tui.screens.modals import ConfirmScreen, TextPromptScreen
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop.tui.widgets.tables import ConsoleTable
 
 
 def flatten_config(config: Config) -> dict[str, Any]:
-    flat: dict[str, Any] = {}
-
-    def walk(prefix: str, data: dict[str, Any]) -> None:
-        for key, value in data.items():
-            dotted = f"{prefix}{key}"
-            if isinstance(value, dict):
-                walk(f"{dotted}.", value)
-            else:
-                flat[dotted] = value
-
-    walk("", config.model_dump(mode="json"))
-    return flat
+    """Every setting as one addressable leaf: ``daemon.poll_interval_s``,
+    ``github.repos[1].deliver_base``, ``sandbox.env.RAILS_ENV``."""
+    return configkeys.flatten(config.model_dump(mode="json"))
 
 
 class ConfigEditor(TextArea):
@@ -59,7 +69,9 @@ class ConfigScreen(ConsoleScreen):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("slash", "filter", "Filter"),
         Binding("escape", "clear_filter", "Clear filter", show=False),
-        Binding("i", "edit", "Edit"),
+        Binding("e", "edit_value", "Edit value"),
+        Binding("a", "add_key", "Add key"),
+        Binding("i", "edit", "Edit file"),
         Binding("V", "validate", "Validate draft"),
         Binding("W", "save", "Save draft"),
         Binding("ctrl+s", "save", "Save", show=False, priority=True),
@@ -87,6 +99,9 @@ class ConfigScreen(ConsoleScreen):
         # the draft only while it is untouched.
         self._loaded_text = ""
         self._anchor_note = ""
+        #: Whether the pending keyed save is the whole change (see
+        #: ``_key_edited``); a hand-edited draft is confirmed as one.
+        self._keyed_alone = True
 
     def compose(self) -> ComposeResult:
         yield from self.compose_frame()
@@ -186,11 +201,14 @@ class ConfigScreen(ConsoleScreen):
             rows.append(("error", ("configuration", Text(self.error, style="red"), "")))
         for dotted in sorted(self.flat):
             value = repr(self.flat[dotted])
-            source = self.sources.get(dotted, "default")
+            source = configkeys.source_for(dotted, self.sources)
             if needle and needle not in f"{dotted} {value} {source}".lower():
                 continue
             style = "" if source == "default" else "bold"
-            rows.append((dotted, (dotted, value[:120], Text(source, style=style))))
+            # Short enough that the source column survives an 80-column
+            # terminal; the whole value is one Enter away.
+            shown = value if len(value) <= 60 else value[:59] + "…"
+            rows.append((dotted, (dotted, shown, Text(source, style=style))))
         self.query_one("#resolved", ConsoleTable).replace_rows(rows)
 
     @staticmethod
@@ -219,11 +237,11 @@ class ConfigScreen(ConsoleScreen):
         if config is None:
             return
         rows = []
-        for entry in config.github.repo_list():
+        for index, entry in enumerate(config.github.repo_list()):
             effective = config.github.effective_repo(entry.repo) or entry
             rows.append(
                 (
-                    entry.repo,
+                    f"github.repos[{index}]",
                     (
                         entry.repo,
                         "yes" if entry.enabled else "no",
@@ -244,8 +262,9 @@ class ConfigScreen(ConsoleScreen):
             text.append("  (new file)" if not path.is_file() else "", style="dim")
         text.append(f"\n{self.last_verdict}")
         text.append(
-            "\ni edits · Esc leaves the editor · V validates · W saves (typed) · "
-            "E opens $EDITOR · L reloads",
+            "\ni edits the file · Esc leaves the editor · V validates · W saves (typed) · "
+            "E opens $EDITOR · L reloads"
+            "\nResolved: Enter or e edits one key · a adds one",
             style="dim",
         )
         self.query_one("#edit-status", TextPanel).update(text)
@@ -280,6 +299,118 @@ class ConfigScreen(ConsoleScreen):
         self.query_one("#tabs", TabbedContent).active = "edit-pane"
         self.query_one("#editor", ConfigEditor).focus()
 
+    # -- one key at a time -------------------------------------------------------
+
+    def on_data_table_row_selected(self, event: ConsoleTable.RowSelected) -> None:
+        """Enter on a resolved key edits it; Enter on a repository narrows
+        the resolved view to that entry's keys."""
+        key = str(event.row_key.value or "")
+        if event.data_table.id == "resolved" and key != "error":
+            self.edit_key(key)
+        elif event.data_table.id == "repos" and key:
+            self._filter_to(key)
+
+    def _filter_to(self, prefix: str) -> None:
+        box = self.query_one("#filter", Input)
+        box.display = True
+        box.value = prefix
+        self.query_one("#tabs", TabbedContent).active = "resolved-pane"
+        self.query_one("#resolved", ConsoleTable).focus()
+
+    def action_edit_value(self) -> None:
+        self.query_one("#tabs", TabbedContent).active = "resolved-pane"
+        key = self.query_one("#resolved", ConsoleTable).selected_key()
+        if key is None or key == "error":
+            self.app.notify("no key selected", title="config", severity="warning")
+            return
+        self.edit_key(key)
+
+    def action_add_key(self) -> None:
+        """A key the resolved view has no row for: a new ``[[github.repos]]``
+        entry, an environment variable, a registry."""
+        if self._refuse_read_only():
+            return
+
+        def typed(dotted: str | None) -> None:
+            if dotted:
+                self.edit_key(dotted.strip())
+
+        self.app.push_screen(
+            TextPromptScreen(
+                "add a key",
+                "The dotted path to set — github.repos[2].repo, sandbox.env.RAILS_ENV. "
+                "An index one past the end appends an entry.",
+                placeholder="section.key",
+            ),
+            typed,
+        )
+
+    def _refuse_read_only(self) -> bool:
+        if self.console_app.read_only:
+            self.app.notify("read-only console: editing refused", severity="warning")
+            return True
+        return False
+
+    def edit_key(self, dotted: str) -> None:
+        """Open one setting on its own; what comes back goes through the
+        loader before the file is touched."""
+        if self._refuse_read_only():
+            return
+        if self.path is None:  # pragma: no cover - anchored on mount
+            return
+        try:
+            parts = configkeys.parse_path(dotted)
+        except configkeys.PathError as exc:
+            self.app.notify(str(exc)[:300], title="config", severity="error")
+            return
+        dotted = configkeys.format_path(parts)
+        why = configkeys.ENV_ONLY_KEYS.get(dotted)
+        if why is not None:
+            self.app.notify(
+                f"{dotted} is not a file setting: {why}", title=dotted, severity="warning"
+            )
+            return
+        _, in_file = configtoml.file_value(self.draft(), parts)
+        spec = configkeys.describe(dotted)
+        value = self.flat.get(dotted)
+        source = configkeys.source_for(dotted, self.sources) if dotted in self.flat else "unset"
+        self.app.push_screen(
+            ValueScreen(
+                spec,
+                value,
+                source=source,
+                target=str(self.path),
+                in_file=in_file,
+            ),
+            self._key_edited,
+        )
+
+    def _key_edited(self, edit: ValueEdit | None) -> None:
+        if edit is None:
+            return
+        draft = self.draft()
+        parts = configkeys.parse_path(edit.path)
+        try:
+            text = (
+                configtoml.unset_value(draft, parts)
+                if edit.unset
+                else configtoml.set_value(draft, parts, edit.value)
+            )
+        except ValueError as exc:
+            self.last_verdict = f"{edit.path}: {exc}"
+            self._edit_status()
+            self.app.notify(str(exc)[:300], title=edit.path, severity="error", timeout=15)
+            return
+        if text == draft:
+            self.app.notify(f"{edit.path} already says that", title="config")
+            return
+        # A one-key edit saves without a second confirmation because the
+        # dialog *was* the confirmation. That only holds while the key is
+        # the whole change: a draft the operator has also edited by hand
+        # would ride along, so it goes back to the typed tier.
+        self._keyed_alone = draft == self._loaded_text
+        self.validate_draft(text, then_save=True, edit=edit)
+
     def draft(self) -> str:
         return self.query_one("#editor", ConfigEditor).text
 
@@ -287,29 +418,64 @@ class ConfigScreen(ConsoleScreen):
         self.validate_draft(self.draft())
 
     @work(thread=True, exclusive=True, group="validate")
-    def validate_draft(self, text: str, then_save: bool = False) -> None:
+    def validate_draft(
+        self, text: str, then_save: bool = False, edit: ValueEdit | None = None
+    ) -> None:
         deps = self.console_app.deps
         root = self.path.parent if self.path is not None else deps.cwd
         verdict = validate_text(text, cwd=root, env=os.environ)
         if get_current_worker().is_cancelled:
             return
-        self.app.call_from_thread(self._validated, verdict, text, then_save)
+        self.app.call_from_thread(self._validated, verdict, text, then_save, edit)
 
-    def _validated(self, verdict: Verdict, text: str, then_save: bool) -> None:
-        self.last_verdict = verdict.text
-        self._edit_status()
+    def _validated(
+        self, verdict: Verdict, text: str, then_save: bool, edit: ValueEdit | None = None
+    ) -> None:
+        key = edit.path if edit is not None else None
+        self.last_verdict = verdict.text if key is None else f"{key}: {verdict.text}"
         if not verdict.ok:
-            self.app.notify(verdict.text[:300], title="validate", severity="error", timeout=15)
+            self._edit_status()
+            self.app.notify(
+                verdict.text[:300], title=key or "validate", severity="error", timeout=15
+            )
             return
+        if edit is not None:
+            note, severity = self._answered_by(edit, verdict)
+            if note is not None:
+                self.last_verdict = note
+                self.app.notify(note[:300], title=edit.path, severity=severity, timeout=15)
+        self._edit_status()
         if verdict.dropped:
             self.app.notify(verdict.text[:300], title="validate", severity="warning", timeout=15)
         if then_save and self.path is not None:
+            solo = key if self._keyed_alone else None
             self.console_app.perform(
-                actions.save_config(self.console_app.deps, self.path, text),
+                actions.save_config(self.console_app.deps, self.path, text, key=solo),
                 on_success=lambda: self._saved(text),
             )
         elif not verdict.dropped:
             self.app.notify("the draft loads", title="validate")
+
+    def _answered_by(self, edit: ValueEdit, verdict: Verdict) -> tuple[str | None, SeverityLevel]:
+        """Which layer answers for the edited key once the draft applies.
+        This file is written either way — the operator asked for it — but a
+        key the environment or the home config also sets would otherwise
+        look applied when it is not, and an unset key should say what it
+        fell back to."""
+        if verdict.config is None:  # pragma: no cover - guarded by verdict.ok
+            return None, "information"
+        source = configkeys.source_for(edit.path, verdict.sources)
+        if source in FILE_LAYERS:
+            return None, "information"
+        value = configkeys.flatten(verdict.config.model_dump(mode="json")).get(edit.path)
+        if edit.unset:
+            where = "its default" if source == "default" else source
+            return f"{edit.path} unset here; it now comes from {where}: {value!r}", "information"
+        return (
+            f"{edit.path} is written, but {source} sets it too and wins: "
+            f"the loop still sees {value!r}",
+            "warning",
+        )
 
     def action_save(self) -> None:
         if self.console_app.read_only:
@@ -317,10 +483,15 @@ class ConfigScreen(ConsoleScreen):
             return
         # Never write a draft the loader would refuse: the daemon's next
         # start would fail on it.
+        self._keyed_alone = True
         self.validate_draft(self.draft(), then_save=True)
 
     def _saved(self, text: str) -> None:
         self._loaded_text = text
+        editor = self.query_one("#editor", ConfigEditor)
+        if editor.text != text:
+            # A one-key edit rewrote the file; the draft is that file.
+            editor.load_text(text)
         self._edit_status()
         self.load()
 

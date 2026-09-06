@@ -65,6 +65,7 @@ returns.
 | `/`               | Runs, Events tab            | filter (Runs: any column; Events: a type prefix such as `policy.`) |
 | `Esc`             | anywhere                    | clear a filter, close a run                                        |
 | `Enter`           | Runs, Queue, Overview lists | open the run                                                       |
+| `Enter`           | Config, Resolved tab        | edit that setting; `a` adds one by dotted path                     |
 | `f`               | a run                       | toggle following the event tail                                    |
 | `v`               | a run                       | Thread tab as the `sbxloop run` transcript or as dense lines       |
 
@@ -272,17 +273,43 @@ orphan verdicts (the prompt says so, and their kept marker is cleared).
 
 ### Config (`7`)
 
-- **Resolved** — every key with its value and the layer that set it (user
-  config, `pyproject.toml`, `sbxloop.toml`, env, default), as
-  `sbxloop config show` prints; `/` filters keys, values and sources.
+- **Resolved** — every setting as one addressable key with its value and
+  the layer that set it (user config, `pyproject.toml`, `sbxloop.toml`,
+  env, default), as `sbxloop config show` prints; `/` filters keys, values
+  and sources. Arrays of tables are walked, so the second repository is
+  `github.repos[1].deliver_base` rather than one blob you have to find in
+  the file, and a leaf inherits the layer that supplied the array it lives
+  in. Lists of scalars (`policy.allow`) stay one key: the useful edit
+  there is the whole list.
+- **Editing one key.** `Enter` on a row — or `e` — opens that setting on
+  its own: what it accepts (a type, the set a `Literal` allows, the bounds
+  the model carries), what it holds now and which layer is answering, and
+  the file the answer is written to. The widget follows the type — a
+  picker for a bool or a fixed set, one item per line for a list, a line
+  of text otherwise — so a string needs no quotes and a bad value is named
+  before the loader sees it. `^U` unsets the key instead, so the file stops
+  saying anything about it and the layer beneath answers. `Enter` (a
+  picker: `^S`) applies: the change is written into the draft at that path
+  and nowhere else, **every comment in the file kept**, the whole draft
+  goes through the real loader, and only a draft it accepts is saved — the
+  same atomic write, backup and offered restart as the Edit tab's `W`. A
+  key the environment or the home config also sets is still written and
+  the verdict says so, naming the layer that wins and the value the loop
+  actually sees.
+- **Adding a key.** `a` takes a dotted path the resolved view has no row
+  for — `sandbox.env.RAILS_ENV`, `github.repos[2].repo` — and opens the
+  same dialog. An index one past the end appends an entry; an index beyond
+  that is refused by name.
 - **Policy** — the effective per-phase egress policy `sbxloop config policy`
   prints, from the same fold (`sbxloop.cli.policyview.policy_view`).
 - **Repos** — the configured repositories as `sbxloop config repos` lists
-  them.
-- **Edit** — the `sbxloop.toml` the daemon reads: the daemon says where it
-  loaded its configuration from (`status` carries its directory), and the
-  editor follows that, not the directory the console was started in (the
-  commented example when there is no file yet). `i` focuses it, `Esc`
+  them. `Enter` on a repository narrows the Resolved view to that entry's
+  keys.
+- **Edit** — the whole `sbxloop.toml` as text, for the changes no single
+  key describes. The daemon says where it loaded its configuration from
+  (`status` carries its directory), and the editor follows that, not the
+  directory the console was started in (the commented example when there
+  is no file yet). `i` focuses it, `Esc`
   hands focus back. `V` validates the draft with the real loader, in
   place of that file at the same discovered root — the user,
   `pyproject.toml` and environment layers still applied, and the project
@@ -295,7 +322,8 @@ orphan verdicts (the prompt says so, and their kept marker is cleared).
   (typed, as on the Daemon screen), since the daemon reads the file only
   at start. A draft the loader refuses is never written. `E` opens
   `$EDITOR` on the file with the terminal handed over; `L` reloads from
-  disk. `--read-only` makes the editor read-only.
+  disk. `--read-only` makes the editor read-only and refuses per-key
+  edits too.
 
 ### Doctor (`8`) and secrets
 

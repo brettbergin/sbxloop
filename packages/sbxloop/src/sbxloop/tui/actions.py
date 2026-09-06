@@ -661,7 +661,13 @@ def gc_run_dirs(deps: Deps, days: float) -> Action:
 # -- config, secrets ------------------------------------------------------------------
 
 
-def save_config(deps: Deps, path: Path, text: str) -> Action:
+def save_config(deps: Deps, path: Path, text: str, *, key: str | None = None) -> Action:
+    """Write a draft. Saving the whole file is the typed tier — everything
+    in the buffer lands at once. A single ``key`` the operator just typed
+    into the value dialog is its own confirmation, so it goes straight
+    through; the backup and the loader's verdict are the safety net either
+    way."""
+
     def run() -> Outcome:
         try:
             backup = save_text(path, text, now=deps.clock())
@@ -670,6 +676,8 @@ def save_config(deps: Deps, path: Path, text: str) -> Action:
         note = f"saved {path}" + (f"\nprevious kept as {backup.name}" if backup else "")
         return Outcome(True, note + "\nthe daemon reads it at its next start: restart to apply")
 
+    if key is not None:
+        return Action(f"set {key} in {path.name}", run, confirm="none")
     return Action(
         f"save {path.name}",
         run,

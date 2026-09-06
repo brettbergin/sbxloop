@@ -32,6 +32,10 @@ dependencies = [
     # provisions is chosen against it (#627).
     "packaging>=24",
     "textual>=8.2",
+    # Round-trip TOML for the console's config editor: setting one key must
+    # keep every comment and every other line of the operator's file
+    # (`tui/configtoml.py`); `tomllib` reads but cannot write.
+    "tomlkit>=0.13",
 ]
 
 [project.optional-dependencies]

@@ -5,6 +5,7 @@ with a timestamped backup)."""
 
 from __future__ import annotations
 
+import dataclasses
 import os
 import shutil
 import time
@@ -13,9 +14,13 @@ from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 
-from sbxloop.config import discover_config, load_config_with_sources
+from sbxloop.config import Config, discover_config, load_config_with_sources
 
 CONFIG_FILENAME = "sbxloop.toml"
+
+#: What :func:`load_config_with_sources` calls the layer this module edits
+#: — the plain file, and the cut-down a repository-carried one becomes.
+FILE_LAYERS = (CONFIG_FILENAME, f"{CONFIG_FILENAME} (project)")
 
 
 def config_path(cwd: Path) -> Path:
@@ -48,6 +53,13 @@ class Verdict:
     #: Keys a repository-carried ``sbxloop.toml`` may not set: the loader
     #: ignores them with a warning, so a save would apply nothing for them.
     dropped: tuple[str, ...] = ()
+    #: What the draft resolves to, every layer applied, and which layer
+    #: answered for each key — how a single-key edit finds out that the
+    #: environment still wins. ``None``/empty when the draft was refused.
+    #: Excluded from equality: a Config is compared by every field it has,
+    #: and nothing needs that here.
+    config: Config | None = dataclasses.field(default=None, compare=False, repr=False)
+    sources: Mapping[str, str] = dataclasses.field(default_factory=dict, compare=False, repr=False)
 
     @property
     def ok(self) -> bool:
@@ -73,12 +85,12 @@ def validate_text(text: str, *, cwd: Path, env: Mapping[str, str]) -> Verdict:
     cut-down when the file is the repository's. Nothing is written."""
     dropped: list[str] = []
     try:
-        load_config_with_sources(
+        config, sources = load_config_with_sources(
             cwd=cwd, env=dict(env), sbxloop_toml_text=text, dropped_keys=dropped
         )
     except Exception as exc:
         return Verdict(str(exc))
-    return Verdict(None, tuple(sorted(set(dropped))))
+    return Verdict(None, tuple(sorted(set(dropped))), config, sources)
 
 
 def save_text(path: Path, text: str, *, now: float | None = None) -> Path | None:
@@ -98,6 +110,7 @@ def save_text(path: Path, text: str, *, now: float | None = None) -> Path | None
 
 __all__ = [
     "CONFIG_FILENAME",
+    "FILE_LAYERS",
     "Verdict",
     "config_path",
     "read_text",
