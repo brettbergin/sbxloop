@@ -201,7 +201,9 @@ It picks up labeled issues and lets you follow and steer runs from chat.
 Prefer the terminal? Run `sbxloop tui` on the daemon host. The
 [TUI](docs/tui.md) puts the queue, live runs, logs, and chat in one place,
 so you can steer work and approve held merges without switching to Discord
-or Slack. It uses the same home and configuration as the daemon.
+or Slack. It uses the same home and configuration as the daemon — and edits
+that configuration in place: pick a setting, change it, and the file is
+written back with its comments intact.
 
 ## Run as a service on Debian
 
