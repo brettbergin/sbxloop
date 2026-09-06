@@ -222,15 +222,16 @@ def discover(
 
     if state_root.is_dir():
         for path in sorted(state_root.iterdir()):
-            if (path / "state.db").is_file():
-                legacy.state_db_candidates.append(path / "state.db")
+            db = path / "state.db"
+            if db.is_file() and db not in legacy.state_db_candidates:
+                legacy.state_db_candidates.append(db)
         legacy.legacy_state_roots.append(state_root)
 
     for name in ("state.db", "daemon", "conformance", "bake.json", "gc-pending"):
         path = home.root / name
         if path.exists():
             legacy.flat_home_files.append(path)
-            if name == "state.db":
+            if name == "state.db" and path not in legacy.state_db_candidates:
                 legacy.state_db_candidates.append(path)
     if cwd.resolve() != home.root.resolve() and (cwd / ".sbxloop" / "state.db").is_file():
         legacy.state_db_candidates.append(cwd / ".sbxloop" / "state.db")
