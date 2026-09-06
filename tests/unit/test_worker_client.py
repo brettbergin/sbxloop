@@ -72,10 +72,12 @@ def script_toolchain_probe(
 
 
 def script_git_probe(fake_sbx: FakeSbx, *, returncode: int = 0) -> None:
-    """Script the baseline git probe (#252). Unscripted it runs on the host,
-    where git is present on every dev machine and CI runner — so tests that
-    assert the exact apt command pin it rather than rely on that."""
-    fake_sbx.script(f"exec boxa sh -c {toolchains.GIT.probe}", returncode=returncode)
+    """Script every baseline tool probe (git #252, yq/jq #751) to the same
+    answer. Unscripted they run on the host, where git is present on every
+    dev machine and CI runner and yq varies — so tests that assert the
+    exact apt command pin them rather than rely on that."""
+    for tool in toolchains.BASELINE_TOOLS:
+        fake_sbx.script(f"exec boxa sh -c {tool.probe}", returncode=returncode)
 
 
 def script_toolchain_probe_batch(
@@ -548,6 +550,7 @@ class TestInstallFallbacks:
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
+        script_git_probe(fake_sbx, returncode=0)
         script_toolchain_probe(fake_sbx, "python", returncode=0)
         script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
@@ -648,7 +651,7 @@ class TestInstallFallbacks:
         ]
         assert apt_cmds == [
             "exec boxa sh -c sudo -n apt-get update -q && "
-            "sudo -n apt-get install -y -q git python3-venv python3-pip curl ca-certificates"
+            "sudo -n apt-get install -y -q git yq jq python3-venv python3-pip curl ca-certificates"
         ]
 
     def test_ensure_dev_tools_git_probe_success_installs_nothing(
@@ -1116,7 +1119,7 @@ class TestPrebakedTemplate:
         joined = [" ".join(c) for c in fake_sbx.invocations("exec")]
         assert not [j for j in joined if "-m venv" in j or "pip install" in j]
         assert joined[-1] == (
-            "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git"
+            "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git yq jq"
         )
 
     def test_verified_prebaked_logs_the_baked_languages(
