@@ -1,7 +1,16 @@
-"""Editing ``sbxloop.toml`` from the console: which file, how a draft is
-validated (the real loader, against a scratch copy, with the same user
-and environment layers the daemon sees) and how a save lands (atomic,
-with a timestamped backup)."""
+"""Editing the operator's configuration from the console: which file, how
+a draft is validated (the real loader, against a scratch copy, with every
+other layer the daemon sees) and how a save lands (atomic, with a
+timestamped backup).
+
+**Which file.** The home's ``config/sbxloop.toml`` — what ``sbxloop init``
+writes, what a deploy preserves and what ``sbxloop backup`` snapshots. It
+is the operator's file by construction: the loader reads it out of the
+home whatever directory anything was started in, so the console edits the
+same file the daemon reads no matter where either was launched. A
+``sbxloop.toml`` in a working directory is *project* config a repository
+carries, and the console does not write to it.
+"""
 
 from __future__ import annotations
 
@@ -14,19 +23,31 @@ from dataclasses import dataclass
 from importlib import resources
 from pathlib import Path
 
-from sbxloop.config import Config, discover_config, load_config_with_sources
+from sbxloop.config import Config, load_config_with_sources
+from sbxloop.paths import SbxloopHome
 
 CONFIG_FILENAME = "sbxloop.toml"
 
-#: What :func:`load_config_with_sources` calls the layer this module edits
-#: — the plain file, and the cut-down a repository-carried one becomes.
-FILE_LAYERS = (CONFIG_FILENAME, f"{CONFIG_FILENAME} (project)")
+#: What :func:`load_config_with_sources` calls the layer this module edits.
+#: A key whose source is anything else is not answered by this file, however
+#: the save went.
+FILE_LAYER = "home config"
 
 
-def config_path(cwd: Path) -> Path:
-    """The ``sbxloop.toml`` the loader would read from ``cwd`` — the
-    discovered root's, whether or not it exists yet."""
-    return discover_config(cwd).root / CONFIG_FILENAME
+def config_path(home: SbxloopHome) -> Path:
+    """The operator config ``home`` carries, whether or not it exists yet."""
+    return home.config_toml
+
+
+def home_env(home: SbxloopHome, env: Mapping[str, str]) -> dict[str, str]:
+    """``env`` with the home the console is attached to named in it.
+
+    The loader finds the operator config through ``SBXLOOP_HOME``/``HOME``,
+    not through any argument, so a console pointed at another home with
+    ``--state-dir`` would otherwise read one file and write another. Both
+    ``load`` and ``validate`` go through here, so what the resolved view
+    shows and what a save changes are always the same file."""
+    return {**env, "SBXLOOP_HOME": str(home.root)}
 
 
 def template_text() -> str:
@@ -50,12 +71,9 @@ class Verdict:
     """What the loader made of a draft."""
 
     error: str | None
-    #: Keys a repository-carried ``sbxloop.toml`` may not set: the loader
-    #: ignores them with a warning, so a save would apply nothing for them.
-    dropped: tuple[str, ...] = ()
     #: What the draft resolves to, every layer applied, and which layer
-    #: answered for each key — how a single-key edit finds out that the
-    #: environment still wins. ``None``/empty when the draft was refused.
+    #: answered for each key — how a single-key edit finds out that another
+    #: layer still wins. ``None``/empty when the draft was refused.
     #: Excluded from equality: a Config is compared by every field it has,
     #: and nothing needs that here.
     config: Config | None = dataclasses.field(default=None, compare=False, repr=False)
@@ -69,28 +87,20 @@ class Verdict:
     def text(self) -> str:
         if self.error is not None:
             return f"draft refused: {self.error}"
-        if self.dropped:
-            return (
-                "draft loads, but this sbxloop.toml is the repository's (tracked by git): "
-                f"the daemon ignores {', '.join(self.dropped)} — operator settings belong "
-                "in ~/.config/sbxloop/sbxloop.toml or the environment"
-            )
         return "draft loads: the loader accepted it"
 
 
-def validate_text(text: str, *, cwd: Path, env: Mapping[str, str]) -> Verdict:
-    """The loader's own verdict on a draft, in place of the ``sbxloop.toml``
-    at the root discovered from ``cwd`` — the same discovery, the same
-    user, ``pyproject.toml`` and environment layers, the same project
-    cut-down when the file is the repository's. Nothing is written."""
-    dropped: list[str] = []
+def validate_text(text: str, *, home: SbxloopHome, env: Mapping[str, str]) -> Verdict:
+    """The loader's own verdict on a draft, in place of ``home``'s
+    ``config/sbxloop.toml`` — every other layer still applied, and resolved
+    from the home, which is where the daemon runs. Nothing is written."""
     try:
         config, sources = load_config_with_sources(
-            cwd=cwd, env=dict(env), sbxloop_toml_text=text, dropped_keys=dropped
+            cwd=home.root, env=home_env(home, env), home_config_text=text
         )
     except Exception as exc:
         return Verdict(str(exc))
-    return Verdict(None, tuple(sorted(set(dropped))), config, sources)
+    return Verdict(None, config, sources)
 
 
 def save_text(path: Path, text: str, *, now: float | None = None) -> Path | None:
@@ -110,9 +120,10 @@ def save_text(path: Path, text: str, *, now: float | None = None) -> Path | None
 
 __all__ = [
     "CONFIG_FILENAME",
-    "FILE_LAYERS",
+    "FILE_LAYER",
     "Verdict",
     "config_path",
+    "home_env",
     "read_text",
     "save_text",
     "template_text",

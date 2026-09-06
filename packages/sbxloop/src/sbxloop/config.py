@@ -2559,34 +2559,18 @@ def _project_layer(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     return kept, dropped
 
 
-def _file_layers(
-    discovery: ConfigDiscovery,
-    *,
-    sbxloop_toml_text: str | None = None,
-    dropped_keys: list[str] | None = None,
-) -> list[tuple[str, dict[str, Any]]]:
+def _file_layers(discovery: ConfigDiscovery) -> list[tuple[str, dict[str, Any]]]:
     """The two file layers at the discovered root, each cut down to project
-    config when the repository carries it (see ``PROJECT_LAYER_KEYS``).
-    ``sbxloop_toml_text`` stands in for the root's ``sbxloop.toml`` — a
-    draft validated exactly as the file would load, the cut-down included;
-    ``dropped_keys`` collects what the cut-down ignored."""
+    config when the repository carries it (see ``PROJECT_LAYER_KEYS``)."""
     layers: list[tuple[str, dict[str, Any]]] = []
     for name, read in (
         ("pyproject.toml", _pyproject_layer),
         ("sbxloop.toml", _sbxloop_toml_layer),
     ):
         path = discovery.root / name
-        if name == "sbxloop.toml" and sbxloop_toml_text is not None:
-            try:
-                raw = tomllib.loads(sbxloop_toml_text)
-            except tomllib.TOMLDecodeError as exc:
-                raise ConfigError(f"invalid TOML in the draft of {path}: {exc}") from exc
-        else:
-            raw = read(discovery.root)
+        raw = read(discovery.root)
         if raw and discovery.is_project_file(path):
             raw, dropped = _project_layer(raw)
-            if dropped_keys is not None:
-                dropped_keys.extend(dropped)
             if dropped:
                 log.warning(
                     "config.project_layer.ignored",
@@ -2608,8 +2592,16 @@ def home_config_path(env: Mapping[str, str]) -> Path | None:
     return SbxloopHome(root).config_toml if root is not None else None
 
 
-def _home_config_layer(env: Mapping[str, str]) -> dict[str, Any]:
+def _home_config_layer(env: Mapping[str, str], text: str | None = None) -> dict[str, Any]:
+    """The operator's own ``$SBXLOOP_HOME/config/sbxloop.toml``. ``text``
+    stands in for it unread — the console validating a draft of that file
+    before it is written."""
     path = home_config_path(env)
+    if text is not None:
+        try:
+            return tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"invalid TOML in the draft of {path}: {exc}") from exc
     if path is None or not path.is_file():
         return {}
     return _read_toml(path)
@@ -2687,13 +2679,11 @@ def load_config_with_sources(
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
     *,
-    sbxloop_toml_text: str | None = None,
-    dropped_keys: list[str] | None = None,
+    home_config_text: str | None = None,
 ) -> tuple[Config, dict[str, str]]:
     """Load config and report, per dotted key, which layer supplied it.
-    ``sbxloop_toml_text`` replaces the discovered root's ``sbxloop.toml``
-    (the console validating a draft); ``dropped_keys`` receives the keys a
-    repository-carried layer may not set."""
+    ``home_config_text`` replaces the home's ``config/sbxloop.toml`` — the
+    console validating a draft of the operator's file before writing it."""
     cwd = cwd or Path.cwd()
     if env is None:
         # Only consult secrets.env when reading the real environment;
@@ -2703,8 +2693,8 @@ def load_config_with_sources(
 
     discovery = discover_config(cwd)
     layers: list[tuple[str, dict[str, Any]]] = [
-        ("home config", _home_config_layer(env)),
-        *_file_layers(discovery, sbxloop_toml_text=sbxloop_toml_text, dropped_keys=dropped_keys),
+        ("home config", _home_config_layer(env, home_config_text)),
+        *_file_layers(discovery),
         ("env", _env_layer(env)),
     ]
 
