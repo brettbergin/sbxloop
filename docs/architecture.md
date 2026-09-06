@@ -992,6 +992,14 @@ default, which loads no filesystem settings), so a target repository's
 `.claude/settings.json` cannot reconfigure an unattended session and
 CLAUDE.md costs its tokens once, through the prompt.
 
+Host reads of these convention files and PR templates use `repofiles`:
+directory-relative opens with kernel symlink following disabled, resolving
+links only within the checkout. Links between repository files still work;
+links to host files are omitted. Replacing a path between inspection and
+opening cannot redirect the read outside the checkout. Artifact staging and
+regular-file PR uploads use the same reader and fail when a file cannot be
+opened safely. Hosts without directory-relative, no-follow opens fail closed.
+
 ## Workloads
 
 A run has a **kind** (`RunKind`: `code` or `workload`, `runs.kind`), and the
