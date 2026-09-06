@@ -230,7 +230,10 @@ more than a paragraph it has to interpret. A finding you cannot reproduce
 is `minor` at most. When a finding is one case of a wider gap — the same
 code path also sees other row states, id forms or inputs — say so in the
 body and name the neighbours: a fix that settles only the case you named
-costs the run another round for the next one.
+costs the run another round for the next one. `yq` and `jq` are on every
+sandbox for reading and validating YAML/JSON (`yq` takes jq syntax:
+`yq -r '.on' .github/workflows/ci.yml`) — do not install PyYAML, Ruby, or
+a venv just to parse YAML.
 
 ## Response format
 

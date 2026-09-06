@@ -1882,7 +1882,12 @@ that already ships the toolchain costs no install and no network. It is
 continues, since the agent has passwordless `sudo apt-get` as an escape
 hatch. And it is **selected, not accumulated** — an explicit `languages`
 replaces detection rather than adding to it, so nothing is installed for a
-language you did not ask for. The one rider is `git-lfs` (#693): not a
+language you did not ask for. Two riders sit outside the selection. The
+baseline tools — `git` (#252) and `yq`/`jq` (#751) — land on every agent
+sandbox whatever the language set, because tests shell out to git and
+YAML turns up in every repository (workflows, compose files, Helm charts)
+while no language toolchain ships a parser; the agent is told `yq` is the
+jq-syntax one. And `git-lfs` (#693): not a
 language and not selectable, it is added to whatever set was resolved
 whenever a `.gitattributes` in the workspace routes files through
 `filter=lfs`, so the sandbox can read and write the assets the repository
