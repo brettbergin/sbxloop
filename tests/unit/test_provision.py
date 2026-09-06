@@ -11,6 +11,7 @@ import pytest
 from sbxloop.config import Config
 from sbxloop.errors import ProvisionError
 from sbxloop.events import Event, EventBus
+from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner, sandbox_name
 from sbxloop.sbx.sandbox import WORK_DIR
@@ -424,7 +425,7 @@ class TestEnsurePair:
         # r1's agent probe cached "invisible-under-exec"; clear it so r2
         # takes the registration path whose no-recovery property this
         # asserts (the cached path is covered by TestCachedProxyVerdictSkip).
-        shutil.rmtree(tmp_path / "state" / "conformance")
+        shutil.rmtree(SbxloopHome(tmp_path / "state").conformance)
         rm_calls_before = len(fake_sbx.invocations("secret rm"))
         pair = provisioner.ensure_pair("r2")
         assert len(fake_sbx.invocations("secret rm")) == rm_calls_before
@@ -825,7 +826,7 @@ class TestSecretIdempotency:
         provisioner.ensure_pair("r1").cleanup()
         # r1's probe cached "invisible-under-exec"; clear it so r2 takes the
         # registration path whose collision recovery this test exercises.
-        shutil.rmtree(tmp_path / "state" / "conformance")
+        shutil.rmtree(SbxloopHome(tmp_path / "state").conformance)
         pair = provisioner.ensure_pair("r2")  # must not raise
         try:
             state = self.secret_state(fake_sbx)
@@ -855,7 +856,7 @@ class TestSecretIdempotency:
         # resume straight to the env file (see TestCachedProxyVerdictSkip's
         # rotation test); clear it so this test keeps exercising the
         # registration-collision replacement an unknown sbx version takes.
-        shutil.rmtree(tmp_path / "state" / "conformance")
+        shutil.rmtree(SbxloopHome(tmp_path / "state").conformance)
         rotated = dict(TOKENS, GH_TOKEN="github_pat_rotated")
         provisioner2 = make_provisioner(fake_sbx, tmp_path, env=rotated)
         pair = provisioner2.ensure_pair("r1")
@@ -877,7 +878,7 @@ class TestSecretIdempotency:
         first.cleanup()
         # r1's probe cached "invisible-under-exec"; clear it so r2 takes the
         # registration path this test exists to exercise.
-        shutil.rmtree(tmp_path / "state" / "conformance")
+        shutil.rmtree(SbxloopHome(tmp_path / "state").conformance)
         import logging
 
         with caplog.at_level(logging.WARNING):
@@ -1037,7 +1038,7 @@ class TestSecretEnvVerification:
             assert not [e for e in events if e.type == "sandbox.secret_probe_error"]
             from sbxloop.sbx.conformance import PROBE_SECRET_ENV_VISIBILITY, load_verdicts
 
-            cached = load_verdicts(tmp_path / "state", "0.38.0")
+            cached = load_verdicts(SbxloopHome(tmp_path / "state"), "0.38.0")
             assert cached[PROBE_SECRET_ENV_VISIBILITY].verdict == "sentinel-under-exec"
         finally:
             pair.cleanup()
@@ -1058,7 +1059,7 @@ class TestSecretEnvVerification:
             assert not [e for e in events if e.type == "sandbox.secret_env_fallback"]
             from sbxloop.sbx.conformance import PROBE_SECRET_ENV_VISIBILITY, load_verdicts
 
-            cached = load_verdicts(tmp_path / "state", "0.38.0")
+            cached = load_verdicts(SbxloopHome(tmp_path / "state"), "0.38.0")
             assert cached[PROBE_SECRET_ENV_VISIBILITY].verdict == "visible-under-exec"
         finally:
             pair.cleanup()
@@ -1162,7 +1163,9 @@ class TestMountDiscovery:
             assert [e.data["probe"] for e in mount_events] == ["error"]
             # and the infra failure did not clobber the conformance cache
             # with a bogus "not-found" verdict
-            assert PROBE_WORKSPACE_MOUNT not in load_verdicts(tmp_path / "state", "0.38.0")
+            assert PROBE_WORKSPACE_MOUNT not in load_verdicts(
+                SbxloopHome(tmp_path / "state"), "0.38.0"
+            )
         finally:
             pair.cleanup()
 
@@ -1296,7 +1299,7 @@ class TestConformanceRecording:
         provisioner = make_provisioner(fake_sbx, tmp_path)
         pair = provisioner.ensure_pair("r1")
         try:
-            cached = load_verdicts(tmp_path / "state", "0.38.0")
+            cached = load_verdicts(SbxloopHome(tmp_path / "state"), "0.38.0")
             assert cached[PROBE_SECRET_ENV_VISIBILITY].verdict == "invisible-under-exec"
             assert cached[PROBE_SECRET_ENV_VISIBILITY].source == "provision"
             assert cached[PROBE_WORKSPACE_MOUNT].verdict == "discoverable"
@@ -1473,7 +1476,9 @@ class TestCachedProxyVerdictSkip:
     def seed_broken_verdict(self, tmp_path: Path, verdict: str = "invisible-under-exec") -> None:
         from sbxloop.sbx.conformance import PROBE_SECRET_ENV_VISIBILITY, record_field_verdict
 
-        record_field_verdict(tmp_path / "state", "0.38.0", PROBE_SECRET_ENV_VISIBILITY, verdict)
+        record_field_verdict(
+            SbxloopHome(tmp_path / "state"), "0.38.0", PROBE_SECRET_ENV_VISIBILITY, verdict
+        )
 
     def test_cached_broken_verdict_skips_registration_and_probe(
         self, fake_sbx: FakeSbx, tmp_path: Path
@@ -1702,7 +1707,7 @@ class TestMimicSentinels:
         try:
             fallback = [e for e in events if e.type == "sandbox.secret_env_fallback"]
             assert fallback, "mimic sentinel must trigger the env-file fallback"
-            cached = load_verdicts(tmp_path / "state", "0.38.0")
+            cached = load_verdicts(SbxloopHome(tmp_path / "state"), "0.38.0")
             assert cached[PROBE_SECRET_ENV_VISIBILITY].verdict == "sentinel-under-exec"
         finally:
             pair.cleanup()
@@ -1872,7 +1877,7 @@ class TestStdinEnvDelivery:
         # the verdict is cached for this sbx version
         from sbxloop.sbx.conformance import PROBE_EXEC_STDIN_ENV, load_verdicts
 
-        record = load_verdicts(tmp_path / "state", "0.38.0").get(PROBE_EXEC_STDIN_ENV)
+        record = load_verdicts(SbxloopHome(tmp_path / "state"), "0.38.0").get(PROBE_EXEC_STDIN_ENV)
         assert record is not None and record.verdict == "delivers"
 
     def test_fallback_writes_env_file_when_probe_fails(

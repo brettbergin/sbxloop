@@ -198,4 +198,10 @@ def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = SbxloopHome(tmp_path / ".sbxloop")
     home.ensure_tree()
     home.write_record(sbxloop_version="test", created_by="tests/conftest.py")
+    # The CLI pins tempfile.tempdir to the home's tmp/ once it exists; that
+    # is process-global, and this test's home is gone when the next test
+    # runs. Start every test from the platform default.
+    import tempfile
+
+    monkeypatch.setattr(tempfile, "tempdir", None)
     return tmp_path

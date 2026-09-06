@@ -656,10 +656,10 @@ class TestDaemonCommand:
         result = runner.invoke(app, ["tui", "--help"])
         assert result.exit_code == 0, result.output
         plain = re.sub(r"\x1b\[[0-9;]*m", "", result.output)
-        assert "--run" in plain and "--read-only" in plain and "--state-dir" in plain
-        assert "--unit" in plain
+        assert "--run" in plain and "--read-only" in plain and "--unit" in plain
+        assert "--state-dir" not in plain  # the home is the home; SBXLOOP_HOME moves it
         result = runner.invoke(
-            app, ["tui", "--state-dir", str(workdir / "nowhere")], env={"COLUMNS": "300"}
+            app, ["tui"], env={"COLUMNS": "300", "SBXLOOP_HOME": str(workdir / "nowhere")}
         )
         assert result.exit_code == 2
         assert "does not exist" in result.output and "sbxloop daemon" in result.output
@@ -1248,8 +1248,8 @@ class TestDoctor:
         git: bool | None = None,
         languages: list[str] | None = None,
     ) -> None:
-        state = workdir / ".sbxloop"
-        state.mkdir(exist_ok=True)
+        state = home(workdir).state
+        state.mkdir(parents=True, exist_ok=True)
         record: dict[str, object] = {
             "ref": ref,
             "worker_version": worker_version,
