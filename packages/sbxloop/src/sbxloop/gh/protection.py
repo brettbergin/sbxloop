@@ -229,16 +229,18 @@ def _pool(a: BaseRequirements, b: BaseRequirements) -> tuple[Any, ...]:
 
 
 def _read_classic(ops: Any, repo: str, base: str) -> _Reading:
+    from sbxloop.gh.ops import raw_lookup
+
     try:
-        protection = ops.raw("GET", f"/repos/{repo}/branches/{base}/protection")
+        protection = raw_lookup(ops, "GET", f"/repos/{repo}/branches/{base}/protection")
     except GithubOpsError as exc:
-        if exc.http_status == 404:
-            return _Reading(True, [], UNKNOWN)  # explicitly unprotected — an answer
         log.info("protection.classic_unreadable", repo=repo, base=base, error=str(exc))
         return _Reading(False, [], UNKNOWN)
     except Exception as exc:  # nosec B110 - advisory probe; the fallback is "gate on all"
         log.info("protection.classic_unreadable", repo=repo, base=base, error=str(exc))
         return _Reading(False, [], UNKNOWN)
+    if protection is None:
+        return _Reading(True, [], UNKNOWN)  # explicitly unprotected — an answer (#558)
     if not isinstance(protection, dict):
         return _Reading(True, [], UNKNOWN)
     reviews = protection.get("required_pull_request_reviews")

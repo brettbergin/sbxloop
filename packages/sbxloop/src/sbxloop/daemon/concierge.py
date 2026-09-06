@@ -2042,12 +2042,9 @@ def _remove_label(ops: GithubOps, issue_path: str, label: str) -> None:
     resource) as success — same tolerance as ``GitHubIssueSource``. Swallowed
     inside the ``DaemonGithub.call`` lambda so a 404 never looks like a dead
     sandbox and triggers its drop-and-retry."""
-    try:
-        ops.raw("DELETE", f"{issue_path}/labels/{quote(label, safe='')}")
-    except GithubOpsError as exc:
-        missing = exc.http_status == 404 if exc.http_status is not None else "HTTP 404" in str(exc)
-        if not missing:
-            raise
+    from sbxloop.gh.ops import raw_lookup
+
+    raw_lookup(ops, "DELETE", f"{issue_path}/labels/{quote(label, safe='')}")
 
 
 def _work_item_note(item: WorkItem | None) -> str:
