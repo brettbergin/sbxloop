@@ -281,3 +281,69 @@ def test_events_wait_while_follow_is_off(seeded: SbxloopHome) -> None:
             assert log.count == before + 1
 
     drive(scenario)
+
+
+def test_a_workload_run_header_shows_its_profile_and_needs(seeded: SbxloopHome) -> None:
+    """#804: a workload's screen says which profile bounded it, what the
+    plan asked for and the grant gave (names only), and a refused need
+    with the sbxloop.toml key that would allow it."""
+    import json
+
+    from sbxloop.engine.store import StateStore
+    from sbxloop_worker.protocol import Event
+
+    store = StateStore(seeded.state_db)
+    pinned = json.dumps({"workload": {"default": "research"}})
+    store.create_run("r_work", "Digest the week", pinned, kind="workload")
+    store.set_run_state("r_work", "completed")
+    store.append_event(
+        Event.now(
+            "run.needs_granted",
+            "r_work",
+            profile="research",
+            hosts=["api.example.com"],
+            credentials=["weather"],
+            sinks=["chat"],
+            repos=[],
+            message="granted",
+        )
+    )
+    store.create_run("r_refused", "Reach out", pinned, kind="workload")
+    store.set_run_state("r_refused", "failed")
+    store.append_event(
+        Event.now(
+            "run.needs_refused",
+            "r_refused",
+            profile="research",
+            need="host",
+            value="evil.example.com",
+            task_id="t1",
+            key="workloads.research.egress",
+            message="refused",
+        )
+    )
+    store.close()
+
+    async def scenario() -> None:
+        app = make_app(seeded, run="r_work")
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause(1.5)
+            header = app.screen.query_one("#header", TextPanel).content_text
+            assert "workload (research)" in header
+            assert "granted: hosts api.example.com; credentials weather; sinks chat" in header
+            assert "refused" not in header
+
+    drive(scenario)
+
+    async def refused() -> None:
+        app = make_app(seeded, run="r_refused")
+        async with app.run_test(size=(140, 45)) as pilot:
+            await pilot.pause(1.5)
+            header = app.screen.query_one("#header", TextPanel).content_text
+            assert "workload (research)" in header
+            assert (
+                "refused: host evil.example.com — allow it with `workloads.research.egress`"
+                in header
+            )
+
+    drive(refused)

@@ -882,16 +882,11 @@ def workload_profile_checks(config: Config) -> list[Check]:
     by name with what each bounds, and which one runs by default. The
     config loader already refused a profile naming an unknown credential
     or a default naming no profile; this row is the at-a-glance view."""
+    from sbxloop.cli.workloadview import profile_summary
+
     if not config.workloads:
         return []
-    listed = "; ".join(
-        f"{p.name}"
-        + (" (default)" if p.name == config.workload.default else "")
-        + f": hosts {', '.join(p.egress) or '-'}, credentials "
-        + f"{', '.join(p.credentials) or '-'}, sinks {', '.join(p.sinks) or '-'}, "
-        + f"repo {'yes' if p.repo else 'no'}"
-        for p in config.workloads
-    )
+    listed = "; ".join(profile_summary(config, p) for p in config.workloads)
     if config.workload.default is None:
         listed += (
             " — no \\[workload] default: a run names one with --profile or runs "
