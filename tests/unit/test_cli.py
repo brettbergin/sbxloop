@@ -393,7 +393,7 @@ class TestConfigAndInit:
         assert "evil.example.com" in result.output
 
     def test_init_writes_and_refuses_overwrite(self, workdir: Path) -> None:
-        result = runner.invoke(app, ["init"])
+        result = runner.invoke(app, ["init", "--project"])
         assert result.exit_code == 0
         assert (workdir / "sbxloop.toml").is_file()
         # the generated file must itself be valid config
@@ -402,13 +402,13 @@ class TestConfigAndInit:
         config = load_config(cwd=workdir, env={})
         assert config.model == "auto"
 
-        again = runner.invoke(app, ["init"])
+        again = runner.invoke(app, ["init", "--project"])
         assert again.exit_code == 2
-        forced = runner.invoke(app, ["init", "--force"])
+        forced = runner.invoke(app, ["init", "--project", "--force"])
         assert forced.exit_code == 0
 
     def test_init_template_documents_landing_knobs(self, workdir: Path) -> None:
-        result = runner.invoke(app, ["init"])
+        result = runner.invoke(app, ["init", "--project"])
         assert result.exit_code == 0
         text = (workdir / "sbxloop.toml").read_text()
         # landing is always on; its budgets and the merge style are documented

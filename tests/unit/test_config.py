@@ -30,7 +30,7 @@ def test_artifacts_exclude_default_and_override(tmp_path: Path) -> None:
 def test_init_template_exclude_matches_the_default(tmp_path: Path) -> None:
     """`sbxloop init` writes the exclude list out literally; a starter file
     that silently differs from the built-in default would be a trap."""
-    from sbxloop.cli.app import DEFAULT_CONFIG_TOML
+    from sbxloop.data import DEFAULT_CONFIG_TOML
 
     (tmp_path / "sbxloop.toml").write_text(DEFAULT_CONFIG_TOML)
     written = load_config(cwd=tmp_path, env={}).artifacts.exclude

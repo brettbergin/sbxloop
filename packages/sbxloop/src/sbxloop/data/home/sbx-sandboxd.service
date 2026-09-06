@@ -1,0 +1,25 @@
+# sbx-sandboxd.service — rendered by `sbxloop init --systemd` for the home
+# at @HOME@ and linked into ~/.config/systemd/user.
+[Unit]
+Description=Docker Sandboxes daemon (sandboxd) — sbxloop's sandbox backend
+Documentation=https://docs.docker.com/ai/sandboxes/
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# `sbx daemon start` stays in the foreground (-d/--detach is what backgrounds
+# it), so Type=simple is right. Through the home's wrapper, which puts
+# /usr/sbin on PATH: sandboxd's "block" volume driver shells out to mkfs.ext4,
+# and without it the only symptom is "unknown volume driver: block".
+Environment=SBXLOOP_HOME=@HOME@
+ExecStart=@HOME@/bin/sbx daemon start
+ExecStop=@HOME@/bin/sbx daemon stop
+Restart=always
+RestartSec=10
+TimeoutStopSec=60
+
+[Install]
+WantedBy=default.target

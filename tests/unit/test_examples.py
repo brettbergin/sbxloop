@@ -14,8 +14,8 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
-from sbxloop.cli.app import DEFAULT_CONFIG_TOML, config_presets, render_config_template
 from sbxloop.config import Config, load_config, load_secrets_env
+from sbxloop.data import DEFAULT_CONFIG_TOML, config_presets, render_config_template
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 EXAMPLE = REPO_ROOT / "sbxloop.toml.example"
@@ -66,7 +66,7 @@ def test_sbxloop_init_renders_the_example_file(tmp_path: Path, monkeypatch: Any)
     from sbxloop.cli.app import app
 
     monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(app, ["init"])
+    result = CliRunner().invoke(app, ["init", "--project"])
     assert result.exit_code == 0, result.output
     written = (tmp_path / "sbxloop.toml").read_text()
     assert _key_paths(tomllib.loads(written)) == _key_paths(tomllib.loads(EXAMPLE.read_text()))
@@ -147,7 +147,7 @@ class TestPresets:
         from sbxloop.cli.app import app
 
         monkeypatch.chdir(tmp_path)
-        result = CliRunner().invoke(app, ["init", "--preset", "large-repo"])
+        result = CliRunner().invoke(app, ["init", "--project", "--preset", "large-repo"])
         assert result.exit_code == 0, result.output
         written = (tmp_path / "sbxloop.toml").read_text()
         assert written == render_config_template("large-repo")
@@ -165,7 +165,7 @@ class TestPresets:
         from sbxloop.cli.app import app
 
         monkeypatch.chdir(tmp_path)
-        result = CliRunner().invoke(app, ["init", "--preset", "huge-repo"])
+        result = CliRunner().invoke(app, ["init", "--project", "--preset", "huge-repo"])
         assert result.exit_code == 2, result.output
         assert "unknown preset 'huge-repo'" in result.output
         assert "large-repo" in result.output  # names what does exist

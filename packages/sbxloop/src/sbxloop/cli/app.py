@@ -7,11 +7,12 @@ import json
 import math
 import os
 import queue
+import shlex
+import subprocess
 import sys
 import tempfile
 import threading
 import time
-from importlib import resources
 from pathlib import Path
 from typing import Annotated, Any, NoReturn, cast, get_args
 
@@ -42,6 +43,7 @@ from sbxloop.config import (
 from sbxloop.daemon.control import DEFAULT_TIMEOUT_S
 from sbxloop.daemon.store import DaemonStore, apply_item_verb
 from sbxloop.daemon.versions import VersionProbe, start_drift_check
+from sbxloop.data import config_presets, render_config_template
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import (
     TERMINAL_RUN_STATES,
@@ -57,6 +59,7 @@ from sbxloop.errors import SbxloopError
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
 from sbxloop.ghids import normalize_item_id, try_parse_gh_id
+from sbxloop.homeinit import SBX_VERSION
 from sbxloop.log import configure_logging, get_logger
 from sbxloop.paths import SbxloopHome, resolve_home_root
 from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
@@ -1656,46 +1659,147 @@ def config_policy() -> None:
 
 @app.command()
 def init(
-    force: Annotated[bool, typer.Option("--force", help="Overwrite an existing file.")] = False,
+    project: Annotated[
+        bool,
+        typer.Option(
+            "--project",
+            help="Write a project sbxloop.toml into the current directory instead of "
+            "initialising the host's home.",
+        ),
+    ] = False,
+    force: Annotated[
+        bool, typer.Option("--force", help="Overwrite an existing config file.")
+    ] = False,
     to_stdout: Annotated[
         bool,
-        typer.Option("--stdout", help="Print the template instead of writing sbxloop.toml."),
+        typer.Option("--stdout", help="Print the config template instead of writing anything."),
     ] = False,
     preset: Annotated[
         str | None,
         typer.Option(
             "--preset",
             help=(
-                "Append a packaged preset's live sections to the template, e.g. "
+                "Append a packaged preset's live sections to the config template, e.g. "
                 "`large-repo` for a repository whose gate takes minutes."
             ),
         ),
     ] = None,
+    systemd: Annotated[
+        bool,
+        typer.Option(
+            "--systemd/--no-systemd",
+            help="Render the daemon and sandboxd user units into the home and enable them "
+            "(Linux; never started).",
+        ),
+    ] = False,
+    runner_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--runner",
+            help="With --systemd: also render the github-runner unit for an Actions runner "
+            "installed in this directory.",
+        ),
+    ] = None,
+    sbx: Annotated[
+        bool,
+        typer.Option("--sbx/--no-sbx", help="Install Docker's sbx into the home."),
+    ] = True,
+    sbx_version: Annotated[
+        str | None,
+        typer.Option("--sbx-version", help=f"The sbx release to install (default {SBX_VERSION})."),
+    ] = None,
+    version: Annotated[
+        str | None,
+        typer.Option(
+            "--version",
+            help="The sbxloop release to install into the home's venv (default: this one).",
+        ),
+    ] = None,
+    wheels: Annotated[
+        Path | None,
+        typer.Option(
+            "--wheels", help="A directory of wheels to install from (a deploy's release assets)."
+        ),
+    ] = None,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Print the plan; touch nothing.")
+    ] = False,
 ) -> None:
-    """Write a commented sbxloop.toml with the default configuration.
+    """Initialise this host's sbxloop home (~/.sbxloop, or $SBXLOOP_HOME).
 
-    The template is `sbxloop.toml.example`, shipped as package data and
-    published at the repository root — one source of truth, so the example
-    file and this command cannot drift. `--preset NAME` appends the packaged
-    `presets/NAME.toml` (live sections, every table in the template is
-    commented out) so the result is one self-contained file.
+    Lays out the tree, writes the launchers (bin/sbxloop, bin/sbx), installs
+    uv, a CPython and sbxloop into venv/, installs Docker's sbx under sbx/,
+    writes config/sbxloop.toml and config/secrets.env once, and with
+    --systemd renders and enables the user units. Idempotent: re-run it after
+    an upgrade or to repair a home. `--project` writes a repository's own
+    sbxloop.toml (the project layer) into the current directory instead.
     """
-    try:
-        text = render_config_template(preset)
-    except KeyError:
+    from sbxloop.homeinit import HomeInit, InitError, InitOptions, path_hint
+
+    if to_stdout or project:
+        try:
+            text = render_config_template(preset)
+        except KeyError:
+            available = ", ".join(sorted(config_presets())) or "none"
+            console.print(f"unknown preset {preset!r} (available: {available})")
+            raise typer.Exit(2) from None
+        if to_stdout:
+            # bare TOML on stdout, nothing else — `sbxloop init --stdout > f.toml`
+            sys.stdout.write(text)
+            return
+        path = Path("sbxloop.toml")
+        if path.exists() and not force:
+            console.print("sbxloop.toml already exists (use --force to overwrite)")
+            raise typer.Exit(2)
+        path.write_text(text)
+        console.print(f"wrote {path}")
+        return
+
+    if preset is not None and preset not in config_presets():
         available = ", ".join(sorted(config_presets())) or "none"
         console.print(f"unknown preset {preset!r} (available: {available})")
-        raise typer.Exit(2) from None
-    if to_stdout:
-        # bare TOML on stdout, nothing else — `sbxloop init --stdout > f.toml`
-        sys.stdout.write(text)
-        return
-    path = Path("sbxloop.toml")
-    if path.exists() and not force:
-        console.print("sbxloop.toml already exists (use --force to overwrite)")
         raise typer.Exit(2)
-    path.write_text(text)
-    console.print(f"wrote {path}")
+    home = SbxloopHome(resolve_home_root())
+    options = InitOptions(
+        systemd=systemd,
+        runner_dir=runner_dir.expanduser().resolve() if runner_dir else None,
+        sbx=sbx,
+        sbx_version=sbx_version or SBX_VERSION,
+        version=version,
+        wheels=wheels.expanduser().resolve() if wheels else None,
+        force=force,
+        dry_run=dry_run,
+        preset=preset,
+    )
+    init = HomeInit(
+        home, options, say=lambda line: console.print(line, markup=False, soft_wrap=True)
+    )
+    console.print(f"sbxloop home: {home.root}", soft_wrap=True)
+    try:
+        report = init.execute()
+    except InitError as exc:
+        console.print(f"[bold red]init failed:[/] {exc}")
+        raise typer.Exit(1) from exc
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or "").strip()
+        console.print(f"[bold red]init failed:[/] `{shlex.join(exc.cmd)}` exited {exc.returncode}")
+        if detail:
+            console.print(detail, markup=False)
+        raise typer.Exit(1) from exc
+    if dry_run:
+        return
+    for line in report.done:
+        console.print(f"  done     {line}", markup=False, soft_wrap=True)
+    for line in report.skipped:
+        console.print(f"  kept     {line}", markup=False, soft_wrap=True)
+    for line in report.notes:
+        console.print(f"  note     {line}", markup=False, soft_wrap=True)
+    hint = path_hint(home, os.environ)
+    if hint:
+        console.print(f"add the launchers to your PATH: {hint}", markup=False, soft_wrap=True)
+    console.print(
+        "next: fill in config/secrets.env, edit config/sbxloop.toml, run `sbxloop doctor`"
+    )
 
 
 @app.command("init-repo")
@@ -2631,36 +2735,6 @@ def doctor(
 # The commented default configuration lives in one file — `sbxloop.toml.example`,
 # shipped as package data and published at the repository root — so `sbxloop
 # init` and the example a reader copies can never drift apart.
-DEFAULT_CONFIG_TOML = (
-    resources.files("sbxloop.data").joinpath("sbxloop.toml.example").read_text(encoding="utf-8")
-)
-
-
-def config_presets() -> dict[str, str]:
-    """The packaged `init --preset` fragments by name, from `sbxloop/data/presets`.
-
-    Package data, not a checkout path, so `sbxloop init --preset` works from a
-    wheel (#636) and nothing `init` writes points outside the user's project.
-    """
-    folder = resources.files("sbxloop.data").joinpath("presets")
-    return {
-        entry.name.removesuffix(".toml"): entry.read_text(encoding="utf-8")
-        for entry in folder.iterdir()
-        if entry.name.endswith(".toml")
-    }
-
-
-def render_config_template(preset: str | None = None) -> str:
-    """The template `sbxloop init` writes, with a preset's sections appended.
-
-    Every table in the template is commented out, so appending a preset's
-    live `[budgets]`/`[limits]` yields valid TOML. Raises KeyError for a
-    preset name the package does not ship.
-    """
-    if preset is None:
-        return DEFAULT_CONFIG_TOML
-    fragment = config_presets()[preset]
-    return DEFAULT_CONFIG_TOML.rstrip("\n") + "\n\n" + fragment
 
 
 def main() -> None:
