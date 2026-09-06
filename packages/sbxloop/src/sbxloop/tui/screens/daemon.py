@@ -29,7 +29,7 @@ from sbxloop.tui.format import age, clock
 from sbxloop.tui.runner import StreamHandle
 from sbxloop.tui.screens.base import ConsoleScreen
 from sbxloop.tui.screens.modals import TextPromptScreen
-from sbxloop.tui.system import LEVELS, UnitState, journal_argv, passes, probe_unit
+from sbxloop.tui.system import LEVELS, UnitState, journal_source, passes, probe_unit
 from sbxloop.tui.widgets.panel import TextPanel
 
 #: `systemctl show` is cheap but forks; the bar and this screen share it.
@@ -292,13 +292,13 @@ class DaemonScreen(ConsoleScreen):
 
     def _journal_source(self) -> tuple[str, ...] | None:
         deps = self.console_app.deps
-        unit = self.unit
-        if unit is not None and unit.loaded:
-            return journal_argv(deps.unit)
-        log_path = deps.console_dir / "daemon.log"
-        if "daemon" in deps.children.by_name and log_path.exists():
-            return ("tail", "-n", "200", "-F", str(log_path))
-        return None
+        return journal_source(
+            self.unit,
+            deps.unit,
+            daemon_log=deps.home.daemon_log,
+            console_log=deps.console_dir / "daemon.log",
+            spawned="daemon" in deps.children.by_name,
+        )
 
     def _journal_title(self) -> None:
         try:
