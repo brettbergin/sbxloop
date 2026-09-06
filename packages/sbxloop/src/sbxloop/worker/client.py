@@ -249,7 +249,7 @@ class WorkerClient:
         no_deps: bool = False,
         system_site_packages: bool = False,
         ensure_dev_tools: bool = False,
-        languages: Sequence[str] = (),
+        languages: Sequence[str] | None = None,
         versions: Mapping[str, toolchains.ToolchainVersion] | None = None,
         expect_prebaked: bool = False,
         apt_packages: Sequence[str] = (),
@@ -282,7 +282,10 @@ class WorkerClient:
 
         ``ensure_dev_tools`` additionally makes the sandbox dev-ready for
         the AGENT's own work (see _ensure_dev_tools) — the engine sets it
-        for the agent sandbox only, passing the configured ``languages``.
+        for the agent sandbox only, passing the run's resolved
+        ``languages``. ``None`` is the default set (Python); an empty
+        sequence is *no* language toolchain at all — a workload's box
+        (#801) gets the baseline tools and its backend's runtime only.
         ``versions`` selects the series each toolchain is provisioned at
         (#627): the workspace's ``requires-python`` / ``.nvmrc`` verdicts
         that ``toolchains.resolve_languages`` read on the host. Absent, or
@@ -299,7 +302,7 @@ class WorkerClient:
             role=self.role,
             expect_prebaked=expect_prebaked,
             ensure_dev_tools=ensure_dev_tools,
-            languages=list(languages) or None,
+            languages=None if languages is None else list(languages),
             versions={k: v.series for k, v in versions.items()} if versions else None,
         )
         if expect_prebaked and self._verify_prebaked():
@@ -565,7 +568,7 @@ class WorkerClient:
     def _top_up_prebaked(
         self,
         timeout: float,
-        languages: Sequence[str],
+        languages: Sequence[str] | None,
         versions: Mapping[str, toolchains.ToolchainVersion] | None = None,
     ) -> None:
         """Make a verified template dev-ready for THIS run's languages (#615).
@@ -586,7 +589,9 @@ class WorkerClient:
         """
         selected = (
             *toolchains.BASELINE_TOOLS,
-            *toolchains.resolve(languages or toolchains.DEFAULT_LANGUAGES, versions),
+            *toolchains.resolve(
+                toolchains.DEFAULT_LANGUAGES if languages is None else languages, versions
+            ),
         )
         missing = self.missing_toolchains(selected)
         if missing is None:
@@ -624,7 +629,7 @@ class WorkerClient:
     def _ensure_dev_tools(
         self,
         timeout: float,
-        languages: Sequence[str] = (),
+        languages: Sequence[str] | None = None,
         versions: Mapping[str, toolchains.ToolchainVersion] | None = None,
     ) -> None:
         """Best-effort: make the sandbox dev-ready for the agent's own work.
@@ -657,7 +662,9 @@ class WorkerClient:
         """
         selected = (
             *toolchains.BASELINE_TOOLS,
-            *toolchains.resolve(languages or toolchains.DEFAULT_LANGUAGES, versions),
+            *toolchains.resolve(
+                toolchains.DEFAULT_LANGUAGES if languages is None else languages, versions
+            ),
         )
         missing = [tc for tc in selected if not self.sandbox.exec(["sh", "-c", tc.probe]).ok]
         if not missing:

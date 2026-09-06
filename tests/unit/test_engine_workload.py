@@ -91,10 +91,12 @@ class TestWorkloadRun:
         assert start.data["kind"] == "workload"
         assert start.data["workspace"] is None
         assert start.data["workspace_source"] == "data-dir"
-        # The toolchain set is the config's answer, not a detection over an
-        # empty directory.
+        # No language toolchain at all (#801): a workload has no workspace
+        # to detect from and its operator needs none — the field showed
+        # every chat workload spending a minute installing python, dotnet
+        # and javascript it never used.
         (languages,) = [e for e in harness.events if e.type == "sandbox.languages"]
-        assert languages.data["source"] == "default"
+        assert languages.data["source"] == "none" and languages.data["languages"] == []
         # The operator planned and executed, the judge passed the task, and
         # the judgment re-ran the task's check on the finished workspace.
         rows = [
@@ -1577,3 +1579,51 @@ class TestSinks:
         assert resumed.reason == (
             "publishing to artifact failed: task t1 declared an unsafe path '../escape'"
         )
+
+
+class TestWorkloadLanguages:
+    """#801: a workload box provisions its profile's `languages`, empty by
+    default — never `[sandbox] languages`, which is a code run's set."""
+
+    def test_the_profile_names_the_toolchains(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1", verify=["test -f hello.txt"])), FILES_BUILD, PASS])
+        engine = harness.engine(
+            sandbox={"languages": ["dotnet", "javascript"]},
+            workloads=[{"name": "coder", "languages": ["go"]}],
+            workload={"default": "coder"},
+        )
+        result = engine.start("write hello.txt", kind="workload")
+        assert result.state == "completed"
+        (languages,) = [e for e in harness.events if e.type == "sandbox.languages"]
+        assert languages.data["source"] == "profile"
+        assert languages.data["languages"] == ["go"]
+
+    def test_sandbox_languages_do_not_apply_to_a_workload(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1", verify=["test -f hello.txt"])), FILES_BUILD, PASS])
+        engine = harness.engine(
+            sandbox={"languages": ["dotnet", "javascript"]},
+            workloads=[{"name": "plain"}],
+            workload={"default": "plain"},
+        )
+        result = engine.start("write hello.txt", kind="workload")
+        assert result.state == "completed"
+        (languages,) = [e for e in harness.events if e.type == "sandbox.languages"]
+        assert languages.data["source"] == "none" and languages.data["languages"] == []
+        # A code run on the same config still gets the configured set.
+        harness.events.clear()
+        harness.script([taskgraph(task("t1")), BUILD])
+        assert harness.engine(sandbox={"languages": ["dotnet"]}).start("code").succeeded
+        (languages,) = [e for e in harness.events if e.type == "sandbox.languages"]
+        assert languages.data["source"] == "config" and languages.data["languages"] == ["dotnet"]
+
+    def test_profile_languages_are_normalized_and_checked(self) -> None:
+        from sbxloop.config import Config
+
+        config = Config.model_validate(
+            {"workloads": [{"name": "p", "languages": ["js", "python", "javascript"]}]}
+        )
+        assert config.workloads[0].languages == ["javascript", "python"]
+        with pytest.raises(
+            ValueError, match=r"unsupported workloads\[\]\.languages entries \['cobol'\]"
+        ):
+            Config.model_validate({"workloads": [{"name": "p", "languages": ["cobol"]}]})
