@@ -139,6 +139,15 @@ class JobRunner:
                     with contextlib.suppress(OSError):
                         bundle.unlink(missing_ok=True)
             return JobResult(job_id=self.job.job_id, status="ok", output_json=asdict(merged))
+        if self.job.kind == "service.mcp":
+            from sbxloop_worker.mcpops import execute
+
+            output = execute(
+                self.job.params,
+                self.result_path.parent / "mcp-sessions",
+                timeout_s=self.job.timeout_s,
+            )
+            return JobResult(job_id=self.job.job_id, status="ok", output_json=output)
         if self.job.kind == "service.http":
             return self._run_service_http(writer)
         if self.job.kind == "service.fetch":
