@@ -33,7 +33,9 @@ from textual.notifications import SeverityLevel
 from textual.widgets import Input, TabbedContent, TabPane
 from textual.worker import get_current_worker
 
+from sbxloop.cli.doctor import stored_schedules
 from sbxloop.cli.policyview import PolicyView, policy_view
+from sbxloop.cli.workloadview import NO_PROFILE_NOTE, ProfileView, profile_views
 from sbxloop.config import Config, load_config_with_sources
 from sbxloop.tui import actions, configkeys, configtoml
 from sbxloop.tui.configedit import (
@@ -95,6 +97,8 @@ class ConfigScreen(ConsoleScreen):
                 yield ConsoleTable("key", "value", "source", id="resolved")
             with TabPane("Policy", id="policy-pane"), VerticalScroll():
                 yield TextPanel(Text("loading…", style="dim"), id="policy")
+            with TabPane("Workloads", id="workloads-pane"), VerticalScroll():
+                yield TextPanel(Text("loading…", style="dim"), id="workloads")
             with TabPane("Repos", id="repos-pane"):
                 yield ConsoleTable(
                     "repo", "enabled", "base", "token env", "trigger label", id="repos"
@@ -128,13 +132,16 @@ class ConfigScreen(ConsoleScreen):
             )
         except Exception as exc:
             if not get_current_worker().is_cancelled:
-                self.app.call_from_thread(self._apply, None, {}, {}, None, str(exc))
+                self.app.call_from_thread(self._apply, None, {}, {}, None, str(exc), [])
             return
         flat = flatten_config(config)
         view = policy_view(config)
+        # The stored schedules hang under the profile they name (#804); the
+        # read-only handle, off the UI thread like every other read here.
+        profiles = profile_views(config, [s.spec for s in stored_schedules(config)])
         if get_current_worker().is_cancelled:
             return
-        self.app.call_from_thread(self._apply, config, flat, sources, view, None)
+        self.app.call_from_thread(self._apply, config, flat, sources, view, None, profiles)
 
     def _apply(
         self,
@@ -143,6 +150,7 @@ class ConfigScreen(ConsoleScreen):
         sources: dict[str, str],
         view: PolicyView | None,
         error: str | None,
+        profiles: list[ProfileView] | None = None,
     ) -> None:
         self.config, self.flat, self.sources, self.error = config, flat, sources, error
         self.render_resolved()
@@ -150,6 +158,10 @@ class ConfigScreen(ConsoleScreen):
             self.query_one("#policy", TextPanel).update(self._policy(view))
         elif error:
             self.query_one("#policy", TextPanel).update(Text(error, style="red"))
+        if config is not None:
+            self.query_one("#workloads", TextPanel).update(self._workloads(profiles or []))
+        elif error:
+            self.query_one("#workloads", TextPanel).update(Text(error, style="red"))
         self._repos()
 
     def _shadowing_files(self) -> list[Path]:
@@ -203,6 +215,31 @@ class ConfigScreen(ConsoleScreen):
         if view.service is not None:
             table.add_row("service sandbox", view.service)
         table.add_row("audit trail", view.audit)
+        return table
+
+    @staticmethod
+    def _workloads(profiles: list[ProfileView]) -> Any:
+        """One card per `[[workloads]]` profile (#804): its bounds spelled
+        out the way the operator persona is told them, the schedules that
+        run under it; with none declared, what that means for a run."""
+        if not profiles:
+            return Text(NO_PROFILE_NOTE, style="yellow")
+        table = Table.grid(padding=(0, 1))
+        table.add_column(style="bold", no_wrap=True)
+        table.add_column()
+        for index, view in enumerate(profiles):
+            if index:
+                table.add_row("", "")
+            title = Text(view.title, style="bold cyan")
+            if view.description:
+                title.append(f" — {view.description}", style="dim")
+            table.add_row(Text("[[workloads]]"), title)
+            for label, value in view.rows:
+                table.add_row(f"  {label}", Text(value))
+            table.add_row(
+                "  schedules",
+                Text("; ".join(view.schedules) if view.schedules else "none", style="dim"),
+            )
         return table
 
     def _repos(self) -> None:

@@ -2032,6 +2032,30 @@ class WorkloadProfile(_ConfigModel):
     publish: WorkloadPublish = "auto"
     budgets: BudgetOverrides = Field(default_factory=BudgetOverrides)
     description: str = ""
+    # The language toolchains a workload's agent box is provisioned with
+    # (#801): empty by default — the operator persona needs its backend's
+    # runtime and nothing else, and `[sandbox] languages` (a code run's
+    # set) is not applied to a workload. Name entries here when the asks
+    # under this profile run code.
+    languages: list[str] = Field(default_factory=list)
+
+    @field_validator("languages")
+    @classmethod
+    def _check_languages(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        bad: list[str] = []
+        for entry in value:
+            key = normalize_language(entry)
+            if key is None:
+                bad.append(entry)
+            elif key not in normalized:
+                normalized.append(key)
+        if bad:
+            raise ValueError(
+                f"unsupported workloads[].languages entries {bad}: "
+                f"choose from {list(supported_languages())}"
+            )
+        return normalized
 
     @field_validator("name")
     @classmethod
