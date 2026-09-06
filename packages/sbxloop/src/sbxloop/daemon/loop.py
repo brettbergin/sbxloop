@@ -717,6 +717,10 @@ class DaemonLoop:
                 "item_id": handle.item.item_id,
                 "run_id": handle.run_id,
                 "title": handle.item.title,
+                # A workload and its profile (#804): the console's "now"
+                # line says which bounds the run is under.
+                "kind": handle.item.kind,
+                "profile": handle.item.profile,
             }
             if handle
             else None,
