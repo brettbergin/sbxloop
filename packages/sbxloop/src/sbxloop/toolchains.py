@@ -66,6 +66,7 @@ __all__ = [
     "SKIP_DIRS",
     "TOOLCHAINS",
     "WORKSPACE_TOOLS",
+    "YQ",
     "LanguageResolution",
     "TagMarker",
     "Toolchain",
@@ -1721,12 +1722,12 @@ TOOLCHAINS: tuple[Toolchain, ...] = (
 
 # Baseline agent tooling: provisioned on every agent sandbox regardless of
 # `[sandbox] languages`, and deliberately NOT selectable through it (issue
-# #252). git is the one tool a project's tests or build shell out to no
-# matter which ecosystem it belongs to — sbxloop's own suite does, on a
-# hardcoded PATH — and a template without it fails those tasks on every
-# revision. apt `git` is cheap and comes from the mirrors already in the
-# always-reachable baseline, so it rides the same pooled apt call as the
-# selected languages.
+# #252; yq/jq joined in #751). git is the one tool a project's tests or
+# build shell out to no matter which ecosystem it belongs to — sbxloop's own
+# suite does, on a hardcoded PATH — and a template without it fails those
+# tasks on every revision. apt `git` is cheap and comes from the mirrors
+# already in the always-reachable baseline, so it rides the same pooled apt
+# call as the selected languages.
 GIT = Toolchain(
     name="git",
     wanted="git",
@@ -1734,7 +1735,21 @@ GIT = Toolchain(
     apt_packages=("git",),
 )
 
-BASELINE_TOOLS: tuple[Toolchain, ...] = (GIT,)
+# yq + jq (#751): the agent meets YAML on every repository whatever its
+# language — CI workflows, compose files, Helm charts, pre-commit config —
+# and no language toolchain ships a YAML tool, so a workflow-editing run
+# spent four turns hunting for one (ruby, PyYAML, a venv without pip). The
+# Debian `yq` is the Python one (kislyuk): a jq-syntax wrapper over `jq`,
+# one syntax for YAML and JSON, apt-only, no installer host. The prompts
+# name it and its syntax so the agent does not reach for mikefarah flags.
+YQ = Toolchain(
+    name="yq",
+    wanted="yq",
+    probe="command -v yq >/dev/null && command -v jq >/dev/null",
+    apt_packages=("yq", "jq"),
+)
+
+BASELINE_TOOLS: tuple[Toolchain, ...] = (GIT, YQ)
 
 # Workspace tooling (#693): provisioned when the *workspace* calls for it,
 # whatever `[sandbox] languages` says, and not selectable through it any

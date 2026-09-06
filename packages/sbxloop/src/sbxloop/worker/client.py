@@ -633,7 +633,7 @@ class WorkerClient:
         ``sbxloop.toolchains``) before the agent's first turn, so it does not
         burn revision budget bootstrapping its own compiler. Empty selects
         the default, which is Python — the case this ensure was born for.
-        ``toolchains.BASELINE_TOOLS`` (git, #252) is provisioned on top of
+        ``toolchains.BASELINE_TOOLS`` (git #252, yq/jq #751) is provisioned on top of
         whatever was selected: a project's tests shell out to git whatever
         its language, so it is not an opt-in.
 

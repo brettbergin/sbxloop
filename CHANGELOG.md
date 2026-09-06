@@ -1,6 +1,43 @@
 ## [Unreleased]
 
+### Fixed
+
+- **Overview's page rail drew on top of the console's rail.** Both were
+  docked to the screen's left edge, and two widgets docked to the same edge
+  of one container overlay each other rather than stacking — so the page
+  rail covered Overview, Runs, Queue, Chat, Sandboxes and Daemon, leaving
+  only Config, Doctor and Help visible below it. The page rail now sits in
+  a `Horizontal` beside the page, in the space the docked rail leaves. A
+  test asserts the two rails' regions do not intersect: every content
+  assertion passed while the screen was unreadable, so geometry is the only
+  thing that catches this.
+
 ### Added
+
+- **Overview reports how the loop has been performing.** The screen was
+  four panels — the run in flight, the queue, recent runs, who is waiting
+  on you — three of which have their own screen, and none of which answered
+  the question you open a console with. It is now a live line and five
+  pages behind Overview's own rail (`s` Summary, `f` Flow, `c` Cost, `t`
+  Time, `h` Health; `o` opens the window's costliest run), each stating its
+  finding in a sentence before drawing a bar.
+
+  Three things it insists on, each of which was a wrong answer first.
+  **Active is not elapsed:** a run's wall-clock is dominated by time spent
+  waiting for a human — on this project's own host active time has run at
+  about a sixth of elapsed — so both are carried and named, and the runs
+  that waited longest are listed. **Turns are the cost:** every turn
+  re-sends the session context, so turns lead and tokens-per-turn is the
+  number that moves when a prompt grows; the costliest runs are ranked by
+  name so an outlier is not averaged away. **A cancelled run is a decision,
+  not a failure:** it is counted and reported but kept out of the success
+  rate's denominator.
+
+  Code and workload runs are never blended — they differ by an order of
+  magnitude in turns and duration. `StateStore.runs_between` and
+  `phases_between` fold each window in one grouped pass, and
+  `sbxloop.tui.analytics` turns those rows into the report on a slow timer
+  of its own, so a growing store is not rescanned between console ticks.
 
 - **A navigation rail down the left of the console.** Every screen with the
   key that reaches it, the one you are on marked, and a badge where a screen

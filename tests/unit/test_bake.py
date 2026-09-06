@@ -56,6 +56,7 @@ def script_install(
     # likewise host-dependent when unscripted — and an unscripted miss
     # would run the toolchain's installer on the host.
     fake_sbx.script(f"exec {BOX} sh -c {toolchains.GIT.probe}", returncode=git_rc)
+    fake_sbx.script(f"exec {BOX} sh -c {toolchains.YQ.probe}", returncode=0)
     for toolchain in toolchains.resolve(languages):
         fake_sbx.script(f"exec {BOX} sh -c {toolchain.probe}", returncode=0)
     # The batched probe the bake records from (#615): what landed.

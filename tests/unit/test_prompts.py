@@ -157,6 +157,19 @@ def test_build_carries_environment_notes() -> None:
     assert "cannot edit" in build
 
 
+def test_prompts_name_yq_for_yaml() -> None:
+    """Field regression (#751, run r72m8rass): the builder spent four turns
+    hunting for a YAML parser (ruby, PyYAML, a venv without pip) on a
+    workflow-editing task. Both prompts say yq/jq are there and that yq
+    takes jq syntax, so the agent neither installs a parser nor reaches
+    for mikefarah flags."""
+    for name, context in (("build", build_context()), ("review", RENDER_CONTEXTS["review"])):
+        text = " ".join(render(name, **context).split())
+        assert "`yq` and `jq` are on every sandbox" in text, name
+        assert "jq syntax" in text or "jq-syntax" in text, name
+        assert "Do not install PyYAML" in text or "do not install PyYAML" in text, name
+
+
 def test_build_is_framed_as_a_branch_not_an_artifact() -> None:
     """#689: the builder edits an existing repository on a feature branch
     that a human reviews as a pull request — not a workspace it fills
