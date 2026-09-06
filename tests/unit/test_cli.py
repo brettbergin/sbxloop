@@ -1190,14 +1190,17 @@ class TestDoctor:
         result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.output
         assert "workload profiles" in result.output
-        assert "research: hosts *.example.com, credentials -, sinks chat, repo no" in result.output
+        assert (
+            "research: egress 1 pattern, credentials 0, sinks 1 (chat), repo no, publish auto"
+            in result.output
+        )
         assert "no [workload] default" in result.output
         (workdir / "sbxloop.toml").write_text(
             '[[workloads]]\nname = "research"\n\n[workload]\ndefault = "research"\n'
         )
         result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.output
-        assert "research (default): hosts -" in result.output
+        assert "research (default): egress 0 patterns" in result.output
         assert "no [workload] default" not in result.output
         # nothing declared, no row
         (workdir / "sbxloop.toml").write_text("")

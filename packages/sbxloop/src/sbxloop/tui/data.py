@@ -8,6 +8,7 @@ screens only ever see the frozen snapshots built here.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import time
 from collections.abc import Callable, Iterator
@@ -165,6 +166,12 @@ class RunDetail:
     last_event_ts: float | None
     landing_events: tuple[Event, ...]
     usage: RunUsage | None = None
+    #: A workload's profile (#804): the one its run config pins, else the
+    #: one the grant named; None for a code run or a run with no profile.
+    profile: str | None = None
+    #: What the plan declared and the grant did (#804): names only.
+    needs_granted: Event | None = None
+    needs_refused: Event | None = None
 
 
 def build_run_detail(
@@ -196,6 +203,14 @@ def build_run_detail(
     else:
         with mailbox.read_engine() as engine:
             usage = usage_for_run(engine, run_id)
+    profile: str | None = None
+    granted = refused = None
+    if record.kind == "workload":
+        granted = mailbox.last_event(run_id, HostEventTypes.RUN_NEEDS_GRANTED)
+        refused = mailbox.last_event(run_id, HostEventTypes.RUN_NEEDS_REFUSED)
+        profile = workload_profile_of(mailbox, run_id)
+        if profile is None and granted is not None:
+            profile = str(granted.data.get("profile") or "") or None
     return RunDetail(
         record=record,
         tasks=tuple(mailbox.tasks(run_id)),
@@ -207,7 +222,24 @@ def build_run_detail(
         last_event_ts=last_event_ts,
         landing_events=tuple(landing),
         usage=usage,
+        profile=profile,
+        needs_granted=granted,
+        needs_refused=refused,
     )
+
+
+def workload_profile_of(mailbox: MailboxClient, run_id: str) -> str | None:
+    """The profile a workload run was pinned to (#804): `for_workload_profile`
+    writes it into the run's persisted config as `[workload] default`."""
+    try:
+        with mailbox.read_engine() as engine:
+            raw = engine.get_run_config(run_id)
+        data = json.loads(raw) if raw else {}
+    except Exception:  # a pre-config row, or a store on its way out
+        return None
+    workload = data.get("workload") if isinstance(data, dict) else None
+    default = workload.get("default") if isinstance(workload, dict) else None
+    return str(default) if default else None
 
 
 class EventTail:

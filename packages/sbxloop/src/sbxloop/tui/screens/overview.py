@@ -214,6 +214,10 @@ class OverviewScreen(ConsoleScreen):
         record = next((r for r in (runs.runs if runs else ()) if r.run_id == run_id), None)
         text.append("  running ", style="green")
         text.append(run_id, style="bold")
+        kind = current.get("kind") or (record.kind if record is not None else None)
+        if kind and kind != "code":
+            profile = current.get("profile")
+            text.append(f" · {kind}" + (f" ({profile})" if profile else ""), style="dim")
         if record is not None:
             if record.stage:
                 text.append(f" · {record.stage}", style="dim")
