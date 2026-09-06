@@ -80,6 +80,18 @@ class TestNeverRestartUnderARun:
         positions = [deploy.index(f"      - name: {name}\n") for name in order]
         assert positions == sorted(positions)
 
+    @pytest.mark.parametrize("fixture", ["deploy", "example"])
+    def test_the_backup_label_carries_no_dots(
+        self, fixture: str, request: pytest.FixtureRequest
+    ) -> None:
+        """The snapshot is taken by the sbxloop already installed, whose
+        label rules must hold on every release: dashes, never the dots of
+        the version."""
+        text = request.getfixturevalue(fixture)
+        upgrade = _step(text, "Upgrade")
+        assert 'backup --label "deploy-${VERSION//./-}"' in upgrade
+        assert 'backup --label "deploy-${VERSION}"' not in upgrade
+
     def test_rollback_only_after_the_upgrade_ran(self, deploy: str) -> None:
         rollback = _step(deploy, "Roll back")
         assert "steps.upgrade.outcome != 'skipped'" in rollback
