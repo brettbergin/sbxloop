@@ -6,6 +6,17 @@ All notable changes to sbxloop are documented here. The project adheres to
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.5.0] — 2026-09-06
+
+The 1.0 line, from the one-run redesign to the sbxloop home, cut as one
+minor release: every entry below shipped as a 1.0.x patch since 0.7.0 and
+is on the field host. The version jumps to 1.5 to mark the install and
+layout cutover (the home) as the boundary a host must cross with
+`sbxloop init --migrate`; see "The sbxloop home" under Changed and the
+"1.0 cutover" section for the two manual steps in this line.
+
 ### Added
 
 - **The console edits configuration one setting at a time.** The Config
