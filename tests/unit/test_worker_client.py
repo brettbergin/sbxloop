@@ -631,6 +631,29 @@ class TestInstallFallbacks:
         ]
         assert len(scripts) == 1 and "python3.13" in scripts[0], scripts
 
+    def test_ensure_dev_tools_with_no_languages_installs_the_baseline_only(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # #801: an empty language set is "none", not "the default" — a
+        # workload's box gets git and yq/jq and no language toolchain; only
+        # None means the default Python.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_git_probe(fake_sbx, returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=())
+        apt_cmds = [
+            " ".join(c) for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)
+        ]
+        assert apt_cmds == [
+            "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git yq jq"
+        ]
+        python_probe = toolchains.resolve(["python"])[0].probe
+        assert not [c for c in fake_sbx.invocations("exec") if python_probe in " ".join(c)]
+
     def test_ensure_dev_tools_installs_git_as_baseline(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:

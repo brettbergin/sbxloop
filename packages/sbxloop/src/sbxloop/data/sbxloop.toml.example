@@ -290,6 +290,11 @@ secret_strategy = "proxy"
 # repo = false
 # publish = "auto"
 # budgets = { max_tasks = 8, max_wall_clock_s = 3600.0 }
+# The language toolchains the workload's agent box is provisioned with:
+# none by default — a workload box gets git, yq/jq and the agent backend's
+# own runtime, not `[sandbox] languages` — so name some only when the asks
+# under this profile run code (the same names `[sandbox] languages` takes).
+# languages = []
 
 # [workload]
 # The profile a workload run gets when `sbxloop run --profile` names none.
