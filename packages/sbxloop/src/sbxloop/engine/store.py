@@ -612,6 +612,62 @@ class StateStore:
         rows = self._conn.execute("SELECT * FROM runs ORDER BY created_at DESC").fetchall()
         return [self._run_record(row) for row in rows]
 
+    # -- windows, for the console's analytics ------------------------------
+    #
+    # Both fold in SQL rather than in Python. The console recomputes these
+    # every few seconds against a store that only grows, and a query per
+    # run would be a scan per run.
+
+    def runs_between(self, since: float, until: float) -> list[sqlite3.Row]:
+        """Every run *created* in the window, with its phase totals folded
+        in: turns, tokens, cache reads and ``active`` (the time its phase
+        attempts were actually running, which is not the same as
+        ``updated_at - created_at`` — a run parked on a merge gate has
+        elapsed time it did not spend working).
+
+        A run is attributed whole to the window it started in, attempts
+        included, so a total here is "what the runs that began in this
+        window cost", not "work done during this window"."""
+        return list(
+            self._conn.execute(
+                """
+                SELECT r.run_id, r.kind, r.state, r.reason, r.created_at, r.updated_at,
+                       r.review_rounds, r.ci_rounds,
+                       COALESCE(SUM(p.turns), 0) AS turns,
+                       COALESCE(SUM(COALESCE(p.input_tokens, 0)
+                                    + COALESCE(p.output_tokens, 0)), 0) AS tokens,
+                       COALESCE(SUM(p.cache_read_tokens), 0) AS cache,
+                       COALESCE(SUM(p.ended_at - p.started_at), 0.0) AS active
+                  FROM runs r
+                  LEFT JOIN phase_attempts p ON p.run_id = r.run_id
+                 WHERE r.created_at >= ? AND r.created_at < ?
+                 GROUP BY r.run_id
+                 ORDER BY r.created_at
+                """,
+                (since, until),
+            )
+        )
+
+    def phases_between(self, since: float, until: float) -> list[sqlite3.Row]:
+        """How long each phase ran in the window, by the attempts that
+        *started* in it — the breakdown behind "where the time went".
+        Longest first."""
+        return list(
+            self._conn.execute(
+                """
+                SELECT p.phase,
+                       COUNT(*) AS attempts,
+                       COALESCE(SUM(p.ended_at - p.started_at), 0.0) AS seconds,
+                       COALESCE(SUM(p.turns), 0) AS turns
+                  FROM phase_attempts p
+                 WHERE p.started_at >= ? AND p.started_at < ?
+                 GROUP BY p.phase
+                 ORDER BY seconds DESC
+                """,
+                (since, until),
+            )
+        )
+
     # -- tasks -------------------------------------------------------------
 
     def save_tasks(self, run_id: str, specs: list[TaskSpec]) -> None:
