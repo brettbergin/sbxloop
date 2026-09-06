@@ -824,6 +824,59 @@ def credentials_checks(config: Config, env: dict[str, str]) -> list[Check]:
     ]
 
 
+def mcp_checks(config: Config, env: dict[str, str]) -> list[Check]:
+    """Rows when `[[mcp]]` declares anything: what each server is, and
+    whether the two things that make it work are actually in place.
+
+    A missing credential fails provisioning by name, so it is a hard row.
+    A server whose hosts are not on the agent sandbox's allowlist would
+    instead fail at its first request, inside the sandbox, looking like a
+    hang — the config loader cannot catch that because the allowlist is
+    assembled at provisioning, so it is checked here.
+    """
+    if not config.mcp:
+        return []
+    rows: list[Check] = []
+    listed = "; ".join(
+        f"{s.name} ({s.transport} → {', '.join(s.hosts) or 'no hosts declared'}; "
+        f"roles {', '.join(s.roles)})"
+        for s in config.mcp
+    )
+    rows.append(Check("mcp servers", True, listed, hard=False))
+
+    unset = [
+        (server.name, entry.env)
+        for server in config.mcp
+        if server.credential is not None
+        for entry in [config.credential(server.credential)]
+        if entry is not None and not env.get(entry.env)
+    ]
+    if unset:
+        missing = ", ".join(f"{name} ({var})" for name, var in unset)
+        rows.append(
+            Check(
+                "mcp credentials",
+                False,
+                f"not set in the daemon's environment — {missing}; export them where the "
+                "daemon reads its secrets, or drop `credential` from those entries "
+                "(provisioning fails by name otherwise)",
+            )
+        )
+
+    hostless = [server.name for server in config.mcp if not server.hosts]
+    if hostless:
+        rows.append(
+            Check(
+                "mcp egress",
+                False,
+                f"{', '.join(hostless)} declare no `hosts`, so the agent sandbox's "
+                "allowlist will refuse whatever they contact — the server fails at its "
+                "first request rather than at startup; list the domains each one needs",
+            )
+        )
+    return rows
+
+
 def workload_profile_checks(config: Config) -> list[Check]:
     """One row when `[[workloads]]` declares anything (#758): the profiles
     by name with what each bounds, and which one runs by default. The
@@ -1109,6 +1162,7 @@ def collect_checks(
     )
     checks.extend(registry_credential_checks(config, env))
     checks.extend(credentials_checks(config, env))
+    checks.extend(mcp_checks(config, env))
     checks.extend(workload_profile_checks(config))
     checks.extend(schedule_checks(config))
     # A github credential matters only when the GitHub integration is

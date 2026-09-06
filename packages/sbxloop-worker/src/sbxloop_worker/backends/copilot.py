@@ -28,6 +28,7 @@ from typing import Any, get_args
 from sbxloop_worker._json import extract_json
 from sbxloop_worker.backends import BackendResult, BackendUnavailableError, EmitFn
 from sbxloop_worker.hosttools import HostToolTimeout, request_tool, safe_call_id
+from sbxloop_worker.mcp import server_configs
 from sbxloop_worker.protocol import (
     EventTypes,
     HostToolCall,
@@ -482,6 +483,12 @@ def _tool_error(data: Any) -> str | None:
     return excerpt_output(message)
 
 
+#: This SDK's spelling of the stdio transport — ``local``, where the Claude
+#: Agent SDK says ``stdio``; field-verified against github-copilot-sdk 1.0.8
+#: (``MCPStdioServerConfig.type: Literal["local", "stdio"]``).
+MCP_STDIO_TYPE = "local"
+
+
 def system_message_config(content: str | None) -> dict[str, Any] | None:
     """The SDK ``system_message`` kwarg for one job, or None to leave the
     SDK's default prompt untouched.
@@ -731,6 +738,8 @@ class CopilotBackend:
             # unsupported signature must not fail the session.
             kwargs["working_directory"] = job.cwd
         kwargs.update(self._tool_kwargs(job, emit))
+        if job.mcp_servers:
+            kwargs["mcp_servers"] = server_configs(job.mcp_servers, stdio_type=MCP_STDIO_TYPE)
         try:
             return await self._open(client, job, kwargs)
         except TypeError:

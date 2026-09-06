@@ -38,11 +38,13 @@ from pydantic import BaseModel
 from sbxloop import toolchains
 from sbxloop.config import Config
 from sbxloop.deliver import pr_conventions
+from sbxloop.engine.harness import ROLE_BY_PHASE, brief_for_phase
 from sbxloop.engine.model import JudgeVerdict, SteerVerdict, TaskGraph, TaskRecord, WorkloadPlan
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.repocontext import repo_conventions
 from sbxloop.engine.review import ReviewGuard, ReviewVerdict
 from sbxloop.engine.service import FETCH_TOOL_NAME
+from sbxloop.engine.skilltools import SKILL_TOOL_NAME, answer_skill_call, skill_tool_spec
 from sbxloop.errors import InvalidOutputTwice, WorkerError
 from sbxloop.events import EventBus
 from sbxloop.ids import new_job_id
@@ -62,6 +64,8 @@ from sbxloop_worker.protocol import (
     BatchCommandResult,
     Event,
     EventTypes,
+    HostToolCall,
+    HostToolResponse,
     HostToolSpec,
     JobRequest,
     JobResult,
@@ -482,13 +486,17 @@ class PhaseRunner:
         # Only the working phases get the host tools: the planners and the
         # critics read and judge; the builder and the operator's executor
         # are the ones whose work may need a service.
-        host_tools = self.host_tools if phase in TOOLED_PHASES else ()
+        service_tools = self.host_tools if phase in TOOLED_PHASES else ()
+        # The skill tool is NOT narrowed to the tooled phases: a critic needs
+        # the verification procedure exactly as much as the builder does, and
+        # unlike a service call it reaches nothing outside the host.
+        host_tools, tool_handler = self._tools_for(phase, service_tools)
         job = JobRequest(
             job_id=new_job_id(),
             run_id=self.run_id,
             kind="agent.session",
             prompt=prompt,
-            system_message=system_message,
+            system_message=brief_for_phase(self.config, phase, system_message),
             system_preset=system_preset,
             model=self.config.model,
             permission_mode=permission_mode,
@@ -500,6 +508,12 @@ class PhaseRunner:
             # attempt's session so the work already done is not re-derived.
             resume_session_id=resume_session_id,
             host_tools=list(host_tools),
+            # Role-filtered: `[[mcp]] roles` decides which sessions get a
+            # server, and the default excludes critics — a read-only review
+            # reaching a third-party service is a capability nobody asked
+            # for, and both backends already fail closed on an unknown MCP
+            # tool in read-only mode.
+            mcp_servers=self.config.mcp_specs_for(ROLE_BY_PHASE[phase]),
         )
         started = time.monotonic()
         log.info(
@@ -518,7 +532,7 @@ class PhaseRunner:
             # The handler rides along only when the job carries tools: a run
             # without them submits exactly the call it always did.
             result = (
-                self.agent.submit(job, agent=agent_name, tool_handler=self.tool_handler)
+                self.agent.submit(job, agent=agent_name, tool_handler=tool_handler)
                 if host_tools
                 else self.agent.submit(job, agent=agent_name)
             )
@@ -544,6 +558,36 @@ class PhaseRunner:
             assert result.error is not None
             raise WorkerError(f"agent job failed ({result.error.type}): {result.error.message}")
         return result
+
+    def _tools_for(
+        self, phase: str, service_tools: Sequence[HostToolSpec]
+    ) -> tuple[tuple[HostToolSpec, ...], HostToolHandler | None]:
+        """The host tools one phase's session gets, and the handler that
+        answers them.
+
+        Two sources meet here. The run's own tools (a service call, a
+        dependency fetch) are the caller's and only the working phases get
+        them. The skill tool is the loop's, every phase gets it, and it is
+        answered from package data without leaving the host — so a run with
+        no service tools still gets one, which is why the handler cannot
+        simply be ``self.tool_handler``.
+        """
+        role = ROLE_BY_PHASE[phase]
+        skill_spec = skill_tool_spec(role)
+        if skill_spec is None:
+            return tuple(service_tools), self.tool_handler if service_tools else None
+        delegate = self.tool_handler
+
+        def handler(call: HostToolCall) -> HostToolResponse:
+            if call.name == SKILL_TOOL_NAME:
+                return answer_skill_call(call, role)
+            if delegate is None:  # pragma: no cover - no tool but the skill one exists
+                return HostToolResponse(
+                    call_id=call.call_id, ok=False, error=f"unknown tool {call.name!r}"
+                )
+            return delegate(call)
+
+        return (*service_tools, skill_spec), handler
 
     def _watch_tools(self, job_id: str, digest: ToolDigest | None) -> Callable[[], None]:
         """Feed one job's tool events to ``digest`` while it runs; a no-op

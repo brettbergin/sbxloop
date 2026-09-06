@@ -48,6 +48,7 @@ from sbxloop_worker.backends.copilot import (
     excerpt_output,
 )
 from sbxloop_worker.hosttools import HostToolTimeout, request_tool, safe_call_id
+from sbxloop_worker.mcp import server_configs
 from sbxloop_worker.protocol import (
     EventTypes,
     HostToolCall,
@@ -81,6 +82,11 @@ ANTHROPIC_TOKEN_ENV = "ANTHROPIC_API_KEY"  # nosec B105 - env var name
 ANTHROPIC_TOKEN_PREFIX = "sk-ant-"  # nosec B105 - shape marker, not a credential
 
 TOOL_ARGS_CLIP = 400
+
+
+#: This SDK's spelling of the stdio transport (the Copilot SDK says
+#: ``local``); field-verified against claude-agent-sdk 0.2.149.
+MCP_STDIO_TYPE = "stdio"
 
 
 def read_only_denial(tool_name: str) -> str | None:
@@ -310,10 +316,17 @@ class ClaudeBackend:
             kwargs["cwd"] = job.cwd
         if resume:
             kwargs["resume"] = resume
+        servers: dict[str, Any] = {}
         if job.host_tools:
             if not job.host_tools_dir:
                 raise RuntimeError("host_tools need host_tools_dir")
-            kwargs["mcp_servers"] = {HOST_TOOL_SERVER: self._host_tool_server(job, emit)}
+            servers[HOST_TOOL_SERVER] = self._host_tool_server(job, emit)
+        # The operator's servers alongside the in-process one, never
+        # instead of it: the host tools ARE an MCP server here, and
+        # replacing the dict would silently take the run's own tools away.
+        servers.update(server_configs(job.mcp_servers, stdio_type=MCP_STDIO_TYPE))
+        if servers:
+            kwargs["mcp_servers"] = servers
         if job.permission_mode == "auto" and governor.cap is None and job.available_tools is None:
             # The microVM (network policy + secret proxy) is the security
             # boundary; inside it the agent runs unattended. Any of a

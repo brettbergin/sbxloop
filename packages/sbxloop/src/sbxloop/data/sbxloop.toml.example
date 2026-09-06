@@ -235,6 +235,30 @@ secret_strategy = "proxy"
 # scheme = ""
 # description = "read-only weather forecasts"
 
+# External MCP servers the agent sessions may use — the extensibility
+# point. Each entry is given to every session whose role is listed, on
+# whichever `[agent] backend` runs (the two SDKs spell the transports
+# slightly differently; the loop translates). `transport`: "stdio" (the
+# default; `command` is the argv) or "http"/"sse" (`url`). `hosts`: the
+# domains the server contacts — the agent sandbox's allowlist is
+# least-privilege and refuses anything not listed here, and an undeclared
+# host fails at the server's first request rather than at startup.
+# `credential`: a `[[credentials]]` name whose value is bound into the
+# agent sandbox for this server alone — proxy-substituted in flight to that
+# credential's host, so nothing secret is ever in the config, a job, an
+# event or an `sbx` argument. Never put a token in `command`. `roles`:
+# which sessions get it — "planner", "builder", "critic", "operator",
+# "concierge"; the default is builder + operator, and adding "critic" hands
+# a third-party service to a read-only review session.
+# [[mcp]]
+# name = "weather"
+# transport = "stdio"
+# command = ["npx", "-y", "weather-mcp-server"]
+# hosts = ["api.weather.example.com"]
+# credential = "weather"
+# roles = ["builder"]
+# description = "forecast lookups for the builder"
+
 # Named bounds for `--kind workload` runs. The operator's plan
 # declares what each task needs — hosts, credentials by name, a sink, a
 # repository — and the run's profile decides what is granted; a need
