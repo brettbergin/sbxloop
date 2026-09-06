@@ -268,10 +268,8 @@ class JobRequest(ProtocolModel):
     # configures none, which is the default.
     mcp_servers: list[McpServerSpec] = Field(default_factory=list)
 
-    # kind == "shell.check"; kind == "service.fetch": the package manager's
-    # argv as the host composed it from the ecosystem's fixed recipe (#766),
-    # run in the service sandbox with ``params`` naming the ecosystem and
-    # verb for the events — never a shell, never an argv the model wrote.
+    # kind == "shell.check": commands execute only in the agent sandbox.
+    # A service.fetch request cannot carry executable arguments.
     argv: list[str] | None = None
 
     # kind == "shell.batch": shell command strings, each run via ``sh -c``
@@ -284,7 +282,7 @@ class JobRequest(ProtocolModel):
     # always bounds the job as a whole).
     command_timeout_s: float | None = None
 
-    # agent.session + shell.check + service.fetch: in-sandbox working
+    # agent.session + shell.check: in-sandbox working
     # directory. The worker process chdirs here (via --cwd) so agent
     # sessions and shell commands run in the run's canonical workspace.
     cwd: str | None = None
@@ -372,13 +370,12 @@ class JobRequest(ProtocolModel):
             ):
                 raise ValueError("git.merge must not set prompt, argv, commands, or op")
         elif self.kind == "service.fetch":
-            if not self.argv:
-                raise ValueError("service.fetch requires a non-empty argv")
-            missing = [k for k in ("ecosystem", "verb") if not self.params.get(k)]
-            if missing:
-                raise ValueError(f"service.fetch requires params {missing}")
-            if self.prompt is not None or self.commands is not None or self.op is not None:
-                raise ValueError("service.fetch must not set prompt, commands, or op")
+            if any(
+                value is not None
+                for value in (self.argv, self.prompt, self.commands, self.op, self.cwd)
+            ):
+                raise ValueError("service.fetch must not set argv, prompt, commands, op, or cwd")
+            RegistryFetchParams.model_validate(self.params)
         return self
 
 
@@ -392,6 +389,19 @@ class BatchCommandResult(ProtocolModel):
     command: str
     exit_code: int
     output: str = ""
+
+
+class RegistryFetchParams(ProtocolModel):
+    """Read-only artifact request; every authority and credential comes from the host."""
+
+    registry: str = Field(min_length=1, max_length=256)
+    path: str = Field(min_length=1, max_length=8192)
+    operation: Literal["download", "git"] = "download"
+    ref: str = Field(
+        default="HEAD",
+        pattern=r"^(HEAD|[0-9a-f]{40}|[0-9a-f]{64}|refs/(heads|tags)/[A-Za-z0-9][A-Za-z0-9._/-]*)$",
+    )
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class JobResult(ProtocolModel):
@@ -486,9 +496,8 @@ class EventTypes:
     # and where it went (method, path, status) — never the header it sent.
     SERVICE_HTTP_START = "service.http_start"
     SERVICE_HTTP_END = "service.http_end"
-    # A service.fetch job in the service sandbox (#766): which ecosystem
-    # and verb, the argv, and how it ended — never the environment it ran
-    # with (the credential is in it).
+    # A service.fetch job: registry, operation, path and artifact metadata;
+    # no executable argv, artifact contents or authentication headers.
     SERVICE_FETCH_START = "service.fetch_start"
     SERVICE_FETCH_END = "service.fetch_end"
 

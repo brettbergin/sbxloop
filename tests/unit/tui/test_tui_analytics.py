@@ -170,3 +170,112 @@ def test_the_cache_serves_one_window_per_ttl() -> None:
     assert cache.stale(110.0), "past the ttl it is recomputed"
     cache.clear()
     assert cache.stale(105.0)
+
+
+def test_phases_carry_cost_and_rework(tmp_path: Path) -> None:
+    """A phase's cache-to-fresh ratio is a per-phase fact, not a global
+    one, and retries are where the loop went round again."""
+    store = seed(tmp_path / "s.db")
+    try:
+        # A second attempt at one phase, and a phase that re-sends far more
+        # than it writes.
+        store.record_phase(
+            "r_ok",
+            "review",
+            task_id="t1",
+            attempt=2,
+            status="ok",
+            output_json="{}",
+            started_at=NOW - 5 * DAY,
+            turns=10,
+            usage=Usage(input_tokens=100, output_tokens=0, cache_read_tokens=4000),
+        )
+        store._conn.commit()
+        a = compute(store, now=NOW, window_s=7 * DAY)
+    finally:
+        store.close()
+    by_name = {p.phase: p for p in a.phases}
+    review = by_name["review"]
+    assert review.retries == 1, "an attempt past the first is a retry"
+    assert review.cache_ratio == 40.0, "4000 cache reads against 100 fresh"
+    assert by_name["build"].retries == 0
+    assert a.retried_phases[0].phase == "review"
+    # Phases rank differently by time and by cost, and cost is actionable.
+    assert a.phase_turns[0].turns >= a.phase_turns[-1].turns
+
+
+def test_the_previous_window_is_what_better_or_worse_means(tmp_path: Path) -> None:
+    store = seed(tmp_path / "s.db")
+    try:
+        # A run a fortnight back: outside this window, inside the one before.
+        created = NOW - 9 * DAY
+        store.create_run("r_old", "older", kind="code")
+        store._conn.execute(
+            "UPDATE runs SET state='merged', created_at=?, updated_at=? WHERE run_id=?",
+            (created, created + 100.0, "r_old"),
+        )
+        store.record_phase(
+            "r_old",
+            "build",
+            task_id="t1",
+            attempt=1,
+            status="ok",
+            output_json="{}",
+            started_at=created,
+            turns=334,
+        )
+        store._conn.execute(
+            "UPDATE phase_attempts SET ended_at=? WHERE run_id='r_old'", (created + 100.0,)
+        )
+        store._conn.commit()
+        a = compute(store, now=NOW, window_s=7 * DAY)
+    finally:
+        store.close()
+    assert a.previous is not None and a.previous.runs == 1
+    assert a.delta("runs") == 6.0, "seven runs this window against one before it"
+    # 699 turns now against 334 before: a shade over double.
+    assert a.delta("turns") is not None and round(a.delta("turns"), 2) == 1.09
+    assert fold([], [], since=0.0, until=1.0).delta("turns") is None, "nothing to compare with"
+
+
+def test_days_split_the_trend_by_outcome(tmp_path: Path) -> None:
+    store = seed(tmp_path / "s.db")
+    try:
+        a = compute(store, now=NOW, window_s=7 * DAY, buckets=7)
+    finally:
+        store.close()
+    assert len(a.days) == 7
+    assert sum(d.runs for d in a.days) == 7
+    assert sum(d.landed for d in a.days) == a.total.landed
+    assert sum(d.failed for d in a.days) == a.total.failed
+    assert sum(d.cancelled for d in a.days) == a.total.cancelled
+
+
+def test_spreads_show_what_a_mean_hides(tmp_path: Path) -> None:
+    """One run at 478 turns against a handful in the tens: the median and
+    p90 say that, the average does not."""
+    store = seed(tmp_path / "s.db")
+    try:
+        a = compute(store, now=NOW, window_s=7 * DAY)
+    finally:
+        store.close()
+    median, p90 = a.turns_spread
+    assert median < p90, "the spread is real"
+    assert p90 >= 400, "the outlier survives into p90"
+    assert median <= a.total.turns_per_run, "the mean is dragged up by it"
+    cycle_median, cycle_p90 = a.cycle_spread
+    assert cycle_p90 >= cycle_median
+    assert a.slowest_to_land[0].run_id == "r_park", "elapsed, so the parked run is slowest"
+    assert all(r.state in ("merged", "completed") for r in a.landed_runs)
+
+
+def test_rework_and_rounds_are_counted(tmp_path: Path) -> None:
+    store = seed(tmp_path / "s.db")
+    try:
+        store._conn.execute("UPDATE runs SET review_rounds=2, ci_rounds=1 WHERE run_id='r_ok'")
+        store._conn.commit()
+        a = compute(store, now=NOW, window_s=7 * DAY)
+    finally:
+        store.close()
+    assert a.review_rounds == 2 and a.ci_rounds == 1
+    assert a.rework.tasks == 0, "the seeded runs carry no task rows"

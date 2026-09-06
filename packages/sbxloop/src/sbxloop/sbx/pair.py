@@ -64,8 +64,8 @@ class SandboxPair:
         # the agent sandbox exists — and carried here so the worker install
         # and the verify-command lint read the same answer.
         self.languages = languages or LanguageResolution(DEFAULT_LANGUAGES, "default", {})
-        # The service sandbox's own view of the same workspace (#766) —
-        # where its dependency fetches run; None when it fetches nothing.
+        # Retained for callers of the pair API. Fixed service operations
+        # have no project cwd; provisioning leaves this unset.
         self.service_workdir = service_workdir
         self._cleaned = False
 

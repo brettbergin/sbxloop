@@ -649,8 +649,14 @@ class StateStore:
         )
 
     def phases_between(self, since: float, until: float) -> list[sqlite3.Row]:
-        """How long each phase ran in the window, by the attempts that
-        *started* in it — the breakdown behind "where the time went".
+        """Each phase in the window, by the attempts that *started* in it:
+        how long it ran, what it cost, and how often it had to go round
+        again.
+
+        ``retries`` counts attempts past the first — where the loop fights
+        itself. ``cache`` is separate from ``tokens`` because the ratio
+        between them is a per-phase fact, not a global one: a phase that
+        re-sends a large fixed context reads far more than it writes.
         Longest first."""
         return list(
             self._conn.execute(
@@ -658,7 +664,11 @@ class StateStore:
                 SELECT p.phase,
                        COUNT(*) AS attempts,
                        COALESCE(SUM(p.ended_at - p.started_at), 0.0) AS seconds,
-                       COALESCE(SUM(p.turns), 0) AS turns
+                       COALESCE(SUM(p.turns), 0) AS turns,
+                       COALESCE(SUM(COALESCE(p.input_tokens, 0)
+                                    + COALESCE(p.output_tokens, 0)), 0) AS tokens,
+                       COALESCE(SUM(p.cache_read_tokens), 0) AS cache,
+                       COALESCE(SUM(CASE WHEN p.attempt > 1 THEN 1 ELSE 0 END), 0) AS retries
                   FROM phase_attempts p
                  WHERE p.started_at >= ? AND p.started_at < ?
                  GROUP BY p.phase
@@ -667,6 +677,23 @@ class StateStore:
                 (since, until),
             )
         )
+
+    def task_totals_between(self, since: float, until: float) -> sqlite3.Row:
+        """What the tasks of the window's runs cost in rework: revisions a
+        task needed, replans it forced, and how many were flagged as having
+        a suspect verify."""
+        return self._conn.execute(  # type: ignore[no-any-return]
+            """
+            SELECT COUNT(*) AS tasks,
+                   COALESCE(SUM(t.revisions), 0) AS revisions,
+                   COALESCE(SUM(t.replans), 0) AS replans,
+                   COALESCE(SUM(t.verify_suspect), 0) AS suspect
+              FROM tasks t
+              JOIN runs r ON r.run_id = t.run_id
+             WHERE r.created_at >= ? AND r.created_at < ?
+            """,
+            (since, until),
+        ).fetchone()
 
     # -- tasks -------------------------------------------------------------
 

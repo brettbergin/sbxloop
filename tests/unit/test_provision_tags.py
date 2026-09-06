@@ -137,7 +137,10 @@ def test_a_remote_clone_fetches_from_origin_under_the_runs_token(
 
     seen: list[tuple[Path | None, str | None]] = []
 
-    def spy(clone: Path, *, source: Path | None, token: str | None) -> hostgit.TagFetch:
+    def spy(
+        clone: Path, *, source: Path | None, token: str | None, credential_url: str
+    ) -> hostgit.TagFetch:
+        assert credential_url == "https://github.com"
         seen.append((source, token))
         return hostgit.TagFetch(1, "remote")
 
@@ -160,7 +163,10 @@ def test_a_host_checkout_without_tags_sends_the_token_to_origin(
     provisioner = _provisioner(fake_sbx, config)
     seen: list[tuple[Path | None, str | None]] = []
 
-    def spy(clone: Path, *, source: Path | None, token: str | None) -> hostgit.TagFetch:
+    def spy(
+        clone: Path, *, source: Path | None, token: str | None, credential_url: str
+    ) -> hostgit.TagFetch:
+        assert credential_url == "https://github.com"
         seen.append((source, token))
         return hostgit.TagFetch(0, "remote")
 

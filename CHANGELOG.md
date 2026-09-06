@@ -1,5 +1,34 @@
 ## [Unreleased]
 
+### Added
+
+- **The Overview pages carry real analysis now.** They shipped filling
+  15–22% of the screen: five pages behind a rail, for content that would
+  have fitted on one. Each page gained the analysis the store could already
+  answer but nothing asked it, and fill is now 49–68% against a real week.
+
+  **Cost** says *which phase* burns the turns rather than only how many —
+  on the field host `build` is 64% of every turn — and how much context
+  each phase re-sends: `build` reads 1.2x what it writes, `execute` 37x.
+  It also carries the median and p90 turns per run, because one run being
+  22% of a week is invisible in a mean.
+
+  **Flow** gained how long work took to land, end to end: a median of 17
+  minutes against a p90 of 11 hours on the same week, which is the parked
+  time showing up where a person actually feels it.
+
+  **Health** gained where the loop went round again — `followup` retried 14
+  of 23 attempts, `review` 6 of 21 — plus the phase table, task revisions
+  and replans, and review/CI rounds.
+
+  **Summary** and every other page gained a week-over-week delta, a
+  day-by-day strip split by outcome, and one "biggest lever" line naming
+  whichever cost is furthest out of proportion.
+
+  `phases_between` now returns tokens, cache reads and retries per phase,
+  and `task_totals_between` is new; the fold reads the window before this
+  one so every headline can say whether it is better or worse.
+
 ### Fixed
 
 - **Overview's page rail drew on top of the console's rail.** Both were

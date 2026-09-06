@@ -695,51 +695,59 @@ for a plan that names it) and the ecosystem's client configuration is
 written into the agent sandbox before the worker installs, so the tooling
 actually uses it.
 
-An entry with `auth_env` is a **credentialed** registry, and the agent
-sandbox never reaches it: the credential and the client file go to the run's
-**service sandbox** (the same one `[[credentials]]` provisions), which fetches
-the project's dependencies into a cache both sandboxes see — the workspace's
-`.sbxloop/deps/` (kept out of git, reached as `~/.sbxloop/deps` in either
-VM) — and the agent sandbox is configured **offline** for that ecosystem
-(`npm_config_offline`, `PIP_NO_INDEX` + `PIP_FIND_LINKS` and the `UV_*`
-pair, `GOPROXY=off`, `CARGO_NET_OFFLINE`, `MAVEN_ARGS=-o`, `NUGET_PACKAGES`,
-`BUNDLE_LOCAL`) and installs, builds and tests from that cache. Provisioning runs
-one fetch per ecosystem whose manifest the workspace carries (`package.json`,
-`requirements.txt` / `pyproject.toml`, `go.mod`, `Cargo.toml`, `pom.xml`, a
-`*.csproj`, `Gemfile`); a non-zero exit fails the run at provisioning with
-the package manager's last lines. During the build the agent holds a
-`fetch_dependencies(ecosystem, packages?)` tool: called after it edits the
-manifest it re-fetches from it; called with package specs it adds them (npm,
-pypi and go — the other ecosystems take the manifest only). The host authors
-the fetch command from a fixed per-ecosystem recipe (`npm ci --ignore-scripts`, `pip download`, `go mod download`, `cargo fetch`, `mvn dependency:go-offline`, `dotnet restore`, `bundle cache`), so nothing the
-model writes runs where the credential is readable; a package spec that is
-not one, or an ecosystem the run has no credentialed registry for, is
-refused before a job exists. Every fetch is a `sandbox.fetch` event with the
-command and exit code, its output scrubbed of the credential. The service
-sandbox needs the workspace mount the agent's has, and fails provisioning
-naming it otherwise. The recipes are field-unverified past npm and pip as of
-#766; Gradle, pnpm/yarn Berry and Poetry have no recipe yet and stay open
-registries.
+An entry with `auth_env` is a **credentialed** registry. Its credential
+stays in the run's **service sandbox**, which performs authenticated data
+downloads from the configured HTTPS authority. Package managers and build
+hooks run in the **agent sandbox**, which holds no registry credentials.
+The host copies downloaded metadata, package archives or Git bundles into
+the agent and verifies the transferred bytes. The service does not evaluate
+manifests, extract packages or install dependencies.
 
-| kind      | writes                                                                                                                                                      |
-| --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `npm`     | `~/.npmrc`: `@scope:registry=` (or `registry=`) and `//host/path/:_authToken=${AUTH_ENV}`; read by npm, pnpm and yarn classic                               |
-| `pypi`    | `PIP_INDEX_URL` and `UV_DEFAULT_INDEX` — the registry *is* the index, so point it at a virtual/group repository that proxies PyPI; credential in `~/.netrc` |
-| `go`      | `GOPRIVATE` naming the host (every `go` entry joins it); credential in `~/.netrc` for the git fetch                                                         |
-| `cargo`   | `~/.cargo/config.toml` `[registries.NAME]` with a sparse index; token in `CARGO_REGISTRIES_<NAME>_TOKEN`                                                    |
-| `maven`   | `~/.m2/settings.xml`: a `<mirror>` of `*` and a `<server>` whose password is `${env.AUTH_ENV}`; Gradle does not read it                                     |
-| `nuget`   | `~/.nuget/NuGet/NuGet.Config`: a package source plus credentials referencing `%AUTH_ENV%`; nuget.org stays unless the repository clears it                  |
-| `gem`     | `BUNDLE_<HOST>=user:token` for bundler; with `url`, `~/.gemrc` lists it as the gem source                                                                   |
-| `generic` | nothing but the allowlist entry, plus `~/.netrc` when `auth_env` is set                                                                                     |
+Before your setup commands, one agent session resolves private dependencies
+through `fetch_dependencies`, populates the ecosystem's offline cache, and
+preserves dependency declarations and lockfile versions. The host then
+verifies the ordinary dependency preparation command in the agent's offline
+environment. Incomplete resolution or verification fails provisioning with
+a resumable error. This preparation session uses the configured model and
+per-job/tool-call budgets; its usage appears in the `dependencies` phase.
+
+During a build or workload, the same tool can fetch dependencies after
+manifest edits. Call it with `ecosystem` to discover registry names, URLs
+and the cache location. Add `registry` and an absolute `path` to download a
+file; optional `filename` and `sha256` name and verify it. `operation=git`
+returns a Git bundle, with optional `ref` selecting a branch, tag or commit.
+The response contains a local path in the agent, byte count and SHA-256.
+The agent reads the files and uses its native tools to resolve transitive
+dependencies and populate caches. A discovery query does not install anything.
+
+The cache is `.sbxloop/deps/` in the workspace, excluded from Git and linked
+at `~/.sbxloop/deps` in the agent only. Credentialed ecosystems use the
+existing offline environment (`npm_config_offline`, `PIP_NO_INDEX` and
+`PIP_FIND_LINKS`, `GOPROXY=off`, `CARGO_NET_OFFLINE`, `MAVEN_ARGS=-o`,
+`NUGET_PACKAGES`, `BUNDLE_LOCAL`). Downloads are bounded to 1 GiB. Redirects
+must stay on the configured HTTPS authority; credentials are never forwarded
+to another host. Full resolution against private registries across all
+ecosystems is **field-unverified**. No proxy or listener runs in either VM.
+
+Open registries keep their existing agent-side configuration:
+
+| kind      | agent configuration without `auth_env`                   |
+| --------- | -------------------------------------------------------- |
+| `npm`     | `~/.npmrc` with scoped or default registry URL           |
+| `pypi`    | `PIP_INDEX_URL` and `UV_DEFAULT_INDEX`                   |
+| `go`      | `GOPRIVATE`                                              |
+| `cargo`   | `~/.cargo/config.toml` with the named sparse index       |
+| `maven`   | `~/.m2/settings.xml` with the configured mirror          |
+| `nuget`   | `~/.nuget/NuGet/NuGet.Config` with the configured source |
+| `gem`     | `~/.gemrc` with the source URL, when set                 |
+| `generic` | network allowlist only                                   |
 
 `auth_env` is read from the daemon's environment at provision time; unset
 names fail provisioning before a sandbox boots (the `registry credentials`
 row of `sbxloop doctor` lists them), and the value never rides an `sbx`
-argument, an event, or a log line. Wherever the ecosystem expands environment
-variables in its own config the client file names the variable and holds no
-secret; the netrc kinds (`pypi`, `go`, `generic`) have no such form, so
-`~/.netrc` holds the value at rest, 0600, in the service VM — those kinds
-pair it with `auth_user`, the login the registry expects beside the token. A
+argument, an event, or a log line. The service uses Bearer authentication
+for npm, the registry token for Cargo, and HTTP Basic with `auth_user` for
+the other kinds. No credential-bearing registry client file is written. A
 derived variable a repository sets in `[sandbox] env` (its own `GOPRIVATE`)
 wins over the registry's. A `[[github.repos]]` entry may carry its own
 `registries` list, which replaces the top-level one.
@@ -2089,7 +2097,7 @@ The notable knobs:
 | `[sandbox] env`                                                                | `{}`                                            | Environment for the agent sandbox's worker and everything it runs: plain values only — the agent sandbox holds no operator secret (a registry token goes on `[[registries]] auth_env`, a service key on `[[credentials]]`; `secret_env` is refused by name, #766). Per-repo overridable; see "Environment for the agent sandbox".                                                                                                                                                                                                                                                                                                                                                               |
 | `[sandbox] apt_packages` / `setup_commands`                                    | `[]` / `[]`                                     | OS packages ensured beside the toolchains (fail closed), and commands run in the workspace before the first phase, each a `sandbox.setup` event. Per-repo overridable; see "OS packages and setup commands".                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `[sandbox] verify_mode`                                                        | `full`                                          | What the verify phase and the gate decide: `full` gates, `advisory` runs and reports without blocking, `ci-only` skips them and relies on the PR's checks. Per-repo overridable; see "Suites that need services".                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `[[registries]]`                                                               | none                                            | Private package registries: an open entry opens `host` for the agent sandbox and writes the ecosystem's client config there (`~/.npmrc`, `PIP_INDEX_URL`, `GOPRIVATE`, `~/.cargo/config.toml`, `settings.xml`, `NuGet.Config`, `BUNDLE_*`); an entry with `auth_env` is reached only from the service sandbox, which fetches into the shared `.sbxloop/deps` cache while the agent sandbox works offline with a `fetch_dependencies` tool (#766). Per-repo overridable; see "Private package registries".                                                                                                                                                                                       |
+| `[[registries]]`                                                               | none                                            | Private package registries: an open entry opens `host` for the agent sandbox and writes the ecosystem's client config there (`~/.npmrc`, `PIP_INDEX_URL`, `GOPRIVATE`, `~/.cargo/config.toml`, `settings.xml`, `NuGet.Config`, `BUNDLE_*`); an entry with `auth_env` is reached only from the service sandbox, which downloads data through fixed operations; the host transfers artifacts to the agent, where dependency resolution and offline cache preparation run through `fetch_dependencies`. Per-repo overridable; see "Private package registries".                                                                                                                                    |
 | `[[credentials]]`                                                              | none                                            | The catalogue of credentials a run may be granted by name (#765): `name`, `env` (the daemon-environment variable holding the value), `host` (the one host it is good for), `header` / `scheme` (how it is attached; `Authorization: Bearer` by default). A granted run gets a third, service sandbox holding exactly those values and a `call_service` build tool; the agent sandbox never holds them. `sbxloop doctor` checks every `env` is set.                                                                                                                                                                                                                                              |
 | `[[mcp]]`                                                                      | none                                            | External MCP servers the agent sessions may use. `name`, `transport` (`stdio` with a `command` argv, or `http`/`sse` with a `url`), `hosts` (the domains the server contacts, added to the agent sandbox's allowlist — an undeclared host fails at the server's first request), `credential` (a `[[credentials]]` name, bound into the agent sandbox for this server alone and proxy-substituted in flight, so no secret is ever in the config, a job or an event), `roles` (which sessions get it; default builder + operator, never a critic unless you say so). Works on either `[agent] backend`. `sbxloop doctor` checks the credentials are set and that every server declares its hosts. |
 | `[sandbox] languages`                                                          | detected                                        | Toolchains pre-installed in the agent sandbox; unset = detect from the workspace's manifests, `python` if none (see below).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |

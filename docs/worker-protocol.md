@@ -55,7 +55,7 @@ delivery tier provisioning chose (see docs/architecture.md):
 | `shell.batch`   | `commands`, `command_timeout_s?`, `cwd?`                                                                                                     | `output_json`: list of `{command, exit_code, output}` (one per command, in order); job `exit_code` is the first nonzero. Nonzero exits are still **ok** results                |
 | `github.op`     | `op`, `params`                                                                                                                               | op-specific JSON (see below)                                                                                                                                                   |
 | `service.http`  | `params: {credential, method, path, query?, headers?, body?, timeout_s?}`                                                                    | `{credential, method, path, status, headers, body (clipped, credential value redacted), truncated, elapsed_s}` — see "Service ops"                                             |
-| `service.fetch` | `argv`, `cwd`, `params: {ecosystem, verb, scrub_env}`                                                                                        | `exit_code` + captured output with every `scrub_env` variable's value blanked — see "Service ops"; a nonzero exit is an **ok** result                                          |
+| `service.fetch` | `params: {registry, path, operation?, ref?, sha256?}`                                                                                        | Artifact metadata `{registry, operation, bytes, sha256}`; bytes stay in a separate artifact for host-mediated transfer                                                         |
 
 The `git.merge` job runs only on the agent worker. It requires `cwd` and
 `params: {base_branch, base_sha, bundle_path?}` and returns
@@ -232,21 +232,30 @@ body is clipped head+tail and the credential's value replaced with `***`
 wherever an API echoed it; request headers are never returned. Events:
 `service.http_start {credential, method, path}` and `service.http_end {status, elapsed_s}`.
 
-`service.fetch` jobs execute in the same box for a run whose repository has a
-credentialed `[[registries]]` entry (#766): the package manager's argv exactly
-as the host composed it from the ecosystem's fixed recipe (`npm ci --ignore-scripts`, `pip download -d <cache>`, `go mod download`, …), run in
-the workspace mount the box shares with the agent box — never a shell, never
-an argv the model wrote. `params.ecosystem` and `params.verb` name the fetch
-for the events; `params.scrub_env` lists the registry credential variables
-whose values the worker blanks out of the output before it leaves the box.
-Events: `service.fetch_start {ecosystem, verb}` and `service.fetch_end {exit_code, elapsed_s}`.
+`service.fetch` downloads registry data in the credential-bearing service
+sandbox. It accepts `params: {registry, path, operation?, ref?, sha256?}`;
+`argv`, `cwd`, `commands`, `prompt` and `op` are forbidden. The registry name
+resolves through the host-authored `SBXLOOP_REGISTRIES` catalogue. Download
+URLs and redirects stay on that entry's HTTPS authority. `operation=git`
+fetches a ref into fresh bare Git metadata and emits a bundle without
+checking out files. Neither operation loads manifests or invokes a package
+manager. The worker starts in Python isolated mode.
 
-On the host, the build session's `call_service` host tool is answered by
-`ServiceOps`: the credential name is checked against the run's grant before
-any job is built, and each call is one `service.call` host event
-(`credential`, `method`, `path`, `status` or `error`, `duration_s`); its
-`fetch_dependencies` tool the same way, each fetch — refused on the host or
-run — one `sandbox.fetch` event (`ecosystem`, `verb`, `argv`, `exit_code`).
+Successful output is `{registry, operation, bytes, sha256}`. Artifact bytes
+are written beside the result as `<job_id>.artifact`, bounded to 1 GiB and
+checked for echoed service credentials. The host copies that fixed path
+out, verifies its digest and size, copies the data into the agent, and
+removes the service artifact. A failed fetch is an error result. Events are
+`service.fetch_start {registry, operation, path}` and
+`service.fetch_end {registry, operation, path, bytes, sha256, duration_s}`.
+
+On the host, `ServiceOps` checks each tool request against the run's grants.
+`call_service` records a `service.call` event; `fetch_dependencies` records
+`sandbox.fetch` with its ecosystem, registry, path, operation and result
+metadata. Content and credentials never enter those events. The agent's
+tool response names the copied local file; it contains no artifact bytes.
+A discovery-only fetch returns registry names, URLs and cache information
+without submitting a service job.
 
 `SBXLOOP_SERVICE_FAKE=<path>` (tests) swaps the HTTPS transport for scripted
 responses from that JSON file, each request appended to
