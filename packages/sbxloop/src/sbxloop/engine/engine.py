@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import queue
 import shlex
 import shutil
@@ -62,7 +63,7 @@ from urllib.parse import quote
 
 from pydantic import ValidationError
 
-from sbxloop import hostgit
+from sbxloop import hostgit, repofiles
 from sbxloop.config import (
     DEFAULT_PR_TITLE_TEMPLATE,
     GITHUB_SINKS,
@@ -190,6 +191,7 @@ from sbxloop.gh.ops import (
     ReviewComment,
     SubmittedReview,
     identities_match,
+    raw_lookup,
     raw_pages,
     user_identity,
 )
@@ -1512,12 +1514,7 @@ class LoopEngine:
         for "this branch is still about this repository's current line of
         work". A comparison GitHub cannot make (404 on unrelated histories)
         answers no rather than raising."""
-        try:
-            data = ops.raw("GET", f"/repos/{repo}/compare/{base}...{branch}")
-        except GithubOpsError as exc:
-            if exc.http_status == 404:
-                return False
-            raise
+        data = raw_lookup(ops, "GET", f"/repos/{repo}/compare/{base}...{branch}")
         if not isinstance(data, dict):
             return False
         merge_base = data.get("merge_base_commit")
@@ -2386,7 +2383,12 @@ class LoopEngine:
                 for rel in files:
                     dest = target / rel
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(p.pair.workspace / rel, dest)
+                    with (
+                        repofiles.open_file(p.pair.workspace, rel) as source,
+                        dest.open("wb") as out,
+                    ):
+                        shutil.copyfileobj(source, out)
+                        os.fchmod(out.fileno(), os.fstat(source.fileno()).st_mode & 0o777)
             else:
                 self._copy_out(p.pair, target, files)
         return target, [str(target / rel) for rel in files]

@@ -521,8 +521,20 @@ def _search_issues(t: Transport, p: dict[str, Any]) -> JsonValue:
 
 
 def _raw_api(t: Transport, p: dict[str, Any]) -> JsonValue:
+    """One REST call; with ``allow_missing_statuses`` (#558) a status in the
+    list is an *answer* — ``{"missing": true, "http_status": N}`` on an ok
+    result — rather than a failed job and its red panel. The generic form
+    of what ``repo.get`` / ``ref.get`` / ``label.get`` grew one by one for
+    their existence probes (#222, #518, #556)."""
     _require(p, "method", "path")
-    return t.request(str(p["method"]).upper(), str(p["path"]), p.get("body"))
+    allowed = p.get("allow_missing_statuses") or ()
+    statuses = {int(s) for s in allowed} if isinstance(allowed, list | tuple) else set()
+    try:
+        return t.request(str(p["method"]).upper(), str(p["path"]), p.get("body"))
+    except GithubOpError as exc:
+        if exc.http_status in statuses:
+            return {"missing": True, "http_status": exc.http_status}
+        raise
 
 
 # The header a classic (OAuth-scoped) PAT answers every request with. A
