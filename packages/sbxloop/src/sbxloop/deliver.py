@@ -66,7 +66,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from sbxloop import hostgit
+from sbxloop import hostgit, repofiles
 from sbxloop.engine.model import (
     DEFAULT_ARTIFACT_EXCLUDES,
     PR_BODY_FILE,
@@ -771,7 +771,13 @@ def _blob_upload(source_dir: Path, change: hostgit.WorkspaceChange) -> tuple[dic
     whether the plan came from ``git diff`` or a walk of the tree."""
     full = source_dir / change.path
     entry = {"path": change.path, "mode": change.mode, "type": "blob"}
-    return entry, hostgit.blob_content(full, change.mode)
+    try:
+        if change.mode == hostgit.SYMLINK_MODE:
+            return entry, str(full.readlink()).encode()
+        with repofiles.open_file(source_dir, change.path) as source:
+            return entry, source.read()
+    except OSError as exc:
+        raise DeliveryError(f"cannot safely read repository file {change.path!r}") from exc
 
 
 def _plan_git_diff(source_dir: Path, base_sha: str, exclude: Sequence[str]) -> DeliveryPlan | None:
@@ -1001,11 +1007,8 @@ def pr_template(root: Path) -> tuple[str, str] | None:
     it, else ``None``. Read as bytes and decoded leniently — a template is
     prose, and one odd byte must not fail a delivery."""
     for rel in PR_TEMPLATE_PATHS:
-        path = root / rel
         try:
-            if not path.is_file():
-                continue
-            text = path.read_bytes()[:PR_TEMPLATE_CAP].decode("utf-8", "replace").strip()
+            text = repofiles.read_text(root, rel, limit=PR_TEMPLATE_CAP).strip()
         except OSError:
             continue
         if text:
@@ -1024,7 +1027,7 @@ def conventional_titles(root: Path) -> str | None:
     package = root / "package.json"
     if package.is_file():
         try:
-            data = json.loads(package.read_bytes()[: PR_TEMPLATE_CAP * 4])
+            data = json.loads(repofiles.read_bytes(root, "package.json", limit=PR_TEMPLATE_CAP * 4))
         except (OSError, ValueError):
             data = None
         if isinstance(data, dict) and "commitlint" in data:
@@ -1035,7 +1038,7 @@ def conventional_titles(root: Path) -> str | None:
             if path.suffix not in (".yml", ".yaml") or not path.is_file():
                 continue
             try:
-                text = path.read_bytes()[: PR_TEMPLATE_CAP * 4].decode("utf-8", "replace")
+                text = repofiles.read_text(root, path.relative_to(root), limit=PR_TEMPLATE_CAP * 4)
             except OSError:
                 continue
             for action in _TITLE_ACTIONS:
