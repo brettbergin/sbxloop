@@ -1164,17 +1164,36 @@ class WorkerClient:
                 Event.now(EventTypes.WORKER_STDOUT, job.run_id, job_id=job.job_id, line=line)
             )
             return None
+        # A worker controls its stream and durable log. Host-only events
+        # can trigger actions (including file uploads), so they must never
+        # enter the host bus through this untrusted ingress.
+        worker_types = {value for name, value in vars(EventTypes).items() if name.isupper()}
+        if (
+            event.type not in worker_types
+            or event.run_id != job.run_id
+            or event.job_id not in (None, job.job_id)
+        ):
+            log.warning(
+                "worker.event_rejected",
+                job=job.job_id,
+                sandbox=self.sandbox.name,
+                event_type=event.type[:100],
+            )
+            return None
+        # Older workers omit job_id on some telemetry. The transport, not
+        # the payload, owns its identity; bind accepted events to this job.
+        event = event.model_copy(update={"run_id": job.run_id, "job_id": job.job_id})
         if self.role is not None and event.type in (
             EventTypes.SANDBOX_RESOURCES,
             EventTypes.SANDBOX_RESOURCES_WARNING,
         ):
-            event.data.setdefault("role", self.role)
+            event.data["role"] = self.role
         agent = self._job_agents.get(job.job_id)
         if event.type.startswith("agent."):
             if agent is not None:
-                event.data.setdefault("agent", agent)
+                event.data["agent"] = agent
             if self.backend is not None:
-                event.data.setdefault("backend", self.backend)
+                event.data["backend"] = self.backend
         self.bus.publish(event)
         if event.type == EventTypes.AGENT_TOOL_REQUEST:
             broker = self._brokers.get(job.job_id)
