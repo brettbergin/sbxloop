@@ -645,40 +645,8 @@ class Provisioner:
         return SecretSpec(kind="custom", host=host, env=env)
 
     def _agent_secret_specs(self, roles: Sequence[str] | None = None) -> list[SecretSpec]:
-        """Every custom secret the agent sandbox is registered for: the
-        backend's own credential, then one per credentialed ``[[mcp]]``
-        server, each bound to that credential's single host so the proxy
-        substitutes it only in flight to the service it belongs to.
-
-        Config validation already guarantees the env names are distinct and
-        none collides with the backend's, which matters because sbx keys
-        custom secrets by env name and refuses a second registration.
-        """
-        specs = [self._agent_secret_spec()]
-        specs += [
-            SecretSpec(kind="custom", host=host, env=env)
-            for env, host in self.config.mcp_secrets_for(roles)
-        ]
-        return specs
-
-    def mcp_secret_env(self, roles: Sequence[str] | None = None) -> dict[str, str]:
-        """The credential values for the agent sandbox's MCP servers, read
-        from the daemon's environment.
-
-        Every declared name must be set, for the same reason a registry's
-        ``auth_env`` must: the operator said a server needs it, and a run
-        without it fails later, inside a sandbox, as an authentication
-        error nothing on the host explains.
-        """
-        names = [env for env, _ in self.config.mcp_secrets_for(roles)]
-        missing = [name for name in names if not self.env.get(name)]
-        if missing:
-            raise ProvisionError(
-                f"[[mcp]] credential env names {missing} are not set in the daemon's "
-                "environment (secrets.env / the service unit); set them, or drop the "
-                "`credential` from the MCP entries that reference them"
-            )
-        return {name: self.env[name] for name in names}
+        """Only the inference credential belongs in the agent sandbox."""
+        return [self._agent_secret_spec()]
 
     def gh_credential(self, repo: str | None = None) -> GhCredential:
         """The credential the github sandbox authenticates with, scoped to
@@ -1414,7 +1382,13 @@ class Provisioner:
         github_enabled = self.config.github.enabled and (
             kind == "code" or self._workload_needs_github()
         )
-        creds = self.config.credentials_named(credentials)
+        creds = self.config.credentials_named(
+            list(
+                dict.fromkeys(
+                    [*credentials, *(cred.name for cred in self.config.mcp_credentials())]
+                )
+            )
+        )
         # ... or, since #766, for a repository whose registries carry a
         # credential: the box fetches the dependencies the agent sandbox
         # then builds from offline.
@@ -1704,6 +1678,14 @@ class Provisioner:
         """Non-secret catalogues for the service's fixed HTTP and registry ops."""
         regs = self.config.credentialed_registries_for(repo)
         env: dict[str, str] = {}
+        if self.config.mcp_credentials():
+            env["SBXLOOP_MCP_SERVERS"] = json.dumps(
+                [
+                    {"name": server.name, "url": server.url, "credential": server.credential}
+                    for server in self.config.mcp
+                    if server.credential is not None
+                ]
+            )
         if regs:
             env["SBXLOOP_REGISTRIES"] = json.dumps(registries.catalogue_entries(regs))
         if credentials:
@@ -2520,7 +2502,6 @@ class Provisioner:
         exports: dict[str, str] = {**spec.persistent_env, **spec.secret_env}
         if spec.role == "agent":
             exports[self.agent_token_env()] = token
-            exports.update(self.mcp_secret_env())
         elif spec.role == "github":
             exports["GH_TOKEN"] = token
             exports["GITHUB_TOKEN"] = token
@@ -2600,12 +2581,15 @@ class Provisioner:
             return lambda: {
                 **self.agent_persistent_env(repo),
                 self.agent_token_env(): self.agent_token(),
-                # The MCP servers' credentials travel the same road as the
-                # agent's own: never in the job, never in argv.
-                **self.mcp_secret_env(),
             }
         if role == "service":
-            creds = self.config.credentials_named(credentials)
+            creds = self.config.credentials_named(
+                list(
+                    dict.fromkeys(
+                        [*credentials, *(cred.name for cred in self.config.mcp_credentials())]
+                    )
+                )
+            )
             return lambda: {
                 **self.service_persistent_env(creds, repo),
                 **self.service_secret_env(creds, repo),
