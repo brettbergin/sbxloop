@@ -1200,7 +1200,9 @@ class WorkerClient:
             if agent is not None:
                 event.data["agent"] = agent
             if self.backend is not None:
-                event.data["backend"] = self.backend
+                # Diagnostic data, not authority: a fallback worker can
+                # truthfully report a different backend from the config.
+                event.data.setdefault("backend", self.backend)
         self.bus.publish(event)
         if event.type == EventTypes.AGENT_TOOL_REQUEST:
             broker = self._brokers.get(job.job_id)
