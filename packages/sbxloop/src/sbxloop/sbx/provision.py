@@ -1186,6 +1186,11 @@ class Provisioner:
             + ", ".join(f"{path} ({how})" for path, how in populated),
         )
 
+    def clone_token(self, repo: str) -> str | None:
+        """The credential a host-side clone of ``repo`` authenticates with —
+        the same one a run's remote clone uses."""
+        return self._clone_token(repo)
+
     def _clone_token(self, repo: str) -> str | None:
         """The token the remote clone authenticates with, or ``None`` when
         the host has no GitHub credential configured at all (a public

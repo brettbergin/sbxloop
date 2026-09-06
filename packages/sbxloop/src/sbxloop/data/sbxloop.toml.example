@@ -64,8 +64,11 @@ secret_strategy = "proxy"
 # `sbxloop bake` builds one with the worker preinstalled, cutting the
 # per-run install out of provisioning.
 # template = "sbxloop-baked:latest"
-# Where runs execute. Unset (the default) gives every run a fresh directory
-# under ~/.sbxloop/runs. Point it at an existing project to work on that code.
+# The checkout runs are cut from. Unset (the default): the daemon clones the
+# repository into ~/.sbxloop/workspaces/<owner>/<name> on first use and
+# refreshes it before every run. Point it at a checkout of your own only to
+# use that one instead; `sbxloop run` with no repository works in a fresh
+# directory under ~/.sbxloop/runs.
 # workspace = "/path/to/checkout"
 # When `workspace` is a git checkout: "auto" (default) isolates each run in
 # a per-run clone on branch sbxloop/<run_id> — the checkout and its branches

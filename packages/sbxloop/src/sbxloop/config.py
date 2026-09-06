@@ -2397,7 +2397,9 @@ class Config(_ConfigModel):
            to belong to this repository: with a single enabled repo (the
            unchanged single-repo deployment) it applies as before; with
            several, only when the checkout's ``origin`` names this entry;
-        3. otherwise ``None``.
+        3. the home's own checkout, ``workspaces/<owner>/<name>``, once the
+           daemon has cloned it (:meth:`default_workspace_for_repo`);
+        4. otherwise ``None``.
 
         It never returns a checkout that belongs to a different repository:
         that is exactly the multi-repo failure this exists to prevent.
@@ -2408,16 +2410,32 @@ class Config(_ConfigModel):
         if entry is not None and entry.workspace is not None:
             return entry.workspace.expanduser()
         legacy = self.sandbox.workspace
-        if legacy is None:
+        if legacy is not None:
+            legacy = legacy.expanduser()
+            if entry is None:
+                # No repo entries at all (GitHub off, or the legacy [github]
+                # repo spelling): the single daemon-wide workspace is all
+                # there is.
+                if not self.github.enabled_repos():
+                    return legacy
+            elif (not self.github.multi_repo and entry.enabled) or hostgit.origin_matches_repo(
+                legacy, entry.repo
+            ):
+                return legacy
+        default = self.default_workspace_for_repo(repo)
+        return default if default is not None and default.is_dir() else None
+
+    def default_workspace_for_repo(self, repo: str | None) -> Path | None:
+        """Where the daemon keeps ``repo``'s dedicated clone when the operator
+        has not pointed it at one: ``workspaces/<owner>/<name>`` under the
+        home. None for no repository, or one that is not ``owner/name``."""
+        target = repo or self.github.repo
+        if not target:
             return None
-        legacy = legacy.expanduser()
-        if entry is None:
-            # No repo entries at all (GitHub off, or the legacy [github] repo
-            # spelling): the single daemon-wide workspace is all there is.
-            return legacy if not self.github.enabled_repos() else None
-        if not self.github.multi_repo and entry.enabled:
-            return legacy
-        return legacy if hostgit.origin_matches_repo(legacy, entry.repo) else None
+        try:
+            return self.paths.workspace_for(target)
+        except ValueError:
+            return None
 
     def workspace_source(self, repo: str | None) -> WorkspaceSource:
         """Where a fresh run for ``repo`` gets its tree from.
