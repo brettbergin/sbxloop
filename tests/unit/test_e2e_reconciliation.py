@@ -201,7 +201,7 @@ class TestTwoRoundRunIsReconciledOnThePr:
         self, run: tuple[Harness, FakeGithub, LoopEngine, RunResult]
     ) -> None:
         harness, fake, _, result = run
-        reopened = StateStore(harness.paths.state_db)
+        reopened = StateStore(harness.home.state_db)
         try:
             posted = reopened.posted_findings(result.run_id)
             statuses = reopened.reconciliations(result.run_id, 1)

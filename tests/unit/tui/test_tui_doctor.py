@@ -37,11 +37,14 @@ def host(
 ) -> Path:
     """A host whose config lives beside the seeded state dir, with tokens
     (set after the fake sbx fixture, which scrubs them)."""
-    monkeypatch.chdir(seeded)
+    monkeypatch.chdir(seeded.root)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg-config"))
     monkeypatch.setenv("COPILOT_GITHUB_TOKEN", "tok")
     monkeypatch.setenv("GH_TOKEN", "tok")
-    (seeded.root / "sbxloop.toml").write_text(f'state_dir = "{seeded}"\n')
+    # The console and the CLI must read the same home: SBXLOOP_HOME names
+    # it, and the record makes doctor's `home` row read it as initialised.
+    monkeypatch.setenv("SBXLOOP_HOME", str(seeded.root))
+    seeded.write_record(sbxloop_version="test", created_by="test")
     return seeded
 
 
