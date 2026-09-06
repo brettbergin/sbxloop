@@ -31,15 +31,31 @@ opens that run's screen at once; `--read-only` removes every action.
 ## Layout and navigation
 
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│ ● running  r7ab3kq2m · Add retries   queue 2   runs 4/12 UTC   failures 0  │
-│ sbxloop 1.4.2   bridge ✓   up since 2d ago   ctl 12 ms   14:02:11          │
-├────────────────────────────────────────────────────────────────────────────┤
-│                            <active screen>                                 │
-├────────────────────────────────────────────────────────────────────────────┤
-│ 1 Overview 2 Runs 3 Queue 4 Chat 5 Sandboxes 6 Daemon 7 Config 8 Doctor ? │
-└────────────────────────────────────────────────────────────────────────────┘
+┌─────────────┬──────────────────────────────────────────────────────────────┐
+│             │ ● running  r7ab3kq2m · Add retries   queue 2   runs 4/12 UTC  │
+│ 1 Overview  │ sbxloop 1.5.2   bridge ✓   up since 2d ago   ctl 12 ms        │
+│ 2 Runs      ├──────────────────────────────────────────────────────────────┤
+│ 3 Queue   2 │                                                              │
+│ 4 Chat      │                     <active screen>                          │
+│ 5 Sandboxes │                                                              │
+│ 6 Daemon  1 │                                                              │
+│ 7 Config    │                                                              │
+│ 8 Doctor    ├──────────────────────────────────────────────────────────────┤
+│ ? Help      │ / Filter  r Refresh  q Quit                     ^p palette    │
+└─────────────┴──────────────────────────────────────────────────────────────┘
 ```
+
+The **navigation rail** runs down the left of every screen: every screen
+with the key that reaches it, the one you are on marked, and a badge where
+a screen you are *not* on wants attention — the queue's depth, unread
+control-channel rows, gates and holds waiting for a human. Clicking a row
+is the same verb as pressing its key. It is the console's map; the footer
+keeps its row for the verbs of whichever screen is up. Below 90 columns the
+rail hides itself and the keys still reach everything.
+
+`sbxloop.tui.widgets.navrail.NAV` is the single source of the console's
+shape — the rail renders it and the app builds its bindings from it, so a
+screen cannot be reachable by key and missing from the map.
 
 The two-line **status bar** is on every screen: the daemon (`●` running,
 `◌` idle, `⏸` paused with its holds, `🛑` breaker open, `…` starting, `✖`
@@ -55,6 +71,7 @@ returns.
 | key               | where                       | what                                                               |
 | ----------------- | --------------------------- | ------------------------------------------------------------------ |
 | `1` … `8`         | anywhere                    | Overview, Runs, Queue, Chat, Sandboxes, Daemon, Config, Doctor     |
+| click             | the rail                    | the same as that row's key                                         |
 | `?`               | anywhere                    | Help                                                               |
 | `ctrl+p`          | anywhere                    | the command palette: screens and argument-less verbs by name       |
 | `r`               | anywhere                    | refresh now (store and `ctl status`)                               |
@@ -65,7 +82,7 @@ returns.
 | `/`               | Runs, Events tab            | filter (Runs: any column; Events: a type prefix such as `policy.`) |
 | `Esc`             | anywhere                    | clear a filter, close a run                                        |
 | `Enter`           | Runs, Queue, Overview lists | open the run                                                       |
-| `Enter`           | Config, Resolved tab        | edit that setting; `a` adds one by dotted path                     |
+| `Enter`           | Config, Resolved tab        | edit that setting (`e` too); `a` adds one by dotted path           |
 | `f`               | a run                       | toggle following the event tail                                    |
 | `v`               | a run                       | Thread tab as the `sbxloop run` transcript or as dense lines       |
 
@@ -273,57 +290,67 @@ orphan verdicts (the prompt says so, and their kept marker is cleared).
 
 ### Config (`7`)
 
+Three tabs, and every change made from the first of them one key at a
+time. **There is no text editor here.** Handing the operator a file and
+leaving them to find the line is what this screen replaced; for a change
+no key describes, edit `~/.sbxloop/config/sbxloop.toml` on the host.
+
+**Which file an edit lands in:** the home's `config/sbxloop.toml` — what
+`sbxloop init` writes, what a deploy preserves and what `sbxloop backup`
+snapshots. Its path is the first line of the Resolved tab. The loader
+reads it out of the home whatever directory anything was started in, so
+the console writes the same file the daemon reads no matter where either
+was launched. A `sbxloop.toml` in a working directory is *project* config
+a repository carries; the console shows it as a layer but never writes to
+it. If one is sitting in the home itself the loader applies it **over** the
+operator config — the screen names it so the split is visible, and per-key
+edits say when that file still wins.
+
 - **Resolved** — every setting as one addressable key with its value and
-  the layer that set it (user config, `pyproject.toml`, `sbxloop.toml`,
+  the layer that set it (home config, `pyproject.toml`, `sbxloop.toml`,
   env, default), as `sbxloop config show` prints; `/` filters keys, values
-  and sources. Arrays of tables are walked, so the second repository is
-  `github.repos[1].deliver_base` rather than one blob you have to find in
-  the file, and a leaf inherits the layer that supplied the array it lives
-  in. Lists of scalars (`policy.allow`) stay one key: the useful edit
-  there is the whole list.
+  and sources. It is resolved **from the home**, not from the directory the
+  console was started in: that is where the daemon runs, so this is the
+  configuration the loop actually gets, and it is the same root an edit is
+  validated against — a save shows up here at once. Arrays of tables are
+  walked, so the second repository is `github.repos[1].deliver_base` rather
+  than one blob you have to find in a file, and a leaf inherits the layer
+  that supplied the array it lives in. Lists of scalars (`policy.allow`)
+  stay one key: the useful edit there is the whole list.
+
 - **Editing one key.** `Enter` on a row — or `e` — opens that setting on
   its own: what it accepts (a type, the set a `Literal` allows, the bounds
   the model carries), what it holds now and which layer is answering, and
   the file the answer is written to. The widget follows the type — a
-  picker for a bool or a fixed set, one item per line for a list, a line
-  of text otherwise — so a string needs no quotes and a bad value is named
+  picker for a bool or a fixed set, one item per line for a list, a line of
+  text otherwise — so a string needs no quotes and a bad value is named
   before the loader sees it. `^U` unsets the key instead, so the file stops
-  saying anything about it and the layer beneath answers. `Enter` (a
-  picker: `^S`) applies: the change is written into the draft at that path
-  and nowhere else, **every comment in the file kept**, the whole draft
-  goes through the real loader, and only a draft it accepts is saved — the
-  same atomic write, backup and offered restart as the Edit tab's `W`. A
-  key the environment or the home config also sets is still written and
-  the verdict says so, naming the layer that wins and the value the loop
-  actually sees.
+  saying anything about it and the layer beneath answers.
+
+  `Enter` (a picker: `^S`) applies. The edit starts from the file as it is
+  on disk — there is no buffered draft to go stale — and the value is
+  written at that path and nowhere else, **every comment in the file
+  kept**. The whole result then goes through the real loader, and only a
+  file it accepts is saved: the write is atomic, the previous file is kept
+  beside it as `sbxloop.toml.bak-<stamp>`, and a restart of the unit is
+  offered, since the daemon reads its configuration only at start. A file
+  the loader refuses is never written. The dialog is the confirmation, so
+  nothing else is asked. A key the environment or a `sbxloop.toml` in the
+  home also sets is still written and the verdict says so, naming the layer
+  that wins and the value the loop actually sees. `--read-only` refuses
+  every edit.
+
 - **Adding a key.** `a` takes a dotted path the resolved view has no row
   for — `sandbox.env.RAILS_ENV`, `github.repos[2].repo` — and opens the
   same dialog. An index one past the end appends an entry; an index beyond
   that is refused by name.
+
 - **Policy** — the effective per-phase egress policy `sbxloop config policy`
   prints, from the same fold (`sbxloop.cli.policyview.policy_view`).
+
 - **Repos** — the configured repositories as `sbxloop config repos` lists
   them. `Enter` on a repository narrows the Resolved view to that entry's
   keys.
-- **Edit** — the whole `sbxloop.toml` as text, for the changes no single
-  key describes. The daemon says where it loaded its configuration from
-  (`status` carries its directory), and the editor follows that, not the
-  directory the console was started in (the commented example when there
-  is no file yet). `i` focuses it, `Esc`
-  hands focus back. `V` validates the draft with the real loader, in
-  place of that file at the same discovered root — the user,
-  `pyproject.toml` and environment layers still applied, and the project
-  cut-down too: a `sbxloop.toml` the repository carries (tracked by git)
-  may only set project keys, and the verdict names the keys the daemon
-  would ignore rather than saying "loads". It names what it refuses (an
-  unknown key, a bad value). `W` (or `ctrl+s`) validates and then saves,
-  typed `save`: the write is atomic, the previous file is kept beside it
-  as `sbxloop.toml.bak-<stamp>`, and a restart of the unit is offered
-  (typed, as on the Daemon screen), since the daemon reads the file only
-  at start. A draft the loader refuses is never written. `E` opens
-  `$EDITOR` on the file with the terminal handed over; `L` reloads from
-  disk. `--read-only` makes the editor read-only and refuses per-key
-  edits too.
 
 ### Doctor (`8`) and secrets
 

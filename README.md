@@ -32,6 +32,10 @@ Built on [Docker Sandboxes (`sbx`)](https://docs.docker.com/ai/sandboxes/),
 sbxloop takes an ask from chat, a labeled issue, or your terminal and works
 it through to a merged pull request. It plans the change, writes the code,
 runs checks, handles review feedback, and follows CI through to the finish.
+For general [agentic workloads](docs/architecture.md#workloads), it can
+research a question, prepare a brief or report, or produce a set of files.
+It plans, executes, and checks the work, then publishes the result to chat
+or another configured destination.
 You can watch, steer, or stop it along the way.
 
 Docker's `sbx` CLI provides the isolated sandbox runtime. sbxloop provisions
@@ -157,6 +161,11 @@ Add a separate repository token to `secrets.env`, following the
 ```dotenv
 GH_TOKEN=your_repository_token
 ```
+
+Alternatively, use [GitHub App authentication](docs/user-guide.md#github-app-auth)
+by setting `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, and
+`GITHUB_APP_PRIVATE_KEY_PATH` in `secrets.env`. Leave `GH_TOKEN` and
+`GITHUB_TOKEN` unset when using the App.
 
 Name the target repository for one run:
 
