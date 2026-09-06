@@ -49,8 +49,9 @@ Each of these has broken a real run when violated.
   `tests/unit/test_prompts.py` and `scripts/check_self_references.py`
   enforce this.
 - **Every knob lands in three places:** the config model, the example config
-  and the README table — with a per-repo override wherever `RepoConfig`
-  already narrows.
+  (`packages/sbxloop/src/sbxloop/data/sbxloop.toml.example`) and the knob
+  table in `docs/user-guide.md` — with a per-repo override wherever
+  `RepoConfig` already narrows.
 - **Secrets never appear in events, logs or `sbx` argv.** Names travel;
   values ride the env-file path.
 - **The target's conventions outrank ours.** When the repository says how it
@@ -127,6 +128,6 @@ Each of these has broken a real run when violated.
   what changed, and how it was verified; `Closes #N` for the issue it
   resolves.
 - Commits and PR bodies carry the trailers the project uses — see `git log`.
-- A PR that adds a config key without the example, the README row and the
-  test is not done. A PR that changes behaviour without a test that failed
+- A PR that adds a config key without the example, the user-guide row and
+  the test is not done. A PR that changes behaviour without a test that failed
   first is not done either.
