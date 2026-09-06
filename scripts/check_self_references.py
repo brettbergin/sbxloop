@@ -59,6 +59,10 @@ PERSONAL = re.compile(
 )
 
 PROMPTS = SRC / "engine" / "prompts"
+# Skill bodies are prompt bodies: the agent reads them verbatim, and a
+# skill is loaded into a run on someone else's repository, where a bare
+# `#12` reads as an issue in THEIR tracker.
+SKILLS = SRC / "skills"
 TEMPLATES = [
     SRC / "data" / "sbxloop.toml.example",
     *(SRC / "data" / "presets").glob("*.toml"),
@@ -102,7 +106,7 @@ def check_prompt_bodies() -> list[Finding]:
     """Prompt bodies below the contract header; the header is stripped
     before the model sees the file and is written for humans."""
     found: list[Finding] = []
-    for path in sorted(PROMPTS.glob("*.md")):
+    for path in [*sorted(PROMPTS.glob("*.md")), *sorted(SKILLS.glob("*/SKILL.md"))]:
         raw = path.read_text(encoding="utf-8")
         body_start = 0
         if raw.startswith("<!--"):

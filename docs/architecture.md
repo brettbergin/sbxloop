@@ -890,6 +890,38 @@ scales with turns"). The briefing is domain-neutral by test — no language,
 no toolchain, no incident — and the pull-request framing appears only when
 `[github] repo` makes delivery real.
 
+Procedures the agent needs *sometimes* are skills, not prompt text.
+`sbxloop.skills` ships a tree of `<name>/SKILL.md` files — YAML frontmatter
+(`name`, `description`, `roles`) over a Markdown body, deliberately the
+shape a Claude-native skills directory uses, so the same tree can later be
+handed to a backend that loads it from a filesystem without a second source
+of truth. Today the door is a host tool: `engine.skilltools.skill_tool_spec`
+builds a `load_skill` spec whose `name` enum is exactly the skills that
+role may load, and whose description carries the catalogue, so the listing
+costs the tool schema rather than a section in every phase prompt and a body
+costs nothing until it is asked for (goal 3 again). `answer_skill_call`
+answers host-side and logs `skill.loaded`; a name outside the caller's role
+is refused rather than returned, and every malformed call is answered rather
+than raised, because a model that asked for a procedure must always get
+something it can act on.
+
+A host tool rather than a file read is the floor, not a fallback: the
+concierge runs with `available_tools=[]` and `permission_mode="read_only"`,
+so it has no reader and no shell, and this is the only way it can reach a
+procedure at all. That is also why `PhaseRunner._tools_for` does **not**
+narrow the skill tool to `TOOLED_PHASES` the way the run's service tools are
+narrowed — a critic needs the verification procedure as much as the builder
+does, and unlike `call_service` the skill tool reaches nothing outside the
+host. Its consequence is that every agent job now carries at least one host
+tool, so the handler always rides along; `_tools_for` composes the run's own
+handler behind the skill one, and a run with no credentials still gets a
+working `load_skill`. The four shipped skills are `run-shape` (planner,
+builder, critic), `verify-gate` (builder, critic), `deliver-pr` (builder)
+and `operate-sbxloop` (concierge, and the one written for a human asking how
+to set the loop up). Bodies are gated as prompt bodies are:
+`scripts/check_self_references.py` reads `skills/*/SKILL.md` alongside
+`engine/prompts/*.md`.
+
 The repository's own instruction files reach every phase the same way
 (#688). `engine.repocontext.read_repo_context` reads `AGENTS.md`,
 `CLAUDE.md`, `.cursorrules`, `.github/copilot-instructions.md`, the

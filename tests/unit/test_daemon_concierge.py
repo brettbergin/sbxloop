@@ -264,6 +264,10 @@ class TestJobShape:
             "usage_today",
             "daemon_log",
             "start_workload",
+            # Last, and never gated: it reaches nothing outside the host, and
+            # with `available_tools == []` it is this session's only way to
+            # read a procedure at all.
+            "load_skill",
         ]  # no github_get: no repo configured; the rest need nothing
         assert job.host_tools_dir is None  # the WorkerClient fills it in
         assert job.system_message and "sbxloop concierge" in job.system_message

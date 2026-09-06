@@ -64,6 +64,7 @@ from sbxloop.daemon.versions import VersionProbe
 from sbxloop.engine.harness import harness_context
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunState
 from sbxloop.engine.prompts import bullet_list, render
+from sbxloop.engine.skilltools import SKILL_TOOL_NAME, answer_skill_call, skill_tool_spec
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     ConfigError,
@@ -1103,7 +1104,23 @@ class Concierge:
                     self._tool_close_issue,
                 )
             )
+        # The skill tool last: it reaches nothing outside the host, so it is
+        # never gated on a repository or a credential the way the tools
+        # above are. It is also the concierge's ONLY door to a procedure —
+        # this session runs with `available_tools=[]`, so there is no reader
+        # and no shell to open a file with.
+        skill_spec = skill_tool_spec("concierge")
+        if skill_spec is not None:
+            tools.append(HostTool(skill_spec, self._tool_load_skill))
         return tools
+
+    @staticmethod
+    def _tool_load_skill(args: dict[str, Any], by: str) -> str:
+        call = HostToolCall(call_id="concierge", name=SKILL_TOOL_NAME, arguments=args)
+        response = answer_skill_call(call, "concierge")
+        if not response.ok:
+            raise ValueError(response.error or "no such skill")
+        return response.text
 
     def _thread_for(self, run_id: str) -> ChatThread | None:
         """The run's thread on the surface this turn is answered on, else
