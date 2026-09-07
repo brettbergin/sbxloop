@@ -218,6 +218,28 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
 }
 
 
+def apply_engine_schema(conn: sqlite3.Connection) -> None:
+    """Bring any engine database this project ever wrote to the current shape.
+
+    Creates the five tables from nothing on a fresh file, and adds every
+    column released after 0.2.0 that the file is missing — idempotent, so an
+    already-current database is untouched. Nothing is backfilled: each added
+    column's DDL default is the migration, and the two run states written
+    before the pipeline existed are remapped on read, never rewritten.
+
+    This is the whole of the engine side of Alembic revision 0001, which is
+    why it takes a bare connection rather than a store: it has to run against
+    a database no store could open yet.
+    """
+    conn.executescript(_SCHEMA)
+    for table, migrations in _MIGRATIONS.items():
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}  # nosec B608
+        for column, ddl in migrations:
+            if column not in existing:
+                conn.execute(ddl)
+    conn.commit()
+
+
 class StateStore:
     def __init__(self, path: Path, *, readonly: bool = False) -> None:
         """Open the store. ``readonly`` opens the file through a read-only
@@ -248,13 +270,7 @@ class StateStore:
         # WAL + NORMAL: commits no longer fsync per insert, and a crash can
         # only lose the tail of the WAL (not corrupt the database).
         self._conn.execute("PRAGMA synchronous=NORMAL")
-        self._conn.executescript(_SCHEMA)
-        for table, migrations in _MIGRATIONS.items():
-            existing = {row["name"] for row in self._conn.execute(f"PRAGMA table_info({table})")}
-            for column, ddl in migrations:
-                if column not in existing:
-                    self._conn.execute(ddl)
-        self._conn.commit()
+        apply_engine_schema(self._conn)
 
     def close(self) -> None:
         self._conn.close()
