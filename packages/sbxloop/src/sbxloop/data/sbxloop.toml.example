@@ -519,6 +519,14 @@ secret_strategy = "proxy"
 # and tool cap — `sbxloop init --preset large-repo` writes them.
 # max_revisions_per_task = 2
 # max_replans_per_task = 1
+# Verify commands that may be re-authored on one task after proving
+# unpassable — the same check failing identically across attempts AND
+# approaches, so no further work on the code can change it. The re-author
+# sees only that one command and may replace it, drop it, or let it stand;
+# the rest of the task's checks are untouchable, and a dropped check is
+# reported so a reviewer knows what stopped being tested. 0 turns the
+# escalation off: a suspect check fails the task instead.
+# max_verify_reauthors_per_task = 1
 # max_tasks = 20
 # max_wall_clock_s = 7200.0
 # per_job_timeout_s = 1800.0

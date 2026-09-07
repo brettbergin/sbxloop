@@ -1,5 +1,34 @@
 ## [Unreleased]
 
+### Added
+
+- **A verify command that cannot pass can now be re-authored instead of
+  ending the run.** The loop has always been able to *recognise* a check
+  that no amount of work can satisfy - the same command failing with
+  identical output across attempts and across approaches - and it has never
+  been able to do anything about one. The verify commands are
+  decomposer-authored, the builder is told it cannot edit them, and nothing
+  re-ran decompose, so the only lever was a fresh session against the same
+  impossible command. When no approach existed, the run was abandoned with
+  the work finished and every other check green.
+
+  A suspect check now escalates first, to one bounded re-author that sees
+  that command and no other. It may **replace** the check with one that
+  tests the same property and can pass, **drop** it when the property is not
+  testable in this environment at all (a running server, a rendering engine,
+  a deployed address), or **keep** it, which says the check is right and the
+  work is not - and falls through to exactly the fresh-session replan that
+  ran before. The rest of the task's checks are untouchable either way.
+
+  Guarded, because the phase is asked to edit the exam having just been told
+  a check is in its way: a replacement is held to the same mechanical lint a
+  decomposition is, a replacement that cannot fail whatever the workspace
+  contains is refused, and the command carrying the project's own gate may
+  be rewritten but never removed. Every change is reported on the run, so a
+  reviewer knows the exam moved and what stopped being tested. Budgeted by
+  `[budgets] max_verify_reauthors_per_task` (default 1); 0 restores the old
+  behaviour.
+
 ### Fixed
 
 - **`pkill` in a verify command is now rejected at plan time.** A check that

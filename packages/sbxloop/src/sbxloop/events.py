@@ -282,6 +282,11 @@ class HostEventTypes:
     # workflow): `evidence` names what was seen, `hint` the knob (#682).
     # A hint only — the mode never changes on its own.
     VERIFY_SERVICES_DETECTED = "verify.services_detected"
+    # A verify command that proved unpassable was replaced or dropped:
+    # `task_id`, `verdict`, `command`, `replacement` (empty when dropped)
+    # and `reason`. Loud on purpose — the exam a pull request was judged
+    # against changed mid-run, and the reviewer is entitled to know.
+    VERIFY_REAUTHORED = "verify.reauthored"
     POLICY_ALLOW = "policy.allow"
     POLICY_DENY = "policy.deny"
     SANDBOX_PROVISION_START = "sandbox.provision_start"

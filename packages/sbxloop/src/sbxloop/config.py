@@ -1299,6 +1299,13 @@ class Limits(_ConfigModel):
 class Budgets(_ConfigModel):
     max_revisions_per_task: int = 2
     max_replans_per_task: int = 1
+    # How many of a task's verify commands may be re-authored after proving
+    # unpassable — the same check failing identically across attempts and
+    # approaches, so no further work on the code can change it. The
+    # re-author sees only that one command and may replace it, drop it, or
+    # let it stand; the rest of the task's exam is untouchable. 0 turns the
+    # escalation off, and a suspect check fails the task as it did before.
+    max_verify_reauthors_per_task: int = Field(default=1, ge=0)
     max_tasks: int = 20
     max_wall_clock_s: float = 7200.0
     per_job_timeout_s: float = 1800.0

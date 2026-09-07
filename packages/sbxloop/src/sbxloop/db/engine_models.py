@@ -105,6 +105,7 @@ class Task(Base):
     session_id: Mapped[str | None] = mapped_column(Text)
     verify_fingerprints: Mapped[str] = mapped_column(Text, nullable=False, server_default="'[]'")
     verify_suspect: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    verify_reauthors: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     # A workload task's TaskOutput; NULL for every code task.
     output_json: Mapped[str | None] = mapped_column(Text)
 
