@@ -14,12 +14,30 @@ from typing import Any
 import pytest
 from sqlalchemy import Engine, inspect
 
+import sbxloop.db.daemon_models
 import sbxloop.db.engine_models  # noqa: F401  - registers the models on Base
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.db import Base, open_engine
 from sbxloop.engine.store import StateStore
 
 ENGINE_TABLES = ("runs", "tasks", "phase_attempts", "reconciliations", "events")
+DAEMON_TABLES = (
+    "daemon_work_items",
+    "daemon_runs",
+    "daemon_run_resumes",
+    "daemon_state",
+    "daemon_run_watches",
+    "daemon_requesters",
+    "daemon_prior_attempts",
+    "daemon_chat_threads",
+    "daemon_merge_gates",
+    "daemon_gate_prompts",
+    "daemon_review_holds",
+    "daemon_pending_clarifications",
+    "daemon_local_messages",
+    "daemon_schedules",
+)
+ALL_TABLES = ENGINE_TABLES + DAEMON_TABLES
 
 
 @pytest.fixture
@@ -59,7 +77,7 @@ def _norm_default(default: object) -> str | None:
     return str(default).strip().strip("'").strip('"')
 
 
-@pytest.mark.parametrize("table", ENGINE_TABLES)
+@pytest.mark.parametrize("table", ALL_TABLES)
 class TestModelsMatchTheDeployedSchema:
     def test_the_columns_agree(self, live: Engine, modelled: Engine, table: str) -> None:
         assert _columns(modelled, table) == _columns(live, table)
@@ -106,8 +124,8 @@ class TestAutogenerateSeesNoDrift:
 
 
 class TestTheModelledSetIsComplete:
-    def test_every_engine_table_has_a_model(self) -> None:
-        assert set(ENGINE_TABLES) <= set(Base.metadata.tables)
+    def test_every_table_has_a_model(self) -> None:
+        assert set(ALL_TABLES) == set(Base.metadata.tables)
 
     def test_no_model_invents_a_table_the_database_lacks(self, live: Engine) -> None:
         """Anything modelled must exist on a database opened the old way."""
