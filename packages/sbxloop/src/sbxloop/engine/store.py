@@ -55,6 +55,19 @@ from sbxloop_worker.protocol import Event, EventTypes, Usage
 # may touch, so a caller cannot increment an arbitrary column by name.
 RUN_COUNTERS: frozenset[str] = frozenset({"review_rounds", "ci_rounds", "update_attempts"})
 
+# What a `reconciliations` row is about. The table carries six concerns and
+# told them apart by the sign of `round`; `kind` says which out loud. The
+# sentinel rounds are still written beside it — the release before this one
+# reads them, and a failed deploy restarts that release against the same
+# database.
+RECONCILE_REVIEW = "review"
+RECONCILE_HUMAN = "human"
+RECONCILE_ADVISORY = "advisory"
+RECONCILE_BOT = "bot"
+RECONCILE_CONFIRM = "confirm"
+RECONCILE_NOTED = "noted"
+
+
 # Run states written before the pipeline existed, remapped at read time so a
 # pre-1.0 state database still lists and resumes: both were "the task graph
 # is being worked", which `building` now names.
@@ -1070,7 +1083,14 @@ class StateStore:
     # -- reconciliation ----------------------------------------------------
 
     def record_reconciliation(
-        self, run_id: str, round: int, anchor: str, status: str, *, resolved: bool = False
+        self,
+        run_id: str,
+        round: int,
+        anchor: str,
+        status: str,
+        *,
+        resolved: bool = False,
+        kind: str = RECONCILE_REVIEW,
     ) -> None:
         """Note that this run/round has spoken to ``anchor`` on the PR.
 
@@ -1085,6 +1105,7 @@ class StateStore:
             status=status,
             resolved=1 if resolved else 0,
             ts=time.time(),
+            kind=kind,
         )
         stmt = stmt.on_conflict_do_update(
             index_elements=["run_id", "round", "anchor"],
@@ -1092,18 +1113,30 @@ class StateStore:
                 "status": stmt.excluded.status,
                 "resolved": stmt.excluded.resolved,
                 "ts": stmt.excluded.ts,
+                "kind": stmt.excluded.kind,
             },
         )
         with self._write() as session:
             session.execute(stmt)
 
-    def reconciliations(self, run_id: str, round: int | None = None) -> dict[str, str]:
-        """``{anchor: status}`` already reconciled for this run (and round)."""
+    def reconciliations(
+        self, run_id: str, round: int | None = None, *, kind: str | None = None
+    ) -> dict[str, str]:
+        """``{anchor: status}`` already reconciled for this run (and round).
+
+        ``kind`` narrows to one of the six concerns this table carries. The
+        sentinel ``round`` alone would answer the same question — it still
+        does, and is still written — but naming the kind means a caller that
+        wants human replies says so, and a row whose band was misread shows
+        up as a mismatch rather than as a plausible answer.
+        """
         stmt = select(Reconciliation.anchor, Reconciliation.status).where(
             Reconciliation.run_id == run_id
         )
         if round is not None:
             stmt = stmt.where(Reconciliation.round == round)
+        if kind is not None:
+            stmt = stmt.where(Reconciliation.kind == kind)
         with self._read() as session:
             return {str(anchor): str(status) for anchor, status in session.execute(stmt)}
 
@@ -1119,11 +1152,11 @@ class StateStore:
         can dismiss — from buying another full fix pass on every landing
         attempt (#520).
         """
-        self.record_reconciliation(run_id, self.HUMAN_ROUND, key, status)
+        self.record_reconciliation(run_id, self.HUMAN_ROUND, key, status, kind=RECONCILE_HUMAN)
 
     def answered_objections(self, run_id: str) -> dict[str, str]:
         """``{key: status}`` of the human objections this run has answered."""
-        return self.reconciliations(run_id, self.HUMAN_ROUND)
+        return self.reconciliations(run_id, self.HUMAN_ROUND, kind=RECONCILE_HUMAN)
 
     # Advisory-check fix rounds (#611) live under their own sentinel round:
     # a regression on a check the base does not require gets one round,
@@ -1132,21 +1165,23 @@ class StateStore:
 
     def record_advisory_round(self, run_id: str, check: str) -> None:
         """Note that this run spent its one fix round on advisory ``check``."""
-        self.record_reconciliation(run_id, self.ADVISORY_ROUND, check, "spent")
+        self.record_reconciliation(
+            run_id, self.ADVISORY_ROUND, check, "spent", kind=RECONCILE_ADVISORY
+        )
 
     def advisory_rounds(self, run_id: str) -> frozenset[str]:
         """The advisory checks this run has already spent a round on."""
-        return frozenset(self.reconciliations(run_id, self.ADVISORY_ROUND))
+        return frozenset(self.reconciliations(run_id, self.ADVISORY_ROUND, kind=RECONCILE_ADVISORY))
 
     # An automated reviewer's changes-requested review buys one fix round
     # per run (#613); the same sentinel pattern says whether it was spent.
     BOT_ROUND = -3
 
     def record_bot_round(self, run_id: str) -> None:
-        self.record_reconciliation(run_id, self.BOT_ROUND, "bot", "spent")
+        self.record_reconciliation(run_id, self.BOT_ROUND, "bot", "spent", kind=RECONCILE_BOT)
 
     def bot_round_spent(self, run_id: str) -> bool:
-        return "bot" in self.reconciliations(run_id, self.BOT_ROUND)
+        return "bot" in self.reconciliations(run_id, self.BOT_ROUND, kind=RECONCILE_BOT)
 
     # Round n+1's confirmations of carried-over findings share the table too,
     # under their own negative rounds: they are keyed by the *same* anchors a
@@ -1159,12 +1194,17 @@ class StateStore:
     ) -> None:
         """Note that review round ``round`` has confirmed ``anchor`` in its thread."""
         self.record_reconciliation(
-            run_id, self.CONFIRM_ROUND_BASE - round, anchor, status, resolved=resolved
+            run_id,
+            self.CONFIRM_ROUND_BASE - round,
+            anchor,
+            status,
+            resolved=resolved,
+            kind=RECONCILE_CONFIRM,
         )
 
     def confirmations(self, run_id: str, round: int) -> dict[str, str]:
         """``{anchor: status}`` this review round has already confirmed."""
-        return self.reconciliations(run_id, self.CONFIRM_ROUND_BASE - round)
+        return self.reconciliations(run_id, self.CONFIRM_ROUND_BASE - round, kind=RECONCILE_CONFIRM)
 
     # "noted, not blocking" replies live in their own negative band too, so
     # an approving round's note on an anchor never shadows a reconciliation
@@ -1176,12 +1216,17 @@ class StateStore:
     ) -> None:
         """Note that review round ``round`` has answered a non-blocking finding."""
         self.record_reconciliation(
-            run_id, self.NOTED_ROUND_BASE - round, anchor, status, resolved=resolved
+            run_id,
+            self.NOTED_ROUND_BASE - round,
+            anchor,
+            status,
+            resolved=resolved,
+            kind=RECONCILE_NOTED,
         )
 
     def noted(self, run_id: str, round: int) -> dict[str, str]:
         """``{anchor: status}`` this review round has already noted."""
-        return self.reconciliations(run_id, self.NOTED_ROUND_BASE - round)
+        return self.reconciliations(run_id, self.NOTED_ROUND_BASE - round, kind=RECONCILE_NOTED)
 
     # -- events ------------------------------------------------------------
 
