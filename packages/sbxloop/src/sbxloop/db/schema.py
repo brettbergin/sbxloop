@@ -20,6 +20,9 @@ one that stopped depending on the old shape.
 
 from __future__ import annotations
 
+import logging
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from alembic import command
@@ -29,6 +32,26 @@ from alembic.script import ScriptDirectory
 from sqlalchemy import Connection, Engine
 
 MIGRATIONS_DIR = Path(__file__).parent / "migrations"
+
+#: Alembic narrates every step at INFO. That is right for a developer
+#: running it by hand and wrong here: the daemon migrates on open, and its
+#: log ring buffer is what an operator reads over chat — three lines of
+#: "Context impl SQLiteImpl" per start would push out the run they were
+#: looking for. A migration that actually fails still raises.
+_ALEMBIC_LOGGERS = ("alembic", "alembic.runtime.migration", "alembic.autogenerate")
+
+
+@contextmanager
+def _quiet_alembic() -> Iterator[None]:
+    """Hold Alembic's own loggers at WARNING for the duration of a call."""
+    saved = [(logging.getLogger(name), logging.getLogger(name).level) for name in _ALEMBIC_LOGGERS]
+    for logger, _ in saved:
+        logger.setLevel(logging.WARNING)
+    try:
+        yield
+    finally:
+        for logger, level in saved:
+            logger.setLevel(level)
 
 
 def _config(connection: Connection) -> Config:
@@ -53,7 +76,8 @@ def head_revision() -> str:
 
 def current_revision(engine: Engine) -> str | None:
     """The revision ``engine``'s database is stamped at, or None if unstamped."""
-    with engine.connect() as conn:
+    # `MigrationContext.configure` narrates too, and this runs on every open.
+    with _quiet_alembic(), engine.connect() as conn:
         return MigrationContext.configure(conn).get_current_revision()
 
 
@@ -65,7 +89,8 @@ def ensure_schema(engine: Engine) -> None:
     ``alembic_version`` and nothing more, which is why it can sit in a store's
     constructor.
     """
-    if current_revision(engine) == head_revision():
-        return
-    with engine.connect() as conn:
-        command.upgrade(_config(conn), "head")
+    with _quiet_alembic():
+        if current_revision(engine) == head_revision():
+            return
+        with engine.connect() as conn:
+            command.upgrade(_config(conn), "head")

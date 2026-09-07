@@ -34,6 +34,16 @@ def exec_raw(store: HasEngine, sql: str, params: Sequence[Any] = ()) -> None:
         conn.exec_driver_sql(sql, tuple(params))
 
 
+def query_raw(store: HasEngine, sql: str, params: Sequence[Any] = ()) -> list[Any]:
+    """Read raw rows out of a store's database.
+
+    For the checks that are *about* the physical schema — a PRAGMA, a
+    sqlite_master listing — which no store method exposes and none should.
+    """
+    with store._engine.connect() as conn:
+        return list(conn.exec_driver_sql(sql, tuple(params)))
+
+
 def backdate(store: HasEngine, run_id: str, updated_at: float) -> None:
     """Move a run's ``updated_at`` into the past.
 
