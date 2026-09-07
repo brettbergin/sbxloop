@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple
 
 from sbxloop import backends, hostgit, toolchains
-from sbxloop.config import Config, CredentialConfig, RegistryConfig, RepoConfig
+from sbxloop.config import Config, CredentialConfig, RegistryConfig, RepoConfig, SandboxConfig
 from sbxloop.engine.model import RunKind
 from sbxloop.errors import ConfigError, GithubOpsError, ProvisionError, SbxError
 from sbxloop.events import EventBus
@@ -177,6 +177,26 @@ class GhApp:
 
 
 GhCredential = GhPat | GhApp
+
+
+class ContinueBranch(NamedTuple):
+    """Cut the run's clone from ``branch`` — published work to continue —
+    instead of a fresh branch off the base (#646). ``optional`` says an
+    unfetchable branch is survivable: a restart continuing a previous
+    attempt's push (#600) starts fresh with a logged reason, while a
+    resume that must find its own work fails. The engine passes one to
+    :meth:`Provisioner.ensure_pair`; ``[sandbox] continue_branch`` is the
+    operator's way to ask for the same thing by hand."""
+
+    branch: str
+    optional: bool = False
+
+
+def continue_from_config(sandbox: SandboxConfig) -> ContinueBranch | None:
+    """The operator's ``[sandbox] continue_branch`` knob as a parameter."""
+    if not sandbox.continue_branch:
+        return None
+    return ContinueBranch(sandbox.continue_branch, sandbox.continue_branch_optional)
 
 
 class GhCredentialStatus(NamedTuple):
@@ -424,6 +444,9 @@ class Provisioner:
         self.bus = bus or EventBus()
         self.env = os.environ if env is None else env
         self.post_create = post_create
+        # What the next ensure_pair cuts the clone from (#646): the operator's
+        # knob until a caller passes its own.
+        self._continue: ContinueBranch | None = continue_from_config(config.sandbox)
         self._sbx_version: str | None = None
         self._sbx_version_known = False
         # Serializes the version lookup and the cache file's read-modify-
@@ -787,8 +810,14 @@ class Provisioner:
         expects_mount: bool | None = None,
         credentials: Sequence[str] = (),
         kind: RunKind = "code",
+        continue_branch: ContinueBranch | None = None,
     ) -> SandboxPair:
         """Provision the run's sandbox pair around its workspace.
+
+        ``continue_branch`` (#646) cuts the clone from published work — a
+        restart adopting the branch a previous attempt pushed — instead of
+        a fresh branch off the base; None falls back to the operator's
+        ``[sandbox] continue_branch``.
 
         ``expects_mount`` says whether the agent sandbox must see the
         workspace: None lets the workspace's origin decide (an explicit path
@@ -806,6 +835,11 @@ class Provisioner:
         directory that starts empty. Its ``workspace`` is passed only by a
         resume, pinning the same data directory.
         """
+        self._continue = (
+            continue_branch
+            if continue_branch is not None
+            else continue_from_config(self.config.sandbox)
+        )
         if workspace is not None:
             # An explicit workspace is authoritative: it is either the
             # resume pin from the runs table (which must be reused in place
@@ -1032,7 +1066,8 @@ class Provisioner:
                 "PATH to clone it from its remote"
             )
         url = f"{self.config.github.web_url}/{repo}"
-        continue_branch = self.config.sandbox.continue_branch
+        continuing = self._continue
+        continue_branch = continuing.branch if continuing is not None else None
         branch = continue_branch or self._branch_name(run_id, repo)
         clone_filter = self.config.sandbox.clone_filter
         token = self._clone_token(repo)
@@ -1047,10 +1082,12 @@ class Provisioner:
                 token=token,
             )
         except ProvisionError as exc:
-            if continue_branch and self.config.sandbox.continue_branch_optional:
+            if continuing is not None and continuing.optional:
                 # The offered branch is not on the remote any more: start
                 # fresh rather than fail the run (#600).
-                branch = self._fresh_after_missing_continue(run_id, continue_branch, exc, clone_dir)
+                branch = self._fresh_after_missing_continue(
+                    run_id, continuing.branch, exc, clone_dir
+                )
                 sha = hostgit.clone_from_remote(
                     url, clone_dir, branch, clone_filter=clone_filter, token=token
                 )
@@ -1297,7 +1334,8 @@ class Provisioner:
             )
             return clone_dir
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
-        existing = self.config.sandbox.continue_branch
+        continuing = self._continue
+        existing = continuing.branch if continuing is not None else None
         sha: str | None = None
         message = ""
         if existing:
@@ -1308,7 +1346,7 @@ class Provisioner:
             try:
                 sha = hostgit.clone_existing_branch(source, clone_dir, existing)
             except ProvisionError as exc:
-                if not self.config.sandbox.continue_branch_optional:
+                if continuing is None or not continuing.optional:
                     raise
                 # A restart offered a branch that is no longer fetchable
                 # (deleted on origin, never fetched here): a fresh start is
