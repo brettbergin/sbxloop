@@ -229,6 +229,7 @@ SOURCE_ROOT = REPO_ROOT / "packages" / "sbxloop" / "src" / "sbxloop"
 
 # Credentials the code reads by name; each must be documented in .env.example.
 CREDENTIAL_ENVS = {
+    "GLITCHTIP_DSN",
     "COPILOT_GITHUB_TOKEN",
     "GH_TOKEN",
     "GITHUB_TOKEN",
