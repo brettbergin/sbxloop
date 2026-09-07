@@ -42,6 +42,9 @@ from zoneinfo import ZoneInfo
 
 from sbxloop import __version__, hostgit
 from sbxloop.config import Config, GithubConfig, SandboxConfig, ScheduleConfig
+from sbxloop.daemon.campaign_runner import CampaignCoordinator
+from sbxloop.daemon.campaign_source import source_for_campaign
+from sbxloop.daemon.campaigns import CampaignError, CampaignPlan, CampaignStepPlan
 from sbxloop.daemon.github import DaemonGithub
 from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
 from sbxloop.daemon.logsink import event_log_subscriber
@@ -330,6 +333,18 @@ class DaemonLoop:
         # The import is reached from the loop thread (a tick) and from a
         # concierge command alike; one of them does it.
         self._schedules_lock = threading.Lock()
+        # One scheduling boundary for campaign controls, source preparation,
+        # discovery and claim reservation. Never held around an engine run.
+        self._campaign_lock = threading.RLock()
+        self.campaign_runner = CampaignCoordinator(
+            config,
+            store,
+            dstore,
+            lambda: self.source,
+            clock,
+            self._notice,
+            self._issue_context_block,
+        )
 
     # -- external control ---------------------------------------------------------
 
@@ -523,7 +538,12 @@ class DaemonLoop:
         by: str | None = None,
     ) -> WorkItem:
         """Move pending work without changing retry timing or interrupting a run."""
-        moved = self.dstore.move_queued(item_id, before=before, after=after)
+        with self._campaign_lock:
+            for key in (item_id, before or after):
+                candidate = self.dstore.get(key) if key else None
+                if candidate is not None and self.campaign_runner.campaigns.member(candidate):
+                    raise CampaignError("use campaign move to reorder campaign steps")
+            moved = self.dstore.move_queued(item_id, before=before, after=after)
         relation = "before" if before is not None else "after"
         anchor = normalize_item_id(before if before is not None else after or "")
         who = by or "operator"
@@ -536,6 +556,78 @@ class DaemonLoop:
             anchor=anchor,
         )
         return moved
+
+    def admit_campaign(self, plan: CampaignPlan) -> str:
+        with self._campaign_lock:
+            return self.campaign_runner.admit(plan)
+
+    def start_campaign(self, campaign_id: str, item_ids: list[str], by: str | None = None) -> str:
+        """Admit an explicitly ordered list of existing pristine queue items."""
+        with self._campaign_lock:
+            existing = self.campaign_runner.campaigns.get(campaign_id)
+            if existing is not None:
+                original = [step.item.item_id for step in existing.plan.steps]
+                requested = [
+                    self.campaign_runner.campaigns._step_for_id(existing, key).item.item_id
+                    for key in item_ids
+                ]
+                if requested != original:
+                    raise CampaignError(f"campaign {campaign_id} already has a different plan")
+                return self.campaign_runner.status(campaign_id)
+            steps: list[CampaignStepPlan] = []
+            for item_id in item_ids:
+                item = self.dstore.get(item_id)
+                if item is None:
+                    raise CampaignError(f"unknown queued work item: {item_id}")
+                base = None
+                if item.kind == "code":
+                    repo = self._item_repo(item) or self.config.github.repo
+                    if repo is None:
+                        raise CampaignError(f"{item_id} needs an explicit repository")
+                    item = item.model_copy(update={"repo": repo})
+                    base = self.config.github.for_repo(repo).deliver_base
+                    if base is None:
+                        source = source_for_campaign(self.source, item)
+                        if source is None:
+                            raise CampaignError(f"{item_id} has no GitHub source")
+                        base = source._ops().default_branch(repo)
+                steps.append(CampaignStepPlan.model_validate({"item": item, "expected_base": base}))
+            return self.campaign_runner.admit(
+                CampaignPlan(
+                    campaign_id=campaign_id,
+                    title=campaign_id,
+                    requested_by=by or "operator",
+                    steps=tuple(steps),
+                )
+            )
+
+    def campaign_status(self, campaign_id: str | None = None) -> str:
+        with self._campaign_lock:
+            return self.campaign_runner.status(campaign_id)
+
+    def hold_campaign(
+        self, campaign_id: str, by: str | None = None, reason: str = "operator hold"
+    ) -> str:
+        with self._campaign_lock:
+            return self.campaign_runner.hold(campaign_id, by, reason)
+
+    def resume_campaign(self, campaign_id: str, by: str | None = None) -> str:
+        with self._campaign_lock:
+            return self.campaign_runner.resume(campaign_id, by)
+
+    def move_campaign_step(
+        self,
+        campaign_id: str,
+        item_id: str,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        by: str | None = None,
+    ) -> str:
+        with self._campaign_lock:
+            return self.campaign_runner.move(
+                campaign_id, item_id, before=before, after=after, by=by
+            )
 
     def _close_dead_run(self, run_id: str, result: str, now: float) -> None:
         """A pinned run that will never be resumed: drop its sandboxes and
@@ -865,6 +957,8 @@ class DaemonLoop:
         # A parked PR's review poll (#675) is not new work: it runs even
         # paused, so an approval given during a pause still lands.
         self._review_tick(now)
+        with self._campaign_lock:
+            self.campaign_runner.reconcile()
         if self.paused:
             return TickResult(idle_kind="paused")
         if self._breaker_open(now):
@@ -886,13 +980,49 @@ class DaemonLoop:
                     resets_at=day_end,
                 )
             return TickResult(idle_kind="daily_cap")
-        discovered = self._discover(now) + self._fire_schedules(now)
-        item = self.dstore.reserve_next_queued(now, self.config.daemon.retry_backoff_s)
+        with self._campaign_lock:
+            discovered = self.campaign_runner.enqueue_ready()
+            discovered += self._discover(now) + self._fire_schedules(now)
+            item = self.dstore.reserve_next_queued(
+                now, self.config.daemon.retry_backoff_s, allows=self.campaign_runner.allows
+            )
+            if item is not None and not item.claimed:
+                assert item.claim_token is not None
+                self._claiming = item.item_id
+                try:
+                    with defer_signals():
+                        claimed = self.source.claim(item)
+                        if claimed:
+                            self.dstore.mark_claimed(item.item_id, now)
+                finally:
+                    self._claiming = None
+                if not claimed:
+                    if self.campaign_runner.claim_failed(item):
+                        return TickResult(
+                            discovered=discovered, dispatched=item.item_id, outcome="failed"
+                        )
+                    self.dstore.discard(item.item_id)
+                    self._notice(
+                        "item.claim_failed",
+                        f"could not claim {item.item_id} ({item.title}); "
+                        "forgotten — re-queued by the next poll if the trigger label "
+                        "is still on it",
+                        item=item.item_id,
+                        title=item.title,
+                    )
+                    return TickResult(
+                        discovered=discovered, dispatched=item.item_id, outcome="failed"
+                    )
+                log.info("item.claimed", item=item.item_id, title=item.title)
         if item is None:
             # Say WHY there is nothing to run: a queue full of items sitting
             # in retry backoff reads as "no work" otherwise (field: --once
             # after a failed attempt printed no_work with no explanation).
-            waiting = self.dstore.queued()
+            waiting = [
+                candidate
+                for candidate in self.dstore.queued()
+                if self.campaign_runner.allows(candidate)
+            ]
             if waiting:
                 soonest = min(
                     max(
@@ -908,42 +1038,12 @@ class DaemonLoop:
                     idle_detail=f"{len(waiting)} queued; next eligible in {soonest:.0f}s",
                 )
             return TickResult(discovered=discovered, idle_kind="no_work")
-        if not item.claimed:
-            # The claim's token is persisted before the comment goes up, and
-            # SIGTERM/SIGINT are held until the claim is complete (#530): a
-            # process that dies mid-claim either never posted, or left a row
-            # recovery can settle against the comment it did post.
-            # Selection reserved the token atomically: an accepted queue move
-            # cannot race this claim and leave us dispatching the old order.
-            assert item.claim_token is not None
-            self._claiming = item.item_id
-            try:
-                with defer_signals():
-                    claimed = self.source.claim(item)
-                    if claimed:
-                        self.dstore.mark_claimed(item.item_id, now)
-            finally:
-                self._claiming = None
-            if not claimed:
-                # Not ours to run — another daemon won, the issue closed, the
-                # trigger label went away, or GitHub was down. Never a
-                # terminal row: that is what discovery dedups against, and
-                # what made a lost race permanent. The next poll re-creates
-                # the row if the trigger label is (still, or again) there.
-                self.dstore.discard(item.item_id)
-                self._notice(
-                    "item.claim_failed",
-                    f"could not claim {item.item_id} ({item.title}); forgotten — "
-                    "re-queued by the next poll if the trigger label is still on it",
-                    item=item.item_id,
-                    title=item.title,
-                )
-                return TickResult(discovered=discovered, dispatched=item.item_id, outcome="failed")
-            log.info("item.claimed", item=item.item_id, title=item.title)
         if item.run_id is not None:
             outcome = self._resume(item, now)
         else:
             outcome = self._dispatch(item, resume_run_id=None)
+        with self._campaign_lock:
+            self.campaign_runner.reconcile()
         return TickResult(discovered=discovered, dispatched=item.item_id, outcome=outcome)
 
     def _resume(self, item: WorkItem, now: float) -> TickOutcome:
@@ -1202,6 +1302,9 @@ class DaemonLoop:
             )
         fresh = 0
         for item in found:
+            if not self.campaign_runner.allows(item):
+                continue
+            item = self.campaign_runner.snapshot_item(item)
             if self.dstore.upsert_new(item, now):
                 fresh += 1
                 self._notice(
@@ -1509,6 +1612,7 @@ class DaemonLoop:
         else:
             self.dstore.mark_resuming(item.item_id, run_id, now)
             item = self.dstore.get(item.item_id) or item
+        item = self.campaign_runner.snapshot_item(item)
         log.info(
             "run.dispatch",
             item=item.item_id,
@@ -2864,6 +2968,17 @@ class DaemonLoop:
                 "deliver_closes": issue if item.kind == "code" else None,
             }
         )
+        campaign_step = self.campaign_runner.campaigns.member(item)
+        if campaign_step is not None and item.kind == "code":
+            base = campaign_step.expected_base
+            gh = gh.model_copy(
+                update={
+                    "deliver_base": base,
+                    "repos": [
+                        entry.model_copy(update={"deliver_base": base}) for entry in gh.repos
+                    ],
+                }
+            )
         update: dict[str, Any] = {"github": gh, "keep_on_failure": False}
         if item.kind == "workload" and issue is not None:
             # The workload's issue sink answers on the issue that asked
@@ -3021,6 +3136,24 @@ class DaemonLoop:
         explicit line saying the discussion is missing — the run goes on
         with the ask itself rather than waiting on a GitHub read.
         """
+        campaign_step = self.campaign_runner.campaigns.member(item)
+        if campaign_step is not None:
+            item = self.campaign_runner.snapshot_item(item)
+            campaign = self.campaign_runner.campaigns.get(campaign_step.campaign_id)
+            assert campaign is not None
+            parts = [item.title.strip(), _MARKER_RE.sub("", item.body).strip()]
+            provenance = (
+                f"---\nCampaign {campaign_step.campaign_id}, step {campaign_step.position}. "
+                f"Admitted by {campaign.plan.requested_by}; source: {item.url or item.item_id}."
+            )
+            if campaign_step.context:
+                room = self.config.budgets.outcome_max_chars - len(
+                    "\n\n".join([*parts, "", provenance])
+                )
+                parts.append(
+                    _fit_context(campaign_step.context, room, self.config.budgets.outcome_max_chars)
+                )
+            return "\n\n".join([*parts, provenance])
         if is_local_id(item.item_id):
             # A chat ask (#760) or a schedule tick (#761): the ask is the
             # whole ask, and there is no issue discussion to fetch.
@@ -3401,6 +3534,8 @@ class DaemonLoop:
                 )
         self._settle_offline_overrides()
         self._reconcile_orphan_runs()
+        with self._campaign_lock:
+            self.campaign_runner.reconcile()
 
     def _settle_half_claims(self) -> None:
         """Rows whose claim was started but never completed (#530): the

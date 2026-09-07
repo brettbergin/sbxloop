@@ -51,6 +51,9 @@ COMMANDS: tuple[str, ...] = (
     "queue",
     "move <item> before|after <item>",
     "items",
+    "campaigns [name]",
+    "campaign start <name> <item>...|hold <name> [reason]|resume <name>|"
+    "move <name> <item> before|after <item>",
     "abandon <item> [reason]",
     "retry <item>",
     "requeue <item>",
@@ -66,7 +69,9 @@ COMMANDS: tuple[str, ...] = (
 # Verbs that may talk to the source (GitHub through the ops sandbox —
 # seconds, not milliseconds); a surface with an event loop to protect runs
 # these off it.
-ITEM_COMMANDS: frozenset[str] = frozenset({"abandon", "retry", "requeue", "grant-rounds"})
+ITEM_COMMANDS: frozenset[str] = frozenset(
+    {"abandon", "retry", "requeue", "grant-rounds", "campaign"}
+)
 
 CTL_SUBDIR = Path("daemon") / "ctl"
 _REQUEST_SUFFIX = ".json"
@@ -117,7 +122,7 @@ def usage(prefix: str) -> str:
 
 # Read-only commands: answered constantly by dashboards and humans checking
 # in, so they trace at DEBUG; every mutating command is an INFO audit line.
-_READ_ONLY_COMMANDS = frozenset({"status", "queue", "items", "log", "schedules"})
+_READ_ONLY_COMMANDS = frozenset({"status", "queue", "items", "log", "schedules", "campaigns"})
 
 #: The daemon's log levels, as ``log`` accepts them — the one list
 #: ``[daemon] log_level`` accepts, so the three surfaces cannot drift.
@@ -306,6 +311,40 @@ def _schedule_add_args(name: str, args: list[str]) -> Any:
         errors = getattr(exc, "errors", None)
         first = errors()[0]["msg"] if callable(errors) else str(exc)
         return f"schedules add failed: {first.removeprefix('Value error, ')}"
+
+
+_CAMPAIGN_USAGE = (
+    "usage: campaign start <name> <item>... | hold <name> [reason] | resume <name> | "
+    "move <name> <item> before|after <item>"
+)
+
+
+def _campaign(loop: Any, args: list[str], by: str | None) -> CommandReply:
+    if not args:
+        return CommandReply(_CAMPAIGN_USAGE, ok=False)
+    verb = args[0].lower()
+    try:
+        if verb == "start" and len(args) >= 3:
+            return CommandReply(loop.start_campaign(args[1], args[2:], by=by))
+        if verb == "hold" and len(args) >= 2:
+            return CommandReply(
+                loop.hold_campaign(args[1], by=by, reason=" ".join(args[2:]) or "operator hold")
+            )
+        if verb == "resume" and len(args) == 2:
+            return CommandReply(loop.resume_campaign(args[1], by=by))
+        if verb == "move" and len(args) == 5 and args[3].lower() in ("before", "after"):
+            return CommandReply(
+                loop.move_campaign_step(
+                    args[1],
+                    args[2],
+                    before=args[4] if args[3].lower() == "before" else None,
+                    after=args[4] if args[3].lower() == "after" else None,
+                    by=by,
+                )
+            )
+    except (ValueError, KeyError) as exc:
+        return CommandReply(f"campaign {verb} failed: {exc.args[0] if exc.args else exc}", ok=False)
+    return CommandReply(_CAMPAIGN_USAGE, ok=False)
 
 
 def _schedules(loop: Any, args: list[str], by: str | None) -> CommandReply:
@@ -517,6 +556,15 @@ def _dispatch(
         )
     if word == "items":
         return CommandReply(items_lines(loop.dstore.items()))
+    if word == "campaign":
+        return _campaign(loop, args, by)
+    if word == "campaigns":
+        if len(args) > 1:
+            return CommandReply("usage: campaigns [name]", ok=False)
+        try:
+            return CommandReply(loop.campaign_status(args[0] if args else None))
+        except (ValueError, KeyError) as exc:
+            return CommandReply(f"campaigns failed: {exc.args[0] if exc.args else exc}", ok=False)
     if word == "grant-rounds":
         return _grant_rounds(loop, args, by)
     if word == "resume-repo":

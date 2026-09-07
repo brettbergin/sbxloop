@@ -2562,6 +2562,7 @@ def daemon(
         if github is not None:
             log.debug("daemon.shutdown", step="github sandbox")
             github.close()
+        loop.campaign_runner.close()
         dstore.close()
         log.info(
             "daemon.stopped",
@@ -2741,7 +2742,8 @@ def daemon_ctl(
         list[str],
         typer.Argument(
             help="status | pause [--hold NAME] | resume [--hold NAME|--all] | cancel "
-            "[--retry] | queue | items | abandon <item> [reason] | retry <item> | "
+            "[--retry] | queue | move <item> before|after <item> | items | campaigns [name] | "
+            "campaign start|hold|resume|move ... | abandon <item> [reason] | retry <item> | "
             "requeue <item> | grant-rounds <run> <n> | log [--tail N] [--level L] [--grep T] "
             "| stop (the chat !sbx verbs)."
         ),

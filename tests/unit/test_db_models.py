@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from sqlalchemy import Engine, inspect
 
+import sbxloop.db.campaign_models
 import sbxloop.db.daemon_models
 import sbxloop.db.engine_models  # noqa: F401  - registers the models on Base
 from sbxloop.daemon.store import DaemonStore
@@ -36,6 +37,8 @@ DAEMON_TABLES = (
     "daemon_pending_clarifications",
     "daemon_local_messages",
     "daemon_schedules",
+    "daemon_campaigns",
+    "daemon_campaign_steps",
 )
 ALL_TABLES = ENGINE_TABLES + DAEMON_TABLES
 

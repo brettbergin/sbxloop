@@ -981,6 +981,32 @@ run; an item whose backoff has not elapsed remains ineligible. New items
 join the end with an increasing admission sequence. Displayed positions
 change when work moves or leaves the queue; work item identities stay fixed.
 
+For work that must finish in order, admit an ordered **campaign**:
+`sbxloop daemon ctl campaign start <name> <item> <item> ...`, or the same
+command after `!sbx` in chat. Each listed item must be queued, unclaimed,
+and never started. Admission saves the complete asks and their order, then
+parks the members' run labels. The daemon makes only the first unfinished
+step eligible and advances automatically after verified delivery. A code
+step needs its PR merged into the admitted target branch; a workload needs
+completed tasks and matching publication receipts. Merely closing an issue
+or marking an item done does not advance a campaign.
+
+`campaigns` lists progress; `campaigns <name>` shows each step and the reason
+the campaign is waiting. `campaign hold <name> [reason]` stops new dispatches
+without interrupting the active run. `campaign resume <name>` releases that
+hold; it does not waive a failed step, review gate, or missing delivery proof.
+Use the existing item retry or gate-release controls to resolve those waits.
+`campaign move <name> <item> before|after <other-item>` reorders unstarted
+members when their declared prerequisites allow it. All commands work
+through `sbxloop daemon ctl` and chat, and changes appear in the chronology.
+
+Campaigns survive daemon restarts. Their saved scope is fixed, and completed
+members retain their delivery evidence. A campaign is serial internally;
+other eligible work can run while its next step is waiting or in backoff.
+Existing running, completed, or previously attempted items cannot be admitted
+in this first version. A source read or ownership conflict holds the campaign
+with a reason so a person can resolve it and resume.
+
 `<item>` is a work item id. GitHub items are **typed** —
 `gh:issue:<number>` for the issue a run was claimed from, `gh:pr:<number>`
 for a pull request referenced as a work-item resource — and the untyped

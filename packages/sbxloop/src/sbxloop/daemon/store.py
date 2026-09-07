@@ -2055,7 +2055,9 @@ class DaemonStore:
             )
         )
 
-    def reserve_next_queued(self, now: float, backoff_s: float) -> WorkItem | None:
+    def reserve_next_queued(
+        self, now: float, backoff_s: float, *, allows: Callable[[WorkItem], bool] | None = None
+    ) -> WorkItem | None:
         """Select eligible work and reserve its claim in one transaction.
 
         A move either commits first and determines this selection, or sees
@@ -2067,7 +2069,9 @@ class DaemonStore:
         with self._write(immediate=True) as session:
             for row in session.scalars(self._queued_query()):
                 item = _row_to_item(row)
-                if dispatch_eligible_at(item, backoff_s) > now:
+                if dispatch_eligible_at(item, backoff_s) > now or (
+                    allows is not None and not allows(item)
+                ):
                     continue
                 if not item.claimed and not item.claim_token:
                     row.claim_token = uuid.uuid4().hex
