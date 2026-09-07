@@ -7,9 +7,14 @@ actually opens a console with: *is this working well?*
 
 It answers that in prose and proportion rather than in a grid. One live
 line on top, a narrow rail of pages beside the console's own, and a page
-that states its finding in a sentence before it draws a bar. Five pages,
-because five metric classes fought over one screen and lost; given a page
-each, every one of them fits in a few lines.
+that states its finding in a sentence before it draws a bar. Six pages,
+because that many metric classes fought over one screen and lost; given a
+page each, every one of them fits in a few lines.
+
+Most of the drawing is :mod:`sbxloop.tui.widgets.band` — one row, solid
+colour, no axis, and the right answer to every "what share" question here.
+Spread is the exception: *what shape* needs a scale, so that page and the
+Cost trend use :mod:`sbxloop.tui.widgets.chart`.
 
 The numbers are :mod:`sbxloop.tui.analytics`, recomputed on a slow timer of
 its own — nothing in a week-long window changes between console ticks.
@@ -18,6 +23,7 @@ its own — nothing in a week-long window changes between console ticks.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Any, ClassVar, NamedTuple
 
 from rich.text import Text
@@ -25,14 +31,15 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Sparkline, Static
+from textual.widgets import Static
 from textual.worker import get_current_worker
 
 from sbxloop.tui import analytics
-from sbxloop.tui.analytics import Analytics, Lane
+from sbxloop.tui.analytics import Analytics, Lane, RunRow
 from sbxloop.tui.data import ConsoleState
 from sbxloop.tui.format import age
 from sbxloop.tui.screens.base import ConsoleScreen
+from sbxloop.tui.widgets import chart
 from sbxloop.tui.widgets.band import (
     BAD_COLOUR,
     IDLE_COLOUR,
@@ -62,6 +69,7 @@ PAGES: tuple[PageItem, ...] = (
     PageItem("c", "cost", "Cost"),
     PageItem("t", "time", "Time"),
     PageItem("h", "health", "Health"),
+    PageItem("d", "spread", "Spread"),
 )
 
 
@@ -131,7 +139,7 @@ class OverviewScreen(ConsoleScreen):
     OverviewScreen .lab { width: 13; color: $text-muted; }
     OverviewScreen .lab-wide { width: 30; color: $text-muted; }
     OverviewScreen .val { width: 11; text-style: bold; }
-    OverviewScreen Sparkline { height: 1; width: 28; }
+    OverviewScreen .cap { color: $text-muted; }
     OverviewScreen.-narrow PageRail { display: none; }
     """
 
@@ -255,6 +263,7 @@ class OverviewScreen(ConsoleScreen):
             "cost": self._cost,
             "time": self._time,
             "health": self._health,
+            "spread": self._spread,
         }[self.page]
         for widget in builder(data):
             body.mount(widget)
@@ -430,15 +439,21 @@ class OverviewScreen(ConsoleScreen):
             )
         return None
 
+    @staticmethod
+    def _bucket_label(data: Analytics, offset: int, fmt: str) -> str:
+        """Which day a bucket is, taken from the middle of the bucket so
+        rounding cannot push it into the neighbouring one."""
+        when = time.localtime(
+            data.since + (offset + 0.5) * (data.until - data.since) / max(len(data.days), 1)
+        )
+        return time.strftime(fmt, when)
+
     def _days(self, data: Analytics) -> list[Any]:
         """The trend as a stack: each bucket split by how its runs ended."""
         peak = max((d.runs for d in data.days), default=0) or 1
         out: list[Any] = []
         for offset, day in enumerate(data.days):
-            when = time.localtime(
-                data.since + (offset + 0.5) * (data.until - data.since) / max(len(data.days), 1)
-            )
-            label = time.strftime("%a %d", when)
+            label = self._bucket_label(data, offset, "%a %d")
             segments = [
                 Segment("landed", day.landed, OK_COLOUR),
                 Segment("failed", day.failed, BAD_COLOUR),
@@ -535,9 +550,11 @@ class OverviewScreen(ConsoleScreen):
             ),
             TextPanel("", classes="gap"),
             TextPanel("turns per day", classes="h"),
-            Sparkline([float(x) for x in data.daily["turns"]], summary_function=max),
-            TextPanel("", classes="gap"),
         ]
+        # A sparkline drew this shape but named no value on it: the peak
+        # and the floor looked the same on a quiet week as on a heavy one.
+        out.extend(self._trend(data, "turns", PALETTE[1]))
+        out.append(TextPanel("", classes="gap"))
         # Which phase burns the turns — the total says how much, this says
         # where, and only the second one is actionable.
         by_turns = data.phase_turns
@@ -791,6 +808,143 @@ class OverviewScreen(ConsoleScreen):
                     (" CI rounds   ", "dim"),
                     (f"{total.cancelled}", "bold"),
                     (" cancelled by you", "dim"),
+                )
+            )
+        )
+        return out
+
+    @staticmethod
+    def _captioned(drawn: chart.Chart) -> list[Any]:
+        """A plot and the sentence saying what is in it. `render` paints a
+        chart, which leaves nothing for a screen reader — or a test — to
+        read; the caption is the chart in words."""
+        return [drawn, TextPanel(Text(drawn.caption, style="dim"), classes="cap")]
+
+    def _trend(self, data: Analytics, metric: str, colour: str) -> list[Any]:
+        """A daily series against a labelled scale."""
+        series = [float(x) for x in data.daily.get(metric, ())]
+        if not series:
+            return [TextPanel(Text("no daily series", style="dim"))]
+        labels = [self._bucket_label(data, i, "%a") for i in range(len(series))]
+        return self._captioned(chart.bars(labels, series, colour))
+
+    def _distribution(
+        self,
+        values: list[float],
+        colour: str,
+        spread: Text,
+        fmt: Callable[[float], str] | None = None,
+    ) -> list[Any]:
+        """A histogram, under the median-and-p90 line either way.
+
+        Median and p90 say where the middle is; they say nothing about
+        whether the runs cluster there or sit in two camps either side of
+        it, which is the whole reason to draw the shape. Under
+        `chart.MIN_POINTS` runs there is no shape to see — every bin holds
+        one run — and the two numbers are the better answer alone."""
+        if not chart.enough(values):
+            return [
+                TextPanel(spread),
+                TextPanel(
+                    Text(
+                        f"{plural(len(values), 'run')} — too few to show a shape "
+                        f"(needs {chart.MIN_POINTS}).",
+                        style="dim",
+                    ),
+                    classes="cap",
+                ),
+            ]
+        # One bin per two runs, held between 6 and 12: fewer and the shape
+        # is a block, more and every bin holds one run and the histogram
+        # is just the scatter drawn worse.
+        bins = max(6, min(12, len(values) // 2))
+        return [*self._captioned(chart.histogram(values, bins, colour, fmt)), TextPanel(spread)]
+
+    def _spread(self, data: Analytics) -> list[Any]:
+        """How the week's runs are distributed, rather than what they
+        totalled. The totals are on Cost and Time; this page is the one
+        that shows an average hiding two populations."""
+        runs = list(data.runs_seen)
+        turns = [float(r.turns) for r in runs]
+        active = [r.active for r in runs]
+        t_median, t_p90 = data.turns_spread
+        a_median, a_p90 = data.active_spread
+        tail = t_p90 / t_median if t_median else 0.0
+        out: list[Any] = [
+            self._say(
+                (f"{len(runs)} runs", "bold"),
+                (" in the window. The middle one cost ", "dim"),
+                (f"{t_median:.0f} turns", "bold"),
+                (", the ninetieth ", "dim"),
+                (f"{t_p90:.0f}", f"bold {WAIT_COLOUR}" if tail >= 2 else "bold"),
+                (
+                    f" — a {tail:.1f}x tail." if tail >= 2 else " — no long tail.",
+                    "dim",
+                ),
+            ),
+            TextPanel("", classes="gap"),
+            TextPanel("turns per run", classes="h"),
+        ]
+        out.extend(
+            self._distribution(
+                turns,
+                PALETTE[1],
+                Text.assemble(
+                    ("median ", "dim"),
+                    (f"{t_median:.0f} turns", "bold"),
+                    ("   ·   p90 ", "dim"),
+                    (f"{t_p90:.0f} turns", "bold"),
+                ),
+            )
+        )
+        out.append(TextPanel("", classes="gap"))
+        out.append(TextPanel("working time per run", classes="h"))
+        out.extend(
+            self._distribution(
+                active,
+                PALETTE[0],
+                Text.assemble(
+                    ("median ", "dim"),
+                    (hm(a_median), "bold"),
+                    ("   ·   p90 ", "dim"),
+                    (hm(a_p90), "bold"),
+                ),
+                hm,
+            )
+        )
+        out.append(TextPanel("", classes="gap"))
+        out.append(TextPanel("turns against elapsed, one dot per run", classes="h"))
+        out.extend(self._cost_against_time(runs))
+        out.append(TextPanel("", classes="gap"))
+        out.extend(self._compare(data, [("turns", "turns", f"{data.total.turns:,}", True)]))
+        return out
+
+    def _cost_against_time(self, runs: list[RunRow]) -> list[Any]:
+        """Turns against elapsed. A run far off the crowd cost turns its
+        wall-clock does not explain — the shape a ranked list cannot show,
+        because a list is sorted by one axis and the outlier is the run
+        that disagrees with both."""
+        xs = [r.active + r.parked for r in runs]
+        ys = [float(r.turns) for r in runs]
+        if not chart.enough(xs):
+            return [
+                TextPanel(
+                    Text(
+                        f"{plural(len(xs), 'run')} — a scatter of that needs "
+                        f"{chart.MIN_POINTS}; the ranked lists on Cost and Time "
+                        "say more at this size.",
+                        style="dim",
+                    )
+                )
+            ]
+        out = self._captioned(chart.scatter(xs, ys, PALETTE[4], hm, whole_y=True))
+        out.append(
+            TextPanel(
+                Text.assemble(
+                    ("x: elapsed", "dim"),
+                    ("   ·   ", "dim"),
+                    ("y: turns", "dim"),
+                    ("   ·   o opens the costliest", "dim"),
                 )
             )
         )

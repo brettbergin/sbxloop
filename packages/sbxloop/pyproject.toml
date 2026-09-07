@@ -34,6 +34,10 @@ dependencies = [
     # provisions is chosen against it (#627).
     "packaging>=24",
     "textual>=8.2",
+    # The overview's distributions and trends (`tui/widgets/chart.py`).
+    # Bands cover every "what share" question and cover it better; these
+    # are the plots that need a scale. Pure Python, no transitive deps.
+    "textual-plotext>=1.0.1",
     # Round-trip TOML for the console's config editor: setting one key must
     # keep every comment and every other line of the operator's file
     # (`tui/configtoml.py`); `tomllib` reads but cannot write.

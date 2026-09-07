@@ -68,23 +68,24 @@ Screens are **modes**: each keeps its cursor and scroll when you jump away
 and back. A run opens as a pushed screen over the one you were on; `Esc`
 returns.
 
-| key               | where                       | what                                                               |
-| ----------------- | --------------------------- | ------------------------------------------------------------------ |
-| `1` … `8`         | anywhere                    | Overview, Runs, Queue, Chat, Sandboxes, Daemon, Config, Doctor     |
-| click             | the rail                    | the same as that row's key                                         |
-| `?`               | anywhere                    | Help                                                               |
-| `ctrl+p`          | anywhere                    | the command palette: screens and argument-less verbs by name       |
-| `r`               | anywhere                    | refresh now (store and `ctl status`)                               |
-| `q`               | anywhere                    | quit                                                               |
-| `j`/`k`, arrows   | any list                    | move                                                               |
-| `g`/`G`           | any list                    | first / last row                                                   |
-| `ctrl+d`/`ctrl+u` | any list                    | page                                                               |
-| `/`               | Runs, Events tab            | filter (Runs: any column; Events: a type prefix such as `policy.`) |
-| `Esc`             | anywhere                    | clear a filter, close a run                                        |
-| `Enter`           | Runs, Queue, Overview lists | open the run                                                       |
-| `Enter`           | Config, Resolved tab        | edit that setting (`e` too); `a` adds one by dotted path           |
-| `f`               | a run                       | toggle following the event tail                                    |
-| `v`               | a run                       | Thread tab as the `sbxloop run` transcript or as dense lines       |
+| key                     | where                       | what                                                               |
+| ----------------------- | --------------------------- | ------------------------------------------------------------------ |
+| `1` … `8`               | anywhere                    | Overview, Runs, Queue, Chat, Sandboxes, Daemon, Config, Doctor     |
+| `s` `f` `c` `t` `h` `d` | Overview                    | Summary, Flow, Cost, Time, Health, Spread                          |
+| click                   | the rail                    | the same as that row's key                                         |
+| `?`                     | anywhere                    | Help                                                               |
+| `ctrl+p`                | anywhere                    | the command palette: screens and argument-less verbs by name       |
+| `r`                     | anywhere                    | refresh now (store and `ctl status`)                               |
+| `q`                     | anywhere                    | quit                                                               |
+| `j`/`k`, arrows         | any list                    | move                                                               |
+| `g`/`G`                 | any list                    | first / last row                                                   |
+| `ctrl+d`/`ctrl+u`       | any list                    | page                                                               |
+| `/`                     | Runs, Events tab            | filter (Runs: any column; Events: a type prefix such as `policy.`) |
+| `Esc`                   | anywhere                    | clear a filter, close a run                                        |
+| `Enter`                 | Runs, Queue, Overview lists | open the run                                                       |
+| `Enter`                 | Config, Resolved tab        | edit that setting (`e` too); `a` adds one by dotted path           |
+| `f`                     | a run                       | toggle following the event tail                                    |
+| `v`                     | a run                       | Thread tab as the `sbxloop run` transcript or as dense lines       |
 
 ### Overview
 
@@ -115,7 +116,9 @@ rail — and `o` opens the window's costliest run.
   the cache-to-fresh ratio is a per-phase fact and the phases differ by an
   order of magnitude. The costliest runs are named and ranked, with the
   median and p90 beside them, so an outlier is visible instead of averaged
-  away.
+  away. **Turns per day** is a plot with a labelled scale rather than a
+  sparkline: the sparkline drew the shape but named no value on it, so a
+  quiet week and a heavy one looked the same.
 - **Time** (`t`) — **active** is what the loop did; **parked** is what it
   waited on a human for. These are wildly different: on this project's own
   host active time has run at about a sixth of elapsed, so reporting
@@ -126,9 +129,23 @@ rail — and `o` opens the window's costliest run.
   (retries per phase — a phase that retries constantly is spending turns
   nobody asked for); the phase table; and the rework the week cost in task
   revisions, replans and review/CI rounds.
+- **Spread** (`d`) — how the week's runs are *distributed*, rather than what
+  they totalled. Two histograms (turns per run, working time per run) and a
+  scatter of turns against elapsed, one dot per run. Median and p90 say
+  where the middle is; they cannot tell one hump from two humps either side
+  of it, and the run whose cost its wall-clock does not explain is the one
+  sitting away from the crowd. Under eight runs there is no shape to see,
+  so the page states the median-and-p90 sentence and draws nothing.
 
 A **cancelled** run is a decision, not an outcome: it is counted and
 reported but kept out of the success rate's denominator.
+
+Most of the drawing is `sbxloop.tui.widgets.band` — one row, solid colour,
+no axis, and the right answer to every *what share* question here. The
+plots on Spread and the Cost trend are `sbxloop.tui.widgets.chart`
+(`textual-plotext`), for the *what shape* questions that need a scale;
+their axes are ruled in whole runs and read in the same `1h 20m` units as
+the rest of the screen, and they follow the console's theme.
 
 The numbers are `sbxloop.tui.analytics`, folded from
 `StateStore.runs_between` / `phases_between` in one grouped pass each and
