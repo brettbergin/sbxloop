@@ -43,6 +43,7 @@ loudly rather than pretending.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -460,7 +461,9 @@ class FakeGithub(GithubOps):
             if self.user_type is not None:
                 user["type"] = self.user_type
             return user
-        if method == "GET" and path == f"/repos/{self.repo}":
+        if method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+", path):
+            # The repository itself, whichever one the run names: the fake
+            # answers for every repository with its one payload (#607).
             if self.repo_missing:
                 raise self._failed_op("raw.api", method, path, github_error("repo_missing_404"))
             # The same payload ``repo_get`` answers with: the engine's
