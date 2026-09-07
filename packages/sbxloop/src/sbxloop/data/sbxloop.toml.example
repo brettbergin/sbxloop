@@ -86,12 +86,13 @@ secret_strategy = "proxy"
 # run when that language is in the sandbox. Set "" to say this project has no
 # gate.
 # gate_command = "make check"
-# Continue existing work on this branch instead of starting fresh. Set by the
-# engine when a run is resumed after its clone was pruned; never by hand.
+# Cut a run's clone from an existing branch — published work to continue —
+# instead of a fresh branch off the base. An operator's knob for a one-off
+# run; the engine passes its own (a restart continuing a previous attempt's
+# pushed work) without touching this key.
 # continue_branch = "sbxloop/some-run-id"
-# Whether a continue_branch that cannot be fetched is fatal. False (a resume)
-# fails the run; true (a restart continuing a previous attempt's pushed work)
-# logs why the branch was unusable and cuts a fresh one from base instead.
+# Whether a continue_branch that cannot be fetched is fatal. False fails the
+# run; true logs why the branch was unusable and cuts a fresh one from base.
 # continue_branch_optional = false
 # Extra network allow rules applied to both sandboxes.
 # extra_allow_domains = []
