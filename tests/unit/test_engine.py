@@ -389,7 +389,7 @@ class TestHappyPath:
         engine = harness.engine()
         result = engine.start("record phases")
         rows = engine.store.phase_attempts(result.run_id)
-        assert [row["phase"] for row in rows] == ["decompose", "build", "verify", "gate"]
+        assert [row.phase for row in rows] == ["decompose", "build", "verify", "gate"]
         # A project that declares no gate records the skip, not a pass.
         assert rows[-1]["status"] == "skipped"
 
@@ -399,7 +399,7 @@ class TestHappyPath:
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])
         engine = harness.engine()
         result = engine.start("bill phases")
-        rows = {row["phase"]: row for row in engine.store.phase_attempts(result.run_id)}
+        rows = {row.phase: row for row in engine.store.phase_attempts(result.run_id)}
         for phase in ("decompose", "build"):
             assert rows[phase]["input_tokens"] is not None, phase
             assert rows[phase]["turns"] == 1, phase
@@ -601,7 +601,7 @@ class TestResume:
         result = engine2.resume(run_id)
         assert result.state == "completed"
         assert result.tasks[0].state == "done"
-        phases = [row["phase"] for row in engine2.store.phase_attempts(run_id)]
+        phases = [row.phase for row in engine2.store.phase_attempts(run_id)]
         assert phases.count("decompose") == 1
         # the crashed attempt never committed a phase row - that is exactly the
         # "uncommitted phases re-run" resume semantic
@@ -1671,7 +1671,7 @@ class TestPipeline:
         assert run.branch == f"sbxloop/{result.run_id}"
         assert run.head_sha == "commit2"
         assert run.last_verdict == "approve"
-        phases = [(row["phase"], row["status"]) for row in engine.store.phase_attempts(run.run_id)]
+        phases = [(row.phase, row.status) for row in engine.store.phase_attempts(run.run_id)]
         assert phases == [
             ("decompose", "ok"),
             ("build", "ok"),
@@ -1709,8 +1709,8 @@ class TestPipeline:
         assert all("the greeting is specified as hi" in p for p in second)
         (retry,) = [p for p in second if "already refuted" in p]
         assert "hello.txt:1" in retry
-        rows = [r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "review"]
-        assert [r["attempt"] for r in rows] == [1, 2]
+        rows = [r for r in engine.store.phase_attempts(result.run_id) if r.phase == "review"]
+        assert [r.attempt for r in rows] == [1, 2]
 
     def test_fix_round_reconciliation_is_persisted_and_survives_reopen(
         self, harness: Harness
@@ -1728,7 +1728,7 @@ class TestPipeline:
         rows = [
             r
             for r in reopened.phase_attempts(result.run_id)
-            if r["phase"] == "build" and r["task_id"] == "fix-1"
+            if r.phase == "build" and r.task_id == "fix-1"
         ]
         assert rows
         assert json.loads(rows[-1]["output_json"])["reconciled"] == [
@@ -1742,7 +1742,7 @@ class TestPipeline:
         t1 = [
             r
             for r in reopened.phase_attempts(result.run_id)
-            if r["phase"] == "build" and r["task_id"] == "t1"
+            if r.phase == "build" and r.task_id == "t1"
         ]
         assert "reconciled" not in json.loads(t1[-1]["output_json"])
 
@@ -1806,7 +1806,7 @@ class TestPipeline:
         result = engine.start("write hello.txt")
         assert result.state == "merged"
 
-        rows = [r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "review"]
+        rows = [r for r in engine.store.phase_attempts(result.run_id) if r.phase == "review"]
         first = json.loads(rows[0]["output_json"])
         assert first["review"]["id"] is not None
         assert [p["anchor"] for p in first["posted"]] == ["hello.txt:1"]
@@ -1889,10 +1889,8 @@ class TestPipeline:
         (thread,) = [t for t in fake.threads if t.anchor == "hello.txt:1"]
         assert thread.is_resolved and thread.has_reply_from(fake.user_login)
         # The review record is the comment's url, so the merge gate is satisfied.
-        rows = [r for r in harness_rows(harness, result.run_id) if r["phase"] == "review"]
-        assert all(
-            json.loads(r["output_json"])["review"]["url"].startswith("https://") for r in rows
-        )
+        rows = [r for r in harness_rows(harness, result.run_id) if r.phase == "review"]
+        assert all(json.loads(r.output_json)["review"]["url"].startswith("https://") for r in rows)
         assert json.loads(rows[0]["output_json"])["review"]["event"] == "COMMENT"
         assert fake.merges == [(7, "squash", "commit2")]
 
@@ -1907,7 +1905,7 @@ class TestPipeline:
             "Findings without a thread of their own:\n- `hello.txt:1` [major]"
             in (fake.issue_comments[0])
         )
-        rows = [r for r in harness_rows(harness, result.run_id) if r["phase"] == "review"]
+        rows = [r for r in harness_rows(harness, result.run_id) if r.phase == "review"]
         posted = json.loads(rows[0]["output_json"])["posted"]
         assert posted[0]["anchor"] == "hello.txt:1" and posted[0]["comment_id"] is None
 
@@ -2040,8 +2038,8 @@ class TestPipeline:
         # Filed after the merge, recorded per issue.
         merged_at = harness.event_types().index(HostEventTypes.RUN_MERGED)
         assert harness.event_types().index(HostEventTypes.RUN_FOLLOWUPS) > merged_at
-        rows = [r for r in harness_rows(harness, result.run_id) if r["phase"] == "followup"]
-        assert [r["status"] for r in rows] == ["filed", "filed", "filed", "listed"]
+        rows = [r for r in harness_rows(harness, result.run_id) if r.phase == "followup"]
+        assert [r.status for r in rows] == ["filed", "filed", "filed", "listed"]
 
     def test_a_failed_run_files_nothing(self, harness: Harness) -> None:
         fake = FakeGithub()
@@ -3011,8 +3009,8 @@ class TestPipeline:
         assert types.index("chat.reply") < types.index(HostEventTypes.RUN_END)
         reply = next(e for e in harness.events if e.type == "chat.reply")
         assert reply.data["reply"] == "still waiting on CI"
-        steer = next(r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "steer")
-        assert steer["task_id"] is None
+        steer = next(r for r in engine.store.phase_attempts(result.run_id) if r.phase == "steer")
+        assert steer.task_id is None
 
     def test_steer_task_on_a_fix_task_restarts_its_build(self, harness: Harness) -> None:
         fake = FakeGithub()
@@ -3049,7 +3047,7 @@ class TestPipeline:
         builds = [
             r
             for r in engine.store.phase_attempts(result.run_id)
-            if r["phase"] == "build" and r["task_id"] == "fix-1"
+            if r.phase == "build" and r.task_id == "fix-1"
         ]
         assert len(builds) == 2
         prompts = [
@@ -3157,7 +3155,7 @@ class TestPipeline:
         result = harness.pipeline(fake).resume(run_id)
         assert result.state == "merged"
         assert harness.consumed() == 0
-        reviews = [r for r in engine.store.phase_attempts(run_id) if r["phase"] == "review"]
+        reviews = [r for r in engine.store.phase_attempts(run_id) if r.phase == "review"]
         assert len(reviews) == 1
 
     def test_resume_at_landing_lands(self, harness: Harness) -> None:
@@ -3216,7 +3214,7 @@ class TestInteractiveChat:
         assert reply.data["message_id"] == message_id
         assert "chat.action" not in harness.event_types()
         attempts = engine.store.phase_attempts(result.run_id)
-        steer = [a for a in attempts if a["phase"] == "steer"]
+        steer = [a for a in attempts if a.phase == "steer"]
         assert len(steer) == 1
         assert steer[0]["status"] == "continue"
         assert steer[0]["task_id"] == "t1"
@@ -3258,9 +3256,9 @@ class TestInteractiveChat:
         assert action.data["task_id"] == "t1"
         assert "restarting task t1" in action.data["message"]
         attempts = engine.store.phase_attempts(result.run_id)
-        steer = next(a for a in attempts if a["phase"] == "steer")
-        assert steer["status"] == "steer_task"
-        output = json.loads(steer["output_json"])
+        steer = next(a for a in attempts if a.phase == "steer")
+        assert steer.status == "steer_task"
+        output = json.loads(steer.output_json)
         assert output["applied"] == "steer_task"
         assert output["message"] == "do it in Go"
 
@@ -3274,8 +3272,8 @@ class TestInteractiveChat:
         reply = next(e for e in harness.events if e.type == "chat.reply")
         assert "error" in reply.data
         attempts = engine.store.phase_attempts(result.run_id)
-        steer = next(a for a in attempts if a["phase"] == "steer")
-        assert steer["status"] == "error"
+        steer = next(a for a in attempts if a.phase == "steer")
+        assert steer.status == "error"
 
     def test_invalid_steer_verdict_is_retried(self, harness: Harness) -> None:
         # steer_task without guidance fails SteerVerdict validation; the
@@ -3319,8 +3317,8 @@ class TestInteractiveChat:
         assert result.state == "completed"
         types = harness.event_types()
         assert types.index("chat.reply") < types.index(HostEventTypes.RUN_END)
-        steer = next(r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "steer")
-        assert steer["task_id"] is None
+        steer = next(r for r in engine.store.phase_attempts(result.run_id) if r.phase == "steer")
+        assert steer.task_id is None
 
     def test_resume_replays_persisted_guidance_into_prompts(self, harness: Harness) -> None:
         from sbxloop.engine.phases import PhaseRunner
