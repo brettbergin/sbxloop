@@ -758,6 +758,272 @@ def _pk_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     return [str(row[1]) for row in sorted((r for r in rows if r[5] > 0), key=lambda r: r[5])]
 
 
+def _migrate_repo_columns(conn: sqlite3.Connection) -> None:
+    """Bring a store created before multi-repo to the current shape.
+
+    ``CREATE TABLE IF NOT EXISTS`` leaves an existing table alone, so a
+    daemon upgraded in place still has the single-repo shape — and its
+    key is the one that must change: ``UNIQUE(source_key)`` on
+    ``daemon_work_items`` (``PRIMARY KEY(source_key)`` on
+    ``daemon_requesters``) collides the moment two configured
+    repositories each have an issue with the same number, which is
+    exactly what an upgraded store is about to see. SQLite cannot drop a
+    constraint with ALTER, so the tables are rebuilt: new shape, rows
+    copied with ``repo = ''``, drop, rename, indexes recreated — all in
+    one transaction. Copied rows are then settled at daemon startup —
+    backfilled with the sole configured repository
+    (:meth:`backfill_repo`) or, when several are configured, named from
+    their issue URL (:meth:`attribute_repoless`), with whatever is left
+    over dropped if discovery can re-create it (:meth:`drop_repoless`)
+    and otherwise failed with an operator notice
+    (:meth:`strand_repoless`) — so they are never claimed by whichever
+    repo happens to be polled first.
+    """
+    rebuilds = (
+        ("daemon_work_items", _WORK_ITEMS_BODY, _WORK_ITEMS_COLUMNS),
+        ("daemon_requesters", _REQUESTERS_BODY, _REQUESTERS_COLUMNS),
+    )
+    todo = [
+        (table, body, f"{columns}, repo", f"{columns}, ''")
+        for table, body, columns in rebuilds
+        if "repo" not in _columns(conn, table)
+    ]
+    _rebuild_tables(conn, todo, rebuilt_for="repo")
+
+
+def _rebuild_tables(
+    conn: sqlite3.Connection, todo: list[tuple[str, str, str, str]], *, rebuilt_for: str
+) -> None:
+    """Rebuild each ``(table, body, insert_columns, select_expr)`` in one
+    transaction: new shape, rows copied, drop, rename, indexes recreated.
+
+    The indexes are issued statement by statement: ``executescript``
+    commits the open transaction first, which would leave a rebuilt
+    table with no indexes if the recreation failed."""
+    if not todo:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table, body, insert_columns, select_expr in todo:
+            tmp = f"{table}__new"
+            conn.execute(f"CREATE TABLE {tmp} {body}")  # nosec B608 - literals above
+            conn.execute(
+                f"INSERT INTO {tmp} ({insert_columns}) "  # nosec B608 - literals above
+                f"SELECT {select_expr} FROM {table}"
+            )
+            conn.execute(f"DROP TABLE {table}")  # nosec B608 - literal above
+            conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")  # nosec B608
+            log.info("store.migrated", table=table, rebuilt_for=rebuilt_for)
+        # Dropping the old table took its indexes with it.
+        for ddl in _INDEX_DDL:
+            conn.execute(ddl)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# Columns added after the multi-repo rebuild, applied idempotently on
+# open so a store written by an older daemon upgrades in place.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    (
+        "daemon_work_items",
+        "not_before",
+        "ALTER TABLE daemon_work_items ADD COLUMN not_before REAL",
+    ),
+    (
+        "daemon_work_items",
+        "claim_token",
+        "ALTER TABLE daemon_work_items ADD COLUMN claim_token TEXT",
+    ),
+    (
+        "daemon_work_items",
+        "prior_run_id",
+        "ALTER TABLE daemon_work_items ADD COLUMN prior_run_id TEXT",
+    ),
+    (
+        "daemon_work_items",
+        "prior_branch",
+        "ALTER TABLE daemon_work_items ADD COLUMN prior_branch TEXT",
+    ),
+    (
+        "daemon_work_items",
+        "prior_pr_number",
+        "ALTER TABLE daemon_work_items ADD COLUMN prior_pr_number INTEGER",
+    ),
+    (
+        "daemon_review_holds",
+        "held_by_draft",
+        "ALTER TABLE daemon_review_holds ADD COLUMN held_by_draft INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "daemon_work_items",
+        "run_kind",
+        "ALTER TABLE daemon_work_items ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'code'",
+    ),
+    (
+        "daemon_work_items",
+        "profile",
+        "ALTER TABLE daemon_work_items ADD COLUMN profile TEXT",
+    ),
+    (
+        "daemon_merge_gates",
+        "kind",
+        "ALTER TABLE daemon_merge_gates ADD COLUMN kind TEXT NOT NULL DEFAULT 'merge'",
+    ),
+    # The schedule itself moved into its row (#818); a daemon from
+    # before that wrote state-only rows, which the config import
+    # fills in on the next start.
+    *(
+        ("daemon_schedules", column, f"ALTER TABLE daemon_schedules ADD COLUMN {column} {kind}")
+        for column, kind in (
+            ("profile", "TEXT"),
+            ("ask", "TEXT"),
+            ("every", "TEXT"),
+            ("cron", "TEXT"),
+            ("timezone", "TEXT"),
+            ("source", "TEXT"),
+            ("created_by", "TEXT"),
+            ("created_at", "REAL"),
+        )
+    ),
+)
+
+
+def _migrate_added_columns(conn: sqlite3.Connection) -> None:
+    for table, column, ddl in _ADDED_COLUMNS:
+        if column in _columns(conn, table):
+            continue
+        conn.execute(ddl)
+        conn.commit()
+        log.info("store.migrated", table=table, added=column)
+
+
+def _migrate_discord_threads(conn: sqlite3.Connection) -> None:
+    """Fold a pre-Slack ``daemon_discord_threads`` table into
+    ``daemon_chat_threads``: same rows, ids cast to text, backend
+    ``discord``; the old table is dropped so this runs once. A row that
+    already exists in the new table (a store that was migrated and then
+    reopened by an older daemon which recreated the old table) is left
+    alone."""
+    if "daemon_discord_threads" not in _tables(conn):
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        moved = conn.execute(
+            "INSERT OR IGNORE INTO daemon_chat_threads "
+            "(run_id, backend, channel_id, thread_id, headline_id, status_id) "
+            "SELECT run_id, 'discord', CAST(channel_id AS TEXT), CAST(thread_id AS TEXT), "
+            "CAST(headline_id AS TEXT), CAST(status_id AS TEXT) "
+            "FROM daemon_discord_threads"
+        ).rowcount
+        conn.execute("DROP TABLE daemon_discord_threads")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    log.info("store.migrated", table="daemon_chat_threads", moved=moved)
+
+
+def _migrate_backend_keys(conn: sqlite3.Connection) -> None:
+    """Key the chat state by backend, once.
+
+    A one-bridge daemon kept one thread and one watcher list per run,
+    and the gate's prompt on the gate row. The operator console's local
+    bridge runs beside the external one and opens its own thread for
+    the same run, so ``daemon_chat_threads`` is rebuilt on
+    ``(run_id, backend)`` and ``daemon_run_watches`` gains a ``backend``
+    column in its UNIQUE key (SQLite cannot widen a key with ALTER —
+    same rebuild as :meth:`_migrate_repo_columns`). The prompt location
+    moves into ``daemon_gate_prompts`` under the backend the run's
+    thread used; the old columns stay readable and are never written
+    again. Each step is guarded by the shape it changes, so a store
+    already migrated is left alone.
+    """
+    rebuilds: list[tuple[str, str, str, str]] = []
+    if _pk_columns(conn, "daemon_chat_threads") == ["run_id"]:
+        rebuilds.append(
+            (
+                "daemon_chat_threads",
+                _CHAT_THREADS_BODY,
+                _CHAT_THREADS_COLUMNS,
+                _CHAT_THREADS_COLUMNS,
+            )
+        )
+    watches_rebuilt = "backend" not in _columns(conn, "daemon_run_watches")
+    if watches_rebuilt:
+        rebuilds.append(
+            (
+                "daemon_run_watches",
+                _RUN_WATCHES_BODY,
+                _RUN_WATCHES_COLUMNS,
+                _RUN_WATCHES_COLUMNS,
+            )
+        )
+    _rebuild_tables(conn, rebuilds, rebuilt_for="backend")
+    # The backend a pre-upgrade row belongs to is the one that opened the
+    # run's thread, else the one external backend the store has seen at
+    # all (a daemon runs one), else Discord — never 'local', which no
+    # released daemon ran.
+    external = (
+        "(SELECT t.backend FROM daemon_chat_threads t WHERE t.run_id = %s "
+        "AND t.backend != 'local' LIMIT 1)"
+    )
+    sole = (
+        "(SELECT backend FROM daemon_chat_threads WHERE backend != 'local' "
+        "GROUP BY backend HAVING COUNT(*) = (SELECT COUNT(*) FROM daemon_chat_threads "
+        "WHERE backend != 'local') LIMIT 1)"
+    )
+    fallback = f"COALESCE({external}, {sole}, 'discord')"
+    if watches_rebuilt:
+        watch_backend = fallback % "daemon_run_watches.run_id"  # nosec B608 - literals only
+        conn.execute("UPDATE daemon_run_watches SET backend = " + watch_backend)  # nosec
+        conn.commit()
+    # The prompt location a one-bridge daemon kept on the gate row is
+    # carried into the prompt table and cleared from the row, so an
+    # older daemon writing it again (a rollback window) is carried again
+    # on the next start — a shape-based step, not a one-shot marker.
+    gate_backend = fallback % "g.run_id"  # nosec B608 - literals only
+    carry = (
+        "INSERT OR IGNORE INTO daemon_gate_prompts (run_id, backend, channel_id, message_id) "  # nosec B608
+        "SELECT g.run_id, {backend}, g.prompt_channel_id, g.prompt_message_id "
+        "FROM daemon_merge_gates g "
+        "WHERE g.prompt_message_id IS NOT NULL AND g.prompt_message_id != ''"
+    ).replace("{backend}", gate_backend)
+    moved = conn.execute(carry).rowcount
+    conn.execute(
+        "UPDATE daemon_merge_gates SET prompt_channel_id = NULL, prompt_message_id = NULL "
+        "WHERE prompt_message_id IS NOT NULL"
+    )
+    conn.commit()
+    if moved:
+        log.info("store.migrated", table="daemon_gate_prompts", moved=moved)
+
+
+def apply_daemon_schema(conn: sqlite3.Connection) -> None:
+    """Bring any daemon database this project ever wrote to the current shape.
+
+    Creates the tables from nothing on a fresh file and upgrades an existing
+    one in place: the repo-column rebuild, the idempotent ADD COLUMN set, the
+    pre-Slack thread fold and the backend rekey, in that order, then stamps
+    the schema version the operator console handshakes on.
+
+    This is the whole of the daemon side of Alembic revision 0001, which is
+    why it takes a bare connection rather than a store: it has to run against
+    a database no store could open yet.
+    """
+    conn.executescript(_SCHEMA)
+    _migrate_repo_columns(conn)
+    _migrate_added_columns(conn)
+    _migrate_discord_threads(conn)
+    _migrate_backend_keys(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO daemon_state (key, value) VALUES (?, ?)",
+        (SCHEMA_VERSION_KEY, SCHEMA_VERSION),
+    )
+    conn.commit()
+
+
 class DaemonStore:
     @classmethod
     def archive_legacy(cls, path: Path, *, clock: Callable[[], float] = time.time) -> Path | None:
@@ -859,254 +1125,11 @@ class DaemonStore:
                 f"{path} is a pre-1.0 daemon state database; start `sbxloop daemon` once "
                 f"to archive it (to {path.name}{LEGACY_SUFFIX}) and begin a fresh store"
             )
-        self._conn.executescript(_SCHEMA)
-        self._migrate_repo_columns()
-        self._migrate_added_columns()
-        self._migrate_discord_threads()
-        self._migrate_backend_keys()
-        self._conn.execute(
-            "INSERT OR REPLACE INTO daemon_state (key, value) VALUES (?, ?)",
-            (SCHEMA_VERSION_KEY, SCHEMA_VERSION),
-        )
-        self._conn.commit()
+        apply_daemon_schema(self._conn)
         log.debug("store.opened", db=str(path), schema=SCHEMA_VERSION)
 
     def close(self) -> None:
         self._conn.close()
-
-    def _migrate_repo_columns(self) -> None:
-        """Bring a store created before multi-repo to the current shape.
-
-        ``CREATE TABLE IF NOT EXISTS`` leaves an existing table alone, so a
-        daemon upgraded in place still has the single-repo shape — and its
-        key is the one that must change: ``UNIQUE(source_key)`` on
-        ``daemon_work_items`` (``PRIMARY KEY(source_key)`` on
-        ``daemon_requesters``) collides the moment two configured
-        repositories each have an issue with the same number, which is
-        exactly what an upgraded store is about to see. SQLite cannot drop a
-        constraint with ALTER, so the tables are rebuilt: new shape, rows
-        copied with ``repo = ''``, drop, rename, indexes recreated — all in
-        one transaction. Copied rows are then settled at daemon startup —
-        backfilled with the sole configured repository
-        (:meth:`backfill_repo`) or, when several are configured, named from
-        their issue URL (:meth:`attribute_repoless`), with whatever is left
-        over dropped if discovery can re-create it (:meth:`drop_repoless`)
-        and otherwise failed with an operator notice
-        (:meth:`strand_repoless`) — so they are never claimed by whichever
-        repo happens to be polled first.
-        """
-        rebuilds = (
-            ("daemon_work_items", _WORK_ITEMS_BODY, _WORK_ITEMS_COLUMNS),
-            ("daemon_requesters", _REQUESTERS_BODY, _REQUESTERS_COLUMNS),
-        )
-        todo = [
-            (table, body, f"{columns}, repo", f"{columns}, ''")
-            for table, body, columns in rebuilds
-            if "repo" not in _columns(self._conn, table)
-        ]
-        self._rebuild_tables(todo, rebuilt_for="repo")
-
-    def _rebuild_tables(self, todo: list[tuple[str, str, str, str]], *, rebuilt_for: str) -> None:
-        """Rebuild each ``(table, body, insert_columns, select_expr)`` in one
-        transaction: new shape, rows copied, drop, rename, indexes recreated.
-
-        The indexes are issued statement by statement: ``executescript``
-        commits the open transaction first, which would leave a rebuilt
-        table with no indexes if the recreation failed."""
-        if not todo:
-            return
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            for table, body, insert_columns, select_expr in todo:
-                tmp = f"{table}__new"
-                self._conn.execute(f"CREATE TABLE {tmp} {body}")  # nosec B608 - literals above
-                self._conn.execute(
-                    f"INSERT INTO {tmp} ({insert_columns}) "  # nosec B608 - literals above
-                    f"SELECT {select_expr} FROM {table}"
-                )
-                self._conn.execute(f"DROP TABLE {table}")  # nosec B608 - literal above
-                self._conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")  # nosec B608
-                log.info("store.migrated", table=table, rebuilt_for=rebuilt_for)
-            # Dropping the old table took its indexes with it.
-            for ddl in _INDEX_DDL:
-                self._conn.execute(ddl)
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
-
-    # Columns added after the multi-repo rebuild, applied idempotently on
-    # open so a store written by an older daemon upgrades in place.
-    _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
-        (
-            "daemon_work_items",
-            "not_before",
-            "ALTER TABLE daemon_work_items ADD COLUMN not_before REAL",
-        ),
-        (
-            "daemon_work_items",
-            "claim_token",
-            "ALTER TABLE daemon_work_items ADD COLUMN claim_token TEXT",
-        ),
-        (
-            "daemon_work_items",
-            "prior_run_id",
-            "ALTER TABLE daemon_work_items ADD COLUMN prior_run_id TEXT",
-        ),
-        (
-            "daemon_work_items",
-            "prior_branch",
-            "ALTER TABLE daemon_work_items ADD COLUMN prior_branch TEXT",
-        ),
-        (
-            "daemon_work_items",
-            "prior_pr_number",
-            "ALTER TABLE daemon_work_items ADD COLUMN prior_pr_number INTEGER",
-        ),
-        (
-            "daemon_review_holds",
-            "held_by_draft",
-            "ALTER TABLE daemon_review_holds ADD COLUMN held_by_draft INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "daemon_work_items",
-            "run_kind",
-            "ALTER TABLE daemon_work_items ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'code'",
-        ),
-        (
-            "daemon_work_items",
-            "profile",
-            "ALTER TABLE daemon_work_items ADD COLUMN profile TEXT",
-        ),
-        (
-            "daemon_merge_gates",
-            "kind",
-            "ALTER TABLE daemon_merge_gates ADD COLUMN kind TEXT NOT NULL DEFAULT 'merge'",
-        ),
-        # The schedule itself moved into its row (#818); a daemon from
-        # before that wrote state-only rows, which the config import
-        # fills in on the next start.
-        *(
-            ("daemon_schedules", column, f"ALTER TABLE daemon_schedules ADD COLUMN {column} {kind}")
-            for column, kind in (
-                ("profile", "TEXT"),
-                ("ask", "TEXT"),
-                ("every", "TEXT"),
-                ("cron", "TEXT"),
-                ("timezone", "TEXT"),
-                ("source", "TEXT"),
-                ("created_by", "TEXT"),
-                ("created_at", "REAL"),
-            )
-        ),
-    )
-
-    def _migrate_added_columns(self) -> None:
-        for table, column, ddl in self._ADDED_COLUMNS:
-            if column in _columns(self._conn, table):
-                continue
-            self._conn.execute(ddl)
-            self._conn.commit()
-            log.info("store.migrated", table=table, added=column)
-
-    def _migrate_discord_threads(self) -> None:
-        """Fold a pre-Slack ``daemon_discord_threads`` table into
-        ``daemon_chat_threads``: same rows, ids cast to text, backend
-        ``discord``; the old table is dropped so this runs once. A row that
-        already exists in the new table (a store that was migrated and then
-        reopened by an older daemon which recreated the old table) is left
-        alone."""
-        if "daemon_discord_threads" not in _tables(self._conn):
-            return
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            moved = self._conn.execute(
-                "INSERT OR IGNORE INTO daemon_chat_threads "
-                "(run_id, backend, channel_id, thread_id, headline_id, status_id) "
-                "SELECT run_id, 'discord', CAST(channel_id AS TEXT), CAST(thread_id AS TEXT), "
-                "CAST(headline_id AS TEXT), CAST(status_id AS TEXT) "
-                "FROM daemon_discord_threads"
-            ).rowcount
-            self._conn.execute("DROP TABLE daemon_discord_threads")
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
-        log.info("store.migrated", table="daemon_chat_threads", moved=moved)
-
-    def _migrate_backend_keys(self) -> None:
-        """Key the chat state by backend, once.
-
-        A one-bridge daemon kept one thread and one watcher list per run,
-        and the gate's prompt on the gate row. The operator console's local
-        bridge runs beside the external one and opens its own thread for
-        the same run, so ``daemon_chat_threads`` is rebuilt on
-        ``(run_id, backend)`` and ``daemon_run_watches`` gains a ``backend``
-        column in its UNIQUE key (SQLite cannot widen a key with ALTER —
-        same rebuild as :meth:`_migrate_repo_columns`). The prompt location
-        moves into ``daemon_gate_prompts`` under the backend the run's
-        thread used; the old columns stay readable and are never written
-        again. Each step is guarded by the shape it changes, so a store
-        already migrated is left alone.
-        """
-        rebuilds: list[tuple[str, str, str, str]] = []
-        if _pk_columns(self._conn, "daemon_chat_threads") == ["run_id"]:
-            rebuilds.append(
-                (
-                    "daemon_chat_threads",
-                    _CHAT_THREADS_BODY,
-                    _CHAT_THREADS_COLUMNS,
-                    _CHAT_THREADS_COLUMNS,
-                )
-            )
-        watches_rebuilt = "backend" not in _columns(self._conn, "daemon_run_watches")
-        if watches_rebuilt:
-            rebuilds.append(
-                (
-                    "daemon_run_watches",
-                    _RUN_WATCHES_BODY,
-                    _RUN_WATCHES_COLUMNS,
-                    _RUN_WATCHES_COLUMNS,
-                )
-            )
-        self._rebuild_tables(rebuilds, rebuilt_for="backend")
-        # The backend a pre-upgrade row belongs to is the one that opened the
-        # run's thread, else the one external backend the store has seen at
-        # all (a daemon runs one), else Discord — never 'local', which no
-        # released daemon ran.
-        external = (
-            "(SELECT t.backend FROM daemon_chat_threads t WHERE t.run_id = %s "
-            "AND t.backend != 'local' LIMIT 1)"
-        )
-        sole = (
-            "(SELECT backend FROM daemon_chat_threads WHERE backend != 'local' "
-            "GROUP BY backend HAVING COUNT(*) = (SELECT COUNT(*) FROM daemon_chat_threads "
-            "WHERE backend != 'local') LIMIT 1)"
-        )
-        fallback = f"COALESCE({external}, {sole}, 'discord')"
-        if watches_rebuilt:
-            watch_backend = fallback % "daemon_run_watches.run_id"  # nosec B608 - literals only
-            self._conn.execute("UPDATE daemon_run_watches SET backend = " + watch_backend)  # nosec
-            self._conn.commit()
-        # The prompt location a one-bridge daemon kept on the gate row is
-        # carried into the prompt table and cleared from the row, so an
-        # older daemon writing it again (a rollback window) is carried again
-        # on the next start — a shape-based step, not a one-shot marker.
-        gate_backend = fallback % "g.run_id"  # nosec B608 - literals only
-        carry = (
-            "INSERT OR IGNORE INTO daemon_gate_prompts (run_id, backend, channel_id, message_id) "  # nosec B608
-            "SELECT g.run_id, {backend}, g.prompt_channel_id, g.prompt_message_id "
-            "FROM daemon_merge_gates g "
-            "WHERE g.prompt_message_id IS NOT NULL AND g.prompt_message_id != ''"
-        ).replace("{backend}", gate_backend)
-        moved = self._conn.execute(carry).rowcount
-        self._conn.execute(
-            "UPDATE daemon_merge_gates SET prompt_channel_id = NULL, prompt_message_id = NULL "
-            "WHERE prompt_message_id IS NOT NULL"
-        )
-        self._conn.commit()
-        if moved:
-            log.info("store.migrated", table="daemon_gate_prompts", moved=moved)
 
     def backfill_repo(self, repo: str | None) -> int:
         """Give repo-less rows the daemon's sole configured repository.
