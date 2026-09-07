@@ -8,7 +8,7 @@ from sbxloop.tui.widgets.chronology import ChronologyLog
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop.tui.widgets.statusbar import StatusBar
 from sbxloop.tui.widgets.tables import ConsoleTable
-from tests.unit.tui.conftest import FakeCtl, drive, live_status, make_app
+from tests.unit.tui.conftest import FakeCtl, drive, live_status, make_app, until
 
 
 def bar_text(app: object) -> str:
@@ -343,12 +343,19 @@ def test_a_workload_run_header_shows_its_profile_and_needs(seeded: SbxloopHome) 
     )
     store.close()
 
+    def header_of(app: object) -> str:
+        from sbxloop.tui.app import SbxloopTui
+
+        assert isinstance(app, SbxloopTui)
+        return app.screen.query_one("#header", TextPanel).content_text
+
     async def scenario() -> None:
         app = make_app(seeded, run="r_work")
         async with app.run_test(size=(140, 45)) as pilot:
-            await pilot.pause(1.5)
-            header = app.screen.query_one("#header", TextPanel).content_text
-            assert "workload (research)" in header
+            # The header is filled in from the store after mount, so wait for
+            # it rather than for a duration: the placeholder is `run r_work`.
+            assert await until(pilot, lambda: "workload (research)" in header_of(app))
+            header = header_of(app)
             assert "granted: hosts api.example.com; credentials weather; sinks chat" in header
             assert "refused" not in header
 
@@ -357,12 +364,10 @@ def test_a_workload_run_header_shows_its_profile_and_needs(seeded: SbxloopHome) 
     async def refused() -> None:
         app = make_app(seeded, run="r_refused")
         async with app.run_test(size=(140, 45)) as pilot:
-            await pilot.pause(1.5)
-            header = app.screen.query_one("#header", TextPanel).content_text
-            assert "workload (research)" in header
+            assert await until(pilot, lambda: "workload (research)" in header_of(app))
             assert (
                 "refused: host evil.example.com — allow it with `workloads.research.egress`"
-                in header
+                in header_of(app)
             )
 
     drive(refused)
