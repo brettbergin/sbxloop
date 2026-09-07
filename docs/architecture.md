@@ -1491,6 +1491,18 @@ are nonconditional: a foreign daemon can race the ownership read. Normal
 source claim arbitration still applies; a failed claim retains campaign
 membership and holds it for reconciliation. No cross-host atomicity is claimed.
 
+`daemon/epics.py` is an intake adapter, separate from readiness. It resolves
+an explicit issue-body member list and ordered section (or complete `order: N`
+labels), validates explicit prerequisites, and returns a frozen plan. The
+concierge's `start_epic` uses each repository's real source and labels, pins
+the target base, and admits a stable `epic:<repo>:<number>` campaign. Each child
+snapshot includes the epic brief and full ordered plan, so later runs keep
+the procedural context across restarts. An existing campaign is inspected
+from its saved plan; refetching an edited epic does not widen its scope.
+Closed children require explicit reconciliation and cannot count as successful
+delivery merely because their issues are closed. Native sub-issue APIs and
+parallel branches are outside this first adapter.
+
 `sbxloop daemon` is deliberately small: it claims issues carrying
 `sbxloop:run` in **every configured, enabled repository** (a label swap plus
 a claim comment as the optimistic lock — carrying host, pid and start time so a

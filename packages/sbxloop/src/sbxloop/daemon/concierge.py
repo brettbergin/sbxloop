@@ -42,6 +42,8 @@ from urllib.parse import quote
 
 from sbxloop.cli.tui import format_event
 from sbxloop.config import SINK_NAMES, BridgeBackend, Config, ScheduleConfig
+from sbxloop.daemon.campaign_source import source_for_campaign
+from sbxloop.daemon.campaigns import CampaignError
 from sbxloop.daemon.chat_choices import (
     ChoiceQuestion,
     PendingFiling,
@@ -49,6 +51,13 @@ from sbxloop.daemon.chat_choices import (
     parse_pending_filing,
 )
 from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX, dispatch, format_log_tail, plain
+from sbxloop.daemon.epics import (
+    MAX_EPIC_STEPS,
+    EpicPlanError,
+    campaign_plan_from_epic,
+    epic_campaign_id,
+    resolve_epic,
+)
 from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.store import ChatThread, DaemonStore
@@ -935,6 +944,49 @@ class Concierge:
                     self._tool_list_repos,
                 )
             )
+        if (
+            self.github is not None
+            and self.config.github.repo_list()
+            and self.config.concierge.create_issues
+        ):
+            tools.append(
+                HostTool(
+                    HostToolSpec(
+                        name="start_epic",
+                        description=(
+                            "Run an existing epic as one durable ordered campaign. The epic "
+                            "must explicitly list its child issues and their build order, "
+                            "or pass ordered_issue_numbers in the person's intended order. "
+                            "A complete set of order: N labels on listed children also works. "
+                            "A request to run the epic authorizes every declared step: one "
+                            "call, no confirmation and no per-child labeling. Pass preview: "
+                            "true ONLY when asked to inspect the plan without starting it. "
+                            "Missing membership/order, conflicting prerequisites, unreadable "
+                            "issues or closed children block admission with a named reason. "
+                            "Do not invent an order or turn incidental issue references into "
+                            "members. The reply includes the campaign id for sbx_control "
+                            "campaigns and campaign hold/resume/move. Later epic edits never "
+                            "expand an admitted campaign; another call returns its status."
+                        ),
+                        parameters=_schema(
+                            {
+                                "number": {"type": "integer", "minimum": 1},
+                                "repo": {"type": "string"},
+                                "ordered_issue_numbers": {
+                                    "type": "array",
+                                    "items": {"type": "integer", "minimum": 1},
+                                    "minItems": 1,
+                                    "maxItems": MAX_EPIC_STEPS,
+                                    "uniqueItems": True,
+                                },
+                                "preview": {"type": "boolean"},
+                            },
+                            ["number"],
+                        ),
+                    ),
+                    self._tool_start_epic,
+                )
+            )
         if self.github is not None and self.config.github.repo:
             tools.append(
                 HostTool(
@@ -1714,6 +1766,101 @@ class Concierge:
             _one_line(f"{_mergeable_summary(pr)} · {behind}", 300),
         ]
         return "\n".join(lines)[:2000]
+
+    def _tool_start_epic(self, args: dict[str, Any], by: str) -> str:
+        number = args.get("number")
+        preview = args.get("preview", False)
+        ordered = args.get("ordered_issue_numbers")
+        if type(number) is not int or number < 1:
+            raise EpicPlanError("number must be a positive integer issue number")
+        if type(preview) is not bool:
+            raise EpicPlanError("preview must be true or false")
+        if ordered is not None and (
+            not isinstance(ordered, list)
+            or not ordered
+            or len(ordered) > MAX_EPIC_STEPS
+            or any(type(value) is not int or value < 1 for value in ordered)
+            or len(set(ordered)) != len(ordered)
+        ):
+            raise EpicPlanError(
+                f"ordered_issue_numbers needs 1 to {MAX_EPIC_STEPS} unique positive issue numbers"
+            )
+        repo, error = self._resolve_repo(args)
+        if error is not None or repo is None:
+            raise EpicPlanError(error or "an explicit repository is required")
+        entry = self.config.github.find_repo(repo)
+        if entry is None or not entry.enabled:
+            raise EpicPlanError(f"repository {repo} is disabled")
+        campaign_id = epic_campaign_id(repo, number)
+        existing = self.loop.campaign_runner.campaigns.get(campaign_id)
+        if existing is not None:
+            if ordered is not None and ordered != [
+                int(step.item.source_key) for step in existing.plan.steps
+            ]:
+                raise CampaignError(
+                    f"campaign {campaign_id} is already admitted; use campaign move "
+                    "to change pending order while preserving its prerequisites"
+                )
+            return (
+                f"already admitted {campaign_id}; using its pinned plan\n"
+                + self.loop.campaign_status(campaign_id)
+            )
+        identity = WorkItem(
+            item_id=issue_item_id(number, repo=repo),
+            source_key=str(number),
+            title=f"Epic {number}",
+            repo=repo,
+        )
+        source = source_for_campaign(self.loop.source, identity)
+        if source is None:
+            raise EpicPlanError(f"repository {repo} has no GitHub source")
+        try:
+            ops = source._ops()
+            epic = resolve_epic(
+                ops,
+                repo,
+                number,
+                ordered_issue_numbers=ordered,
+                trigger_label=source.labels.trigger,
+                workload_label=source.labels.workload,
+            )
+            base = self.config.github.for_repo(repo).deliver_base
+            if any(step.kind == "code" for step in epic.steps) and base is None:
+                base = ops.default_branch(repo)
+        except EpicPlanError as exc:
+            if isinstance(exc.__cause__, SbxloopError):
+                source._failed(exc.__cause__)
+            raise
+        except SbxloopError as exc:
+            source._failed(exc)
+            raise
+        closed = [f"#{step.number}" for step in epic.steps if step.state == "closed"]
+        if preview:
+            lines = [
+                f"epic preview {campaign_id}: {epic.title} ({len(epic.steps)} steps)",
+                epic.url,
+                f"order source: {epic.order_source}; code base: {base or 'not applicable'}",
+                "order: " + " → ".join(f"#{step.number}" for step in epic.steps),
+            ]
+            if closed:
+                lines.append(
+                    "BLOCKED: closed members need delivery reconciliation before admission: "
+                    + ", ".join(closed)
+                )
+            for position, step in enumerate(epic.steps, 1):
+                needs = ", ".join(f"#{number}" for number in step.depends_on)
+                lines.append(
+                    f"{position}. #{step.number} {_one_line(step.title, 70)} "
+                    f"[{step.kind}, {step.state}]" + (f"; needs {needs}" if needs else "")
+                )
+            return "\n".join(lines)
+        plan = campaign_plan_from_epic(
+            epic,
+            requested_by=by,
+            requester_id=self._turn_author_id,
+            expected_base=base,
+        )
+        return self.loop.admit_campaign(plan)
 
     def _tool_create_issue(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None

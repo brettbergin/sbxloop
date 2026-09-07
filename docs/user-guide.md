@@ -1007,6 +1007,27 @@ Existing running, completed, or previously attempted items cannot be admitted
 in this first version. A source read or ownership conflict holds the campaign
 with a reason so a person can resolve it and resume.
 
+To start from an epic without labeling every child, tell the concierge
+"run this epic" with its issue URL. The `start_epic` tool reads an explicit
+child list and build order, previews it when asked, and admits the saved plan
+when the person asks to run it. The campaign is named
+`epic:<owner/name>:<number>`; use that name with the campaign controls above.
+The admitted child asks retain the epic brief, source, and complete step order.
+Later edits to the epic do not silently change an active campaign.
+
+The first version accepts child lists under **Backlog**, **Sub-issues**,
+**Tasks**, or **Child issues**, and numbered **Build order**, **Execution
+order**, or **Implementation order** sections. An ordered section can supply
+the child list itself. A complete set of unique positive `order: N` labels
+also supplies order. An explicit order supplied in chat must include every
+listed child exactly once. Incidental issue mentions are not members, and
+issue numbers alone never determine execution order. Declared `Depends on`,
+`Dependencies`, and `Prerequisites` must refer to earlier members; ambiguity,
+cycles, references outside the admitted scope, or closed children stop intake
+with a reason. There is a limit of 100 children per epic. Native GitHub
+sub-issue relationships are not read by this initial adapter; list the members
+in the epic body.
+
 `<item>` is a work item id. GitHub items are **typed** —
 `gh:issue:<number>` for the issue a run was claimed from, `gh:pr:<number>`
 for a pull request referenced as a work-item resource — and the untyped

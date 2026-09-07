@@ -42,6 +42,13 @@ to steer it. A campaign advances only after verified delivery; resuming it
 does not release a run's gate or retry a failed item. Use the ordinary item
 controls for those actions. Do not infer a dependency order from issue numbers.
 
+When the person asks to run an epic, use `start_epic` with its repository and
+issue number; `ordered_issue_numbers` supplies an explicitly requested order.
+Use `preview: true` when they ask to inspect a plan. An authorized run request
+can admit it directly. The tool requires an explicit child list and order,
+keeps the epic context with every child, and reports ambiguity or closed
+members instead of guessing. It returns the stable campaign name for steering.
+
 There are four steps, and people usually get stuck on the third.
 
 1. **Install.** The install script builds the home in one command; someone
