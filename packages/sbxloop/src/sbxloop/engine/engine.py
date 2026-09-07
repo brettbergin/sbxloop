@@ -4685,7 +4685,7 @@ class LoopEngine:
                     f"verify command suspect: `{repeated[0].command}` failed identically again"
                 ),
             )
-            self._register_verify_suspect(run_id, task, repeated)
+            self._register_verify_suspect(run_id, phases, task, repeated)
             return
         self._register_revision(run_id, task, feedback, verify_failure=True)
 
@@ -4707,19 +4707,29 @@ class LoopEngine:
         return repeated
 
     def _register_verify_suspect(
-        self, run_id: str, task: TaskRecord, repeated: Sequence[VerifyFailure]
+        self,
+        run_id: str,
+        phases: PhaseRunner,
+        task: TaskRecord,
+        repeated: Sequence[VerifyFailure],
     ) -> None:
-        """Spend one fresh-session attempt on the only thing the loop can do.
+        """Escalate a check that cannot pass, then fall back to a fresh session.
 
         The verify commands are decomposer-authored and the builder is told
-        it cannot edit them, so this does NOT order a re-author (the review
-        of #509 was right that nothing in the loop re-runs decompose). What
-        it does is give the one remaining lever a fresh session: an approach
-        whose layout and setup satisfy the command exactly as written. The
-        feedback also tells the builder to report the command as unpassable
-        if it cannot be satisfied, and ``verify_suspect`` is carried into the
-        run's failure reason (``_failure_reason``) so the diagnosis reaches a
-        human rather than dying in the task row.
+        it cannot edit them. That used to be the end of the story: nothing in
+        the loop re-ran decompose, so the only lever was to give the builder
+        a fresh session and hope an approach existed that satisfied the
+        command as written. When none did — because the command was asking
+        for something no arrangement of the workspace could give — the run
+        was abandoned with the work finished and every other check green
+        (field failure rkbgkf32a).
+
+        So the check is now escalated first: one bounded re-author that sees
+        that command and no other, and may replace it, drop it, or let it
+        stand. Only when it stands (or the budget is spent, or it declines)
+        does the old fresh-session replan run, and after that the task fails
+        with ``verify_suspect`` carried into the run's failure reason
+        (``_failure_reason``) so the diagnosis reaches a human.
 
         Deliberately does NOT increment ``revisions``: the whole point of
         the signal is that identical revisions are wasted (field run
@@ -4727,12 +4737,77 @@ class LoopEngine:
         ``uv run mypy packages``).
         """
         task.last_feedback = verify_suspect_feedback(list(repeated))
+        if self._reauthor_verify(run_id, phases, task, repeated[0]):
+            return
         if task.replans >= self.config.budgets.max_replans_per_task:
             self._set_task_state(run_id, task, "failed")
             return
         task.replans += 1
         self._discard_session(task)
         self._set_task_state(run_id, task, "executing")
+
+    def _reauthor_verify(
+        self,
+        run_id: str,
+        phases: PhaseRunner,
+        task: TaskRecord,
+        failure: VerifyFailure,
+    ) -> bool:
+        """Try to change the check instead of the work; True if it changed.
+
+        The task stays in ``verifying`` on success rather than going back
+        through BUILD. The build already passed — only the exam changed — and
+        a run's cost scales with turns, so a build turn that would find
+        nothing to do is a turn not worth spending.
+
+        ``verify_suspect`` is cleared with the command that earned it. The
+        fingerprints are left alone: they are keyed by command text, so the
+        replacement starts clean anyway, and a *different* command that
+        starts repeating is a new suspect that deserves its own escalation.
+        """
+        budget = self.config.budgets.max_verify_reauthors_per_task
+        if task.verify_reauthors >= budget:
+            return False
+        try:
+            answer = phases.reauthor_verify(
+                task,
+                suspect_command=failure.command,
+                suspect_output=failure.output,
+                builder_report=self._prior_attempt_report(run_id, task),
+            )
+        except (InvalidOutputTwice, WorkerError) as exc:
+            # A re-author that cannot answer must not take the run with it:
+            # the fallback below is exactly the behaviour that existed before
+            # this phase did.
+            log.warning(
+                "verify.reauthor_failed", run=run_id, task=task.spec.id, error=str(exc)[:300]
+            )
+            return False
+        if answer.verdict == "keep":
+            return False
+        task.verify_reauthors += 1
+        replacement = answer.command.strip() if answer.verdict == "replace" else ""
+        task.spec.verify_commands = [
+            replacement if command == failure.command else command
+            for command in task.spec.verify_commands
+            if replacement or command != failure.command
+        ]
+        task.verify_suspect = False
+        self.bus.emit(
+            HostEventTypes.VERIFY_REAUTHORED,
+            run_id,
+            task_id=task.spec.id,
+            verdict=answer.verdict,
+            command=failure.command,
+            replacement=replacement,
+            reason=answer.reason,
+            text=(
+                f"verify check {answer.verdict}d on task {task.spec.id}: "
+                f"`{failure.command}` — {answer.reason}"
+            ),
+        )
+        self.store.update_task(run_id, task)
+        return True
 
     @staticmethod
     def _discard_session(task: TaskRecord) -> None:

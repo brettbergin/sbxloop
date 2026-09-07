@@ -30,6 +30,7 @@ import hashlib
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
+from functools import partial
 from pathlib import Path
 from typing import Literal, NamedTuple, TypeVar
 
@@ -39,7 +40,14 @@ from sbxloop import toolchains
 from sbxloop.config import Config
 from sbxloop.deliver import pr_conventions
 from sbxloop.engine.harness import ROLE_BY_PHASE, brief_for_phase
-from sbxloop.engine.model import JudgeVerdict, SteerVerdict, TaskGraph, TaskRecord, WorkloadPlan
+from sbxloop.engine.model import (
+    JudgeVerdict,
+    SteerVerdict,
+    TaskGraph,
+    TaskRecord,
+    VerifyReauthor,
+    WorkloadPlan,
+)
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.repocontext import repo_conventions
 from sbxloop.engine.review import ReviewGuard, ReviewVerdict
@@ -51,12 +59,14 @@ from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
 from sbxloop.verifylint import (
     UV_LOCKFILE,
+    command_heads,
     config_override_example,
     gate_problems,
     gate_rule,
     lint_verify_commands,
     project_gate,
     reviewer_gate_rule,
+    runs_gate,
 )
 from sbxloop.worker.client import WorkerClient
 from sbxloop.worker.hosttools import HostToolHandler
@@ -198,6 +208,8 @@ AGENT_NAMES = {
     "operator_plan": "operator",
     "operator_execute": "operator",
     "operator_judge": "judge",
+    # The one actor allowed to change the exam rather than the work.
+    "reauthor_verify": "verify editor",
 }
 # The phases whose session gets the run's host tools: the one doing the
 # work that may need a service. Planners and critics read and judge.
@@ -771,6 +783,101 @@ class PhaseRunner:
             check=self._check_taskgraph,
         )
         return graph
+
+    # Commands that decide nothing: a "replacement" made of these passes
+    # whatever the workspace contains, which is a deleted check wearing the
+    # shape of one.
+    _NO_OP_HEADS = frozenset({"true", ":", "echo", "printf", "exit"})
+
+    def reauthor_verify(
+        self,
+        task: TaskRecord,
+        *,
+        suspect_command: str,
+        suspect_output: str,
+        builder_report: str,
+    ) -> VerifyReauthor:
+        """Decide what happens to one verify command that cannot pass.
+
+        The command has failed identically across attempts and approaches, so
+        the loop knows no further work on the code can change it. Until this
+        existed the loop could only say so and abandon the run, throwing away
+        work that was finished (field failure rkbgkf32a). Here the check
+        itself is the thing that gets to change.
+
+        Scoped to the one suspect command: everything else on the task is
+        passed as context and stays byte-identical whatever comes back. The
+        answer is held to the same mechanical gate a decomposition is —
+        toolchain conventions, no environment mutation, no network, no
+        pattern kills — plus two rules only this phase needs: a replacement
+        may not be a no-op, and the command carrying the project's own gate
+        may be replaced but never dropped.
+        """
+        gate_note = self._reauthor_gate_note(suspect_command)
+        answer, _ = self._agent_json(
+            VerifyReauthor,
+            "reauthor_verify",
+            {
+                "task_title": f"{task.spec.id}: {task.spec.title}",
+                "task_description": task.spec.description or "(no description)",
+                "acceptance_criteria": bullet_list(task.spec.acceptance_criteria),
+                "suspect_command": suspect_command,
+                "suspect_output": suspect_output.strip() or "(no output at all)",
+                "other_commands": bullet_list(
+                    [c for c in task.spec.verify_commands if c != suspect_command]
+                ),
+                "builder_report": builder_report or "(the builder said nothing about it)",
+                "gate_rule": gate_note,
+            },
+            permission_mode="read_only",
+            check=partial(self._check_reauthor, suspect_command=suspect_command),
+        )
+        return answer
+
+    def _reauthor_gate_note(self, suspect_command: str) -> str:
+        """The extra rule when the suspect check is the one carrying the
+        project's own gate: it may be rewritten, never removed."""
+        gate = self.project_gate()
+        if not gate or not runs_gate(suspect_command, gate):
+            return ""
+        return (
+            "This check runs the project's own gate, so it may be replaced but never "
+            f"dropped: whatever replaces it must run `{gate}` too."
+        )
+
+    def _check_reauthor(self, answer: VerifyReauthor, *, suspect_command: str) -> None:
+        """Reject an answer that would weaken the exam rather than fix it.
+
+        The lint is the same one a decomposition is held to, so a
+        replacement cannot smuggle in what the decomposer is forbidden. The
+        two rules beyond it exist because this phase, unlike the decomposer,
+        is talking to a model that has just been told a check is in its way:
+        a replacement that cannot fail is a deleted check wearing the shape
+        of one, and the command carrying the project's gate is the last one
+        that should quietly disappear.
+        """
+        gate = self.project_gate()
+        carries_gate = bool(gate and runs_gate(suspect_command, gate))
+        if answer.verdict == "drop" and carries_gate:
+            raise ValueError(
+                "this check runs the project's own gate and cannot be dropped — "
+                "replace it with one that still runs it, or keep it"
+            )
+        if answer.verdict != "replace":
+            return
+        if problems := self._lint_verify_commands([answer.command]):
+            raise ValueError("; ".join(problems))
+        heads = command_heads(answer.command)
+        if heads and all(head in self._NO_OP_HEADS for head in heads):
+            raise ValueError(
+                f"`{answer.command}` cannot fail whatever the workspace contains, so it "
+                "is not a check — give one that can fail, or keep the existing check"
+            )
+        if carries_gate and not runs_gate(answer.command, gate or ""):
+            raise ValueError(
+                f"the check being replaced runs this project's gate (`{gate}`); "
+                "the replacement must run it too"
+            )
 
     def repo_conventions(self) -> str:
         """The repository's own instruction files as a prompt section

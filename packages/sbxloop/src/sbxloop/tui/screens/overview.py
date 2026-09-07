@@ -7,9 +7,14 @@ actually opens a console with: *is this working well?*
 
 It answers that in prose and proportion rather than in a grid. One live
 line on top, a narrow rail of pages beside the console's own, and a page
-that states its finding in a sentence before it draws a bar. Five pages,
-because five metric classes fought over one screen and lost; given a page
-each, every one of them fits in a few lines.
+that states its finding in a sentence before it draws a bar. Six pages,
+because that many metric classes fought over one screen and lost; given a
+page each, every one of them fits in a few lines.
+
+Most of the drawing is :mod:`sbxloop.tui.widgets.band` — one row, solid
+colour, no axis, and the right answer to every "what share" question here.
+Spread is the exception: *what shape* needs a scale, so that page and the
+Cost trend use :mod:`sbxloop.tui.widgets.chart`.
 
 The numbers are :mod:`sbxloop.tui.analytics`, recomputed on a slow timer of
 its own — nothing in a week-long window changes between console ticks.
@@ -18,6 +23,7 @@ its own — nothing in a week-long window changes between console ticks.
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import Any, ClassVar, NamedTuple
 
 from rich.text import Text
@@ -25,21 +31,21 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Horizontal, VerticalScroll
-from textual.widgets import Sparkline, Static
+from textual.widgets import Static
 from textual.worker import get_current_worker
 
 from sbxloop.tui import analytics
-from sbxloop.tui.analytics import Analytics, Lane
+from sbxloop.tui.analytics import Analytics, Lane, RunRow
 from sbxloop.tui.data import ConsoleState
 from sbxloop.tui.format import age
 from sbxloop.tui.screens.base import ConsoleScreen
+from sbxloop.tui.widgets import chart
 from sbxloop.tui.widgets.band import (
     BAD_COLOUR,
     IDLE_COLOUR,
     OK_COLOUR,
     PALETTE,
     PARKED_COLOUR,
-    TRACK_COLOUR,
     WAIT_COLOUR,
     Band,
     Segment,
@@ -62,6 +68,7 @@ PAGES: tuple[PageItem, ...] = (
     PageItem("c", "cost", "Cost"),
     PageItem("t", "time", "Time"),
     PageItem("h", "health", "Health"),
+    PageItem("d", "spread", "Spread"),
 )
 
 
@@ -131,7 +138,7 @@ class OverviewScreen(ConsoleScreen):
     OverviewScreen .lab { width: 13; color: $text-muted; }
     OverviewScreen .lab-wide { width: 30; color: $text-muted; }
     OverviewScreen .val { width: 11; text-style: bold; }
-    OverviewScreen Sparkline { height: 1; width: 28; }
+    OverviewScreen .cap { color: $text-muted; }
     OverviewScreen.-narrow PageRail { display: none; }
     """
 
@@ -255,6 +262,7 @@ class OverviewScreen(ConsoleScreen):
             "cost": self._cost,
             "time": self._time,
             "health": self._health,
+            "spread": self._spread,
         }[self.page]
         for widget in builder(data):
             body.mount(widget)
@@ -275,26 +283,35 @@ class OverviewScreen(ConsoleScreen):
 
     @staticmethod
     def _ranked(
-        rows: list[tuple[str, float, str]], colour: str, *, wide: bool = False
+        rows: list[tuple[str, float, str]],
+        colour: str,
+        fmt: Callable[[float], str] | None = None,
+        *,
+        wide: bool = False,
     ) -> list[Any]:
-        """A short ranked list, each row a bar against the biggest.
+        """A short ranked list as bars against a scale, biggest at the top.
 
-        ``wide`` gives the label room for a sentence rather than an id: a
-        failure reason is prose, and reads as nothing clipped to the width
-        of a run id."""
+        The band version drew each row against the biggest, which shows the
+        ranking and hides the quantity: 400 turns and 12 turns were a full
+        bar and a stub, with no way to read either number off it.
+
+        ``wide`` keeps a prose label — a failure reason is a sentence and
+        reads as nothing clipped to the width of a run id — so those are
+        truncated further to fit the axis gutter rather than the label
+        column that no longer exists."""
         if not rows:
             return [TextPanel(Text("nothing to rank", style="dim"))]
-        peak = max(value for _label, value, _note in rows) or 1.0
-        label_class = "lab-wide" if wide else "lab"
-        return [
-            Horizontal(
-                TextPanel(f"{label} ", classes=label_class),
-                TextPanel(note, classes="val"),
-                Band([Segment("v", value, colour), Segment("rest", peak - value, TRACK_COLOUR)]),
-                classes="r",
-            )
-            for label, value, note in rows
-        ]
+        width = 26 if wide else 14
+        drawn = chart.ranked([(label[:width], value) for label, value, _note in rows], colour, fmt)
+        # The exact values, which a bar against an axis approximates and
+        # which some notes carry more of than the bar can ("3 of 12").
+        notes = Text()
+        for index, (label, _value, note) in enumerate(rows):
+            if index:
+                notes.append("  ·  ", style="dim")
+            notes.append(f"{label[:width]} ", style="dim")
+            notes.append(note)
+        return [drawn, TextPanel(notes, classes="cap")]
 
     @staticmethod
     def _delta(value: float | None, *, lower_is_better: bool = False) -> tuple[str, str]:
@@ -367,23 +384,27 @@ class OverviewScreen(ConsoleScreen):
                 (" waiting on you.", "dim"),
             ),
             TextPanel("", classes="gap"),
-            self._row(
+        ]
+        out.extend(
+            self._plotted(
                 "outcome", f"{rate:.0%} ok" if rate is not None else "—", self._outcome(total)
-            ),
-            TextPanel("", classes="gap"),
-            self._row(
+            )
+        )
+        out.append(TextPanel("", classes="gap"))
+        out.extend(
+            self._plotted(
                 "time",
                 hm(total.elapsed),
                 [
                     Segment("active", total.active, PALETTE[0]),
                     Segment("parked", total.parked, PARKED_COLOUR),
                 ],
-            ),
-            TextPanel("", classes="gap"),
-            self._row("phases", hm(data.active_seconds), phases),
-            TextPanel(legend(phases)),
-            TextPanel("", classes="gap"),
-        ]
+                hm,
+            )
+        )
+        out.append(TextPanel("", classes="gap"))
+        out.extend(self._plotted("phases", hm(data.active_seconds), phases, hm))
+        out.append(TextPanel("", classes="gap"))
         out.extend(
             self._compare(
                 data,
@@ -396,8 +417,8 @@ class OverviewScreen(ConsoleScreen):
             )
         )
         out.append(TextPanel("", classes="gap"))
-        out.append(TextPanel("day by day", classes="h"))
-        out.extend(self._days(data))
+        out.append(TextPanel("day by day, by outcome", classes="h"))
+        out.extend(self._day_chart(data))
         lever = self._lever(data)
         if lever is not None:
             out.append(TextPanel("", classes="gap"))
@@ -430,30 +451,30 @@ class OverviewScreen(ConsoleScreen):
             )
         return None
 
-    def _days(self, data: Analytics) -> list[Any]:
-        """The trend as a stack: each bucket split by how its runs ended."""
-        peak = max((d.runs for d in data.days), default=0) or 1
-        out: list[Any] = []
-        for offset, day in enumerate(data.days):
-            when = time.localtime(
-                data.since + (offset + 0.5) * (data.until - data.since) / max(len(data.days), 1)
-            )
-            label = time.strftime("%a %d", when)
-            segments = [
-                Segment("landed", day.landed, OK_COLOUR),
-                Segment("failed", day.failed, BAD_COLOUR),
-                Segment("cancelled", day.cancelled, IDLE_COLOUR),
-                Segment("rest", peak - day.runs, TRACK_COLOUR),
-            ]
-            out.append(
-                Horizontal(
-                    TextPanel(label, classes="lab"),
-                    TextPanel(f"{day.runs or '—'}", classes="val"),
-                    Band(segments),
-                    classes="r",
-                )
-            )
-        return out
+    @staticmethod
+    def _bucket_label(data: Analytics, offset: int, fmt: str) -> str:
+        """Which day a bucket is, taken from the middle of the bucket so
+        rounding cannot push it into the neighbouring one."""
+        when = time.localtime(
+            data.since + (offset + 0.5) * (data.until - data.since) / max(len(data.days), 1)
+        )
+        return time.strftime(fmt, when)
+
+    def _day_chart(self, data: Analytics) -> list[Any]:
+        """The week as one stacked plot rather than a bar per day."""
+        labels = [self._bucket_label(data, i, "%a") for i in range(len(data.days))]
+        if not labels:
+            return [TextPanel(Text("no days in the window", style="dim"))]
+        series = [
+            ("landed", [float(d.landed) for d in data.days], OK_COLOUR),
+            ("failed", [float(d.failed) for d in data.days], BAD_COLOUR),
+            ("cancelled", [float(d.cancelled) for d in data.days], IDLE_COLOUR),
+        ]
+        drawn = chart.stacked(labels, series)
+        # The week's totals as the key — the same swatch-name-share line a
+        # band carries, so the two kinds of stack read the same way.
+        key = legend([Segment(name, sum(values), colour) for name, values, colour in series])
+        return [drawn, TextPanel(key, classes="cap")]
 
     def _flow(self, data: Analytics) -> list[Any]:
         out: list[Any] = [
@@ -466,7 +487,7 @@ class OverviewScreen(ConsoleScreen):
             TextPanel("", classes="gap"),
             TextPanel("runs per day, by outcome", classes="h"),
         ]
-        out.extend(self._days(data))
+        out.extend(self._day_chart(data))
         out.append(TextPanel("", classes="gap"))
         out.append(TextPanel("by kind", classes="h"))
         out.extend(
@@ -515,6 +536,7 @@ class OverviewScreen(ConsoleScreen):
                         for r in data.slowest_to_land[:6]
                     ],
                     PALETTE[3],
+                    hm,
                 )
             )
             out.append(TextPanel("", classes="gap"))
@@ -535,32 +557,20 @@ class OverviewScreen(ConsoleScreen):
             ),
             TextPanel("", classes="gap"),
             TextPanel("turns per day", classes="h"),
-            Sparkline([float(x) for x in data.daily["turns"]], summary_function=max),
-            TextPanel("", classes="gap"),
         ]
+        # A sparkline drew this shape but named no value on it: the peak
+        # and the floor looked the same on a quiet week as on a heavy one.
+        out.extend(self._trend(data, "turns", PALETTE[1]))
+        out.append(TextPanel("", classes="gap"))
         # Which phase burns the turns — the total says how much, this says
         # where, and only the second one is actionable.
         by_turns = data.phase_turns
         if by_turns:
-            out.append(TextPanel("turns by phase", classes="h"))
-            out.append(
-                Band(
-                    [
-                        Segment(p.phase, float(p.turns), PALETTE[i % len(PALETTE)])
-                        for i, p in enumerate(by_turns[:6])
-                    ]
-                )
-            )
-            out.append(
-                TextPanel(
-                    legend(
-                        [
-                            Segment(p.phase, float(p.turns), PALETTE[i % len(PALETTE)])
-                            for i, p in enumerate(by_turns[:6])
-                        ]
-                    )
-                )
-            )
+            turn_split = [
+                Segment(p.phase, float(p.turns), PALETTE[i % len(PALETTE)])
+                for i, p in enumerate(by_turns[:6])
+            ]
+            out.extend(self._plotted("turns by phase", f"{total.turns:,}", turn_split))
             out.append(TextPanel("", classes="gap"))
             out.append(TextPanel("context re-sent per phase", classes="h"))
             out.extend(
@@ -587,7 +597,8 @@ class OverviewScreen(ConsoleScreen):
         out.append(TextPanel("costliest runs", classes="h"))
         out.extend(
             self._ranked(
-                [(r.run_id, float(r.turns), f"{r.turns} turns") for r in data.costliest], PALETTE[1]
+                [(r.run_id, float(r.turns), f"{r.turns} turns") for r in data.costliest],
+                PALETTE[1],
             )
         )
         out.append(TextPanel("", classes="gap"))
@@ -641,20 +652,22 @@ class OverviewScreen(ConsoleScreen):
                 (f" — {total.parked_share:.0%} of elapsed.", "dim"),
             ),
             TextPanel("", classes="gap"),
-            self._row(
+        ]
+        out.extend(
+            self._plotted(
                 "elapsed",
                 hm(total.elapsed),
                 [
                     Segment("active", total.active, PALETTE[0]),
                     Segment("parked", total.parked, PARKED_COLOUR),
                 ],
-            ),
-            TextPanel("", classes="gap"),
-            TextPanel("where the working time went", classes="h"),
-            Band(phases),
-            TextPanel(legend(phases)),
-            TextPanel("", classes="gap"),
-        ]
+                hm,
+            )
+        )
+        out.append(TextPanel("", classes="gap"))
+        out.append(TextPanel("where the working time went", classes="h"))
+        out.extend(self._plotted("phases", hm(data.active_seconds), phases, hm))
+        out.append(TextPanel("", classes="gap"))
         if data.phases:
             out.extend(
                 self._cols(
@@ -680,7 +693,9 @@ class OverviewScreen(ConsoleScreen):
         out.append(TextPanel("longest parked", classes="h"))
         out.extend(
             self._ranked(
-                [(r.run_id, r.parked, hm(r.parked)) for r in data.longest_parked], WAIT_COLOUR
+                [(r.run_id, r.parked, hm(r.parked)) for r in data.longest_parked],
+                WAIT_COLOUR,
+                hm,
             )
         )
         out.append(TextPanel("", classes="gap"))
@@ -791,6 +806,165 @@ class OverviewScreen(ConsoleScreen):
                     (" CI rounds   ", "dim"),
                     (f"{total.cancelled}", "bold"),
                     (" cancelled by you", "dim"),
+                )
+            )
+        )
+        return out
+
+    def _plotted(
+        self,
+        label: str,
+        value: str,
+        segments: list[Segment],
+        fmt: Callable[[float], str] | None = None,
+    ) -> list[Any]:
+        """`_row`'s charted counterpart: the same heading and the same key,
+        with a scale between them instead of a single painted row."""
+        if not any(s.value > 0 for s in segments):
+            return [self._row(label, value, segments)]
+        drawn = chart.proportion([(s.label, s.value, s.colour) for s in segments], fmt)
+        return [
+            # `:<13` alone runs the two together when the label is longer
+            # than the field — "turns by phase" is fourteen characters.
+            TextPanel(
+                Text.assemble((f"{label:<13}", "dim"), (" ", ""), (value, "bold")),
+            ),
+            drawn,
+            TextPanel(legend(segments), classes="cap"),
+        ]
+
+    @staticmethod
+    def _captioned(drawn: chart.Chart) -> list[Any]:
+        """A plot and the sentence saying what is in it. `render` paints a
+        chart, which leaves nothing for a screen reader — or a test — to
+        read; the caption is the chart in words."""
+        return [drawn, TextPanel(Text(drawn.caption, style="dim"), classes="cap")]
+
+    def _trend(self, data: Analytics, metric: str, colour: str) -> list[Any]:
+        """A daily series against a labelled scale."""
+        series = [float(x) for x in data.daily.get(metric, ())]
+        if not series:
+            return [TextPanel(Text("no daily series", style="dim"))]
+        labels = [self._bucket_label(data, i, "%a") for i in range(len(series))]
+        return self._captioned(chart.bars(labels, series, colour))
+
+    def _distribution(
+        self,
+        values: list[float],
+        colour: str,
+        spread: Text,
+        fmt: Callable[[float], str] | None = None,
+    ) -> list[Any]:
+        """A histogram, under the median-and-p90 line either way.
+
+        Median and p90 say where the middle is; they say nothing about
+        whether the runs cluster there or sit in two camps either side of
+        it, which is the whole reason to draw the shape. Under
+        `chart.MIN_POINTS` runs there is no shape to see — every bin holds
+        one run — and the two numbers are the better answer alone."""
+        if not chart.enough(values):
+            return [
+                TextPanel(spread),
+                TextPanel(
+                    Text(
+                        f"{plural(len(values), 'run')} — too few to show a shape "
+                        f"(needs {chart.MIN_POINTS}).",
+                        style="dim",
+                    ),
+                    classes="cap",
+                ),
+            ]
+        # One bin per two runs, held between 6 and 12: fewer and the shape
+        # is a block, more and every bin holds one run and the histogram
+        # is just the scatter drawn worse.
+        bins = max(6, min(12, len(values) // 2))
+        return [*self._captioned(chart.histogram(values, bins, colour, fmt)), TextPanel(spread)]
+
+    def _spread(self, data: Analytics) -> list[Any]:
+        """How the week's runs are distributed, rather than what they
+        totalled. The totals are on Cost and Time; this page is the one
+        that shows an average hiding two populations."""
+        runs = list(data.runs_seen)
+        turns = [float(r.turns) for r in runs]
+        active = [r.active for r in runs]
+        t_median, t_p90 = data.turns_spread
+        a_median, a_p90 = data.active_spread
+        tail = t_p90 / t_median if t_median else 0.0
+        out: list[Any] = [
+            self._say(
+                (f"{len(runs)} runs", "bold"),
+                (" in the window. The middle one cost ", "dim"),
+                (f"{t_median:.0f} turns", "bold"),
+                (", the ninetieth ", "dim"),
+                (f"{t_p90:.0f}", f"bold {WAIT_COLOUR}" if tail >= 2 else "bold"),
+                (
+                    f" — a {tail:.1f}x tail." if tail >= 2 else " — no long tail.",
+                    "dim",
+                ),
+            ),
+            TextPanel("", classes="gap"),
+            TextPanel("turns per run", classes="h"),
+        ]
+        out.extend(
+            self._distribution(
+                turns,
+                PALETTE[1],
+                Text.assemble(
+                    ("median ", "dim"),
+                    (f"{t_median:.0f} turns", "bold"),
+                    ("   ·   p90 ", "dim"),
+                    (f"{t_p90:.0f} turns", "bold"),
+                ),
+            )
+        )
+        out.append(TextPanel("", classes="gap"))
+        out.append(TextPanel("working time per run", classes="h"))
+        out.extend(
+            self._distribution(
+                active,
+                PALETTE[0],
+                Text.assemble(
+                    ("median ", "dim"),
+                    (hm(a_median), "bold"),
+                    ("   ·   p90 ", "dim"),
+                    (hm(a_p90), "bold"),
+                ),
+                hm,
+            )
+        )
+        out.append(TextPanel("", classes="gap"))
+        out.append(TextPanel("turns against elapsed, one dot per run", classes="h"))
+        out.extend(self._cost_against_time(runs))
+        out.append(TextPanel("", classes="gap"))
+        out.extend(self._compare(data, [("turns", "turns", f"{data.total.turns:,}", True)]))
+        return out
+
+    def _cost_against_time(self, runs: list[RunRow]) -> list[Any]:
+        """Turns against elapsed. A run far off the crowd cost turns its
+        wall-clock does not explain — the shape a ranked list cannot show,
+        because a list is sorted by one axis and the outlier is the run
+        that disagrees with both."""
+        xs = [r.active + r.parked for r in runs]
+        ys = [float(r.turns) for r in runs]
+        if not chart.enough(xs):
+            return [
+                TextPanel(
+                    Text(
+                        f"{plural(len(xs), 'run')} — a scatter of that needs "
+                        f"{chart.MIN_POINTS}; the ranked lists on Cost and Time "
+                        "say more at this size.",
+                        style="dim",
+                    )
+                )
+            ]
+        out = self._captioned(chart.scatter(xs, ys, PALETTE[4], hm, whole_y=True))
+        out.append(
+            TextPanel(
+                Text.assemble(
+                    ("x: elapsed", "dim"),
+                    ("   ·   ", "dim"),
+                    ("y: turns", "dim"),
+                    ("   ·   o opens the costliest", "dim"),
                 )
             )
         )

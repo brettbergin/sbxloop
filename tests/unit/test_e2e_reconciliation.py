@@ -208,7 +208,7 @@ class TestTwoRoundRunIsReconciledOnThePr:
             rows = [
                 r
                 for r in reopened.phase_attempts(result.run_id)
-                if r["phase"] == "build" and r["task_id"] == "fix-1"
+                if r.phase == "build" and r.task_id == "fix-1"
             ]
         finally:
             reopened.close()
@@ -220,7 +220,7 @@ class TestTwoRoundRunIsReconciledOnThePr:
         assert posted[0].comment_id == fake.threads[0].root_comment_id
         assert posted[0].thread_node_id == fake.threads[0].node_id
         assert statuses["hello.txt:1"] == "addressed"
-        assert json.loads(rows[-1]["output_json"])["reconciled"] == [
+        assert json.loads(rows[-1].output_json or "{}")["reconciled"] == [
             {
                 "anchor": "hello.txt:1",
                 "status": "addressed",
