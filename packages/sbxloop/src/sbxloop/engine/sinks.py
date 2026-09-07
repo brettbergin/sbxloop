@@ -65,13 +65,19 @@ def sinks_declared(tasks: Sequence[TaskRecord]) -> list[str]:
 
 
 def safe_relative(path: str) -> PurePosixPath | None:
-    """A task-declared data-directory path as something the host may copy:
-    relative, normalised, never climbing out. None refuses it. The lists
-    come from the engine's own ``find`` (#757), so a refusal here is a
-    corrupted row rather than a hostile operator — but the copy runs on the
-    host, and the check costs nothing."""
+    """Validate an untrusted agent filename for copying and publication.
+
+    Accept relative POSIX paths that stay relative on every supported host.
+    Return None for spellings that can escape the destination or acquire
+    native path semantics when the host constructs an attachment path.
+    """
+    # Worker filenames use POSIX syntax even when the host uses Windows.
+    # Refuse drive/stream syntax, native separators and Windows parent
+    # aliases before a host Path can reinterpret a supposedly relative name.
+    if any(char in path for char in ("\\", ":", "\x00")):
+        return None
     pure = PurePosixPath(path)
-    if pure.is_absolute() or not pure.parts or any(part in ("..", "") for part in pure.parts):
+    if pure.is_absolute() or not pure.parts or any(part.rstrip(" .") == "" for part in pure.parts):
         return None
     return pure
 
