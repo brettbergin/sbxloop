@@ -26,6 +26,7 @@ from rich.table import Table
 from rich.tree import Tree
 
 import sbxloop
+from sbxloop import telemetry
 from sbxloop.backends import backend_for
 from sbxloop.cli.doctor import run_doctor
 from sbxloop.cli.tui import ChatInput, Dashboard, format_event, plain_printer, render_event
@@ -56,7 +57,7 @@ from sbxloop.engine.model import (
 )
 from sbxloop.engine.sinks import published_line
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import SbxloopError
+from sbxloop.errors import ConfigError, SbxloopError
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
 from sbxloop.ghids import normalize_item_id, try_parse_gh_id
@@ -127,6 +128,14 @@ def _main_callback(
     # Every command sees the home's secrets.env (tokens + SBXLOOP_* settings);
     # real environment variables always take precedence.
     load_secrets_env()
+    # Repair commands (init/config/doctor) must remain usable when config is
+    # invalid. Each command still owns its normal config error handling.
+    try:
+        telemetry_config = load_config().telemetry
+    except ConfigError:
+        pass
+    else:
+        telemetry.configure_telemetry(telemetry_config)
     # Temporary files land in the home too, once there is one (`sbxloop
     # init`); before that the platform default stands.
     tmp = resolve_home_root() / "tmp"
@@ -3020,7 +3029,13 @@ def doctor(
 
 
 def main() -> None:
-    app()
+    try:
+        app()
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        raise
+    finally:
+        telemetry.shutdown_telemetry()
 
 
 if __name__ == "__main__":

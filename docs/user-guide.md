@@ -1819,6 +1819,50 @@ such guests — so seeing the abort means the fallback had no `rg` to land
 on: look for a `sandbox.tooling_warning` event in `sbxloop logs`, and check
 the `page-size` probe under `sbxloop doctor --deep`.
 
+### GlitchTip error reporting
+
+sbxloop can report host failures to your own [GlitchTip](https://glitchtip.com/sdkdocs/python/)
+project through the Sentry Python SDK. Reporting is off until you put the
+project's DSN in `~/.sbxloop/config/secrets.env` (or export it in the host environment):
+
+```dotenv
+GLITCHTIP_DSN=https://your-public-key@errors.example.com/1
+```
+
+Restart the daemon after changing this file. Real environment variables take
+precedence. To label the deployment or use another variable name, add this to
+the home's `config/sbxloop.toml`:
+
+```toml
+[telemetry]
+dsn_env = "GLITCHTIP_DSN"
+environment = "production"
+```
+
+Reports include unhandled CLI exceptions, sbxloop ERROR events, and WARNING
+events logged with an exception. They carry the sbxloop release, deployment
+label, static event name, exception type, and stack filenames/functions/line
+numbers. Exception messages, local variables, source lines, absolute paths,
+command arguments, log fields, and customer payloads are omitted. The local
+daemon log retains the full diagnostic context.
+
+The SDK is confined to the host: no DSN is injected into sandboxes and no
+sandbox egress rule is added. Session tracking, tracing, profiling, metrics,
+breadcrumbs, automatic integrations, and log export are disabled. Unhandled
+background-thread exceptions and third-party library logs are not collected;
+background failures must reach sbxloop's logging pipeline. Invalid DSNs produce
+a `telemetry.init_failed` warning without printing their value, and reporting
+failures do not stop a run. CLI shutdown allows up to two seconds to flush.
+Remove or empty the DSN to disable reporting, then restart the daemon.
+
+| Key                     | Default         | Meaning                                                                   |
+| ----------------------- | --------------- | ------------------------------------------------------------------------- |
+| `telemetry.dsn_env`     | `GLITCHTIP_DSN` | Name of the environment variable containing the DSN; never the DSN value. |
+| `telemetry.environment` | `production`    | Deployment label attached to reports.                                     |
+
+These are host settings, with no per-repository override; tracked project
+configuration cannot change the reporting destination.
+
 ## Language toolchains
 
 The agent builds a project inside its sandbox, so whatever that project needs

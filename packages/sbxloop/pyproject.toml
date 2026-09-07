@@ -28,6 +28,8 @@ dependencies = [
     "sbxloop-worker",
     "gitpython>=3.1.59",
     "structlog>=24.1",
+    # Optional host error reporting is dormant until the operator supplies a DSN.
+    "sentry-sdk>=2.68.0,<3",
     # `.rubocop.yml` / other YAML project files the verify lint reads (#628).
     "pyyaml>=6.0",
     # `requires-python` is a PEP 440 specifier; the toolchain series a run

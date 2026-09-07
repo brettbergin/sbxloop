@@ -269,6 +269,14 @@ For a daemon that stays running, follow the [deployment guide](docs/deploy.md).
 The [user guide](docs/user-guide.md) has the full command reference and help
 for when something gets stuck.
 
+Optional [GlitchTip error reporting](docs/user-guide.md#glitchtip-error-reporting)
+sends host failures to your own project. Set the DSN in the home's secrets file.
+
+| Key                     | Default         | Meaning                                                                            |
+| ----------------------- | --------------- | ---------------------------------------------------------------------------------- |
+| `telemetry.dsn_env`     | `GLITCHTIP_DSN` | Environment variable holding the reporting DSN; empty or unset disables reporting. |
+| `telemetry.environment` | `production`    | Deployment label on error reports.                                                 |
+
 ## Contributing
 
 <p>
