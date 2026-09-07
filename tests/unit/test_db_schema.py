@@ -14,11 +14,12 @@ from pathlib import Path
 import pytest
 from alembic import command
 
-from sbxloop.daemon.store import apply_daemon_schema
+from sbxloop.daemon.store import DaemonStore, apply_daemon_schema
 from sbxloop.db import current_revision, ensure_schema, open_engine
 from sbxloop.db.schema import _config
 from sbxloop.db.session import BUSY_TIMEOUT_MS
 from sbxloop.engine.store import StateStore, apply_engine_schema
+from sbxloop_worker.protocol import Event
 from tests.fakes import legacy_db
 
 
@@ -277,3 +278,141 @@ class TestReconciliationKindBackfill:
             assert store.noted("r1", 0) == {"a7": "answered"}
         finally:
             store.close()
+
+
+class TestAnInstallationUpgradesInPlace:
+    """The acceptance test for #539: a deployed database keeps working.
+
+    Everything above checks one shape or one revision. This checks the thing
+    an operator actually does — take the database a released version wrote,
+    with rows in it, install the new one, and carry on — and that the file
+    the new code leaves behind is still one the *previous* version can read,
+    which is what a failed deploy's rollback depends on.
+    """
+
+    @staticmethod
+    def _released_database(path: Path) -> None:
+        """A database as the last release left it: pre-ORM schema, real rows."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        conn = sqlite3.connect(path)
+        try:
+            apply_engine_schema(conn)
+            apply_daemon_schema(conn)
+            conn.execute(
+                "INSERT INTO runs (run_id, outcome, state, config_json, created_at,"
+                " updated_at, kind, branch, pr_number) VALUES"
+                " ('r_old', 'ship it', 'merged', '{}', 100.0, 200.0, 'code', 'sbx/x', 4)"
+            )
+            conn.execute(
+                "INSERT INTO tasks (run_id, task_id, order_idx, state, spec_json)"
+                " VALUES ('r_old', 't1', 0, 'done', '{\"id\": \"t1\", \"title\": \"T1\"}')"
+            )
+            conn.execute(
+                "INSERT INTO phase_attempts (run_id, task_id, phase, attempt, status,"
+                " output_json, started_at, ended_at, turns) VALUES"
+                " ('r_old', 't1', 'build', 1, 'ok', '{}', 100.0, 150.0, 3)"
+            )
+            conn.execute(
+                "INSERT INTO events (run_id, ts, type, data_json)"
+                " VALUES ('r_old', 120.0, 'run.started', '{}')"
+            )
+            conn.execute(
+                "INSERT INTO reconciliations (run_id, round, anchor, status, resolved, ts)"
+                " VALUES ('r_old', -2, 'lint', 'spent', 0, 130.0)"
+            )
+            conn.execute(
+                "INSERT INTO daemon_work_items (item_id, source_key, title, state, repo,"
+                " created_at, updated_at, run_id) VALUES"
+                " ('gh:issue:4', '4', 'Fix the thing', 'done', 'acme/alpha', 100.0, 200.0,"
+                " 'r_old')"
+            )
+            conn.execute(
+                "INSERT INTO daemon_runs (run_id, item_id, started_at, finished_at, result)"
+                " VALUES ('r_old', 'gh:issue:4', 100.0, 200.0, 'done')"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_it_opens_migrates_and_reads_every_row_back(self, tmp_path: Path) -> None:
+        path = tmp_path / "state.db"
+        self._released_database(path)
+
+        store, daemon = StateStore(path), DaemonStore(path)
+        try:
+            run = store.get_run("r_old")
+            assert (run.state, run.kind, run.branch, run.pr_number) == (
+                "merged",
+                "code",
+                "sbx/x",
+                4,
+            )
+            assert [t.spec.id for t in store.get_tasks("r_old")] == ["t1"]
+            assert [a.phase for a in store.phase_attempts("r_old")] == ["build"]
+            assert [e.type for _, e in store.events("r_old")] == ["run.started"]
+            # Read through the accessor whose kind revision 0002 backfilled.
+            assert store.advisory_rounds("r_old") == frozenset({"lint"})
+
+            item = daemon.get("gh:issue:4")
+            assert item is not None and item.state == "done" and item.repo == "acme/alpha"
+            assert daemon.runs_for_item("gh:issue:4") == ["r_old"]
+        finally:
+            store.close()
+            daemon.close()
+
+    def test_it_keeps_writing_after_the_upgrade(self, tmp_path: Path) -> None:
+        """Not just readable — the upgraded database is still the live one."""
+        path = tmp_path / "state.db"
+        self._released_database(path)
+        store = StateStore(path)
+        try:
+            store.create_run("r_new", "another")
+            store.set_run_state("r_new", "building")
+            store.append_event(
+                Event(ts=300.0, run_id="r_new", job_id=None, type="run.started", data={})
+            )
+            assert {r.run_id for r in store.list_runs()} == {"r_old", "r_new"}
+        finally:
+            store.close()
+
+    def test_the_previous_version_can_still_read_what_the_new_one_wrote(
+        self, tmp_path: Path
+    ) -> None:
+        """The rollback contract, checked rather than asserted.
+
+        A failed deploy reinstalls the previous version and restarts it
+        against this database; it does not restore the snapshot it took. So
+        every column that version reads has to still be there, and mean what
+        it did. `apply_engine_schema`/`apply_daemon_schema` are that
+        version's migrator — running them over a migrated database must be
+        a no-op, and its own queries must still answer.
+        """
+        path = tmp_path / "state.db"
+        self._released_database(path)
+        StateStore(path).close()
+        DaemonStore(path).close()
+
+        conn = sqlite3.connect(path)
+        try:
+            before = conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
+            ).fetchall()
+            # The old migrator, re-run as a rolled-back release would.
+            apply_engine_schema(conn)
+            apply_daemon_schema(conn)
+            after = conn.execute(
+                "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
+            ).fetchall()
+            assert after == before, "the previous version's migrator changed the schema"
+
+            # And the columns it reads still answer, sentinel `round`
+            # included — that is what tells it an advisory round was spent.
+            conn.row_factory = sqlite3.Row
+            run = conn.execute("SELECT * FROM runs WHERE run_id = 'r_old'").fetchone()
+            assert run["state"] == "merged" and run["pr_number"] == 4
+            spent = conn.execute(
+                "SELECT anchor FROM reconciliations WHERE run_id = 'r_old' AND round = -2"
+            ).fetchall()
+            assert [r["anchor"] for r in spent] == ["lint"]
+        finally:
+            conn.close()
