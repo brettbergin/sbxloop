@@ -12,6 +12,7 @@ from sbxloop.daemon.store import LEGACY_SUFFIX, SCHEMA_VERSION, DaemonStore
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import DaemonError
 from tests.fakes.legacy_db import daemon_db, insert_daemon_row
+from tests.fakes.rawdb import exec_raw, query_raw
 
 
 def item(key: str = "7", **overrides: object) -> WorkItem:
@@ -495,9 +496,7 @@ class TestLedgerAndThreads:
         store.record_chat_thread("r1", "control", "thread:9", "9", backend="local")
         assert store.chat_thread("r1", "discord") is not None
         assert store.chat_thread("r1", "local") is not None
-        pk = [
-            r[1] for r in store._conn.execute("PRAGMA table_info(daemon_chat_threads)") if r[5] > 0
-        ]
+        pk = [r[1] for r in query_raw(store, "PRAGMA table_info(daemon_chat_threads)") if r[5] > 0]
         assert pk == ["run_id", "backend"]
         store.close()
         assert DaemonStore(path).chat_thread("r2", "slack") is not None
@@ -526,7 +525,7 @@ class TestLedgerAndThreads:
         assert store.chat_thread("r2") == ("42", "4343", "101", "102", "discord")
         assert store.run_for_thread(4343) == "r2"
         tables = {
-            r[0] for r in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            r[0] for r in query_raw(store, "SELECT name FROM sqlite_master WHERE type='table'")
         }
         assert "daemon_discord_threads" not in tables
         # Reopening is a no-op.
@@ -548,8 +547,7 @@ class TestLedgerAndThreads:
         """The self-filing lanes are gone with their bookkeeping."""
         store = DaemonStore(tmp_path / "state.db")
         tables = {
-            str(r[0])
-            for r in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            str(r[0]) for r in query_raw(store, "SELECT name FROM sqlite_master WHERE type='table'")
         }
         assert tables >= {"daemon_work_items", "daemon_runs", "daemon_requesters"}
         assert not tables & {
@@ -886,7 +884,7 @@ class TestRepoScoping:
 
         store = DaemonStore(path)
         assert "repo" in {
-            str(r[1]) for r in store._conn.execute("PRAGMA table_info(daemon_work_items)")
+            str(r[1]) for r in query_raw(store, "PRAGMA table_info(daemon_work_items)")
         }
         got = store.get("gh:issue:7")
         assert got is not None and got.repo is None
@@ -1288,13 +1286,13 @@ class TestGatePrompts:
         store.record_chat_thread("r1", "42", "4242", "100", backend="discord")
         store.record_chat_thread("r_slack", "C1", "17.5", "17.5", backend="slack")
         for run in ("r1", "r_slack", "r_bare"):
-            store._conn.execute(
-                "UPDATE daemon_merge_gates SET prompt_channel_id = '42', prompt_message_id = '555' "
-                "WHERE run_id = ?",
+            exec_raw(
+                store,
+                "UPDATE daemon_merge_gates SET prompt_channel_id = '42', "
+                "prompt_message_id = '555' WHERE run_id = ?",
                 (run,),
             )
-        store._conn.execute("DELETE FROM daemon_gate_prompts")
-        store._conn.commit()
+        exec_raw(store, "DELETE FROM daemon_gate_prompts")
         store.close()
         again = DaemonStore(path)
         assert again.gate_prompt("r1", "discord") == ("42", "555")
@@ -1567,8 +1565,7 @@ class TestWorkloadItems:
         assert store.add_schedule(daily, source="chat", by="brett", now=400.0) is True
         assert store.schedule_rows()["daily"].anchor == 400.0
         # Validated on the way out: a hand-edited row cannot fire nonsense.
-        store._conn.execute("UPDATE daemon_schedules SET every = 'soon' WHERE name = 'daily'")
-        store._conn.commit()
+        exec_raw(store, "UPDATE daemon_schedules SET every = 'soon' WHERE name = 'daily'")
         assert [s.spec.name for s in store.schedules()] == ["hourly"]
 
     def test_schedule_rows_record_the_grid(self, tmp_path: Path) -> None:
