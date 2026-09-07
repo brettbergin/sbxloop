@@ -48,7 +48,6 @@ import os
 import queue
 import shlex
 import shutil
-import sqlite3
 import tarfile
 import tempfile
 import threading
@@ -62,6 +61,7 @@ from typing import Any, NamedTuple
 from urllib.parse import quote
 
 from pydantic import ValidationError
+from sqlalchemy import RowMapping
 
 from sbxloop import hostgit, repofiles
 from sbxloop.config import (
@@ -2087,7 +2087,7 @@ class LoopEngine:
             )
         if mode != "advisory":
             return ""
-        latest: dict[tuple[str, str | None], sqlite3.Row] = {}
+        latest: dict[tuple[str, str | None], RowMapping] = {}
         for row in self.store.phase_attempts(run_id):
             if row["phase"] in ("verify", "gate"):
                 latest[(str(row["phase"]), row["task_id"])] = row

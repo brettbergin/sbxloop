@@ -26,6 +26,7 @@ from sbxloop.paths import SbxloopHome
 from sbxloop_worker.protocol import Event as ProtocolEvent
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import FakeGithub
+from tests.fakes.rawdb import exec_raw
 
 runner = CliRunner()
 
@@ -211,10 +212,10 @@ class TestStatusAndLogs:
         # forever; --follow must notice the silence and exit, not spin.
         store = seed_store(workdir)
         store.set_run_state("rseeded11", "building")
-        store._conn.execute(  # backdate the state change (no public setter)
-            "UPDATE runs SET updated_at = 1.0 WHERE run_id = 'rseeded11'"
+        exec_raw(
+            store,  # backdate the state change (no public setter)
+            "UPDATE runs SET updated_at = 1.0 WHERE run_id = 'rseeded11'",
         )
-        store._conn.commit()
         result = runner.invoke(app, ["logs", "rseeded11", "--follow"])
         assert result.exit_code == 0
         # single words: rich may wrap the note anywhere between words
