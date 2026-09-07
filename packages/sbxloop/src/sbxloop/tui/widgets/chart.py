@@ -34,9 +34,39 @@ MIN_POINTS = 8
 #: page without scrolling on a normal terminal.
 CHART_HEIGHT = 13
 
+#: A single horizontal bar carries no vertical information, so it gets the
+#: shortest frame that still leaves room for the axis and its ticks.
+BAR_HEIGHT = 7
+
+#: Rows a ranked bar needs per entry, plus the frame and axis. Plotext
+#: gives a horizontal bar two rows before it labels one, so an entry that
+#: gets fewer than two loses its name.
+ROWS_PER_ENTRY = 2
+RANKED_CHROME = 4
+
 #: How many ticks a relabelled axis gets. Five spans the range without the
 #: labels running into each other at the widths these plots get.
 TICKS = 5
+
+#: Plotext's fallback when it does not recognise a colour. It does not
+#: raise on one it cannot read — `color="not-a-colour"` draws in this,
+#: exactly like a hex string does — so a palette handed straight to
+#: plotext fails silently and every series comes out the same blue.
+_PLOTEXT_DEFAULT = 12
+
+
+def rgb(colour: str) -> tuple[int, int, int]:
+    """A ``#RRGGBB`` band colour as the triple plotext understands.
+
+    `band.py` keeps every colour with a fixed meaning, and those are the
+    colours these plots must use: a landed bar that is not `OK_COLOUR` is
+    a different green from the one four inches up the same screen. Plotext
+    accepts a name or an ``(r, g, b)`` triple and quietly ignores anything
+    else, so the hex has to be unpacked here."""
+    text = colour.lstrip("#")
+    if len(text) != 6:
+        raise ValueError(f"not a #RRGGBB colour: {colour!r}")
+    return (int(text[0:2], 16), int(text[2:4], 16), int(text[4:6], 16))
 
 
 def _spread(lo: float, hi: float, count: int = TICKS) -> list[float]:
@@ -102,6 +132,12 @@ class Chart(PlotextPlot):
         positions = _spread(lo, hi)
         self.plt.xticks(positions, [fmt(v) for v in positions])
 
+    def count_x(self, peak: float, floor: float = 0.0) -> None:
+        """Whole numbers along an x axis that counts things — the value
+        axis of a horizontal bar, where `count_y` rules a vertical one."""
+        ticks = whole_ticks(peak, floor=floor)
+        self.plt.xticks([float(t) for t in ticks], [f"{t:,}" for t in ticks])
+
     def count_y(self, peak: float, floor: float = 0.0) -> None:
         """Whole numbers up a y axis that counts things.
 
@@ -116,9 +152,95 @@ def bars(labels: Sequence[str], values: Sequence[float], colour: str) -> Chart:
     chart = Chart()
     plt = chart.plt
     peak = max([*values, 0.0])
-    plt.bar(list(labels), [float(v) for v in values], color=colour)
+    plt.bar(list(labels), [float(v) for v in values], color=rgb(colour))
     chart.count_y(peak)
     chart.caption = f"{len(values)} buckets, peak {peak:,.0f}"
+    return chart
+
+
+def stacked(
+    labels: Sequence[str],
+    series: Sequence[tuple[str, Sequence[float], str]],
+    peak: float | None = None,
+) -> Chart:
+    """A bucket per label, each split by what it is made of.
+
+    The day-by-day strip did this as one `Band` per day, which shows each
+    day's *mix* but makes the week's shape something you read down a
+    column of bars. Stacked against a shared scale, the mix and the trend
+    are the same picture."""
+    chart = Chart()
+    names = [name for name, _values, _colour in series]
+    # No `labels=`: plotext draws its key *inside* the axes, over the top
+    # of the bars it is describing. The caller puts `band.legend` under the
+    # plot instead — the same key every other stack on these pages carries.
+    # A per-series colour list is real despite the bundled stub declaring
+    # one colour; a list of triples does paint distinct series.
+    chart.plt.stacked_bar(
+        list(labels),
+        [[float(v) for v in values] for _name, values, _colour in series],
+        color=[rgb(colour) for _name, _values, colour in series],  # type: ignore[arg-type]
+    )
+    totals = [sum(parts) for parts in zip(*(values for _n, values, _c in series), strict=True)]
+    chart.count_y(peak if peak is not None else max([*totals, 0.0]))
+    chart.caption = f"{len(labels)} buckets, {', '.join(names)}"
+    return chart
+
+
+def proportion(
+    segments: Sequence[tuple[str, float, str]],
+    fmt: Callable[[float], str] | None = None,
+) -> Chart:
+    """One horizontal bar split into its parts, against a value axis.
+
+    A `Band` says the same thing in a single row and says it well; this
+    trades that row count for a scale, so the share can be read off as a
+    quantity rather than only as a proportion."""
+    chart = Chart()
+    chart.styles.height = BAR_HEIGHT
+    values = [max(value, 0.0) for _name, value, _colour in segments]
+    chart.plt.stacked_bar(
+        [""],
+        [[value] for value in values],
+        color=[rgb(colour) for _name, _value, colour in segments],  # type: ignore[arg-type]
+        orientation="horizontal",
+    )
+    total = sum(values)
+    if fmt is not None:
+        chart.label_x(0.0, total, fmt)
+    else:
+        chart.count_x(total)
+    chart.caption = ", ".join(f"{name} {value:,.0f}" for name, value, _c in segments)
+    return chart
+
+
+def ranked(
+    rows: Sequence[tuple[str, float]],
+    colour: str,
+    fmt: Callable[[float], str] | None = None,
+) -> Chart:
+    """A short ranked list as bars against a scale, biggest at the top.
+
+    The band version drew each row against the biggest, which shows the
+    ranking and hides the quantity: two runs at 400 and 12 turns looked
+    like a full bar and a stub with no way to tell 12 from 120. Plotext
+    stacks its categories upward, so the order is reversed on the way in
+    to put the costliest run at the top where the eye starts."""
+    chart = Chart()
+    chart.styles.height = max(len(rows) * ROWS_PER_ENTRY + RANKED_CHROME, BAR_HEIGHT)
+    ordered = list(reversed(rows))
+    chart.plt.bar(
+        [label for label, _value in ordered],
+        [float(value) for _label, value in ordered],
+        orientation="horizontal",
+        color=rgb(colour),
+    )
+    peak = max([value for _label, value in rows], default=0.0)
+    if fmt is not None:
+        chart.label_x(0.0, peak, fmt)
+    else:
+        chart.count_x(peak)
+    chart.caption = f"{len(rows)} ranked, top {rows[0][0] if rows else '—'}"
     return chart
 
 
@@ -132,7 +254,7 @@ def histogram(
     and p90 cannot show, because two very different shapes share them."""
     chart = Chart()
     numbers = [float(v) for v in values]
-    chart.plt.hist(numbers, bins=bins, color=colour)
+    chart.plt.hist(numbers, bins=bins, color=rgb(colour))
     chart.count_y(_tallest(numbers, bins))
     if fmt is not None and numbers:
         chart.label_x(min(numbers), max(numbers), fmt)
@@ -173,7 +295,7 @@ def scatter(
     up = [float(y) for y in ys]
     # Braille packs four dots into a cell, so a hundred runs stay
     # distinguishable in a plot thirteen rows tall.
-    chart.plt.scatter(across, up, color=colour, marker="braille")
+    chart.plt.scatter(across, up, color=rgb(colour), marker="braille")
     if fmt is not None and across:
         chart.label_x(min(across), max(across), fmt)
     if whole_y and up:
@@ -188,6 +310,7 @@ def enough(values: Sequence[float]) -> bool:
 
 
 __all__ = [
+    "BAR_HEIGHT",
     "CHART_HEIGHT",
     "MIN_POINTS",
     "TICKS",
@@ -195,6 +318,9 @@ __all__ = [
     "bars",
     "enough",
     "histogram",
+    "proportion",
+    "ranked",
+    "rgb",
     "scatter",
     "whole_ticks",
 ]
