@@ -2,6 +2,19 @@
 
 ### Fixed
 
+- **`pkill` in a verify command is now rejected at plan time.** A check that
+  starts a server to probe it has to stop it again, and `pkill -f <pattern>`
+  is the obvious way to write that — but the pattern is matched against
+  every process's full command line, so one drawn from the command's own
+  text (a port, a binary name) reaches sibling commands and the agent's own
+  runtime as well as the server. The decomposer is told not to write them
+  and `verifylint` rejects them at JSON acceptance, alongside the existing
+  environment-mutation and network rules, so a violation costs one retry
+  with the rule quoted rather than a task's whole revision budget against a
+  check the builder is forbidden to edit. Killing a pid the command recorded
+  stays legal, and so does no cleanup at all: each verify command runs in a
+  process group of its own, and what it leaves running is reaped for it.
+
 - **A verify command could kill itself, and did.** Verify commands ran as
   `sh -c '<the whole command>'` in the worker's own process group, which put
   the command's text on a command line and its children in a group nobody

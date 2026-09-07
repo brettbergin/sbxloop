@@ -142,6 +142,29 @@ MUTATING_COMMANDS = frozenset({"sudo", "apt", "apt-get", "dnf", "yum", "apk"})
 NETWORK_COMMANDS = frozenset({"gh", "curl", "wget"})
 _LOCAL_ADDRESS = re.compile(r"localhost|127\.0\.0\.1|\[?::1\]?|0\.0\.0\.0|unix:")
 
+# And so is killing processes by pattern or by name. A check that starts a
+# server and probes it has to stop it again, and `pkill -f <pattern>` is the
+# obvious way to write that — but the pattern is matched against every
+# process's full command line, and a pattern drawn from the command's own
+# text (a port, a binary name) matches more than the server. Sibling
+# commands, the agent's own runtime and, before the worker ran each command
+# from a script file, the verify shell itself are all in range; the name
+# form is no narrower, since `killall node` reaches whatever else in a
+# one-tenant sandbox happens to be node. A command that backgrounds
+# something knows its pid — `srv=$!` … `kill "$srv"` — and that is the only
+# form that stops what it started and nothing else. Leaving no cleanup at
+# all is also correct: each verify command runs in a process group of its
+# own and whatever survives it is reaped.
+PATTERN_KILL_COMMANDS = frozenset({"pkill", "killall"})
+_PATTERN_KILL_REMEDY = (
+    "it selects processes by pattern or name, so it reaches more than "
+    "whatever this command started. Signal a pid instead: capture the "
+    "background process's pid into a shell variable and kill only that "
+    "one. Or drop the cleanup entirely — each verify command runs in a "
+    "process group of its own, and anything it leaves running is killed "
+    "for it"
+)
+
 # Shell operators that start a new command position. Backtick / $( catch
 # command substitutions so `echo $(pytest)` is still inspected.
 _SEGMENT_SPLIT = re.compile(r"\|\||&&|;|\||\$\(|`|\n")
@@ -1799,6 +1822,11 @@ def lint_verify_commands(
                     f"verify command `{command}` runs `{head}` — verify commands "
                     "must not modify the environment; anything that needs "
                     "installing is a plan step, not a verification"
+                )
+                continue
+            if head in PATTERN_KILL_COMMANDS:
+                problems.append(
+                    f"verify command `{command}` runs `{head}` — {_PATTERN_KILL_REMEDY}"
                 )
                 continue
             if head in NETWORK_COMMANDS and (head == "gh" or not _LOCAL_ADDRESS.search(command)):
