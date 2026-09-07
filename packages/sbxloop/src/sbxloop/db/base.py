@@ -16,9 +16,12 @@ from __future__ import annotations
 from sqlalchemy import MetaData
 from sqlalchemy.orm import DeclarativeBase
 
+# No "uq" entry, deliberately. The UNIQUE constraints on disk were written
+# inline in `CREATE TABLE`, which SQLite leaves unnamed; naming them here
+# would make autogenerate see a constraint to add on every comparison
+# against a real database. They stay unnamed, and stay comparable.
 NAMING_CONVENTION = {
     "ix": "ix_%(column_0_label)s",
-    "uq": "uq_%(table_name)s_%(column_0_name)s",
     "ck": "ck_%(table_name)s_%(constraint_name)s",
     "fk": "fk_%(table_name)s_%(column_0_name)s_%(referred_table_name)s",
     "pk": "pk_%(table_name)s",
