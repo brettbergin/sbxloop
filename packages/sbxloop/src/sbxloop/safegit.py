@@ -13,10 +13,12 @@ import shutil
 import sys
 import tempfile
 from collections.abc import Iterator
+from configparser import Error as ConfigError
 from contextlib import contextmanager
 from pathlib import Path
 
-from git import Repo
+from git import GitConfigParser, Repo
+from git.types import Lit_config_levels
 
 from sbxloop.errors import ProvisionError
 
@@ -63,6 +65,17 @@ def _copy_file(source: Path, target: Path) -> None:
         shutil.copyfile(source, target)
 
 
+class _MetadataRepo(Repo):
+    """Read only literal local metadata, including during Repo initialization."""
+
+    def config_reader(self, config_level: Lit_config_levels | None = None) -> GitConfigParser:
+        # Repo.__init__ reads core.bare before read_repo gets control. Override
+        # that reader too: even a discarded parse error must not open includes.
+        return GitConfigParser(
+            self._get_config_path("repository"), read_only=True, merge_includes=False
+        )
+
+
 @contextmanager
 def read_repo(root: Path) -> Iterator[Repo]:
     """A private Git metadata snapshot, reading the requested working tree.
@@ -70,21 +83,30 @@ def read_repo(root: Path) -> Iterator[Repo]:
     Git has no switch to omit local config. Command-line overrides for a
     few known hook names miss arbitrary filter/merge driver names and race
     an agent that can still edit config. A new gitdir avoids both problems.
-    Object bytes are read through an alternate store; no source config is
-    consulted and no missing object can trigger a promisor remote fetch.
+    Object bytes are read through an alternate store; only literal format
+    metadata is read from source config, with includes disabled. No missing
+    object can trigger a promisor remote fetch.
 
     Callers must disable Git's recursive submodule work-tree scans and open
     submodules through this same helper instead: a child Git would otherwise
     discover that submodule's original gitdir and executable configuration.
     """
     root = root.absolute()
-    with Repo(root) as source, tempfile.TemporaryDirectory(prefix="sbxloop-read-git-") as tmp:
-        with source.config_reader(config_level="repository") as config:
-            values = {
-                f"{section}.{key}".lower(): str(value).lower()
-                for section in config.sections()
-                for key, value in config.items(section)
-            }
+    with (
+        _MetadataRepo(root, expand_vars=False) as source,
+        tempfile.TemporaryDirectory(prefix="sbxloop-read-git-") as tmp,
+    ):
+        try:
+            with source.config_reader(config_level="repository") as config:
+                values = {
+                    f"{section}.{key}".lower(): str(value).lower()
+                    for section in config.sections()
+                    for key, value in config.items(section)
+                }
+        except ConfigError:
+            # Parser diagnostics include source lines. They are unsafe to pass
+            # to callers that publish a failed run's reason to chat or GitHub.
+            raise ProvisionError("cannot parse repository metadata config") from None
         if (
             values.get("extensions.objectformat", "sha1") != "sha1"
             or values.get("extensions.refstorage", "files") != "files"

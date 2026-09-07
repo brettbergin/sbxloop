@@ -1,6 +1,70 @@
 ## [Unreleased]
 
+### Added
+
+- **A verify command that cannot pass can now be re-authored instead of
+  ending the run.** The loop has always been able to *recognise* a check
+  that no amount of work can satisfy - the same command failing with
+  identical output across attempts and across approaches - and it has never
+  been able to do anything about one. The verify commands are
+  decomposer-authored, the builder is told it cannot edit them, and nothing
+  re-ran decompose, so the only lever was a fresh session against the same
+  impossible command. When no approach existed, the run was abandoned with
+  the work finished and every other check green.
+
+  A suspect check now escalates first, to one bounded re-author that sees
+  that command and no other. It may **replace** the check with one that
+  tests the same property and can pass, **drop** it when the property is not
+  testable in this environment at all (a running server, a rendering engine,
+  a deployed address), or **keep** it, which says the check is right and the
+  work is not - and falls through to exactly the fresh-session replan that
+  ran before. The rest of the task's checks are untouchable either way.
+
+  Guarded, because the phase is asked to edit the exam having just been told
+  a check is in its way: a replacement is held to the same mechanical lint a
+  decomposition is, a replacement that cannot fail whatever the workspace
+  contains is refused, and the command carrying the project's own gate may
+  be rewritten but never removed. Every change is reported on the run, so a
+  reviewer knows the exam moved and what stopped being tested. Budgeted by
+  `[budgets] max_verify_reauthors_per_task` (default 1); 0 restores the old
+  behaviour.
+
 ### Fixed
+
+- **`pkill` in a verify command is now rejected at plan time.** A check that
+  starts a server to probe it has to stop it again, and `pkill -f <pattern>`
+  is the obvious way to write that — but the pattern is matched against
+  every process's full command line, so one drawn from the command's own
+  text (a port, a binary name) reaches sibling commands and the agent's own
+  runtime as well as the server. The decomposer is told not to write them
+  and `verifylint` rejects them at JSON acceptance, alongside the existing
+  environment-mutation and network rules, so a violation costs one retry
+  with the rule quoted rather than a task's whole revision budget against a
+  check the builder is forbidden to edit. Killing a pid the command recorded
+  stays legal, and so does no cleanup at all: each verify command runs in a
+  process group of its own, and what it leaves running is reaped for it.
+
+- **A verify command could kill itself, and did.** Verify commands ran as
+  `sh -c '<the whole command>'` in the worker's own process group, which put
+  the command's text on a command line and its children in a group nobody
+  reaped. Both halves broke checks that were otherwise correct. A check that
+  started a dev server on a port and cleaned up with `pkill -f <port>`
+  matched the shell running it, because that shell's command line contained
+  the port: it SIGTERMed itself before reaching its own assertion and
+  reported a signal exit with no output — identically on every attempt, so
+  the loop flagged the check as unpassable and abandoned the run, with the
+  work complete and every other gate green. Separately, anything a command
+  backgrounded and did not kill kept running after the command returned,
+  holding its port against the next attempt and holding the captured pipe
+  open, so reading the command's output blocked until the whole job timed
+  out.
+
+  Each command now runs from a script file, so its text never reaches the
+  process table and a pattern kill reaches only what the command started; in
+  a session of its own, so whatever it leaves running is a process group the
+  worker tears down (SIGTERM, then SIGKILL) when the command returns or times
+  out; and with its output on a file rather than a pipe an orphan can hold
+  open.
 
 - **The Config screen showed `repr`, not values.** Floats carried a `.0`
   tail every duration and interval in the config has (`60.0`, `14400.0`),

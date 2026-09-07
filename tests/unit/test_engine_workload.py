@@ -100,10 +100,7 @@ class TestWorkloadRun:
         assert languages.data["source"] == "none" and languages.data["languages"] == []
         # The operator planned and executed, the judge passed the task, and
         # the judgment re-ran the task's check on the finished workspace.
-        rows = [
-            (r["phase"], r["task_id"], r["status"])
-            for r in engine.store.phase_attempts(result.run_id)
-        ]
+        rows = [(r.phase, r.task_id, r.status) for r in engine.store.phase_attempts(result.run_id)]
         assert rows == [
             ("plan", None, "ok"),
             ("execute", "t1", "ok"),
@@ -188,9 +185,9 @@ class TestWorkloadRun:
         (judge,) = [
             r
             for r in engine.store.phase_attempts(result.run_id)
-            if r["phase"] == "judge" and r["task_id"] is None
+            if r.phase == "judge" and r.task_id is None
         ]
-        assert judge["status"] == "failed"
+        assert judge.status == "failed"
         run = engine.store.get_run(result.run_id)
         assert run.state == "failed" and run.stage == "judging"
 
@@ -201,7 +198,7 @@ class TestWorkloadRun:
         assert result.state == "failed"
         assert "judging" not in harness.run_states()
         rows = engine.store.phase_attempts(result.run_id)
-        assert not any(r["phase"] == "judge" and r["task_id"] is None for r in rows)
+        assert not any(r.phase == "judge" and r.task_id is None for r in rows)
 
 
 class TestOperatorAndJudge:
@@ -231,8 +228,8 @@ class TestOperatorAndJudge:
         assert t1.spec.needs.hosts == ["api.example.com"]
         assert t1.spec.needs.credentials == []
         assert t1.spec.needs.sink == "chat" and t1.spec.needs.repo is None
-        (row,) = [r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "plan"]
-        assert row["task_id"] is None and "Count the widgets" in row["output_json"]
+        (row,) = [r for r in engine.store.phase_attempts(result.run_id) if r.phase == "plan"]
+        assert row.task_id is None and "Count the widgets" in row.output_json
         # The operator's prompt carries the needs by name.
         (execute,) = jobs(harness, result.run_id, "execute")
         assert "api.example.com" in execute["prompt"] and "sink: chat" in execute["prompt"]
@@ -319,9 +316,9 @@ class TestOperatorAndJudge:
         # The second attempt sees the first attempt's own report.
         assert "wrote nothing" in second["prompt"]
         rows = [
-            (r["phase"], r["attempt"], r["status"])
+            (r.phase, r.attempt, r.status)
             for r in engine.store.phase_attempts(result.run_id)
-            if r["task_id"] == "t1"
+            if r.task_id == "t1"
         ]
         assert rows == [
             ("execute", 1, "ok"),
@@ -388,8 +385,8 @@ class TestOperatorAndJudge:
         assert result.reason is not None
         assert result.reason.startswith("the judge could not reach a verdict on task t1")
         assert result.reason.endswith("; the run fails closed")
-        (row,) = [r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "judge"]
-        assert row["status"] == "failed" and '"degraded": true' in row["output_json"]
+        (row,) = [r for r in engine.store.phase_attempts(result.run_id) if r.phase == "judge"]
+        assert row.status == "failed" and '"degraded": true' in row.output_json
 
     def test_a_failing_verdict_must_name_a_criterion(self, harness: Harness) -> None:
         """`passed: false` with an empty `unmet` is a malformed verdict: it
@@ -451,11 +448,9 @@ class TestOperatorAndJudge:
         assert "`Read`" in prompt and "— failed" in prompt
         assert "wrote hello.txt" in prompt, "the report is the judge's claim to check"
         assert "test -f hello.txt" in prompt and "exit 0" in prompt
-        (execute,) = [
-            r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "execute"
-        ]
-        assert '"tool_calls": 2' in execute["output_json"]
-        assert "echo hi > hello.txt" in execute["output_json"]
+        (execute,) = [r for r in engine.store.phase_attempts(result.run_id) if r.phase == "execute"]
+        assert '"tool_calls": 2' in (execute.output_json or "")
+        assert "echo hi > hello.txt" in (execute.output_json or "")
         # The relayed tool events carry the operator's name, not the builder's.
         tools = [e for e in harness.events if e.type == "agent.tool_end"]
         assert [e.data.get("agent") for e in tools] == ["operator", "operator"]
@@ -657,7 +652,7 @@ class TestWorkloadResume:
         # Still one sandbox, still the same data directory.
         assert harness.sandboxes_left() == []
         assert result.workspace == harness.home.runs / run_id / "workspace"
-        phases = [r["phase"] for r in harness.engine().store.phase_attempts(run_id)]
+        phases = [r.phase for r in harness.engine().store.phase_attempts(run_id)]
         assert phases.count("plan") == 1 and phases.count("execute") == 1
         assert "decompose" not in phases and "build" not in phases
 
@@ -676,9 +671,9 @@ class TestWorkloadResume:
         judged = [
             r
             for r in engine.store.phase_attempts(result.run_id)
-            if r["phase"] == "judge" and r["task_id"] is None
+            if r.phase == "judge" and r.task_id is None
         ]
-        assert [r["attempt"] for r in judged] == [1, 2]
+        assert [r.attempt for r in judged] == [1, 2]
 
     def test_resume_at_verifying_re_judges_the_persisted_report(self, harness: Harness) -> None:
         """Died between execute and judge: the judge reads the execute row
@@ -821,7 +816,7 @@ class TestNeeds:
         assert [e for e in harness.events if e.type == "policy.allow"] == []
         assert harness.run_states() == ["provisioning", "planning", "failed"]
         assert all(t.state == "pending" for t in engine.store.get_tasks(result.run_id))
-        phases = [r["phase"] for r in engine.store.phase_attempts(result.run_id)]
+        phases = [r.phase for r in engine.store.phase_attempts(result.run_id)]
         assert phases == ["plan"], "no task ran"
 
     def test_a_denied_host_is_refused_even_inside_the_profile(
@@ -962,7 +957,7 @@ class TestNeeds:
         assert kinds == {"service.http"}
         assert engine.store.get_run(run_id).state == "completed"
         # planned once: the re-provision resumed at executing
-        phases = [r["phase"] for r in engine.store.phase_attempts(run_id)]
+        phases = [r.phase for r in engine.store.phase_attempts(run_id)]
         assert phases.count("plan") == 1 and phases.count("execute") == 1
 
     def test_a_failed_re_provision_leaves_the_run_resumable(
@@ -998,7 +993,7 @@ class TestNeeds:
             "completed",
         ]
         assert self.granted(harness) == [], "granted once, on the first pass"
-        phases = [r["phase"] for r in engine.store.phase_attempts(run.run_id)]
+        phases = [r.phase for r in engine.store.phase_attempts(run.run_id)]
         assert phases.count("plan") == 1 and phases.count("execute") == 1
         self.assert_no_secret(harness)
 

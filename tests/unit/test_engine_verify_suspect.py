@@ -9,13 +9,14 @@ from __future__ import annotations
 import pytest
 
 from sbxloop.engine.engine import LoopEngine as Engine
-from sbxloop.engine.model import TaskRecord, TaskSpec
+from sbxloop.engine.model import TaskRecord, TaskSpec, VerifyReauthor
 from sbxloop.engine.phases import (
     VerifyFailure,
     normalise_verify_output,
     verify_fingerprint,
     verify_suspect_feedback,
 )
+from sbxloop.errors import InvalidOutputTwice
 
 MYPY = "uv run mypy packages"
 MYPY_OUT = (
@@ -141,38 +142,85 @@ class _Bus:
         return None
 
 
+class _Store:
+    def __init__(self) -> None:
+        self.saved: list[TaskRecord] = []
+
+    def update_task(self, run_id: str, task: TaskRecord) -> None:
+        self.saved.append(task)
+
+
+class _FakePhases:
+    """The re-author phase, stubbed. `answer` may be an exception to raise."""
+
+    def __init__(self, answer: VerifyReauthor | Exception) -> None:
+        self.answer = answer
+        self.calls: list[dict[str, object]] = []
+
+    def reauthor_verify(
+        self,
+        task: TaskRecord,
+        *,
+        suspect_command: str,
+        suspect_output: str,
+        builder_report: str,
+    ) -> VerifyReauthor:
+        self.calls.append(
+            {
+                "task": task.spec.id,
+                "command": suspect_command,
+                "output": suspect_output,
+                "report": builder_report,
+            }
+        )
+        if isinstance(self.answer, Exception):
+            raise self.answer
+        return self.answer
+
+
 class _FakeEngine:
-    """Just enough engine for the two routing helpers under test."""
+    """Just enough engine for the routing helpers under test."""
 
     _record_verify_failures = staticmethod(Engine._record_verify_failures)
     _register_verify_suspect = Engine._register_verify_suspect
+    _reauthor_verify = Engine._reauthor_verify
     _register_revision = Engine._register_revision
     _discard_session = staticmethod(Engine._discard_session)
 
-    def __init__(self, max_replans: int = 1) -> None:
+    def __init__(self, max_replans: int = 1, max_reauthors: int = 1) -> None:
         self.bus = _Bus()
         self.states: list[str] = []
         self.max_replans = max_replans
+        self.store = _Store()
 
         class _Budgets:
             max_replans_per_task = max_replans
             max_revisions_per_task = 2
+            max_verify_reauthors_per_task = max_reauthors
 
         class _Config:
             budgets = _Budgets()
 
         self.config = _Config()
 
+    def _prior_attempt_report(self, run_id: str, task: TaskRecord, *, phase: str = "build") -> str:
+        return "the builder's last word"
+
     def _set_task_state(self, run_id: str, task: TaskRecord, state: str) -> None:
         task.state = state  # type: ignore[assignment]
         self.states.append(state)
+
+
+def _keep() -> _FakePhases:
+    """The check stands: the escalation declines and the old path runs."""
+    return _FakePhases(VerifyReauthor(verdict="keep", reason="the check is right"))
 
 
 def test_suspect_routes_to_a_replan_without_spending_a_revision() -> None:
     engine = _FakeEngine()
     record = task()
     record.revisions = 1
-    engine._register_verify_suspect("r", record, [VerifyFailure(MYPY, 1, MYPY_OUT)])
+    engine._register_verify_suspect("r", _keep(), record, [VerifyFailure(MYPY, 1, MYPY_OUT)])
     assert record.replans == 1
     assert record.revisions == 0  # the replan resets; no extra revision spent
     assert record.session_id is None
@@ -183,7 +231,7 @@ def test_suspect_routes_to_a_replan_without_spending_a_revision() -> None:
 def test_suspect_fails_the_task_when_replans_are_exhausted() -> None:
     engine = _FakeEngine(max_replans=0)
     record = task()
-    engine._register_verify_suspect("r", record, [VerifyFailure(MYPY, 1, MYPY_OUT)])
+    engine._register_verify_suspect("r", _keep(), record, [VerifyFailure(MYPY, 1, MYPY_OUT)])
     assert engine.states == ["failed"]
 
 
@@ -209,3 +257,97 @@ def test_repeat_after_flagging_keeps_the_suspect_wording() -> None:
     assert "VERIFY COMMAND SUSPECT" in record.last_feedback
     assert "start over with a fresh approach" not in record.last_feedback
     assert record.replans == 0
+
+
+# -- re-authoring the check ---------------------------------------------
+#
+# Field failure rkbgkf32a: the check was unpassable, the loop knew it, and
+# the only move it had was to fail the run over work that was finished.
+
+
+BAD = "npm run dev -- --port 5199 & sleep 5; curl -sf http://localhost:5199/"
+GOOD = "test -f site/dist/index.html"
+
+
+def suspect_task() -> TaskRecord:
+    return TaskRecord(spec=TaskSpec(id="t2", title="t2", verify_commands=[BAD, GOOD]))
+
+
+def test_replace_swaps_the_check_and_stays_in_verify() -> None:
+    """The build already passed — only the exam changed — so the task must
+    not spend a BUILD turn re-deriving work that is already correct."""
+    engine = _FakeEngine()
+    phases = _FakePhases(
+        VerifyReauthor(verdict="replace", command="test -f site/index.html", reason="static")
+    )
+    record = suspect_task()
+    record.state = "verifying"
+    record.verify_suspect = True
+    engine._register_verify_suspect("r", phases, record, [VerifyFailure(BAD, -15, "")])
+    assert record.spec.verify_commands == ["test -f site/index.html", GOOD]
+    assert record.verify_reauthors == 1
+    assert record.verify_suspect is False
+    assert record.replans == 0
+    assert engine.states == []  # still verifying; no BUILD turn spent
+    assert engine.store.saved == [record]
+
+
+def test_drop_removes_only_the_suspect_check() -> None:
+    engine = _FakeEngine()
+    phases = _FakePhases(VerifyReauthor(verdict="drop", reason="needs a running server"))
+    record = suspect_task()
+    engine._register_verify_suspect("r", phases, record, [VerifyFailure(BAD, -15, "")])
+    assert record.spec.verify_commands == [GOOD]
+    assert record.verify_reauthors == 1
+
+
+def test_keep_falls_through_to_the_old_replan() -> None:
+    """A check that is right and simply not satisfied must still cost a
+    fresh session, then fail the task — the behaviour that predates this."""
+    engine = _FakeEngine()
+    record = suspect_task()
+    engine._register_verify_suspect("r", _keep(), record, [VerifyFailure(BAD, -15, "")])
+    assert record.spec.verify_commands == [BAD, GOOD]
+    assert record.verify_reauthors == 0
+    assert record.replans == 1
+    assert engine.states == ["executing"]
+
+
+def test_the_budget_bounds_the_escalation() -> None:
+    engine = _FakeEngine(max_reauthors=0)
+    phases = _FakePhases(VerifyReauthor(verdict="drop", reason="x"))
+    record = suspect_task()
+    engine._register_verify_suspect("r", phases, record, [VerifyFailure(BAD, -15, "")])
+    assert phases.calls == []  # not even asked
+    assert record.spec.verify_commands == [BAD, GOOD]
+    assert record.replans == 1
+
+
+def test_a_phase_that_cannot_answer_falls_back_instead_of_failing_the_run() -> None:
+    engine = _FakeEngine()
+    phases = _FakePhases(InvalidOutputTwice("no JSON twice"))
+    record = suspect_task()
+    engine._register_verify_suspect("r", phases, record, [VerifyFailure(BAD, -15, "")])
+    assert record.spec.verify_commands == [BAD, GOOD]
+    assert record.replans == 1
+    assert engine.states == ["executing"]
+
+
+def test_the_phase_is_handed_the_suspect_command_and_the_builders_report() -> None:
+    engine = _FakeEngine()
+    phases = _FakePhases(VerifyReauthor(verdict="keep", reason="fine"))
+    engine._register_verify_suspect("r", phases, suspect_task(), [VerifyFailure(BAD, -15, "")])
+    (call,) = phases.calls
+    assert call["command"] == BAD
+    assert call["report"] == "the builder's last word"
+
+
+def test_reauthor_count_persists() -> None:
+    record = suspect_task()
+    record.verify_reauthors = 2
+    assert TaskRecord.model_validate(record.model_dump()).verify_reauthors == 2
+
+
+def test_replace_needs_a_command() -> None:
+    with pytest.raises(ValueError, match="needs a command"):
+        VerifyReauthor(verdict="replace", reason="no command given")

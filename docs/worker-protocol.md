@@ -92,9 +92,19 @@ retry, so nothing was lost.
 the job JSON, boot a cold Python under `sbx exec`, fetch the result) that
 dwarfs a mechanical command's real work: the host batches all verify
 commands into one job, and the scrutinizer's evidence commands into
-another. Each command runs via `sh -c` sequentially in the job's `cwd` with
-`command_timeout_s` (default `timeout_s`) as its individual cap; `timeout_s`
-bounds the whole job.
+another. The commands run sequentially in the job's `cwd` with
+`command_timeout_s` (default `timeout_s`) as each one's individual cap;
+`timeout_s` bounds the whole job.
+
+Each command is isolated from itself and from the ones around it. It runs
+from a script file rather than `sh -c`, so its text never reaches the
+process table — a command that pattern-matches processes (`pkill -f`,
+`pgrep -f`) cannot match the shell running it — in a session of its own, so
+whatever it leaves running is a process group the worker tears down (SIGTERM,
+then SIGKILL) when the command returns or times out. Output goes to a file,
+not a pipe, so a backgrounded process that inherits it cannot hold the
+command's result open. A verify command therefore cannot kill itself, hold a
+port against the next attempt, or hang the job it belongs to.
 
 ## Host tools (agent.session)
 

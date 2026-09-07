@@ -2352,6 +2352,11 @@ class TestRunCommand:
                 },
                 # 3 builds burn the revisions, then the replan's fresh
                 # session burns 3 more — verify ("false") fails them all.
+                # The re-author phase is asked once when the check first
+                # repeats; "keep" leaves the loop on the path above.
+                execute,
+                execute,
+                {"json": {"verdict": "keep", "command": "", "reason": "the check is right"}},
                 *[execute] * 6,
             ],
         )

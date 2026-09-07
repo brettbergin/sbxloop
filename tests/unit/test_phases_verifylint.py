@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from sbxloop.config import Config
-from sbxloop.engine.model import TaskGraph, TaskSpec
+from sbxloop.engine.model import TaskGraph, TaskSpec, VerifyReauthor
 from sbxloop.engine.phases import PhaseRunner
 
 
@@ -85,3 +85,70 @@ def test_declarable_registry_egress_is_accepted() -> None:
         "test -f README.md", egress=[{"domain": "registry.npmjs.org", "reason": "npm install"}]
     )
     phases._check_taskgraph(ok)
+
+
+# -- re-author guards ---------------------------------------------------
+#
+# The re-author phase is the only actor allowed to change the exam rather
+# than the work, and it is asked to do so having just been told a check is
+# in the way. These are what stop "fix the check" becoming "delete it".
+
+
+def _answer(verdict: str, command: str = "") -> VerifyReauthor:
+    return VerifyReauthor(verdict=verdict, command=command, reason="r")  # type: ignore[arg-type]
+
+
+def test_a_replacement_is_held_to_the_same_lint_as_a_decomposition() -> None:
+    phases = runner(None)
+    phases._check_reauthor(_answer("replace", ".venv/bin/pytest -q"), suspect_command="x")
+    with pytest.raises(ValueError, match=r"\.venv/bin/pytest"):
+        phases._check_reauthor(_answer("replace", "pytest -q"), suspect_command="x")
+
+
+def test_a_replacement_may_not_reach_the_network_or_kill_by_pattern() -> None:
+    phases = runner(None)
+    with pytest.raises(ValueError, match="not the network"):
+        phases._check_reauthor(
+            _answer("replace", "curl -sf https://example.com/"), suspect_command="x"
+        )
+    with pytest.raises(ValueError, match="by pattern or name"):
+        phases._check_reauthor(_answer("replace", "pkill -f server"), suspect_command="x")
+
+
+@pytest.mark.parametrize("command", ["true", "echo ok", ": ", "true && echo done"])
+def test_a_replacement_that_cannot_fail_is_refused(command: str) -> None:
+    """A check that passes whatever the workspace contains is a deleted
+    check wearing the shape of one."""
+    phases = runner(None)
+    with pytest.raises(ValueError, match="cannot fail"):
+        phases._check_reauthor(_answer("replace", command), suspect_command="x")
+
+
+def gated_runner(workspace: Path) -> PhaseRunner:
+    """A runner whose resolved toolchains include the gate's own (#624):
+    a detector whose command the sandbox could not run is not consulted."""
+    return PhaseRunner(  # type: ignore[arg-type]
+        None, Config(), "r1", "ship it", workspace=workspace, languages=("python", "make")
+    )
+
+
+def test_the_command_carrying_the_project_gate_cannot_be_dropped(tmp_path: Path) -> None:
+    (tmp_path / "Makefile").write_text("check:\n\tpytest\n")
+    phases = gated_runner(tmp_path)
+    assert phases.project_gate() == "make check"
+    with pytest.raises(ValueError, match="cannot be dropped"):
+        phases._check_reauthor(_answer("drop"), suspect_command="make check")
+    # ... and a replacement for it must still run it
+    with pytest.raises(ValueError, match="must run it too"):
+        phases._check_reauthor(_answer("replace", "test -f out"), suspect_command="make check")
+    phases._check_reauthor(_answer("replace", "make check ARGS=1"), suspect_command="make check")
+
+
+def test_dropping_an_ordinary_check_is_allowed(tmp_path: Path) -> None:
+    (tmp_path / "Makefile").write_text("check:\n\tpytest\n")
+    phases = gated_runner(tmp_path)
+    phases._check_reauthor(_answer("drop"), suspect_command="test -f dist/index.html")
+
+
+def test_keep_is_never_rejected() -> None:
+    runner(None)._check_reauthor(_answer("keep"), suspect_command="anything at all")
