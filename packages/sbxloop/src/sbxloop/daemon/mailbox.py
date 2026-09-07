@@ -183,8 +183,15 @@ class MailboxClient:
     # -- the daemon's and the engine's state, read-only --------------------------
 
     def runs(self, *, limit: int = 200) -> list[RunRecord]:
+        """The runs touched most recently. Ordering by when a run *started*
+        buried a run that merged this morning under ones that have not
+        moved in days, and truncated the same way."""
         with self._lock:
-            return self.engine.list_runs()[:limit]
+            return self.engine.recent_runs(limit)
+
+    def run_costs(self, run_ids: Sequence[str]) -> dict[str, tuple[int, float]]:
+        with self._lock:
+            return self.engine.run_costs(run_ids)
 
     def run(self, run_id: str) -> RunRecord | None:
         with self._lock:
