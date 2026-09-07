@@ -161,8 +161,11 @@ def test_queue_screen_and_help(seeded: SbxloopHome) -> None:
             await pilot.pause(0.5)
             await pilot.press("3")
             await pilot.pause(0.5)
+            # The fixture's items: 41 running, 44 queued, 40 done — and a
+            # done item is finished work that Runs lists, not queue.
+            assert app.screen.query_one("#running", ConsoleTable).row_count == 1
             assert app.screen.query_one("#queued", ConsoleTable).row_count == 1
-            assert app.screen.query_one("#items", ConsoleTable).row_count == 3
+            assert app.screen.query_one("#parked", ConsoleTable).row_count == 0
             assert "●" not in bar_text(app)
             await pilot.press("question_mark")
             await pilot.pause(0.3)
@@ -227,11 +230,13 @@ def test_queue_lists_the_daemons_dispatch_order_and_eligibility(seeded: SbxloopH
             await pilot.pause(0.8)
             await pilot.press("3")
             await pilot.pause(0.8)
+            # The queued section leads with its rank, so the id is the
+            # second cell and the reason the last.
             table = app.screen.query_one("#queued", ConsoleTable)
             first = table.get_row_at(0)
-            assert str(first[0]) == "gh:issue:50" and "resume" in str(first[4])
+            assert str(first[1]) == "gh:issue:50" and "resume" in str(first[-1])
             row = table.get_row_at(table.get_row_index("gh:issue:51"))
-            assert str(row[4]) != "now"
+            assert str(row[-1]) != "now"
 
     drive(scenario)
 

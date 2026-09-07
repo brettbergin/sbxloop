@@ -213,9 +213,41 @@ A run has six tabs:
 
 ### Queue
 
-What the daemon will dispatch next (with the backoff's `not before`) and
-every work item with its repository, state, attempts, pinned run, title,
-last error and last update. `Enter` opens the item's run.
+**What is stuck, and what runs next.** The screen used to be two tables —
+the dispatch order, and a dump of every item that ever existed — with no
+filter, half its verbs hidden from the footer, and the merge gates and
+review holds loaded into state but never drawn. Pressing `m` on the wrong
+row answered "no open merge gate", which is the console telling you to
+guess again.
+
+It is grouped by **what you would do about it**, in the order a person
+triages. A stat strip leads: `7 queued · oldest 2d · median wait 12m · 2 waiting on you` — the age of what is waiting *now*, since a work item
+carries no dispatch timestamp for a queued-to-started time.
+
+- **waiting on you** — `gated`, `awaiting_review`, `paused_review`, each
+  row naming what holds it (`merge #170`, `review #182`) and the key that
+  clears it. These are the rows the loop is blocked on.
+- **running now** — the pinned run and how long since it moved.
+- **queued next** — the daemon's own dispatch order, numbered, with the
+  item's own reason: `now`, `resume, first`, `retry 14:20`, `backoff 3 · 14:20`.
+- **parked / failed** — `failed`, `blocked`, `cancelled` from the last 7
+  days, matching Overview's window. Older ones are counted in the heading
+  and reachable with `/`, which lifts the window.
+
+`done` is not here: it is finished work, and Runs lists it.
+
+Two layers decide whether anything moves and **both are shown, because
+both are true**. An item has its own reason; the daemon has a global one —
+its breaker, the daily cap, a pause, or not answering at all. When the
+daemon is blocked nothing dispatches whatever the rows say, so the block
+is stated once in a banner and the queued rows are dimmed, keeping their
+own reason rather than all claiming the daemon's.
+
+The footer offers **only the verbs the selected row allows**, so `m`
+appears on a row with an open gate and nowhere else. `/` filters every
+section on id, repository, state, title and error; `Enter` opens the
+item's run; `j`/`k` and the arrows cross a section boundary rather than
+trapping the cursor in whichever table it landed in.
 
 ## Chat
 
