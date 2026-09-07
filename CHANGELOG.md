@@ -2,6 +2,19 @@
 
 ### Fixed
 
+- **The Config screen showed `repr`, not values.** Floats carried a `.0`
+  tail every duration and interval in the config has (`60.0`, `14400.0`),
+  strings came wrapped in quotes (`'claude'`), bools were Python's
+  (`True`), an unset key spelled out `None`, and an empty string was an
+  empty cell. Values now read the way they are written in the file and
+  typed into the editor: `60`, `claude`, `true`, `—` for unset, `""` for
+  empty, a list as its items. A string that would be mistaken for another
+  type keeps its quotes, so `"60"` and `"true"` are never read as the
+  number or the bool, and whitespace collapses so a multi-line
+  commit-message template stays one row. The filter now matches what is on
+  screen rather than the `repr` behind it, and the value column is bounded
+  so the source column survives beside the console's rail at 120 columns.
+
 - **The Runs screen showed two columns.** Nine were defined — run, state,
   stage, item, repo, title, PR, rounds, updated — but the state cell
   carried its failure reason inline and unclipped, so a 409-character
@@ -25,6 +38,7 @@
   while it was still being worked on. `StateStore.recent_runs` orders and
   limits by `updated_at`, and the screen pins the run in flight on top.
 
+
 ### Added
 
 - **Runs shows what a run cost.** Turns spent and time worked, per run, in
@@ -32,8 +46,6 @@
   than one per run. `p` opens a run's pull request; on a host with no
   browser the outcome carries the URL, which is what an operator on the
   other end of an ssh session needs.
-
-### Added
 
 - **The Overview pages carry real analysis now.** They shipped filling
   15–22% of the screen: five pages behind a rail, for content that would

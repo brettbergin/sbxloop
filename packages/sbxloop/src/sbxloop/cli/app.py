@@ -134,6 +134,20 @@ def _main_callback(
         tempfile.tempdir = str(tmp)
 
 
+def _require_supported_host() -> None:
+    """Refuse, by name, a host that cannot boot a sandbox (#596) — before
+    any state is written or a microVM is attempted. Read-only commands
+    are not gated: `sbxloop doctor` on the same host says the same thing
+    as a row."""
+    from sbxloop.hostos import host_support
+
+    support = host_support()
+    if support.supported:
+        return
+    console.print(f"[bold red]{support.refusal}[/]")
+    raise typer.Exit(2)
+
+
 def _config_with_overrides(**overrides: Any) -> Config:
     config = _run_config()
     updates = {k: v for k, v in overrides.items() if v is not None}
@@ -693,6 +707,7 @@ def run(
     With a GitHub repository configured the run carries its work all the
     way: a draft pull request, its own review, fix rounds, CI, and the merge.
     """
+    _require_supported_host()
     config = _config_with_overrides(
         model=model,
         keep_sandboxes=keep_sandboxes,
@@ -852,6 +867,7 @@ def resume(
     ] = 0,
 ) -> None:
     """Resume an unfinished run (fresh sandboxes, persisted state and config)."""
+    _require_supported_host()
     config = _run_config()
     engine = LoopEngine(config)
     try:
@@ -1081,6 +1097,7 @@ def shell(
     Attaching to an in-flight run is meant as observation: the worker owns
     its env files and workspace, so avoid mutating them mid-phase.
     """
+    _require_supported_host()
     if role not in ("agent", "github", "service"):
         console.print(f"[bold red]invalid --role {role!r}:[/] must be agent, github or service")
         raise typer.Exit(2)
@@ -2074,6 +2091,7 @@ def daemon(
     Subcommands inspect and steer
     individual work items; `sbxloop daemon ctl CMD` talks to the running
     daemon instead."""
+    _require_supported_host()
     if ctx.invoked_subcommand is not None:
         return
     from sbxloop.daemon.agentbox import DaemonAgent
@@ -2831,6 +2849,7 @@ def bake(
     reinstalling it on every provision (and fall back to the normal
     install if the template goes stale).
     """
+    _require_supported_host()
     config = load_config()
     cli = SbxCLI(app_name=config.app_name or None)
     try:

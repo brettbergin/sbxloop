@@ -368,8 +368,12 @@ edits say when that file still wins.
 
 - **Resolved** — every setting as one addressable key with its value and
   the layer that set it (home config, `pyproject.toml`, `sbxloop.toml`,
-  env, default), as `sbxloop config show` prints; `/` filters keys, values
-  and sources. It is resolved **from the home**, not from the directory the
+  env, default); `/` filters keys, values and sources, matching what is on
+  screen. Values read the way they are written rather than the way Python
+  prints them: `60` not `60.0`, `claude` not `'claude'`, `true` not `True`,
+  `—` for unset, `""` for an empty string, and a list as its items. A
+  string that would be mistaken for another type keeps its quotes, so
+  `"60"` and `"true"` are never read as the number or the bool. It is resolved **from the home**, not from the directory the
   console was started in: that is where the daemon runs, so this is the
   configuration the loop actually gets, and it is the same root an edit is
   validated against — a save shows up here at once. Arrays of tables are

@@ -43,6 +43,7 @@ loudly rather than pretending.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
@@ -211,6 +212,14 @@ class FakeGithub(GithubOps):
         # Branches with no merge base against the base branch (#600): the
         # compare endpoint 404s for them, as GitHub does.
         self.unrelated_branches: set[str] = set()
+        # How the repository and its refs answer a raw GET (#607): the
+        # repository itself absent (404), a repository with no commits at
+        # all (every ref GET is a 409), a base ref that is not there or not
+        # visible (404), a ref whose answer carries no sha.
+        self.repo_missing = False
+        self.empty_repo = False
+        self.missing_refs: set[str] = set()
+        self.malformed_refs: set[str] = set()
         self.pr_created = False
         self.pr_create_calls = 0
         self.threads: list[ReviewThread] = []
@@ -257,6 +266,15 @@ class FakeGithub(GithubOps):
         status = getattr(exc, "http_status", None)
         self.failed_jobs.append((op, method, path, status if isinstance(status, int) else None))
 
+    def _failed_op(self, op: str, method: str, path: str, exc: GithubOpsError) -> GithubOpsError:
+        """A recorded worker-error shape as the failed job it would be —
+        unless the caller declared the miss an answer (``_allow_missing``),
+        in which case a 404/409 is data and writes no ledger entry."""
+        status = getattr(exc, "http_status", None)
+        if not (self._missing_ok and status in (404, 409)):
+            self._record_failed_job(op, method, path, exc)
+        return exc
+
     @property
     def failed_job_paths(self) -> list[str]:
         """The paths of the calls that would have failed a worker job."""
@@ -300,22 +318,39 @@ class FakeGithub(GithubOps):
         return dict(self.repo_payload)
 
     def repo_lookup(self, repo: str) -> dict[str, Any] | None:
+        """The real ``repo.get`` under ``allow_missing`` (#607): one raw
+        GET in the ledger, a 404 answered as None with no failed job, any
+        other refusal raised — so a test sees the probe and its cost."""
         self._maybe_fail("repo_lookup")
-        # The same payload ``repo_get`` answers with: the engine's up-front
-        # probe reads ``has_issues`` off it (#631).
-        payload = dict(self.repo_payload)
-        if self.has_issues is not None:
-            payload["has_issues"] = self.has_issues
-        return payload
+        with self._allow_missing():
+            try:
+                data = self.raw("GET", f"/repos/{repo}")
+            except GithubOpsError as exc:
+                if exc.http_status == 404:
+                    return None
+                raise
+        return data if isinstance(data, dict) else None
 
     def ref_lookup(self, repo: str, ref: str) -> str | None:
-        # A delivery branch (``sbxloop/<run>``) exists only once delivery
-        # created it, and then sits at the PR head; anything else is a base
-        # branch that is simply there.
-        branch = ref.removeprefix("heads/")
-        if branch.startswith("sbxloop/"):
-            return self.head_sha if branch in self.branches else None
-        return "base123"
+        """The real ``ref.get`` under ``allow_missing`` (#607): one raw GET
+        in the ledger; a 404 (no such ref) or 409 (an empty repository)
+        answers None with no failed job; any other refusal raises; and a
+        malformed answer or one without a sha raises the way the real
+        facade does, so the branches a defect can hide in are reachable."""
+        with self._allow_missing():
+            try:
+                data = self.raw("GET", f"/repos/{repo}/git/ref/{ref}")
+            except GithubOpsError as exc:
+                if exc.http_status in (404, 409):
+                    return None
+                raise
+        if not isinstance(data, dict):
+            raise GithubOpsError(f"ref.get returned a malformed result: {data!r}")
+        obj = data.get("object")
+        sha = obj.get("sha") if isinstance(obj, dict) else None
+        if not sha:
+            raise GithubOpsError(f"ref.get returned no sha for {ref!r}: {data!r}")
+        return str(sha)
 
     def label_lookup(self, repo: str, name: str) -> dict[str, Any] | None:
         """A repository label probe (#556): its data, or None when absent.
@@ -426,6 +461,34 @@ class FakeGithub(GithubOps):
             if self.user_type is not None:
                 user["type"] = self.user_type
             return user
+        if method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+", path):
+            # The repository itself, whichever one the run names: the fake
+            # answers for every repository with its one payload (#607).
+            if self.repo_missing:
+                raise self._failed_op("raw.api", method, path, github_error("repo_missing_404"))
+            # The same payload ``repo_get`` answers with: the engine's
+            # up-front probe reads ``has_issues`` off it (#631).
+            payload = dict(self.repo_payload)
+            if self.has_issues is not None:
+                payload["has_issues"] = self.has_issues
+            return payload
+        if method == "GET" and "/git/ref/" in path:
+            ref = path.split("/git/ref/", 1)[1]
+            branch = ref.removeprefix("heads/")
+            if self.empty_repo:
+                raise self._failed_op("raw.api", method, path, github_error("empty_repo_ref_409"))
+            # A delivery branch (``sbxloop/<run>``) exists only once delivery
+            # created it, and then sits at the PR head; anything else is a
+            # base branch that is simply there unless said otherwise.
+            gone = branch in self.missing_refs or (
+                branch.startswith("sbxloop/") and branch not in self.branches
+            )
+            if gone:
+                raise self._failed_op("raw.api", method, path, github_error("ref_missing_404"))
+            if branch in self.malformed_refs:
+                return {"ref": f"refs/{ref}", "object": {}}
+            sha = self.head_sha if branch.startswith("sbxloop/") else "base123"
+            return {"ref": f"refs/{ref}", "object": {"sha": sha, "type": "commit"}}
         if method == "GET" and "/git/commits/" in path:
             return {"tree": {"sha": "basetree"}}
         if method == "POST" and path.endswith("/git/trees"):

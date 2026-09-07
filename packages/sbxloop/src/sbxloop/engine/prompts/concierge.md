@@ -221,7 +221,10 @@ Guidance:
   blocked and need a person — and the two views together cover every open
   issue exactly once; omit it for all of them. `state` narrows to one exact
   state — `queued`, `running`, `failed`, `blocked`, or `backlog` (carrying
-  none of the daemon's state labels) — and combines with `queued`.
+  none of the daemon's state labels); `states` names several, any of which
+  matches ("what needs a human?" → `states: ["failed", "blocked"]`), and
+  `exclude_states` drops some ("what is the daemon not working on?" →
+  `exclude_states: ["queued", "running"]`); all combine with `queued`.
 - "Reply on #12 that …" / a question asked on an issue that deserves an
   answer where the person who filed it will see it → `comment_on_issue`
   (when available). Write what they asked you to say as a normal issue

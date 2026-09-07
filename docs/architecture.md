@@ -958,21 +958,34 @@ github-copilot-sdk 1.0.8 and claude-agent-sdk 0.2.149). On the claude
 backend the operator's servers are merged *alongside* the in-process
 `sbxloop` host-tool server, never over it.
 
-Two properties make that safe to hand an unattended agent. **No secret
-travels in a job:** a spec carries `${NAME}` references, and
-`sbxloop_worker.mcp.expand_refs` resolves them inside the sandbox against an
-environment where, under the default secret strategy, the value is a proxy
-placeholder that only becomes real in flight to the credential's own host —
-so nothing secret reaches a job, an event, a log or an `sbx` argument, and
-config validation rejects a token-shaped word in `command` for the same
-reason. **The hosts are declared:** `agent_policy_allows` adds
-`config.mcp_hosts_for(roles)` to the sandbox's allowlist, deduped like every
-other tier because a repeated `sbx policy allow` is fatal, and the
-concierge's long-lived box is scoped to `CONCIERGE_MCP_ROLES` so it does not
-open hosts for servers no session there can use. A server that declares no
-hosts is a doctor failure, since it would otherwise fail at its first
-request rather than at startup.
+Credential-free servers use the native SDK transports above. Credentialed
+servers require Streamable HTTP at their credential's HTTPS host. Their
+keys are delivered only to the service sandbox, through the same stdin or
+private env-file transport as other service credentials. They are never
+registered as agent proxy secrets or expanded in agent code. Credentialed
+stdio and legacy SSE transports are refused at configuration loading.
 
+The host discovers tools through fixed `service.mcp` jobs, then replaces
+credentialed server descriptors with host tools before staging an agent
+job. Each job gets only the servers selected for its role. Calls go through
+the existing host-tool event and response-file channel; the host submits a
+fixed authenticated JSON-RPC request in the service VM. No listener,
+subprocess, repository code, or agent runs there. MCP credentials do not
+implicitly grant the generic `call_service` tool access to them. The
+concierge lazily provisions its own service VM with its role's MCP grants.
+
+The service negotiates protocol versions 2025-11-25, 2025-06-18 or
+2025-03-26, supporting tool discovery, pagination and calls with JSON or SSE
+response framing. Remote session IDs remain inside that VM; job cleanup
+requests session deletion. Redirects and automatic request replay are
+refused. Resources, prompts, sampling, elicitation, legacy SSE endpoints
+and resumable streams are unsupported. Compatibility with deployed remote
+servers is **field-unverified**; the tests exercise synthetic transports.
+
+Only credential-free MCP hosts are added to agent egress. Credentialed MCP
+hosts belong to the service allowlist. Configuration continues to reject
+token-shaped command arguments; values never belong in configuration,
+job files, events, logs or `sbx` arguments.
 The repository's own instruction files reach every phase the same way
 (#688). `engine.repocontext.read_repo_context` reads `AGENTS.md`,
 `CLAUDE.md`, `.cursorrules`, `.github/copilot-instructions.md`, the
@@ -991,6 +1004,14 @@ the Claude backend passes `setting_sources=[]` explicitly (the SDK's own
 default, which loads no filesystem settings), so a target repository's
 `.claude/settings.json` cannot reconfigure an unattended session and
 CLAUDE.md costs its tokens once, through the prompt.
+
+Host reads of these convention files and PR templates use `repofiles`:
+directory-relative opens with kernel symlink following disabled, resolving
+links only within the checkout. Links between repository files still work;
+links to host files are omitted. Replacing a path between inspection and
+opening cannot redirect the read outside the checkout. Artifact staging and
+regular-file PR uploads use the same reader and fail when a file cannot be
+opened safely. Hosts without directory-relative, no-follow opens fail closed.
 
 ## Workloads
 
