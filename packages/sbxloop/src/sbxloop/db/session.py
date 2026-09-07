@@ -46,7 +46,7 @@ def readonly_uri(path: Path) -> str:
     return f"{path.resolve().as_uri()}?mode=ro"
 
 
-def open_engine(path: Path, *, readonly: bool = False) -> Engine:
+def open_engine(path: Path, *, readonly: bool = False, owns_schema: bool = True) -> Engine:
     """Open the state database at ``path``.
 
     ``readonly`` opens through a read-only URI and sets no pragma but the busy
@@ -55,6 +55,12 @@ def open_engine(path: Path, *, readonly: bool = False) -> Engine:
     and leaves durability at ``synchronous=NORMAL``: commits stop fsyncing one
     by one, and a crash can lose the tail of the WAL but never corrupt the
     database.
+
+    ``owns_schema=False`` is a read-write open that sets neither of those.
+    Changing the journal mode takes a brief exclusive lock, and the operator
+    console writes to a file a live daemon already put in WAL — asking again
+    would be contending for a lock to assert something already true. The
+    daemon sets them; a second process joins.
 
     Applying no schema is deliberate. Call :func:`sbxloop.db.ensure_schema`
     for that, so opening a database and migrating it stay separable.
@@ -87,7 +93,7 @@ def open_engine(path: Path, *, readonly: bool = False) -> Engine:
         cur = dbapi_conn.cursor()
         try:
             cur.execute(f"PRAGMA busy_timeout={BUSY_TIMEOUT_MS}")
-            if not readonly:
+            if not readonly and owns_schema:
                 cur.execute("PRAGMA journal_mode=WAL")
                 cur.execute("PRAGMA synchronous=NORMAL")
         finally:
