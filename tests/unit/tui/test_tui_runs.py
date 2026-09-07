@@ -12,6 +12,7 @@ from sbxloop.tui.screens.runs import COLUMNS, RunsScreen, fit, took
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop.tui.widgets.tables import ConsoleTable
 from sbxloop_worker.protocol import Usage
+from tests.fakes.rawdb import exec_raw
 from tests.unit.tui.conftest import FakeCtl, drive, live_status, make_app
 
 LONG_REASON = (
@@ -59,7 +60,8 @@ def seed(home: SbxloopHome) -> None:
     for run_id, state, days, mins, turns, active in plan:
         created = now - days * 86400
         store.create_run(run_id, f"outcome for {run_id}")
-        store._conn.execute(
+        exec_raw(
+            store,
             "UPDATE runs SET state=?, created_at=?, updated_at=?, reason=?, pr_number=? "
             "WHERE run_id=?",
             (
@@ -82,10 +84,9 @@ def seed(home: SbxloopHome) -> None:
             turns=turns,
             usage=Usage(input_tokens=turns * 10, output_tokens=0, cache_read_tokens=0),
         )
-        store._conn.execute(
-            "UPDATE phase_attempts SET ended_at=? WHERE run_id=?", (created + active, run_id)
+        exec_raw(
+            store, "UPDATE phase_attempts SET ended_at=? WHERE run_id=?", (created + active, run_id)
         )
-    store._conn.commit()
     store.close()
 
 
@@ -101,11 +102,11 @@ def test_the_store_hands_back_the_runs_that_moved(tmp_path: Path) -> None:
             store.create_run(run_id, "outcome")
             # Started oldest-first; touched newest-first. The two orders
             # are exact reverses of each other.
-            store._conn.execute(
+            exec_raw(
+                store,
                 "UPDATE runs SET created_at=?, updated_at=? WHERE run_id=?",
                 (now - (10 - index) * 86400, now - index * 60, run_id),
             )
-        store._conn.commit()
         assert [r.run_id for r in store.recent_runs()] == ["r0", "r1", "r2", "r3", "r4"]
         assert [r.run_id for r in store.list_runs()] == ["r4", "r3", "r2", "r1", "r0"]
         # The limit follows the order that matters: the two runs touched

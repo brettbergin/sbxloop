@@ -33,6 +33,7 @@ from sbxloop.engine.model import (
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
+from tests.fakes.rawdb import backdate
 from tests.unit.test_hostgit import (
     git as git_cmd,
 )
@@ -2143,10 +2144,7 @@ class TestStaleRunReconciliation:
 
     @staticmethod
     def _age(h: Harness, run_id: str, updated_at: float) -> None:
-        h.store._conn.execute(
-            "UPDATE runs SET updated_at = ? WHERE run_id = ?", (updated_at, run_id)
-        )
-        h.store._conn.commit()
+        backdate(h.store, run_id, updated_at)
 
     @staticmethod
     def _stale_harness(tmp_path: Path) -> Harness:
