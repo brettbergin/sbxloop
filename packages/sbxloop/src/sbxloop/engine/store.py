@@ -30,7 +30,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
-from sqlalchemy import Result, RowMapping, case, func, insert, select, text, update
+from sqlalchemy import Result, case, func, insert, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
@@ -87,6 +87,88 @@ class PostedRecord(NamedTuple):
     @property
     def body_only(self) -> bool:
         return self.comment_id is None
+
+
+class PhaseAttemptRecord(NamedTuple):
+    """One attempt at one phase, as callers read it back.
+
+    A record rather than a model instance or a driver row: these outlive the
+    session that read them — the engine folds them after the fact, the
+    console renders them in another process — and a detached instance would
+    be a trap where a frozen tuple is not.
+
+    ``task_id`` is None for a run-level phase; the usage fields are None for
+    attempts recorded before the store counted tokens.
+    """
+
+    id: int
+    run_id: str
+    task_id: str | None
+    phase: str
+    attempt: int
+    status: str
+    output_json: str | None
+    started_at: float
+    ended_at: float
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+    turns: int | None = None
+
+    @property
+    def seconds(self) -> float:
+        """How long the attempt ran."""
+        return self.ended_at - self.started_at
+
+
+class RunWindowRecord(NamedTuple):
+    """One run in an analytics window, with its phase totals folded in.
+
+    ``active`` is the time the run's attempts were actually running, which
+    is not ``updated_at - created_at``: a run parked on a merge gate has
+    elapsed time it did not spend working.
+    """
+
+    run_id: str
+    kind: str
+    state: str
+    reason: str | None
+    created_at: float
+    updated_at: float
+    review_rounds: int
+    ci_rounds: int
+    turns: int
+    tokens: int
+    cache: int
+    active: float
+
+
+class PhaseWindowRecord(NamedTuple):
+    """One phase in an analytics window, by the attempts that started in it.
+
+    ``retries`` counts attempts past the first — where the loop fights
+    itself. ``cache`` is kept apart from ``tokens`` because the ratio
+    between them is a per-phase fact: a phase that re-sends a large fixed
+    context reads far more than it writes.
+    """
+
+    phase: str
+    attempts: int
+    seconds: float
+    turns: int
+    tokens: int
+    cache: int
+    retries: int
+
+
+class TaskTotalsRecord(NamedTuple):
+    """What the tasks of a window's runs cost in rework."""
+
+    tasks: int
+    revisions: int
+    replans: int
+    suspect: int
 
 
 _SCHEMA = """
@@ -268,32 +350,23 @@ def apply_engine_schema(conn: sqlite3.Connection) -> None:
     conn.commit()
 
 
-# The columns `phase_attempts` rows are handed to callers as. A mapping
-# rather than a model instance: the rows outlive the session that read them
-# (the engine folds them after the fact, the console renders them in another
-# process), and a detached instance would be a trap where a plain mapping is
-# not. `RowMapping` supports `row["phase"]`, which is what the callers of
-# this method have always done.
-_ATTEMPT_COLUMNS: tuple[str, ...] = (
-    "id",
-    "run_id",
-    "task_id",
-    "phase",
-    "attempt",
-    "status",
-    "output_json",
-    "started_at",
-    "ended_at",
-    "input_tokens",
-    "output_tokens",
-    "cache_read_tokens",
-    "cache_write_tokens",
-    "turns",
-)
-
-
-def _attempt_mapping(row: PhaseAttempt) -> RowMapping:
-    return cast(RowMapping, {name: getattr(row, name) for name in _ATTEMPT_COLUMNS})
+def _attempt_record(row: PhaseAttempt) -> PhaseAttemptRecord:
+    return PhaseAttemptRecord(
+        id=row.id,
+        run_id=row.run_id,
+        task_id=row.task_id,
+        phase=row.phase,
+        attempt=row.attempt,
+        status=row.status,
+        output_json=row.output_json,
+        started_at=row.started_at,
+        ended_at=row.ended_at,
+        input_tokens=row.input_tokens,
+        output_tokens=row.output_tokens,
+        cache_read_tokens=row.cache_read_tokens,
+        cache_write_tokens=row.cache_write_tokens,
+        turns=row.turns,
+    )
 
 
 def _rowcount(result: Result[Any]) -> int:
@@ -702,7 +775,7 @@ class StateStore:
     # every few seconds against a store that only grows, and a query per
     # run would be a scan per run.
 
-    def runs_between(self, since: float, until: float) -> list[RowMapping]:
+    def runs_between(self, since: float, until: float) -> list[RunWindowRecord]:
         """Every run *created* in the window, with its phase totals folded
         in: turns, tokens, cache reads and ``active`` (the time its phase
         attempts were actually running, which is not the same as
@@ -742,9 +815,9 @@ class StateStore:
             .order_by(Run.created_at)
         )
         with self._read() as session:
-            return [row._mapping for row in session.execute(stmt)]
+            return [RunWindowRecord(*row) for row in session.execute(stmt)]
 
-    def phases_between(self, since: float, until: float) -> list[RowMapping]:
+    def phases_between(self, since: float, until: float) -> list[PhaseWindowRecord]:
         """Each phase in the window, by the attempts that *started* in it:
         how long it ran, what it cost, and how often it had to go round
         again.
@@ -780,9 +853,9 @@ class StateStore:
             .order_by(seconds.desc())
         )
         with self._read() as session:
-            return [row._mapping for row in session.execute(stmt)]
+            return [PhaseWindowRecord(*row) for row in session.execute(stmt)]
 
-    def task_totals_between(self, since: float, until: float) -> RowMapping:
+    def task_totals_between(self, since: float, until: float) -> TaskTotalsRecord:
         """What the tasks of the window's runs cost in rework: revisions a
         task needed, replans it forced, and how many were flagged as having
         a suspect verify."""
@@ -798,7 +871,7 @@ class StateStore:
             .where(Run.created_at >= since, Run.created_at < until)
         )
         with self._read() as session:
-            return session.execute(stmt).one()._mapping
+            return TaskTotalsRecord(*session.execute(stmt).one())
 
     # -- tasks -------------------------------------------------------------
 
@@ -937,7 +1010,9 @@ class StateStore:
                 .limit(1)
             )
 
-    def latest_phase_attempt(self, run_id: str, task_id: str, phase: str) -> RowMapping | None:
+    def latest_phase_attempt(
+        self, run_id: str, task_id: str, phase: str
+    ) -> PhaseAttemptRecord | None:
         """The task's most recent attempt row of ``phase`` (attempt, status,
         output_json...), or None if it never ran."""
         with self._read() as session:
@@ -951,15 +1026,15 @@ class StateStore:
                 .order_by(PhaseAttempt.id.desc())
                 .limit(1)
             ).first()
-            return None if row is None else _attempt_mapping(row[0])
+            return None if row is None else _attempt_record(row[0])
 
-    def phase_attempts(self, run_id: str, task_id: str | None = None) -> list[RowMapping]:
+    def phase_attempts(self, run_id: str, task_id: str | None = None) -> list[PhaseAttemptRecord]:
         stmt = select(PhaseAttempt).where(PhaseAttempt.run_id == run_id)
         if task_id is not None:
             stmt = stmt.where(PhaseAttempt.task_id == task_id)
         with self._read() as session:
             rows = session.scalars(stmt.order_by(PhaseAttempt.id)).all()
-            return [_attempt_mapping(row) for row in rows]
+            return [_attempt_record(row) for row in rows]
 
     def posted_findings(self, run_id: str) -> list[PostedRecord]:
         """Every review finding this run posted on its PR, oldest round first.
@@ -971,10 +1046,10 @@ class StateStore:
         """
         records: list[PostedRecord] = []
         for row in self.phase_attempts(run_id):
-            if row["phase"] != "review":
+            if row.phase != "review":
                 continue
             try:
-                data = json.loads(row["output_json"] or "{}")
+                data = json.loads(row.output_json or "{}")
             except ValueError:
                 continue
             if not isinstance(data, dict):
@@ -990,7 +1065,7 @@ class StateStore:
                 comment_id = item.get("comment_id")
                 records.append(
                     PostedRecord(
-                        round=int(row["attempt"]),
+                        round=int(row.attempt),
                         anchor=str(item["anchor"]),
                         comment_id=int(comment_id) if comment_id is not None else None,
                         thread_node_id=(

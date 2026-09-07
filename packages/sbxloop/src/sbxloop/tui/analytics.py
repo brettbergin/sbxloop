@@ -1,6 +1,7 @@
 """What the console's Overview reports: a window of runs folded into the
 few numbers that answer "is this performing well".
 
+
 Three things this module insists on, because each of them was a wrong
 answer first:
 
@@ -33,7 +34,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
 
-from sqlalchemy import RowMapping
+from sbxloop.engine.store import (
+    PhaseWindowRecord,
+    RunWindowRecord,
+    TaskTotalsRecord,
+)
 
 #: The window the Overview reports on, and the number of buckets its
 #: trends are drawn with — a day per bucket over a week.
@@ -54,11 +59,11 @@ CACHE_TTL_S = 10.0
 class WindowStore(Protocol):
     """The slice of the engine store this module reads."""
 
-    def runs_between(self, since: float, until: float) -> list[RowMapping]: ...
+    def runs_between(self, since: float, until: float) -> list[RunWindowRecord]: ...
 
-    def phases_between(self, since: float, until: float) -> list[RowMapping]: ...
+    def phases_between(self, since: float, until: float) -> list[PhaseWindowRecord]: ...
 
-    def task_totals_between(self, since: float, until: float) -> RowMapping: ...
+    def task_totals_between(self, since: float, until: float) -> TaskTotalsRecord: ...
 
 
 @dataclass(frozen=True)
@@ -303,15 +308,15 @@ def _reason(raw: str | None) -> str:
 
 
 def fold(
-    runs: Sequence[RowMapping],
-    phases: Sequence[RowMapping],
+    runs: Sequence[RunWindowRecord],
+    phases: Sequence[PhaseWindowRecord],
     *,
     since: float,
     until: float,
     buckets: int = BUCKETS,
     top: int = 8,
-    tasks: RowMapping | None = None,
-    previous: Sequence[RowMapping] = (),
+    tasks: TaskTotalsRecord | None = None,
+    previous: Sequence[RunWindowRecord] = (),
 ) -> Analytics:
     """Fold the window's rows into what the screen reports."""
     lanes: dict[str, Lane] = {}
@@ -323,43 +328,43 @@ def fold(
     rounds = [0, 0]
 
     for row in runs:
-        kind = str(row["kind"])
+        kind = str(row.kind)
         lane = lanes.get(kind, Lane(kind))
-        state = str(row["state"])
-        active = float(row["active"])
-        elapsed = max(float(row["updated_at"]) - float(row["created_at"]), 0.0)
+        state = str(row.state)
+        active = float(row.active)
+        elapsed = max(float(row.updated_at) - float(row.created_at), 0.0)
         lanes[kind] = Lane(
             kind,
             lane.runs + 1,
             lane.landed + (1 if state in LANDED else 0),
             lane.failed + (1 if state == "failed" else 0),
             lane.cancelled + (1 if state == CANCELLED else 0),
-            lane.turns + int(row["turns"]),
-            lane.tokens + int(row["tokens"]),
-            lane.cache + int(row["cache"]),
+            lane.turns + int(row.turns),
+            lane.tokens + int(row.tokens),
+            lane.cache + int(row.cache),
             lane.active + active,
             lane.elapsed + elapsed,
         )
         rows.append(
             RunRow(
-                str(row["run_id"]),
+                str(row.run_id),
                 kind,
                 state,
-                int(row["turns"]),
-                int(row["tokens"]),
+                int(row.turns),
+                int(row.tokens),
                 active,
                 max(elapsed - active, 0.0),
             )
         )
         if state == "failed":
-            reasons[_reason(row["reason"])] += 1
-        rounds[0] += int(row["review_rounds"] or 0)
-        rounds[1] += int(row["ci_rounds"] or 0)
+            reasons[_reason(row.reason)] += 1
+        rounds[0] += int(row.review_rounds or 0)
+        rounds[1] += int(row.ci_rounds or 0)
         if width > 0:
-            index = min(buckets - 1, int((float(row["created_at"]) - since) // width))
+            index = min(buckets - 1, int((float(row.created_at) - since) // width))
             if 0 <= index < buckets:
                 daily["runs"][index] += 1
-                daily["turns"][index] += int(row["turns"])
+                daily["turns"][index] += int(row.turns)
                 day = days[index]
                 days[index] = Day(
                     day.landed + (1 if state in LANDED else 0),
@@ -375,13 +380,13 @@ def fold(
         lanes=lanes,
         phases=tuple(
             PhaseSlice(
-                str(p["phase"]),
-                float(p["seconds"]),
-                int(p["attempts"]),
-                int(p["turns"]),
-                int(p["tokens"]),
-                int(p["cache"]),
-                int(p["retries"]),
+                str(p.phase),
+                float(p.seconds),
+                int(p.attempts),
+                int(p.turns),
+                int(p.tokens),
+                int(p.cache),
+                int(p.retries),
             )
             for p in phases
         ),
@@ -393,10 +398,10 @@ def fold(
         days=tuple(days),
         rework=(
             Rework(
-                int(tasks["tasks"]),
-                int(tasks["revisions"]),
-                int(tasks["replans"]),
-                int(tasks["suspect"]),
+                int(tasks.tasks),
+                int(tasks.revisions),
+                int(tasks.replans),
+                int(tasks.suspect),
             )
             if tasks is not None
             else Rework()
@@ -407,22 +412,22 @@ def fold(
     )
 
 
-def _lane_of(rows: Sequence[RowMapping]) -> Lane:
+def _lane_of(rows: Sequence[RunWindowRecord]) -> Lane:
     """Every kind together, for the window before this one."""
     lane = Lane("previous")
     for row in rows:
-        state = str(row["state"])
-        active = float(row["active"])
-        elapsed = max(float(row["updated_at"]) - float(row["created_at"]), 0.0)
+        state = str(row.state)
+        active = float(row.active)
+        elapsed = max(float(row.updated_at) - float(row.created_at), 0.0)
         lane = Lane(
             "previous",
             lane.runs + 1,
             lane.landed + (1 if state in LANDED else 0),
             lane.failed + (1 if state == "failed" else 0),
             lane.cancelled + (1 if state == CANCELLED else 0),
-            lane.turns + int(row["turns"]),
-            lane.tokens + int(row["tokens"]),
-            lane.cache + int(row["cache"]),
+            lane.turns + int(row.turns),
+            lane.tokens + int(row.tokens),
+            lane.cache + int(row.cache),
             lane.active + active,
             lane.elapsed + elapsed,
         )

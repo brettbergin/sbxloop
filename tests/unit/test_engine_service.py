@@ -400,10 +400,11 @@ class TestCredentialedRegistryRun:
         assert result.succeeded, result.reason
         run_id = result.run_id
         (preparation_spend,) = [
-            row for row in engine.store.phase_attempts(run_id) if row["phase"] == "dependencies"
+            row for row in engine.store.phase_attempts(run_id) if row.phase == "dependencies"
         ]
-        assert preparation_spend["turns"] == 1
-        assert preparation_spend["input_tokens"] > 0
+        assert preparation_spend.turns == 1
+        assert preparation_spend.input_tokens is not None
+        assert preparation_spend.input_tokens > 0
         calls = npm_calls(fake_npm)
         assert [c["argv"] for c in calls] == ["ci --ignore-scripts"]
         assert all(c["token"] == "" for c in calls)
