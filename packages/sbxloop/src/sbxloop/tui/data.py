@@ -14,8 +14,6 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from sqlalchemy import RowMapping
-
 from sbxloop.config import TUI_CONTROL_CHANNEL
 from sbxloop.daemon.control import CommandReply
 from sbxloop.daemon.mailbox import MailboxClient
@@ -23,6 +21,7 @@ from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.store import ChatThread, MergeGate, ReviewHold, dispatch_eligible_at
 from sbxloop.daemon.usage import RunUsage, usage_for_run
 from sbxloop.engine.model import RunRecord, TaskRecord
+from sbxloop.engine.store import PhaseAttemptRecord
 from sbxloop.events import HostEventTypes
 from sbxloop_worker.protocol import Event
 
@@ -166,7 +165,7 @@ def build_items(mailbox: MailboxClient, *, retry_backoff_s: float) -> ItemsSnaps
 class RunDetail:
     record: RunRecord
     tasks: tuple[TaskRecord, ...]
-    phases: tuple[RowMapping, ...]
+    phases: tuple[PhaseAttemptRecord, ...]
     item: WorkItem | None
     gate: MergeGate | None
     hold: ReviewHold | None

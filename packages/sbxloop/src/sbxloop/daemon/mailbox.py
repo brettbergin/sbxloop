@@ -23,8 +23,6 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import RowMapping
-
 from sbxloop.config import TUI_CONTROL_CHANNEL
 from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.store import (
@@ -38,7 +36,7 @@ from sbxloop.daemon.store import (
     ReviewHold,
 )
 from sbxloop.engine.model import RunRecord, TaskRecord
-from sbxloop.engine.store import StateStore
+from sbxloop.engine.store import PhaseAttemptRecord, StateStore
 from sbxloop.log import get_logger
 from sbxloop_worker.protocol import Event
 
@@ -206,7 +204,7 @@ class MailboxClient:
         with self._lock:
             return self.engine.get_tasks(run_id)
 
-    def phase_attempts(self, run_id: str) -> list[RowMapping]:
+    def phase_attempts(self, run_id: str) -> list[PhaseAttemptRecord]:
         with self._lock:
             return self.engine.phase_attempts(run_id)
 

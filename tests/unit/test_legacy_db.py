@@ -177,7 +177,7 @@ class TestEngineShapes:
         assert store.get_run_guidance("old") == []
         assert run.credentials == []
         if shape == "pre_usage":
-            assert store.phase_attempts("old")[0]["input_tokens"] is None
+            assert store.phase_attempts("old")[0].input_tokens is None
         # The new columns are writable, and a reopen does not re-apply the ALTERs.
         assert store.grant_rounds("old", 1) == 1
         store.set_run_credentials("old", ["weather"])
