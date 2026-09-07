@@ -376,23 +376,27 @@ class OverviewScreen(ConsoleScreen):
                 (" waiting on you.", "dim"),
             ),
             TextPanel("", classes="gap"),
-            self._row(
+        ]
+        out.extend(
+            self._plotted(
                 "outcome", f"{rate:.0%} ok" if rate is not None else "—", self._outcome(total)
-            ),
-            TextPanel("", classes="gap"),
-            self._row(
+            )
+        )
+        out.append(TextPanel("", classes="gap"))
+        out.extend(
+            self._plotted(
                 "time",
                 hm(total.elapsed),
                 [
                     Segment("active", total.active, PALETTE[0]),
                     Segment("parked", total.parked, PARKED_COLOUR),
                 ],
-            ),
-            TextPanel("", classes="gap"),
-            self._row("phases", hm(data.active_seconds), phases),
-            TextPanel(legend(phases)),
-            TextPanel("", classes="gap"),
-        ]
+                hm,
+            )
+        )
+        out.append(TextPanel("", classes="gap"))
+        out.extend(self._plotted("phases", hm(data.active_seconds), phases, hm))
+        out.append(TextPanel("", classes="gap"))
         out.extend(
             self._compare(
                 data,
@@ -405,8 +409,8 @@ class OverviewScreen(ConsoleScreen):
             )
         )
         out.append(TextPanel("", classes="gap"))
-        out.append(TextPanel("day by day", classes="h"))
-        out.extend(self._days(data))
+        out.append(TextPanel("day by day, by outcome", classes="h"))
+        out.extend(self._day_chart(data))
         lever = self._lever(data)
         if lever is not None:
             out.append(TextPanel("", classes="gap"))
@@ -447,6 +451,22 @@ class OverviewScreen(ConsoleScreen):
             data.since + (offset + 0.5) * (data.until - data.since) / max(len(data.days), 1)
         )
         return time.strftime(fmt, when)
+
+    def _day_chart(self, data: Analytics) -> list[Any]:
+        """The week as one stacked plot rather than a bar per day."""
+        labels = [self._bucket_label(data, i, "%a") for i in range(len(data.days))]
+        if not labels:
+            return [TextPanel(Text("no days in the window", style="dim"))]
+        series = [
+            ("landed", [float(d.landed) for d in data.days], OK_COLOUR),
+            ("failed", [float(d.failed) for d in data.days], BAD_COLOUR),
+            ("cancelled", [float(d.cancelled) for d in data.days], IDLE_COLOUR),
+        ]
+        drawn = chart.stacked(labels, series)
+        # The week's totals as the key — the same swatch-name-share line a
+        # band carries, so the two kinds of stack read the same way.
+        key = legend([Segment(name, sum(values), colour) for name, values, colour in series])
+        return [drawn, TextPanel(key, classes="cap")]
 
     def _days(self, data: Analytics) -> list[Any]:
         """The trend as a stack: each bucket split by how its runs ended."""
@@ -812,6 +832,26 @@ class OverviewScreen(ConsoleScreen):
             )
         )
         return out
+
+    def _plotted(
+        self,
+        label: str,
+        value: str,
+        segments: list[Segment],
+        fmt: Callable[[float], str] | None = None,
+    ) -> list[Any]:
+        """`_row`'s charted counterpart: the same heading and the same key,
+        with a scale between them instead of a single painted row."""
+        if not any(s.value > 0 for s in segments):
+            return [self._row(label, value, segments)]
+        drawn = chart.proportion([(s.label, s.value, s.colour) for s in segments], fmt)
+        return [
+            TextPanel(
+                Text.assemble((f"{label:<13}", "dim"), (value, "bold")),
+            ),
+            drawn,
+            TextPanel(legend(segments), classes="cap"),
+        ]
 
     @staticmethod
     def _captioned(drawn: chart.Chart) -> list[Any]:

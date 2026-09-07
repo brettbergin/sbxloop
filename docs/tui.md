@@ -102,10 +102,13 @@ draws a bar. The pages take **letters** — the digits belong to the console's
 rail — and `o` opens the window's costliest run.
 
 - **Summary** (`s`) — the week in a sentence, then outcome, elapsed split
-  into active/parked, and where the working time went, as proportion; then
-  the change against the week before, a day-by-day strip split by outcome,
-  and one "biggest lever" line naming whichever cost is furthest out of
-  proportion.
+  into active/parked, and where the working time went — each a horizontal
+  stacked plot against a value axis, so a share can be read off as a
+  quantity (`23h 51m`) and not only as a proportion. Then the change
+  against the week before, the week itself as one stacked plot with a day
+  per bucket, and one "biggest lever" line naming whichever cost is
+  furthest out of proportion. A split that is all zero has no proportion
+  to draw, so that row falls back to the one-row band.
 - **Flow** (`f`) — runs per day by outcome, each kind's rates with its own
   turns, active and parked per run, and **how long work took to land** end
   to end (median and p90, slowest named). Code and workload runs differ by
@@ -140,12 +143,18 @@ rail — and `o` opens the window's costliest run.
 A **cancelled** run is a decision, not an outcome: it is counted and
 reported but kept out of the success rate's denominator.
 
-Most of the drawing is `sbxloop.tui.widgets.band` — one row, solid colour,
-no axis, and the right answer to every *what share* question here. The
-plots on Spread and the Cost trend are `sbxloop.tui.widgets.chart`
-(`textual-plotext`), for the *what shape* questions that need a scale;
-their axes are ruled in whole runs and read in the same `1h 20m` units as
-the rest of the screen, and they follow the console's theme.
+The plots are `sbxloop.tui.widgets.chart` (`textual-plotext`). Their axes
+are ruled in whole runs and read in the same `1h 20m` units as the rest of
+the screen, and they follow the console's theme. `sbxloop.tui.widgets.band`
+still draws every stack outside Overview and Overview's own ranked rows,
+and remains the fallback wherever a plot would rule an axis over nothing.
+
+One trap worth knowing if you add a plot: **plotext does not raise on a
+colour it cannot read.** `color="#22C55E"` and `color="not-a-colour"` both
+draw in its default, so a `band.py` palette entry handed straight to
+plotext silently paints every series the same blue. Convert it with
+`chart.rgb` first; `tests/unit/tui/test_tui_charts.py` asserts on the
+painted output rather than on the argument for exactly this reason.
 
 The numbers are `sbxloop.tui.analytics`, folded from
 `StateStore.runs_between` / `phases_between` in one grouped pass each and
