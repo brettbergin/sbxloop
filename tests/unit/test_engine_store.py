@@ -226,9 +226,9 @@ class TestPhasesAndEvents:
             "r1", "plan", task_id="t1", attempt=1, status="ok", output_json=None, started_at=2.0
         )
         all_attempts = store.phase_attempts("r1")
-        assert [row["phase"] for row in all_attempts] == ["decompose", "plan"]
+        assert [row.phase for row in all_attempts] == ["decompose", "plan"]
         t1_attempts = store.phase_attempts("r1", "t1")
-        assert [row["phase"] for row in t1_attempts] == ["plan"]
+        assert [row.phase for row in t1_attempts] == ["plan"]
 
     def test_phase_usage_roundtrips(self, store: StateStore) -> None:
         store.create_run("r1", "x")
@@ -249,11 +249,11 @@ class TestPhasesAndEvents:
             turns=3,
         )
         row = store.phase_attempts("r1")[0]
-        assert row["input_tokens"] == 1200
-        assert row["output_tokens"] == 34
-        assert row["cache_read_tokens"] == 900
-        assert row["cache_write_tokens"] == 10
-        assert row["turns"] == 3
+        assert row.input_tokens == 1200
+        assert row.output_tokens == 34
+        assert row.cache_read_tokens == 900
+        assert row.cache_write_tokens == 10
+        assert row.turns == 3
 
     def test_phase_usage_defaults_to_null(self, store: StateStore) -> None:
         """A mechanical phase (verify) records no usage — columns stay NULL."""
@@ -262,9 +262,9 @@ class TestPhasesAndEvents:
             "r1", "verify", task_id="t1", attempt=1, status="ok", output_json=None, started_at=1.0
         )
         row = store.phase_attempts("r1")[0]
-        assert row["input_tokens"] is None
-        assert row["output_tokens"] is None
-        assert row["turns"] is None
+        assert row.input_tokens is None
+        assert row.output_tokens is None
+        assert row.turns is None
 
     def test_pre_usage_database_migrates_in_place(self, tmp_path: Path) -> None:
         """A state.db whose phase_attempts predates the usage columns opens
@@ -291,7 +291,7 @@ class TestPhasesAndEvents:
 
         store = StateStore(db)
         old_row = store.phase_attempts("r1")[0]
-        assert old_row["input_tokens"] is None
+        assert old_row.input_tokens is None
         store.record_phase(
             "r1",
             "execute",
@@ -303,7 +303,7 @@ class TestPhasesAndEvents:
             usage=Usage(input_tokens=5),
             turns=1,
         )
-        assert store.phase_attempts("r1")[1]["input_tokens"] == 5
+        assert store.phase_attempts("r1")[1].input_tokens == 5
         # reopening does not re-apply the ALTERs
         StateStore(db).phase_attempts("r1")
 

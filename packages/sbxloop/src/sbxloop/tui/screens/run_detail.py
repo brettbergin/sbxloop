@@ -376,8 +376,8 @@ class RunDetailScreen(ConsoleScreen):
         rows = []
         totals = {"in": 0, "out": 0, "cr": 0, "cw": 0, "turns": 0}
         for row in detail.phases:
-            started = row["started_at"]
-            ended = row["ended_at"]
+            started = row.started_at
+            ended = row.ended_at
             for key, col in (
                 ("in", "input_tokens"),
                 ("out", "output_tokens"),
@@ -385,23 +385,23 @@ class RunDetailScreen(ConsoleScreen):
                 ("cw", "cache_write_tokens"),
                 ("turns", "turns"),
             ):
-                value = row[col]
+                value = getattr(row, col)
                 if value is not None:
                     totals[key] += int(value)
             rows.append(
                 (
-                    str(row["id"]),
+                    str(row.id),
                     (
-                        row["task_id"] or "—",
-                        row["phase"],
-                        str(row["attempt"]),
-                        row["status"],
+                        row.task_id or "—",
+                        row.phase,
+                        str(row.attempt),
+                        row.status,
                         clock(started),
                         duration((ended - started) if started and ended else None),
-                        tokens(row["input_tokens"]),
-                        tokens(row["output_tokens"]),
-                        f"{tokens(row['cache_read_tokens'])}/{tokens(row['cache_write_tokens'])}",
-                        str(row["turns"] if row["turns"] is not None else "—"),
+                        tokens(row.input_tokens),
+                        tokens(row.output_tokens),
+                        f"{tokens(row.cache_read_tokens)}/{tokens(row.cache_write_tokens)}",
+                        str(row.turns if row.turns is not None else "—"),
                     ),
                 )
             )

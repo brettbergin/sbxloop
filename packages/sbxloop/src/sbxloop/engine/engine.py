@@ -61,7 +61,6 @@ from typing import Any, NamedTuple
 from urllib.parse import quote
 
 from pydantic import ValidationError
-from sqlalchemy import RowMapping
 
 from sbxloop import hostgit, repofiles
 from sbxloop.config import (
@@ -165,7 +164,7 @@ from sbxloop.engine.review import (
     unanswered_findings,
 )
 from sbxloop.engine.service import ServiceOps
-from sbxloop.engine.store import PostedRecord, StateStore
+from sbxloop.engine.store import PhaseAttemptRecord, PostedRecord, StateStore
 from sbxloop.errors import (
     BudgetExceededError,
     ConfigError,
@@ -1142,7 +1141,7 @@ class LoopEngine:
         output = result.output_json
         ready = result.status == "ok" and isinstance(output, dict) and output.get("ready") is True
         attempt = 1 + sum(
-            row["phase"] == "dependencies" for row in self.store.phase_attempts(run_id)
+            1 for row in self.store.phase_attempts(run_id) if row.phase == "dependencies"
         )
         self.store.record_phase(
             run_id,
@@ -2087,16 +2086,16 @@ class LoopEngine:
             )
         if mode != "advisory":
             return ""
-        latest: dict[tuple[str, str | None], RowMapping] = {}
+        latest: dict[tuple[str, str | None], PhaseAttemptRecord] = {}
         for row in self.store.phase_attempts(run_id):
-            if row["phase"] in ("verify", "gate"):
-                latest[(str(row["phase"]), row["task_id"])] = row
+            if row.phase in ("verify", "gate"):
+                latest[(row.phase, row.task_id)] = row
         lines: list[str] = []
         for (phase, task_id), row in latest.items():
-            if row["status"] != "advisory":
+            if row.status != "advisory":
                 continue
             try:
-                data = json.loads(row["output_json"] or "{}")
+                data = json.loads(row.output_json or "{}")
             except ValueError:
                 continue
             if phase == "gate":
@@ -2261,7 +2260,7 @@ class LoopEngine:
         attempt = 1 + sum(
             1
             for row in self.store.phase_attempts(run_id)
-            if row["phase"] == "judge" and row["task_id"] is None
+            if row.phase == "judge" and row.task_id is None
         )
         started = time.time()
         results = phases.shell_batch(commands) if commands else []
@@ -2549,7 +2548,7 @@ class LoopEngine:
         self._set_run_state(run_id, "gating")
         gate = phases.project_gate()
         mode = self._verify_mode
-        attempt = 1 + sum(1 for row in self.store.phase_attempts(run_id) if row["phase"] == "gate")
+        attempt = 1 + sum(1 for row in self.store.phase_attempts(run_id) if row.phase == "gate")
         started = time.time()
         if not gate or mode == "ci-only":
             # Under `ci-only` (#682) the gate is the pull request's checks:
@@ -3341,15 +3340,15 @@ class LoopEngine:
         """The most recent fix task's build report and its round number."""
         report, seen = "", []
         for row in self.store.phase_attempts(run_id):
-            if row["phase"] != "build" or not row["task_id"]:
+            if row.phase != "build" or not row.task_id:
                 continue
-            task_id = str(row["task_id"])
+            task_id = str(row.task_id)
             if not is_fix_task(task_id):
                 continue
             if task_id not in seen:
                 seen.append(task_id)
             try:
-                report = str(json.loads(row["output_json"] or "{}").get("report") or "")
+                report = str(json.loads(row.output_json or "{}").get("report") or "")
             except ValueError:
                 report = ""
         return report, len(seen)
@@ -3390,21 +3389,16 @@ class LoopEngine:
         """
         rounds: list[ReviewRound] = []
         for row in self.store.phase_attempts(run_id):
-            if row["phase"] == "review":
+            if row.phase == "review":
                 try:
-                    data = json.loads(row["output_json"] or "{}")
+                    data = json.loads(row.output_json or "{}")
                     verdict = ReviewVerdict.model_validate(data.get("verdict") or data)
                 except (ValueError, ValidationError):
                     continue
                 rounds.append(ReviewRound(len(rounds) + 1, verdict, ""))
-            elif (
-                row["phase"] == "build"
-                and rounds
-                and row["task_id"]
-                and is_fix_task(str(row["task_id"]))
-            ):
+            elif row.phase == "build" and rounds and row.task_id and is_fix_task(str(row.task_id)):
                 try:
-                    report = json.loads(row["output_json"] or "{}").get("report") or ""
+                    report = json.loads(row.output_json or "{}").get("report") or ""
                 except ValueError:
                     report = ""
                 last = rounds[-1]
@@ -3425,10 +3419,10 @@ class LoopEngine:
         with no review round at all has nothing to have failed, so True.
         """
         for row in reversed(self.store.phase_attempts(run_id)):
-            if row["phase"] != "review":
+            if row.phase != "review":
                 continue
             try:
-                data = json.loads(row["output_json"] or "{}")
+                data = json.loads(row.output_json or "{}")
             except ValueError:
                 return False
             review = data.get("review") if isinstance(data, dict) else None
@@ -4045,10 +4039,10 @@ class LoopEngine:
         ``"(comment)"`` when the checklist comment was posted)."""
         out: dict[str, str] = {}
         for row in self.store.phase_attempts(run_id):
-            if row["phase"] != "followup":
+            if row.phase != "followup":
                 continue
             try:
-                data = json.loads(row["output_json"] or "{}")
+                data = json.loads(row.output_json or "{}")
             except ValueError:
                 continue
             key = str(data.get("key") or "")
