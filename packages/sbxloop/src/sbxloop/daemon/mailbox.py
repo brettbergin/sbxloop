@@ -65,9 +65,11 @@ class MailboxClient:
         # The console's one write path. A read-only handle cannot serve it
         # and the read-only stores must stay read-only, so this is a third
         # connection of its own — on the ORM's engine like everything else,
-        # but running no schema statement: the daemon owns the schema, and
-        # the console must never migrate it.
-        self._rw = open_engine(path)
+        # but `owns_schema=False`: it runs no migration, and it does not set
+        # the journal mode either. The daemon has already put this file in
+        # WAL, and asking again would take an exclusive lock to assert
+        # something that is already true, against the process using it.
+        self._rw = open_engine(path, owns_schema=False)
 
     def close(self) -> None:
         with self._lock:
