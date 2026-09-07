@@ -14,15 +14,17 @@ import getpass
 import json
 import os
 import shutil
-import sqlite3
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 from rich.table import Table
+from sqlalchemy.exc import SQLAlchemyError
 
 import sbxloop
 from sbxloop import toolchains
@@ -30,7 +32,7 @@ from sbxloop.backends import backend_for
 from sbxloop.config import Config, MergeMethod, RepoConfig, load_config, load_config_with_sources
 from sbxloop.engine.landing import allowed_merge_methods, resolve_merge_method
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError
+from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError, StateError
 from sbxloop.gh.labels import lifecycle_specs, missing_labels
 from sbxloop.gh.ops import GithubOps
 from sbxloop.gh.permissions import (
@@ -172,7 +174,9 @@ def daemon_repo_health(
         return {}
     out: dict[str, dict[str, Any]] = {}
     try:
-        store = DaemonStore(db)
+        # Read-only: doctor runs while the daemon is live, and a diagnostic
+        # that migrates the schema out from under it is not a diagnostic.
+        store = DaemonStore(db, readonly=True)
         try:
             for key, value in store.values_with_prefix(REPO_HEALTH_KEY).items():
                 try:
@@ -186,6 +190,27 @@ def daemon_repo_health(
     except Exception:  # a store doctor cannot read is its own row elsewhere
         return {}
     return out
+
+
+def _count_orphans(cli: SbxCLI, state_db: Path) -> int:
+    """Orphan count, without doctor ever writing to the state database.
+
+    Read-only when the file is there: doctor runs while the daemon is live,
+    and a diagnostic that migrates the schema under it is not a diagnostic.
+    When it is not there, the sandboxes are classified against an empty
+    store in a temporary directory rather than against the real path — a
+    host with no database has recorded no runs, so a sandbox on it is
+    unaccounted for exactly as it always was, and doctor still does not
+    create the file it was asked to inspect.
+    """
+    with ExitStack() as stack:
+        if state_db.is_file():
+            store = StateStore(state_db, readonly=True)
+        else:
+            scratch = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            store = StateStore(scratch / "state.db")
+        stack.callback(store.close)
+        return count_orphans(cli, store)
 
 
 def repo_checks(
@@ -914,7 +939,7 @@ def stored_schedules(config: Config) -> list[Any]:
     if not db.is_file():
         return []
     try:
-        store = DaemonStore(db)
+        store = DaemonStore(db, readonly=True)
         try:
             return list(store.schedules())
         finally:
@@ -1046,8 +1071,8 @@ def collect_checks(
         if logged_in:
             report("checking for orphaned sandboxes")
             try:
-                orphans = count_orphans(cli, StateStore(config.paths.state_db))
-            except (SbxError, OSError, sqlite3.Error):
+                orphans = _count_orphans(cli, config.paths.state_db)
+            except (SbxError, OSError, StateError, SQLAlchemyError):
                 orphans = None
             if orphans is not None:
                 checks.append(

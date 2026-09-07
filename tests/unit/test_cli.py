@@ -3446,6 +3446,41 @@ class TestDoctorRepoHealthRow:
         got = daemon_repo_health(config, sources, env)
         assert got == {"acme/alpha": {"suspended": True, "reason": "x"}}
 
+    def test_reading_health_never_migrates_the_store(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """doctor runs while the daemon is live, so it opens read-only.
+
+        A diagnostic that migrates the schema out from under a running
+        daemon is not a diagnostic. This pins the shape of the database
+        before and after — including its `alembic_version` — so a
+        read-write open here would show up as a difference.
+        """
+        import sqlite3
+
+        from sbxloop.cli.doctor import daemon_repo_health, stored_schedules
+        from sbxloop.config import load_config_with_sources
+        from sbxloop.daemon.store import DaemonStore
+
+        (workdir / "sbxloop.toml").write_text('[[github.repos]]\nrepo = "acme/alpha"\n')
+        config, sources = load_config_with_sources()
+        env = dict(os.environ)
+        DaemonStore(config.paths.state_db).close()
+
+        def snapshot() -> list[tuple[str, str]]:
+            conn = sqlite3.connect(config.paths.state_db)
+            try:
+                return conn.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
+                ).fetchall()
+            finally:
+                conn.close()
+
+        before = snapshot()
+        assert daemon_repo_health(config, sources, env) == {}
+        assert stored_schedules(config) == []
+        assert snapshot() == before
+
 
 class TestDoctorBranchProtection:
     """Rules of the base the loop cannot satisfy 405 every loop merge:

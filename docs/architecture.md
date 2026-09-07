@@ -1122,9 +1122,25 @@ leftover of the layouts the home replaced. `sbxloop init` builds it (`homeinit.p
 
 ## Persistence and resume
 
-`StateStore` is a WAL-mode SQLite database at `~/.sbxloop/state/state.db` (the home's
-`state/`, see *The home* below) with
-four tables: `runs`, `tasks`, `phase_attempts`, `events`. A workload task's
+`~/.sbxloop/state/state.db` (the home's `state/`, see *The home* below) is one
+WAL-mode SQLite database holding **nineteen** tables, and two stores read it
+through separate connections. `StateStore` owns five — `runs`, `tasks`,
+`phase_attempts`, `reconciliations`, `events` — and `DaemonStore` the
+fourteen `daemon_*` ones (the queue, the run ledger, the resume budget,
+key/value state, run watches, requesters, prior attempts, chat threads,
+merge gates and their prompts, review holds, pending clarifications, the
+operator console's mailbox and the schedules).
+
+Both are SQLAlchemy models under `sbxloop/db/` (#539), and Alembic owns the
+upgrade path — one revision chain for the whole file, applied when a store
+opens it, so an unattended daemon still migrates itself with no operator
+step. Revision 0001 is not a schema: it is the hand-written migrator both
+stores ran before, so a database in any of the sixteen shapes this project
+has released comes up to the current one by the code that already did that.
+Revisions are **additive only**, because a failed deploy rolls back by
+restarting the previous version against the database the new one migrated.
+
+A workload task's
 row also carries its `TaskOutput` (`tasks.output_json`, #757): the
 `## Result` section of the operator's report, its first line as the
 summary, and the names of the files the attempt left in the data directory
