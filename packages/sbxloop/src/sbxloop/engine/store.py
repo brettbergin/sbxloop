@@ -132,6 +132,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     session_id TEXT,
     verify_fingerprints TEXT NOT NULL DEFAULT '[]',
     verify_suspect INTEGER NOT NULL DEFAULT 0,
+    verify_reauthors INTEGER NOT NULL DEFAULT 0,
     output_json TEXT,
     PRIMARY KEY (run_id, task_id)
 );
@@ -237,6 +238,10 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
         ),
         # A workload task's TaskOutput (#757); NULL for every code task.
         ("output_json", "ALTER TABLE tasks ADD COLUMN output_json TEXT"),
+        (
+            "verify_reauthors",
+            "ALTER TABLE tasks ADD COLUMN verify_reauthors INTEGER NOT NULL DEFAULT 0",
+        ),
     ),
 }
 
@@ -842,12 +847,17 @@ class StateStore:
                 .where(Task.run_id == run_id, Task.task_id == task.spec.id)
                 .values(
                     state=task.state,
+                    # The spec is rewritten here, not only at graph time: a
+                    # re-authored verify command changes it mid-task, and a
+                    # resumed run must read back the exam it actually ran.
+                    spec_json=task.spec.model_dump_json(),
                     revisions=task.revisions,
                     replans=task.replans,
                     last_feedback=task.last_feedback,
                     session_id=task.session_id,
                     verify_fingerprints=json.dumps(task.verify_fingerprints),
                     verify_suspect=int(task.verify_suspect),
+                    verify_reauthors=task.verify_reauthors,
                     output_json=(
                         task.output.model_dump_json() if task.output is not None else None
                     ),
@@ -874,6 +884,7 @@ class StateStore:
             session_id=row.session_id,
             verify_fingerprints=json.loads(row.verify_fingerprints or "[]"),
             verify_suspect=bool(row.verify_suspect),
+            verify_reauthors=row.verify_reauthors,
             output=(TaskOutput.model_validate_json(row.output_json) if row.output_json else None),
         )
 
