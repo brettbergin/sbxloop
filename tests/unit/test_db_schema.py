@@ -13,10 +13,10 @@ from pathlib import Path
 
 import pytest
 
-from sbxloop.daemon.store import DaemonStore
+from sbxloop.daemon.store import apply_daemon_schema
 from sbxloop.db import current_revision, ensure_schema, head_revision, open_engine
 from sbxloop.db.session import BUSY_TIMEOUT_MS
-from sbxloop.engine.store import StateStore
+from sbxloop.engine.store import StateStore, apply_engine_schema
 from tests.fakes import legacy_db
 
 
@@ -42,9 +42,20 @@ def _dirs(tmp_path: Path) -> tuple[Path, Path]:
 
 
 def _via_stores(path: Path) -> None:
-    """Open the file the way the code did before #539."""
-    StateStore(path).close()
-    DaemonStore(path).close()
+    """Bring the file up the way a released version did, with no Alembic.
+
+    The stores themselves migrate through Alembic now, so opening one would
+    compare the new path against itself. These are the functions a previous
+    release ran on open, called against a bare connection exactly as it
+    called them — which is what a database in the field was built by.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        apply_engine_schema(conn)
+        apply_daemon_schema(conn)
+    finally:
+        conn.close()
 
 
 def _via_alembic(path: Path) -> None:
@@ -96,7 +107,7 @@ class TestBaselineMatchesTheStores:
         finally:
             store.close()
 
-    def test_alembic_stamps_a_database_the_stores_created(self, tmp_path: Path) -> None:
+    def test_alembic_stamps_a_database_a_release_created(self, tmp_path: Path) -> None:
         """An installation upgraded in place is stamped, not rebuilt."""
         path = tmp_path / "state.db"
         _via_stores(path)

@@ -9,11 +9,12 @@ screens only ever see the frozen snapshots built here.
 from __future__ import annotations
 
 import json
-import sqlite3
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
+
+from sqlalchemy import RowMapping
 
 from sbxloop.config import TUI_CONTROL_CHANNEL
 from sbxloop.daemon.control import CommandReply
@@ -165,7 +166,7 @@ def build_items(mailbox: MailboxClient, *, retry_backoff_s: float) -> ItemsSnaps
 class RunDetail:
     record: RunRecord
     tasks: tuple[TaskRecord, ...]
-    phases: tuple[sqlite3.Row, ...]
+    phases: tuple[RowMapping, ...]
     item: WorkItem | None
     gate: MergeGate | None
     hold: ReviewHold | None

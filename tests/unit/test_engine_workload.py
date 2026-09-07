@@ -30,6 +30,7 @@ from sbxloop.errors import WorkerError
 from sbxloop.events import HostEventTypes
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import FakeGithub
+from tests.fakes.rawdb import exec_raw
 from tests.unit.test_engine import BUILD, FILES_BUILD, Harness, task, taskgraph
 
 WORKLOAD_STATES = ["provisioning", "planning", "executing", "judging", "publishing", "completed"]
@@ -1477,11 +1478,11 @@ class TestSinks:
         assert len(fake.issues_created) == 1
         # Park the run as if it had died after the issue, before the chat.
         engine.store.set_run_state(result.run_id, "publishing")
-        engine.store._conn.execute(
+        exec_raw(
+            engine.store,
             "UPDATE runs SET published = ? WHERE run_id = ?",
             (json.dumps([result.published[0].model_dump(mode="json")]), result.run_id),
         )
-        engine.store._conn.commit()
         harness.events.clear()
         harness.script([])
         resumed = harness.engine(
@@ -1564,15 +1565,16 @@ class TestSinks:
         (t1,) = engine.store.get_tasks(result.run_id)
         assert t1.output is not None
         row = {**t1.output.model_dump(mode="json"), "files": ["../escape"]}
-        engine.store._conn.execute(
+        exec_raw(
+            engine.store,
             "UPDATE tasks SET output_json = ? WHERE run_id = ? AND task_id = ?",
             (json.dumps(row), result.run_id, "t1"),
         )
-        engine.store._conn.execute(
+        exec_raw(
+            engine.store,
             "UPDATE runs SET published = '[]', state = 'publishing' WHERE run_id = ?",
             (result.run_id,),
         )
-        engine.store._conn.commit()
         harness.script([])
         resumed = harness.engine(**{**profiled, "workloads": [PUBLISHING]}).resume(result.run_id)
         assert resumed.state == "failed"
