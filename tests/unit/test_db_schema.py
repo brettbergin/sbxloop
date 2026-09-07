@@ -13,9 +13,11 @@ from pathlib import Path
 
 import pytest
 from alembic import command
+from alembic.autogenerate import compare_metadata
+from alembic.runtime.migration import MigrationContext
 
 from sbxloop.daemon.store import DaemonStore, apply_daemon_schema
-from sbxloop.db import current_revision, ensure_schema, open_engine
+from sbxloop.db import Base, current_revision, ensure_schema, head_revision, open_engine
 from sbxloop.db.schema import _config
 from sbxloop.db.session import BUSY_TIMEOUT_MS
 from sbxloop.engine.store import StateStore, apply_engine_schema
@@ -416,3 +418,127 @@ class TestAnInstallationUpgradesInPlace:
             assert [r["anchor"] for r in spent] == ["lint"]
         finally:
             conn.close()
+
+
+class TestTheBaselineIsFrozen:
+    """Revision 0001 is a released artefact, not a live schema definition.
+
+    Its body is the pre-ORM migrators, and every deployed database is
+    already stamped at it, so Alembic will never run it against one again.
+    A column added to it after it shipped therefore reaches a fresh install
+    and nothing else — which is exactly how `tasks.verify_reauthors` came to
+    be missing in the field while being mapped on the ORM model, and how the
+    daemon came to crash-loop on `no such column` (#864, fixed by 0004).
+
+    These two tests close that hole from both ends: the baseline may not
+    move, and head must arrive at the models.
+    """
+
+    FIXTURE = Path(__file__).parent.parent / "fakes" / "baseline_0001.sql"
+
+    @staticmethod
+    def _objects(conn: sqlite3.Connection) -> dict[str, str]:
+        """Every schema object, normalised the way the fixture is written.
+
+        `sqlite_sequence` is SQLite's own bookkeeping for AUTOINCREMENT and
+        `alembic_version` is the stamp itself; neither is ours to freeze.
+        """
+        rows = conn.execute(
+            "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL"
+            " AND name NOT IN ('alembic_version', 'sqlite_sequence')"
+        ).fetchall()
+        return {name: " ".join(sql.split()) for name, sql in rows}
+
+    @classmethod
+    def _frozen(cls) -> dict[str, str]:
+        """The fixture, read back as the same mapping `_objects` returns.
+
+        Each object is written as a `-- <name>` line and then its statement,
+        so the file stays readable as SQL and diffs one object at a time.
+        """
+        objects: dict[str, str] = {}
+        name: str | None = None
+        for line in cls.FIXTURE.read_text().splitlines():
+            # A name line is a comment holding exactly one token; the
+            # file's prose header is comments too, and is multi-word.
+            if line.startswith("-- ") and len(line[3:].split()) == 1:
+                name = line[3:].strip()
+            elif line.strip() and not line.startswith("--"):
+                assert name is not None, f"statement with no name: {line}"
+                objects[name] = line.rstrip(";")
+                name = None
+        return objects
+
+    def test_the_migrators_still_produce_the_shape_0001_shipped(self, tmp_path: Path) -> None:
+        """If this fails, your schema change belongs in a new revision.
+
+        Do not regenerate the fixture to make it pass: the fixture is what
+        every installation in the field was built by, and moving it only
+        hides the drift from the one path that matters.
+        """
+        path = tmp_path / "state.db"
+        _via_stores(path)
+        conn = sqlite3.connect(path)
+        try:
+            assert self._objects(conn) == self._frozen()
+        finally:
+            conn.close()
+
+    def test_a_database_stamped_at_the_baseline_reaches_the_models(self, tmp_path: Path) -> None:
+        """The production upgrade path, which no other test here walks.
+
+        A deployed installation is *already* stamped at 0001, so it is built
+        by the migrators and then stamped **without running them again** —
+        which is the state a release leaves behind, and the state in which
+        an edit to 0001 is silently inert. Whatever the ORM maps has to be
+        there at the end of the upgrade, so every column added since 0001
+        needs a revision of its own to carry it.
+
+        The shape it starts from is the one
+        `test_the_migrators_still_produce_the_shape_0001_shipped` pins to
+        `baseline_0001.sql`, so this walks the released baseline even though
+        it calls today's migrators to lay it down.
+        """
+        path = tmp_path / "state.db"
+        _via_stores(path)
+
+        engine = open_engine(path)
+        try:
+            with engine.connect() as conn_:
+                command.stamp(_config(conn_), "0001")
+            assert current_revision(engine) == "0001"
+            ensure_schema(engine)
+            assert current_revision(engine) == head_revision()
+            with engine.connect() as conn_:
+                drift = compare_metadata(MigrationContext.configure(conn_), Base.metadata)
+            assert drift == [], f"head does not match the models: {drift}"
+        finally:
+            engine.dispose()
+
+    def test_a_hand_patched_database_still_upgrades(self, tmp_path: Path) -> None:
+        """Recovering by hand must not cost the installation its next upgrade.
+
+        The only way to get a crash-looping daemon back up before 0004
+        existed was to run the shipped `ALTER` against the file directly, so
+        that is the shape some databases are in. 0004 has to absorb it:
+        SQLite raises on a duplicate column rather than ignoring it.
+        """
+        path = tmp_path / "state.db"
+        _via_stores(path)
+        conn = sqlite3.connect(path)
+        try:
+            conn.execute("ALTER TABLE tasks ADD COLUMN verify_reauthors INTEGER NOT NULL DEFAULT 0")
+            conn.commit()
+        finally:
+            conn.close()
+
+        engine = open_engine(path)
+        try:
+            with engine.connect() as conn_:
+                command.stamp(_config(conn_), "0001")
+            ensure_schema(engine)
+            assert current_revision(engine) == head_revision()
+            with engine.connect() as conn_:
+                assert compare_metadata(MigrationContext.configure(conn_), Base.metadata) == []
+        finally:
+            engine.dispose()

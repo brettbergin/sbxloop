@@ -175,6 +175,16 @@ _RUN_WATCHES_BODY = (
 )
 _RUN_WATCHES_COLUMNS = "run_id, watcher_id, created_at"
 
+# FROZEN. This schema, the table bodies above it and the ALTERs in
+# `apply_daemon_schema` are the daemon half of Alembic revision 0001, and
+# 0001 has shipped: every deployed database is already stamped at it, so
+# Alembic will never run this code against one again. A column added here
+# now reaches a fresh install and nothing else, and the field crashes on
+# the first query that selects it.
+#
+# To change the schema, add a revision under db/migrations/versions instead.
+# `tests/unit/test_db_schema.py` freezes the shape this produces and will
+# fail if it moves.
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS daemon_work_items {_WORK_ITEMS_BODY};
 CREATE INDEX IF NOT EXISTS idx_daemon_items_state ON daemon_work_items(state, created_at);

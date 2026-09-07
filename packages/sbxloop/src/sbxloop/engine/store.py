@@ -184,6 +184,15 @@ class TaskTotalsRecord(NamedTuple):
     suspect: int
 
 
+# FROZEN. Everything below is the body of Alembic revision 0001, and 0001
+# has shipped: every deployed database is already stamped at it, so Alembic
+# will never run this code against one again. A column added here now
+# reaches a fresh install and nothing else, and the field crashes on the
+# first query that selects it.
+#
+# To change the schema, add a revision under db/migrations/versions instead.
+# `tests/unit/test_db_schema.py` freezes the shape this produces and will
+# fail if it moves.
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS runs (
     run_id     TEXT PRIMARY KEY,
@@ -227,7 +236,6 @@ CREATE TABLE IF NOT EXISTS tasks (
     session_id TEXT,
     verify_fingerprints TEXT NOT NULL DEFAULT '[]',
     verify_suspect INTEGER NOT NULL DEFAULT 0,
-    verify_reauthors INTEGER NOT NULL DEFAULT 0,
     output_json TEXT,
     PRIMARY KEY (run_id, task_id)
 );
@@ -267,8 +275,9 @@ CREATE TABLE IF NOT EXISTS events (
 CREATE INDEX IF NOT EXISTS idx_events_run ON events (run_id, seq);
 """
 
-# Columns added after 0.2.0; applied idempotently per table so existing
-# state databases upgrade in place on open.
+# Columns added after 0.2.0 and before revision 0001; applied idempotently
+# per table so a pre-0001 state database upgrades in place on open. FROZEN
+# for the same reason as _SCHEMA above — a new column goes in a revision.
 _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
     "runs": (
         ("workspace", "ALTER TABLE runs ADD COLUMN workspace TEXT"),
@@ -333,10 +342,6 @@ _MIGRATIONS: dict[str, tuple[tuple[str, str], ...]] = {
         ),
         # A workload task's TaskOutput (#757); NULL for every code task.
         ("output_json", "ALTER TABLE tasks ADD COLUMN output_json TEXT"),
-        (
-            "verify_reauthors",
-            "ALTER TABLE tasks ADD COLUMN verify_reauthors INTEGER NOT NULL DEFAULT 0",
-        ),
     ),
 }
 

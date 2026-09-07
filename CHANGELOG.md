@@ -31,6 +31,22 @@
 
 ### Fixed
 
+- **The re-authoring counter now reaches databases that already exist.**
+  `tasks.verify_reauthors` was added to the body of Alembic revision 0001
+  rather than to a revision of its own. 0001 had already shipped, and
+  Alembic does not re-run a revision a database is stamped at - so the
+  column reached a fresh install and nothing else. The daemon crash-looped
+  on the first `select(Task)` after upgrading (`no such column: tasks.verify_reauthors`), taking the run it was serving down with it, on
+  the very feature meant to rescue such runs.
+
+  Revision 0004 carries the column, and adds it only if it is absent, so an
+  installation recovered by hand with the shipped `ALTER` still upgrades.
+
+  The baseline is now frozen against `tests/fakes/baseline_0001.sql`, and a
+  database stamped at 0001 - the state every deployed installation is in -
+  is migrated to head and compared against the ORM models. Between them, a
+  schema change that skips a revision fails the suite instead of the field.
+
 - **`pkill` in a verify command is now rejected at plan time.** A check that
   starts a server to probe it has to stop it again, and `pkill -f <pattern>`
   is the obvious way to write that — but the pattern is matched against
