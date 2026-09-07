@@ -7,6 +7,7 @@ StateStore run on a tmp db so persistence paths are exercised for real.
 from __future__ import annotations
 
 import shutil
+import sqlite3
 import threading
 import time
 from datetime import UTC, datetime
@@ -1315,6 +1316,31 @@ class TestSourceBackoff:
         result = h.loop.tick()  # recovers and dispatches
         assert polls == 4 and result.dispatched == "gh:issue:1"
         assert h.loop._source_failures == 0
+
+    def test_one_unrecordable_item_does_not_take_the_daemon_down(self, tmp_path: Path) -> None:
+        """A poll that raises is backed off, but recording an item used to
+        have no guard at all: the exception left ``upsert_new``, went
+        through ``tick()`` and ``run_forever()`` and killed the process.
+        Discovery is deterministic, so the next start died on the same item
+        — on db that was six restarts before systemd gave up (2026-09-07).
+        The bad item is skipped and its healthy neighbours still queue."""
+        h = Harness(tmp_path)
+        poisoned, healthy = gh_item("1"), gh_item("2")
+
+        real = h.dstore.upsert_new
+
+        def explode(item: WorkItem, now: float) -> bool:
+            if item.item_id == poisoned.item_id:
+                raise sqlite3.IntegrityError("UNIQUE constraint failed")
+            return real(item, now)
+
+        h.dstore.upsert_new = explode  # type: ignore[method-assign]
+        h.loop.source = FakeSource([poisoned, healthy])
+
+        result = h.loop.tick()
+
+        assert result.dispatched == "gh:issue:2"
+        assert h.dstore.get("gh:issue:1") is None
 
     def test_recover_failed_run_takes_failure_path(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
