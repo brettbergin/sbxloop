@@ -969,6 +969,18 @@ running item's pinned run so its next dispatch starts over (attempts and
 backoff kept). The same controls are `!sbx items|abandon|retry|requeue` on
 Discord.
 
+The pending queue has a persistent order. `sbxloop daemon ctl queue` (or
+`!sbx queue`) shows numbered positions, with interrupted runs awaiting
+resume first. To move pending work, use
+`sbxloop daemon ctl move <item> before <other-item>` or
+`sbxloop daemon ctl move <item> after <other-item>`; the same commands work
+through chat. Both items must still be queued and unclaimed, with no pinned
+run or claim in progress. Moves survive a restart and name the requester
+in the chronology. They do not reset retry backoff or interrupt the active
+run; an item whose backoff has not elapsed remains ineligible. New items
+join the end with an increasing admission sequence. Displayed positions
+change when work moves or leaves the queue; work item identities stay fixed.
+
 `<item>` is a work item id. GitHub items are **typed** —
 `gh:issue:<number>` for the issue a run was claimed from, `gh:pr:<number>`
 for a pull request referenced as a work-item resource — and the untyped

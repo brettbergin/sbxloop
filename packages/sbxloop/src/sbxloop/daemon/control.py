@@ -49,6 +49,7 @@ COMMANDS: tuple[str, ...] = (
     "resume [<item|run>|--hold NAME|--all]",
     "cancel [--retry]",
     "queue",
+    "move <item> before|after <item>",
     "items",
     "abandon <item> [reason]",
     "retry <item>",
@@ -498,6 +499,22 @@ def _dispatch(
         )
     if word == "queue":
         return CommandReply(queue_lines(loop.dstore.queued()))
+    if word == "move":
+        if len(args) != 3 or args[1].lower() not in ("before", "after"):
+            return CommandReply("usage: move <item> before|after <item>", ok=False)
+        item_id, relation, anchor = args
+        try:
+            moved = loop.move_queued_item(
+                item_id,
+                before=anchor if relation.lower() == "before" else None,
+                after=anchor if relation.lower() == "after" else None,
+                by=by,
+            )
+        except (ValueError, KeyError) as exc:
+            return CommandReply(f"move failed: {exc.args[0] if exc.args else exc}", ok=False)
+        return CommandReply(
+            f"moved {code(moved.item_id)} {relation.lower()} {code(normalize_item_id(anchor))}."
+        )
     if word == "items":
         return CommandReply(items_lines(loop.dstore.items()))
     if word == "grant-rounds":

@@ -54,6 +54,7 @@ class WorkItemRow(Base):
         # The key that actually guards correctness; see the module docstring.
         UniqueConstraint("source_key", "repo"),
         Index("idx_daemon_items_state", "state", "created_at"),
+        Index("idx_daemon_items_enqueue_seq", "enqueue_seq", unique=True),
     )
 
     item_id: Mapped[str] = mapped_column(Text, primary_key=True, nullable=True)
@@ -85,6 +86,11 @@ class WorkItemRow(Base):
     prior_pr_number: Mapped[int | None] = mapped_column(Integer)
     run_kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="'code'")
     profile: Mapped[str | None] = mapped_column(Text)
+    # Nullable so a rollback to the previous release can still insert.
+    # The current store assigns these atomically and fills rollback rows
+    # when it opens. Sequence is immutable; order may be edited.
+    enqueue_seq: Mapped[int | None] = mapped_column(Integer)
+    queue_order: Mapped[int | None] = mapped_column(Integer)
 
 
 class DaemonRunRow(Base):

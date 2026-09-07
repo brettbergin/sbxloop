@@ -1446,6 +1446,16 @@ spent are `blocked` for the same reason: nothing another round would change.
 
 ## The daemon
 
+Queue order is explicit and durable. `WorkItem.enqueue_seq` is an increasing
+admission sequence allocated under the store's write transaction;
+`queue_order` records editable position. Existing rows migrate in their
+previous FIFO order (`created_at`, then rowid). `queued_in_order`, queue
+display, and selection share the ordering rule: pinned resumes first, then
+queue order. Retry eligibility still decides whether a candidate can run.
+The shared `move <item> before|after <item>` control moves only unclaimed,
+unpinned queued items, preserves retry timestamps, and narrates the caller
+and relative placement. It performs no source mutation.
+
 `sbxloop daemon` is deliberately small: it claims issues carrying
 `sbxloop:run` in **every configured, enabled repository** (a label swap plus
 a claim comment as the optimistic lock — carrying host, pid and start time so a
