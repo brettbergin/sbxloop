@@ -110,6 +110,29 @@ sbxloop logs <run>              # the persisted event stream
 sbxloop artifacts <run> --tree  # what the run produced
 ```
 
+To update the home installed by `sbxloop init`:
+
+```bash
+sbxloop update --check    # show installed and latest versions from PyPI
+sbxloop update --dry-run  # also show the installation command
+sbxloop update           # install a newer release, if available
+```
+
+`update` uses the home's `uv` to install sbxloop and its worker at the same
+version, keeps the chat extras and any installed host Copilot SDK, and
+verifies both packages before recording the new version in `home.json`.
+It leaves an equal or newer installed version alone. A failed lookup or
+installation exits nonzero; a failed installation is not automatically
+rolled back. Config, secrets, runs and services are left in place. Restart
+any running daemon when idle to load the new version, then run
+`sbxloop doctor` (and re-bake if it reports a stale template).
+
+`--check` works from other installation types too. Automatic updates require
+the running installation to belong to the selected `SBXLOOP_HOME`; checkouts,
+pipx, `uv tool` and externally managed installations should use their own
+installer, or `sbxloop init` to create a home. This explicit command checks
+PyPI even when the daemon's background `version_check` is disabled.
+
 `run` works on a checkout, and says which one before anything is
 provisioned: `--workspace PATH`, else the checkout the config names
 (`[sandbox] workspace` or a `[[github.repos]]` entry), else the git checkout
@@ -496,6 +519,7 @@ daemon may run on schedules alone. `!sbx schedules` (or `sbxloop daemon ctl sche
 | `sbxloop artifacts RUN`                         | List a run's harvested files. `--tree` renders a tree; `--path` prints just the directory (for scripting).                                                                                                                                                                                                                                                                                                             |
 | `sbxloop shell RUN`                             | Interactive shell in a run's sandbox. `--role agent\|github` picks the pair member; `-c CMD` runs one command.                                                                                                                                                                                                                                                                                                         |
 | `sbxloop init`                                  | Build (or repair) the home: tree, launchers, `uv` + CPython + the venv, Docker's `sbx`, `config/sbxloop.toml` and a 0600 `config/secrets.env` written once; `--systemd` renders and enables the units; `--migrate [--purge]` moves a pre-home installation in first; `--dry-run` prints the plan; `--project` writes a repository's own `sbxloop.toml` into the current directory (`--preset large-repo`, `--stdout`). |
+| `sbxloop update`                                | Check PyPI and install a newer sbxloop release into the running home's venv, with its worker pinned to the same version; `--check` only compares versions; `--dry-run` shows the installation command. Restart a running daemon when idle afterwards.                                                                                                                                                                  |
 | `sbxloop backup [list\|restore\|prune]`         | Snapshot the home's config, secrets, units and `state.db` into `backups/<stamp>/`; list, restore or prune the snapshots (the daily sweep keeps `[daemon] backups_keep`).                                                                                                                                                                                                                                               |
 | `sbxloop init-repo OWNER/NAME`                  | Create the labels the loop relies on in a repository — the seven lifecycle labels (with that repository's renames applied) and the follow-up label, each colored and described. Idempotent; boots one github-ops sandbox; exits 1 when the token cannot write labels.                                                                                                                                                  |
 | `sbxloop bake`                                  | Bake a sandbox template with the worker preinstalled (`--ref`, `--from`, `--keep`).                                                                                                                                                                                                                                                                                                                                    |
