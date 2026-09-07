@@ -9,26 +9,79 @@ shape to exist.
 
 from __future__ import annotations
 
+import re
 import time
 from itertools import pairwise
 from pathlib import Path
 
+import pytest
+
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.paths import SbxloopHome
-from sbxloop.tui.screens.overview import hm
+from sbxloop.tui.screens.overview import OverviewScreen, hm
+from sbxloop.tui.widgets.band import BAD_COLOUR, IDLE_COLOUR, OK_COLOUR, Band, Segment
 from sbxloop.tui.widgets.chart import (
     MIN_POINTS,
     Chart,
     bars,
     enough,
     histogram,
+    proportion,
+    rgb,
     scatter,
+    stacked,
     whole_ticks,
 )
 from tests.unit.tui.conftest import drive, make_app
 from tests.unit.tui.test_tui_overview import page_text
 
 from .test_tui_charts_seed import seed_many
+
+
+def painted(chart: Chart, width: int = 60, height: int = 10) -> list[str]:
+    """The distinct 24-bit colours a chart actually paints."""
+    chart.plt.plotsize(width, height)
+    return sorted(set(re.findall(r"38;2;[0-9;]+", chart.plt.build())))
+
+
+def ansi(colour: str) -> str:
+    red, green, blue = rgb(colour)
+    return f"38;2;{red};{green};{blue}"
+
+
+def test_a_hex_band_colour_becomes_a_triple_plotext_understands() -> None:
+    assert rgb("#22C55E") == (34, 197, 94)
+    assert rgb("22C55E") == (34, 197, 94), "the hash is optional"
+    for bad in ("#FFF", "", "#GGGGGG"):
+        with pytest.raises(ValueError):
+            rgb(bad)
+
+
+def test_a_chart_paints_the_band_palette_and_not_plotext_s_fallback() -> None:
+    """Plotext does not raise on a colour it cannot read — `color="#22C55E"`
+    and `color="not-a-colour"` both draw in its default. Handing it the hex
+    straight made every series the same blue while looking correct in the
+    source, so the palette has to be asserted on the painted output."""
+    assert painted(bars(["a", "b"], [3.0, 9.0], OK_COLOUR)) == [ansi(OK_COLOUR)]
+    assert painted(histogram([float(n) for n in range(20)], 6, BAD_COLOUR)) == [ansi(BAD_COLOUR)]
+    assert painted(scatter([1.0, 2.0], [3.0, 7.0], IDLE_COLOUR)) == [ansi(IDLE_COLOUR)]
+
+
+def test_a_stack_keeps_its_segments_apart() -> None:
+    """A stacked bar whose parts share a colour says nothing at all."""
+    drawn = proportion([("landed", 32.0, OK_COLOUR), ("failed", 8.0, BAD_COLOUR)])
+    assert painted(drawn) == sorted({ansi(OK_COLOUR), ansi(BAD_COLOUR)})
+    assert drawn.caption == "landed 32, failed 8"
+    week = stacked(
+        ["Mon", "Tue"],
+        [
+            ("landed", [4.0, 6.0], OK_COLOUR),
+            ("failed", [1.0, 0.0], BAD_COLOUR),
+            ("cancelled", [0.0, 1.0], IDLE_COLOUR),
+        ],
+    )
+    assert painted(week) == sorted({ansi(OK_COLOUR), ansi(BAD_COLOUR), ansi(IDLE_COLOUR)})
+    assert week.caption == "2 buckets, landed, failed, cancelled"
 
 
 def test_a_count_axis_is_ruled_in_whole_things() -> None:
@@ -143,6 +196,39 @@ def test_spread_falls_back_to_the_sentence_on_thin_data(tmp_path: Path) -> None:
     drive(scenario)
 
 
+def test_summary_draws_every_proportion_and_the_week(seeded: SbxloopHome) -> None:
+    """Summary's shares and its trend are all plots now. The headings and
+    the keys stay: a plot the reader cannot name is not an improvement."""
+    seed_many(seeded, count=40)
+
+    async def scenario() -> None:
+        app = make_app(seeded)
+        async with app.run_test(size=(140, 80)) as pilot:
+            await pilot.pause(2.0)
+            text = page_text(app)
+            assert "runs this week" in text, "the page still opens in prose"
+            for heading in ("outcome", "time", "phases", "day by day, by outcome"):
+                assert heading in text, f"{heading} lost its heading"
+            assert "landed" in text and "parked" in text, "the keys survived"
+            # outcome, time, phases, and the week.
+            assert len(app.screen.query(Chart)) == 4
+
+    drive(scenario)
+
+
+def test_a_share_of_nothing_stays_a_band() -> None:
+    """An all-zero split has no proportion to draw — plotext would rule an
+    axis across an empty frame and spend seven rows saying nothing — so
+    that row falls back to the band, which draws an empty track in one."""
+    screen = OverviewScreen()
+    empty = screen._plotted("phases", "0s", [Segment("build", 0.0, OK_COLOUR)])
+    assert not any(isinstance(w, Chart) for w in empty), "drew a plot of nothing"
+    assert len(empty) == 1, "the fallback is the one-row band, not a stack of panels"
+
+    real = screen._plotted("outcome", "80% ok", [Segment("landed", 4.0, OK_COLOUR)])
+    assert any(isinstance(w, Chart) for w in real), "a real share was not plotted"
+
+
 def test_cost_plots_the_trend_against_a_scale(seeded: SbxloopHome) -> None:
     """The sparkline this replaced drew the shape but named no value on
     it, so a quiet week and a heavy one looked identical."""
@@ -155,9 +241,30 @@ def test_cost_plots_the_trend_against_a_scale(seeded: SbxloopHome) -> None:
             await pilot.press("c")
             await pilot.pause(0.5)
             assert "buckets, peak" in page_text(app)
+            # The trend, the phase split, and the costliest runs.
             charts = app.screen.query(Chart)
-            assert len(charts) == 1
+            assert len(charts) == 3
             built = charts.first().plt.build()
             assert time.strftime("%a", time.localtime()) in built, "the days are named"
+
+
+def test_every_page_draws_rather_than_paints_a_row(seeded: SbxloopHome) -> None:
+    """No page still reports a share as a one-row band. A band paints with
+    background colour and no glyph, which on a low-contrast terminal is a
+    stripe you have to hunt for and carries no scale to read."""
+    seed_many(seeded, count=40)
+
+    async def scenario() -> None:
+        app = make_app(seeded)
+        async with app.run_test(size=(140, 90)) as pilot:
+            await pilot.pause(2.0)
+            for key, least in (("s", 4), ("f", 2), ("c", 3), ("t", 3), ("h", 1), ("d", 3)):
+                await pilot.press(key)
+                await pilot.pause(0.4)
+                drawn = len(app.screen.query(Chart))
+                assert drawn >= least, f"page {key} drew {drawn} charts, wanted {least}"
+                assert not app.screen.query(Band), f"page {key} still paints a band"
+
+    drive(scenario)
 
     drive(scenario)

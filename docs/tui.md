@@ -102,33 +102,40 @@ draws a bar. The pages take **letters** — the digits belong to the console's
 rail — and `o` opens the window's costliest run.
 
 - **Summary** (`s`) — the week in a sentence, then outcome, elapsed split
-  into active/parked, and where the working time went, as proportion; then
-  the change against the week before, a day-by-day strip split by outcome,
-  and one "biggest lever" line naming whichever cost is furthest out of
-  proportion.
+  into active/parked, and where the working time went — each a horizontal
+  stacked plot against a value axis, so a share can be read off as a
+  quantity (`23h 51m`) and not only as a proportion. Then the change
+  against the week before, the week itself as one stacked plot with a day
+  per bucket, and one "biggest lever" line naming whichever cost is
+  furthest out of proportion. A split that is all zero has no proportion
+  to draw, so that row falls back to the one-row band.
 - **Flow** (`f`) — runs per day by outcome, each kind's rates with its own
   turns, active and parked per run, and **how long work took to land** end
   to end (median and p90, slowest named). Code and workload runs differ by
-  an order of magnitude, so they are never blended.
+  an order of magnitude, so they are never blended. Runs per day is one
+  stacked plot with a day per bucket.
 - **Cost** (`c`) — turns lead, because every turn re-sends the session
   context and spend tracks turns rather than jobs. **Which phase** burns
   them, not only how many, and **how much context each phase re-sends** —
   the cache-to-fresh ratio is a per-phase fact and the phases differ by an
-  order of magnitude. The costliest runs are named and ranked, with the
-  median and p90 beside them, so an outlier is visible instead of averaged
-  away. **Turns per day** is a plot with a labelled scale rather than a
-  sparkline: the sparkline drew the shape but named no value on it, so a
-  quiet week and a heavy one looked the same.
+  order of magnitude. The costliest runs are named and ranked against a
+  scale, with the median and p90 beside them, so an outlier is visible
+  instead of averaged away. **Turns per day** is a plot with a labelled
+  scale rather than a sparkline: the sparkline drew the shape but named no
+  value on it, so a quiet week and a heavy one looked the same.
 - **Time** (`t`) — **active** is what the loop did; **parked** is what it
   waited on a human for. These are wildly different: on this project's own
   host active time has run at about a sixth of elapsed, so reporting
   elapsed as "duration" says the loop is slow when the loop is fast and the
-  human is not. The runs that waited longest are named.
+  human is not. The runs that waited longest are ranked against a duration
+  axis, so `21h 35m` is readable off the plot and not only `68%`.
 - **Health** (`h`) — failures grouped by cause, so a common cause reads as
   one row rather than several one-offs; **where the loop went round again**
   (retries per phase — a phase that retries constantly is spending turns
   nobody asked for); the phase table; and the rework the week cost in task
-  revisions, replans and review/CI rounds.
+  revisions, replans and review/CI rounds. A ranked plot keeps the exact
+  counts on a line beneath it, because a bar approximates and a note like
+  `3 of 12` carries more than the bar can.
 - **Spread** (`d`) — how the week's runs are *distributed*, rather than what
   they totalled. Two histograms (turns per run, working time per run) and a
   scatter of turns against elapsed, one dot per run. Median and p90 say
@@ -140,12 +147,25 @@ rail — and `o` opens the window's costliest run.
 A **cancelled** run is a decision, not an outcome: it is counted and
 reported but kept out of the success rate's denominator.
 
-Most of the drawing is `sbxloop.tui.widgets.band` — one row, solid colour,
-no axis, and the right answer to every *what share* question here. The
-plots on Spread and the Cost trend are `sbxloop.tui.widgets.chart`
-(`textual-plotext`), for the *what shape* questions that need a scale;
-their axes are ruled in whole runs and read in the same `1h 20m` units as
-the rest of the screen, and they follow the console's theme.
+Every share, trend and ranking on Overview is a plot
+(`sbxloop.tui.widgets.chart`, over `textual-plotext`). Their axes are ruled
+in whole runs and read in the same `1h 20m` units as the rest of the
+screen, and they follow the console's theme.
+
+`sbxloop.tui.widgets.band` drew all of these as one-row bars until it was
+used in anger: a band paints with *background* colour and no glyph, so a
+single row is a thin stripe that is easy to miss on a low-contrast
+terminal, and it carries no scale — a full bar and a stub tell you the
+ranking and not one number. Band is still the right tool outside Overview,
+and is still the fallback for a split that is all zero, where a plot would
+rule an axis across an empty frame to say nothing.
+
+One trap worth knowing if you add a plot: **plotext does not raise on a
+colour it cannot read.** `color="#22C55E"` and `color="not-a-colour"` both
+draw in its default, so a `band.py` palette entry handed straight to
+plotext silently paints every series the same blue. Convert it with
+`chart.rgb` first; `tests/unit/tui/test_tui_charts.py` asserts on the
+painted output rather than on the argument for exactly this reason.
 
 The numbers are `sbxloop.tui.analytics`, folded from
 `StateStore.runs_between` / `phases_between` in one grouped pass each and

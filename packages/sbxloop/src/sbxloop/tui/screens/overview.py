@@ -46,7 +46,6 @@ from sbxloop.tui.widgets.band import (
     OK_COLOUR,
     PALETTE,
     PARKED_COLOUR,
-    TRACK_COLOUR,
     WAIT_COLOUR,
     Band,
     Segment,
@@ -284,26 +283,35 @@ class OverviewScreen(ConsoleScreen):
 
     @staticmethod
     def _ranked(
-        rows: list[tuple[str, float, str]], colour: str, *, wide: bool = False
+        rows: list[tuple[str, float, str]],
+        colour: str,
+        fmt: Callable[[float], str] | None = None,
+        *,
+        wide: bool = False,
     ) -> list[Any]:
-        """A short ranked list, each row a bar against the biggest.
+        """A short ranked list as bars against a scale, biggest at the top.
 
-        ``wide`` gives the label room for a sentence rather than an id: a
-        failure reason is prose, and reads as nothing clipped to the width
-        of a run id."""
+        The band version drew each row against the biggest, which shows the
+        ranking and hides the quantity: 400 turns and 12 turns were a full
+        bar and a stub, with no way to read either number off it.
+
+        ``wide`` keeps a prose label — a failure reason is a sentence and
+        reads as nothing clipped to the width of a run id — so those are
+        truncated further to fit the axis gutter rather than the label
+        column that no longer exists."""
         if not rows:
             return [TextPanel(Text("nothing to rank", style="dim"))]
-        peak = max(value for _label, value, _note in rows) or 1.0
-        label_class = "lab-wide" if wide else "lab"
-        return [
-            Horizontal(
-                TextPanel(f"{label} ", classes=label_class),
-                TextPanel(note, classes="val"),
-                Band([Segment("v", value, colour), Segment("rest", peak - value, TRACK_COLOUR)]),
-                classes="r",
-            )
-            for label, value, note in rows
-        ]
+        width = 26 if wide else 14
+        drawn = chart.ranked([(label[:width], value) for label, value, _note in rows], colour, fmt)
+        # The exact values, which a bar against an axis approximates and
+        # which some notes carry more of than the bar can ("3 of 12").
+        notes = Text()
+        for index, (label, _value, note) in enumerate(rows):
+            if index:
+                notes.append("  ·  ", style="dim")
+            notes.append(f"{label[:width]} ", style="dim")
+            notes.append(note)
+        return [drawn, TextPanel(notes, classes="cap")]
 
     @staticmethod
     def _delta(value: float | None, *, lower_is_better: bool = False) -> tuple[str, str]:
@@ -376,23 +384,27 @@ class OverviewScreen(ConsoleScreen):
                 (" waiting on you.", "dim"),
             ),
             TextPanel("", classes="gap"),
-            self._row(
+        ]
+        out.extend(
+            self._plotted(
                 "outcome", f"{rate:.0%} ok" if rate is not None else "—", self._outcome(total)
-            ),
-            TextPanel("", classes="gap"),
-            self._row(
+            )
+        )
+        out.append(TextPanel("", classes="gap"))
+        out.extend(
+            self._plotted(
                 "time",
                 hm(total.elapsed),
                 [
                     Segment("active", total.active, PALETTE[0]),
                     Segment("parked", total.parked, PARKED_COLOUR),
                 ],
-            ),
-            TextPanel("", classes="gap"),
-            self._row("phases", hm(data.active_seconds), phases),
-            TextPanel(legend(phases)),
-            TextPanel("", classes="gap"),
-        ]
+                hm,
+            )
+        )
+        out.append(TextPanel("", classes="gap"))
+        out.extend(self._plotted("phases", hm(data.active_seconds), phases, hm))
+        out.append(TextPanel("", classes="gap"))
         out.extend(
             self._compare(
                 data,
@@ -405,8 +417,8 @@ class OverviewScreen(ConsoleScreen):
             )
         )
         out.append(TextPanel("", classes="gap"))
-        out.append(TextPanel("day by day", classes="h"))
-        out.extend(self._days(data))
+        out.append(TextPanel("day by day, by outcome", classes="h"))
+        out.extend(self._day_chart(data))
         lever = self._lever(data)
         if lever is not None:
             out.append(TextPanel("", classes="gap"))
@@ -448,27 +460,21 @@ class OverviewScreen(ConsoleScreen):
         )
         return time.strftime(fmt, when)
 
-    def _days(self, data: Analytics) -> list[Any]:
-        """The trend as a stack: each bucket split by how its runs ended."""
-        peak = max((d.runs for d in data.days), default=0) or 1
-        out: list[Any] = []
-        for offset, day in enumerate(data.days):
-            label = self._bucket_label(data, offset, "%a %d")
-            segments = [
-                Segment("landed", day.landed, OK_COLOUR),
-                Segment("failed", day.failed, BAD_COLOUR),
-                Segment("cancelled", day.cancelled, IDLE_COLOUR),
-                Segment("rest", peak - day.runs, TRACK_COLOUR),
-            ]
-            out.append(
-                Horizontal(
-                    TextPanel(label, classes="lab"),
-                    TextPanel(f"{day.runs or '—'}", classes="val"),
-                    Band(segments),
-                    classes="r",
-                )
-            )
-        return out
+    def _day_chart(self, data: Analytics) -> list[Any]:
+        """The week as one stacked plot rather than a bar per day."""
+        labels = [self._bucket_label(data, i, "%a") for i in range(len(data.days))]
+        if not labels:
+            return [TextPanel(Text("no days in the window", style="dim"))]
+        series = [
+            ("landed", [float(d.landed) for d in data.days], OK_COLOUR),
+            ("failed", [float(d.failed) for d in data.days], BAD_COLOUR),
+            ("cancelled", [float(d.cancelled) for d in data.days], IDLE_COLOUR),
+        ]
+        drawn = chart.stacked(labels, series)
+        # The week's totals as the key — the same swatch-name-share line a
+        # band carries, so the two kinds of stack read the same way.
+        key = legend([Segment(name, sum(values), colour) for name, values, colour in series])
+        return [drawn, TextPanel(key, classes="cap")]
 
     def _flow(self, data: Analytics) -> list[Any]:
         out: list[Any] = [
@@ -481,7 +487,7 @@ class OverviewScreen(ConsoleScreen):
             TextPanel("", classes="gap"),
             TextPanel("runs per day, by outcome", classes="h"),
         ]
-        out.extend(self._days(data))
+        out.extend(self._day_chart(data))
         out.append(TextPanel("", classes="gap"))
         out.append(TextPanel("by kind", classes="h"))
         out.extend(
@@ -530,6 +536,7 @@ class OverviewScreen(ConsoleScreen):
                         for r in data.slowest_to_land[:6]
                     ],
                     PALETTE[3],
+                    hm,
                 )
             )
             out.append(TextPanel("", classes="gap"))
@@ -559,25 +566,11 @@ class OverviewScreen(ConsoleScreen):
         # where, and only the second one is actionable.
         by_turns = data.phase_turns
         if by_turns:
-            out.append(TextPanel("turns by phase", classes="h"))
-            out.append(
-                Band(
-                    [
-                        Segment(p.phase, float(p.turns), PALETTE[i % len(PALETTE)])
-                        for i, p in enumerate(by_turns[:6])
-                    ]
-                )
-            )
-            out.append(
-                TextPanel(
-                    legend(
-                        [
-                            Segment(p.phase, float(p.turns), PALETTE[i % len(PALETTE)])
-                            for i, p in enumerate(by_turns[:6])
-                        ]
-                    )
-                )
-            )
+            turn_split = [
+                Segment(p.phase, float(p.turns), PALETTE[i % len(PALETTE)])
+                for i, p in enumerate(by_turns[:6])
+            ]
+            out.extend(self._plotted("turns by phase", f"{total.turns:,}", turn_split))
             out.append(TextPanel("", classes="gap"))
             out.append(TextPanel("context re-sent per phase", classes="h"))
             out.extend(
@@ -604,7 +597,8 @@ class OverviewScreen(ConsoleScreen):
         out.append(TextPanel("costliest runs", classes="h"))
         out.extend(
             self._ranked(
-                [(r.run_id, float(r.turns), f"{r.turns} turns") for r in data.costliest], PALETTE[1]
+                [(r.run_id, float(r.turns), f"{r.turns} turns") for r in data.costliest],
+                PALETTE[1],
             )
         )
         out.append(TextPanel("", classes="gap"))
@@ -658,20 +652,22 @@ class OverviewScreen(ConsoleScreen):
                 (f" — {total.parked_share:.0%} of elapsed.", "dim"),
             ),
             TextPanel("", classes="gap"),
-            self._row(
+        ]
+        out.extend(
+            self._plotted(
                 "elapsed",
                 hm(total.elapsed),
                 [
                     Segment("active", total.active, PALETTE[0]),
                     Segment("parked", total.parked, PARKED_COLOUR),
                 ],
-            ),
-            TextPanel("", classes="gap"),
-            TextPanel("where the working time went", classes="h"),
-            Band(phases),
-            TextPanel(legend(phases)),
-            TextPanel("", classes="gap"),
-        ]
+                hm,
+            )
+        )
+        out.append(TextPanel("", classes="gap"))
+        out.append(TextPanel("where the working time went", classes="h"))
+        out.extend(self._plotted("phases", hm(data.active_seconds), phases, hm))
+        out.append(TextPanel("", classes="gap"))
         if data.phases:
             out.extend(
                 self._cols(
@@ -697,7 +693,9 @@ class OverviewScreen(ConsoleScreen):
         out.append(TextPanel("longest parked", classes="h"))
         out.extend(
             self._ranked(
-                [(r.run_id, r.parked, hm(r.parked)) for r in data.longest_parked], WAIT_COLOUR
+                [(r.run_id, r.parked, hm(r.parked)) for r in data.longest_parked],
+                WAIT_COLOUR,
+                hm,
             )
         )
         out.append(TextPanel("", classes="gap"))
@@ -812,6 +810,28 @@ class OverviewScreen(ConsoleScreen):
             )
         )
         return out
+
+    def _plotted(
+        self,
+        label: str,
+        value: str,
+        segments: list[Segment],
+        fmt: Callable[[float], str] | None = None,
+    ) -> list[Any]:
+        """`_row`'s charted counterpart: the same heading and the same key,
+        with a scale between them instead of a single painted row."""
+        if not any(s.value > 0 for s in segments):
+            return [self._row(label, value, segments)]
+        drawn = chart.proportion([(s.label, s.value, s.colour) for s in segments], fmt)
+        return [
+            # `:<13` alone runs the two together when the label is longer
+            # than the field — "turns by phase" is fourteen characters.
+            TextPanel(
+                Text.assemble((f"{label:<13}", "dim"), (" ", ""), (value, "bold")),
+            ),
+            drawn,
+            TextPanel(legend(segments), classes="cap"),
+        ]
 
     @staticmethod
     def _captioned(drawn: chart.Chart) -> list[Any]:
