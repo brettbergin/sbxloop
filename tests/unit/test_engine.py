@@ -396,7 +396,7 @@ class TestHappyPath:
         rows = engine.store.phase_attempts(result.run_id)
         assert [row.phase for row in rows] == ["decompose", "build", "verify", "gate"]
         # A project that declares no gate records the skip, not a pass.
-        assert rows[-1]["status"] == "skipped"
+        assert rows[-1].status == "skipped"
 
     def test_phase_attempts_carry_usage(self, harness: Harness) -> None:
         """Every agent phase row bills its session's tokens and turns; the
@@ -406,10 +406,10 @@ class TestHappyPath:
         result = engine.start("bill phases")
         rows = {row.phase: row for row in engine.store.phase_attempts(result.run_id)}
         for phase in ("decompose", "build"):
-            assert rows[phase]["input_tokens"] is not None, phase
-            assert rows[phase]["turns"] == 1, phase
-        assert rows["verify"]["input_tokens"] is None
-        assert rows["verify"]["turns"] is None
+            assert rows[phase].input_tokens is not None, phase
+            assert rows[phase].turns == 1, phase
+        assert rows["verify"].input_tokens is None
+        assert rows["verify"].turns is None
 
 
 class TestReviseAndVerify:
@@ -1739,7 +1739,7 @@ class TestPipeline:
             if r.phase == "build" and r.task_id == "fix-1"
         ]
         assert rows
-        assert json.loads(rows[-1]["output_json"])["reconciled"] == [
+        assert json.loads(rows[-1].output_json or "{}")["reconciled"] == [
             {
                 "anchor": "hello.txt:1",
                 "status": "refuted",
@@ -1752,7 +1752,7 @@ class TestPipeline:
             for r in reopened.phase_attempts(result.run_id)
             if r.phase == "build" and r.task_id == "t1"
         ]
-        assert "reconciled" not in json.loads(t1[-1]["output_json"])
+        assert "reconciled" not in json.loads(t1[-1].output_json or "{}")
 
     def test_reconciliation_replies_and_resolves_before_the_next_review(
         self, harness: Harness
@@ -1815,7 +1815,7 @@ class TestPipeline:
         assert result.state == "merged"
 
         rows = [r for r in engine.store.phase_attempts(result.run_id) if r.phase == "review"]
-        first = json.loads(rows[0]["output_json"])
+        first = json.loads(rows[0].output_json or "{}")
         assert first["review"]["id"] is not None
         assert [p["anchor"] for p in first["posted"]] == ["hello.txt:1"]
 
@@ -1899,7 +1899,7 @@ class TestPipeline:
         # The review record is the comment's url, so the merge gate is satisfied.
         rows = [r for r in harness_rows(harness, result.run_id) if r.phase == "review"]
         assert all(json.loads(r.output_json)["review"]["url"].startswith("https://") for r in rows)
-        assert json.loads(rows[0]["output_json"])["review"]["event"] == "COMMENT"
+        assert json.loads(rows[0].output_json or "{}")["review"]["event"] == "COMMENT"
         assert fake.merges == [(7, "squash", "commit2")]
 
     def test_self_review_degrades_a_refused_anchor_per_finding(self, harness: Harness) -> None:
@@ -1914,7 +1914,7 @@ class TestPipeline:
             in (fake.issue_comments[0])
         )
         rows = [r for r in harness_rows(harness, result.run_id) if r.phase == "review"]
-        posted = json.loads(rows[0]["output_json"])["posted"]
+        posted = json.loads(rows[0].output_json or "{}")["posted"]
         assert posted[0]["anchor"] == "hello.txt:1" and posted[0]["comment_id"] is None
 
     def test_a_distinct_reviewer_identity_still_uses_the_review_feature(
@@ -3224,8 +3224,8 @@ class TestInteractiveChat:
         attempts = engine.store.phase_attempts(result.run_id)
         steer = [a for a in attempts if a.phase == "steer"]
         assert len(steer) == 1
-        assert steer[0]["status"] == "continue"
-        assert steer[0]["task_id"] == "t1"
+        assert steer[0].status == "continue"
+        assert steer[0].task_id == "t1"
 
     def test_steer_run_persists_standing_guidance(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t1")), self.STEER_RUN, *HAPPY_TASK])
