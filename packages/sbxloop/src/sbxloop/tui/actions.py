@@ -9,6 +9,8 @@ tiers and the read-only refusal live in exactly one place."""
 from __future__ import annotations
 
 import shlex
+import subprocess
+import sys
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -677,6 +679,29 @@ def save_config(deps: Deps, path: Path, text: str, *, key: str) -> Action:
     return Action(f"set {key} in {path.name}", run, confirm="none")
 
 
+def open_url(url: str) -> Action:
+    """Hand a URL to the desktop, and say what it was either way.
+
+    The console usually runs on the daemon host, which may have no browser
+    and no desktop at all — so a failure is not an error here: the outcome
+    carries the URL, which is what an operator on the other end of an ssh
+    session actually needs."""
+
+    def run() -> Outcome:
+        opener = "open" if sys.platform == "darwin" else "xdg-open"
+        try:
+            result = subprocess.run(  # nosec B603 - fixed opener, url is one argv element
+                [opener, url], capture_output=True, timeout=10, check=False
+            )
+        except (OSError, subprocess.SubprocessError):
+            return Outcome(True, f"no browser on this host — the pull request is\n{url}")
+        if result.returncode != 0:
+            return Outcome(True, f"no browser on this host — the pull request is\n{url}")
+        return Outcome(True, f"opened {url}")
+
+    return Action(f"open {url}", run, confirm="none", mutating=False)
+
+
 def clean_secret_registrations(deps: Deps, *, every: bool = False) -> Action:
     def run() -> Outcome:
         try:
@@ -747,6 +772,7 @@ __all__ = [
     "gc_run_dirs",
     "grant_rounds",
     "merge",
+    "open_url",
     "pause",
     "prune_sandboxes",
     "remove_one_sandbox",

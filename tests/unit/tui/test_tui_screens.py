@@ -90,8 +90,22 @@ def test_runs_screen_lists_filters_and_opens_a_run(seeded: SbxloopHome) -> None:
             await pilot.pause(0.5)
             table = app.screen.query_one("#runs", ConsoleTable)
             assert table.row_count == 3
-            row = table.get_row_at(table.get_row_index("r_failed"))
-            assert "orphaned" in str(row[1])
+            # The state cell is a word. Its reason is under the table, in
+            # full — inline and unclipped it sized the column and pushed
+            # every other one off the screen.
+            table.move_cursor(row=table.get_row_index("r_failed"))
+            await pilot.pause(0.3)
+            state = str(table.get_row_at(table.get_row_index("r_failed"))[1])
+            assert "failed" in state and "orphaned" not in state
+            detail = app.screen.query_one("#detail", TextPanel).content_text
+            assert "r_failed" in detail and "orphaned: daemon restarted" in detail
+            # The reason is still searchable even though it is off the row.
+            await pilot.press("slash")
+            await pilot.press(*"orphaned")
+            await pilot.pause(0.3)
+            assert table.row_count == 1
+            await pilot.press("escape")
+            await pilot.pause(0.3)
             await pilot.press("slash")
             await pilot.press(*"merged")
             await pilot.pause(0.3)
