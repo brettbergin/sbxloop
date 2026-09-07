@@ -45,6 +45,12 @@ def texts(dstore: DaemonStore, channel: str) -> list[str]:
     return [r.text for r in rows(dstore, channel) if r.direction == "out"]
 
 
+def reactions(dstore: DaemonStore, message_id: int) -> tuple[str, ...]:
+    """The reactions on one message, or none while it is still being written."""
+    row = dstore.local_message(message_id)
+    return tuple(row.reactions) if row is not None else ()
+
+
 def typed(dstore: DaemonStore, channel: str, text: str, **fields: Any) -> int:
     """What the console writes when an operator types."""
     return dstore.local_post(
@@ -178,8 +184,10 @@ class TestInbound:
             assert wait_for(lambda: any("two runs today" in s for s in texts(dstore, "control")))
             assert concierge.turns == [("what's running?", "TUI user `brett`")]
             assert concierge.author_ids == ["brett"] and concierge.vias == ["local"]
-            row = dstore.local_message(asked)
-            assert row is not None and "⏳" in row.reactions and "✅" in row.reactions
+            # `_concierge_turn` stamps ✅ *after* it sends the answer, so
+            # waiting on the reply text is not waiting on the reaction.
+            assert wait_for(lambda: "✅" in reactions(dstore, asked))
+            assert "⏳" in reactions(dstore, asked)
             assert any(s.startswith("🛠 concierge: sbx_control") for s in texts(dstore, "control"))
         finally:
             bridge.close(drain_wait_s=1)
@@ -225,9 +233,9 @@ class TestInbound:
             assert engine.posted == []
             steer = typed(dstore, thread, "@sbx focus on auth first")
             assert wait_for(lambda: engine.posted == ["focus on auth first"])
-            assert wait_for(lambda: "⏳" in (dstore.local_message(steer) or plain).reactions)  # type: ignore[union-attr]
+            assert wait_for(lambda: "⏳" in reactions(dstore, steer))
             bus.emit("chat.reply", "r1", message_id="m1", reply="Will do.", action="steer_task")
-            assert wait_for(lambda: "✅" in (dstore.local_message(steer) or plain).reactions)  # type: ignore[union-attr]
+            assert wait_for(lambda: "✅" in reactions(dstore, steer))
             assert wait_for(lambda: any("Will do." in s for s in texts(dstore, thread)))
         finally:
             bridge.close(drain_wait_s=1)

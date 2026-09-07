@@ -332,6 +332,24 @@ def drive(coro_fn: Callable[[], Coroutine[Any, Any, None]]) -> None:
     asyncio.run(coro_fn())
 
 
+async def until(pilot: Any, pred: Callable[[], bool], timeout: float = 10.0) -> bool:
+    """Pump the console until ``pred`` holds, rather than guessing a duration.
+
+    A screen fills itself in from a worker, so anything it reads from the
+    store lands some time after mount. `pilot.pause(<n>)` guesses how long
+    that takes, and the guess is made on an idle laptop — under a loaded
+    `-n auto` run the same wait can expire mid-refresh and the assertion
+    reads the placeholder. This waits for the thing itself and returns as
+    soon as it is there, so it is both steadier and quicker.
+    """
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if pred():
+            return True
+        await pilot.pause(0.05)
+    return pred()
+
+
 __all__ = [
     "FakeChild",
     "FakeCtl",
@@ -342,4 +360,5 @@ __all__ = [
     "drive",
     "live_status",
     "make_app",
+    "until",
 ]
