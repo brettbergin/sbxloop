@@ -756,23 +756,33 @@ class TestWriterSerialization:
     on a different thread from the engine) slipped through.
     """
 
-    def test_every_committing_method_holds_the_lock(self) -> None:
+    def test_the_session_helpers_take_the_lock(self) -> None:
+        """Both ways into a session hold it, so every caller is serialised."""
+        import inspect
+
+        from sbxloop.engine import store as store_module
+
+        for name in ("_write", "_read"):
+            body = inspect.getsource(getattr(store_module.StateStore, name))
+            assert "with self._lock" in body, f"{name} does not take the store's lock"
+
+    def test_no_method_opens_a_session_of_its_own(self) -> None:
+        """Every statement goes through `_write`, `_read` or `begin_immediate`.
+
+        Those are what hold the lock. A method that built its own
+        ``Session(self._engine)`` would run unserialised on the single
+        shared connection — which is the bug this class exists for, and the
+        shape ``reconcile_run`` once slipped through in.
+        """
         import inspect
         import re
 
         from sbxloop.engine import store as store_module
 
-        source = inspect.getsource(store_module).split("\n")
-        current, lock_at, unguarded = None, -1, []
-        for i, line in enumerate(source):
-            match = re.match(r"    def (\w+)", line)
-            if match:
-                current, lock_at = match.group(1), -1
-            if "with self._lock:" in line:
-                lock_at = i
-            if "_conn.commit()" in line and lock_at < 0 and current != "__init__":
-                unguarded.append(current)
-        assert not unguarded, f"writers commit without self._lock: {unguarded}"
+        source = inspect.getsource(store_module)
+        rogue = re.findall(r"Session\(\s*self\._engine", source)
+        # `_write` and `_read` are the two sanctioned constructions.
+        assert len(rogue) == 2, f"a method opens its own session: {len(rogue)} sites, expected 2"
 
 
 class TestEphemeralDeltas:

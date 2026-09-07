@@ -33,7 +33,7 @@ from sbxloop.engine.model import (
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
-from tests.fakes.rawdb import backdate
+from tests.fakes.rawdb import backdate, query_raw
 from tests.unit.test_hostgit import (
     git as git_cmd,
 )
@@ -1535,10 +1535,8 @@ class TestOperatorItemControls:
         h.loop.recover()
         assert h.source.calls == [("abandoned", "operator: doomed plan")]
         assert removed == ["sbxloop-r_dead-agent", "sbxloop-r_dead-github"]
-        row = h.dstore._conn.execute(
-            "SELECT result FROM daemon_runs WHERE run_id = 'r_dead'"
-        ).fetchone()
-        assert row["result"] == "abandoned"
+        rows = query_raw(h.dstore, "SELECT result FROM daemon_runs WHERE run_id = 'r_dead'")
+        assert rows[0][0] == "abandoned"
         item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "failed" and item.run_id == "r_dead"
         assert h.loop.tick().idle_kind == "no_work"
@@ -1557,10 +1555,8 @@ class TestOperatorItemControls:
         h.store.set_run_state("r_dead", "building")
         h.dstore.requeue("gh:issue:1", 4.0)
         h.loop.recover()
-        row = h.dstore._conn.execute(
-            "SELECT result FROM daemon_runs WHERE run_id = 'r_dead'"
-        ).fetchone()
-        assert row["result"] == "requeued"
+        rows = query_raw(h.dstore, "SELECT result FROM daemon_runs WHERE run_id = 'r_dead'")
+        assert rows[0][0] == "requeued"
         assert not any(c[0] in ("abandoned", "cancelled") for c in h.source.calls)
         h.clock.t += 10_000
         assert h.loop.tick().outcome == "done"
