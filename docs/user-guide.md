@@ -165,6 +165,23 @@ result = engine.start(outcome="Add mypy strict typing to ./src and fix all findi
 print(result.state, result.run_id)
 ```
 
+### Platform support
+
+sbxloop runs on Linux and macOS. The hard constraint is the sandbox layer:
+every run, the daemon and the bake boot Docker Sandboxes microVMs through
+`sbx`, which Docker ships for those two systems.
+
+On **Windows** the supported path is **WSL2**: install a Linux distribution,
+turn on Docker Desktop's WSL integration for it, and install sbxloop inside
+that distribution — the install script, `sbxloop init`, the daemon and the
+console all run there unchanged, and `sbxloop doctor` reports the host as
+WSL. Developing sbxloop on Windows works the same way: clone and run the
+test suite inside the distribution. Native Windows is refused by name:
+`sbxloop run`, `resume`, `shell`, `daemon` and `bake` exit with a line
+naming the WSL2 path before writing any state, and `sbxloop doctor`'s
+first row (`host`) says the same. The read-only commands still answer so
+the refusal can be diagnosed from the host itself.
+
 ## How a run works
 
 ```

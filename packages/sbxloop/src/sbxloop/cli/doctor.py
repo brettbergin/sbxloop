@@ -444,6 +444,15 @@ def workspace_origin_mismatches(config: Config) -> list[WorkspaceOriginMismatch]
     return mismatches
 
 
+def host_check() -> Check:
+    """The host itself (#596): a hard failure on native Windows, naming
+    the WSL2 path; a note under WSL2; a pass elsewhere."""
+    from sbxloop.hostos import host_support
+
+    support = host_support()
+    return Check("host", support.supported, support.detail, hard=not support.supported)
+
+
 def workspace_checks(config: Config) -> list[Check]:
     """Where each enabled repository's dedicated checkout is: the operator's
     own, the home's (cloned by the daemon on first use), or nowhere yet."""
@@ -994,6 +1003,7 @@ def collect_checks(
     config, sources = load_config_with_sources(env=env)
     cli = cli or SbxCLI(app_name=config.app_name or None)
     checks: list[Check] = []
+    checks.append(host_check())
     report = progress or (lambda _message: None)
 
     # sbx binary + version. The very first sbx invocation may trigger

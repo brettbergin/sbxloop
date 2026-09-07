@@ -87,6 +87,11 @@ curl -fsSL https://raw.githubusercontent.com/brettbergin/sbxloop/main/scripts/in
 export PATH="$HOME/.sbxloop/bin:$PATH"
 ```
 
+On Windows, use WSL2: install a Linux distribution, turn on Docker Desktop's
+WSL integration for it, and run the same two lines inside that distribution.
+Native Windows cannot boot the sandboxes; `sbxloop run`, `daemon` and `bake`
+refuse there by name and `sbxloop doctor` says so in its first row.
+
 `sbxloop init` creates the home directory, installs the runtime, and writes
 your starter configuration and secrets file:
 
