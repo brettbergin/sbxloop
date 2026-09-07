@@ -38,7 +38,6 @@
   while it was still being worked on. `StateStore.recent_runs` orders and
   limits by `updated_at`, and the screen pins the run in flight on top.
 
-
 ### Added
 
 - **Runs shows what a run cost.** Turns spent and time worked, per run, in
