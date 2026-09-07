@@ -878,6 +878,86 @@ class TestTools:
         assert "4 open issue(s)" in everything.text
         assert "NOT QUEUED" in everything.text
 
+    def test_list_issues_takes_several_states_and_negated_ones(self, tmp_path: Path) -> None:
+        """#609: "what needs a human?" is failed OR blocked — `states` says
+        so exactly, where `queued: false` swept in the backlog; and
+        `exclude_states` answers the negated question."""
+        issues = [
+            {
+                "number": 7,
+                "title": "Backlog",
+                "labels": [],
+                "created_at": "bogus",
+                "user": {"login": "ana"},
+                "comments": 0,
+                "html_url": "https://gh/i/7",
+            },
+            {
+                "number": 8,
+                "title": "Queued",
+                "labels": [{"name": "sbxloop:run"}],
+                "created_at": "bogus",
+                "user": {"login": "bo"},
+                "comments": 0,
+                "html_url": "https://gh/i/8",
+            },
+            {
+                "number": 9,
+                "title": "Failed",
+                "labels": [{"name": "sbxloop:failed"}],
+                "created_at": "bogus",
+                "user": {"login": "bo"},
+                "comments": 0,
+                "html_url": "https://gh/i/9",
+            },
+            {
+                "number": 10,
+                "title": "Blocked",
+                "labels": [{"name": "sbxloop:blocked"}],
+                "created_at": "bogus",
+                "user": {"login": "bo"},
+                "comments": 0,
+                "html_url": "https://gh/i/10",
+            },
+            {
+                "number": 11,
+                "title": "Running and once failed",
+                "labels": [{"name": "sbxloop:in-progress"}, {"name": "sbxloop:failed"}],
+                "created_at": "bogus",
+                "user": {"login": "bo"},
+                "comments": 0,
+                "html_url": "https://gh/i/11",
+            },
+        ]
+        github = FakeGithub({"/issues?": issues})
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {"calls": [("list_issues", {"states": ["failed", "blocked"]})]},
+                {"calls": [("list_issues", {"exclude_states": ["queued", "running"]})]},
+                {"calls": [("list_issues", {"state": "failed", "states": ["blocked"]})]},
+                {"calls": [("list_issues", {"states": ["failed"], "exclude_states": ["running"]})]},
+                {"calls": [("list_issues", {"states": ["bogus", 3]})]},
+            ],
+            github=github,
+        )
+        for text in ("needs a human?", "not being worked?", "both", "failed but idle", "junk"):
+            turn(concierge, text)
+        needs_human, idle, both, failed_idle, junk = client.responses
+
+        def numbers(text: str) -> set[str]:
+            return {line.split()[1] for line in text.splitlines() if line.startswith("- #")}
+
+        assert numbers(needs_human.text) == {"#9", "#10", "#11"}
+        assert "failed|blocked open issue(s)" in needs_human.text
+        assert numbers(idle.text) == {"#7", "#9", "#10"}
+        assert "not-queued|running open issue(s)" in idle.text
+        assert numbers(both.text) == {"#9", "#10", "#11"}  # `state` folds into `states`
+        assert numbers(failed_idle.text) == {"#9"}
+        assert "failed not-running" in failed_idle.text
+        # Unknown names are ignored, not an error: everything comes back.
+        assert numbers(junk.text) == {"#7", "#8", "#9", "#10", "#11"}
+
     def test_list_issues_all_parameter_controls_the_requested_state(self, tmp_path: Path) -> None:
         issues = [
             {

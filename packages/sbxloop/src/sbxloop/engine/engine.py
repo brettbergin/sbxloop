@@ -202,7 +202,7 @@ from sbxloop.policy import EgressGranter, egress_rejection
 from sbxloop.sbx import registries
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
-from sbxloop.sbx.provision import Provisioner
+from sbxloop.sbx.provision import ContinueBranch, Provisioner
 from sbxloop.sbx.sandbox import SBXLOOP_DIR
 from sbxloop.verifylint import services_evidence
 from sbxloop.worker.client import WorkerClient
@@ -726,7 +726,7 @@ class LoopEngine:
         # work, the review diff describes it, and the delivered tree is the
         # one the agent actually built. Pinning after provisioning would
         # only change where the result lands.
-        provisioner = Provisioner(self.sbx, self._provision_config(), self.bus)
+        provisioner = Provisioner(self.sbx, self.config, self.bus)
         # A resumed run's workspace is pinned from the runs table — never
         # recomputed from config, which would silently relocate it (#60).
         # The run's repository (its config was narrowed to it in
@@ -743,6 +743,7 @@ class LoopEngine:
             expects_mount=expects_mount,
             credentials=credentials,
             kind=kind,
+            continue_branch=self._continue_branch(),
         )
         assert pair.workspace is not None
         self._confirm_prior_checkout(run_id, pair)
@@ -1389,22 +1390,18 @@ class LoopEngine:
             log.info("run.issues_disabled", run=run_id, repo=entry.repo)
         return probe.has_issues
 
-    def _provision_config(self) -> Config:
-        """The config provisioning sees: a restart's offered branch pinned
-        as ``sandbox.continue_branch`` so the run's clone is cut from the
-        previous attempt's work rather than from the base branch (#600).
+    def _continue_branch(self) -> ContinueBranch | None:
+        """A restart's offered branch, for provisioning to cut the run's
+        clone from the previous attempt's work rather than from the base
+        branch (#600) — passed as the provisioner's own parameter (#646),
+        not smuggled through the config.
 
-        The pin is *optional* — unlike a resume, a restart has published
+        The offer is *optional* — unlike a resume, a restart has published
         nothing of its own, so a branch that is gone from origin is a fresh
         start with a logged reason, not a failed provision.
         """
         branch = self._prior.branch
-        if not branch:
-            return self.config
-        sandbox = self.config.sandbox.model_copy(
-            update={"continue_branch": branch, "continue_branch_optional": True}
-        )
-        return self.config.model_copy(update={"sandbox": sandbox})
+        return ContinueBranch(branch, optional=True) if branch else None
 
     def _confirm_prior_checkout(self, run_id: str, pair: SandboxPair) -> None:
         """Keep the branch offer only if the workspace really landed on it.
@@ -1472,10 +1469,9 @@ class LoopEngine:
             if head_sha is None:
                 self._prior_unusable(p, branch, "the branch is no longer on origin")
                 return
-            if not self._shares_merge_base(ops, repo, base, branch):
-                self._prior_unusable(
-                    p, branch, f"the branch has no merge base with {base} (unrelated history)"
-                )
+            problem = self._merge_base_problem(ops, repo, base, branch)
+            if problem is not None:
+                self._prior_unusable(p, branch, problem)
                 return
             pr_number = self._prior_open_pr(ops, repo, branch, prior.pr_number)
         except (GithubOpsError, SbxloopError) as exc:
@@ -1513,16 +1509,31 @@ class LoopEngine:
         )
 
     @staticmethod
-    def _shares_merge_base(ops: GithubOps, repo: str, base: str, branch: str) -> bool:
-        """Whether ``branch`` and ``base`` have a common ancestor — the test
-        for "this branch is still about this repository's current line of
-        work". A comparison GitHub cannot make (404 on unrelated histories)
-        answers no rather than raising."""
+    def _merge_base_problem(ops: GithubOps, repo: str, base: str, branch: str) -> str | None:
+        """Why ``branch`` cannot be continued on ``base`` — None when the
+        two share history, the test for "this branch is still about this
+        repository's current line of work".
+
+        GitHub's compare answers 404 both for unrelated histories and for
+        a base the token cannot see (#647), and the two mean different
+        things to an operator: one is a branch to abandon, the other a
+        permissions problem that would report as "unrelated history".
+        A miss is told apart by asking for the base ref itself.
+        """
         data = raw_lookup(ops, "GET", f"/repos/{repo}/compare/{base}...{branch}")
+        if data is None:
+            if ops.ref_lookup(repo, f"heads/{base}") is None:
+                return (
+                    f"GitHub could not compare it with {base}: the base branch is not on "
+                    "origin, or the token cannot see it"
+                )
+            return f"the branch has no merge base with {base} (unrelated history)"
         if not isinstance(data, dict):
-            return False
+            return f"GitHub's comparison with {base} had no usable shape"
         merge_base = data.get("merge_base_commit")
-        return bool(isinstance(merge_base, dict) and merge_base.get("sha"))
+        if isinstance(merge_base, dict) and merge_base.get("sha"):
+            return None
+        return f"GitHub's comparison with {base} named no merge base"
 
     @staticmethod
     def _prior_open_pr(ops: GithubOps, repo: str, branch: str, recorded: int | None) -> int | None:
