@@ -38,6 +38,12 @@ CHART_HEIGHT = 13
 #: shortest frame that still leaves room for the axis and its ticks.
 BAR_HEIGHT = 7
 
+#: Rows a ranked bar needs per entry, plus the frame and axis. Plotext
+#: gives a horizontal bar two rows before it labels one, so an entry that
+#: gets fewer than two loses its name.
+ROWS_PER_ENTRY = 2
+RANKED_CHROME = 4
+
 #: How many ticks a relabelled axis gets. Five spans the range without the
 #: labels running into each other at the widths these plots get.
 TICKS = 5
@@ -208,6 +214,36 @@ def proportion(
     return chart
 
 
+def ranked(
+    rows: Sequence[tuple[str, float]],
+    colour: str,
+    fmt: Callable[[float], str] | None = None,
+) -> Chart:
+    """A short ranked list as bars against a scale, biggest at the top.
+
+    The band version drew each row against the biggest, which shows the
+    ranking and hides the quantity: two runs at 400 and 12 turns looked
+    like a full bar and a stub with no way to tell 12 from 120. Plotext
+    stacks its categories upward, so the order is reversed on the way in
+    to put the costliest run at the top where the eye starts."""
+    chart = Chart()
+    chart.styles.height = max(len(rows) * ROWS_PER_ENTRY + RANKED_CHROME, BAR_HEIGHT)
+    ordered = list(reversed(rows))
+    chart.plt.bar(
+        [label for label, _value in ordered],
+        [float(value) for _label, value in ordered],
+        orientation="horizontal",
+        color=rgb(colour),
+    )
+    peak = max([value for _label, value in rows], default=0.0)
+    if fmt is not None:
+        chart.label_x(0.0, peak, fmt)
+    else:
+        chart.count_x(peak)
+    chart.caption = f"{len(rows)} ranked, top {rows[0][0] if rows else '—'}"
+    return chart
+
+
 def histogram(
     values: Sequence[float],
     bins: int,
@@ -283,6 +319,7 @@ __all__ = [
     "enough",
     "histogram",
     "proportion",
+    "ranked",
     "rgb",
     "scatter",
     "whole_ticks",

@@ -112,26 +112,30 @@ rail — and `o` opens the window's costliest run.
 - **Flow** (`f`) — runs per day by outcome, each kind's rates with its own
   turns, active and parked per run, and **how long work took to land** end
   to end (median and p90, slowest named). Code and workload runs differ by
-  an order of magnitude, so they are never blended.
+  an order of magnitude, so they are never blended. Runs per day is one
+  stacked plot with a day per bucket.
 - **Cost** (`c`) — turns lead, because every turn re-sends the session
   context and spend tracks turns rather than jobs. **Which phase** burns
   them, not only how many, and **how much context each phase re-sends** —
   the cache-to-fresh ratio is a per-phase fact and the phases differ by an
-  order of magnitude. The costliest runs are named and ranked, with the
-  median and p90 beside them, so an outlier is visible instead of averaged
-  away. **Turns per day** is a plot with a labelled scale rather than a
-  sparkline: the sparkline drew the shape but named no value on it, so a
-  quiet week and a heavy one looked the same.
+  order of magnitude. The costliest runs are named and ranked against a
+  scale, with the median and p90 beside them, so an outlier is visible
+  instead of averaged away. **Turns per day** is a plot with a labelled
+  scale rather than a sparkline: the sparkline drew the shape but named no
+  value on it, so a quiet week and a heavy one looked the same.
 - **Time** (`t`) — **active** is what the loop did; **parked** is what it
   waited on a human for. These are wildly different: on this project's own
   host active time has run at about a sixth of elapsed, so reporting
   elapsed as "duration" says the loop is slow when the loop is fast and the
-  human is not. The runs that waited longest are named.
+  human is not. The runs that waited longest are ranked against a duration
+  axis, so `21h 35m` is readable off the plot and not only `68%`.
 - **Health** (`h`) — failures grouped by cause, so a common cause reads as
   one row rather than several one-offs; **where the loop went round again**
   (retries per phase — a phase that retries constantly is spending turns
   nobody asked for); the phase table; and the rework the week cost in task
-  revisions, replans and review/CI rounds.
+  revisions, replans and review/CI rounds. A ranked plot keeps the exact
+  counts on a line beneath it, because a bar approximates and a note like
+  `3 of 12` carries more than the bar can.
 - **Spread** (`d`) — how the week's runs are *distributed*, rather than what
   they totalled. Two histograms (turns per run, working time per run) and a
   scatter of turns against elapsed, one dot per run. Median and p90 say
@@ -143,11 +147,18 @@ rail — and `o` opens the window's costliest run.
 A **cancelled** run is a decision, not an outcome: it is counted and
 reported but kept out of the success rate's denominator.
 
-The plots are `sbxloop.tui.widgets.chart` (`textual-plotext`). Their axes
-are ruled in whole runs and read in the same `1h 20m` units as the rest of
-the screen, and they follow the console's theme. `sbxloop.tui.widgets.band`
-still draws every stack outside Overview and Overview's own ranked rows,
-and remains the fallback wherever a plot would rule an axis over nothing.
+Every share, trend and ranking on Overview is a plot
+(`sbxloop.tui.widgets.chart`, over `textual-plotext`). Their axes are ruled
+in whole runs and read in the same `1h 20m` units as the rest of the
+screen, and they follow the console's theme.
+
+`sbxloop.tui.widgets.band` drew all of these as one-row bars until it was
+used in anger: a band paints with *background* colour and no glyph, so a
+single row is a thin stripe that is easy to miss on a low-contrast
+terminal, and it carries no scale — a full bar and a stub tell you the
+ranking and not one number. Band is still the right tool outside Overview,
+and is still the fallback for a split that is all zero, where a plot would
+rule an axis across an empty frame to say nothing.
 
 One trap worth knowing if you add a plot: **plotext does not raise on a
 colour it cannot read.** `color="#22C55E"` and `color="not-a-colour"` both

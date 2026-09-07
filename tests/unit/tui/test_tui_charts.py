@@ -19,7 +19,7 @@ import pytest
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.paths import SbxloopHome
 from sbxloop.tui.screens.overview import OverviewScreen, hm
-from sbxloop.tui.widgets.band import BAD_COLOUR, IDLE_COLOUR, OK_COLOUR, Segment
+from sbxloop.tui.widgets.band import BAD_COLOUR, IDLE_COLOUR, OK_COLOUR, Band, Segment
 from sbxloop.tui.widgets.chart import (
     MIN_POINTS,
     Chart,
@@ -241,9 +241,30 @@ def test_cost_plots_the_trend_against_a_scale(seeded: SbxloopHome) -> None:
             await pilot.press("c")
             await pilot.pause(0.5)
             assert "buckets, peak" in page_text(app)
+            # The trend, the phase split, and the costliest runs.
             charts = app.screen.query(Chart)
-            assert len(charts) == 1
+            assert len(charts) == 3
             built = charts.first().plt.build()
             assert time.strftime("%a", time.localtime()) in built, "the days are named"
+
+
+def test_every_page_draws_rather_than_paints_a_row(seeded: SbxloopHome) -> None:
+    """No page still reports a share as a one-row band. A band paints with
+    background colour and no glyph, which on a low-contrast terminal is a
+    stripe you have to hunt for and carries no scale to read."""
+    seed_many(seeded, count=40)
+
+    async def scenario() -> None:
+        app = make_app(seeded)
+        async with app.run_test(size=(140, 90)) as pilot:
+            await pilot.pause(2.0)
+            for key, least in (("s", 4), ("f", 2), ("c", 3), ("t", 3), ("h", 1), ("d", 3)):
+                await pilot.press(key)
+                await pilot.pause(0.4)
+                drawn = len(app.screen.query(Chart))
+                assert drawn >= least, f"page {key} drew {drawn} charts, wanted {least}"
+                assert not app.screen.query(Band), f"page {key} still paints a band"
+
+    drive(scenario)
 
     drive(scenario)
