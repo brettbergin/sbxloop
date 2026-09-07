@@ -2,6 +2,41 @@
 
 ### Fixed
 
+- **`pkill` in a verify command is now rejected at plan time.** A check that
+  starts a server to probe it has to stop it again, and `pkill -f <pattern>`
+  is the obvious way to write that — but the pattern is matched against
+  every process's full command line, so one drawn from the command's own
+  text (a port, a binary name) reaches sibling commands and the agent's own
+  runtime as well as the server. The decomposer is told not to write them
+  and `verifylint` rejects them at JSON acceptance, alongside the existing
+  environment-mutation and network rules, so a violation costs one retry
+  with the rule quoted rather than a task's whole revision budget against a
+  check the builder is forbidden to edit. Killing a pid the command recorded
+  stays legal, and so does no cleanup at all: each verify command runs in a
+  process group of its own, and what it leaves running is reaped for it.
+
+- **A verify command could kill itself, and did.** Verify commands ran as
+  `sh -c '<the whole command>'` in the worker's own process group, which put
+  the command's text on a command line and its children in a group nobody
+  reaped. Both halves broke checks that were otherwise correct. A check that
+  started a dev server on a port and cleaned up with `pkill -f <port>`
+  matched the shell running it, because that shell's command line contained
+  the port: it SIGTERMed itself before reaching its own assertion and
+  reported a signal exit with no output — identically on every attempt, so
+  the loop flagged the check as unpassable and abandoned the run, with the
+  work complete and every other gate green. Separately, anything a command
+  backgrounded and did not kill kept running after the command returned,
+  holding its port against the next attempt and holding the captured pipe
+  open, so reading the command's output blocked until the whole job timed
+  out.
+
+  Each command now runs from a script file, so its text never reaches the
+  process table and a pattern kill reaches only what the command started; in
+  a session of its own, so whatever it leaves running is a process group the
+  worker tears down (SIGTERM, then SIGKILL) when the command returns or times
+  out; and with its output on a file rather than a pipe an orphan can hold
+  open.
+
 - **The Config screen showed `repr`, not values.** Floats carried a `.0`
   tail every duration and interval in the config has (`60.0`, `14400.0`),
   strings came wrapped in quotes (`'claude'`), bools were Python's
