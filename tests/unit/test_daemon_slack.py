@@ -20,7 +20,14 @@ from sbxloop.daemon.chat import build_bridge
 from sbxloop.daemon.discord import DiscordBridge
 from sbxloop.daemon.discord_format import agent_model_label, format_for_discord
 from sbxloop.daemon.model import DaemonNotice, RunReport, TaskOutcome, WorkItem
-from sbxloop.daemon.slack import SlackBridge, SlackMessage, SlackTarget
+from sbxloop.daemon.slack import (
+    CHOICE_ACTION_PREFIX,
+    GATE_ACTION_ID,
+    SlackBridge,
+    SlackMessage,
+    SlackTarget,
+    dispatch_envelope,
+)
 from sbxloop.daemon.store import ChatThread, DaemonStore
 from sbxloop.engine.model import Published
 from sbxloop.errors import DaemonError
@@ -51,6 +58,7 @@ class FakeWeb:
     """The slice of ``AsyncWebClient`` the bridge calls, recording everything."""
 
     def __init__(self) -> None:
+        self.ephemeral: list[dict[str, Any]] = []
         self.posted: list[dict[str, Any]] = []
         self.updated: list[dict[str, Any]] = []
         self.reactions: list[dict[str, Any]] = []
@@ -75,6 +83,10 @@ class FakeWeb:
 
     async def chat_update(self, **kwargs: Any) -> dict[str, Any]:
         self.updated.append(kwargs)
+        return {"ok": True}
+
+    async def chat_postEphemeral(self, **kwargs: Any) -> dict[str, Any]:
+        self.ephemeral.append(kwargs)
         return {"ok": True}
 
     async def reactions_add(self, **kwargs: Any) -> dict[str, Any]:
@@ -801,3 +813,189 @@ class TestWorkloads:
             assert "merge" not in prompt["text"] and "pull/9" not in prompt["text"]
         finally:
             bridge.close()
+
+
+def _question() -> Any:
+    from sbxloop.daemon.chat_choices import Choice, ChoiceQuestion
+
+    return ChoiceQuestion(
+        prompt="What do you want changed?",
+        choices=(
+            Choice(value="the wording", label="The wording"),
+            Choice(value="the layout", label="The layout"),
+        ),
+    )
+
+
+def _click(
+    action_id: str, value: str, *, ts: str, block_id: str = "sbx-choices", user: str = "U1"
+) -> dict[str, Any]:
+    """A Socket Mode ``block_actions`` payload, as Slack sends it."""
+    return {
+        "type": "block_actions",
+        "user": {"id": user, "username": "brett" if user == "U1" else "ana"},
+        "container": {"type": "message", "channel_id": CHANNEL, "message_ts": ts},
+        "channel": {"id": CHANNEL},
+        "message": {"ts": ts, "text": "question"},
+        "actions": [{"action_id": action_id, "block_id": block_id, "value": value}],
+    }
+
+
+class TestButtons:
+    """#571: clarifying choices and the gate prompt carry block-kit buttons
+    on Slack, driving the same `_answer_choice` / `approve_merge` seams as
+    Discord's components; the prose stays the fallback for typing."""
+
+    def test_choices_post_one_button_per_choice_with_the_prose_body(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            posted = asyncio.run(
+                bridge._send_choices(SlackTarget(CHANNEL), "", _question(), pending_key="pending:x")
+            )
+            assert isinstance(posted, SlackMessage)
+            msg = client.web.posted[-1]
+            assert "What do you want changed?" in msg["text"] and "1." in msg["text"]
+            section, actions = msg["blocks"]
+            assert (
+                section["type"] == "section"
+                and "What do you want changed?" in section["text"]["text"]
+            )
+            assert actions["type"] == "actions" and actions["block_id"] == "pending:x"
+            buttons = actions["elements"]
+            assert [b["action_id"] for b in buttons] == [
+                f"{CHOICE_ACTION_PREFIX}0",
+                f"{CHOICE_ACTION_PREFIX}1",
+            ]
+            assert [b["value"] for b in buttons] == ["the wording", "the layout"]
+            assert [b["text"]["text"] for b in buttons] == ["The wording", "The layout"]
+        finally:
+            bridge.close()
+
+    def test_a_click_answers_through_answer_choice_and_drops_the_buttons(
+        self, tmp_path: Path
+    ) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            posted = asyncio.run(bridge._send_choices(SlackTarget(CHANNEL), "", _question()))
+            answered: list[tuple[str, str, str | None, str | None, str | None]] = []
+            bridge._answer_choice = (
+                lambda mid, value, author=None, *, author_id=None, author_name=None: (  # type: ignore[method-assign]
+                    answered.append((mid, value, author, author_id, author_name)) or True
+                )
+            )
+            dispatch_envelope(
+                bridge,
+                "interactive",
+                _click(f"{CHOICE_ACTION_PREFIX}1", "the layout", ts=posted.ts),
+            )
+            assert wait_for(lambda: bool(answered))
+            assert answered == [(posted.ts, "the layout", "Slack user `brett`", "U1", "brett")]
+            assert wait_for(lambda: any(u["ts"] == posted.ts for u in client.web.updated))
+            edit = next(u for u in client.web.updated if u["ts"] == posted.ts)
+            assert edit["blocks"] == [] and "the layout" in edit["text"] and "brett" in edit["text"]
+        finally:
+            bridge.close()
+
+    def test_a_click_before_the_rekey_resolves_through_the_pending_key(
+        self, tmp_path: Path
+    ) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            posted = asyncio.run(
+                bridge._send_choices(SlackTarget(CHANNEL), "", _question(), pending_key="pending:k")
+            )
+            seen: list[str] = []
+
+            def answer(mid: str, value: str, author: Any = None, **kw: Any) -> bool:
+                seen.append(mid)
+                return mid == "pending:k"
+
+            bridge._answer_choice = answer  # type: ignore[method-assign]
+            dispatch_envelope(
+                bridge,
+                "interactive",
+                _click(
+                    f"{CHOICE_ACTION_PREFIX}0", "the wording", ts=posted.ts, block_id="pending:k"
+                ),
+            )
+            assert wait_for(lambda: seen == [posted.ts, "pending:k"])
+            assert wait_for(lambda: any(u["ts"] == posted.ts for u in client.web.updated))
+        finally:
+            bridge.close()
+
+    def test_an_expired_click_gets_the_typed_route_ephemerally(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            bridge._answer_choice = lambda *a, **kw: False  # type: ignore[method-assign]
+            dispatch_envelope(
+                bridge, "interactive", _click(f"{CHOICE_ACTION_PREFIX}0", "x", ts="1.2")
+            )
+            assert wait_for(lambda: bool(client.web.ephemeral))
+            note = client.web.ephemeral[-1]
+            assert note["user"] == "U1" and "expired" in note["text"]
+            assert client.web.updated == []
+        finally:
+            bridge.close()
+
+    def test_the_gate_prompt_carries_a_button_and_a_click_approves(self, tmp_path: Path) -> None:
+        bridge, client, floop = make_bridge(tmp_path)
+        try:
+            calls: list[tuple[str, str | None]] = []
+
+            def approve_merge(target: str, by: str | None = None) -> str:
+                calls.append((target, by))
+                return "✅ approved — completing the landing"
+
+            floop.approve_merge = approve_merge  # type: ignore[attr-defined]
+            gate = make_gate(kind="publish", notify=("U1",))
+            posted = asyncio.run(
+                bridge._send_gate(SlackTarget(CHANNEL), "⏸ result held <@U1>", gate)
+            )
+            msg = client.web.posted[-1]
+            assert "<@U1>" in msg["text"]
+            (button,) = msg["blocks"][1]["elements"]
+            assert button["action_id"] == GATE_ACTION_ID and button["value"] == "r77"
+            assert button["text"]["text"] == "Release result" and button["style"] == "primary"
+            dispatch_envelope(
+                bridge, "interactive", _click(GATE_ACTION_ID, "r77", ts=posted.ts, user="U2")
+            )
+            assert wait_for(lambda: calls == [("r77", "Slack user `ana`")])
+            assert wait_for(lambda: any("approved" in p["text"] for p in client.web.posted))
+            reply = next(p for p in client.web.posted if "approved" in p["text"])
+            assert reply["thread_ts"] == posted.ts
+            # Resolution clears the button.
+            asyncio.run(bridge._finalize_gate_message(posted, "✅ released by ana"))
+            assert (
+                client.web.updated[-1]["blocks"] == []
+                and "released" in client.web.updated[-1]["text"]
+            )
+        finally:
+            bridge.close()
+
+    def test_a_merge_gate_button_says_approve(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            asyncio.run(bridge._send_gate(SlackTarget(CHANNEL), "ready to merge", make_gate()))
+            (button,) = client.web.posted[-1]["blocks"][1]["elements"]
+            assert button["text"]["text"] == "Approve merge"
+        finally:
+            bridge.close()
+
+    def test_envelopes_route_by_kind(self, tmp_path: Path) -> None:
+        seen: list[tuple[str, Any]] = []
+
+        class Bridge:
+            def _handle_event(self, event: Any) -> None:
+                seen.append(("event", event))
+
+            def _handle_interaction(self, payload: Any) -> None:
+                seen.append(("click", payload))
+
+        dispatch_envelope(Bridge(), "events_api", {"event": {"type": "message"}})
+        dispatch_envelope(Bridge(), "interactive", {"type": "block_actions", "actions": []})
+        dispatch_envelope(Bridge(), "interactive", {"type": "view_submission"})
+        dispatch_envelope(Bridge(), "slash_commands", {"command": "/x"})
+        assert seen == [
+            ("event", {"type": "message"}),
+            ("click", {"type": "block_actions", "actions": []}),
+        ]
