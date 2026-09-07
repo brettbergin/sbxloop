@@ -27,12 +27,13 @@ without a screen.
 
 from __future__ import annotations
 
-import sqlite3
 import time
 from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
+
+from sqlalchemy import RowMapping
 
 #: The window the Overview reports on, and the number of buckets its
 #: trends are drawn with — a day per bucket over a week.
@@ -53,11 +54,11 @@ CACHE_TTL_S = 10.0
 class WindowStore(Protocol):
     """The slice of the engine store this module reads."""
 
-    def runs_between(self, since: float, until: float) -> list[sqlite3.Row]: ...
+    def runs_between(self, since: float, until: float) -> list[RowMapping]: ...
 
-    def phases_between(self, since: float, until: float) -> list[sqlite3.Row]: ...
+    def phases_between(self, since: float, until: float) -> list[RowMapping]: ...
 
-    def task_totals_between(self, since: float, until: float) -> sqlite3.Row: ...
+    def task_totals_between(self, since: float, until: float) -> RowMapping: ...
 
 
 @dataclass(frozen=True)
@@ -302,15 +303,15 @@ def _reason(raw: str | None) -> str:
 
 
 def fold(
-    runs: Sequence[sqlite3.Row],
-    phases: Sequence[sqlite3.Row],
+    runs: Sequence[RowMapping],
+    phases: Sequence[RowMapping],
     *,
     since: float,
     until: float,
     buckets: int = BUCKETS,
     top: int = 8,
-    tasks: sqlite3.Row | None = None,
-    previous: Sequence[sqlite3.Row] = (),
+    tasks: RowMapping | None = None,
+    previous: Sequence[RowMapping] = (),
 ) -> Analytics:
     """Fold the window's rows into what the screen reports."""
     lanes: dict[str, Lane] = {}
@@ -406,7 +407,7 @@ def fold(
     )
 
 
-def _lane_of(rows: Sequence[sqlite3.Row]) -> Lane:
+def _lane_of(rows: Sequence[RowMapping]) -> Lane:
     """Every kind together, for the window before this one."""
     lane = Lane("previous")
     for row in rows:

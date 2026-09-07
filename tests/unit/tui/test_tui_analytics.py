@@ -10,6 +10,7 @@ from pathlib import Path
 from sbxloop.engine.store import StateStore
 from sbxloop.tui.analytics import Cache, Lane, compute, fold
 from sbxloop_worker.protocol import Usage
+from tests.fakes.rawdb import exec_raw
 
 NOW = 1_800_000_000.0
 DAY = 86400.0
@@ -32,7 +33,8 @@ def seed(db: Path) -> StateStore:
     for run_id, kind, state, days, active, elapsed, turns in plan:
         created = NOW - days * DAY
         store.create_run(run_id, f"outcome for {run_id}", kind=kind)
-        store._conn.execute(
+        exec_raw(
+            store,
             "UPDATE runs SET state=?, created_at=?, updated_at=?, reason=? WHERE run_id=?",
             (
                 state,
@@ -53,10 +55,9 @@ def seed(db: Path) -> StateStore:
             turns=turns,
             usage=Usage(input_tokens=turns * 1000, output_tokens=0, cache_read_tokens=turns * 5000),
         )
-        store._conn.execute(
-            "UPDATE phase_attempts SET ended_at=? WHERE run_id=?", (created + active, run_id)
+        exec_raw(
+            store, "UPDATE phase_attempts SET ended_at=? WHERE run_id=?", (created + active, run_id)
         )
-    store._conn.commit()
     return store
 
 
@@ -190,7 +191,6 @@ def test_phases_carry_cost_and_rework(tmp_path: Path) -> None:
             turns=10,
             usage=Usage(input_tokens=100, output_tokens=0, cache_read_tokens=4000),
         )
-        store._conn.commit()
         a = compute(store, now=NOW, window_s=7 * DAY)
     finally:
         store.close()
@@ -210,7 +210,8 @@ def test_the_previous_window_is_what_better_or_worse_means(tmp_path: Path) -> No
         # A run a fortnight back: outside this window, inside the one before.
         created = NOW - 9 * DAY
         store.create_run("r_old", "older", kind="code")
-        store._conn.execute(
+        exec_raw(
+            store,
             "UPDATE runs SET state='merged', created_at=?, updated_at=? WHERE run_id=?",
             (created, created + 100.0, "r_old"),
         )
@@ -224,10 +225,9 @@ def test_the_previous_window_is_what_better_or_worse_means(tmp_path: Path) -> No
             started_at=created,
             turns=334,
         )
-        store._conn.execute(
-            "UPDATE phase_attempts SET ended_at=? WHERE run_id='r_old'", (created + 100.0,)
+        exec_raw(
+            store, "UPDATE phase_attempts SET ended_at=? WHERE run_id='r_old'", (created + 100.0,)
         )
-        store._conn.commit()
         a = compute(store, now=NOW, window_s=7 * DAY)
     finally:
         store.close()
@@ -272,8 +272,7 @@ def test_spreads_show_what_a_mean_hides(tmp_path: Path) -> None:
 def test_rework_and_rounds_are_counted(tmp_path: Path) -> None:
     store = seed(tmp_path / "s.db")
     try:
-        store._conn.execute("UPDATE runs SET review_rounds=2, ci_rounds=1 WHERE run_id='r_ok'")
-        store._conn.commit()
+        exec_raw(store, "UPDATE runs SET review_rounds=2, ci_rounds=1 WHERE run_id='r_ok'")
         a = compute(store, now=NOW, window_s=7 * DAY)
     finally:
         store.close()

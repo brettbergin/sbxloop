@@ -19,6 +19,7 @@ from sbxloop.tui.screens.run_detail import RunDetailScreen
 from sbxloop.tui.widgets.band import Segment, legend, paint, widths
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop_worker.protocol import Usage
+from tests.fakes.rawdb import exec_raw
 from tests.unit.tui.conftest import drive, make_app
 
 DAY = 86400.0
@@ -48,7 +49,8 @@ def seed_week(home: SbxloopHome) -> None:
     for run_id, kind, state, days, active, elapsed, turns in plan:
         created = now - days * DAY
         store.create_run(run_id, f"outcome {run_id}", kind=kind)
-        store._conn.execute(
+        exec_raw(
+            store,
             "UPDATE runs SET state=?, created_at=?, updated_at=?, reason=? WHERE run_id=?",
             (
                 state,
@@ -69,10 +71,9 @@ def seed_week(home: SbxloopHome) -> None:
             turns=turns,
             usage=Usage(input_tokens=turns * 1000, output_tokens=0, cache_read_tokens=0),
         )
-        store._conn.execute(
-            "UPDATE phase_attempts SET ended_at=? WHERE run_id=?", (created + active, run_id)
+        exec_raw(
+            store, "UPDATE phase_attempts SET ended_at=? WHERE run_id=?", (created + active, run_id)
         )
-    store._conn.commit()
     store.close()
 
 

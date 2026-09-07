@@ -60,6 +60,7 @@ from tests.fakes.fake_github import (
     human_comment,
     human_review,
 )
+from tests.fakes.rawdb import exec_raw
 
 # -- scripted responses ------------------------------------------------------
 
@@ -757,8 +758,7 @@ class TestResume:
         run_id = self._crashed_run(harness)
         engine = harness.engine()
         original = engine.store.get_run(run_id).workspace
-        engine.store._conn.execute("UPDATE runs SET config_json = '{}' WHERE run_id = ?", (run_id,))
-        engine.store._conn.commit()
+        exec_raw(engine.store, "UPDATE runs SET config_json = '{}' WHERE run_id = ?", (run_id,))
 
         elsewhere = harness.tmp_path / "elsewhere"
         harness.script([*HAPPY_TASK])
