@@ -1179,7 +1179,26 @@ class DaemonLoop:
             )
         fresh = 0
         for item in found:
-            if self.dstore.upsert_new(item, now):
+            # Per item, because recording one is not worth the daemon. A
+            # poll that raises is already caught above and backed off; an
+            # item that raises used to travel all the way out of tick() and
+            # kill the process, and since discovery is deterministic the
+            # next start died on the same item until systemd gave up. One
+            # unrecordable item now costs that item, and the run carries on.
+            try:
+                queued = self.dstore.upsert_new(item, now)
+            except Exception:
+                log.warning(
+                    "item.record_failed",
+                    source=source.name,
+                    item=item.item_id,
+                    repo=item.repo or None,
+                    url=item.url or None,
+                    hint="item skipped; the rest of the poll is unaffected",
+                    exc_info=True,
+                )
+                continue
+            if queued:
                 fresh += 1
                 self._notice(
                     "item.queued",

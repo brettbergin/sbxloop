@@ -144,6 +144,83 @@ class TestUpsert:
         assert prior is not None
         assert (prior.run_id, prior.branch, prior.pr_number) == ("r1", "sbxloop/r1", 9)
 
+    def test_same_issue_number_in_a_second_repo_does_not_collide(self, tmp_path: Path) -> None:
+        """A daemon repointed at a new repository leaves the old
+        repository's rows behind, and a single-repo daemon mints ids that
+        encode only the issue number. Both repositories' issue #24 then
+        want the same primary key, and the INSERT used to raise
+        ``UNIQUE constraint failed: daemon_work_items.item_id`` out of
+        ``tick()`` on every poll — the daemon on db crash-looped six times
+        and systemd gave up (2026-09-07). The second repository's item takes
+        the repo-qualified id instead, and both rows survive."""
+        store = DaemonStore(tmp_path / "state.db")
+        old = item("24", repo="o/old", item_id="gh:issue:24")
+        assert store.upsert_new(old, now=1.0) is True
+        store.mark_done("gh:issue:24", now=2.0)
+
+        new = item("24", repo="o/new", item_id="gh:issue:24", title="a different issue 24")
+        assert store.upsert_new(new, now=3.0) is True
+
+        kept = store.get("gh:issue:24")
+        assert kept is not None and kept.repo == "o/old" and kept.state == "done"
+        moved = store.get("gh:o/new:issue:24")
+        assert moved is not None and moved.repo == "o/new" and moved.state == "queued"
+
+    def test_the_bare_id_is_kept_when_nothing_else_holds_it(self, tmp_path: Path) -> None:
+        """Qualification is only for an id already taken by another
+        repository. With the bare id free, a single-repo daemon keeps
+        writing it, so existing state and operator commands are unchanged."""
+        store = DaemonStore(tmp_path / "state.db")
+        assert store.upsert_new(item("24", repo="o/r", item_id="gh:issue:24"), now=1.0) is True
+        got = store.get("gh:issue:24")
+        assert got is not None and got.item_id == "gh:issue:24"
+
+    def test_a_requalified_item_is_still_deduped_by_repo(self, tmp_path: Path) -> None:
+        """Identity stays ``(source_key, repo)``: the second repository's
+        item is recognised on the next poll by its own repo, not by the id
+        it was given, so it is not queued twice."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("24", repo="o/old", item_id="gh:issue:24"), now=1.0)
+        new = item("24", repo="o/new", item_id="gh:issue:24")
+        assert store.upsert_new(new, now=2.0) is True
+        assert store.upsert_new(new, now=3.0) is False
+
+    def test_a_legacy_bare_row_in_another_repo_also_forces_qualification(
+        self, tmp_path: Path
+    ) -> None:
+        """Rows written before typed ids carry the bare ``gh:24``. That does
+        not fail the primary key against a typed ``gh:issue:24``, so the
+        insert would succeed — but ``_id_variants`` resolves the two to each
+        other, and one lookup would then match both repositories' rows. The
+        newcomer qualifies rather than sit in an ambiguous namespace."""
+        store = DaemonStore(tmp_path / "state.db")
+        exec_raw(
+            store,
+            "INSERT INTO daemon_work_items"
+            " (item_id, source_key, title, body, url, state, created_at, updated_at, repo)"
+            " VALUES ('gh:24', '24', 'legacy', '', '', 'done', 1.0, 1.0, 'o/old')",
+        )
+        assert store.upsert_new(item("24", repo="o/new", item_id="gh:issue:24"), now=2.0) is True
+
+        moved = store.get("gh:o/new:issue:24")
+        assert moved is not None and moved.repo == "o/new"
+        assert query_raw(store, "SELECT repo FROM daemon_work_items WHERE item_id = 'gh:24'") == [
+            ("o/old",)
+        ]
+
+    def test_a_qualified_id_never_resolves_to_another_repos_bare_row(self, tmp_path: Path) -> None:
+        """The bare form encodes only the number, so it must not be offered
+        as a spelling of a repo-qualified id — a state change aimed at
+        ``o/new`` #24 would otherwise land on ``o/old``'s ``gh:issue:24``."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("24", repo="o/old", item_id="gh:issue:24"), now=1.0)
+        store.upsert_new(item("24", repo="o/new", item_id="gh:issue:24"), now=2.0)
+
+        store.mark_running("gh:o/new:issue:24", "r1", now=3.0)
+
+        theirs = store.get("gh:issue:24")
+        assert theirs is not None and theirs.state == "queued" and theirs.run_id is None
+
     def test_dropping_a_repoless_row_keeps_the_prior_branch_and_pr(self, tmp_path: Path) -> None:
         """``drop_repoless`` deletes rows for discovery to re-create
         repo-qualified; the prior attempt must survive that too (#600)."""

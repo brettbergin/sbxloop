@@ -77,7 +77,14 @@ from sbxloop.db.daemon_models import (
 )
 from sbxloop.engine.model import RunKind
 from sbxloop.errors import DaemonError
-from sbxloop.ghids import CHAT_PREFIX, GH_PREFIX, SCHED_PREFIX, normalize_item_id, try_parse_gh_id
+from sbxloop.ghids import (
+    CHAT_PREFIX,
+    GH_PREFIX,
+    SCHED_PREFIX,
+    format_gh_id,
+    normalize_item_id,
+    try_parse_gh_id,
+)
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -761,11 +768,19 @@ def _id_variants(item_id: str) -> tuple[str, str]:
 
     Non-GitHub ids (``inbox:x.md``) come back duplicated, so callers can
     always bind exactly two parameters.
+
+    A **repo-qualified** id comes back duplicated too. The bare form encodes
+    only the issue number, so offering it as a variant of a qualified id
+    would let a lookup for one repository's issue #24 match a bare
+    ``gh:24`` row belonging to a different repository — the same
+    number-is-not-identity confusion that collides the primary key in
+    :meth:`DaemonStore._free_item_id`. A qualified id names its repository
+    and matches only itself.
     """
     parsed = try_parse_gh_id(item_id)
     if parsed is None:
         return (item_id, item_id)
-    if parsed.kind == "issue":
+    if parsed.kind == "issue" and parsed.repo is None:
         return (parsed.item_id, f"{GH_PREFIX}{parsed.number}")
     return (parsed.item_id, parsed.item_id)
 
@@ -1614,7 +1629,7 @@ class DaemonStore:
             # the last attempt pushed are recovered from the durable side
             # table — and failing that from the run history — instead of
             # being lost with the row (#600).
-            item_id = normalize_item_id(item.item_id)
+            item_id = self._free_item_id(session, normalize_item_id(item.item_id), repo)
             prior = self._recover_prior(session, item.source_key, repo, item_id)
             session.execute(
                 insert(WorkItemRow).values(
@@ -1649,6 +1664,52 @@ class DaemonStore:
                     reason="work item row was re-created; prior pushed work carried onto it",
                 )
             return True
+
+    @staticmethod
+    def _free_item_id(session: Session, item_id: str, repo: str) -> str:
+        """``item_id``, repo-qualified if the bare spelling belongs elsewhere.
+
+        Item identity is ``(source_key, repo)`` — the table says so — but
+        ``item_id`` is a global primary key, and a single-repo daemon mints
+        the unqualified form (``gh:issue:24``) that encodes only the number.
+        Those two facts collide the moment one number is used by two
+        repositories, which is not a multi-repo daemon's problem alone: a
+        daemon repointed at a new repository (``[github] repo``) leaves the
+        old repository's rows behind under the same unqualified namespace.
+        The insert then fails the primary key and, before this, took the
+        whole daemon down with it on every tick.
+
+        The caller has already established that this repository has no row
+        for the issue, so a row squatting the bare id belongs to a different
+        repository and the incoming item takes the qualified spelling
+        instead. The common case — nothing there — keeps the bare id, so
+        existing state, watches and operator commands resolve unchanged.
+
+        Both unqualified spellings are checked, because both are squatters:
+        the typed ``gh:issue:24`` would not fail the primary key against a
+        legacy bare ``gh:24`` row, but :func:`_id_variants` resolves the two
+        to each other, so leaving it unqualified would make one lookup match
+        two repositories' rows.
+        """
+        parsed = try_parse_gh_id(item_id)
+        if parsed is None or parsed.repo is not None or not repo:
+            # Not a GitHub id, already qualified, or no repository to
+            # qualify with: nothing to disambiguate it from.
+            return item_id
+        owner = session.scalars(
+            select(WorkItemRow.repo).where(_id_where(item_id), WorkItemRow.repo != repo).limit(1)
+        ).first()
+        if owner is None:
+            return item_id
+        qualified = format_gh_id(parsed.kind, parsed.number, repo=repo)
+        log.info(
+            "store.item_id_qualified",
+            item=qualified,
+            bare=item_id,
+            held_by=owner,
+            reason="the unqualified id is held by another repository's row",
+        )
+        return qualified
 
     # -- prior attempts (durable across row deletion) -------------------------
 
