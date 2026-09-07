@@ -48,6 +48,9 @@ ROLE_BY_PHASE: dict[str, Role] = {
     "operator_plan": "operator",
     "operator_execute": "operator",
     "operator_judge": "critic",
+    # Judging a check rather than the work, and modifying neither: the
+    # critic's briefing is the one that says so.
+    "reauthor_verify": "critic",
 }
 
 _HEAD = """\

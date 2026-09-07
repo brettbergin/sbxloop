@@ -275,6 +275,17 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "workload_label": "sbxloop:workload",
         "workloads": "- `research`: sinks chat, issue",
     },
+    # The one phase that edits the exam rather than the work.
+    "reauthor_verify": {
+        "task_title": "t1: T",
+        "task_description": "d",
+        "acceptance_criteria": "- a",
+        "suspect_command": "check --thing",
+        "suspect_output": "(no output at all)",
+        "other_commands": "- other --check",
+        "builder_report": "r",
+        "gate_rule": "",
+    },
     # The workload's actors (#756): the operator plans and executes, the
     # judge decides.
     "operator_plan": {

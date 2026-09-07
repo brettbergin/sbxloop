@@ -231,6 +231,30 @@ class TaskSpec(_Model):
     needs: TaskNeeds = Field(default_factory=TaskNeeds)
 
 
+class VerifyReauthor(_Model):
+    """What the re-author phase decided about one suspect verify command.
+
+    Scoped to a single command on purpose: the phase is handed the one check
+    that proved unpassable, and the rest of the task's exam is not its to
+    edit. A model that could rewrite the whole set could quietly delete the
+    checks the work fails, which is the failure mode this whole path exists
+    to avoid.
+    """
+
+    verdict: Literal["replace", "drop", "keep"]
+    # The replacement check. Required for "replace"; ignored otherwise.
+    command: str = ""
+    # One sentence, carried into the run's report. For "drop" it names the
+    # property that is no longer being tested, so a human knows to look.
+    reason: str = ""
+
+    @model_validator(mode="after")
+    def _replacement_present(self) -> VerifyReauthor:
+        if self.verdict == "replace" and not self.command.strip():
+            raise ValueError('verdict "replace" needs a command to replace it with')
+        return self
+
+
 class TaskGraph(_Model):
     tasks: list[TaskSpec]
     # The pull request's title in the repository's own commit-subject
@@ -435,6 +459,9 @@ class TaskRecord(_Model):
     # Set once a fingerprint repeats: the check, not the code, is the thing
     # to change, and no further identical revision is spent.
     verify_suspect: bool = False
+    # How many of this task's verify commands have been re-authored after
+    # proving unpassable, against budgets.max_verify_reauthors_per_task.
+    verify_reauthors: int = 0
     # A workload task's result (#757); None for a code run's tasks, whose
     # result is the tree the build left behind.
     output: TaskOutput | None = None

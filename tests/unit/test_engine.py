@@ -91,6 +91,11 @@ def task(
 # BUILD plans and executes in one session and reports in prose (expect=text),
 # so one scripted entry covers one whole task attempt.
 BUILD = {"text": "work complete, files changed"}
+# The re-author phase's answer when the check is right and the work is not.
+# A suspect verify asks it before spending the fresh-session replan, so a
+# script that drives a task to verify-suspect needs one of these; "keep" is
+# the verdict that leaves the loop on the path these tests predate.
+KEEP_VERIFY = {"json": {"verdict": "keep", "command": "", "reason": "the check is right"}}
 # A delivery needs something to deliver: the pipeline tests' builder writes
 # a file (the workspace is a plain directory, so delivery snapshots it).
 FILES_BUILD = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
@@ -435,7 +440,8 @@ class TestReviseAndVerify:
             [
                 taskgraph(task("t1", verify=["test -f done.txt"])),
                 BUILD,
-                BUILD,  # same failure twice -> verify-suspect replan, fresh session
+                BUILD,  # same failure twice -> verify-suspect
+                KEEP_VERIFY,  # the check stands -> replan, fresh session
                 {"text": "fresh approach, wrote done.txt", "files": {"done.txt": "ok\n"}},
             ]
         )
@@ -460,7 +466,9 @@ class TestReviseAndVerify:
         # A verify command no attempt can satisfy: revisions burn, one
         # fresh-session replan burns, then the task fails — the loop is
         # bounded.
-        harness.script([taskgraph(task("t1", verify=["false"])), *([BUILD] * 6)])
+        harness.script(
+            [taskgraph(task("t1", verify=["false"])), BUILD, BUILD, KEEP_VERIFY, *([BUILD] * 6)]
+        )
         result = harness.engine().start("verify never passes")
         assert result.state == "failed"
         assert "verify command that never changed its result" in (result.reason or "")
