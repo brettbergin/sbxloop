@@ -28,6 +28,11 @@ Inside the home:
 
 ## Getting to a first run
 
+To inspect pending work, use `sbx_control` with `queue`. To change its order,
+use `move <item> before <other-item>` or `move <item> after <other-item>`.
+Both items must be queued, unclaimed, and have no pinned run. The move is
+durable and does not interrupt active work or bypass retry backoff.
+
 There are four steps, and people usually get stuck on the third.
 
 1. **Install.** The install script builds the home in one command; someone

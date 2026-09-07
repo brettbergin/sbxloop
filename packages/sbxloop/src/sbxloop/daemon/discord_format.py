@@ -2245,9 +2245,10 @@ def queue_lines(items: list[WorkItem], limit: int = 15) -> str:
     if not items:
         return "queue is empty."
     rows = [
-        f"• {_item_code(i)} "
+        f"{position}. {_item_code(i)} "
         + (link(_one_line(i.title, 80), i.url) if i.url else _one_line(i.title, 80))
-        for i in items[:limit]
+        + (" (resume)" if i.run_id else "")
+        for position, i in enumerate(items[:limit], 1)
     ]
     if len(items) > limit:
         rows.append(f"… and {len(items) - limit} more")

@@ -109,6 +109,11 @@ class WorkItem(BaseModel):
     prior_pr_number: int | None = None
     kind: RunKind = "code"
     profile: str | None = None
+    # Admission identity is assigned by the store, independent of clocks.
+    # Moving pending work changes queue_order, never enqueue_seq. Zero is
+    # the unpersisted source item's default; persisted rows are positive.
+    enqueue_seq: int = 0
+    queue_order: int = 0
 
     @property
     def restarted(self) -> bool:
@@ -240,6 +245,7 @@ NoticeKind = Literal[
     "workspace.refresh_failed",
     "workspace.cloned",
     "item.queued",
+    "item.moved",
     "item.claim_failed",
     "recovery.claim_settled",
     "item.abandoned",

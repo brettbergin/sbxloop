@@ -31,6 +31,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
@@ -800,6 +801,8 @@ def _row_to_item(row: WorkItemRow) -> WorkItem:
         prior_pr_number=row.prior_pr_number,
         kind=cast("RunKind", row.run_kind or "code"),
         profile=row.profile,
+        enqueue_seq=row.enqueue_seq or 0,
+        queue_order=row.queue_order or 0,
     )
 
 
@@ -1288,6 +1291,7 @@ class DaemonStore:
         _refuse_pre_1_0(path)
         self._engine = open_engine(path)
         ensure_schema(self._engine)
+        self._backfill_queue_order()
         # Not part of the schema, and so not behind its version: a stamped
         # database still has to carry a prompt an older daemon wrote back
         # onto a gate row. See `carry_gate_prompts`.
@@ -1307,13 +1311,18 @@ class DaemonStore:
         self._engine.dispose()
 
     @contextmanager
-    def _write(self) -> Iterator[Session]:
+    def _write(self, *, immediate: bool = False) -> Iterator[Session]:
         """A session that commits on the way out, under the store's lock.
 
         Every statement in the block is one transaction, so the pairs that
         have to move together — an item's state and its ledger row — either
         both land or neither does.
         """
+        if immediate:
+            with self._lock, begin_immediate(self._engine) as conn, Session(conn) as session:
+                yield session
+                session.flush()
+            return
         with self._lock, Session(self._engine) as session:
             yield session
             session.commit()
@@ -1505,6 +1514,50 @@ class DaemonStore:
 
     # -- work items ----------------------------------------------------------
 
+    @staticmethod
+    def _allocate_queue_order(session: Session) -> tuple[int, int]:
+        """Allocate under the caller's immediate transaction, including the
+        durable high-water mark so deleting the newest item cannot reuse
+        its admission number."""
+        previous = session.scalar(
+            select(DaemonStateRow.value).where(DaemonStateRow.key == "queue_enqueue_seq")
+        )
+        highest = session.scalar(select(func.max(WorkItemRow.enqueue_seq))) or 0
+        sequence = max(int(previous or 0), highest) + 1
+        order = (session.scalar(select(func.max(WorkItemRow.queue_order))) or 0) + 1
+        statement = sqlite_insert(DaemonStateRow).values(
+            key="queue_enqueue_seq", value=str(sequence)
+        )
+        session.execute(
+            statement.on_conflict_do_update(
+                index_elements=["key"], set_={"value": statement.excluded.value}
+            )
+        )
+        return sequence, order
+
+    def _backfill_queue_order(self) -> None:
+        """An older release may have inserted rows during a rollback.
+        Assign them once on the next writable open, retaining their FIFO.
+        The migration itself handles every row present at first upgrade."""
+        with self._write(immediate=True) as session:
+            rows = list(
+                session.scalars(
+                    select(WorkItemRow)
+                    .where(WorkItemRow.enqueue_seq.is_(None) | WorkItemRow.queue_order.is_(None))
+                    .order_by(WorkItemRow.created_at.asc(), text("rowid ASC"))
+                )
+            )
+            for row in rows:
+                sequence, order = self._allocate_queue_order(session)
+                session.execute(
+                    update(WorkItemRow)
+                    .where(WorkItemRow.item_id == row.item_id)
+                    .values(
+                        enqueue_seq=row.enqueue_seq if row.enqueue_seq is not None else sequence,
+                        queue_order=row.queue_order if row.queue_order is not None else order,
+                    )
+                )
+
     def upsert_new(self, item: WorkItem, now: float) -> bool:
         """Record a discovered item; True if it is work to dispatch now.
 
@@ -1528,7 +1581,7 @@ class DaemonStore:
         The requester the concierge recorded for the issue, if any, is
         copied onto the item.
         """
-        with self._write() as session:
+        with self._write(immediate=True) as session:
             repo = item.repo or ""
             # Identity is (issue, repository), matched exactly — with one
             # concession: an item whose id is *unqualified* can only come
@@ -1616,6 +1669,7 @@ class DaemonStore:
             # being lost with the row (#600).
             item_id = normalize_item_id(item.item_id)
             prior = self._recover_prior(session, item.source_key, repo, item_id)
+            sequence, order = self._allocate_queue_order(session)
             session.execute(
                 insert(WorkItemRow).values(
                     item_id=item_id,
@@ -1637,6 +1691,8 @@ class DaemonStore:
                     prior_pr_number=prior.pr_number if prior else None,
                     run_kind=item.kind,
                     profile=item.profile,
+                    enqueue_seq=sequence,
+                    queue_order=order,
                 )
             )
             if prior is not None:
@@ -1968,10 +2024,7 @@ class DaemonStore:
             return _row_to_item(row) if row else None
 
     def next_queued(self, now: float, backoff_s: float) -> WorkItem | None:
-        """Oldest queued item whose retry backoff (attempts * backoff) has
-        elapsed since its last update. Ties on ``created_at`` (a batch
-        upserted with one ``now``) break on insertion order (rowid), so
-        dispatch is genuinely FIFO.
+        """First item in the persisted order whose retry backoff elapsed.
 
         A queued item that still carries a ``run_id`` is an interrupted run
         awaiting resume (see :meth:`mark_resume_pending`): it was in flight
@@ -1985,21 +2038,41 @@ class DaemonStore:
 
     def queued_in_order(self) -> list[WorkItem]:
         """Every queued item in the order :meth:`next_queued` considers them:
-        interrupted runs awaiting resume first, then FIFO."""
+        interrupted runs awaiting resume first, then persisted queue order."""
         with self._read() as session:
-            # rowid breaks ties within a timestamp, keeping insertion order.
-            return [
-                _row_to_item(row)
-                for row in session.scalars(
-                    select(WorkItemRow)
-                    .where(WorkItemRow.state == "queued")
-                    .order_by(
-                        WorkItemRow.run_id.is_(None).asc(),
-                        WorkItemRow.created_at.asc(),
-                        text("rowid ASC"),
-                    )
-                )
-            ]
+            return [_row_to_item(row) for row in session.scalars(self._queued_query())]
+
+    @staticmethod
+    def _queued_query() -> Select[tuple[WorkItemRow]]:
+        """One ordering rule for display, inspection and claim reservation."""
+        return (
+            select(WorkItemRow)
+            .where(WorkItemRow.state == "queued")
+            .order_by(
+                WorkItemRow.run_id.is_(None).asc(),
+                WorkItemRow.queue_order.asc(),
+                WorkItemRow.enqueue_seq.asc(),
+            )
+        )
+
+    def reserve_next_queued(self, now: float, backoff_s: float) -> WorkItem | None:
+        """Select eligible work and reserve its claim in one transaction.
+
+        A move either commits first and determines this selection, or sees
+        the selected item's persisted token and refuses. Keeping the token
+        on the item also uses the ordinary half-claim recovery if the daemon
+        dies before posting its claim. Existing tokens, claim ownership and
+        retry timestamps are unchanged.
+        """
+        with self._write(immediate=True) as session:
+            for row in session.scalars(self._queued_query()):
+                item = _row_to_item(row)
+                if dispatch_eligible_at(item, backoff_s) > now:
+                    continue
+                if not item.claimed and not item.claim_token:
+                    row.claim_token = uuid.uuid4().hex
+                return _row_to_item(row)
+            return None
 
     def run_items(self) -> dict[str, str]:
         """``run_id -> item_id`` for every run the daemon dispatched (the ledger)."""
@@ -2012,15 +2085,58 @@ class DaemonStore:
             }
 
     def queued(self) -> list[WorkItem]:
-        with self._read() as session:
-            return [
-                _row_to_item(row)
-                for row in session.scalars(
+        """The same order the scheduler considers, including pinned resumes."""
+        return self.queued_in_order()
+
+    def move_queued(
+        self, item_id: str, *, before: str | None = None, after: str | None = None
+    ) -> WorkItem:
+        """Move unclaimed pending work relative to another pending item.
+
+        Reuse the pending items' order slots so claimed work and pinned
+        resumes keep their slots. Neither admission identity nor retry
+        timestamps change. Validation and the permutation commit together.
+        """
+        if (before is None) == (after is None):
+            raise ValueError("provide exactly one of before or after")
+        anchor = before if before is not None else after
+        assert anchor is not None
+        with self._write(immediate=True) as session:
+            moving = session.scalars(select(WorkItemRow).where(_id_where(item_id))).first()
+            target = session.scalars(select(WorkItemRow).where(_id_where(anchor))).first()
+            for key, row in ((item_id, moving), (anchor, target)):
+                if row is None:
+                    raise KeyError(f"unknown work item {key!r}")
+                if row.state != "queued" or row.claimed or row.run_id or row.claim_token:
+                    raise ValueError(
+                        f"{key}: only unclaimed queued items without a pinned run can move"
+                    )
+            assert moving is not None and target is not None
+            if moving.item_id == target.item_id:
+                raise ValueError("an item cannot be moved relative to itself")
+            pending = list(
+                session.scalars(
                     select(WorkItemRow)
-                    .where(WorkItemRow.state == "queued")
-                    .order_by(WorkItemRow.created_at.asc(), text("rowid ASC"))
+                    .where(
+                        WorkItemRow.state == "queued",
+                        WorkItemRow.claimed == 0,
+                        WorkItemRow.run_id.is_(None),
+                        WorkItemRow.claim_token.is_(None),
+                    )
+                    .order_by(WorkItemRow.queue_order.asc(), WorkItemRow.enqueue_seq.asc())
                 )
-            ]
+            )
+            slots = [row.queue_order for row in pending]
+            pending.remove(moving)
+            pending.insert(pending.index(target) + (after is not None), moving)
+            for row, order in zip(pending, slots, strict=True):
+                if row.queue_order != order:
+                    session.execute(
+                        update(WorkItemRow)
+                        .where(WorkItemRow.item_id == row.item_id)
+                        .values(queue_order=order)
+                    )
+            return _row_to_item(moving)
 
     def running_items(self) -> list[WorkItem]:
         with self._read() as session:

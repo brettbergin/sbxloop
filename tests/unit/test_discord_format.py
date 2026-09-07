@@ -971,7 +971,7 @@ class TestEmbeds:
         ]
         assert (
             queue_lines(items, limit=2)
-            == "• `gh:issue:1` [T1](https://x/1)\n• `gh:issue:2` [T2](https://x/2)\n… and 1 more"
+            == "1. `gh:issue:1` [T1](https://x/1)\n2. `gh:issue:2` [T2](https://x/2)\n… and 1 more"
         )
 
     def test_daemon_notice_masks_urls(self) -> None:
