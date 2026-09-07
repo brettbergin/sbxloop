@@ -47,7 +47,7 @@ import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import parse_qs, quote, unquote
 
 from sbxloop.errors import GithubOpsError
 from sbxloop.gh.ops import (
@@ -240,6 +240,16 @@ class FakeGithub(GithubOps):
         # single-label GET finds these, and creating one is a 422.
         self.labels_existing: set[str] = set()
         self.existing_issues: list[dict[str, Any]] = []
+        # Exact issue reads, including epic intake: keyed by repository as
+        # well as number so cross-repository mistakes cannot answer silently.
+        self.issue_payloads: dict[tuple[str, int], dict[str, Any]] = {}
+        # Campaign admission needs complete ownership history and actual
+        # label mutations. Values can deliberately be malformed in tests.
+        self.issue_comment_payloads: dict[tuple[str, int], Any] = {}
+        self.issue_event_payloads: dict[tuple[str, int], Any] = {}
+        self.issue_read_scripts: dict[tuple[str, int], list[dict[str, Any]]] = {}
+        self.raw_failures: dict[tuple[str, str], Exception] = {}
+        self.issue_time = "2026-09-07T12:00:00Z"
         self.resolved: list[str] = []
         self._comment_id = 0
         self._commits = 0
@@ -451,6 +461,26 @@ class FakeGithub(GithubOps):
         # list whole, so page one is the list and any later page is empty;
         # routing below matches on the path without its query.
         path, _, query = path.partition("?")
+        failure = self.raw_failures.get((method, path))
+        if failure is not None:
+            self._record_failed_job("raw.api", method, path, failure)
+            raise failure
+        issue_list = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/(comments|events)", path)
+        if method == "GET" and issue_list:
+            key = (issue_list[1], int(issue_list[2]))
+            if key in self.issue_payloads:
+                payloads = (
+                    self.issue_comment_payloads
+                    if issue_list[3] == "comments"
+                    else self.issue_event_payloads
+                )
+                payload = payloads.get(key, [])
+                if not isinstance(payload, list):
+                    return payload
+                params = parse_qs(query)
+                page = int(params.get("page", ["1"])[0])
+                size = int(params.get("per_page", ["30"])[0])
+                return list(payload[(page - 1) * size : page * size])
         if method == "GET" and "page=" in query and not query.endswith("page=1"):
             return []
         if method == "GET" and path == "/user":
@@ -461,6 +491,40 @@ class FakeGithub(GithubOps):
             if self.user_type is not None:
                 user["type"] = self.user_type
             return user
+        issue_match = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)", path)
+        if method == "GET" and issue_match:
+            key = (issue_match[1], int(issue_match[2]))
+            script = self.issue_read_scripts.get(key)
+            if script:
+                self.issue_payloads[key] = script.pop(0) if len(script) > 1 else script[0]
+            if key not in self.issue_payloads:
+                raise self._failed(
+                    "raw.api", method, path, 404, f"issue {key} not found (HTTP 404)"
+                )
+            return dict(self.issue_payloads[key])
+        issue_labels = re.fullmatch(r"/repos/([^/]+/[^/]+)/issues/(\d+)/labels(?:/(.+))?", path)
+        if issue_labels:
+            key = (issue_labels[1], int(issue_labels[2]))
+            if key in self.issue_payloads:
+                names = {label["name"] for label in self.issue_payloads[key].get("labels", [])}
+                if method == "POST":
+                    assert body is not None
+                    for label in body["labels"]:
+                        if label not in names:
+                            self.issue_event_payloads.setdefault(key, []).append(
+                                {
+                                    "event": "labeled",
+                                    "created_at": self.issue_time,
+                                    "label": {"name": label},
+                                }
+                            )
+                        names.add(label)
+                elif method == "DELETE" and issue_labels[3] is not None:
+                    names.discard(unquote(issue_labels[3]))
+                else:
+                    raise AssertionError(f"FakeGithub: unexpected issue label call {method} {path}")
+                self.issue_payloads[key]["labels"] = [{"name": name} for name in sorted(names)]
+                return list(self.issue_payloads[key]["labels"])
         if method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+", path):
             # The repository itself, whichever one the run names: the fake
             # answers for every repository with its one payload (#607).
@@ -642,6 +706,16 @@ class FakeGithub(GithubOps):
     def issue_comment(self, repo: str, number: int, body: str) -> str:
         self._maybe_fail("issue_comment")
         self.issue_answers.append((number, body))
+        key = (repo, number)
+        if key in self.issue_payloads:
+            self.issue_comment_payloads.setdefault(key, []).append(
+                {
+                    "id": len(self.issue_answers),
+                    "body": body,
+                    "created_at": self.issue_time,
+                    "user": {"login": self.user_login},
+                }
+            )
         return f"https://github.com/{repo}/issues/{number}#issuecomment-{len(self.issue_answers)}"
 
     def pr_get(self, repo: str, number: int) -> dict[str, Any]:

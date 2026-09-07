@@ -33,6 +33,15 @@ use `move <item> before <other-item>` or `move <item> after <other-item>`.
 Both items must be queued, unclaimed, and have no pinned run. The move is
 durable and does not interrupt active work or bypass retry backoff.
 
+For an explicitly ordered set of queued, unstarted items, use `sbx_control`
+with `campaign start <name> <item> <item> ...`. Inspect `campaigns <name>`
+for progress and blockers. Use `campaign hold <name> [reason]`,
+`campaign resume <name>`, or
+`campaign move <name> <item> before|after <other-item>` when the operator asks
+to steer it. A campaign advances only after verified delivery; resuming it
+does not release a run's gate or retry a failed item. Use the ordinary item
+controls for those actions. Do not infer a dependency order from issue numbers.
+
 There are four steps, and people usually get stuck on the third.
 
 1. **Install.** The install script builds the home in one command; someone

@@ -1123,15 +1123,16 @@ leftover of the layouts the home replaced. `sbxloop init` builds it (`homeinit.p
 ## Persistence and resume
 
 `~/.sbxloop/state/state.db` (the home's `state/`, see *The home* below) is one
-WAL-mode SQLite database holding **nineteen** tables, and two stores read it
+WAL-mode SQLite database holding **twenty-one** tables, and three stores read it
 through separate connections. `StateStore` owns five — `runs`, `tasks`,
 `phase_attempts`, `reconciliations`, `events` — and `DaemonStore` the
 fourteen `daemon_*` ones (the queue, the run ledger, the resume budget,
 key/value state, run watches, requesters, prior attempts, chat threads,
 merge gates and their prompts, review holds, pending clarifications, the
-operator console's mailbox and the schedules).
+operator console's mailbox and the schedules). `CampaignStore` owns the two
+campaign tables: admitted plans and their ordered steps with delivery evidence.
 
-Both are SQLAlchemy models under `sbxloop/db/` (#539), and Alembic owns the
+All use SQLAlchemy models under `sbxloop/db/` (#539), and Alembic owns the
 upgrade path — one revision chain for the whole file, applied when a store
 opens it, so an unattended daemon still migrates itself with no operator
 step. Revision 0001 is not a schema: it is the hand-written migrator both
@@ -1455,6 +1456,40 @@ queue order. Retry eligibility still decides whether a candidate can run.
 The shared `move <item> before|after <item>` control moves only unclaimed,
 unpinned queued items, preserves retry timestamps, and narrates the caller
 and relative placement. It performs no source mutation.
+
+Serial campaigns sit outside the run engine. `daemon/campaigns.py` owns an
+immutable admission plan, mutable step positions, holds, and append-only
+delivery evidence in additive `daemon_campaign*` tables. Admission validates
+the whole plan and absorbs pristine queued rows atomically; membership uses
+repository-qualified canonical identities. The original ask, run kind,
+workload profile, explicit prerequisites, and intended code base are saved.
+Changing position does not change identity or scope. Completed and started
+steps cannot move, and a move cannot put an explicit prerequisite after its
+dependent.
+
+`daemon/campaign_runner.py` prepares admitted sources, reconciles actual run
+delivery, and enqueues only the first unfinished step. The loop serializes
+controls, preparation, discovery, and reservation with one campaign lock,
+released before the engine runs. Discovery and reservation both check
+membership, so labeling a later member does not bypass the frontier. Manual
+holds and automatic blockers are separate: resuming a hold cannot waive
+missing evidence. On restart, reconciliation recovers successful delivery
+before making another step ready. A reporting failure cannot erase delivery.
+
+Code evidence requires a merged run and a GitHub PR whose repository, base,
+and merge commit match the admitted target. Workload evidence requires a
+completed run, complete task records, and publication receipts covering their
+outputs and sinks. Neither an issue's closed state nor a work item's `done`
+state is sufficient. This leaves both run kinds and their existing stage
+machines unchanged.
+
+`daemon/campaign_source.py` resolves each member's configured GitHub source,
+checks the current trigger epoch and claim comments, and parks or prepares
+the correct run-kind label. Admission is durable before label writes; partial
+preparation holds the campaign and is retried explicitly. GitHub label writes
+are nonconditional: a foreign daemon can race the ownership read. Normal
+source claim arbitration still applies; a failed claim retains campaign
+membership and holds it for reconciliation. No cross-host atomicity is claimed.
 
 `sbxloop daemon` is deliberately small: it claims issues carrying
 `sbxloop:run` in **every configured, enabled repository** (a label swap plus
