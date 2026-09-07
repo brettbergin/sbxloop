@@ -127,6 +127,27 @@ Step by step:
    `sbxloop daemon notify`, including how long it waited and whether a failure happened
    before anything was installed.
 
+## What rollback means for the schema
+
+Step 6 is the reason the database migrations are **additive only**.
+
+A rollback reinstalls the previous version and restarts it against the database the new
+one already migrated. It does **not** restore the snapshot step 3 took — that snapshot is
+there for an operator to reach for deliberately, not for the job to unwind with. So the
+version being rolled back to has to keep reading the file correctly.
+
+In practice that means a revision may add a table, or add a column that is nullable or
+carries a default. It may not rename, drop or retype anything the previous version reads.
+Where a column replaces an older one, the release that adds it keeps writing both, and
+only a later release — once no deployed version depends on the old shape — stops.
+`reconciliations.kind` is the worked example: it names what a row is about, while `round`
+goes on carrying the sentinel the previous version reads.
+
+The store applies migrations when it opens the database, so there is no step to add here
+and nothing to run by hand. `tests/unit/test_db_schema.py` holds the check: a database
+written by a released version is migrated, read back, written to, and then handed to the
+*previous* version's migrator, which must find nothing to do.
+
 Two settings, and no names in the file:
 
 - The repository variable **`SBXLOOP_DEPLOY_HOST`** is the runner label the job targets
