@@ -1919,6 +1919,33 @@ def _migrate_home(
     say("next: `sbxloop doctor`")
 
 
+@app.command("update")
+def update_command(
+    check: Annotated[
+        bool, typer.Option("--check", help="Compare versions without installing anything.")
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Check versions and show the installation command.")
+    ] = False,
+) -> None:
+    """Check PyPI and update this home's sbxloop and worker to the latest release."""
+    from sbxloop.update import UpdateError, update_home
+
+    if check and dry_run:
+        console.print("choose either --check or --dry-run", markup=False)
+        raise typer.Exit(2)
+    try:
+        update_home(
+            SbxloopHome(resolve_home_root()),
+            check=check,
+            dry_run=dry_run,
+            say=lambda line: console.print(line, markup=False, soft_wrap=True),
+        )
+    except UpdateError as exc:
+        console.print(f"update failed: {exc}", markup=False, soft_wrap=True)
+        raise typer.Exit(1) from exc
+
+
 backup_app = typer.Typer(
     help="Snapshots of the home's config, secrets, units and state.db.",
     invoke_without_command=True,
