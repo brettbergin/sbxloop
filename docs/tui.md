@@ -138,9 +138,26 @@ an empty screen.
 
 ### Runs and a run
 
-Runs lists every run newest first: id, state (the reason dimmed after it,
-as `sbxloop status` prints it), stage, item, repository, title, PR, review
-and CI rounds, last update. A run has six tabs:
+Runs lists every run the store knows, **most recently touched first** with
+the run in flight pinned on top — observing wants the live one, reviewing
+wants what moved. Ordering by when a run *started* buried a run that began
+on Tuesday and merged this morning under runs that had not moved in days,
+and applied its limit the same way.
+
+Columns: run, state, title, updated, PR, turns, took, stage, rounds, item,
+repo — dropped weakest-first as the terminal narrows rather than
+overflowing, and each cell held to its column's width. The state is a
+**word**: its reason used to be appended inline and unclipped, and a
+409-character `github op` error sized the column and pushed the other
+eight off the screen. The reason now appears **in full** under the table
+for the row the cursor is on, along with the branch, the pull request URL
+and whatever exhausted the run.
+
+`/` filters on any of it — including the reason, which is searchable even
+though it is no longer on the row. `Enter` opens the run; `p` opens its
+pull request (on a host with no browser the outcome carries the URL).
+
+A run has six tabs:
 
 - **Thread** — the run's transcript: the same renderers `sbxloop run --tui` uses (agent messages as Markdown panels, tool calls as lines,
   failed calls with their excerpt), tailed from the persisted events.

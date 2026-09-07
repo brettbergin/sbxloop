@@ -628,6 +628,41 @@ class StateStore:
         rows = self._conn.execute("SELECT * FROM runs ORDER BY created_at DESC").fetchall()
         return [self._run_record(row) for row in rows]
 
+    def recent_runs(self, limit: int = 200) -> list[RunRecord]:
+        """The runs touched most recently, newest first.
+
+        Not the ones *started* most recently: a run merged this morning
+        that began on Tuesday is the interesting one, and ordering by
+        ``created_at`` buries it under runs that have not moved since. The
+        limit is applied to this order too, so a long-running run cannot
+        fall off the end of the list while it is still being worked on."""
+        rows = self._conn.execute(
+            "SELECT * FROM runs ORDER BY updated_at DESC LIMIT ?", (limit,)
+        ).fetchall()
+        return [self._run_record(row) for row in rows]
+
+    def run_costs(self, run_ids: Sequence[str]) -> dict[str, tuple[int, float]]:
+        """Turns and working seconds for each of ``run_ids`` — one grouped
+        query, not one per run, because this is on the console's poll."""
+        ids = list(run_ids)
+        if not ids:
+            return {}
+        # The ids go in as one bound JSON array rather than as a generated
+        # list of placeholders: the statement is static, and a long list
+        # cannot run into SQLite's variable limit.
+        rows = self._conn.execute(
+            """
+            SELECT run_id,
+                   COALESCE(SUM(turns), 0) AS turns,
+                   COALESCE(SUM(ended_at - started_at), 0.0) AS active
+              FROM phase_attempts
+             WHERE run_id IN (SELECT value FROM json_each(?))
+             GROUP BY run_id
+            """,
+            (json.dumps(ids),),
+        ).fetchall()
+        return {str(r["run_id"]): (int(r["turns"]), float(r["active"])) for r in rows}
+
     # -- windows, for the console's analytics ------------------------------
     #
     # Both fold in SQL rather than in Python. The console recomputes these

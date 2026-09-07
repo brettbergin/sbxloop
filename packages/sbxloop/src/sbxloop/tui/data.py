@@ -110,6 +110,9 @@ class RunsSnapshot:
     item_by_run: dict[str, str]
     repo_by_item: dict[str, str]
     last_event_by_run: dict[str, float]
+    #: Turns spent and seconds worked, per run — what a run cost, beside
+    #: what it did.
+    cost_by_run: dict[str, tuple[int, float]] = field(default_factory=dict)
 
     def item_for(self, run_id: str) -> str | None:
         return self.item_by_run.get(run_id)
@@ -117,6 +120,9 @@ class RunsSnapshot:
     def repo_for(self, run_id: str) -> str | None:
         item = self.item_by_run.get(run_id)
         return self.repo_by_item.get(item) if item else None
+
+    def cost_for(self, run_id: str) -> tuple[int, float]:
+        return self.cost_by_run.get(run_id, (0, 0.0))
 
 
 def build_runs(mailbox: MailboxClient, *, limit: int = 200) -> RunsSnapshot:
@@ -133,7 +139,8 @@ def build_runs(mailbox: MailboxClient, *, limit: int = 200) -> RunsSnapshot:
         if item.run_id:
             item_by_run[item.run_id] = item.item_id
     last = mailbox.last_event_ts_many([r.run_id for r in runs[:30]])
-    return RunsSnapshot(runs, item_by_run, repo_by_item, last)
+    costs = mailbox.run_costs([r.run_id for r in runs])
+    return RunsSnapshot(runs, item_by_run, repo_by_item, last, costs)
 
 
 @dataclass(frozen=True)

@@ -28,10 +28,28 @@ class ConsoleTable(DataTable[Any]):
         self._column_keys: list[ColumnKey] = []
         self._keys: list[str] = []
         self._cells: dict[str, tuple[Any, ...]] = {}
+        #: A row to put the cursor back on after the columns change.
+        self._restore: str | None = None
 
     def on_mount(self) -> None:
         if self._columns and not self.columns:
             self._column_keys = self.add_columns(*self._columns)
+
+    def set_columns(self, *columns: str) -> None:
+        """Replace the columns, keeping the cursor on its row.
+
+        A screen whose columns depend on the terminal's width rebuilds them
+        on resize; the rows are re-supplied by the next ``replace_rows``,
+        so this only has to forget what it cached about the old shape."""
+        if columns == self._columns and self._column_keys:
+            return
+        selected = self.selected_key()
+        self._columns = columns
+        self.clear(columns=True)
+        self._column_keys = self.add_columns(*columns) if columns else []
+        self._keys = []
+        self._cells = {}
+        self._restore = selected
 
     def replace_rows(self, rows: Iterable[tuple[str, Sequence[Any]]]) -> None:
         """Rows keyed by an id. When the key order is unchanged — the usual
@@ -49,7 +67,8 @@ class ConsoleTable(DataTable[Any]):
                     self.update_cell(key, column_key, value)
                 self._cells[key] = cells
             return
-        selected = self.selected_key()
+        selected = self.selected_key() or self._restore
+        self._restore = None
         scroll_y = self.scroll_y
         self.clear()
         self._keys = []

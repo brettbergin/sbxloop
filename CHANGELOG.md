@@ -15,7 +15,36 @@
   screen rather than the `repr` behind it, and the value column is bounded
   so the source column survives beside the console's rail at 120 columns.
 
+- **The Runs screen showed two columns.** Nine were defined — run, state,
+  stage, item, repo, title, PR, rounds, updated — but the state cell
+  carried its failure reason inline and unclipped, so a 409-character
+  `github op` error sized that column and pushed every other one off the
+  screen. The tab was an id and a state; the title, the pull request and
+  the age were all defined and none of them were visible.
+
+  The state is a word now. Its reason appears **in full** under the table
+  for the row the cursor is on, with the branch, the PR URL and whatever
+  exhausted the run — and it stays searchable by `/` even though it is no
+  longer on the row. Columns drop weakest-first as the terminal narrows
+  instead of overflowing, and each cell is held to its column's width, so
+  no single long value can take the space budgeted to the rest.
+
+- **Runs were ordered by the wrong clock.** The list came back
+  newest-*started* first while its last column showed when each run was
+  last *touched*: on the field host 9 of 47 runs sat in a different place
+  under the two orders, and a run that began on Tuesday and merged this
+  morning was far down a list whose own row said "2m ago". The limit was
+  applied to that order too, so a long-lived run could fall off the end
+  while it was still being worked on. `StateStore.recent_runs` orders and
+  limits by `updated_at`, and the screen pins the run in flight on top.
+
 ### Added
+
+- **Runs shows what a run cost.** Turns spent and time worked, per run, in
+  the list — `StateStore.run_costs` folds them in one grouped query rather
+  than one per run. `p` opens a run's pull request; on a host with no
+  browser the outcome carries the URL, which is what an operator on the
+  other end of an ssh session needs.
 
 - **The Overview pages carry real analysis now.** They shipped filling
   15–22% of the screen: five pages behind a rail, for content that would
