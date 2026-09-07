@@ -119,6 +119,9 @@ class PhaseAttempt(Base):
     """
 
     __tablename__ = "phase_attempts"
+    # Every read but one filters on `run_id` and orders by `id` descending;
+    # without this each was a scan of every attempt ever recorded.
+    __table_args__ = (Index("idx_phase_attempts_lookup", "run_id", "task_id", "phase", "id"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, nullable=True)
     run_id: Mapped[str] = mapped_column(Text, nullable=False)

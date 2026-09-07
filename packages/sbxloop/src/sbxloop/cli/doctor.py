@@ -14,7 +14,6 @@ import getpass
 import json
 import os
 import shutil
-import sqlite3
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -23,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 from rich.table import Table
+from sqlalchemy.exc import SQLAlchemyError
 
 import sbxloop
 from sbxloop import toolchains
@@ -30,7 +30,7 @@ from sbxloop.backends import backend_for
 from sbxloop.config import Config, MergeMethod, RepoConfig, load_config, load_config_with_sources
 from sbxloop.engine.landing import allowed_merge_methods, resolve_merge_method
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError
+from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError, StateError
 from sbxloop.gh.labels import lifecycle_specs, missing_labels
 from sbxloop.gh.ops import GithubOps
 from sbxloop.gh.permissions import (
@@ -172,7 +172,9 @@ def daemon_repo_health(
         return {}
     out: dict[str, dict[str, Any]] = {}
     try:
-        store = DaemonStore(db)
+        # Read-only: doctor runs while the daemon is live, and a diagnostic
+        # that migrates the schema out from under it is not a diagnostic.
+        store = DaemonStore(db, readonly=True)
         try:
             for key, value in store.values_with_prefix(REPO_HEALTH_KEY).items():
                 try:
@@ -914,7 +916,7 @@ def stored_schedules(config: Config) -> list[Any]:
     if not db.is_file():
         return []
     try:
-        store = DaemonStore(db)
+        store = DaemonStore(db, readonly=True)
         try:
             return list(store.schedules())
         finally:
@@ -1046,8 +1048,15 @@ def collect_checks(
         if logged_in:
             report("checking for orphaned sandboxes")
             try:
-                orphans = count_orphans(cli, StateStore(config.paths.state_db))
-            except (SbxError, OSError, sqlite3.Error):
+                # Read-only for the same reason, and closed either way: a
+                # store left open here would hold the connection for the
+                # rest of the command.
+                store = StateStore(config.paths.state_db, readonly=True)
+                try:
+                    orphans = count_orphans(cli, store)
+                finally:
+                    store.close()
+            except (SbxError, OSError, StateError, SQLAlchemyError):
                 orphans = None
             if orphans is not None:
                 checks.append(
