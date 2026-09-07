@@ -14,8 +14,10 @@ import getpass
 import json
 import os
 import shutil
+import tempfile
 import time
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -188,6 +190,27 @@ def daemon_repo_health(
     except Exception:  # a store doctor cannot read is its own row elsewhere
         return {}
     return out
+
+
+def _count_orphans(cli: SbxCLI, state_db: Path) -> int:
+    """Orphan count, without doctor ever writing to the state database.
+
+    Read-only when the file is there: doctor runs while the daemon is live,
+    and a diagnostic that migrates the schema under it is not a diagnostic.
+    When it is not there, the sandboxes are classified against an empty
+    store in a temporary directory rather than against the real path — a
+    host with no database has recorded no runs, so a sandbox on it is
+    unaccounted for exactly as it always was, and doctor still does not
+    create the file it was asked to inspect.
+    """
+    with ExitStack() as stack:
+        if state_db.is_file():
+            store = StateStore(state_db, readonly=True)
+        else:
+            scratch = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            store = StateStore(scratch / "state.db")
+        stack.callback(store.close)
+        return count_orphans(cli, store)
 
 
 def repo_checks(
@@ -1048,14 +1071,7 @@ def collect_checks(
         if logged_in:
             report("checking for orphaned sandboxes")
             try:
-                # Read-only for the same reason, and closed either way: a
-                # store left open here would hold the connection for the
-                # rest of the command.
-                store = StateStore(config.paths.state_db, readonly=True)
-                try:
-                    orphans = count_orphans(cli, store)
-                finally:
-                    store.close()
+                orphans = _count_orphans(cli, config.paths.state_db)
             except (SbxError, OSError, StateError, SQLAlchemyError):
                 orphans = None
             if orphans is not None:
