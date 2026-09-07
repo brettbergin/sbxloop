@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Literal, NamedTuple
 
 from sbxloop import backends, hostgit, toolchains
-from sbxloop.config import Config, CredentialConfig, RegistryConfig, RepoConfig
+from sbxloop.config import Config, CredentialConfig, RegistryConfig, RepoConfig, SandboxConfig
 from sbxloop.engine.model import RunKind
 from sbxloop.errors import ConfigError, GithubOpsError, ProvisionError, SbxError
 from sbxloop.events import EventBus
@@ -177,6 +177,26 @@ class GhApp:
 
 
 GhCredential = GhPat | GhApp
+
+
+class ContinueBranch(NamedTuple):
+    """Cut the run's clone from ``branch`` — published work to continue —
+    instead of a fresh branch off the base (#646). ``optional`` says an
+    unfetchable branch is survivable: a restart continuing a previous
+    attempt's push (#600) starts fresh with a logged reason, while a
+    resume that must find its own work fails. The engine passes one to
+    :meth:`Provisioner.ensure_pair`; ``[sandbox] continue_branch`` is the
+    operator's way to ask for the same thing by hand."""
+
+    branch: str
+    optional: bool = False
+
+
+def continue_from_config(sandbox: SandboxConfig) -> ContinueBranch | None:
+    """The operator's ``[sandbox] continue_branch`` knob as a parameter."""
+    if not sandbox.continue_branch:
+        return None
+    return ContinueBranch(sandbox.continue_branch, sandbox.continue_branch_optional)
 
 
 class GhCredentialStatus(NamedTuple):
@@ -424,6 +444,9 @@ class Provisioner:
         self.bus = bus or EventBus()
         self.env = os.environ if env is None else env
         self.post_create = post_create
+        # What the next ensure_pair cuts the clone from (#646): the operator's
+        # knob until a caller passes its own.
+        self._continue: ContinueBranch | None = continue_from_config(config.sandbox)
         self._sbx_version: str | None = None
         self._sbx_version_known = False
         # Serializes the version lookup and the cache file's read-modify-
@@ -645,40 +668,8 @@ class Provisioner:
         return SecretSpec(kind="custom", host=host, env=env)
 
     def _agent_secret_specs(self, roles: Sequence[str] | None = None) -> list[SecretSpec]:
-        """Every custom secret the agent sandbox is registered for: the
-        backend's own credential, then one per credentialed ``[[mcp]]``
-        server, each bound to that credential's single host so the proxy
-        substitutes it only in flight to the service it belongs to.
-
-        Config validation already guarantees the env names are distinct and
-        none collides with the backend's, which matters because sbx keys
-        custom secrets by env name and refuses a second registration.
-        """
-        specs = [self._agent_secret_spec()]
-        specs += [
-            SecretSpec(kind="custom", host=host, env=env)
-            for env, host in self.config.mcp_secrets_for(roles)
-        ]
-        return specs
-
-    def mcp_secret_env(self, roles: Sequence[str] | None = None) -> dict[str, str]:
-        """The credential values for the agent sandbox's MCP servers, read
-        from the daemon's environment.
-
-        Every declared name must be set, for the same reason a registry's
-        ``auth_env`` must: the operator said a server needs it, and a run
-        without it fails later, inside a sandbox, as an authentication
-        error nothing on the host explains.
-        """
-        names = [env for env, _ in self.config.mcp_secrets_for(roles)]
-        missing = [name for name in names if not self.env.get(name)]
-        if missing:
-            raise ProvisionError(
-                f"[[mcp]] credential env names {missing} are not set in the daemon's "
-                "environment (secrets.env / the service unit); set them, or drop the "
-                "`credential` from the MCP entries that reference them"
-            )
-        return {name: self.env[name] for name in names}
+        """Only the inference credential belongs in the agent sandbox."""
+        return [self._agent_secret_spec()]
 
     def gh_credential(self, repo: str | None = None) -> GhCredential:
         """The credential the github sandbox authenticates with, scoped to
@@ -819,8 +810,14 @@ class Provisioner:
         expects_mount: bool | None = None,
         credentials: Sequence[str] = (),
         kind: RunKind = "code",
+        continue_branch: ContinueBranch | None = None,
     ) -> SandboxPair:
         """Provision the run's sandbox pair around its workspace.
+
+        ``continue_branch`` (#646) cuts the clone from published work — a
+        restart adopting the branch a previous attempt pushed — instead of
+        a fresh branch off the base; None falls back to the operator's
+        ``[sandbox] continue_branch``.
 
         ``expects_mount`` says whether the agent sandbox must see the
         workspace: None lets the workspace's origin decide (an explicit path
@@ -838,6 +835,11 @@ class Provisioner:
         directory that starts empty. Its ``workspace`` is passed only by a
         resume, pinning the same data directory.
         """
+        self._continue = (
+            continue_branch
+            if continue_branch is not None
+            else continue_from_config(self.config.sandbox)
+        )
         if workspace is not None:
             # An explicit workspace is authoritative: it is either the
             # resume pin from the runs table (which must be reused in place
@@ -1064,7 +1066,8 @@ class Provisioner:
                 "PATH to clone it from its remote"
             )
         url = f"{self.config.github.web_url}/{repo}"
-        continue_branch = self.config.sandbox.continue_branch
+        continuing = self._continue
+        continue_branch = continuing.branch if continuing is not None else None
         branch = continue_branch or self._branch_name(run_id, repo)
         clone_filter = self.config.sandbox.clone_filter
         token = self._clone_token(repo)
@@ -1079,10 +1082,12 @@ class Provisioner:
                 token=token,
             )
         except ProvisionError as exc:
-            if continue_branch and self.config.sandbox.continue_branch_optional:
+            if continuing is not None and continuing.optional:
                 # The offered branch is not on the remote any more: start
                 # fresh rather than fail the run (#600).
-                branch = self._fresh_after_missing_continue(run_id, continue_branch, exc, clone_dir)
+                branch = self._fresh_after_missing_continue(
+                    run_id, continuing.branch, exc, clone_dir
+                )
                 sha = hostgit.clone_from_remote(
                     url, clone_dir, branch, clone_filter=clone_filter, token=token
                 )
@@ -1329,7 +1334,8 @@ class Provisioner:
             )
             return clone_dir
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
-        existing = self.config.sandbox.continue_branch
+        continuing = self._continue
+        existing = continuing.branch if continuing is not None else None
         sha: str | None = None
         message = ""
         if existing:
@@ -1340,7 +1346,7 @@ class Provisioner:
             try:
                 sha = hostgit.clone_existing_branch(source, clone_dir, existing)
             except ProvisionError as exc:
-                if not self.config.sandbox.continue_branch_optional:
+                if continuing is None or not continuing.optional:
                     raise
                 # A restart offered a branch that is no longer fetchable
                 # (deleted on origin, never fetched here): a fresh start is
@@ -1414,7 +1420,13 @@ class Provisioner:
         github_enabled = self.config.github.enabled and (
             kind == "code" or self._workload_needs_github()
         )
-        creds = self.config.credentials_named(credentials)
+        creds = self.config.credentials_named(
+            list(
+                dict.fromkeys(
+                    [*credentials, *(cred.name for cred in self.config.mcp_credentials())]
+                )
+            )
+        )
         # ... or, since #766, for a repository whose registries carry a
         # credential: the box fetches the dependencies the agent sandbox
         # then builds from offline.
@@ -1704,6 +1716,14 @@ class Provisioner:
         """Non-secret catalogues for the service's fixed HTTP and registry ops."""
         regs = self.config.credentialed_registries_for(repo)
         env: dict[str, str] = {}
+        if self.config.mcp_credentials():
+            env["SBXLOOP_MCP_SERVERS"] = json.dumps(
+                [
+                    {"name": server.name, "url": server.url, "credential": server.credential}
+                    for server in self.config.mcp
+                    if server.credential is not None
+                ]
+            )
         if regs:
             env["SBXLOOP_REGISTRIES"] = json.dumps(registries.catalogue_entries(regs))
         if credentials:
@@ -2520,7 +2540,6 @@ class Provisioner:
         exports: dict[str, str] = {**spec.persistent_env, **spec.secret_env}
         if spec.role == "agent":
             exports[self.agent_token_env()] = token
-            exports.update(self.mcp_secret_env())
         elif spec.role == "github":
             exports["GH_TOKEN"] = token
             exports["GITHUB_TOKEN"] = token
@@ -2600,12 +2619,15 @@ class Provisioner:
             return lambda: {
                 **self.agent_persistent_env(repo),
                 self.agent_token_env(): self.agent_token(),
-                # The MCP servers' credentials travel the same road as the
-                # agent's own: never in the job, never in argv.
-                **self.mcp_secret_env(),
             }
         if role == "service":
-            creds = self.config.credentials_named(credentials)
+            creds = self.config.credentials_named(
+                list(
+                    dict.fromkeys(
+                        [*credentials, *(cred.name for cred in self.config.mcp_credentials())]
+                    )
+                )
+            )
             return lambda: {
                 **self.service_persistent_env(creds, repo),
                 **self.service_secret_env(creds, repo),
