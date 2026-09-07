@@ -19,9 +19,10 @@ Two shapes are worth knowing before reading further:
 * **``reconciliations`` is six tables wearing one.** ``round`` is a
   namespace as much as a number — at or above zero it is a real review round,
   and the sentinels below it (see :mod:`sbxloop.engine.store`) carry human
-  replies, advisory and bot round spend, confirmations and noted findings. A
-  ``kind`` column to say so honestly is coming in its own revision; until
-  then the model documents the overloading rather than hiding it.
+  replies, advisory and bot round spend, confirmations and noted findings.
+  ``kind`` now names which of the six a row is, but ``round`` keeps its
+  sentinel: the previous release reads the bands, and a failed deploy
+  restarts it against this database.
 """
 
 from __future__ import annotations
@@ -152,6 +153,11 @@ class Reconciliation(Base):
     status: Mapped[str] = mapped_column(Text, nullable=False)
     resolved: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     ts: Mapped[float] = mapped_column(REAL, nullable=False)
+    # Which of the six concerns this row is, said out loud rather than
+    # encoded in the sign of `round`. Not part of the key: `round` still
+    # carries the sentinel, because the release before this one reads it
+    # and a rollback restarts that release against this database.
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="'review'")
 
 
 class EventRow(Base):
