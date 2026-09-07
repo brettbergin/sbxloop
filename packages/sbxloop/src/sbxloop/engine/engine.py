@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import queue
 import shlex
 import shutil
@@ -62,7 +63,7 @@ from urllib.parse import quote
 
 from pydantic import ValidationError
 
-from sbxloop import hostgit
+from sbxloop import hostgit, repofiles
 from sbxloop.config import (
     DEFAULT_PR_TITLE_TEMPLATE,
     GITHUB_SINKS,
@@ -819,6 +820,10 @@ class LoopEngine:
                         if pair.service is not None
                         else None
                     )
+                    if service_client is not None:
+                        from sbxloop.worker.mcp import McpBroker
+
+                        agent.mcp_prepare = McpBroker(lambda: service_client).prepare
                     service = (
                         self._service_ops(
                             service_client,
@@ -862,7 +867,7 @@ class LoopEngine:
                         # host through the service sandbox.
                         host_tools=service.tool_specs() if service is not None else (),
                         tool_handler=service.handler(phase="build" if kind == "code" else "execute")
-                        if service is not None
+                        if service is not None and service.tool_specs()
                         else None,
                         # The judge's tool digest is read off the bus (#756);
                         # a code run's phases never ask for one.
@@ -1464,10 +1469,9 @@ class LoopEngine:
             if head_sha is None:
                 self._prior_unusable(p, branch, "the branch is no longer on origin")
                 return
-            if not self._shares_merge_base(ops, repo, base, branch):
-                self._prior_unusable(
-                    p, branch, f"the branch has no merge base with {base} (unrelated history)"
-                )
+            problem = self._merge_base_problem(ops, repo, base, branch)
+            if problem is not None:
+                self._prior_unusable(p, branch, problem)
                 return
             pr_number = self._prior_open_pr(ops, repo, branch, prior.pr_number)
         except (GithubOpsError, SbxloopError) as exc:
@@ -1505,16 +1509,31 @@ class LoopEngine:
         )
 
     @staticmethod
-    def _shares_merge_base(ops: GithubOps, repo: str, base: str, branch: str) -> bool:
-        """Whether ``branch`` and ``base`` have a common ancestor — the test
-        for "this branch is still about this repository's current line of
-        work". A comparison GitHub cannot make (404 on unrelated histories)
-        answers no rather than raising."""
+    def _merge_base_problem(ops: GithubOps, repo: str, base: str, branch: str) -> str | None:
+        """Why ``branch`` cannot be continued on ``base`` — None when the
+        two share history, the test for "this branch is still about this
+        repository's current line of work".
+
+        GitHub's compare answers 404 both for unrelated histories and for
+        a base the token cannot see (#647), and the two mean different
+        things to an operator: one is a branch to abandon, the other a
+        permissions problem that would report as "unrelated history".
+        A miss is told apart by asking for the base ref itself.
+        """
         data = raw_lookup(ops, "GET", f"/repos/{repo}/compare/{base}...{branch}")
+        if data is None:
+            if ops.ref_lookup(repo, f"heads/{base}") is None:
+                return (
+                    f"GitHub could not compare it with {base}: the base branch is not on "
+                    "origin, or the token cannot see it"
+                )
+            return f"the branch has no merge base with {base} (unrelated history)"
         if not isinstance(data, dict):
-            return False
+            return f"GitHub's comparison with {base} had no usable shape"
         merge_base = data.get("merge_base_commit")
-        return bool(isinstance(merge_base, dict) and merge_base.get("sha"))
+        if isinstance(merge_base, dict) and merge_base.get("sha"):
+            return None
+        return f"GitHub's comparison with {base} named no merge base"
 
     @staticmethod
     def _prior_open_pr(ops: GithubOps, repo: str, branch: str, recorded: int | None) -> int | None:
@@ -2379,7 +2398,12 @@ class LoopEngine:
                 for rel in files:
                     dest = target / rel
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(p.pair.workspace / rel, dest)
+                    with (
+                        repofiles.open_file(p.pair.workspace, rel) as source,
+                        dest.open("wb") as out,
+                    ):
+                        shutil.copyfileobj(source, out)
+                        os.fchmod(out.fileno(), os.fstat(source.fileno()).st_mode & 0o777)
             else:
                 self._copy_out(p.pair, target, files)
         return target, [str(target / rel) for rel in files]

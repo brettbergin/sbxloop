@@ -540,8 +540,8 @@ def test_example_mcp_entry_loads_with_its_credential() -> None:
     # The builder asked for it gets a spec carrying a reference, never a
     # value; the read-only critic is not among its roles.
     (spec,) = config.mcp_specs_for("builder")
-    assert spec.command == entry["command"][0]
-    assert spec.env == {credential["env"]: f"${{{credential['env']}}}"}
+    assert spec.mediated and spec.url == entry["url"]
+    assert spec.env == {} and spec.headers == {}
     assert config.mcp_specs_for("critic") == []
 
 

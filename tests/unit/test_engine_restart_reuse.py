@@ -126,6 +126,51 @@ class TestFallback:
         assert len(reasons) == 1
         assert "merge base" in reasons[0]
 
+    def test_an_invisible_base_is_named_as_such_not_as_unrelated_history(self) -> None:
+        """#647: GitHub's compare 404s for a base the token cannot see just
+        as it does for unrelated histories; a permissions problem must not
+        be reported as a branch to abandon. The base ref tells them apart."""
+        from typing import Any
+
+        from sbxloop.engine.engine import LoopEngine
+
+        class Ops:
+            def __init__(self, compare: Any, base_sha: str | None) -> None:
+                self.compare, self.base_sha = compare, base_sha
+                self.refs: list[str] = []
+
+            def raw_lookup(self, method: str, path: str, body: Any = None, **kw: Any) -> Any:
+                assert method == "GET" and path == "/repos/o/r/compare/main...prior"
+                return self.compare
+
+            def ref_lookup(self, repo: str, ref: str) -> str | None:
+                self.refs.append(ref)
+                return self.base_sha
+
+        problem = LoopEngine._merge_base_problem
+
+        # A 404 with the base visible: genuinely unrelated history.
+        ops = Ops(None, "base123")
+        assert problem(ops, "o/r", "main", "prior") == (  # type: ignore[arg-type]
+            "the branch has no merge base with main (unrelated history)"
+        )
+        assert ops.refs == ["heads/main"]
+        # A 404 with the base itself missing: not visible to the token, or gone.
+        ops = Ops(None, None)
+        text = problem(ops, "o/r", "main", "prior")  # type: ignore[arg-type]
+        assert text is not None
+        assert "could not compare it with main" in text and "token cannot see it" in text
+        assert "unrelated" not in text
+        # Related: no problem, and no ref probe spent.
+        ops = Ops({"merge_base_commit": {"sha": "abc"}}, "base123")
+        assert problem(ops, "o/r", "main", "prior") is None  # type: ignore[arg-type]
+        assert ops.refs == []
+        # A comparison that names no merge base is said as such.
+        ops = Ops({"merge_base_commit": {}}, "base123")
+        assert problem(ops, "o/r", "main", "prior") == (  # type: ignore[arg-type]
+            "GitHub's comparison with main named no merge base"
+        )
+
     def test_a_gone_pr_keeps_the_branch_and_opens_a_new_pr(self, harness: Harness) -> None:
         """The branch is still good even when its PR is gone: continue the
         commits, open a fresh pull request for them."""

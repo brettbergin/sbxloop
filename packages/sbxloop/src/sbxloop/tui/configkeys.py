@@ -316,10 +316,62 @@ def describe(dotted: str, *, model: type[BaseModel] = Config) -> FieldSpec:
 # -- values as text ---------------------------------------------------------
 
 
+#: What a bare string would be mistaken for if the quotes came off: the
+#: display drops them everywhere else, and keeps them only here.
+_LOOKS_TYPED = frozenset({"true", "false", "none", "null", "nan", "inf", "-inf"})
+
+
 def _scalar_text(value: Any) -> str:
+    """One scalar, the way an operator writes it rather than the way Python
+    prints it: ``true`` not ``True``, ``60`` not ``60.0``."""
     if isinstance(value, bool):
         return "true" if value else "false"
+    if isinstance(value, float):
+        # A whole number is a whole number. `60.0` reads as a float's
+        # artefact, and every duration and interval in this config is one.
+        return str(int(value)) if value.is_integer() else f"{value:g}"
     return str(value)
+
+
+def _ambiguous(text: str) -> bool:
+    """Whether a bare string would read as some other type."""
+    if text.strip().lower() in _LOOKS_TYPED:
+        return True
+    try:
+        float(text)
+    except ValueError:
+        return False
+    return True
+
+
+def display(value: Any) -> str:
+    """A value as a table shows it: no `repr` quotes, no `.0` tails, and
+    nothing rendered as an empty cell.
+
+    Quotes come off strings — an operator reading `github.repo` wants
+    `owner/name`, not `'owner/name'` — *except* where a bare string would
+    be mistaken for another type. `"60"` and `"true"` keep their quotes so
+    they cannot be read as the number or the bool, and an empty string
+    shows as `""` rather than as nothing at all. Whitespace collapses so a
+    multi-line template stays one row.
+    """
+    if value is None:
+        return "—"
+    if isinstance(value, str):
+        if not value:
+            return '""'
+        # One row, one line. A commit-message template carries newlines,
+        # and a cell that grows to fit them pushes the table apart; the
+        # whole value is one keystroke away in the editor.
+        flat = " ".join(value.split())
+        return f'"{flat}"' if _ambiguous(flat) else flat
+    if isinstance(value, list | tuple):
+        return ", ".join(display(item) for item in value) if value else "(empty)"
+    if isinstance(value, Mapping):
+        if not value:
+            return "(empty)"
+        return ", ".join(f"{key}={display(item)}" for key, item in value.items())
+    return _scalar_text(value)
 
 
 def render_value(value: Any, spec: FieldSpec) -> str:
@@ -402,6 +454,7 @@ __all__ = [
     "ValueKind",
     "ancestors",
     "describe",
+    "display",
     "flatten",
     "format_path",
     "is_leaf",

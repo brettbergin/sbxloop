@@ -99,6 +99,37 @@ class TestChatInput:
         assert chat.buffer == ""
 
 
+class TestAgentAttribution:
+    """#648: an agent message names its backend beside its model, as the
+    chat transports do (#601) — a model alone does not say who ran."""
+
+    def test_backend_and_model_are_both_named(self) -> None:
+        rendered = render_event(
+            make_event(
+                EventTypes.AGENT_MESSAGE,
+                content="hello",
+                agent="builder",
+                backend="claude",
+                model="claude-sonnet-5",
+            )
+        )
+        text = render_to_text(rendered)
+        assert "builder" in text and "claude · claude-sonnet-5" in text
+
+    def test_a_pre_stamping_event_says_the_backend_is_unknown(self) -> None:
+        rendered = render_event(
+            make_event(EventTypes.AGENT_MESSAGE, content="hello", agent="builder", model="m")
+        )
+        assert "unknown · m" in render_to_text(rendered)
+
+    def test_no_model_and_no_backend_is_just_the_speaker(self) -> None:
+        rendered = render_event(
+            make_event(EventTypes.AGENT_MESSAGE, content="hello", agent="critic")
+        )
+        text = render_to_text(rendered)
+        assert "critic" in text and "unknown" not in text
+
+
 class TestChatRendering:
     def test_chat_message_renders_as_user_panel(self) -> None:
         rendered = render_event(

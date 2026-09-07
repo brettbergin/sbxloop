@@ -229,6 +229,13 @@ class WorkerClient:
         # Provisioner.job_env — None means the sandbox's credentials arrive
         # another way (sbx secret proxy, or the env-file fallback).
         self.job_env = job_env
+        self.mcp_prepare: (
+            Callable[
+                [JobRequest, HostToolHandler | None],
+                contextlib.AbstractContextManager[tuple[JobRequest, HostToolHandler | None]],
+            ]
+            | None
+        ) = None
         # job_id -> agent persona (planner, executor, ...) supplied at
         # submit(); stamped onto that job's agent.* events so the transcript
         # can say who is speaking (the worker doesn't know which phase it
@@ -961,6 +968,11 @@ class WorkerClient:
         """
         if self.credential_refresh is not None:
             self.credential_refresh()
+        if any(server.mediated for server in job.mcp_servers):
+            if self.mcp_prepare is None:
+                raise WorkerError("credentialed MCP has no host mediator")
+            with self.mcp_prepare(job, tool_handler) as (prepared, handler):
+                return self.submit(prepared, agent=agent, tool_handler=handler)
         if bool(job.host_tools) != (tool_handler is not None):
             raise WorkerError(
                 "job.host_tools and tool_handler must be given together "
@@ -1171,16 +1183,37 @@ class WorkerClient:
                 Event.now(EventTypes.WORKER_STDOUT, job.run_id, job_id=job.job_id, line=line)
             )
             return None
+        # A worker controls its stream and durable log. Host-only events
+        # can trigger actions (including file uploads), so they must never
+        # enter the host bus through this untrusted ingress.
+        worker_types = {value for name, value in vars(EventTypes).items() if name.isupper()}
+        if (
+            event.type not in worker_types
+            or event.run_id != job.run_id
+            or event.job_id not in (None, job.job_id)
+        ):
+            log.warning(
+                "worker.event_rejected",
+                job=job.job_id,
+                sandbox=self.sandbox.name,
+                event_type=event.type[:100],
+            )
+            return None
+        # Older workers omit job_id on some telemetry. The transport, not
+        # the payload, owns its identity; bind accepted events to this job.
+        event = event.model_copy(update={"run_id": job.run_id, "job_id": job.job_id})
         if self.role is not None and event.type in (
             EventTypes.SANDBOX_RESOURCES,
             EventTypes.SANDBOX_RESOURCES_WARNING,
         ):
-            event.data.setdefault("role", self.role)
+            event.data["role"] = self.role
         agent = self._job_agents.get(job.job_id)
         if event.type.startswith("agent."):
             if agent is not None:
-                event.data.setdefault("agent", agent)
+                event.data["agent"] = agent
             if self.backend is not None:
+                # Diagnostic data, not authority: a fallback worker can
+                # truthfully report a different backend from the config.
                 event.data.setdefault("backend", self.backend)
         self.bus.publish(event)
         if event.type == EventTypes.AGENT_TOOL_REQUEST:

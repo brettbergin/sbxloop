@@ -244,17 +244,19 @@ secret_strategy = "proxy"
 # domains the server contacts — the agent sandbox's allowlist is
 # least-privilege and refuses anything not listed here, and an undeclared
 # host fails at the server's first request rather than at startup.
-# `credential`: a `[[credentials]]` name whose value is bound into the
-# agent sandbox for this server alone — proxy-substituted in flight to that
-# credential's host, so nothing secret is ever in the config, a job, an
-# event or an `sbx` argument. Never put a token in `command`. `roles`:
+# credential: a [[credentials]] name kept in the service sandbox.
+# Credentialed servers require Streamable HTTP at that credential's HTTPS
+# host. The host mediates tool calls; no key enters agent code or sbx argv.
+# Credentialed stdio and legacy SSE transports are refused. Never put a
+# token in command. Roles:
 # which sessions get it — "planner", "builder", "critic", "operator",
 # "concierge"; the default is builder + operator, and adding "critic" hands
 # a third-party service to a read-only review session.
 # [[mcp]]
 # name = "weather"
-# transport = "stdio"
-# command = ["npx", "-y", "weather-mcp-server"]
+# transport = "http"
+# command = [] # Used only with credential-free stdio, e.g. ["npx", "weather-mcp-server"].
+# url = "https://api.weather.example.com/mcp"
 # hosts = ["api.weather.example.com"]
 # credential = "weather"
 # roles = ["builder"]

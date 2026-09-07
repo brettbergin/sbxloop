@@ -19,12 +19,19 @@ from sbxloop.config import Config
 from sbxloop.daemon.chat import build_bridge
 from sbxloop.daemon.discord import DiscordBridge
 from sbxloop.daemon.discord_format import agent_model_label, format_for_discord
-from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
+from sbxloop.daemon.model import DaemonNotice, RunReport, TaskOutcome, WorkItem
 from sbxloop.daemon.slack import SlackBridge, SlackMessage, SlackTarget
 from sbxloop.daemon.store import ChatThread, DaemonStore
+from sbxloop.engine.model import Published
 from sbxloop.errors import DaemonError
 from sbxloop.events import Event, EventBus
-from tests.unit.test_daemon_discord import FakeConcierge, FakeEngine, FakeLoop, wait_for
+from tests.unit.test_daemon_discord import (
+    FakeConcierge,
+    FakeEngine,
+    FakeLoop,
+    make_gate,
+    wait_for,
+)
 
 CHANNEL = "C0123ABCDEF"
 BOT = "UBOT"
@@ -150,8 +157,19 @@ def message(
     return event
 
 
-def start_run(bridge: SlackBridge, run_id: str = "r1") -> tuple[WorkItem, EventBus, FakeEngine]:
-    item = WorkItem(item_id="gh:issue:4", source_key="4", title="Fix login", url="https://x/4")
+def start_run(
+    bridge: SlackBridge, run_id: str = "r1", *, kind: str = "code"
+) -> tuple[WorkItem, EventBus, FakeEngine]:
+    if kind == "workload":
+        item = WorkItem(
+            item_id="chat:1700000009.000009",
+            source_key="1700000009.000009",
+            title="Summarise the week",
+            url="",
+            kind="workload",
+        )
+    else:
+        item = WorkItem(item_id="gh:issue:4", source_key="4", title="Fix login", url="https://x/4")
     bus = EventBus()
     engine = FakeEngine()
     bridge.run_started(item, run_id, engine, bus)  # type: ignore[arg-type]
@@ -676,3 +694,110 @@ def test_slack_owns_only_member_ids(tmp_path: Path) -> None:
     bridge, _, _ = make_bridge(tmp_path)
     assert bridge._owns_user_id("U0123ABCDEF") and bridge._owns_user_id("W1")
     assert not bridge._owns_user_id("brett") and not bridge._owns_user_id("123456789012345678")
+
+
+class TestWorkloads:
+    """#763: the agentic-workloads shapes on Slack — `start_workload` from a
+    mention, the kind-aware cards, the `chat` sink and the hold prompt —
+    ride the shared bridge, so the Slack fake must show each of them."""
+
+    def test_a_mention_reaches_the_concierge_keyed_on_its_message(self, tmp_path: Path) -> None:
+        """`start_workload` keys the queued item on the asking message's id
+        (`chat:<ts>` on Slack), so the same ask reaching the tool twice
+        queues one run; the bridge hands the turn that id and its surface."""
+        concierge = FakeConcierge()
+        concierge.tool_calls = [("start_workload", {"ask": "summarise the week"}, True)]
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        try:
+            client.deliver(message(f"<@{BOT}> summarise the week", ts="1700000009.000009"))
+            assert wait_for(
+                lambda: concierge.turns == [("summarise the week", "Slack user `brett`")]
+            )
+            assert concierge.message_ids == ["1700000009.000009"]
+            assert concierge.vias == ["slack"]
+            assert wait_for(
+                lambda: any("hello from the concierge" in p["text"] for p in client.web.posted)
+            )
+        finally:
+            bridge.close()
+
+    def test_a_workload_run_shows_verdicts_and_the_result_in_its_thread(
+        self, tmp_path: Path
+    ) -> None:
+        """The judge's verdict lands as a chronology line, the `chat` sink's
+        result is posted whole into the thread, and the finish card shows
+        the tasks' outputs and where the result went — no PR rows."""
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            item, bus, _ = start_run(bridge, kind="workload")
+            headline = client.web.posted[0]
+            assert "*Summarise the week*" in headline["text"]
+            bus.publish(ev("judge.verdict", task_id="t1", attempt=1, passed=True))
+            assert wait_for(
+                lambda: any(
+                    "judge" in p["text"] and "*passed*" in p["text"] for p in client.web.posted
+                )
+            )
+            verdict = next(p for p in client.web.posted if "judge" in p["text"])
+            assert verdict["thread_ts"] == headline["ts"]
+            bus.publish(
+                ev(
+                    "run.published",
+                    sink="chat",
+                    location="chat",
+                    tasks=["t1"],
+                    files=0,
+                    message="1/1 task(s) passed the judge\n\n## t1: A\n\n**forty-two**",
+                )
+            )
+            assert wait_for(lambda: any("forty-two" in p["text"] for p in client.web.posted))
+            result = next(p for p in client.web.posted if "forty-two" in p["text"])
+            assert result["thread_ts"] == headline["ts"]
+            assert "result" in result["text"] and "*forty-two*" in result["text"]
+            report = RunReport(
+                "r1",
+                "completed",
+                "1/1 tasks passed the judge",
+                kind="workload",
+                outputs=(TaskOutcome("t1", "A", "done", "wrote the digest", 1, "passed"),),
+                summary="the week, summarised",
+                published=(Published(sink="chat", location="chat", tasks=["t1"]),),
+            )
+            bridge.run_finished(item, report)
+            assert wait_for(
+                lambda: any("finished: completed" in p["text"] for p in client.web.posted)
+            )
+            finish = next(p for p in client.web.posted if "finished: completed" in p["text"])
+            assert finish["thread_ts"] == headline["ts"]
+            blocks = finish["attachments"][0]["blocks"]
+            card = "\n".join(
+                [b.get("text", {}).get("text", "") for b in blocks]
+                + [f.get("text", "") for b in blocks for f in b.get("fields", [])]
+            )
+            assert "*Tasks*" in card and "wrote the digest" in card and "passed" in card
+            assert "*Published*" in card
+            assert "*PR*" not in card and "pull/" not in card
+        finally:
+            bridge.close()
+
+    def test_a_publish_hold_prompts_for_a_release_in_prose(self, tmp_path: Path) -> None:
+        """`publish = "hold"` on Slack: the same prompt path as Discord's,
+        worded for a held result — release, not merge — as the typed
+        command, since the Slack bridge has no interactive components yet
+        (#571)."""
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            item = WorkItem(item_id="gh:issue:7", source_key="7", title="Seven", kind="workload")
+            with bridge._lock:
+                bridge._items["r77"] = item
+            bridge.dstore.create_merge_gate(
+                "r77", "gh:issue:7", "", 0, "", None, ["U1"], "tok77", 1.0, kind="publish"
+            )
+            asyncio.run(bridge._post_gate_prompt(make_gate(kind="publish", notify=("U1",))))
+            prompt = next(p for p in client.web.posted if "result held" in p["text"])
+            assert "<@U1>" in prompt["text"]
+            assert "release gh:issue:7" in prompt["text"]
+            assert "abandon gh:issue:7" in prompt["text"]
+            assert "merge" not in prompt["text"] and "pull/9" not in prompt["text"]
+        finally:
+            bridge.close()
