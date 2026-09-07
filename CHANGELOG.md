@@ -2,6 +2,28 @@
 
 ### Fixed
 
+- **A verify command could kill itself, and did.** Verify commands ran as
+  `sh -c '<the whole command>'` in the worker's own process group, which put
+  the command's text on a command line and its children in a group nobody
+  reaped. Both halves broke checks that were otherwise correct. A check that
+  started a dev server on a port and cleaned up with `pkill -f <port>`
+  matched the shell running it, because that shell's command line contained
+  the port: it SIGTERMed itself before reaching its own assertion and
+  reported a signal exit with no output — identically on every attempt, so
+  the loop flagged the check as unpassable and abandoned the run, with the
+  work complete and every other gate green. Separately, anything a command
+  backgrounded and did not kill kept running after the command returned,
+  holding its port against the next attempt and holding the captured pipe
+  open, so reading the command's output blocked until the whole job timed
+  out.
+
+  Each command now runs from a script file, so its text never reaches the
+  process table and a pattern kill reaches only what the command started; in
+  a session of its own, so whatever it leaves running is a process group the
+  worker tears down (SIGTERM, then SIGKILL) when the command returns or times
+  out; and with its output on a file rather than a pipe an orphan can hold
+  open.
+
 - **The Config screen showed `repr`, not values.** Floats carried a `.0`
   tail every duration and interval in the config has (`60.0`, `14400.0`),
   strings came wrapped in quotes (`'claude'`), bools were Python's

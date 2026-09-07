@@ -96,7 +96,7 @@ $repo_conventions
 - Your verify commands are the task's whole mechanical exam, and the
   builder **cannot edit** them — a wrong check burns the task's entire
   revision budget against something no revision can fix. They run under
-  POSIX `sh -c` (not bash) from the **workspace root**: if the work lands
+  POSIX `sh` (not bash) from the **workspace root**: if the work lands
   in a subdirectory, every command must name it explicitly
   (`cd app && <test runner>`); a bare `test -f <manifest>` fails when the
   file lives one level down, and a test runner aimed at a directory
