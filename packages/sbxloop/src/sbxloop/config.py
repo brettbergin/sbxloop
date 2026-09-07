@@ -2206,6 +2206,19 @@ class ScheduleConfig(_ConfigModel):
         return Cadence.parse(self.every, self.cron).describe()
 
 
+class TelemetryConfig(_ConfigModel):
+    """Host error reporting; the DSN value lives only in the environment."""
+
+    dsn_env: str = "GLITCHTIP_DSN"
+    environment: str = "production"
+
+    @field_validator("dsn_env")
+    @classmethod
+    def _dsn_env_name(cls, value: str) -> str:
+        _check_env_names([value], "telemetry.dsn_env")
+        return value
+
+
 class Config(_ConfigModel):
     model: str = "auto"
     agent: AgentConfig = Field(default_factory=AgentConfig)
@@ -2248,6 +2261,7 @@ class Config(_ConfigModel):
     limits: Limits = Field(default_factory=Limits)
     landing: LandingConfig = Field(default_factory=LandingConfig)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
+    telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     chat: ChatConfig = Field(default_factory=ChatConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
