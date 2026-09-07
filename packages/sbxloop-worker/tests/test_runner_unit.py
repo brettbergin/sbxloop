@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -95,6 +96,62 @@ class TestRunnerInProcess:
         result, events = run_job(tmp_path, job)
         assert result.status == "timeout"  # type: ignore[attr-defined]
         assert EventTypes.WORKER_ERROR in [e.type for e in events]
+
+    def test_batch_command_text_is_not_on_its_own_command_line(self, tmp_path: Path) -> None:
+        """Field failure rkbgkf32a: a check started a dev server on a port and
+        cleaned up with `pkill -f <port>`, which matched the `sh -c` shell
+        carrying the command's own text. The check SIGTERMed itself before
+        reaching its assertion — exit -15, no output, identically on every
+        attempt, with the work correct and every other gate green. Nothing a
+        command says about itself may reach the process table."""
+        token = "sbxloop-selfmatch-token"
+        job = JobRequest(
+            job_id="j2",
+            run_id="r1",
+            kind="shell.batch",
+            commands=[f"ps -o args= -p $$ | grep -c {token} || true"],
+            timeout_s=20.0,
+        )
+        result, _ = run_job(tmp_path, job)
+        (only,) = result.output_json  # type: ignore[attr-defined]
+        assert only["output"].strip() == "0"
+
+    def test_batch_command_output_survives_a_leaked_background_process(
+        self, tmp_path: Path
+    ) -> None:
+        """A backgrounded process that inherits the captured pipe holds it
+        open after the command returns; reading it then blocks until the job
+        times out. Output goes to a file, so the command's own result is
+        complete the moment it exits."""
+        job = JobRequest(
+            job_id="j2",
+            run_id="r1",
+            kind="shell.batch",
+            commands=["sleep 30 & echo done"],
+            timeout_s=20.0,
+        )
+        result, _ = run_job(tmp_path, job)
+        (only,) = result.output_json  # type: ignore[attr-defined]
+        assert only["output"] == "done\n"
+        assert only["exit_code"] == 0
+
+    def test_batch_reaps_what_a_command_leaves_running(self, tmp_path: Path) -> None:
+        """A leaked server holds its port against the next attempt, so the
+        command's process group does not outlive the command."""
+        marker = tmp_path / "still-running"
+        command = f"sh -c 'sleep 30; touch {marker}' & echo started"
+        job = JobRequest(
+            job_id="j2",
+            run_id="r1",
+            kind="shell.batch",
+            commands=[command],
+            timeout_s=20.0,
+        )
+        result, _ = run_job(tmp_path, job)
+        assert result.exit_code == 0  # type: ignore[attr-defined]
+        # The child is gone with the command, not still counting down.
+        assert subprocess.run(["pgrep", "-f", str(marker)], check=False).returncode != 0
+        assert not marker.exists()
 
     def test_shell_timeout(self, tmp_path: Path) -> None:
         job = JobRequest(

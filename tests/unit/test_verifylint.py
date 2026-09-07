@@ -214,6 +214,40 @@ class TestMutationRules:
             assert problems and "must not modify the environment" in problems[0]
 
 
+class TestPatternKillRules:
+    """Field failure rkbgkf32a: a check started a dev server on a port and
+    cleaned up with `pkill -f <port>`, whose pattern also matched the shell
+    running the check. It killed itself before its own assertion, failed
+    identically on every attempt, and the run was abandoned with the work
+    complete and every other gate green."""
+
+    def test_pkill_and_killall_are_flagged(self) -> None:
+        for command in (
+            "npm run dev -- --port 5199 & sleep 5; curl -sf http://localhost:5199/; pkill -f 5199",
+            "killall node",
+        ):
+            problems = lint_verify_commands([command], [])
+            assert problems and "by pattern or name" in problems[0], command
+
+    def test_the_remedy_names_the_pid_form(self) -> None:
+        (problem,) = lint_verify_commands(["pkill -f server"], [])
+        assert "pid" in problem and "kill only that" in problem
+
+    def test_killing_a_recorded_pid_is_clean(self) -> None:
+        """Stopping exactly what the command started is the remedy, not
+        another violation."""
+        command = (
+            "npm run dev -- --port 5199 & srv=$!; "
+            "curl -sf http://localhost:5199/ | grep -q root; "
+            'kill "$srv"'
+        )
+        assert lint_verify_commands([command], ["javascript"]) == []
+
+    def test_pgrep_is_clean(self) -> None:
+        """Only signalling is out of bounds; looking is harmless."""
+        assert lint_verify_commands(["pgrep -f myserver >/dev/null"], []) == []
+
+
 class TestNetworkRules:
     """#440: a verify command judges the workspace, not the network — a
     rate limit or a flake failed a review task whose local deliverable was

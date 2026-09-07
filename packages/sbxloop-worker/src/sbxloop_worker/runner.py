@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import contextlib
+import os
+import signal
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
@@ -22,6 +25,102 @@ from sbxloop_worker.protocol import (
 from sbxloop_worker.resources import LEVEL_SEVERITY, classify_level, sample_resources
 
 OUTPUT_TAIL_CHARS = 20_000
+
+# How long anything a command leaves running gets to honour SIGTERM before
+# the group is killed outright. A dev server or a database shutting down
+# cleanly takes milliseconds; nothing a verify command starts deserves
+# longer, and the wait ends as soon as the group is empty.
+GROUP_TERM_GRACE_S = 2.0
+
+
+def run_isolated_command(command: str, *, cwd: str | None, timeout_s: float) -> tuple[int, str]:
+    """Run one shell command so it can neither see nor outlive itself.
+
+    Verify commands are model-authored text, and running them the obvious
+    way — ``sh -c '<the whole command>'`` sharing the worker's process
+    group — gave that text two ways to break a check that was otherwise
+    correct.
+
+    It could **see itself**. ``pkill``/``pgrep`` match against the full
+    command line, and ``sh -c`` puts the entire command *on* the command
+    line, so any pattern drawn from the command's own text also matches the
+    shell running it. A check that started a dev server on a port and
+    cleaned up with ``pkill -f <port>`` signalled its own shell: it died
+    with a SIGTERM exit and no output, identically on every attempt, with
+    the work correct and every other gate green (field failure rkbgkf32a,
+    a run abandoned as unverifiable). Passing the command as a *script
+    file* keeps the text out of the process table, so a pattern kill
+    reaches what the command started and nothing else.
+
+    It could **outlive itself**. Anything backgrounded and not reaped kept
+    running after the command returned — holding its port against the next
+    attempt, and holding the captured pipe open so reading the output
+    blocked until the whole job timed out. Each command gets a session of
+    its own, which makes its leftovers a process group this can signal, and
+    output goes to a file rather than to a pipe an orphan can hold open.
+
+    Stdin is ``/dev/null`` for the same reason: a check that reads it is
+    already wrong, and inheriting the worker's would let it block there
+    until the job's timeout instead of failing in front of the builder.
+
+    Returns the exit code and the combined stdout/stderr. Raises
+    :class:`subprocess.TimeoutExpired` when ``timeout_s`` passes, after
+    tearing the group down.
+    """
+    with tempfile.TemporaryDirectory(prefix="sbxloop-cmd-") as tmp:
+        script = Path(tmp) / "command.sh"
+        script.write_text(command, encoding="utf-8")
+        output_path = Path(tmp) / "output"
+        with output_path.open("wb") as sink:
+            # nosec below: executing the job's command inside the sandbox IS
+            # this worker's contract. `sh <file>` runs the command exactly as
+            # `sh -c` did, without publishing it to every reader of the
+            # process table; start_new_session makes the command and its
+            # children a group of their own, so the reap below can never
+            # reach the worker or a sibling command.
+            proc = subprocess.Popen(  # nosec B603 B607
+                ["sh", str(script)],
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                cwd=cwd,
+                start_new_session=True,
+            )
+            try:
+                exit_code = proc.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                # Signal the group while the leader is still in it, then
+                # collect the leader itself.
+                _reap_group(proc.pid)
+                proc.wait()
+                raise
+            _reap_group(proc.pid)
+        # Explicit UTF-8: the sandbox's locale is not guaranteed, and a
+        # check whose output carries a non-ASCII byte must still be readable
+        # rather than raising or arriving mangled.
+        return exit_code, output_path.read_text(encoding="utf-8", errors="replace")
+
+
+def _reap_group(pgid: int) -> None:
+    """SIGTERM, then SIGKILL, whatever is left in the command's process group.
+
+    The group id is the leader's pid. ``ProcessLookupError`` is the normal
+    case and the fast path: the command left nothing behind, so the group is
+    already gone.
+    """
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.monotonic() + GROUP_TERM_GRACE_S
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
 
 
 class JobRunner:
@@ -207,21 +306,15 @@ class JobRunner:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(command, self.job.timeout_s)
-            # nosec below: executing the job's commands inside the sandbox IS
-            # this worker's contract, same as shell.check's argv.
-            proc = subprocess.run(  # nosec B603 B607
-                ["sh", "-c", command],
-                capture_output=True,
-                text=True,
+            exit_code, output = run_isolated_command(
+                command,
                 cwd=self.job.cwd,
-                timeout=min(per_command, remaining),
-                check=False,
+                timeout_s=min(per_command, remaining),
             )
-            output = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
             results.append(
                 BatchCommandResult(
                     command=command,
-                    exit_code=proc.returncode,
+                    exit_code=exit_code,
                     output=output[-OUTPUT_TAIL_CHARS:],
                 )
             )
