@@ -281,7 +281,8 @@ def test_queue_verbs_use_ctl_when_live_and_the_row_when_down(seeded: SbxloopHome
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("3")
             await pilot.pause(1.0)
-            table = app.screen.query_one("#items", ConsoleTable)
+            table = app.screen.query_one("#queued", ConsoleTable)
+            table.focus()
             table.move_cursor(row=table.get_row_index("gh:issue:44"))
             await pilot.press("t")
             await pilot.pause(0.3)
@@ -301,7 +302,10 @@ def test_queue_verbs_use_ctl_when_live_and_the_row_when_down(seeded: SbxloopHome
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("3")
             await pilot.pause(1.5)
-            table = app.screen.query_one("#items", ConsoleTable)
+            # A run pinned by a daemon that is not answering: requeue is
+            # the verb that unpins it.
+            table = app.screen.query_one("#running", ConsoleTable)
+            table.focus()
             table.move_cursor(row=table.get_row_index("gh:issue:41"))
             await pilot.press("u")
             await pilot.pause(0.3)
