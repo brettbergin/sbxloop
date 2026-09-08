@@ -23,9 +23,15 @@ on:
         default: ""
         required: false
 
+permissions:
+  contents: read
+
 env:
   SBX_INSTALL_DIR: /home/runner/.docker/sbx
   SBXLOOP_APP_NAME: sbxloop-conformance
+  # The app-scoped containerd socket exceeds sbx's 104-byte Unix path limit
+  # under the runner's default ~/.local/state directory.
+  XDG_STATE_HOME: /tmp/sbx-state
   # The home defaults to ~/.sbxloop; the cache/upload steps below target
   # .sbxloop/state/conformance in the checkout, so pin the home there.
   SBXLOOP_HOME: ${{ github.workspace }}/.sbxloop
@@ -49,14 +55,15 @@ jobs:
       - name: Install sbx
         env:
           SBX_RELEASE: ${{ inputs.sbx_release }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           if [ -n "$SBX_RELEASE" ]; then
-            api="https://api.github.com/repos/docker/sbx-releases/releases/tags/$SBX_RELEASE"
+            api="repos/docker/sbx-releases/releases/tags/$SBX_RELEASE"
           else
-            api="https://api.github.com/repos/docker/sbx-releases/releases/latest"
+            api="repos/docker/sbx-releases/releases/latest"
           fi
-          url=$(curl -fsSL "$api" \
+          url=$(gh api "$api" \
             | uv run --no-project python -c "import json,sys; assets=[a['browser_download_url'] for a in json.load(sys.stdin)['assets'] if 'linux' in a['name'] and ('amd64' in a['name'] or 'x86_64' in a['name']) and a['name'].endswith('.tar.gz')]; print(assets[0])")
           echo "downloading $url"
           curl -fsSL -o /tmp/sbx.tar.gz "$url"
@@ -117,7 +124,7 @@ jobs:
           path: |
             doctor-deep.out
             sbx-version.out
-            .sbxloop/conformance/*.json
+            .sbxloop/state/conformance/*.json
           if-no-files-found: ignore
 
       - name: Cleanup
