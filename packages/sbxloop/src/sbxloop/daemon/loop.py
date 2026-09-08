@@ -514,6 +514,29 @@ class DaemonLoop:
             self._notice("item.requeued", f"requeue: {item_id} re-queued", item=item_id)
         return fresh
 
+    def move_queued_item(
+        self,
+        item_id: str,
+        *,
+        before: str | None = None,
+        after: str | None = None,
+        by: str | None = None,
+    ) -> WorkItem:
+        """Move pending work without changing retry timing or interrupting a run."""
+        moved = self.dstore.move_queued(item_id, before=before, after=after)
+        relation = "before" if before is not None else "after"
+        anchor = normalize_item_id(before if before is not None else after or "")
+        who = by or "operator"
+        self._notice(
+            "item.moved",
+            f"{who} moved {moved.item_id} {relation} {anchor}",
+            item=moved.item_id,
+            by=who,
+            relation=relation,
+            anchor=anchor,
+        )
+        return moved
+
     def _close_dead_run(self, run_id: str, result: str, now: float) -> None:
         """A pinned run that will never be resumed: drop its sandboxes and
         secrets first (so an interruption here leaves the ledger open for
@@ -864,7 +887,7 @@ class DaemonLoop:
                 )
             return TickResult(idle_kind="daily_cap")
         discovered = self._discover(now) + self._fire_schedules(now)
-        item = self.dstore.next_queued(now, self.config.daemon.retry_backoff_s)
+        item = self.dstore.reserve_next_queued(now, self.config.daemon.retry_backoff_s)
         if item is None:
             # Say WHY there is nothing to run: a queue full of items sitting
             # in retry backoff reads as "no work" otherwise (field: --once
@@ -890,9 +913,9 @@ class DaemonLoop:
             # SIGTERM/SIGINT are held until the claim is complete (#530): a
             # process that dies mid-claim either never posted, or left a row
             # recovery can settle against the comment it did post.
-            token = item.claim_token or uuid.uuid4().hex
-            self.dstore.mark_claiming(item.item_id, token, now)
-            item = self.dstore.get(item.item_id) or item.model_copy(update={"claim_token": token})
+            # Selection reserved the token atomically: an accepted queue move
+            # cannot race this claim and leave us dispatching the old order.
+            assert item.claim_token is not None
             self._claiming = item.item_id
             try:
                 with defer_signals():
