@@ -1030,6 +1030,27 @@ default, which loads no filesystem settings), so a target repository's
 `.claude/settings.json` cannot reconfigure an unattended session and
 CLAUDE.md costs its tokens once, through the prompt.
 
+Claude sessions with a working directory also carry a shell contract in
+their system prompt, including workload personas that decline the coding
+preset. The backend sets
+`CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1` in the CLI child's environment:
+each Bash call starts from the session's initial working directory,
+including resumed sessions and a fresh session after a missed resume.
+This matches the independent working-directory contract of mechanical
+verification. It prevents a successful `cd app` in one call from making
+the next call's `cd app` look for `app/app`. Host-tool-only sessions receive
+no shell instructions, and the Claude-specific behavior is not promised
+by the shared phase prompts to other backends.
+
+Directory changes still affect later commands within the same Bash call.
+The contract asks agents to use absolute paths or isolated command groups,
+guard directory changes, and preserve failures when combining commands or
+trimming output. Tests cover the SDK options and prompt contract across
+fresh, resumed and fallback sessions; the external CLI's behavior remains
+**field-unverified** until exercised on a CI runner. The reset flag's
+semantics are documented in
+[Anthropic's Bash tool reference](https://code.claude.com/docs/en/tools-reference#what-persists-between-commands).
+
 Host reads of these convention files and PR templates use `repofiles`:
 directory-relative opens with kernel symlink following disabled, resolving
 links only within the checkout. Links between repository files still work;

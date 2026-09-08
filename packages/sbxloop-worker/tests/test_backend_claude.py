@@ -9,6 +9,7 @@ or a network.
 
 from __future__ import annotations
 
+import os
 import sys
 import types
 from typing import Any
@@ -277,6 +278,85 @@ class TestSession:
 
 
 class TestOptions:
+    @pytest.mark.parametrize("resume", [None, "existing", "expired"])
+    @pytest.mark.parametrize("system_preset", [True, False])
+    def test_shell_directory_contract_survives_resume_and_fallback(
+        self,
+        sdk: types.ModuleType,
+        monkeypatch: pytest.MonkeyPatch,
+        resume: str | None,
+        system_preset: bool,
+    ) -> None:
+        """Reset Bash between calls, including revisions and a missed resume.
+
+        The SDK owns shell execution: assert its documented launch contract,
+        rather than simulate its cwd behavior with another shell runner.
+        """
+        monkeypatch.setenv("CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR", "0")
+        sdk.fail_on_resume = resume == "expired"
+        sdk.script = [ResultMessage(session_id="s", result="ok")]
+        _, emit = collect_emit()
+        workspace = "/workspace/customer's project"
+        ClaudeBackend().run_session(
+            job(
+                cwd=workspace,
+                system_message="Follow the task's acceptance criteria.",
+                system_preset=system_preset,
+                resume_session_id=resume,
+            ),
+            emit,
+        )
+
+        assert len(sdk.opened_with) == (2 if resume == "expired" else 1)
+        for opts in sdk.opened_with:
+            assert opts.kwargs["cwd"] == workspace
+            assert opts.kwargs["env"] == {"CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1"}
+            prompt = opts.kwargs["system_prompt"]
+            if system_preset:
+                assert prompt["preset"] == "claude_code"
+                prompt = prompt["append"]
+            assert isinstance(prompt, str)
+            assert prompt.startswith("Follow the task's acceptance criteria.")
+            assert workspace in prompt
+            assert "Every Bash tool call starts" in prompt
+            assert "Within one call" in prompt
+            assert "subshell" in prompt and "&&" in prompt
+            assert "pipefail" in prompt
+        # The override belongs to the CLI child, not the worker or another job.
+        assert os.environ["CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR"] == "0"
+
+    @pytest.mark.parametrize("system_preset", [True, False])
+    def test_shell_contract_without_a_persona_keeps_the_selected_preset(
+        self, sdk: types.ModuleType, system_preset: bool
+    ) -> None:
+        sdk.script = [ResultMessage(session_id="s", result="ok")]
+        _, emit = collect_emit()
+        ClaudeBackend().run_session(job(cwd="/workspace", system_preset=system_preset), emit)
+        prompt = sdk.opened_with[0].kwargs["system_prompt"]
+        if system_preset:
+            assert prompt["preset"] == "claude_code"
+            prompt = prompt["append"]
+        assert isinstance(prompt, str)
+        assert "Every Bash tool call starts" in prompt
+
+    @pytest.mark.parametrize("available_tools", [[], ["Read"], ["Bash"]])
+    def test_shell_contract_matches_available_tools(
+        self, sdk: types.ModuleType, available_tools: list[str]
+    ) -> None:
+        sdk.script = [ResultMessage(session_id="s", result="ok")]
+        _, emit = collect_emit()
+        ClaudeBackend().run_session(
+            job(
+                cwd="/workspace",
+                system_message="Use the available tools.",
+                available_tools=available_tools,
+                permission_mode="read_only",
+            ),
+            emit,
+        )
+        prompt = sdk.opened_with[0].kwargs["system_prompt"]["append"]
+        assert ("Every Bash tool call starts" in prompt) == ("Bash" in available_tools)
+
     def test_auto_mode_without_cap_bypasses_permissions(self, sdk: types.ModuleType) -> None:
         sdk.script = [ResultMessage(session_id="s", result="ok")]
         _, emit = collect_emit()
