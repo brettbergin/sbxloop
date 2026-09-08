@@ -94,7 +94,8 @@ def issue_evidence(data: Any, repo: str) -> IssueEvidence:
         or not isinstance(data.get("title"), str)
         or not isinstance(data.get("body"), (str, type(None)))
         or data.get("state") not in ("open", "closed")
-        or data.get("state_reason") not in (None, "completed", "not_planned", "reopened")
+        or data.get("state_reason")
+        not in (None, "completed", "not_planned", "reopened", "duplicate")
     ):
         raise LookupUnavailable("issue lookup returned incomplete or out-of-repository evidence")
     return IssueEvidence(
