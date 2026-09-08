@@ -127,7 +127,8 @@ def test_receipt_survives_resume_and_binds_the_proposal_and_repository(lookup):
 
 
 @pytest.mark.parametrize(
-    "state, reason", [("open", None), ("closed", "not_planned"), ("closed", "completed")]
+    "state, reason",
+    [("open", None), ("closed", "not_planned"), ("closed", "completed"), ("closed", "duplicate")],
 )
 def test_differently_worded_human_issue_is_reused(lookup, state, reason):
     lookup.ops.existing_issues = [existing(state=state, state_reason=reason)]
@@ -176,8 +177,9 @@ def test_failed_refresh_refuses_creation(lookup):
         lookup.check(followup)
 
 
-def test_a_declined_issue_cannot_be_resurrected_as_a_regression(lookup):
-    lookup.ops.existing_issues = [existing(state="closed", state_reason="not_planned")]
+@pytest.mark.parametrize("reason", ["not_planned", "duplicate"])
+def test_an_uncompleted_issue_cannot_be_resurrected_as_a_regression(lookup, reason):
+    lookup.ops.existing_issues = [existing(state="closed", state_reason=reason)]
     followup = looked_up(lookup, decision="regression", existing_issue=12, repro="It fails")
     with pytest.raises(LookupUnavailable, match="regression needs"):
         lookup.check(followup)
