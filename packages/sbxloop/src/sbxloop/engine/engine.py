@@ -89,6 +89,7 @@ from sbxloop.engine.followups import (
     issue_body,
     marker_key,
 )
+from sbxloop.engine.issue_lookup import IssueLookup, LookupUnavailable
 from sbxloop.engine.landing import (
     AwaitingReview,
     Blocked,
@@ -2848,6 +2849,11 @@ class LoopEngine:
         round_no = len(rounds) + 1
         diff = self._diff_for_review(p, run.head_sha)
         started = time.time()
+        phases.issue_lookup = (
+            IssueLookup(ops, repo, run_id, self.store)
+            if self.config.landing.followups == "issues" and p.issues_enabled is not False
+            else None
+        )
         verdict = phases.review(
             diff=diff,
             pr_number=run.pr_number,
@@ -3902,6 +3908,7 @@ class LoopEngine:
         already = self._recorded_followups(run_id)
         filed: list[tuple[str, str]] = []
         listed: list[str] = []
+        reused: list[tuple[str, str]] = []
         started = time.time()
         mode: str = cfg.followups
         downgraded = False
@@ -3910,7 +3917,9 @@ class LoopEngine:
         try:
             if mode == "issues":
                 try:
-                    self._file_followup_issues(p, run, candidates, already, filed, started)
+                    self._file_followup_issues(
+                        p, run, candidates, already, filed, listed, reused, started
+                    )
                 except GithubOpsError as exc:
                     if exc.http_status != 410:
                         raise
@@ -3940,8 +3949,10 @@ class LoopEngine:
         if not filed and not listed:
             return
         extra: dict[str, Any] = {}
+        if reused:
+            extra["reused"] = [{"title": t, "url": u} for t, u in reused]
         if downgraded:
-            extra = {"downgraded_from": "issues", "reason": "issues_disabled"}
+            extra.update(downgraded_from="issues", reason="issues_disabled")
         log.info(
             "run.followups",
             run=run_id,
@@ -3968,6 +3979,8 @@ class LoopEngine:
         candidates: Sequence[Candidate],
         already: dict[str, str],
         filed: list[tuple[str, str]],
+        listed: list[str],
+        reused: list[tuple[str, str]],
         started: float,
     ) -> None:
         """The ``issues`` mode of :meth:`_file_followups`: one issue per
@@ -3977,47 +3990,78 @@ class LoopEngine:
         ops, repo, run_id = p.ops, p.repo, p.run_id
         assert ops is not None and repo is not None and run.pr_number is not None
         cfg = self.config.landing
-        on_repo = self._filed_on_repo(ops, repo, cfg.followup_label, run_id)
-        self._ensure_label(ops, repo, cfg.followup_label)
+        try:
+            on_repo = self._filed_on_repo(ops, repo, cfg.followup_label, run_id)
+            lookup_error = ""
+        except (GithubOpsError, LookupUnavailable):
+            on_repo = {}
+            lookup_error = "existing follow-up issues could not be read"
+        lookup = IssueLookup(ops, repo, run_id, self.store)
+        held: list[tuple[Candidate, str]] = []
+        label_ready = False
+        url: str | None
         for cand in candidates:
             title = cand.followup.title.strip()
             if cand.key in already:
                 filed.append((title, already[cand.key]))
+                reused.append((title, already[cand.key]))
                 continue
-            if cand.key in on_repo:
+            existing = True
+            regression_of_match = cand.followup.decision == "regression" and on_repo.get(
+                cand.key, ""
+            ).endswith(f"/issues/{cand.followup.existing_issue}")
+            if cand.key in on_repo and not regression_of_match:
                 url = on_repo[cand.key]
             else:
-                ref = ops.issue_create(
-                    repo,
-                    title,
-                    issue_body(
-                        cand,
-                        run_id=run_id,
-                        repo=repo,
-                        pr_number=run.pr_number,
-                        pr_url=run.pr_url or "",
-                        closes=self.config.github.deliver_closes,
-                        trigger_label=self.trigger_label,
-                    ),
-                    labels=[cfg.followup_label],
-                )
-                url = ref.url
+                try:
+                    if lookup_error:
+                        raise LookupUnavailable(lookup_error)
+                    url = lookup.check(cand.followup)
+                except (GithubOpsError, LookupUnavailable) as exc:
+                    held.append((cand, str(exc)))
+                    listed.append(title)
+                    continue
+                if url is None:
+                    if not label_ready:
+                        self._ensure_label(ops, repo, cfg.followup_label)
+                        label_ready = True
+                    ref = ops.issue_create(
+                        repo,
+                        title,
+                        issue_body(
+                            cand,
+                            run_id=run_id,
+                            repo=repo,
+                            pr_number=run.pr_number,
+                            pr_url=run.pr_url or "",
+                            closes=self.config.github.deliver_closes,
+                            trigger_label=self.trigger_label,
+                        ),
+                        labels=[cfg.followup_label],
+                    )
+                    url = ref.url
+                    on_repo[cand.key] = url
+                    existing = False
             filed.append((title, url))
+            if existing:
+                reused.append((title, url))
             self.store.record_phase(
                 run_id,
                 "followup",
                 task_id=None,
                 attempt=len(already) + len(filed),
-                status="filed",
+                status="reused" if existing else "filed",
                 output_json=json.dumps({"key": cand.key, "title": title, "url": url}),
                 started_at=started,
             )
             already[cand.key] = url
-        if filed and "(comment)" not in already:
+        if (filed or held) and "(comment)" not in already:
             # One pointer on the PR, so the human sees them without opening
             # the tracker.
             ops.pr_issue_comment(
-                repo, run.pr_number, checklist_comment(candidates, run_id=run_id, filed=filed)
+                repo,
+                run.pr_number,
+                checklist_comment(candidates, run_id=run_id, filed=filed, held=held),
             )
             self._record_followup_comment(run_id, len(already) + 1, len(filed), started)
 
@@ -4052,24 +4096,41 @@ class LoopEngine:
 
     @staticmethod
     def _filed_on_repo(ops: GithubOps, repo: str, label: str, run_id: str) -> dict[str, str]:
-        """Follow-ups already on the repository for this run, by key — the
-        crash-window dedup (filed, died before recording). Read from the
+        """Follow-ups across runs, by key; this run wins for crash recovery.
+        Read from the
         label's issue list, which unlike search is not eventually consistent."""
         out: dict[str, str] = {}
-        try:
-            data = raw_pages(ops, f"/repos/{repo}/issues?labels={quote(label, safe='')}&state=all")
-        except GithubOpsError:
-            log.warning("run.followups_list_failed", repo=repo, exc_info=True)
-            return out
+        data: list[Any] = []
+        for page in range(1, 101):
+            chunk = ops.raw(
+                "GET",
+                f"/repos/{repo}/issues?labels={quote(label, safe='')}&state=all"
+                f"&per_page=100&page={page}",
+            )
+            if not isinstance(chunk, list):
+                raise LookupUnavailable("follow-up listing was malformed")
+            data.extend(chunk)
+            if len(chunk) < 100:
+                break
+        else:
+            raise LookupUnavailable("follow-up listing was incomplete")
         for issue in data:
             # The issues endpoint lists pull requests too (#631): a labelled
             # PR carrying an old marker in its body must not read as "this
             # follow-up was filed" and suppress the issue.
-            if not isinstance(issue, dict) or issue.get("pull_request"):
+            if not isinstance(issue, dict):
+                raise LookupUnavailable("follow-up listing contained a malformed issue")
+            if "pull_request" in issue:
                 continue
             found = marker_key(str(issue.get("body") or ""))
-            if found and found[0] == run_id:
-                out[found[1]] = str(issue.get("html_url") or "")
+            if found:
+                url = str(issue.get("html_url") or "")
+                if not url:
+                    raise LookupUnavailable("existing follow-up has no issue URL")
+                if found[0] == run_id:
+                    out[found[1]] = url
+                else:
+                    out.setdefault(found[1], url)
         return out
 
     @staticmethod

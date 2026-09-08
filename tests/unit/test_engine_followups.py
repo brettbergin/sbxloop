@@ -25,6 +25,7 @@ from sbxloop.errors import GithubOpsError
 from sbxloop.events import HostEventTypes
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import FakeGithub
+from tests.fakes.followups import with_lookups
 from tests.fakes.github_errors import github_error
 from tests.unit.test_engine import (
     FILES_BUILD,
@@ -212,7 +213,7 @@ class TestRendering:
         filed = checklist_comment(
             cands, run_id="r1", filed=[("A", "https://x/issues/1"), ("B", "https://x/issues/2")]
         )
-        assert "filed as issues (not queued for the loop)" in filed
+        assert "tracked in issues (not queued by this run)" in filed
         assert "- [A](https://x/issues/1)\n- [B](https://x/issues/2)" in filed
         listed = checklist_comment(cands, run_id="r1")
         assert 'Not filed as issues (`[landing] followups = "comment"`)' in listed
@@ -323,8 +324,11 @@ def followup_script() -> list[dict[str, Any]]:
     round_one["json"]["followups"] = [FOLLOWUP_A]
     fix = {"text": "Fixed.\n\naddressed: hello.txt:1 — hello\ndeferred: hello.txt:2 — docs later"}
     round_two = review("approve", "fixed; the nit is deferred")
-    round_two["json"]["followups"] = [FOLLOWUP_B]
-    return [taskgraph(task("t1")), FILES_BUILD, round_one, fix, round_two]
+    round_two["json"]["followups"] = [
+        FOLLOWUP_B,
+        {"title": "the greeting is not documented", "body": "The fix round deferred it."},
+    ]
+    return with_lookups([taskgraph(task("t1")), FILES_BUILD, round_one, fix, round_two])
 
 
 class RaceyLabelGithub(FakeGithub):
@@ -496,3 +500,84 @@ class TestIssuesDisabled:
         assert result.state == "merged"
         for _, body, _ in fake.issues_created:
             assert "not** queued for the loop." in body and "trigger label" not in body
+
+
+def test_unchecked_followup_and_deferral_stay_on_the_pr(harness: Harness) -> None:
+    fake = FakeGithub()
+    script = followup_script()
+    for step in script:
+        step.pop("host_tool_calls", None)
+    harness.script(script)
+    result = harness.pipeline(fake).start("ship hello")
+    assert result.state == "merged"
+    assert fake.issues_created == []
+    (comment,) = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+    assert "no completed issue lookup" in comment
+    assert "the greeting is not documented" in comment
+    (event,) = [e for e in harness.events if e.type == HostEventTypes.RUN_FOLLOWUPS]
+    assert event.data["filed"] == [] and len(event.data["listed"]) == 3
+
+
+def test_semantic_duplicate_links_a_human_issue_without_creating_one(harness: Harness) -> None:
+    fake = FakeGithub()
+    fake.existing_issues = [
+        {
+            "number": 12,
+            "title": "Avoid one diagnostic VM per repository",
+            "body": "The doctor boots too many VMs.",
+            "state": "open",
+            "html_url": "https://github.com/o/r/issues/12",
+        }
+    ]
+    script = followup_script()
+    script[2]["json"]["followups"][0].update(decision="tracked", existing_issue=12)
+    harness.script(script)
+    result = harness.pipeline(fake).start("ship hello")
+    assert result.state == "merged"
+    assert FOLLOWUP_A["title"] not in [t for t, _, _ in fake.issues_created]
+    assert len(fake.issues_created) == 2
+    (comment,) = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+    assert "https://github.com/o/r/issues/12" in comment
+
+
+@pytest.mark.parametrize("operation", ["issue_search", "issue_list"])
+def test_failed_lookup_leaves_notes_without_changing_the_merge(
+    harness: Harness,
+    operation: str,
+) -> None:
+    fake = FakeGithub()
+    fake.fail_always[operation] = GithubOpsError("lookup unavailable")
+    harness.script(followup_script())
+    result = harness.pipeline(fake).start("ship hello")
+    assert result.state == "merged" and fake.issues_created == []
+    assert any("Not filed — issue lookup needs triage" in c for c in fake.issue_comments)
+    assert fake.labels_created == []
+
+
+def test_a_regression_can_keep_its_title_without_reopening_the_completed_issue(
+    harness: Harness,
+) -> None:
+    fake = FakeGithub()
+    fake.existing_issues = [
+        {
+            "number": 12,
+            "title": FOLLOWUP_A["title"],
+            "body": followup_marker("old-run", followup_key(FOLLOWUP_A["title"])),
+            "state": "closed",
+            "state_reason": "completed",
+            "html_url": "https://github.com/o/r/issues/12",
+        }
+    ]
+    script = followup_script()
+    script[2]["json"]["followups"][0].update(
+        decision="regression",
+        existing_issue=12,
+        rationale="A new configuration bypasses the earlier fix.",
+        repro="With two repository aliases the probe creates two VMs again.",
+    )
+    harness.script(script)
+    assert harness.pipeline(fake).start("ship hello").state == "merged"
+    assert len(fake.issues_created) == 3
+    assert "Regression of issue #12" in fake.issues_created[0][1]
+    assert "Reproduction:" in fake.issues_created[0][1]
+    assert fake.existing_issues[0]["state"] == "closed"

@@ -38,6 +38,10 @@ It plans, executes, and checks the work, then publishes the result to chat
 or another configured destination.
 You can watch, steer, or stop it along the way.
 
+Out-of-scope findings are checked against existing issues before becoming
+follow-up work. Already tracked problems link to their existing issue;
+uncertain or unchecked findings remain notes on the pull request.
+
 Docker's `sbx` CLI provides the isolated sandbox runtime. sbxloop provisions
 the sandboxes, coordinates the agents and GitHub operations, and cleans up
 when the run ends.
