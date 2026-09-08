@@ -1857,10 +1857,13 @@ environment = "production"
 
 Reports include unhandled CLI exceptions, sbxloop ERROR events, and WARNING
 events logged with an exception. They carry the sbxloop release, deployment
-label, static event name, exception type, and stack filenames/functions/line
-numbers. Exception messages, local variables, source lines, absolute paths,
-command arguments, log fields, and customer payloads are omitted. The local
-daemon log retains the full diagnostic context.
+label, static event name, exception types and messages, chained exceptions,
+exception-group members, and stack filenames, paths, functions, line numbers,
+and source context. Recognizable credential patterns are redacted using the
+same filter as local logs. Local variables, command arguments, and structured
+log fields are not collected. Messages and source context can include
+application data; configure a reporting destination appropriate for that data.
+Individual text values are limited to 100,000 characters by the SDK.
 
 The SDK is confined to the host: no DSN is injected into sandboxes and no
 sandbox egress rule is added. Session tracking, tracing, profiling, metrics,
