@@ -220,6 +220,20 @@ class TestRollbackExtrasParity:
         assert set(upgrade[0].split(",")) == set(rollback[0].split(",")) == {"discord", "slack"}
 
 
+@pytest.mark.parametrize("fixture", ["deploy", "example"])
+@pytest.mark.parametrize("step", ["Upgrade", "Roll back"])
+def test_deploy_preserves_the_operator_installed_sbx(
+    fixture: str, step: str, request: pytest.FixtureRequest
+) -> None:
+    """Plain init would replace a newer runtime with sbxloop's pinned sbx,
+    including during rollback, when the newer runtime may have migrated
+    its state. Refreshing the service must leave that runtime untouched."""
+    text = request.getfixturevalue(fixture)
+    commands = re.findall(r'^\s*"\$\{SBXLOOP\}" init (.*)$', _step(text, step), re.M)
+    assert commands, f"{step} does not refresh the installed service"
+    assert all("--no-sbx" in command.split() for command in commands)
+
+
 class TestStructuredControl:
     """#639: the job reads the daemon through `ctl status --json` and
     speaks through `daemon notify` — never prose, the secrets file or the
@@ -320,7 +334,8 @@ class TestDocsSplit:
         first_fence = section.split("```bash", 1)[1].split("```", 1)[0]
         assert "pip install --python ~/.sbxloop/venv/bin/python" in first_fence
         assert "--upgrade 'sbxloop[discord,slack]==X.Y.Z'" in first_fence
-        assert "sbxloop backup" in first_fence and "sbxloop init --systemd" in first_fence
+        assert "sbxloop backup" in first_fence
+        assert "sbxloop init --systemd --no-sbx" in first_fence
         assert "ctl status --json" in first_fence
         assert "reset-failed sbxloop-daemon" in first_fence
         # The workflow is the optional afterthought, below the commands.
