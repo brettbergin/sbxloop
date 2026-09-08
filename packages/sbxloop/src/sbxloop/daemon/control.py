@@ -424,6 +424,11 @@ def _dispatch(
         ]
         if s.get("stopping"):
             lines.append("**stopping:** yes — nothing new is claimed; exits after the current run")
+        if s.get("source_failures"):
+            lines.append(
+                f"**source:** polling failed {s['source_failures']} time(s); "
+                f"retry in {s.get('source_retry_in_s', 0):.0f}s — check the daemon logs"
+            )
         repos = [r for r in (s.get("repos") or []) if isinstance(r, dict)]
         unwell = [r for r in repos if r.get("state") != "ok"]
         if unwell:

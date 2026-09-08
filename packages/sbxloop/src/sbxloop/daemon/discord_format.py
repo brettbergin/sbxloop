@@ -2235,7 +2235,7 @@ def status_embed(status: dict[str, Any]) -> EmbedSpec:
     )
     resumes = status.get("resumes_today", 0)
     tz = status.get("run_cap_timezone", "UTC")
-    fields = (
+    fields: tuple[tuple[str, str, bool], ...] = (
         ("Current", current, False),
         ("Queued", str(status.get("queued", 0)), True),
         (
@@ -2247,10 +2247,19 @@ def status_embed(status: dict[str, Any]) -> EmbedSpec:
         ("Breaker", breaker, True),
         ("Paused", paused, True),
     )
+    if status.get("source_failures"):
+        fields += (
+            (
+                "Source",
+                f"polling failed {status['source_failures']} time(s); "
+                f"retry in {status.get('source_retry_in_s', 0):.0f}s — check the daemon logs",
+                False,
+            ),
+        )
     color = (
         COLOR_FAIL
         if status.get("breaker_open")
-        else (COLOR_WARN if status.get("paused") else COLOR_OK)
+        else (COLOR_WARN if status.get("paused") or status.get("source_failures") else COLOR_OK)
     )
     return EmbedSpec(title="sbxloop daemon", color=color, fields=fields).clamped()
 

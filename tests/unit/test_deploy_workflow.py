@@ -12,7 +12,10 @@ and config files, and nothing in it may name a host or a user.
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import textwrap
 from pathlib import Path
 
 import pytest
@@ -40,6 +43,74 @@ def _step(deploy: str, name: str) -> str:
     match = re.search(pattern, deploy, re.S)
     assert match, f"step {name!r} missing"
     return match.group(1)
+
+
+@pytest.mark.parametrize("fixture", ["deploy", "example"])
+class TestAuthenticationOutage:
+    def test_preflight_precedes_any_hold_or_upgrade(
+        self, fixture: str, request: pytest.FixtureRequest
+    ) -> None:
+        text = request.getfixturevalue(fixture)
+        preflight = _step(text, "Check the host before upgrading")
+        assert '"${SBXLOOP}" doctor' in preflight
+        assert text.index("name: Check the host before upgrading") < text.index(
+            "name: Take the deploy hold"
+        )
+
+    @pytest.mark.parametrize("failure", ["doctor", "status", "active", "none"])
+    def test_rollback_only_reports_restored_after_health_checks(
+        self,
+        fixture: str,
+        request: pytest.FixtureRequest,
+        tmp_path: Path,
+        failure: str,
+    ) -> None:
+        text = request.getfixturevalue(fixture)
+        rollback = _step(text, "Roll back")
+        script = textwrap.dedent(rollback.split("        run: |\n", 1)[1])
+        for command in ("sbxloop", "uv", "systemctl", "sleep"):
+            path = tmp_path / command
+            path.write_text(
+                "#!/bin/sh\n"
+                'case "$1" in\n'
+                '  doctor) [ "$FAILURE" != doctor ] || exit 1;;\n'
+                '  --version) echo "sbxloop $PREV";;\n'
+                '  daemon) [ "$FAILURE" != status ] || exit 1;;\n'
+                '  --user) if [ "$2" = is-active ] && [ "$FAILURE" = active ]; then exit 1; fi;;\n'
+                "esac\n"
+                "exit 0\n"
+            )
+            path.chmod(0o755)
+        output = tmp_path / "output"
+        env = {
+            **os.environ,
+            "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            "SBXLOOP": str(tmp_path / "sbxloop"),
+            "VENV_SBXLOOP": str(tmp_path / "sbxloop"),
+            "VENV_PYTHON": "unused",
+            "UV": str(tmp_path / "uv"),
+            "PREV": "1.5.51",
+            "UNIT": "test-daemon",
+            "HOST": "test-host",
+            "GITHUB_OUTPUT": str(output),
+            "FAILURE": failure,
+        }
+        result = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True)
+        if failure == "none":
+            assert result.returncode == 0, result.stderr
+            assert "restored=true" in output.read_text()
+        else:
+            assert result.returncode != 0, result.stdout
+            assert "restored=true" not in output.read_text()
+            assert "needs a human" in result.stdout
+
+    def test_report_uses_verified_rollback_outcome(
+        self, fixture: str, request: pytest.FixtureRequest
+    ) -> None:
+        text = request.getfixturevalue(fixture)
+        report = _step(text, "Report")
+        assert "steps.rollback.outputs.restored" in report
+        assert "rollback could not restore health" in report
 
 
 class TestNeverRestartUnderARun:

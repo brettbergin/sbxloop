@@ -549,7 +549,11 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
 
 - the **github-ops box** (`daemon/github.py`) — polling and issue lifecycle
   with `GH_TOKEN`, provisioned lazily, dropped and re-provisioned on
-  failure at most once per five minutes, removed at daemon start/stop;
+  failure at most once per five minutes, removed before provisioning and
+  at daemon stop. Each provision checks inventory and removes only this
+  instance's stale box. Inventory or removal failures stop that attempt;
+  polling backoff retries cleanup after authentication or the sandbox
+  service recovers, while daemon control stays available;
 - the **concierge box** (`daemon/agentbox.py`) — the control channel's
   agent (`daemon/concierge.py`), a Copilot session with the agent token
   and **no built-in tools**: everything it can do is a *host tool*

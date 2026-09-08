@@ -108,6 +108,13 @@ jobs:
             echo "::notice::deploying ${current} -> ${{ steps.target.outputs.version }}"
           fi
 
+      - name: Check the host before upgrading
+        if: steps.installed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # Detect existing login or host failures before changing the install.
+          "${SBXLOOP}" doctor
+
       - name: Take the deploy hold
         id: hold
         if: steps.installed.outputs.changed == 'true'
@@ -249,12 +256,14 @@ jobs:
           echo "::notice::${HOST} is healthy on ${VERSION}"
 
       - name: Roll back
+        id: rollback
         # Only once the upgrade ran: before it nothing on the host changed.
         if: failure() && steps.installed.outputs.changed == 'true' && steps.upgrade.outcome != 'skipped'
         env:
           PREV: ${{ steps.installed.outputs.current }}
         run: |
           set -euo pipefail
+          echo "restored=false" >> "$GITHUB_OUTPUT"
           echo "::error::deploy failed — rolling back to ${PREV}"
           # The same extras as the upgrade: dropping one rolls a host on
           # that backend back to a build that cannot start.
@@ -263,9 +272,16 @@ jobs:
           systemctl --user reset-failed "${UNIT}" || true
           timeout 300 systemctl --user restart "${UNIT}"
           sleep 15
-          systemctl --user is-active --quiet "${UNIT}" \
-            && echo "rolled back to $("${VENV_SBXLOOP}" --version | awk '{print $2}')" \
-            || echo "::error::ROLLBACK ALSO FAILED — ${HOST} needs a human"
+          if systemctl --user is-active --quiet "${UNIT}" \
+            && [ "$("${VENV_SBXLOOP}" --version | awk '{print $2}')" = "${PREV}" ] \
+            && "${SBXLOOP}" doctor \
+            && "${SBXLOOP}" daemon ctl status --json --timeout 300 >/dev/null; then
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+            echo "rolled back to ${PREV}; health checks passed"
+          else
+            echo "::error::ROLLBACK ALSO FAILED — ${HOST} needs a human"
+            exit 1
+          fi
 
       - name: Restore the other holds
         if: always() && steps.installed.outputs.changed == 'true' && steps.state.outcome == 'success'
@@ -294,6 +310,7 @@ jobs:
           RESULT: ${{ job.status }}
           WAITED_S: ${{ steps.drain.outputs.waited_s }}
           UPGRADED: ${{ steps.upgrade.outcome }}
+          RESTORED: ${{ steps.rollback.outputs.restored }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         continue-on-error: true
         run: |
@@ -306,7 +323,9 @@ jobs:
             MSG="✅ \`${HOST}\` restarted on sbxloop \`${VERSION}\`${waited} — [run](${RUN_URL})"
           elif [ "${UPGRADED}" = "skipped" ]; then
             MSG="❌ deploy of sbxloop \`${VERSION}\` to \`${HOST}\` **${RESULT}** before anything was installed — still on \`${FROM}\`, daemon untouched. [run](${RUN_URL})"
-          else
+          elif [ "${RESTORED}" = "true" ]; then
             MSG="❌ deploy of sbxloop \`${VERSION}\` to \`${HOST}\` **${RESULT}** — rolled back to \`${FROM}\`. [run](${RUN_URL})"
+          else
+            MSG="❌ deploy of sbxloop \`${VERSION}\` to \`${HOST}\` **${RESULT}** — rollback could not restore health; ${HOST} needs a human. [run](${RUN_URL})"
           fi
           "${SBXLOOP}" daemon notify "${MSG}"
