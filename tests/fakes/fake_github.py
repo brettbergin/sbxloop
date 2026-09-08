@@ -139,6 +139,7 @@ class FakeGithub(GithubOps):
             "mergeable": True,
             "mergeable_state": "clean",
             "head": {"sha": "commit0"},
+            "base": {"sha": "base123"},
         }
         # What `repo_get` answers (#620): every merge method allowed, so
         # `merge_method = "auto"` resolves to squash as it always did.
@@ -169,6 +170,13 @@ class FakeGithub(GithubOps):
         self.failed_logs_calls: list[str] = []
         self.reviews_payload: list[dict[str, Any]] = []
         self.comments_payload: list[dict[str, Any]] = []
+        # GET /pulls/{n}/files: patches describe the commentable diff, not
+        # the entire file. Tests can omit a patch (binary/oversized file),
+        # supply malformed responses, or move a ref while it is read.
+        self.files_payload: Any = [
+            {"filename": "hello.txt", "patch": "@@ -1,3 +1,3 @@\n-hi\n+hello\n second\n third"}
+        ]
+        self.files_after_read: dict[str, Any] = {}
         self.feedback = ""
         self.undraft_ok = True
         self.update_ok = True
@@ -453,6 +461,15 @@ class FakeGithub(GithubOps):
         # list whole, so page one is the list and any later page is empty;
         # routing below matches on the path without its query.
         path, _, query = path.partition("?")
+        if method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+/pulls/\d+/files", path):
+            self._maybe_fail("pr_files")
+            self.pr.update(self.files_after_read)
+            if not isinstance(self.files_payload, list):
+                return self.files_payload
+            params = parse_qs(query)
+            size = int(params.get("per_page", ["30"])[0])
+            start = (int(params.get("page", ["1"])[0]) - 1) * size
+            return self.files_payload[start : start + size]
         if method == "GET" and path == "/search/issues":
             self._maybe_fail("issue_search")
             if self.issue_search_payload is not None:
@@ -691,7 +708,8 @@ class FakeGithub(GithubOps):
 
     def pr_get(self, repo: str, number: int) -> dict[str, Any]:
         self._maybe_fail("pr_get")
-        return {**self.pr, "head": dict(self.pr["head"])}
+        head = self.pr.get("head")
+        return {**self.pr, "head": dict(head) if isinstance(head, dict) else head}
 
     def pr_required_checks(self, repo: str, number: int) -> tuple[str, ...]:
         self.rollup_calls += 1
@@ -742,7 +760,9 @@ class FakeGithub(GithubOps):
         comments: Sequence[ReviewComment] = (),
     ) -> SubmittedReview:
         self._maybe_fail("pr_review_create")
-        if self.refuse_inline_comments and comments:
+        if (self.refuse_inline_comments and comments) or any(
+            anchor_of(c) in self.refuse_anchors for c in comments
+        ):
             raise self._failed(
                 "raw.api",
                 "POST",
