@@ -171,6 +171,7 @@ from sbxloop.errors import (
     ConfigError,
     DeliveryError,
     DeliveryPermissionError,
+    EmptyDeliveryError,
     GithubOpsError,
     InvalidOutputTwice,
     ProvisionError,
@@ -1626,6 +1627,13 @@ class LoopEngine:
             elif stage == "delivering":
                 try:
                     self._stage_deliver(p)
+                except EmptyDeliveryError as exc:
+                    # Empty output cannot prove the request was satisfied.
+                    # Hand it over without automatically buying another run.
+                    return "blocked", (
+                        f"{exc}; automatic retries stopped. Check whether the request "
+                        "is already satisfied or intended changes were omitted or excluded."
+                    )
                 except DeliveryPermissionError as exc:
                     # The credential cannot make this delivery and no
                     # attempt would change that (#752): hand over with the

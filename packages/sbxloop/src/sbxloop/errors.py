@@ -99,6 +99,14 @@ class DeliveryError(SbxloopError):
     """Delivering a run's workspace as a GitHub PR failed."""
 
 
+class EmptyDeliveryError(DeliveryError):
+    """No deliverable files or changes remain; another attempt needs triage.
+
+    An empty diff can mean the request is already satisfied, omitted work,
+    or changes excluded from delivery. It does not establish completion.
+    """
+
+
 class DeliveryPermissionError(DeliveryError):
     """A delivery the credential is known not to be allowed to make (#752):
     the plan touches ``.github/workflows/`` and the token has no

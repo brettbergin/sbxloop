@@ -350,10 +350,13 @@ with where a check looks. Time spent waiting on GitHub is not charged to
 branch. `completed` — no repository was configured; the work passed the
 gate and sits in the workspace. `failed` — a task or a round budget ran out
 (any PR is still a draft, and nothing re-picks it). `blocked` — the run
-cleared its own bar but GitHub would not let it finish: a protection rule
+needs human triage. An empty delivery stops here without automatic retries:
+check whether the request is already satisfied or changes were omitted or
+excluded; an empty diff alone does not establish completion. GitHub can
+also prevent a run that cleared its own bar from finishing: a protection rule
 wanting an approval this identity cannot give, CI that never reported within
-`ci_timeout_s`, an update-branch budget spent. Nothing another round would
-change, so the PR is left open and out of draft for a human. (`cancelled` is
+`ci_timeout_s`, an update-branch budget spent. Those landing blockers leave
+the PR open and out of draft for a human. (`cancelled` is
 the fifth, and yours.)
 
 **Checkpointing and resume.** State is committed to SQLite after every
@@ -908,10 +911,14 @@ issue:
   `in-progress` → **`sbxloop:failed`**, with re-trigger instructions
   (just re-add `run`; the claim clears `failed` itself). Any PR stays a
   draft.
-- **`blocked`** — the run cleared its own bar and GitHub would not let it
+- **`blocked`** — the run needs human triage. No deliverable files or changes
+  stops a code run without another automatic attempt, without a new PR, and
+  without claiming the issue is completed. Check the current base and the
+  intended changes before closing or re-triggering the issue. A run can also
+  clear its own bar while GitHub would not let it
   finish: a protection rule wanting an approval the loop's identity cannot
   give, CI that never reported, an update-branch budget spent. The PR is
-  left **open and out of draft** — one click from done — the issue stays
+  left **open and out of draft** when blocked at landing; the issue stays
   open with **`sbxloop:blocked`** and a comment saying why, and the item
   neither retries nor counts toward the breaker, because nothing another
   attempt would change. Merge or fix by hand and close the issue, or re-add

@@ -2967,6 +2967,19 @@ class TestPipeline:
         (merged,) = self._events(harness, HostEventTypes.RUN_MERGED)
         assert merged.data["sha"] == "human123" and merged.data["by_human"] is True
 
+    def test_empty_delivery_blocks_without_repeating_the_agent(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1")), BUILD])
+        engine = harness.pipeline(fake)
+        result = engine.start("check whether the requested change is still needed")
+        assert result.state == "blocked"
+        assert result.reason and "nothing to deliver" in result.reason
+        assert "automatic retries" in result.reason
+        assert engine.store.get_run(result.run_id).state == "blocked"
+        assert result.pr_number is None
+        assert harness.consumed() == 2
+        assert not any(method != "GET" for method, _, _ in fake.raw_calls)
+
     def test_failed_graph_never_delivers(self, harness: Harness) -> None:
         fake = FakeGithub()
         harness.script([taskgraph(task("t1", verify=["false"])), BUILD])
