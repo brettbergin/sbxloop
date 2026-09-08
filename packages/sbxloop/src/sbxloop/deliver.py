@@ -73,7 +73,12 @@ from sbxloop.engine.model import (
     exclusion_hit,
     scan_artifacts,
 )
-from sbxloop.errors import DeliveryError, DeliveryPermissionError, GithubOpsError
+from sbxloop.errors import (
+    DeliveryError,
+    DeliveryPermissionError,
+    EmptyDeliveryError,
+    GithubOpsError,
+)
 from sbxloop.gh.ops import GithubOps, PrRef
 from sbxloop.gh.permissions import WORKFLOWS_NEED, workflow_paths
 from sbxloop.ids import branch_name as branch_name  # re-export; shared with hostgit isolation
@@ -742,7 +747,7 @@ def _is_checkout_root(source_dir: Path) -> bool:
 def _plan_snapshot(source_dir: Path, exclude: Sequence[str]) -> DeliveryPlan:
     scan = scan_artifacts(source_dir, exclude)
     if not scan.files:
-        raise DeliveryError(f"nothing to deliver: no files in {source_dir}")
+        raise EmptyDeliveryError(f"nothing to deliver: no files in {source_dir}")
     changes = [
         hostgit.WorkspaceChange(
             path=f.relative_to(source_dir).as_posix(), status="added", mode=hostgit.tree_mode(f)
@@ -810,7 +815,7 @@ def _plan_git_diff(source_dir: Path, base_sha: str, exclude: Sequence[str]) -> D
         why = f"{source_dir} has no changes relative to {diff_base[:12]}"
         if skipped_notes:
             why += " that can be delivered: " + "; ".join(skipped_notes)
-        raise DeliveryError(f"nothing to deliver: {why}")
+        raise EmptyDeliveryError(f"nothing to deliver: {why}")
     entries: list[dict[str, Any]] = []
     uploads: dict[str, bytes] = {}
     lines: list[str] = []

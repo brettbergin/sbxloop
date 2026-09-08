@@ -20,7 +20,12 @@ from sbxloop.deliver import (
     deliver_workspace,
     ensure_repository,
 )
-from sbxloop.errors import DeliveryError, DeliveryPermissionError, GithubOpsError
+from sbxloop.errors import (
+    DeliveryError,
+    DeliveryPermissionError,
+    EmptyDeliveryError,
+    GithubOpsError,
+)
 from sbxloop.gh.ops import PrRef
 from tests.fakes.github_errors import github_error
 from tests.fakes.gitserver import PrivateGitServer, bare_from
@@ -373,7 +378,7 @@ class TestDeliverWorkspace:
     def test_empty_workspace_refused(self, tmp_path: Path) -> None:
         empty = tmp_path / "empty"
         empty.mkdir()
-        with pytest.raises(DeliveryError, match="nothing to deliver"):
+        with pytest.raises(EmptyDeliveryError, match="nothing to deliver"):
             deliver_workspace(
                 StubOps(),  # type: ignore[arg-type]
                 "o/r",
@@ -912,7 +917,7 @@ class TestGitDiffDelivery:
     def test_no_changes_refused(self, tmp_path: Path) -> None:
         clone, _ = make_clone_workspace(tmp_path)
         ops = StubOps()
-        with pytest.raises(DeliveryError, match="no changes relative to"):
+        with pytest.raises(EmptyDeliveryError, match="no changes relative to"):
             deliver(ops, clone)
         # nothing was written to GitHub
         assert not any(m == "POST" for m, _, _ in ops.raw_calls)

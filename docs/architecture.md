@@ -659,6 +659,9 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   and a draft PR (see [Delivery](#delivery)); every later round re-delivers
   onto the same branch, so one run is one PR. A checkout delivers its git
   diff against the base, a history-less workspace a snapshot, and both
+  stop a code run as `blocked` when no deliverable changes or files remain.
+  This outcome asks for triage without an automatic daemon retry: empty
+  output alone proves neither completion nor a transient failure. Otherwise both
   go through one tree builder (`deliver._blob_upload`, #695) that keeps
   exec bits (`100755`) and symlinks (`120000`) as `hostgit.tree_mode`
   reads them from disk. The repository's own
