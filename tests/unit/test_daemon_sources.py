@@ -706,7 +706,9 @@ class TestDaemonGithubInstance:
 
 
 class TestDaemonGithubProvisioning:
-    def test_provision_error_is_wrapped_as_daemon_error(self, tmp_path: Any) -> None:
+    def test_provision_error_is_wrapped_as_daemon_error(
+        self, tmp_path: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         """ensure_github_only can raise ProvisionError (not just SbxError);
         both must surface as one DaemonError (review)."""
         from sbxloop.config import Config
@@ -722,6 +724,7 @@ class TestDaemonGithubProvisioning:
                 raise ProvisionError("GH_TOKEN is not set")
 
         gh_.provisioner = Boom()  # type: ignore[assignment]
+        monkeypatch.setattr(gh_, "remove_stale", lambda: None)
         with pytest.raises(DaemonError, match="GH_TOKEN"):
             gh_.ops()
 

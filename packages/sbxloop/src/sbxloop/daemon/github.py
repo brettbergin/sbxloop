@@ -12,6 +12,7 @@ picked up transparently.
 from __future__ import annotations
 
 import hashlib
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -44,7 +45,7 @@ REPROVISION_MIN_INTERVAL_S = 300.0
 
 def sandbox_name_for(home: SbxloopHome) -> str:
     """Per-instance sandbox name. The name used to be fixed, and
-    ``remove_stale`` deletes a same-named sandbox at startup: a second
+    ``remove_stale`` deletes a same-named sandbox before provisioning: a second
     daemon on the same host (another home) killed
     the first's github sandbox (#254). Two daemons sharing one home
     would also share a run store, which nothing supports, so the home is
@@ -82,27 +83,37 @@ class DaemonGithub:
         self._sandbox: Sandbox | None = None
         self._client: WorkerClient | None = None
         self._ops: GithubOps | None = None
+        self._lifecycle_lock = threading.RLock()
 
     @property
     def workspace(self) -> Path:
         return self.config.paths.github_workspace.resolve()
 
     def remove_stale(self) -> None:
-        """Drop a same-named sandbox left by a previous daemon process."""
-        try:
+        """Remove only this instance's stale box; uncertainty must propagate.
+
+        Inventory, rather than a generic 'not found' exception, proves
+        absence: Docker authentication errors can say 'secret not found'.
+        Run this before every provision so a failed cleanup is retried when
+        authentication or the sandbox service recovers.
+        """
+        if any(info.name == self.name for info in self.sbx.ls()):
             Sandbox(self.sbx, self.name).rm()
             log.info("github_sandbox.stale_removed", sandbox=self.name)
-        except SbxError:
+        else:
             log.debug("github_sandbox.no_stale", sandbox=self.name)
 
     def ops(self) -> GithubOps:
-        if self._ops is None:
-            # Lazy: the first GitHub call of the process (or the first after
-            # a drop) pays for a microVM boot + worker install here — say
-            # so, or that call looks like a hang.
-            log.info("github_sandbox.provision_needed", sandbox=self.name)
-            self._ops = self._provision()
-        return self._ops
+        # Polling and control requests can arrive together. Cleanup belongs
+        # to one provision, never to a competing request's new sandbox.
+        with self._lifecycle_lock:
+            if self._ops is None:
+                # Lazy: the first GitHub call of the process (or the first after
+                # a drop) pays for a microVM boot + worker install here — say
+                # so, or that call looks like a hang.
+                log.info("github_sandbox.provision_needed", sandbox=self.name)
+                self._ops = self._provision()
+            return self._ops
 
     def call(self, fn: Callable[[GithubOps], T]) -> T:
         """Run ``fn(ops)``; on failure drop the sandbox (rate-limited, see
@@ -152,13 +163,14 @@ class DaemonGithub:
             return False
 
     def close(self) -> None:
-        sandbox, self._sandbox, self._client, self._ops = self._sandbox, None, None, None
-        if sandbox is not None:
-            try:
-                sandbox.rm()
-                log.info("github_sandbox.removed", sandbox=self.name)
-            except SbxError:
-                log.warning("github_sandbox.remove_failed", sandbox=self.name, exc_info=True)
+        with self._lifecycle_lock:
+            sandbox, self._sandbox, self._client, self._ops = self._sandbox, None, None, None
+            if sandbox is not None:
+                try:
+                    sandbox.rm()
+                    log.info("github_sandbox.removed", sandbox=self.name)
+                except SbxError:
+                    log.warning("github_sandbox.remove_failed", sandbox=self.name, exc_info=True)
 
     def _provision(self) -> GithubOps:
         clients: list[WorkerClient] = []
@@ -192,6 +204,7 @@ class DaemonGithub:
             install_workers=self.install_workers,
         )
         try:
+            self.remove_stale()
             sandbox = self.provisioner.ensure_github_only(
                 self.name, self.workspace, post_create=install, repo=self.repo
             )

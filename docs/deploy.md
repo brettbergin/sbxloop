@@ -25,11 +25,19 @@ pause hold, waits for the daemon to be idle, and only then installs and restarts
 - `holds` is the set of named pause holds; `paused` is whether any stand. Holds are
   in-memory only: **every restart comes back unpaused**, so an operator's hold has to be
   snapshotted before the restart and re-taken after it.
+- `source_failures` counts consecutive failed discovery polls, independently of failed
+  runs. `source_retry_in_s` gives the remaining polling backoff. A successful poll resets
+  both; plain status and the chat status card warn while polling is failing.
 
 The prose `ctl status` is for people and may change; the JSON is for scripts. Exit codes:
 `0` answered, `1` answered but pending or without a structured status (a daemon older than
 this flag), `2` no daemon answered — the last one means there is nothing to drain. A
 `status` call mutates the circuit breaker, so poll no faster than every 15 s.
+
+The automated workflow runs `sbxloop doctor` before taking its hold or installing anything.
+An existing Docker login or host failure stops deployment with the running install intact.
+After rollback it checks the installed version, service, doctor and control response before
+reporting success; a running process alone does not establish a successful rollback.
 
 ## Install
 

@@ -753,6 +753,11 @@ class DaemonLoop:
             ],
             # Where work comes from (#760): "github", "chat", or both.
             "source": self.source.name,
+            # Polling has its own backoff, independent of failed runs. A
+            # daemon that cannot discover work must not appear healthy
+            # merely because it has no failed runs or queued items.
+            "source_failures": self._source_failures,
+            "source_retry_in_s": max(0.0, self._source_next_poll - now),
         }
 
     # -- multi-repo polling health (#516) -----------------------------------------

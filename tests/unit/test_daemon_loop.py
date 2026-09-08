@@ -1302,7 +1302,17 @@ class TestSourceBackoff:
         flaky = Flaky([gh_item()])
         h.loop.source = flaky
         interval = h.config.daemon.poll_interval_s
+        assert h.loop.status()["source_failures"] == 0
         h.loop.tick()  # failure 1 -> next poll in 2*interval
+        status = h.loop.status()
+        assert status["source_failures"] == 1
+        assert status["source_retry_in_s"] == 2 * interval
+        assert status["consecutive_failures"] == 0
+        from sbxloop.daemon.control import dispatch
+        from sbxloop.daemon.discord_format import COLOR_WARN, status_embed
+
+        assert "polling failed" in dispatch(h.loop, "status").text
+        assert status_embed(status).color == COLOR_WARN
         h.loop.tick()  # skipped
         assert polls == 1
         h.clock.t += 2 * interval
@@ -1316,6 +1326,9 @@ class TestSourceBackoff:
         result = h.loop.tick()  # recovers and dispatches
         assert polls == 4 and result.dispatched == "gh:issue:1"
         assert h.loop._source_failures == 0
+        assert h.loop.status()["source_failures"] == 0
+        assert h.loop.status()["source_retry_in_s"] == 0
+        assert "polling failed" not in dispatch(h.loop, "status").text
 
     def test_one_unrecordable_item_does_not_take_the_daemon_down(self, tmp_path: Path) -> None:
         """A poll that raises is backed off, but recording an item used to
