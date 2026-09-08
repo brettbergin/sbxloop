@@ -690,7 +690,16 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   in a top-level comment; GitHub refuses `REQUEST_CHANGES`/`APPROVE` from
   an author, so the review feature is not asked), and as an
   `APPROVE`/`REQUEST_CHANGES` review (`COMMENT` fallback) when a distinct
-  identity reviews.
+  identity reviews. Before either posting path sends inline findings, the
+  host checks their locations against GitHub's paginated PR file patches
+  and checks that the head and base stayed fixed during the read. Only
+  RIGHT-side additions and context lines in complete, understood hunks
+  qualify. Findings outside that diff, files without a usable patch, and
+  findings whose locations could not be verified go directly into the
+  review body with their original anchors and severity; they remain in
+  the verdict and reconciliation history. The lookup is skipped when
+  there are no inline candidates and adds no agent turn. GitHub refusals
+  after the check still use the existing fallback.
 - **FIX** — one seeded task (`fix-N`), built and verified like any other
   under the same revision/replan budgets, whose exam is the union of the
   decomposer's verify commands plus the gate. Then back to GATE. Every
