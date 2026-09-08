@@ -35,6 +35,8 @@ env:
   # The home defaults to ~/.sbxloop; the cache/upload steps below target
   # .sbxloop/state/conformance in the checkout, so pin the home there.
   SBXLOOP_HOME: ${{ github.workspace }}/.sbxloop
+  # Init reuses this checkout's environment instead of installing a release.
+  UV_PROJECT_ENVIRONMENT: ${{ github.workspace }}/.sbxloop/venv
 
 jobs:
   conformance:
@@ -46,6 +48,9 @@ jobs:
           fetch-depth: 0  # hatch-vcs needs tags to resolve the version
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --all-packages
+
+      - name: Initialize sbxloop home
+        run: uv run sbxloop init --no-sbx
 
       - name: Enable KVM and user namespaces
         run: |

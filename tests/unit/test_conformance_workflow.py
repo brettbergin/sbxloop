@@ -23,6 +23,19 @@ def test_daemon_socket_fits_the_unix_path_limit() -> None:
     assert len(str(socket).encode()) <= 104, socket
 
 
+def test_home_is_initialized_from_the_project_environment_before_doctor() -> None:
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    env = workflow["env"]
+    # Init must keep the checkout's installed code instead of downloading a
+    # released sbxloop into a second environment before probing this change.
+    assert env.get("UV_PROJECT_ENVIRONMENT") == f"{env['SBXLOOP_HOME']}/venv"
+    commands = [step.get("run", "").strip() for step in workflow["jobs"]["conformance"]["steps"]]
+    sync = commands.index("uv sync --all-packages")
+    initialize = commands.index("uv run sbxloop init --no-sbx")
+    doctor = next(i for i, command in enumerate(commands) if "doctor --deep" in command)
+    assert sync < initialize < doctor
+
+
 def test_artifact_upload_includes_the_versioned_verdict_cache(tmp_path: Path) -> None:
     home = SbxloopHome(tmp_path / ".sbxloop")
     verdict = home.conformance / "sbx-0.42.1.json"
