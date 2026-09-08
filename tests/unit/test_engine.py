@@ -3396,6 +3396,97 @@ class TestReviewPostFallback:
     COMMENT fallback alike, and nothing reached the PR. The findings matter
     more than their anchors."""
 
+    @pytest.mark.parametrize("self_review", [False, True])
+    @pytest.mark.parametrize("path,line", [("unchanged.txt", 1), ("hello.txt", 99)])
+    def test_outside_diff_findings_never_attempt_an_inline_post(
+        self, harness: Harness, self_review: bool, path: str, line: int
+    ) -> None:
+        fake = FakeGithub(self_review=self_review)
+        anchor = f"{path}:{line}"
+        fake.refuse_anchors = {anchor}
+        valid = {"path": "hello.txt", "line": 1, "body": "valid nit", "severity": "nit"}
+        outside = {"path": path, "line": line, "body": "outside nit", "severity": "nit"}
+        harness.script(
+            [taskgraph(task("t1")), FILES_BUILD, review("approve", "reviewed", valid, outside)]
+        )
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
+
+        assert result.state == "merged"
+        fake.assert_no_failed_jobs()
+        assert [t.anchor for t in fake.threads] == ["hello.txt:1"]
+        bodies = fake.issue_comments if self_review else [b for _, b, _ in fake.reviews]
+        assert f"`{anchor}` [nit] outside nit" in bodies[0]
+        assert "valid nit" not in bodies[0]
+        records = engine.store.posted_findings(result.run_id)
+        assert [(r.anchor, r.body_only) for r in records] == [
+            ("hello.txt:1", False),
+            (anchor, True),
+        ]
+
+    @pytest.mark.parametrize("self_review", [False, True])
+    @pytest.mark.parametrize(
+        "unavailable", ["missing_patch", "malformed_list", "moved_head", "read_error"]
+    )
+    def test_unverified_locations_preserve_the_finding_in_the_body(
+        self, harness: Harness, self_review: bool, unavailable: str
+    ) -> None:
+        fake = FakeGithub(self_review=self_review)
+        fake.refuse_anchors = {"hello.txt:1"}
+        if unavailable == "missing_patch":
+            fake.files_payload = [{"filename": "hello.txt"}]
+        elif unavailable == "malformed_list":
+            fake.files_payload = {}
+        elif unavailable == "moved_head":
+            fake.files_after_read = {"head": {"sha": "moved"}}
+        else:
+            fake.fail_once["pr_files"] = GithubOpsError("unavailable", http_status=503)
+        nit = {"path": "hello.txt", "line": 1, "body": "keep this nit", "severity": "nit"}
+        harness.script([taskgraph(task("t1")), FILES_BUILD, review("approve", "reviewed", nit)])
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
+        bodies = fake.issue_comments if self_review else [b for _, b, _ in fake.reviews]
+        assert "`hello.txt:1` [nit] keep this nit" in bodies[0]
+        assert fake.threads == []
+        assert not any(status == 422 for _, _, _, status in fake.failed_jobs)
+        (record,) = engine.store.posted_findings(result.run_id)
+        assert record.anchor == "hello.txt:1" and record.body_only
+
+    def test_no_findings_does_not_read_diff_locations(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.fail_always["pr_files"] = AssertionError("no inline candidates")
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        assert harness.pipeline(fake).start("write hello.txt").state == "merged"
+
+    @pytest.mark.parametrize("self_review", [False, True])
+    def test_outside_diff_blocker_still_drives_one_fix_and_is_reconciled(
+        self, harness: Harness, self_review: bool
+    ) -> None:
+        fake = FakeGithub(self_review=self_review)
+        fake.refuse_anchors = {"unchanged.txt:42"}
+        blocker = {**FINDING, "path": "unchanged.txt", "line": 42}
+        fix = {"text": "Fixed.\n\naddressed: unchanged.txt:42 — corrected the greeting"}
+        harness.script(
+            [
+                taskgraph(task("t1")),
+                FILES_BUILD,
+                review("request_changes", "fix it", blocker),
+                fix,
+                REVIEW_OK,
+            ]
+        )
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+        assert harness.consumed() == 5
+        fake.assert_no_failed_jobs()
+        assert fake.threads == []
+        (record,) = engine.store.posted_findings(result.run_id)
+        assert record.anchor == "unchanged.txt:42" and record.body_only
+        assert any(
+            "unchanged.txt:42" in body and "addressed" in body for body in fake.issue_comments
+        )
+
     def test_a_review_refused_for_its_anchors_is_reposted_in_the_body(
         self, harness: Harness
     ) -> None:
