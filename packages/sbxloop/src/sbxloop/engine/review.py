@@ -135,6 +135,11 @@ class Followup(_Model):
     body: str = ""
     path: str = ""
     line: int | None = Field(default=None, ge=1)
+    lookup_id: str = ""
+    decision: Literal["new", "tracked", "regression", "uncertain"] = "uncertain"
+    existing_issue: int | None = Field(default=None, gt=0)
+    rationale: str = ""
+    repro: str = ""
 
     @model_validator(mode="after")
     def _check(self) -> Followup:
@@ -628,6 +633,12 @@ def render_review_history(rounds: Sequence[ReviewRound]) -> str:
             f"### Round {entry.round} — {entry.verdict.verdict}\n\n"
             f"{entry.verdict.summary.strip()}\n\nFindings:\n{findings}\n\n"
             f"The fixer's response:\n\n{response}"
+            + (
+                "\n\nFollow-ups already recorded — do not propose them again:\n"
+                + "\n".join(f.render() for f in entry.verdict.followups)
+                if entry.verdict.followups
+                else ""
+            )
         )
     return "\n\n".join(blocks)
 

@@ -2002,6 +2002,8 @@ class TestPipeline:
     }
 
     def _followup_script(self) -> list[dict[str, Any]]:
+        from tests.fakes.followups import with_lookups
+
         minor = {
             "path": "hello.txt",
             "line": 2,
@@ -2014,8 +2016,12 @@ class TestPipeline:
             "text": "Fixed.\n\naddressed: hello.txt:1 — hello\ndeferred: hello.txt:2 — docs later"
         }
         round_two = review("approve", "fixed; the nit is deferred")
-        round_two["json"]["followups"] = [self.FOLLOWUP_A_AGAIN, self.FOLLOWUP_B]
-        return [taskgraph(task("t1")), FILES_BUILD, round_one, fix, round_two]
+        round_two["json"]["followups"] = [
+            self.FOLLOWUP_A_AGAIN,
+            self.FOLLOWUP_B,
+            {"title": "the greeting is not documented", "body": "The fix round deferred it."},
+        ]
+        return with_lookups([taskgraph(task("t1")), FILES_BUILD, round_one, fix, round_two])
 
     def test_a_landed_run_files_deduped_followups_never_queued(self, harness: Harness) -> None:
         """#517: the reviewer's out-of-scope notes and the fix round's
@@ -2036,7 +2042,7 @@ class TestPipeline:
             assert "sbxloop:run" not in labels
             assert "Out of scope for [PR #7]" in body and f"run `{result.run_id}`" in body
             assert "<!-- sbxloop-followup run=" in body
-        assert "the fix round deferred" in fake.issues_created[2][1]
+        assert "The fix round deferred" in fake.issues_created[2][1]
         assert fake.labels_created == ["sbxloop:follow-up"]
         # The PR gets one pointer comment listing them.
         pointer = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]

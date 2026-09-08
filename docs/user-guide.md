@@ -304,11 +304,20 @@ outcome ──▶ DECOMPOSE (task DAG) ──▶ for each task, in dependency or
   merge with the head the review actually judged (a push that landed since
   loses the race rather than being merged over). Then, and only then, the
   review's out-of-scope notes (`followups`) and the fix rounds' deferred
-  findings are filed as **follow-up issues** on the repository — labelled
+  findings can be filed as **follow-up issues** on the repository — labelled
   `sbxloop:follow-up`, never the trigger label, so a human decides whether
   they run; deduplicated by title within the run and by a body marker
   against the repository, capped by `max_followups_per_run`, and listed in
-  one PR comment. `[landing] followups = "comment"` lists them on the PR
+  one PR comment. The reviewer must first look up related open and closed
+  issues and compare the underlying problem. Existing matches are linked;
+  declined issues stay declined. A regression needs a completed issue and
+  fresh reproduction evidence. The host saves and rechecks each lookup:
+  failed, incomplete, changed or missing evidence leaves a note on the PR
+  for triage instead of creating an issue. This also applies to unchecked
+  deferrals and old saved reviews resumed after upgrading. Lookup calls
+  are bounded and use the existing reviewer session. Chat distinguishes
+  newly filed issues, existing matches and notes needing triage.
+  `[landing] followups = "comment"` lists them on the PR
   instead of filing; `"off"` drops them. A repository with Issues disabled
   cannot take them: filing downgrades to that one PR comment and the
   `run.followups` event records the downgrade (`downgraded_from`,

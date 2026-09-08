@@ -40,6 +40,7 @@ from sbxloop import toolchains
 from sbxloop.config import Config
 from sbxloop.deliver import pr_conventions
 from sbxloop.engine.harness import ROLE_BY_PHASE, brief_for_phase
+from sbxloop.engine.issue_lookup import IssueLookup
 from sbxloop.engine.model import (
     JudgeVerdict,
     SteerVerdict,
@@ -379,6 +380,7 @@ class PhaseRunner:
         if bool(host_tools) != (tool_handler is not None):
             raise ValueError("host_tools and tool_handler must be given together")
         self.host_tools: tuple[HostToolSpec, ...] = tuple(host_tools)
+        self.issue_lookup: IssueLookup | None = None
         self.tool_handler = tool_handler
         # Canonical in-VM working directory for every job in this run: the
         # discovered workspace mount, or the harvest dir. Evidence and verify
@@ -505,6 +507,19 @@ class PhaseRunner:
         # the verification procedure exactly as much as the builder does, and
         # unlike a service call it reaches nothing outside the host.
         host_tools, tool_handler = self._tools_for(phase, service_tools)
+        if phase == "review" and self.issue_lookup is not None:
+            lookup = self.issue_lookup
+            other_handler = tool_handler
+
+            def review_handler(call: HostToolCall) -> HostToolResponse:
+                if call.name == lookup.tool_spec().name:
+                    return lookup.handle(call)
+                if other_handler is not None:
+                    return other_handler(call)
+                return HostToolResponse(call_id=call.call_id, ok=False, error="unknown tool")
+
+            host_tools = (*host_tools, lookup.tool_spec())
+            tool_handler = review_handler
         job = JobRequest(
             job_id=new_job_id(),
             run_id=self.run_id,

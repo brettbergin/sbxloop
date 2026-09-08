@@ -712,8 +712,8 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   round if the base requires the check, one if it does not.
 - **LAND** — see below. Once the PR has merged — never before — the
   review's `followups` (real, out of scope, kept out of `findings` so they
-  cost no fix round) and the fix rounds' `deferred:` findings are filed as
-  follow-up issues on the repository (#517): `engine/followups.py` merges
+  cost no fix round) and the fix rounds' `deferred:` findings are candidates
+  for follow-up issues on the repository (#517): `engine/followups.py` merges
   duplicates across rounds by title, each issue carries a
   `<!-- sbxloop-followup run=… key=… -->` marker and is recorded as a
   `followup` phase row before the next is filed (a resume between filing
@@ -721,6 +721,24 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   by `[landing] max_followups_per_run`, and the label is
   `followup_label`, **never** the trigger label — the 1.0 rule that the
   loop files no work of its own stands; a human promotes a follow-up.
+  Before proposing an issue, the reviewer calls the read-only
+  `lookup_followup` host tool (`engine/issue_lookup.py`), searching open and
+  closed issues with up to three symptom/component queries. The existing
+  review session compares meaning; there is no additional agent phase.
+  A `followup_lookup` phase row binds the lookup ID to the repository, run,
+  exact proposal and returned issues. Filing requires that receipt and a
+  decision (`new`, `tracked`, `regression`, `uncertain`); search is refreshed
+  before writing, and changed, incomplete, failed or absent evidence leaves
+  the note on the PR for triage. `tracked` links the canonical issue without
+  changing its labels or state. Regressions require a completed issue and a
+  fresh reproduction; declined work is never resurrected automatically.
+  Old saved verdicts and unchecked deferrals therefore remain PR notes.
+  Each review permits ten lookup calls, at most twenty results per query
+  and 24,000 characters of combined evidence; exceeding a limit refuses
+  automatic filing. Earlier follow-ups are included in review history, and
+  marker matching spans runs. GitHub search is eventually consistent;
+  the marker-list check covers retry windows but is not a distributed lock
+  against simultaneous writers on different hosts.
   `followups = "comment"` posts one checklist comment on the PR instead;
   `"off"` drops them. A repository with Issues disabled (#631) downgrades
   `issues` to that comment — decided up front from `has_issues` on the

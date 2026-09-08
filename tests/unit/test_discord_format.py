@@ -249,6 +249,26 @@ class TestFormat:
         )
         assert configured == ["📌 1 follow-up(s) listed on the PR, not filed: a"]
 
+    def test_followups_show_new_existing_and_held_together(self) -> None:
+        old = {"title": "known problem", "url": "https://github.com/o/r/issues/12"}
+        new = {"title": "new problem", "url": "https://github.com/o/r/issues/13"}
+        messages = texts(
+            format_for_discord(
+                ev(
+                    "run.followups",
+                    pr=7,
+                    mode="issues",
+                    filed=[old, new],
+                    reused=[old],
+                    listed=["uncertain problem"],
+                )
+            )
+        )
+        assert len(messages) == 3
+        assert "filed 1" in messages[0] and "new problem" in messages[0]
+        assert "already tracked" in messages[1] and "known problem" in messages[1]
+        assert "not filed" in messages[2] and "uncertain problem" in messages[2]
+
     def test_tool_events_are_not_rendered_here(self) -> None:
         # the pump feeds them to ToolBatcher instead
         assert format_for_discord(ev("agent.tool_start", tool="bash", args="ls")) == []

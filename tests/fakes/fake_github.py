@@ -47,7 +47,7 @@ import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import parse_qs, quote, unquote
 
 from sbxloop.errors import GithubOpsError
 from sbxloop.gh.ops import (
@@ -240,6 +240,8 @@ class FakeGithub(GithubOps):
         # single-label GET finds these, and creating one is a 422.
         self.labels_existing: set[str] = set()
         self.existing_issues: list[dict[str, Any]] = []
+        self.issue_search_payload: Any = None
+        self.issue_list_payload: Any = None
         self.resolved: list[str] = []
         self._comment_id = 0
         self._commits = 0
@@ -451,6 +453,35 @@ class FakeGithub(GithubOps):
         # list whole, so page one is the list and any later page is empty;
         # routing below matches on the path without its query.
         path, _, query = path.partition("?")
+        if method == "GET" and path == "/search/issues":
+            self._maybe_fail("issue_search")
+            if self.issue_search_payload is not None:
+                return self.issue_search_payload
+            params = parse_qs(query)
+            search = params["q"][0]
+            repo = search.split()[0].removeprefix("repo:")
+            terms = search.partition("in:title,body ")[2].lower().split()
+            items = [
+                dict(i)
+                for i in self.existing_issues
+                if "pull_request" not in i
+                and f"/{repo}/issues/" in str(i.get("html_url", ""))
+                and all(
+                    t in (str(i.get("title", "")) + " " + str(i.get("body", ""))).lower()
+                    for t in terms
+                )
+            ]
+            return {
+                "total_count": len(items),
+                "incomplete_results": False,
+                "items": items[: int(params.get("per_page", ["20"])[0])],
+            }
+        if method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+/issues/\d+", path):
+            self._maybe_fail("issue_read")
+            for issue in self.existing_issues:
+                if str(issue.get("number")) == path.rsplit("/", 1)[1]:
+                    return dict(issue)
+            raise GithubOpsError("issue not found", http_status=404)
         if method == "GET" and "page=" in query and not query.endswith("page=1"):
             return []
         if method == "GET" and path == "/user":
@@ -588,6 +619,9 @@ class FakeGithub(GithubOps):
             self.labels_created.append(str(body["name"]))
             return {"name": body["name"]}
         if method == "GET" and path.endswith("/issues") and "labels=" in query:
+            self._maybe_fail("issue_list")
+            if self.issue_list_payload is not None:
+                return self.issue_list_payload
             return list(self.existing_issues)
         if method == "POST" and path.endswith("/requested_reviewers"):
             # A review request (#675): recorded on the PR as GitHub does.
@@ -637,6 +671,17 @@ class FakeGithub(GithubOps):
             )
         self.issues_created.append((title, body, list(labels or [])))
         number = 900 + len(self.issues_created)
+        self.existing_issues.append(
+            {
+                "number": number,
+                "title": title,
+                "body": body,
+                "state": "open",
+                "state_reason": None,
+                "html_url": f"https://github.com/{repo}/issues/{number}",
+                "labels": [{"name": label} for label in labels or []],
+            }
+        )
         return IssueRef(number=number, url=f"https://github.com/{repo}/issues/{number}")
 
     def issue_comment(self, repo: str, number: int, body: str) -> str:
