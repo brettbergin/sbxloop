@@ -37,6 +37,7 @@ from typing import Literal, NamedTuple, TypeVar
 from pydantic import BaseModel, TypeAdapter
 
 from sbxloop import toolchains
+from sbxloop.agentmodels import ModelSelection, model_for_phase, refreshed_models, run_model_repo
 from sbxloop.config import Config
 from sbxloop.deliver import pr_conventions
 from sbxloop.engine.harness import ROLE_BY_PHASE, brief_for_phase
@@ -364,10 +365,12 @@ class PhaseRunner:
         host_tools: Sequence[HostToolSpec] = (),
         tool_handler: HostToolHandler | None = None,
         bus: EventBus | None = None,
+        session_models: Mapping[str, str] | None = None,
     ) -> None:
         self.agent = agent
         self.config = config
         self.run_id = run_id
+        self.session_models = dict(session_models or {})
         self.outcome = outcome
         # The run's event bus, when the caller has one: where a job's tool
         # calls are read back from for the judge's digest (#756). None
@@ -498,7 +501,11 @@ class PhaseRunner:
         system_message: str | None = None,
         system_preset: bool = True,
         digest: ToolDigest | None = None,
+        selection: ModelSelection | None = None,
     ) -> JobResult:
+        selection = selection or model_for_phase(
+            refreshed_models(self.config), phase, repo=run_model_repo(self.config)
+        )
         agent_name = AGENT_NAMES[phase]
         # Only the working phases get the host tools: the planners and the
         # critics read and judge; the builder and the operator's executor
@@ -528,7 +535,7 @@ class PhaseRunner:
             prompt=prompt,
             system_message=brief_for_phase(self.config, phase, system_message),
             system_preset=system_preset,
-            model=self.config.model,
+            model=selection.model,
             permission_mode=permission_mode,
             expect=expect,
             cwd=self.workdir,
@@ -552,26 +559,42 @@ class PhaseRunner:
             # tool in read-only mode.
             mcp_servers=self.config.mcp_specs_for(ROLE_BY_PHASE[phase]),
         )
+        recovery = getattr(self.agent, "provider_recovery", None)
+        if recovery is not None:
+            job = recovery.pin_model(job)
+            if job.model != selection.model:
+                assert job.model is not None
+                selection.model, selection.source = job.model, "interrupted call"
+        if resume_session_id and self.session_models.get(resume_session_id) != job.model:
+            log.info(
+                "phase.model_session_rotated",
+                run=self.run_id,
+                agent=agent_name,
+                previous=self.session_models.get(resume_session_id),
+                model=job.model,
+            )
+            job = job.model_copy(update={"resume_session_id": None})
         started = time.monotonic()
         log.info(
             "phase.agent_call",
             run=self.run_id,
             job=job.job_id,
             agent=agent_name,
-            model=self.config.model,
+            model=job.model,
+            model_source=selection.source,
             permission_mode=permission_mode,
             expect=expect,
             prompt_chars=len(prompt),
-            resumed=bool(resume_session_id),
+            resumed=bool(job.resume_session_id),
         )
         unsubscribe = self._watch_tools(job.job_id, digest)
         try:
-            # The handler rides along only when the job carries tools: a run
-            # without them submits exactly the call it always did.
-            result = (
-                self.agent.submit(job, agent=agent_name, tool_handler=tool_handler)
-                if host_tools
-                else self.agent.submit(job, agent=agent_name)
+            result = self.agent.submit(
+                job,
+                agent=agent_name,
+                tool_handler=tool_handler if host_tools else None,
+                agent_phase=phase,
+                model_source=selection.source,
             )
         finally:
             unsubscribe()
@@ -596,6 +619,8 @@ class PhaseRunner:
             if result.error.provider is not None:
                 raise ProviderHeldError(ProviderHold(result.error.provider, None, 0))
             raise WorkerError(f"agent job failed ({result.error.type}): {result.error.message}")
+        if result.session_id and job.model is not None:
+            self.session_models[result.session_id] = job.model
         return result
 
     def _tools_for(
@@ -665,6 +690,9 @@ class PhaseRunner:
         """
         retry_context = ""
         last_error: Exception | None = None
+        selection = model_for_phase(
+            refreshed_models(self.config), prompt_name, repo=run_model_repo(self.config)
+        )
         for _ in range(2):
             prompt = render(prompt_name, retry_context=retry_context, **context)
             try:
@@ -675,6 +703,7 @@ class PhaseRunner:
                     expect="json",
                     system_message=system_message,
                     system_preset=system_preset,
+                    selection=selection,
                 )
             except WorkerError as exc:
                 if "ExpectedJsonMissing" not in str(exc):

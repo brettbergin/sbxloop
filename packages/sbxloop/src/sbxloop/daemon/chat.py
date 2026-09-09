@@ -2311,7 +2311,7 @@ class ChatBridge(ABC):
             if recorded is not None:
                 return recorded
         backend = getattr(getattr(self.config, "agent", None), "backend", None)
-        model = getattr(self.config, "model", None)
+        model = agent_ident_from_config_json(self.config.model_dump_json())["model"]
         return AgentIdent(str(backend or "") or UNKNOWN_BACKEND, str(model or "") or UNKNOWN_MODEL)
 
     def _recorded_agent_ident(self, run_id: str) -> AgentIdent | None:

@@ -27,6 +27,7 @@ from rich.tree import Tree
 
 import sbxloop
 from sbxloop import telemetry
+from sbxloop.agentmodels import model_plan, refreshed_models, run_model_repo
 from sbxloop.backends import backend_for
 from sbxloop.cli.doctor import run_doctor
 from sbxloop.cli.tui import ChatInput, Dashboard, format_event, plain_printer, render_event
@@ -160,6 +161,8 @@ def _require_supported_host() -> None:
 def _config_with_overrides(**overrides: Any) -> Config:
     config = _run_config()
     updates = {k: v for k, v in overrides.items() if v is not None}
+    if "model" in updates:
+        updates["run_model_override"] = updates.pop("model")
     return config.model_copy(update=updates) if updates else config
 
 
@@ -684,7 +687,8 @@ def run(
         str | None,
         typer.Option(
             "--model",
-            help="Model id for the configured [agent] backend (`sbxloop list-models`).",
+            help="Force every run agent to use this model for the configured [agent] backend "
+            "(`sbxloop list-models`); concierge is unchanged. Persists across resume.",
         ),
     ] = None,
     keep_sandboxes: Annotated[
@@ -963,6 +967,31 @@ def status(
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
     tasks = store.get_tasks(run_id)
+    model_policy: dict[str, Any] = {}
+    try:
+        raw_config = store.get_run_config(run_id)
+        if json.loads(raw_config):
+            saved = Config.model_validate_json(raw_config)
+            saved._model_env = config._model_env
+            if record.state not in TERMINAL_RUN_STATES:
+                saved = saved.model_copy(
+                    update={
+                        "home": config.home,
+                        "model_source_dir": saved.model_source_dir or config.model_source_dir,
+                    }
+                )
+                saved = refreshed_models(saved)
+            model_policy = {
+                "backend": saved.agent.backend,
+                "scope": "initial policy" if record.state in TERMINAL_RUN_STATES else "next phase",
+                "roles": {
+                    phase: {"model": choice.model, "source": choice.source}
+                    for phase, choice in model_plan(saved, repo=run_model_repo(saved)).items()
+                    if phase != "concierge"
+                },
+            }
+    except (ValueError, SbxloopError) as exc:
+        model_policy = {"error": str(exc)}
     if json_output:
         # Bare JSON on stdout, nothing else — `sbxloop status <run> --json | jq`.
         # A workload's tasks carry their outputs (#757); a code run's are null.
@@ -976,6 +1005,7 @@ def status(
                         else None
                     ),
                     "tasks": [task.model_dump(mode="json") for task in tasks],
+                    "model_policy": model_policy,
                 }
             )
         )
@@ -988,6 +1018,20 @@ def status(
     if record.reason:
         console.print(f"reason: {record.reason}")
     console.print(f"outcome: {record.outcome}")
+    if model_policy.get("error"):
+        console.print(f"model policy unavailable: {rich_escape(model_policy['error'])}")
+    elif model_policy:
+        model_table = Table(title=f"Agent models ({model_policy['scope']}; requests, not usage)")
+        for column in ("phase", "backend", "model", "source"):
+            model_table.add_column(column)
+        for phase, choice in model_policy["roles"].items():
+            model_table.add_row(
+                phase,
+                model_policy["backend"],
+                rich_escape(choice["model"]),
+                rich_escape(choice["source"]),
+            )
+        console.print(model_table)
     for entry in record.published:
         console.print(f"published: {rich_escape(published_line(entry))}")
     table = Table(title="tasks")
@@ -2923,6 +2967,9 @@ def list_models(
         float,
         typer.Option("--timeout", help="Seconds to wait for the backend's runtime and API."),
     ] = 60.0,
+    repo: Annotated[
+        str | None, typer.Option("--repo", help="Show this repository's model overrides.")
+    ] = None,
 ) -> None:
     """List the models the configured [agent] backend gives this host access to.
 
@@ -2941,6 +2988,8 @@ def list_models(
 
     config = load_config()
     backend = backend_for(config)
+    selected_repo = _resolve_repo(config, repo).repo if repo is not None else None
+    choices = model_plan(config, repo=selected_repo)
     try:
         rows = fetch_backend_rows(backend, timeout_s=timeout_s)
     except SbxloopError as exc:
@@ -2957,7 +3006,9 @@ def list_models(
     for column in columns:
         table.add_column(column)
     for row in rows:
-        configured = row.id == config.model
+        configured = row.id == config.model or any(
+            choice.model == row.id for choice in choices.values()
+        )
         # SDK-provided text is escaped: a model name with brackets must not
         # be parsed as rich markup.
         cells = {
@@ -2987,6 +3038,14 @@ def list_models(
     )
     footnote = "; * = default reasoning effort" if "reasoning" in columns else ""
     console.print(f"[dim]{marker}{footnote}[/]")
+    for phase, choice in choices.items():
+        if choice.source != "model":
+            availability = (
+                ""
+                if choice.model == "auto" or any(row.id == choice.model for row in rows)
+                else " (not in this list)"
+            )
+            console.print(rich_escape(f"{phase}: {choice.model} — {choice.source}{availability}"))
 
 
 @app.command()

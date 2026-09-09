@@ -76,6 +76,7 @@ def _session_fingerprint(job: JobRequest, specs: list[HostToolSpec]) -> str:
         "system_preset": job.system_preset,
         "system_message": job.system_message,
         "cwd": job.cwd,
+        "model": job.model,
     }
     return hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
 

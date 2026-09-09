@@ -70,6 +70,21 @@ secret_strategy = "proxy"
 # alone, and the top-level `model` names the model the chosen backend runs.
 # backend = "copilot"
 
+# [agent.models]
+# Omit a key to inherit top-level model. Explicit "auto" asks the backend
+# to choose, even when the inherited model is pinned. IDs are backend-specific;
+# use `sbxloop list-models`. Model settings are reread before each agent phase.
+# `run --model ID` forces every run agent for that run, never the concierge.
+# SBXLOOP_AGENT__MODELS__BUILD overrides the build key through the environment.
+# decompose = "auto"
+# build = "auto"
+# review = "auto"
+# steer = "auto"
+# reauthor_verify = "auto"
+# operator_plan = "auto"
+# operator_execute = "auto"
+# operator_judge = "auto"
+
 # [sandbox]
 # Custom sandbox template reference (defaults to the sbx shell template).
 # `sbxloop bake` builds one with the worker preinstalled, cutting the
@@ -441,6 +456,17 @@ secret_strategy = "proxy"
 # apt_packages = ["libpq-dev"]     # OS packages beside the toolchains; a set list REPLACES [sandbox]'s
 # setup_commands = ["make setup"]  # run in the workspace before the first phase; REPLACES [sandbox]'s
 # verify_mode = "advisory"         # "full" | "advisory" | "ci-only"; unset uses [sandbox]'s
+# [github.repos.agent_models]
+# Sparse per-key overrides over [agent.models]; omit to inherit. The same
+# eight phase keys are supported. `list-models --repo you/your-repo` shows them.
+# decompose = "auto"
+# build = "auto"
+# review = "auto"
+# steer = "auto"
+# reauthor_verify = "auto"
+# operator_plan = "auto"
+# operator_execute = "auto"
+# operator_judge = "auto"
 # [[github.repos]]
 # repo = "you/other-repo"
 # enabled = false              # registered but not polled

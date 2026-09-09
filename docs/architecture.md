@@ -1307,7 +1307,7 @@ persisting — a crash and a `kill -9` look identical to the store — and
 1. rehydrates the config persisted at run creation (tokens still come from
    the current environment; the home stays the one that located the run;
    the `keep_sandboxes`/`keep_on_failure` debug toggles stay resume-time
-   choices) and pins the workspace from the `runs` table — editing config between
+   choices; model settings refresh at each new phase) and pins the workspace from the `runs` table — editing config between
    start and resume, or resuming from another directory, cannot silently
    change budgets/toggles or relocate the workspace. Any difference from
    the current on-disk config is reported as a `run.config_drift` event,
@@ -1318,6 +1318,45 @@ persisting — a crash and a `kill -9` look identical to the store — and
    is idempotent: the branch is force-moved and the open PR reused; a
    review that never committed its verdict runs again). A phase whose
    result was never committed re-runs from its start; nothing is replayed.
+
+### Model policy at phase boundaries
+
+`agentmodels.py` resolves the eight phase keys independently from persona
+labels (the operator plans and executes under different keys). Every request
+keeps the run's single backend. Selection is run `--model`, repository role,
+global role, then the top-level fallback. Concierge resolution has no run or
+repository override.
+
+Loaded configs carry their original discovery directory and an in-memory
+copy of environment overrides; only the directory and explicit run override
+are serialized, never environment values. Resume adopts the current environment
+and keeps the original home and source directory. `refreshed_models` loads those
+layers for every new phase, copies only model fields onto the pinned run config,
+and fails closed on malformed config or a changed backend. Directly constructed
+configs have no discovery directory and stay under their embedding caller's
+control. Per-run copies prevent repository overrides leaking across workers.
+
+JSON repair shares one selection with the original attempt. A provider recovery
+checkpoint records `requested_model` (nullable migration `0006` for old rows).
+Recovery may restore that model only if the rest of the semantic job identity
+matches; changing a model cannot bypass a credential hold or replay a different
+job. The old request completes before a new phase adopts new policy.
+
+Build and execute phase outputs record the session's requested model. Resume
+loads this mapping and only reuses a session with a known matching model; a
+change or legacy unknown identity starts fresh with the ordinary task brief,
+prior reports, feedback, and workspace intact. Codex also includes the requested
+model in its capability fingerprint. Concierge stores its session model identity
+beside its session id, rotates on change, and defers rotation during interrupted
+call recovery.
+
+The host stamps `agent_phase`, `requested_model`, and `model_source` on agent
+events without overwriting the SDK's reported `model`. Usage groups phase and
+reported model separately from persona totals, so `operator_plan` and
+`operator_execute` remain distinguishable. Status resolves current policy for
+active runs; historical headlines label a snapshot as the initial fallback.
+Model ids are provider-owned strings; catalogue misses are diagnostic rather
+than a closed validation list.
 
 ### Run reconciliation
 

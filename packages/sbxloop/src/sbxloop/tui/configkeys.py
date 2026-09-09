@@ -51,6 +51,9 @@ ValueKind = Literal["choice", "int", "float", "str", "list", "raw"]
 #: environment, and only the environment moves it.
 ENV_ONLY_KEYS: dict[str, str] = {
     "home": "the sbxloop home comes from SBXLOOP_HOME (else HOME), never from a file",
+    "run_model_override": "set by run --model; not a file setting",
+    "run_model_repo": "recorded by the run; not a file setting",
+    "model_source_dir": "recorded by the config loader; not a file setting",
 }
 
 

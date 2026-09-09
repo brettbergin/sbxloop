@@ -368,6 +368,15 @@ def test_unknown_session_manifest_starts_fresh(sdk: Any, emitted: Any) -> None:
     assert sdk.clients[0].resume_params == []
 
 
+def test_changed_model_starts_fresh_and_forwards_the_new_model(sdk: Any, emitted: Any) -> None:
+    previous = CodexBackend().run_session(job(model="first"), emitted[1]).session_id
+    sdk.clients.clear()
+    result = CodexBackend().run_session(job(resume_session_id=previous, model="second"), emitted[1])
+    assert result.session_id != previous
+    assert sdk.clients[0].resume_params == []
+    assert sdk.clients[0].thread_params[0]["model"] == "second"
+
+
 def test_usage_counts_only_this_job_and_deduplicates(sdk: Any, emitted: Any) -> None:
     sdk.script = [
         usage(1000, 10),

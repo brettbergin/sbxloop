@@ -251,7 +251,9 @@ class TestGithubOpErrors:
     def test_github_op_bad_params_is_error_result(self, harness: WorkerHarness) -> None:
         # Missing params fail validation before any transport/network use.
         job = JobRequest(job_id="j3", run_id="r1", kind="github.op", op="issue.create", params={})
-        proc = harness.run(job)
+        # Selecting the REST transport on a host without gh still needs a
+        # credential; a dummy keeps this parameter test independent of the host.
+        proc = harness.run(job, env={"GH_TOKEN": "test-token"})
         assert proc.returncode == 0
         result = harness.result()
         assert result.status == "error"

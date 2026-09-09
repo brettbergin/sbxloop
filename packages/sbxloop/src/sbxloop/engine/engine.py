@@ -63,6 +63,7 @@ from urllib.parse import quote
 from pydantic import ValidationError
 
 from sbxloop import hostgit, repofiles
+from sbxloop.agentmodels import model_for_phase, refreshed_models, run_model_repo
 from sbxloop.config import (
     DEFAULT_PR_TITLE_TEMPLATE,
     GITHUB_SINKS,
@@ -482,6 +483,7 @@ class LoopEngine:
         self._select_repo(repo)
         if kind == "workload":
             self.config = self.config.for_workload_profile(profile)
+            self.config = self.config.model_copy(update={"run_model_repo": repo or ""})
         granted = [c.name for c in self.config.credentials_named(credentials)]
         self.store.create_run(
             run_id, outcome, self.config.model_dump_json(), credentials=granted, kind=kind
@@ -643,7 +645,7 @@ class LoopEngine:
 
     def _rehydrate_config(self, run_id: str) -> None:
         """Adopt the config persisted when the run was created, so a resumed
-        run keeps its original rules (budgets, model, github toggles,
+        run keeps its original rules (budgets, backend, github toggles,
         workspace) even if the on-disk config changed — or the resume happens
         from a different directory — in between.
 
@@ -653,6 +655,8 @@ class LoopEngine:
         (``keep_sandboxes``, ``keep_on_failure``) also stay resume-time
         choices — they are operator intent about THIS attempt, not run
         identity, and flipping keep on to debug a crashing run must work.
+        Model settings refresh separately at each new phase from the original
+        config location; the run's explicit --model override remains pinned.
         Drift from the config this engine was built with is reported via a
         ``run.config_drift`` event, never applied silently.
         """
@@ -683,6 +687,9 @@ class LoopEngine:
             }
         )
         current = self.config
+        stored._model_env = current._model_env
+        if stored.model_source_dir is None:
+            stored.model_source_dir = current.model_source_dir
         if stored.workload.default is not None:
             # The run was pinned to a profile (#758): the live config under
             # that same profile is the fair comparison; a profile that is
@@ -693,7 +700,7 @@ class LoopEngine:
         if drift:
             message = (
                 "resuming with the run's original config; the current config "
-                "differs: " + "; ".join(drift)
+                "differs (model settings refresh before each new phase): " + "; ".join(drift)
             )
             log.warning("run.config_drift", run=run_id, drift=drift)
             self.bus.emit(HostEventTypes.RUN_CONFIG_DRIFT, run_id, message=message)
@@ -715,7 +722,12 @@ class LoopEngine:
         # config was narrowed to its repository, not an operator setting: it
         # differs from the live config by construction and says nothing about
         # drift.
-        ignore = {"github.enabled_repo_count"}
+        ignore = {
+            "github.enabled_repo_count",
+            "run_model_override",
+            "run_model_repo",
+            "model_source_dir",
+        }
         return [
             f"{key} (run: {stored_flat.get(key)!r}, current: {current_flat.get(key)!r})"
             for key in sorted(stored_flat.keys() | current_flat.keys())
@@ -901,6 +913,7 @@ class LoopEngine:
                         # The judge's tool digest is read off the bus (#756);
                         # a code run's phases never ask for one.
                         bus=self.bus if kind == "workload" else None,
+                        session_models=self.store.session_models(run_id),
                     )
                     # Replay persisted chat guidance (steer_run verdicts)
                     # so a resumed run keeps the direction the user set.
@@ -1138,6 +1151,9 @@ class LoopEngine:
         if agent is None or service.workdir is None:
             raise ProvisionError("dependency preparation requires the agent workspace")
         commands = {kind: list(plan.argv) for kind, plan in plans.items()}
+        selection = model_for_phase(
+            refreshed_models(self.config), "build", repo=run_model_repo(self.config)
+        )
         job = JobRequest(
             job_id=new_job_id(),
             run_id=run_id,
@@ -1159,7 +1175,7 @@ class LoopEngine:
                 + "\n".join(self.store.get_run_guidance(run_id))
             ),
             system_message="You prepare dependency data inside the agent sandbox.",
-            model=self.config.model,
+            model=selection.model,
             expect="json",
             cwd=service.workdir,
             timeout_s=self.config.budgets.per_job_timeout_s,
@@ -1177,7 +1193,11 @@ class LoopEngine:
         )
         started = time.time()
         result = agent.submit(
-            job, tool_handler=service.handler(phase="dependencies"), agent="dependency-resolver"
+            job,
+            tool_handler=service.handler(phase="dependencies"),
+            agent="dependency-resolver",
+            agent_phase="build",
+            model_source=selection.source,
         )
         output = result.output_json
         ready = result.status == "ok" and isinstance(output, dict) and output.get("ready") is True
@@ -4355,18 +4375,16 @@ class LoopEngine:
             resume_session_id=resume,
         )
         if resume and result.session_id != resume:
-            # The backend falls back to a fresh session when a resume fails
-            # rather than failing the job. It cannot say so (no logger in
-            # the worker), but a different id coming back is the tell — and
-            # without this line a silently-never-resuming pipeline would
-            # look identical to a working one.
+            # A model change or an SDK resume miss can start a fresh session.
+            # The model-change reason is logged at dispatch; either way the
+            # prior report carried the context into the new session.
             log.info(
                 "phase.resume_missed",
                 run=run_id,
                 task=task.spec.id,
                 requested=resume,
                 got=result.session_id,
-                hint="the SDK could not resume; the prior report still carried the context",
+                hint="continuing in a fresh session; the prior report carried the context",
             )
         task.session_id = result.session_id
         if result.session_id:
@@ -4374,6 +4392,7 @@ class LoopEngine:
         builder_report = clip(result.output_text)
         spend = phases.drain_spend()
         payload: dict[str, Any] = {"report": builder_report, "session_id": result.session_id}
+        payload["requested_model"] = phases.session_models.get(result.session_id or "")
         # A fix round's report is the per-finding answer to the review that
         # seeded it. Parse it once, here, and persist it with the build row:
         # the reconciliation that gets replied onto the PR threads must
@@ -4472,7 +4491,7 @@ class LoopEngine:
                 task=task.spec.id,
                 requested=resume,
                 got=result.session_id,
-                hint="the SDK could not resume; the prior report still carried the context",
+                hint="continuing in a fresh session; the prior report carried the context",
             )
         task.session_id = result.session_id
         if result.session_id:
@@ -4490,6 +4509,7 @@ class LoopEngine:
                     "report": report,
                     "session_id": result.session_id,
                     "tools": digest.render(),
+                    "requested_model": phases.session_models.get(result.session_id or ""),
                     "tool_calls": digest.total,
                 }
             ),

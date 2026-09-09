@@ -19,7 +19,13 @@ class RecordingAgent:
         self.prompts: list[str] = []
 
     def submit(
-        self, job: JobRequest, *, agent: str | None = None, tool_handler: Any = None
+        self,
+        job: JobRequest,
+        *,
+        agent: str | None = None,
+        tool_handler: Any = None,
+        agent_phase: str | None = None,
+        model_source: str | None = None,
     ) -> JobResult:
         assert job.prompt is not None
         self.prompts.append(job.prompt)

@@ -447,7 +447,7 @@ class ConfigScreen(ConsoleScreen):
         if self.path is not None:
             self.console_app.perform(
                 actions.save_config(self.console_app.deps, self.path, text, key=edit.path),
-                on_success=self._saved,
+                on_success=lambda: self._saved(edit.path),
             )
 
     def _answered_by(self, edit: ValueEdit, verdict: Verdict) -> tuple[str | None, SeverityLevel]:
@@ -471,9 +471,18 @@ class ConfigScreen(ConsoleScreen):
             "warning",
         )
 
-    def _saved(self) -> None:
+    def _saved(self, key: str = "") -> None:
         self._file_status()
         self.load()
+        if (
+            key in {"model", "concierge.model"}
+            or key.startswith("agent.models.")
+            or ".agent_models." in key
+        ):
+            self.app.notify(
+                "Model settings refresh before the next phase or concierge turn.", title="config"
+            )
+            return
 
         def decided(restart: bool | None) -> None:
             if restart:
