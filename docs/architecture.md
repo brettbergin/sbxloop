@@ -1081,6 +1081,37 @@ opening cannot redirect the read outside the checkout. Artifact staging and
 regular-file PR uploads use the same reader and fail when a file cannot be
 opened safely. Hosts without directory-relative, no-follow opens fail closed.
 
+### Concierge provider capacity
+
+The `agent_rate_limits` host tool delegates to `DaemonAgent.agent_rate_limits`.
+It submits a separate `agent.rate_limits` job to the active **agent** sandbox,
+with its existing credential delivery and an independent worker client/job id.
+The original concierge session may be waiting for that host-tool reply: the
+query never acquires its session or starts/resumes a model conversation.
+Provider failures return a sanitized report and never enter the sandbox's
+retry/reprovision path. The worker query budget is ten seconds (plus at most
+one second of Copilot runtime cleanup); the host transport uses two seconds
+of grace. Normalized results are at most 32 KiB, with at most 32 limits.
+
+Backend adapters own both the query and normalization. Copilot uses the
+documented but experimental `account.getQuota` RPC, with explicit capability
+failure for SDK/runtime mismatches. Its snapshot timestamp and window lengths
+are unknown. Claude reads organization ceilings through the Rate Limits API
+using only the configured inference credential; insufficient admin scope is
+unsupported, not an invitation to switch credentials. It cannot establish
+remaining quota or effective workspace limits. Codex currently reports
+unsupported. This evidence is independent of recorded token accounting and
+does not feed the run recovery or scheduling state machine.
+
+Source contracts checked against the
+[Copilot SDK v1.0.8 declarations](https://github.com/github/copilot-sdk/blob/v1.0.8/python/copilot/generated/rpc.py),
+[Copilot usage documentation](https://docs.github.com/en/copilot/how-tos/copilot-sdk/features/usage-and-billing)
+and [Claude Rate Limits API](https://platform.claude.com/docs/en/manage-claude/rate-limits-api).
+**Field-unverified:** live account permissions, quota payload freshness and
+the provider query inside a real sbx sandbox. Synthetic provider and sandbox
+transport regressions run in CI; this feature does not make live inference
+calls to probe capacity.
+
 ## Provider recovery
 
 Terminal inference failures cross the worker boundary as

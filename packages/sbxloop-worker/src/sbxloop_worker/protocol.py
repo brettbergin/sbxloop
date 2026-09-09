@@ -24,6 +24,7 @@ HOST_TOOL_NAME_RE = r"^[A-Za-z0-9_-]{1,64}$"
 
 JobKind = Literal[
     "agent.session",
+    "agent.rate_limits",
     "shell.check",
     "shell.batch",
     "github.op",
@@ -352,7 +353,30 @@ class JobRequest(ProtocolModel):
                 f"{self.kind} must not set host_tools, host_tools_dir, available_tools, "
                 "or mcp_servers"
             )
-        if self.kind == "shell.check":
+        if self.kind == "agent.rate_limits":
+            if any(
+                value is not None
+                for value in (
+                    self.prompt,
+                    self.argv,
+                    self.commands,
+                    self.op,
+                    self.cwd,
+                    self.resume_session_id,
+                )
+            ):
+                raise ValueError("agent.rate_limits must not carry executable or session fields")
+            if set(self.params) != {"backend"} or self.params["backend"] not in (
+                "copilot",
+                "claude",
+                "codex",
+            ):
+                raise ValueError("agent.rate_limits requires only the configured backend name")
+            if not 0 < self.timeout_s <= 10:
+                raise ValueError(
+                    "agent.rate_limits timeout must be positive and at most 10 seconds"
+                )
+        elif self.kind == "shell.check":
             if not self.argv:
                 raise ValueError("shell.check requires a non-empty argv")
             if self.prompt is not None or self.commands is not None or self.op is not None:

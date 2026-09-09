@@ -24,6 +24,7 @@ and leaves it alone.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -31,8 +32,9 @@ from typing import TypeVar
 
 from sbxloop.config import Config
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import DaemonError, SbxError, SbxloopError, WorkerError
+from sbxloop.errors import DaemonError, SbxError, SbxloopError, WorkerError, WorkerTimeoutError
 from sbxloop.events import EventBus
+from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
 from sbxloop.paths import SbxloopHome
 from sbxloop.provider import ProviderRecovery
@@ -40,6 +42,8 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import Sandbox
 from sbxloop.worker.client import WorkerClient
+from sbxloop_worker.protocol import JobRequest
+from sbxloop_worker.rate_limits import MAX_REPORT_BYTES, QUERY_TIMEOUT_S, RateLimitReport
 
 log = get_logger(__name__)
 
@@ -109,6 +113,56 @@ class DaemonAgent:
             if not self.note_failure(exc):
                 raise
             return fn(self.client())
+
+    def agent_rate_limits(self) -> RateLimitReport:
+        """Read status beside the active turn; never provision, retry or remove.
+
+        A new client/worker process in the SAME agent sandbox has its own
+        job id and transport bookkeeping. The concierge's worker may be
+        blocked waiting for this host-tool response throughout the query.
+        """
+        backend = self.config.agent.backend
+        unavailable = RateLimitReport(
+            backend=backend,
+            status="unavailable",
+            reason="Agent sandbox status is unavailable; capacity and resets are unknown.",
+        )
+        active = self._client
+        if active is None:
+            return unavailable
+        probe = WorkerClient(
+            active.sandbox,
+            self.bus,
+            python=active.python,
+            transport="stream",
+            grace_s=2,
+            role="agent",
+            backend=backend,
+            job_env=active.job_env,
+        )
+        job = JobRequest(
+            job_id=new_job_id(),
+            run_id=CONCIERGE_RUN_ID,
+            kind="agent.rate_limits",
+            params={"backend": backend},
+            timeout_s=min(QUERY_TIMEOUT_S, self.config.concierge.timeout_s / 2),
+        )
+        try:
+            result = probe.submit(job)
+            if result.status != "ok" or not isinstance(result.output_json, dict):
+                return unavailable
+            if len(json.dumps(result.output_json).encode()) > MAX_REPORT_BYTES:
+                return unavailable
+            report = RateLimitReport.model_validate(result.output_json)
+            return report if report.backend == backend else unavailable
+        except WorkerTimeoutError:
+            return unavailable.model_copy(
+                update={"status": "timeout", "reason": "Agent sandbox status query timed out."}
+            )
+        except Exception:
+            # Never publish transport/SDK exception text or send a query
+            # failure through note_failure(): the active session stays alive.
+            return unavailable
 
     def note_failure(self, exc: BaseException) -> bool:
         """A caller's job failed: drop the sandbox so the next :meth:`client`

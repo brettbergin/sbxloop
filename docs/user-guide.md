@@ -83,6 +83,31 @@ Copilot-SDK rows under Claude or Codex), `sbxloop secrets list|clean|rotate` man
 that credential's registration, `sbxloop list-models` lists that backend's
 models, and `--model` help says so.
 
+Ask the concierge "How much agent capacity remains?" or "When do our limits
+reset?" to invoke `agent_rate_limits`. It uses the daemon's configured
+backend and existing agent-sandbox credential, with no credentials in chat.
+The report names its observation time, provider source, freshness and shared
+account/organization scope. Unknown values stay unknown; `run_usage` and
+`usage_today` continue to report recorded token spend, not provider capacity.
+
+- **Copilot:** the documented SDK `account.getQuota` RPC reports account
+  quota snapshots, including entitlement, used requests, remaining percentage,
+  overage permissions and reset time where supplied. Zero remaining quota
+  does not itself prove requests are blocked. Short-term request/token limits, window
+  length and provider snapshot time are not exposed. An elapsed reset marks
+  the report stale; a successful query alone does not prove snapshot freshness.
+- **Claude:** the read-only organization Rate Limits API reports configured
+  ceilings and model groups. It requires admin scope, so a configured
+  workspace API key returns an explicit unsupported-permission report.
+  Organization ceilings do not include lower workspace overrides and do not
+  establish remaining capacity, reset times or longer-term usage quotas.
+- **Codex:** this adapter currently reports the query as unsupported.
+
+Queries never generate model responses or change billing, credentials,
+models or scheduling. Authentication failures, throttling, timeouts, stale
+data and missing data are explicit. A query failure preserves the concierge
+sandbox and conversation. No new configuration is required.
+
 To use Codex, set `[agent] backend = "codex"` and put `OPENAI_API_KEY` in
 the home's secrets file. Provisioning installs the Python SDK in the
 agent sandbox and allows `api.openai.com`. Code phases, workloads and the

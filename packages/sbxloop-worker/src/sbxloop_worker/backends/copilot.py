@@ -37,6 +37,7 @@ from sbxloop_worker.protocol import (
     SessionHealth,
     Usage,
 )
+from sbxloop_worker.rate_limits import RateLimitReport
 from sbxloop_worker.secrets import looks_like_github_token, redact_secrets
 
 # The SDK's permission-request ``kind`` vocabulary, field-verified against
@@ -562,6 +563,11 @@ def available_tool_count(data: Any) -> int | None:
 
 class CopilotBackend:
     name = "copilot"
+
+    def rate_limits(self, *, timeout_s: float) -> RateLimitReport:
+        from sbxloop_worker.backends.copilot_limits import query
+
+        return query(timeout_s=timeout_s)
 
     def ensure_available(self) -> None:
         """What this backend needs before a session can start (see

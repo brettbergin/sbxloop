@@ -58,6 +58,7 @@ from sbxloop_worker.protocol import (
     ProviderFailure,
     Usage,
 )
+from sbxloop_worker.rate_limits import RateLimitReport
 from sbxloop_worker.secrets import is_sbx_sentinel, redact_secrets
 
 # The in-process MCP server host tools are registered under; the SDK exposes
@@ -207,6 +208,11 @@ def usage_from_result(message: Any, model: str | None) -> Usage:
 
 class ClaudeBackend:
     name = "claude"
+
+    def rate_limits(self, *, timeout_s: float) -> RateLimitReport:
+        from sbxloop_worker.backends.claude_limits import query
+
+        return query(timeout_s=timeout_s)
 
     def ensure_available(self) -> None:
         """What this backend needs before a session can start (see
