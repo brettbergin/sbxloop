@@ -33,6 +33,30 @@ from sqlalchemy.orm import Mapped, mapped_column
 from sbxloop.db.base import Base
 
 
+class ProviderHoldRow(Base):
+    """Credential-scoped cooldown, shared by every agent entry point."""
+
+    __tablename__ = "provider_holds"
+    scope: Mapped[str] = mapped_column(Text, primary_key=True)
+    failure_json: Mapped[str] = mapped_column(Text)
+    attempts: Mapped[int] = mapped_column(Integer)
+    generation: Mapped[int] = mapped_column(Integer)
+    next_at: Mapped[float | None] = mapped_column(REAL)
+    active: Mapped[int] = mapped_column(Integer)
+    updated_at: Mapped[float] = mapped_column(REAL)
+
+
+class ProviderJobRow(Base):
+    """The interrupted job's session, partial output and accumulated usage."""
+
+    __tablename__ = "provider_jobs"
+    run_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    job_key: Mapped[str] = mapped_column(Text, primary_key=True)
+    scope: Mapped[str] = mapped_column(Text)
+    result_json: Mapped[str] = mapped_column(Text)
+    pending: Mapped[int] = mapped_column(Integer)
+
+
 class Run(Base):
     """One run, from the ask that started it to the state it ended in."""
 

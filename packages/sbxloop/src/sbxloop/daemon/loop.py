@@ -105,6 +105,7 @@ from sbxloop.ghids import (
 )
 from sbxloop.ids import new_run_id
 from sbxloop.log import bind_run, clear_run, get_logger
+from sbxloop.provider import ProviderHeldError, ProviderRecovery
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.provision import sandbox_name
@@ -707,12 +708,39 @@ class DaemonLoop:
                     hint="engine still running past shutdown grace; the run stays resumable",
                 )
 
+    def _provider_recovery(self) -> ProviderRecovery:
+        return ProviderRecovery(self.store, self.config.agent.backend, clock=self.clock)
+
+    def _provider_item(self, target: str) -> WorkItem | None:
+        for item in self.dstore.items():
+            if (
+                item.run_id is not None
+                and (target == item.run_id or normalize_item_id(target) == item.item_id)
+                and item.state in ("queued", "cancelled")
+                and self._provider_recovery().pending(item.run_id)
+            ):
+                return item
+        return None
+
+    def cancel_provider(self, target: str, by: str | None = None) -> str:
+        item = self._provider_item(target)
+        if item is None or item.run_id is None:
+            raise ValueError(f"{target!r} has no parked provider run")
+        reason = f"cancelled by {by or 'operator'} while waiting for the provider"
+        self.dstore.mark_cancelled(item.item_id, reason, self.clock())
+        self.store.set_run_state(item.run_id, "cancelled")
+        self.store.set_run_reason(item.run_id, reason)
+        self.store.append_event(Event.now("run.cancelled", item.run_id, reason=reason))
+        return f"{item.item_id}: cancelled; checkpoint retained for resume"
+
     def status(self) -> dict[str, Any]:
         now = self.clock()
         day_start, day_end = day_window(now, self.config.daemon.run_cap_timezone)
         with self._current_lock:
             handle = self._current
+        provider_hold = self._provider_recovery().hold()
         return {
+            "provider_hold": provider_hold.summary() if provider_hold else None,
             "current": {
                 "item_id": handle.item.item_id,
                 "run_id": handle.run_id,
@@ -849,11 +877,18 @@ class DaemonLoop:
         self._review_tick(now)
         if self.paused:
             return TickResult(idle_kind="paused")
+        provider_hold = self._provider_recovery().hold()
+        if provider_hold is not None and provider_hold.blocked(now):
+            return TickResult(idle_kind="provider_held", idle_detail=provider_hold.summary())
         if self._breaker_open(now):
             return TickResult(idle_kind="breaker")
         day_start, day_end = day_window(now, self.config.daemon.run_cap_timezone)
         started_today = self.dstore.runs_started_since(day_start)
-        if started_today >= self.config.daemon.max_runs_per_day:
+        provider_resume = any(
+            item.run_id and self._provider_recovery().pending(item.run_id)
+            for item in self.dstore.queued()
+        )
+        if started_today >= self.config.daemon.max_runs_per_day and not provider_resume:
             if now - self._last_cap_log > 3600:
                 self._last_cap_log = now
                 cap = self.config.daemon.max_runs_per_day
@@ -935,6 +970,10 @@ class DaemonLoop:
         forever (#234)."""
         run_id = item.run_id
         assert run_id is not None
+        if self._provider_recovery().pending(run_id):
+            # Provider downtime neither spends the crash-resume budget nor
+            # destroys the VM containing the interrupted SDK session.
+            return self._dispatch(item, resume_run_id=run_id)
         gate = self.dstore.merge_gate_for(run_id)
         if gate is not None and gate.kind == "publish" and gate.state == "approving":
             # Not an interruption (#760): a held result was released and
@@ -1508,7 +1547,12 @@ class DaemonLoop:
             # already has, so moving the source would change nothing.
             self._refresh_workspace(self._item_repo(item))
         else:
-            self.dstore.mark_resuming(item.item_id, run_id, now)
+            self.dstore.mark_resuming(
+                item.item_id,
+                run_id,
+                now,
+                provider_recovery=self._provider_recovery().pending(run_id),
+            )
             item = self.dstore.get(item.item_id) or item
         log.info(
             "run.dispatch",
@@ -1750,6 +1794,23 @@ class DaemonLoop:
         """
         now = self.clock()
         report = self._report(run_id, result)
+        if (result is not None and result.state == "provider_held") or isinstance(
+            error, ProviderHeldError
+        ):
+            reason = str(error) if error else result.reason if result else None
+            self.store.set_run_reason(run_id, reason)
+            self.store.set_run_state(run_id, "provider_held")
+            self.dstore.finish_ledger(run_id, "provider_held", now)
+            self.dstore.mark_resume_pending(item.item_id, now)
+            self._notice(
+                "run.provider_held",
+                f"⏸ {item.item_id}: {reason}",
+                item=item.item_id,
+                run=run_id,
+                reason=reason,
+            )
+            self._frontend_finished(item, report._replace(state="provider_held", reason=reason))
+            return "provider_held"
         self._remember_pushed_work(item, report)
         state = result.state if result is not None else None
         if state == "gated":
@@ -2365,6 +2426,15 @@ class DaemonLoop:
         """Operator ``resume <item|run>`` on a review wait (#675): check the
         PR now and start the wait over — the way to re-arm a paused hold,
         or to poll at once instead of at the next interval."""
+        recovery = self._provider_recovery()
+        if target == self.config.agent.backend and recovery.hold() is not None:
+            recovery.release()
+            return f"{target}: provider hold released by {by or 'operator'}"
+        item = self._provider_item(target)
+        if item is not None:
+            recovery.release()
+            self.dstore.mark_resume_pending(item.item_id, self.clock())
+            return f"{item.item_id}: provider hold released; continuing run {item.run_id}"
         hold = self.dstore.review_hold_for(target.strip())
         if hold is None:
             raise ValueError(f"{target!r} is not waiting for a review")
@@ -3106,7 +3176,7 @@ class DaemonLoop:
         assert handle is not None and handle.run_id == run_id
         engine = handle.engine
         if resume:
-            return engine.resume(run_id)
+            return engine.resume(run_id, release_provider_hold=False)
         # A restart by re-applied label continues the previous attempt's
         # pushed branch and PR where they are still usable (#600); the
         # engine confirms that with GitHub and falls back to a fresh start.

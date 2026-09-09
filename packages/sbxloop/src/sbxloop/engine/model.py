@@ -22,6 +22,7 @@ from sbxloop.paths import SbxloopHome
 RunKind = Literal["code", "workload"]
 
 RunState = Literal[
+    "provider_held",
     # the task graph
     "created",
     "provisioning",
@@ -110,6 +111,7 @@ TERMINAL_RUN_STATES: frozenset[str] = frozenset(
 )
 RESUMABLE_RUN_STATES: frozenset[str] = frozenset(
     {
+        "provider_held",
         "created",
         "provisioning",
         "decomposing",

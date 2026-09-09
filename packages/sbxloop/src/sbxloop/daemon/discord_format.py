@@ -1563,6 +1563,12 @@ def format_for_discord(
                 flush=True,
             )
         ]
+    if t == "provider.held":
+        return [line(f"⏸ **provider held** — {data.get('message')}", flush=True)]
+    if t == "provider.recovered":
+        return [
+            line(f"▶ **{data.get('backend')} recovered** — continuing the checkpoint", flush=True)
+        ]
     if t == HostEventTypes.RUN_HELD:
         declared = ", ".join(str(name) for name in _list(data, "sinks"))
         where = f" — sinks: {declared}" if declared else ""
