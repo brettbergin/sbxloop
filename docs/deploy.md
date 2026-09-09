@@ -69,14 +69,15 @@ until [ "$({ sbxloop daemon ctl status --json 2>/dev/null || echo '{}'; } | jq -
 
 sbxloop backup --label pre-X.Y.Z
 ~/.sbxloop/bin/uv pip install --python ~/.sbxloop/venv/bin/python --upgrade 'sbxloop[discord,slack]==X.Y.Z' 'sbxloop-worker==X.Y.Z'
-sbxloop init --systemd
+sbxloop init --systemd --no-sbx
 systemctl --user reset-failed sbxloop-daemon && systemctl --user restart sbxloop-daemon
 ```
 
 `sbxloop backup` snapshots the config, secrets, units and the state database first (`backup list`,
 `backup restore <name>`; the daily sweep keeps the newest `[daemon] backups_keep`). `init`
-is idempotent: it refreshes the launchers and the rendered units for the new version and
-keeps everything else.
+refreshes the launchers and the rendered units for the new version. `--no-sbx` preserves
+the installed sandbox runtime; plain `init` would install this sbxloop release's default
+sbx version, which may be older than the one the operator installed.
 
 `reset-failed` matters: `StartLimitBurst=5` per 600 s leaves a unit that crash-looped in
 `failed`, where a plain `restart` will not revive it. The daemon comes back unpaused (holds
@@ -120,7 +121,8 @@ Step by step:
    nothing to drain and the job proceeds. To make a deploy go now, `ctl cancel` the run (it
    stays resumable; `cancel --retry` re-queues it fresh).
 3. **Snapshots** (`sbxloop backup`) and **upgrades** with both distributions pinned to the
-   same version, then re-runs `sbxloop init --systemd` so the launchers and units match.
+   same version, then re-runs `sbxloop init --systemd --no-sbx` so the launchers and units
+   match while preserving the installed sandbox runtime. Rollback also preserves sbx.
 4. **Restarts** after `systemctl --user reset-failed`, having first snapshotted the standing
    holds — immediately before the restart, not at the start of the job, so an operator who
    paused *during* the wait is still paused afterwards.
@@ -134,6 +136,20 @@ Step by step:
    intent survives), **releases its own** on `always()`, and **reports** with
    `sbxloop daemon notify`, including how long it waited and whether a failure happened
    before anything was installed.
+
+## Upgrading the sandbox runtime
+
+An sbxloop deployment or rollback leaves sbx unchanged. Upgrade that runtime separately
+with an explicit version, using `sbxloop init --sbx-version X.Y.Z` after checking
+compatibility on a CI runner. Take a named hold and drain the current run first, then stop
+`sbxloop-daemon` followed by `sbx-sandboxd` before installing. Restart the sandbox backend
+before the sbxloop daemon, check health, and restore any holds that should remain.
+
+Before the first start of the new runtime, keep a matching backup of the old binaries and
+the stopped sandbox state, configuration and credentials. `sbxloop backup` does not include
+sbx's state or binaries. A runtime downgrade can fail after a newer version migrates its
+database, so restoring only the old binaries is insufficient; see
+[Docker's downgrade guidance](https://docs.docker.com/ai/sandboxes/troubleshooting/#daemon-fails-to-start-after-downgrading).
 
 ## What rollback means for the schema
 

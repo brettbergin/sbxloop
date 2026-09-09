@@ -202,7 +202,9 @@ jobs:
           "${UV}" pip install --python "${VENV_PYTHON}" --upgrade \
             "sbxloop[discord,slack]==${VERSION}" "sbxloop-worker==${VERSION}"
           "${VENV_SBXLOOP}" --version
-          "${SBXLOOP}" init --systemd
+          # Keep the operator's sbx runtime, even when its version differs
+          # from this sbxloop release's default.
+          "${SBXLOOP}" init --systemd --no-sbx
 
       - name: Snapshot the holds to restore
         id: state
@@ -268,7 +270,7 @@ jobs:
           # The same extras as the upgrade: dropping one rolls a host on
           # that backend back to a build that cannot start.
           "${UV}" pip install --python "${VENV_PYTHON}" --upgrade "sbxloop[discord,slack]==${PREV}" "sbxloop-worker==${PREV}"
-          "${SBXLOOP}" init --systemd || true
+          "${SBXLOOP}" init --systemd --no-sbx || true
           systemctl --user reset-failed "${UNIT}" || true
           timeout 300 systemctl --user restart "${UNIT}"
           sleep 15

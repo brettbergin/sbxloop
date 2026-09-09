@@ -313,8 +313,9 @@ jobs:
             "${DIST}/sbxloop-${VERSION}-py3-none-any.whl[discord,slack]"
           "${VENV_SBXLOOP}" --version
           # Idempotent: refreshes the launchers and the rendered units for
-          # the new version, keeps config, secrets and sbx as they are.
-          "${SBXLOOP}" init --systemd
+          # the new version. --no-sbx preserves the operator's runtime;
+          # plain init would reinstall this release's pinned sbx version.
+          "${SBXLOOP}" init --systemd --no-sbx
           mkdir -p "${SBXLOOP_HOME}/logs/deploy"
           echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ${{ steps.installed.outputs.current }} -> ${VERSION} run=${{ github.run_id }}" >> "${SBXLOOP_HOME}/logs/deploy/history.log"
 
@@ -407,7 +408,7 @@ jobs:
           # The same extras as the upgrade (#619): a rollback that drops one
           # rolls a host on that backend back to a build that cannot start.
           "${UV}" pip install --python "${VENV_PYTHON}" --upgrade "sbxloop[discord,slack]==${PREV}" "sbxloop-worker==${PREV}"
-          "${SBXLOOP}" init --systemd || true
+          "${SBXLOOP}" init --systemd --no-sbx || true
           systemctl --user reset-failed "${UNIT}" || true
           timeout 300 systemctl --user restart "${UNIT}"
           sleep 15
