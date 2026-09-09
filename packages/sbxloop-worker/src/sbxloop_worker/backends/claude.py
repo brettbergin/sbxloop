@@ -309,6 +309,11 @@ class ClaudeBackend:
             # `.claude/settings.json` (hooks, permission rules) must not
             # reconfigure an unattended session under it.
             "setting_sources": [],
+            # Claude otherwise carries a successful `cd` into later Bash
+            # calls, so another root-relative command can target subdir/subdir.
+            # Override the CLI child's environment on every launch, including
+            # resumes and their fresh-session fallback, without mutating ours.
+            "env": {"CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1"},
         }
         if job.model and job.model != "auto":
             kwargs["model"] = job.model
@@ -373,10 +378,26 @@ class ClaudeBackend:
 
     @staticmethod
     def _system_prompt(job: JobRequest) -> Any:
+        message = job.system_message
+        if job.cwd and (job.available_tools is None or "Bash" in job.available_tools):
+            # Describe this backend's actual shell contract for every persona.
+            # Keep it out of shared phase prompts: other backends own their
+            # cwd behavior, and host-tools-only sessions have no Bash tool.
+            shell_contract = (
+                f"Every Bash tool call starts in the workspace directory {json.dumps(job.cwd)}. "
+                "Directory changes do not carry over between calls. Use paths relative to "
+                "this directory or quoted absolute paths. Within one call, directory changes "
+                "still affect later commands: isolate independent directory changes in "
+                "subshell groups and join required checks with &&. Guard each cd with && "
+                "so a failed directory change stops the dependent command. For Bash pipelines "
+                "that check success, use set -o pipefail so an output filter cannot hide a "
+                "failed check."
+            )
+            message = f"{message}\n\n{shell_contract}" if message else shell_contract
         if not job.system_preset:
-            return job.system_message
-        if job.system_message:
-            return {"type": "preset", "preset": "claude_code", "append": job.system_message}
+            return message
+        if message:
+            return {"type": "preset", "preset": "claude_code", "append": message}
         return {"type": "preset", "preset": "claude_code"}
 
     def _host_tool_server(self, job: JobRequest, emit: EmitFn) -> Any:
