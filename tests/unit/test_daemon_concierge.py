@@ -11,6 +11,7 @@ covered separately (test_worker_client / test_daemon_agentbox).
 
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -262,6 +263,7 @@ class TestJobShape:
             "version_status",
             "run_usage",
             "usage_today",
+            "agent_rate_limits",
             "daemon_log",
             "start_workload",
             "create_schedule",
@@ -330,6 +332,56 @@ class TestJobShape:
 
 
 class TestTools:
+    def test_rate_limit_report_fits_tool_budget(self, tmp_path, monkeypatch):
+        from sbxloop_worker.rate_limits import RateLimit, RateLimitReport
+
+        concierge, client, host, _, _ = make(
+            tmp_path,
+            [{"calls": [("agent_rate_limits", {})]}],
+            config={"concierge": {"max_tool_result_chars": 1000}},
+        )
+        report = RateLimitReport(
+            backend="copilot",
+            status="ok",
+            limits=[RateLimit(name=f"quota-{i}", category="quota") for i in range(32)],
+        )
+        monkeypatch.setattr(host, "agent_rate_limits", lambda: report, raising=False)
+        assert turn(concierge, "limits?").ok
+        text = client.responses[0].text
+        assert len(text) <= 1000
+        parsed = json.loads(text)
+        assert parsed["status"] == "partial" and "truncated" in parsed["reason"]
+        concierge.close()
+
+    @pytest.mark.parametrize("backend", ["copilot", "claude", "codex"])
+    def test_rate_limits_during_active_turn(self, tmp_path, backend, monkeypatch):
+        concierge, client, host, _loop, _dstore = make(
+            tmp_path,
+            [
+                {"calls": [("agent_rate_limits", {})], "session_id": "quota-session"},
+                {"text": "still here"},
+            ],
+            config={"agent": {"backend": backend}},
+        )
+        calls = []
+
+        def query():
+            from sbxloop_worker.rate_limits import RateLimitReport
+
+            calls.append(backend)
+            return RateLimitReport(backend=backend, status="unavailable", reason="test")
+
+        monkeypatch.setattr(host, "agent_rate_limits", query, raising=False)
+        assert turn(concierge, "How much agent capacity remains, and when does it reset?").ok
+        assert client.responses[0].ok
+        report = json.loads(client.responses[0].text)
+        assert report["backend"] == backend and report["status"] == "unavailable"
+        assert report["limits"] == [] and calls == [backend]
+        assert not host.failures
+        assert turn(concierge, "continue").ok
+        assert client.jobs[-1].resume_session_id == "quota-session"
+        concierge.close()
+
     def test_sbx_control_dispatches_with_attribution(self, tmp_path: Path) -> None:
         concierge, client, _, loop, _ = make(
             tmp_path,

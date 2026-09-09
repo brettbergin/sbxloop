@@ -1439,6 +1439,65 @@ class TestHostTools:
         script.write_text(json.dumps([{"text": "asked", "host_tool_calls": calls}]))
         monkeypatch.setenv("SBXLOOP_ECHO_SCRIPT", str(script))
 
+    @pytest.mark.parametrize("transport", ["stream", "poll"])
+    def test_rate_query_round_trip_preserves_waiting_session(
+        self, sandbox, fake_sbx, tmp_path, monkeypatch, transport
+    ):
+        from sbxloop.config import Config
+        from sbxloop.daemon.agentbox import DaemonAgent
+        from sbxloop_worker.protocol import HostToolResponse, HostToolSpec
+
+        self._script(
+            tmp_path,
+            monkeypatch,
+            [
+                {"name": "agent_rate_limits", "arguments": {}},
+                {"name": "still_here", "arguments": {}},
+            ],
+        )
+        bus = EventBus()
+        seen = []
+        bus.subscribe(seen.append)
+        client = make_client(sandbox, bus, transport=transport, poll_interval=0.1)
+        agent = DaemonAgent(
+            Config.model_validate({"home": str(tmp_path / "home"), "agent": {"backend": "codex"}}),
+            sandbox.cli,
+            bus,
+            worker_python=sys.executable,
+        )
+        agent._client, agent._sandbox = client, sandbox
+        calls = []
+
+        def handler(call):
+            calls.append(call.name)
+            assert "waiting" in client._brokers
+            if call.name == "agent_rate_limits":
+                report = agent.agent_rate_limits()
+                assert report.backend == "codex" and report.status == "unsupported"
+                return HostToolResponse(
+                    call_id=call.call_id, ok=True, text=report.model_dump_json()
+                )
+            return HostToolResponse(call_id=call.call_id, ok=True, text="conversation survived")
+
+        job = agent_job(
+            job_id="waiting",
+            host_tools=[
+                HostToolSpec(name="agent_rate_limits", description="capacity"),
+                HostToolSpec(name="still_here", description="continue"),
+            ],
+        )
+        result = client.submit(job, tool_handler=handler)
+        assert result.status == "ok" and "conversation survived" in result.output_text
+        assert calls == ["agent_rate_limits", "still_here"]
+        assert agent._client is client and agent._sandbox is sandbox
+        assert agent._last_reprovision_at is None and not fake_sbx.invocations("rm")
+        starts = [event for event in seen if event.type == EventTypes.WORKER_START]
+        assert sorted(event.data["kind"] for event in starts) == [
+            "agent.rate_limits",
+            "agent.session",
+        ]
+        assert len({event.job_id for event in starts}) == 2
+
     def _job(self, **overrides: object) -> JobRequest:
         from sbxloop_worker.protocol import HostToolSpec
 

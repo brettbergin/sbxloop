@@ -32,6 +32,7 @@ from sbxloop_worker._json import extract_json
 from sbxloop_worker.backends import BackendResult, EmitFn
 from sbxloop_worker.hosttools import request_tool, safe_call_id
 from sbxloop_worker.protocol import EventTypes, HostToolCall, JobRequest, SessionHealth, Usage
+from sbxloop_worker.rate_limits import RateLimitReport
 
 # Backend identity stamped onto agent events and usage samples, so chat
 # can name provider+model.
@@ -42,6 +43,13 @@ SCRIPT_ENV = "SBXLOOP_ECHO_SCRIPT"
 
 class EchoBackend:
     name = "echo"
+
+    def rate_limits(self, *, timeout_s: float) -> RateLimitReport:
+        return RateLimitReport(
+            backend=self.name,
+            status="unsupported",
+            reason="This backend adapter does not expose a read-only provider capacity query.",
+        )
 
     def ensure_available(self) -> None:
         """Nothing to install: the point of this backend is that it runs

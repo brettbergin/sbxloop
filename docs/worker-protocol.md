@@ -57,6 +57,19 @@ delivery tier provisioning chose (see docs/architecture.md):
 | `service.http`  | `params: {credential, method, path, query?, headers?, body?, timeout_s?}`                                                                    | `{credential, method, path, status, headers, body (clipped, credential value redacted), truncated, elapsed_s}` — see "Service ops"                                             |
 | `service.fetch` | `params: {registry, path, operation?, ref?, sha256?}`                                                                                        | Artifact metadata `{registry, operation, bytes, sha256}`; bytes stay in a separate artifact for host-mediated transfer                                                         |
 
+The `agent.rate_limits` job runs in the existing agent sandbox, using
+`params: {backend}` and a positive timeout of at most ten seconds. It rejects
+credentials, executable fields and session-resume fields. It calls the
+backend's read-only status method without opening a model session. Its
+`output_json` is a `RateLimitReport` (`sbxloop_worker.rate_limits`): backend,
+status, observation/snapshot times, source, freshness, scope, capabilities,
+reason, retry timing and up to 32 normalized limits. Null fields are unknown;
+short-term rate limits and longer-term quotas have distinct categories.
+Reports are bounded to 32 KiB and provider text is sanitized before leaving
+the sandbox. Provider query failures are successful worker jobs carrying an
+explicit unavailable/unsupported/authentication/throttled/timeout report,
+not failed inference jobs. They trigger no recovery or scheduling mutation.
+
 The `git.merge` job runs only on the agent worker. It requires `cwd` and
 `params: {base_branch, base_sha, bundle_path?}` and returns
 `{merged, conflicts, message}`. The host stages an optional Git bundle;

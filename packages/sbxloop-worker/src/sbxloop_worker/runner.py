@@ -212,6 +212,19 @@ class JobRunner:
     # -- dispatch ----------------------------------------------------------
 
     def _dispatch(self, writer: EventWriter) -> JobResult:
+        if self.job.kind == "agent.rate_limits":
+            from sbxloop_worker.rate_limits import failure
+
+            backend = self.job.params["backend"]
+            try:
+                report = get_backend(backend).rate_limits(timeout_s=self.job.timeout_s)
+            except Exception as exc:
+                report = failure(backend, exc)
+            return JobResult(
+                job_id=self.job.job_id,
+                status="ok",
+                output_json=report.bounded().model_dump(mode="json"),
+            )
         if self.job.kind == "agent.session":
             return self._run_agent_session(writer)
         if self.job.kind == "shell.check":

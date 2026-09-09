@@ -29,6 +29,7 @@ from sbxloop_worker.backends.copilot import (
 )
 from sbxloop_worker.hosttools import HostToolTimeout, request_tool, safe_call_id
 from sbxloop_worker.protocol import EventTypes, HostToolCall, HostToolSpec, JobRequest, Usage
+from sbxloop_worker.rate_limits import RateLimitReport
 from sbxloop_worker.secrets import redact_secrets
 
 BACKEND_NAME = "codex"
@@ -90,6 +91,13 @@ def _resume_thread_id(handle: str | None, fingerprint: str) -> str | None:
 
 class CodexBackend:
     name = BACKEND_NAME
+
+    def rate_limits(self, *, timeout_s: float) -> RateLimitReport:
+        return RateLimitReport(
+            backend=self.name,
+            status="unsupported",
+            reason="This backend adapter does not expose a read-only provider capacity query.",
+        )
 
     def ensure_available(self) -> None:
         ensure_runtime()

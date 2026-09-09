@@ -330,6 +330,17 @@ def test_concierge_prompt_carries_contract() -> None:
     text = render("concierge", **RENDER_CONTEXTS["concierge"])
     assert text.startswith("# You are the sbxloop concierge")
     assert "`sbx_control`" in text and "`create_issue`" in text
+    assert "`agent_rate_limits` with no arguments" in text
+    for evidence in (
+        "observation time",
+        "source",
+        "freshness",
+        "provider scope",
+        "used or remaining",
+        "Null means unknown",
+        "cannot establish provider capacity",
+    ):
+        assert evidence in text
     # "backlog" is allowed only as the `list_issues` state value, never as a
     # separate queue concept the concierge could file onto
     assert "`enqueue_work`" not in text and "inbox" not in text
