@@ -47,7 +47,7 @@ COMMANDS: tuple[str, ...] = (
     "status",
     "pause [--hold NAME]",
     "resume [<item|run>|--hold NAME|--all]",
-    "cancel [--retry]",
+    "cancel [<item|run>|--retry]",
     "queue",
     "items",
     "abandon <item> [reason]",
@@ -429,6 +429,8 @@ def _dispatch(
                 f"**source:** polling failed {s['source_failures']} time(s); "
                 f"retry in {s.get('source_retry_in_s', 0):.0f}s — check the daemon logs"
             )
+        if s.get("provider_hold"):
+            lines.append(f"**provider:** {s['provider_hold']}")
         repos = [r for r in (s.get("repos") or []) if isinstance(r, dict)]
         unwell = [r for r in repos if r.get("state") != "ok"]
         if unwell:
@@ -478,6 +480,11 @@ def _dispatch(
             )
         return CommandReply("resumed.")
     if word == "cancel":
+        if len(args) == 1 and not args[0].startswith("-"):
+            try:
+                return CommandReply(loop.cancel_provider(args[0], by))
+            except ValueError as exc:
+                return CommandReply(str(exc), ok=False)
         # Attributed to the operator: the item is settled as cancelled (no
         # retry, no breaker count) unless --retry asks for a fresh run.
         unknown = [a for a in args if a != "--retry"]

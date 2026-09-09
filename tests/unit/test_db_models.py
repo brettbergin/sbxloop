@@ -20,7 +20,15 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.db import Base, open_engine
 from sbxloop.engine.store import StateStore
 
-ENGINE_TABLES = ("runs", "tasks", "phase_attempts", "reconciliations", "events")
+ENGINE_TABLES = (
+    "runs",
+    "tasks",
+    "phase_attempts",
+    "reconciliations",
+    "events",
+    "provider_holds",
+    "provider_jobs",
+)
 DAEMON_TABLES = (
     "daemon_work_items",
     "daemon_runs",

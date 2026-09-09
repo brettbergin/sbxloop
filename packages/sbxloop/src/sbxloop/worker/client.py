@@ -36,6 +36,7 @@ from sbxloop.config import Limits, WorkerTransport
 from sbxloop.errors import SbxError, WorkerError, WorkerTimeoutError
 from sbxloop.events import EventBus, HostEventTypes
 from sbxloop.log import get_logger
+from sbxloop.provider import ProviderRecovery
 from sbxloop.sbx.models import ExecResult
 from sbxloop.sbx.sandbox import (
     BAKE_MANIFEST,
@@ -244,6 +245,7 @@ class WorkerClient:
         # job_id -> the broker answering that job's host-tool requests
         # (see sbxloop.worker.hosttools); registered for the life of submit().
         self._brokers: dict[str, HostToolBroker] = {}
+        self.provider_recovery: ProviderRecovery | None = None
 
     # -- install -----------------------------------------------------------
 
@@ -958,6 +960,21 @@ class WorkerClient:
         agent: str | None = None,
         tool_handler: HostToolHandler | None = None,
     ) -> JobResult:
+        if job.kind == "agent.session" and self.provider_recovery is not None:
+            return self.provider_recovery.submit(
+                job,
+                lambda request: self._submit_once(request, agent=agent, tool_handler=tool_handler),
+                self.bus,
+            )
+        return self._submit_once(job, agent=agent, tool_handler=tool_handler)
+
+    def _submit_once(
+        self,
+        job: JobRequest,
+        *,
+        agent: str | None = None,
+        tool_handler: HostToolHandler | None = None,
+    ) -> JobResult:
         """Run one job to completion.
 
         ``tool_handler`` answers the job's host-tool calls (``job.host_tools``)
@@ -972,7 +989,7 @@ class WorkerClient:
             if self.mcp_prepare is None:
                 raise WorkerError("credentialed MCP has no host mediator")
             with self.mcp_prepare(job, tool_handler) as (prepared, handler):
-                return self.submit(prepared, agent=agent, tool_handler=handler)
+                return self._submit_once(prepared, agent=agent, tool_handler=handler)
         if bool(job.host_tools) != (tool_handler is not None):
             raise WorkerError(
                 "job.host_tools and tool_handler must be given together "

@@ -928,6 +928,37 @@ plan is written — the moment a human can still turn the knob — and the
 planner is told to scope verify commands to the subset that runs without
 the services either way.
 
+## Recovering from an agent provider limit
+
+Claude throttling, exhausted quotas and insufficient credit pause the run
+as `provider_held`. The chronology and `!sbx status` show the backend,
+reason and next eligible time, or say that the reset is unknown. Other
+work using the same backend credential waits too, including concierge
+calls. Completed work, partial output, session context and usage are kept.
+
+Transient failures allow three delayed retries (30, 60 and 120 seconds,
+plus jitter), respecting any later provider timing. A quota with a known
+future reset waits until then. Billing failures, unknown resets and
+exhausted transient retries require operator recovery. The daemon
+continues the same run; these waits spend no task-repair or crash-resume
+budget and do not claim another full run.
+
+After resolving the provider limit, use `!sbx resume <item|run>` to
+continue its checkpoint, or `!sbx resume claude` to release the shared
+Claude hold. `!sbx cancel <item|run>` stops a parked run and retains its
+checkpoint; `!sbx pause` holds dispatch as usual. These commands do not
+need an agent call and also work through `sbxloop daemon ctl`. For a
+standalone run, `sbxloop resume <run>` is explicit recovery.
+
+For an interrupted concierge call, repeat the original request after the
+cooldown or explicit release. It continues the preserved session even if
+the daemon's time or queue status changed while waiting.
+
+If the interrupted SDK session is missing after partial work, or its
+request has changed, recovery stays held for inspection. It never
+silently restarts those side effects, changes models or credentials, or
+changes billing arrangements.
+
 ## The daemon: an always-on outer loop
 
 `sbxloop daemon` is deliberately small. It polls the one configured

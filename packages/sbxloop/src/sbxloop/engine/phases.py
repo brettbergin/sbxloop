@@ -58,6 +58,7 @@ from sbxloop.errors import InvalidOutputTwice, WorkerError
 from sbxloop.events import EventBus
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
+from sbxloop.provider import ProviderHeldError, ProviderHold
 from sbxloop.verifylint import (
     UV_LOCKFILE,
     command_heads,
@@ -592,6 +593,8 @@ class PhaseRunner:
         )
         if result.status != "ok":
             assert result.error is not None
+            if result.error.provider is not None:
+                raise ProviderHeldError(ProviderHold(result.error.provider, None, 0))
             raise WorkerError(f"agent job failed ({result.error.type}): {result.error.message}")
         return result
 

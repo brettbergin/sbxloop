@@ -269,6 +269,22 @@ class JobRunner:
     def _run_agent_session(self, writer: EventWriter) -> JobResult:
         backend = get_backend(self.backend_name)
         outcome = backend.run_session(self.job, writer.emit)
+        if outcome.failure is not None:
+            return JobResult(
+                job_id=self.job.job_id,
+                status="error",
+                error=ErrorInfo(
+                    type="ProviderFailure",
+                    message=outcome.failure.reason,
+                    http_status=outcome.failure.http_status,
+                    provider=outcome.failure,
+                ),
+                output_text=outcome.output_text,
+                session_id=outcome.session_id,
+                usage=outcome.usage,
+                turns=outcome.turns,
+                health=outcome.health,
+            )
         if self.job.expect == "json" and outcome.output_json is None:
             return self._error_result(
                 "error",
