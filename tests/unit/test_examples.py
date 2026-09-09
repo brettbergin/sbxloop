@@ -90,7 +90,7 @@ class TestPresets:
     they work from a wheel and nothing `init` writes points at a checkout."""
 
     def test_presets_ship_as_package_data_and_the_contrib_path_is_an_alias(self) -> None:
-        assert config_presets().keys() == {"large-repo", "workload"}
+        assert config_presets().keys() == {"large-repo", "workload", "playwright"}
         for name in config_presets():
             assert (PRESETS_DIR / f"{name}.toml").is_file()
             alias = REPO_ROOT / "contrib" / "presets" / f"{name}.toml"

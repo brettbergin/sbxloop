@@ -901,6 +901,53 @@ command in the error, and `keep_on_failure` keeps the sandbox for `sbxloop shell
 is paid at that repository's provision, since the bake reads the global list
 only.
 
+### Playwright MCP for browser verification
+
+Give Copilot or Claude builders a headless browser with the packaged preset:
+
+```bash
+sbxloop init --preset playwright
+# Inspect the generated config without writing files:
+sbxloop init --stdout --preset playwright
+```
+
+For an existing installation, merge the generated `[sandbox]` settings and
+`[[mcp]]` entry into the home's `config/sbxloop.toml`. Keep any existing
+languages and append the setup commands to the existing list; a repository's
+`setup_commands` override replaces that list and must include the browser
+installation too. The preset selects `[agent] backend = "copilot"`; change
+it to `"claude"` to use the Claude Agent SDK and configure that backend's
+inference credential as usual. Native MCP is not supported by the Codex
+backend.
+
+The preset installs `@playwright/mcp@0.0.80` into
+`$HOME/.sbxloop/playwright-mcp` inside the **agent sandbox**, then invokes
+that package's Playwright CLI to install the matching Chromium binary and
+Linux dependencies. This avoids changing the target's package manifest or
+lockfile. The public package installation uses its own cache with lifecycle
+scripts disabled, including when the target's dependency cache is offline.
+The MCP command uses that installed copy, with `--browser chromium`,
+`--headless` and `--isolated`. Each MCP browser session starts with a fresh
+profile. See the [Playwright MCP options](https://github.com/microsoft/playwright-mcp#configuration)
+and [browser installation guide](https://playwright.dev/docs/browsers#install-browsers).
+
+Only the builder receives the server. It can start the target's development
+server in the sandbox, navigate to its loopback address, inspect pages and
+console errors, and exercise the UI. Ask it to save screenshots and other
+evidence inside the workspace so they survive harvest. The declared hosts
+cover npm and the browser downloads; add the application's external API,
+asset and website domains to the MCP entry's `hosts` as needed. The existing
+network policy and setup failure reporting still apply. Browser tools do
+not replace the target repository's verification gate.
+
+Setup commands run before the first phase of each **code run**; `sbxloop bake`
+does not execute them. Workloads skip these commands, so the preset excludes
+`operator`: to use it for workloads, first prepare a custom sandbox template
+with the same package, browser and OS dependencies installed for the agent
+user, select it under `[sandbox] template`, and add `"operator"` to `roles`.
+Keep planners, critics and the concierge excluded. Update the pinned MCP
+package and reinstall its browser together when upgrading.
+
 ### Suites that need services
 
 Most backend suites want a database, a broker or a browser the sandbox

@@ -247,6 +247,11 @@ secret_strategy = "proxy"
 # scheme = ""
 # description = "read-only weather forecasts"
 
+# For headless browser tools on Copilot/Claude code runs, generate a complete
+# setup with `sbxloop init --stdout --preset playwright`. It includes Node,
+# a pinned Playwright MCP package, Chromium installation and the host allows.
+# Merge its sections into an existing config rather than adding duplicate tables.
+#
 # External MCP servers the agent sessions may use — the extensibility
 # point. Each entry is given to every session whose role is listed, on
 # whichever `[agent] backend` runs (the two SDKs spell the transports

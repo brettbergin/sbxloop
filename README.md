@@ -73,6 +73,10 @@ to get the job done, without putting every key on the workbench.
 The [security architecture](docs/architecture.md#the-credential-split-in-one-picture)
 explains the boundaries and how credentials are handled.
 
+For browser verification with Copilot or Claude, use the
+[Playwright MCP preset](docs/user-guide.md#playwright-mcp-for-browser-verification):
+`sbxloop init --preset playwright` provisions the browser and exposes it to builders.
+
 Need a report or a set of files instead? [Workload runs](docs/architecture.md#workloads)
 use the same supervised loop and publish the result without a code merge.
 

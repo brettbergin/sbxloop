@@ -2,6 +2,13 @@
 
 ### Added
 
+- **Playwright MCP setup for Copilot and Claude builders.**
+  `sbxloop init --preset playwright` configures Node, a pinned MCP package,
+  its matching headless Chromium installation, download hosts and builder
+  access. Setup stays outside the target's dependency tree. The user guide
+  covers existing configurations and the preinstalled template needed for
+  workload operators.
+
 - **A verify command that cannot pass can now be re-authored instead of
   ending the run.** The loop has always been able to *recognise* a check
   that no amount of work can satisfy - the same command failing with
