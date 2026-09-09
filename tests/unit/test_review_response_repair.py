@@ -197,6 +197,44 @@ def test_repair_without_a_session_id_still_receives_the_complete_response(tmp_pa
     assert contains_json(repaired.prompt or "", first)
 
 
+@pytest.mark.parametrize("session_id", [None, "review-session"])
+def test_refutation_evidence_reaches_corrections_without_another_review(
+    tmp_path: Path, session_id: str | None
+) -> None:
+    history = (
+        "### Round 1 — request_changes\n\n"
+        "refuted: src/certificate.py:12 — the caller rejects expired certificates "
+        "before invoking the parser."
+    )
+    approved = {
+        "verdict": "approve",
+        "summary": "The existing refutation resolves this.",
+        "findings": [],
+    }
+    original = verdict(MAJOR)
+    agent = ScriptedAgent([reply(original, session_id=session_id), reply(approved)])
+    phases = runner(agent, tmp_path)
+
+    result = phases.review(
+        diff="+unique_original_diff_marker",
+        pr_number=1,
+        round=2,
+        tasks=[],
+        history=history,
+        refuted={"src/certificate.py:12"},
+    )
+
+    assert result.verdict == "approve"
+    initial, correction = agent.jobs
+    assert history in (initial.prompt or "")
+    assert_response_only(correction)
+    assert correction.resume_session_id == session_id
+    assert history in (correction.prompt or "")
+    assert "already refuted" in (correction.prompt or "")
+    assert contains_json(correction.prompt or "", original)
+    assert "# Review the pull request" not in (correction.prompt or "")
+
+
 def test_repair_has_no_skill_lookup_or_configured_mcp_tools(tmp_path: Path) -> None:
     config = Config.model_validate(
         {

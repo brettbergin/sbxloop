@@ -791,6 +791,7 @@ class PhaseRunner:
                         repair_check=repair_check,
                         checkpoint_key=checkpoint_key,
                         checkpoint=checkpoint,
+                        prior_rounds=context["prior_rounds"],
                     )
                 last_error = exc
                 log.warning(
@@ -841,6 +842,7 @@ class PhaseRunner:
         repair_check: Callable[[object, ModelT], None] | None,
         checkpoint_key: str | None,
         checkpoint: _ReviewResponseCheckpoint,
+        prior_rounds: str,
     ) -> tuple[ModelT, JobResult]:
         """Correct a completed review at most twice, without another investigation.
 
@@ -871,6 +873,7 @@ class PhaseRunner:
                 ),
                 validation_error=str(last_error),
                 schema=schema,
+                prior_rounds=prior_rounds or "(no earlier review rounds)",
             )
             if attempt <= len(checkpoint.repairs):
                 completed = checkpoint.repairs[attempt - 1]

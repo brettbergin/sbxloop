@@ -268,6 +268,7 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "original_response": "",
         "validation_error": "unexpected field",
         "schema": '{"type":"object"}',
+        "prior_rounds": "(no earlier review rounds)",
     },
     "concierge": {
         "chat_name": "Discord",
