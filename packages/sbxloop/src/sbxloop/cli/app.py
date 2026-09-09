@@ -2329,7 +2329,6 @@ def daemon(
     source: WorkSource
     if config.github.enabled:
         github = DaemonGithub(config, sbx, bus, worker_python=config.worker_python)
-        github.remove_stale()
         labels = GitHubLabels(
             config.daemon.trigger_label,
             config.daemon.in_progress_label,

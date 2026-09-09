@@ -1171,9 +1171,15 @@ executed": once the daemon has taken a request it keeps running (item verbs
 cross the ops sandbox), and `ctl` reports it as pending (exit 1) rather than
 absent (exit 2). Scripts that need the state rather than the prose read
 `sbxloop daemon ctl status --json` — one JSON object with `current`, `claiming`,
-`holds`, `paused` and the rest — and post their own notices with
+`holds`, `paused`, `source_failures` and `source_retry_in_s` — and post their own notices with
 `sbxloop daemon notify "<text>"`, which goes through the configured chat backend
 from the host even while the daemon is down ([docs/deploy.md](deploy.md)).
+
+Polling failures are separate from failed runs: an idle daemon with zero run failures can
+still be unable to discover work. Status warns when polling is failing and shows when it
+will retry. After a Docker authentication outage, the next provisioning attempt retries
+cleanup of the daemon's stale GitHub sandbox; restoring login does not require another
+daemon restart.
 
 **Chat with the daemon.** @mention the bot in the control channel (or reply
 to one of its messages) and the **concierge** answers — the channel's own
@@ -1857,10 +1863,13 @@ environment = "production"
 
 Reports include unhandled CLI exceptions, sbxloop ERROR events, and WARNING
 events logged with an exception. They carry the sbxloop release, deployment
-label, static event name, exception type, and stack filenames/functions/line
-numbers. Exception messages, local variables, source lines, absolute paths,
-command arguments, log fields, and customer payloads are omitted. The local
-daemon log retains the full diagnostic context.
+label, static event name, exception types and messages, chained exceptions,
+exception-group members, and stack filenames, paths, functions, line numbers,
+and source context. Recognizable credential patterns are redacted using the
+same filter as local logs. Local variables, command arguments, and structured
+log fields are not collected. Messages and source context can include
+application data; configure a reporting destination appropriate for that data.
+Individual text values are limited to 100,000 characters by the SDK.
 
 The SDK is confined to the host: no DSN is injected into sandboxes and no
 sandbox egress rule is added. Session tracking, tracing, profiling, metrics,

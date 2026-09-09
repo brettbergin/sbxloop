@@ -549,7 +549,11 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
 
 - the **github-ops box** (`daemon/github.py`) — polling and issue lifecycle
   with `GH_TOKEN`, provisioned lazily, dropped and re-provisioned on
-  failure at most once per five minutes, removed at daemon start/stop;
+  failure at most once per five minutes, removed before provisioning and
+  at daemon stop. Each provision checks inventory and removes only this
+  instance's stale box. Inventory or removal failures stop that attempt;
+  polling backoff retries cleanup after authentication or the sandbox
+  service recovers, while daemon control stays available;
 - the **concierge box** (`daemon/agentbox.py`) — the control channel's
   agent (`daemon/concierge.py`), a Copilot session with the agent token
   and **no built-in tools**: everything it can do is a *host tool*
@@ -686,7 +690,16 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   in a top-level comment; GitHub refuses `REQUEST_CHANGES`/`APPROVE` from
   an author, so the review feature is not asked), and as an
   `APPROVE`/`REQUEST_CHANGES` review (`COMMENT` fallback) when a distinct
-  identity reviews.
+  identity reviews. Before either posting path sends inline findings, the
+  host checks their locations against GitHub's paginated PR file patches
+  and checks that the head and base stayed fixed during the read. Only
+  RIGHT-side additions and context lines in complete, understood hunks
+  qualify. Findings outside that diff, files without a usable patch, and
+  findings whose locations could not be verified go directly into the
+  review body with their original anchors and severity; they remain in
+  the verdict and reconciliation history. The lookup is skipped when
+  there are no inline candidates and adds no agent turn. GitHub refusals
+  after the check still use the existing fallback.
 - **FIX** — one seeded task (`fix-N`), built and verified like any other
   under the same revision/replan budgets, whose exam is the union of the
   decomposer's verify commands plus the gate. Then back to GATE. Every
@@ -1025,6 +1038,27 @@ the Claude backend passes `setting_sources=[]` explicitly (the SDK's own
 default, which loads no filesystem settings), so a target repository's
 `.claude/settings.json` cannot reconfigure an unattended session and
 CLAUDE.md costs its tokens once, through the prompt.
+
+Claude sessions with a working directory also carry a shell contract in
+their system prompt, including workload personas that decline the coding
+preset. The backend sets
+`CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1` in the CLI child's environment:
+each Bash call starts from the session's initial working directory,
+including resumed sessions and a fresh session after a missed resume.
+This matches the independent working-directory contract of mechanical
+verification. It prevents a successful `cd app` in one call from making
+the next call's `cd app` look for `app/app`. Host-tool-only sessions receive
+no shell instructions, and the Claude-specific behavior is not promised
+by the shared phase prompts to other backends.
+
+Directory changes still affect later commands within the same Bash call.
+The contract asks agents to use absolute paths or isolated command groups,
+guard directory changes, and preserve failures when combining commands or
+trimming output. Tests cover the SDK options and prompt contract across
+fresh, resumed and fallback sessions; the external CLI's behavior remains
+**field-unverified** until exercised on a CI runner. The reset flag's
+semantics are documented in
+[Anthropic's Bash tool reference](https://code.claude.com/docs/en/tools-reference#what-persists-between-commands).
 
 Host reads of these convention files and PR templates use `repofiles`:
 directory-relative opens with kernel symlink following disabled, resolving

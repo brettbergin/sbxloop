@@ -26,7 +26,7 @@
   <a href=".github/workflows/ci.yml"><img src="https://img.shields.io/badge/GitHub_Actions-2088FF?logo=githubactions&amp;logoColor=white" alt="GitHub Actions" /></a>
 </p>
 
-**Give it the work. Keep the steering wheel.**
+**Give sbxloop the work and ditch the steering wheel.**
 
 Built on [Docker Sandboxes (`sbx`)](https://docs.docker.com/ai/sandboxes/),
 sbxloop takes an ask from chat, a labeled issue, or your terminal and works

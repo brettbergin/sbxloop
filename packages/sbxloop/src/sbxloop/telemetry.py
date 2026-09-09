@@ -1,8 +1,7 @@
 """Opt-in GlitchTip reports from the host, isolated from the SDK's global scope.
 
-Only exception types, stack locations and static log event names leave the
-host. Exception messages can contain arbitrary subprocess output or customer
-data, so they are omitted, along with locals, source, argv and log fields.
+Reports include exception messages, chains, groups and stack source context.
+Recognizable credentials are redacted; locals, argv and log fields stay local.
 The worker never imports this module or receives the reporting credential.
 """
 
@@ -12,7 +11,6 @@ import contextlib
 import os
 import re
 import sys
-import traceback
 from typing import TYPE_CHECKING, Any, Literal, cast
 
 if TYPE_CHECKING:
@@ -24,6 +22,7 @@ if TYPE_CHECKING:
 
 _client: sentry_sdk.Client | None = None
 _EVENT_NAME = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+")
+_MAX_VALUE_LENGTH = 100_000
 
 
 def _before_send(event: Event, _hint: dict[str, Any]) -> Event:
@@ -67,7 +66,8 @@ def configure_telemetry(config: TelemetryConfig) -> None:
             auto_session_tracking=False,
             send_default_pii=False,
             include_local_variables=False,
-            include_source_context=False,
+            include_source_context=True,
+            max_value_length=_MAX_VALUE_LENGTH,
             max_breadcrumbs=0,
             traces_sample_rate=0.0,
             profiles_sample_rate=0.0,
@@ -86,25 +86,34 @@ def configure_telemetry(config: TelemetryConfig) -> None:
 
 
 def _exception_event(error: BaseException) -> dict[Literal["values"], list[dict[str, Any]]]:
-    # Do not ask the SDK to serialize exceptions: even their str() can expose
-    # secrets, and a frame's locals can contain every credential on the host.
-    frames = [
-        {
-            "filename": frame.f_code.co_filename.replace("\\", "/").rsplit("/", 1)[-1],
-            "function": frame.f_code.co_name,
-            "lineno": lineno,
-        }
-        for frame, lineno in traceback.walk_tb(error.__traceback__)
-    ]
-    return {
-        "values": [
-            {
-                "type": type(error).__name__,
-                "value": "Exception message omitted for privacy",
-                "stacktrace": {"frames": frames},
-            }
-        ],
-    }
+    from sentry_sdk.utils import event_from_exception
+
+    # The SDK handles chained exceptions, groups, and traceback ordering. Keep
+    # frame locals disabled: a trace needs source locations, not process memory.
+    event, _ = event_from_exception(
+        error,
+        client_options={
+            "include_local_variables": False,
+            "include_source_context": True,
+            "max_value_length": _MAX_VALUE_LENGTH,
+        },
+    )
+    return cast(
+        'dict[Literal["values"], list[dict[str, Any]]]', _redact_diagnostics(event["exception"])
+    )
+
+
+def _redact_diagnostics(value: Any) -> Any:
+    """Keep diagnostic text while masking the credential shapes used by logs."""
+    from sbxloop.log import redact_text
+
+    if isinstance(value, str):
+        return redact_text(value)
+    if isinstance(value, dict):
+        return {key: _redact_diagnostics(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_diagnostics(item) for item in value]
+    return value
 
 
 def capture_exception(error: BaseException) -> None:

@@ -2889,6 +2889,23 @@ class LoopEngine:
         posted_findings: tuple[PostedFinding, ...] = ()
         posted_review_id: int | None = None
         comments = posting.comments()
+        if comments:
+            try:
+                locations = ops.pr_review_locations(repo, run.pr_number, commit_id=run.head_sha)
+            except GithubOpsError as exc:
+                log.warning(
+                    "review.locations_unavailable",
+                    run=run_id,
+                    pr=run.pr_number,
+                    error=str(exc),
+                    hint="posting findings in the review body",
+                )
+                locations = {}
+            comments = [c for c in comments if any(c.line in h for h in locations.get(c.path, ()))]
+        inline_anchors = {f"{c.path}:{c.line}" for c in comments}
+        in_body = [f for f in posting.findings if f.anchor not in inline_anchors]
+        if in_body:
+            log.info("review.findings_in_body", run=run_id, pr=run.pr_number, findings=len(in_body))
         try:
             try:
                 if self._self_review(p, run.pr_number):
@@ -2900,7 +2917,7 @@ class LoopEngine:
                         repo,
                         run.pr_number,
                         verdict.event,
-                        review_body(posting, run_id=run_id, round=round_no),
+                        review_body(posting, run_id=run_id, round=round_no, in_body=in_body),
                         comments,
                     )
             except GithubOpsError:

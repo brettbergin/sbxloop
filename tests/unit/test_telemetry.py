@@ -1,4 +1,4 @@
-"""GlitchTip reports contain diagnostic locations, never customer payloads."""
+"""GlitchTip preserves exception diagnostics without ambient process data."""
 
 from __future__ import annotations
 
@@ -56,7 +56,7 @@ def test_logged_errors_are_reported_once_without_payloads(
         log.info("run.started", password="private-value")
         log.warning("run.retry")
         try:
-            raise RuntimeError("private-value from a customer response")
+            raise RuntimeError("Upstream request failed with HTTP 503")
         except RuntimeError:
             log.warning("run.crashed", exc_info=True, argv=["private-value"], token="private-value")
         log.error("run.abandoned", error="private-value")
@@ -70,18 +70,27 @@ def test_logged_errors_are_reported_once_without_payloads(
         events = [item.payload.json for envelope in envelopes for item in envelope.items]
         assert len(events) == 2
         assert events[0]["exception"]["values"][0]["type"] == "RuntimeError"
+        assert (
+            events[0]["exception"]["values"][0]["value"] == "Upstream request failed with HTTP 503"
+        )
         frames = events[0]["exception"]["values"][0]["stacktrace"]["frames"]
         assert frames[-1]["function"] == "test_logged_errors_are_reported_once_without_payloads"
         assert events[0]["message"] == "run.crashed"
         assert events[1]["message"] == "run.abandoned"
         assert events[0]["environment"] == "test"
+        assert "context_line" in frames[-1]
+        # Source excerpts can contain this test's literal fixtures; actual
+        # runtime locals and structured log fields must still be absent.
+        for frame in frames:
+            assert "vars" not in frame
+            for key in ("context_line", "pre_context", "post_context"):
+                frame.pop(key, None)
         serialized = json.dumps(events)
         for forbidden in (
             "private-value",
             "customer response",
             "vars",
             "argv",
-            "context_line",
             "breadcrumbs",
         ):
             assert forbidden not in serialized
@@ -212,3 +221,57 @@ def test_sdk_ambient_context_is_discarded() -> None:
         "modules": {"private": "1"},
     }
     assert telemetry._before_send(event, {}) == {"event_id": "id", "message": "run.crashed"}
+
+
+@pytest.mark.parametrize("explicit", [True, False])
+def test_exception_messages_and_chained_tracebacks_are_preserved(explicit: bool) -> None:
+    def fail():
+        raise ValueError("Upstream returned an invalid task identifier")
+
+    try:
+        try:
+            fail()
+        except ValueError as cause:
+            if explicit:
+                raise RuntimeError("Could not load task") from cause
+            raise RuntimeError("Could not load task")  # noqa: B904 - exercise implicit context
+    except RuntimeError as error:
+        values = telemetry._exception_event(error)["values"]
+    assert [(v["type"], v["value"]) for v in values] == [
+        ("ValueError", "Upstream returned an invalid task identifier"),
+        ("RuntimeError", "Could not load task"),
+    ]
+    frames = values[0]["stacktrace"]["frames"]
+    assert frames[-1]["function"] == "fail"
+    assert frames[-1]["abs_path"] == str(Path(__file__).resolve())
+    assert "raise ValueError" in frames[-1]["context_line"]
+    assert all("vars" not in f for v in values for f in v["stacktrace"]["frames"])
+
+
+def test_exception_groups_preserve_children() -> None:
+    error = ExceptionGroup("Multiple failures", [ValueError("bad task"), OSError("missing file")])
+    values = telemetry._exception_event(error)["values"]
+    assert {(v["type"], v["value"]) for v in values} == {
+        ("ExceptionGroup", "Multiple failures"),
+        ("ValueError", "bad task"),
+        ("OSError", "missing file"),
+    }
+
+
+def test_suppressed_exception_context_is_not_reported() -> None:
+    try:
+        try:
+            raise ValueError("suppressed")
+        except ValueError:
+            raise RuntimeError("visible") from None
+    except RuntimeError as error:
+        values = telemetry._exception_event(error)["values"]
+    assert [(v["type"], v["value"]) for v in values] == [("RuntimeError", "visible")]
+
+
+def test_exception_messages_keep_diagnostics_and_redact_credentials() -> None:
+    message = "Request failed: Authorization: Bearer test-credential\n" + "detail " * 400
+    values = telemetry._exception_event(RuntimeError(message))["values"]
+    assert "test-credential" not in values[0]["value"]
+    assert "Request failed:" in values[0]["value"]
+    assert values[0]["value"].endswith("detail " * 400)

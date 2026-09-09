@@ -15,6 +15,7 @@ from pydantic import BaseModel
 
 from sbxloop.config import MergeMethod
 from sbxloop.errors import GithubOpsError
+from sbxloop.gh.review_locations import right_side_ranges
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
 from sbxloop.worker.client import WorkerClient
@@ -1053,6 +1054,48 @@ class GithubOps:
             anchor = f"`{path}:{line}`: " if path and line else f"`{path}`: " if path else ""
             parts.append(f"- {anchor}{body}")
         return "\n\n".join(parts)[:clip]
+
+    def pr_review_locations(
+        self, repo: str, number: int, *, commit_id: str | None
+    ) -> dict[str, tuple[range, ...]]:
+        """Read the PR's commentable RIGHT-side ranges for the reviewed head.
+
+        Check both refs around the paginated read: PR file patches describe
+        the current diff, not necessarily the head the agent reviewed. An
+        unreadable/incomplete listing or moving refs cannot authorize an
+        inline post. The caller preserves those findings in the body.
+        """
+
+        def refs() -> tuple[str, str]:
+            pr = self.pr_get(repo, number)
+            head, base = pr.get("head"), pr.get("base")
+            head_sha = head.get("sha") if isinstance(head, dict) else None
+            base_sha = base.get("sha") if isinstance(base, dict) else None
+            if not isinstance(head_sha, str) or not isinstance(base_sha, str) or not base_sha:
+                raise GithubOpsError("PR diff locations need both head and base SHAs")
+            if not commit_id or head_sha != commit_id:
+                raise GithubOpsError("PR head no longer matches the reviewed commit")
+            return head_sha, base_sha
+
+        before = refs()
+        locations: dict[str, tuple[range, ...]] = {}
+        path = f"/repos/{repo}/pulls/{number}/files"
+        for page in range(1, MAX_PAGES + 1):
+            data = self.raw("GET", f"{path}?per_page={PAGE_SIZE}&page={page}")
+            if not isinstance(data, list):
+                raise GithubOpsError("PR diff locations need a list of changed files")
+            for entry in data:
+                name = entry.get("filename") if isinstance(entry, dict) else None
+                if not isinstance(name, str) or not name or name in locations:
+                    raise GithubOpsError("PR diff locations contain missing or duplicate filenames")
+                locations[name] = right_side_ranges(entry.get("patch"))
+            if len(data) < PAGE_SIZE:
+                break
+        else:
+            raise PaginationError("PR diff locations exceed the changed-file page limit")
+        if refs() != before:
+            raise GithubOpsError("PR base changed while reading diff locations")
+        return locations
 
     def pr_review_create(
         self,
