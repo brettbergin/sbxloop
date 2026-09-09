@@ -34,7 +34,7 @@ dependencies = [
     "pyyaml>=6.0",
     # `requires-python` is a PEP 440 specifier; the toolchain series a run
     # provisions is chosen against it (#627).
-    "packaging>=24",
+    "packaging>=26.3",
     "textual>=8.2",
     # The overview's distributions and trends (`tui/widgets/chart.py`).
     # Bands cover every "what share" question and cover it better; these
