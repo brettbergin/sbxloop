@@ -63,16 +63,26 @@ async def _exercise_server(command: list[str], url: str) -> None:
         )
         await send({"method": "notifications/initialized"})
         listing = await request(2, "tools/list", {})
-        assert {"browser_navigate", "browser_click"} <= {tool["name"] for tool in listing["tools"]}
+        assert {"browser_navigate", "browser_click", "browser_evaluate"} <= {
+            tool["name"] for tool in listing["tools"]
+        }
         page = await request(
             3, "tools/call", {"name": "browser_navigate", "arguments": {"url": url}}
         )
         assert "Playwright preset works" in json.dumps(page), page
-        clicked = await request(
-            4, "tools/call", {"name": "browser_click", "arguments": {"target": "button"}}
+        await request(4, "tools/call", {"name": "browser_click", "arguments": {"target": "button"}})
+        # Action replies may link to snapshot files instead of embedding the
+        # accessibility tree. Read the DOM through MCP to verify the effect.
+        state = await request(
+            5,
+            "tools/call",
+            {
+                "name": "browser_evaluate",
+                "arguments": {"function": "() => document.querySelector('button').textContent"},
+            },
         )
-        assert "Button was clicked" in json.dumps(clicked), clicked
-        await request(5, "tools/call", {"name": "browser_close", "arguments": {}})
+        assert "Button was clicked" in json.dumps(state), state
+        await request(6, "tools/call", {"name": "browser_close", "arguments": {}})
     finally:
         if process.returncode is None:
             process.terminate()
