@@ -19,6 +19,12 @@ from silently falling back to a fresh SDK session. An unavailable session
 returns a provider recovery failure for operator inspection. Older job
 requests default this field to false.
 
+`JobRequest.recovery_key` optionally identifies the same user request when
+its prompt includes changing status. The concierge includes the complete
+request and author, omitting its time/queue preamble. Absent this field,
+the host fingerprints the entire prompt. Model, system instructions and
+output/permission modes always participate in checkpoint matching.
+
 ## Filesystem layout (inside each sandbox)
 
 ```

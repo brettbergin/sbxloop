@@ -142,7 +142,13 @@ class ProviderRecovery:
     def job_key(job: JobRequest) -> str:
         # Job IDs and SDK session IDs change on restart. The request's
         # semantics identify the interrupted call, including its task.
-        content = [job.prompt, job.system_message, job.model, job.expect, job.permission_mode]
+        content = [
+            job.recovery_key if job.recovery_key is not None else job.prompt,
+            job.system_message,
+            job.model,
+            job.expect,
+            job.permission_mode,
+        ]
         return hashlib.sha256(json.dumps(content).encode()).hexdigest()
 
     def checkpoint(self, run_id: str, key: str) -> JobResult | None:

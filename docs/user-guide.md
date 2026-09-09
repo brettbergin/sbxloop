@@ -925,6 +925,10 @@ checkpoint; `!sbx pause` holds dispatch as usual. These commands do not
 need an agent call and also work through `sbxloop daemon ctl`. For a
 standalone run, `sbxloop resume <run>` is explicit recovery.
 
+For an interrupted concierge call, repeat the original request after the
+cooldown or explicit release. It continues the preserved session even if
+the daemon's time or queue status changed while waiting.
+
 If the interrupted SDK session is missing after partial work, or its
 request has changed, recovery stays held for inspection. It never
 silently restarts those side effects, changes models or credentials, or

@@ -270,6 +270,9 @@ class JobRequest(ProtocolModel):
     # Provider recovery must not replay tools in a fresh session if the
     # interrupted session cannot be recovered.
     require_resume: bool = False
+    # Stable request identity when the prompt also contains volatile status.
+    # Callers must include the complete user request and its author/context.
+    recovery_key: str | None = None
     permission_mode: PermissionMode = "auto"
     expect: ExpectMode = "text"
     # Per-phase tool-call ceiling (#228): calls past it are turned away with

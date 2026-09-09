@@ -144,6 +144,38 @@ def test_missing_session_with_partial_work_never_replays(recovery):
         manager.submit(job(), lambda _: pytest.fail("must not call agent"), EventBus())
 
 
+def test_concierge_repeats_interrupted_request_after_status_changes(
+    tmp_path, recovery, monkeypatch
+):
+    from tests.unit.test_daemon_concierge import make, turn
+
+    manager, now = recovery
+    concierge, client, host, _, _ = make(tmp_path, [{"text": "Finished"}])
+    transport = client.submit
+    calls = []
+
+    def guarded(request, **kwargs):
+        def attempt(actual):
+            calls.append(actual)
+            return rejected() if len(calls) == 1 else transport(actual, **kwargs)
+
+        return manager.submit(request, attempt, EventBus())
+
+    monkeypatch.setattr(client, "submit", guarded)
+    try:
+        assert not turn(concierge, "finish the request").ok
+        assert len(calls) == 1
+        assert not host.failures
+        now[0] = manager.hold().next_at
+        concierge.clock = lambda: 2_000_000.0
+        assert turn(concierge, "finish the request").ok
+        assert calls[-1].require_resume
+        assert calls[-1].resume_session_id == "s1"
+        assert not manager.pending(calls[0].run_id)
+    finally:
+        concierge.close()
+
+
 @pytest.mark.parametrize("kind", ["code", "workload"])
 def test_daemon_holds_without_reclaim_or_repair_budgets(tmp_path, kind):
     from sbxloop.config import Config

@@ -448,6 +448,7 @@ class Concierge:
             run_id=CONCIERGE_RUN_ID,
             kind="agent.session",
             prompt=self._preamble(author) + "\n---\n" + text,
+            recovery_key=json.dumps([author, text]),
             system_message=self._system_message(),
             model=cfg.model or self.config.model,
             resume_session_id=session_id,
