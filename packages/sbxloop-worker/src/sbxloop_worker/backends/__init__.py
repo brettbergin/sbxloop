@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from sbxloop_worker.protocol import Event, JobRequest, SessionHealth, Usage
+from sbxloop_worker.rate_limits import RateLimitReport
 
 # emit("agent.message", content="...") -> Event
 EmitFn = Callable[..., Event]
@@ -36,6 +37,8 @@ class AgentBackend(Protocol):
     def ensure_available(self) -> None: ...
 
     def run_session(self, job: JobRequest, emit: EmitFn) -> BackendResult: ...
+
+    def rate_limits(self, *, timeout_s: float) -> RateLimitReport: ...
 
 
 def get_backend(name: str | None = None) -> AgentBackend:

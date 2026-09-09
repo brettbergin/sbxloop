@@ -88,6 +88,7 @@ from sbxloop_worker.protocol import (
     JobRequest,
     Usage,
 )
+from sbxloop_worker.rate_limits import RateLimitReport
 
 if TYPE_CHECKING:
     from sbxloop.daemon.github import DaemonGithub
@@ -153,6 +154,8 @@ class SessionHost(Protocol):
     """Where the concierge's session runs (``DaemonAgent`` in production)."""
 
     def client(self) -> WorkerClient: ...
+
+    def agent_rate_limits(self) -> RateLimitReport: ...
 
     def note_failure(self, exc: BaseException) -> bool: ...
 
@@ -811,6 +814,20 @@ class Concierge:
             ),
             HostTool(
                 HostToolSpec(
+                    name="agent_rate_limits",
+                    description=(
+                        "Read provider limits, remaining quota and resets for the configured "
+                        "agent backend. No arguments or credentials needed. Reports provider "
+                        "scope, source, freshness and unknown fields; shared account limits "
+                        "are not per-run capacity. Use for capacity/limit/reset questions. "
+                        "Use run_usage and usage_today for recorded token spend."
+                    ),
+                    parameters=_schema({}),
+                ),
+                self._tool_agent_rate_limits,
+            ),
+            HostTool(
+                HostToolSpec(
                     name="daemon_log",
                     description=(
                         "The daemon's own recent log lines, from its in-process ring "
@@ -1379,6 +1396,12 @@ class Concierge:
         """One run's folded ``agent.usage`` samples — :func:`usage_for_run`,
         the fold the console's Phases tab shows too."""
         return usage_for_run(self.store, run_id, since=since)
+
+    def _tool_agent_rate_limits(self, args: dict[str, Any], by: str) -> str:
+        if args:
+            raise ValueError("agent_rate_limits takes no arguments; it uses the configured backend")
+        report = self.host.agent_rate_limits()
+        return report.bounded(self.config.concierge.max_tool_result_chars).model_dump_json()
 
     def _tool_run_usage(self, args: dict[str, Any], by: str) -> str:
         run_id = str(args.get("run_id", "")).strip()
