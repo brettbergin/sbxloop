@@ -263,6 +263,13 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "project_gate": "- gate rule",
         **EXAMPLE,
     },
+    "review_repair": {
+        "prior_response": '{"verdict":"approve","summary":"checked"}',
+        "original_response": "",
+        "validation_error": "unexpected field",
+        "schema": '{"type":"object"}',
+        "prior_rounds": "(no earlier review rounds)",
+    },
     "concierge": {
         "chat_name": "Discord",
         "command_prefix": "!sbx",
