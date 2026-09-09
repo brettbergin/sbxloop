@@ -70,6 +70,16 @@ not present as an operator. The Claude backend then passes the message alone
 in place of its `claude_code` preset; the Copilot backend's SDK takes a system
 message in `append` mode only, so the flag has no effect there —
 the operator prompts are written to hold up under a coding-agent preamble.
+The Codex backend uses `baseInstructions` to replace the preset when this
+flag is false, and `developerInstructions` to extend it when true.
+
+The `codex` backend preserves the same job and result envelopes. Its SDK
+communicates with the bundled runtime over stdio inside the agent VM.
+Native environment tools are disabled; worker-owned dynamic tools apply
+the job's permissions and tool-call governor before execution, and host
+tools use the existing event/file relay. Codex read-only sessions expose
+read, list and search tools; `available_tools=[]` exposes only host tools.
+See [Codex backend](codex-backend.md) for the SDK pin and limitations.
 
 `permission_mode="auto"` approves every Copilot SDK permission request — the
 microVM is the security boundary. `read_only` allows only `read`, `url`, and

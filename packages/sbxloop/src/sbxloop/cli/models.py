@@ -17,6 +17,9 @@ host's credential can use, so `model = "..."` in sbxloop.toml (or
   ``{"data": [{"id", "display_name", "created_at", "type"}], "has_more",
   "last_id"}``; the rows are read defensively so a field change degrades a
   column, never the command. FIELD-UNVERIFIED against a live key.
+- codex: the Codex SDK's model catalogue, with OPENAI_API_KEY and an
+  isolated runtime configuration. The optional host `[codex]` extra is
+  needed for this command; listing authenticates but starts no model turn.
 
 Runs on the host and needs no sandbox either way.
 
@@ -35,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -42,8 +46,9 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from sbxloop.backends import ANTHROPIC_TOKEN_ENV, AgentBackend
+from sbxloop.backends import ANTHROPIC_TOKEN_ENV, OPENAI_TOKEN_ENV, AgentBackend
 from sbxloop.errors import SbxloopError
+from sbxloop.log import redact_text
 
 # The SDK's documented auth resolution order.
 SDK_TOKEN_ENVS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
@@ -257,10 +262,85 @@ def anthropic_model_row(record: dict[str, Any]) -> ModelRow:
     )
 
 
+def fetch_codex_models(timeout_s: float = 60.0) -> list[dict[str, Any]]:
+    """The Codex runtime's full visible catalogue, without a model turn.
+
+    The shared runtime context bounds startup, authentication and every
+    page with one watchdog, and removes the temporary auth/config home.
+    ``model`` is the runnable slug; ``id`` can be a catalogue entry id.
+    """
+    if not os.environ.get(OPENAI_TOKEN_ENV):
+        raise SbxloopError(
+            f'{OPENAI_TOKEN_ENV} is not set — [agent] backend = "codex" lists '
+            "models with it; create an OpenAI API key and export it"
+        )
+    try:
+        from openai_codex.types import ModelListResponse
+    except ImportError as exc:
+        raise SbxloopError(
+            "openai-codex is not installed on this host — install it with "
+            "`pip install 'sbxloop[codex]'` to list models"
+        ) from exc
+
+    from sbxloop_worker.backends.codex_runtime import authenticated_client
+
+    records: list[dict[str, Any]] = []
+    cursor: str | None = None
+    seen: set[str] = set()
+    try:
+        with authenticated_client(persistent=False, timeout_s=timeout_s) as client:
+            for _ in range(50):
+                page = client.request(
+                    "model/list",
+                    {"includeHidden": False, "cursor": cursor, "limit": 100},
+                    response_model=ModelListResponse,
+                )
+                records.extend(model.model_dump(mode="json", by_alias=True) for model in page.data)
+                cursor = page.next_cursor
+                if cursor is None:
+                    return records
+                if not cursor or cursor in seen:
+                    raise SbxloopError("listing codex models failed: pagination cursor repeated")
+                seen.add(cursor)
+            raise SbxloopError("listing codex models failed: pagination exceeded 50 pages")
+    except subprocess.TimeoutExpired as exc:
+        raise SbxloopError(f"listing codex models timed out after {timeout_s:.0f}s") from exc
+    except SbxloopError:
+        raise
+    except Exception as exc:
+        raise SbxloopError(f"listing codex models failed: {redact_text(str(exc))}") from exc
+
+
+def codex_model_row(record: dict[str, Any]) -> ModelRow:
+    """Flatten the Codex catalogue's fields without inventing billing data."""
+    model = record.get("model")
+    if not isinstance(model, str) or not model:
+        raise SbxloopError("listing codex models failed: catalogue entry has no runnable model")
+    efforts = record.get("supportedReasoningEfforts") or []
+    return ModelRow(
+        id=model,
+        name=str(record.get("displayName") or ""),
+        multiplier=None,
+        context_window=None,
+        vision="image" in (record.get("inputModalities") or []),
+        reasoning_efforts=tuple(
+            item["reasoningEffort"]
+            for item in efforts
+            if isinstance(item, dict) and isinstance(item.get("reasoningEffort"), str)
+        )
+        or None,
+        default_reasoning_effort=record.get("defaultReasoningEffort"),
+        policy_state=None,
+        raw=dict(record),
+    )
+
+
 def fetch_backend_rows(backend: AgentBackend, timeout_s: float = 60.0) -> list[ModelRow]:
     """The configured backend's models, flattened for display."""
     if backend.name == "claude":
         return [anthropic_model_row(record) for record in fetch_anthropic_models(timeout_s)]
+    if backend.name == "codex":
+        return [codex_model_row(record) for record in fetch_codex_models(timeout_s)]
     return [model_row(info) for info in fetch_models(timeout_s=timeout_s)]
 
 
@@ -270,6 +350,8 @@ def table_columns(backend: AgentBackend) -> tuple[str, ...]:
     id, name and release date."""
     if backend.name == "claude":
         return ("model", "name", "created")
+    if backend.name == "codex":
+        return ("model", "name", "vision", "reasoning")
     return ("model", "name", "billing", "context", "vision", "reasoning", "policy")
 
 

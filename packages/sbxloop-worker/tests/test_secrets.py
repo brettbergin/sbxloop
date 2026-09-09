@@ -11,6 +11,7 @@ import pytest
 from sbxloop_worker.secrets import (
     is_sbx_sentinel,
     looks_like_github_token,
+    redact_secrets,
     shell_sentinel_case,
     shell_token_case,
 )
@@ -41,6 +42,10 @@ class TestShellCases:
             (CUSTOM_SENTINEL, "sentinel"),
             ("ghs_installation123", "token"),
             ("github_pat_abc", "token"),
+            ("sk-proj-example_inference_key", "token"),
+            ("sk-svcacct-example_inference_key", "token"),
+            ("sk-example_inference_key", "token"),
+            ("sk-sbxproxymanagedAbc123", "sentinel"),
             ("not-a-token", "other"),
         ],
     )
@@ -55,6 +60,12 @@ class TestShellCases:
             ["sh", "-c", script, "_", value], capture_output=True, text=True, check=True
         )
         assert out.stdout.strip() == expected
+
+
+@pytest.mark.parametrize("prefix", ["sk-", "sk-proj-", "sk-svcacct-"])
+def test_openai_keys_are_redacted_without_a_label(prefix: str) -> None:
+    token = prefix + "A1b2C3d4E5f6G7h8I9j0K1l2"
+    assert redact_secrets(f"response included {token} here") == "response included *** here"
 
 
 class TestApplyEnvFile:

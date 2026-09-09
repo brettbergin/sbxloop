@@ -58,6 +58,15 @@ def test_example_is_a_valid_config() -> None:
     Config.model_validate(tomllib.loads(EXAMPLE.read_text()))
 
 
+def test_codex_selection_is_documented_in_the_shipped_examples() -> None:
+    config = Config.model_validate({"agent": {"backend": "codex"}})
+    assert config.agent.backend == "codex"
+    assert '"codex" runs the Python Codex SDK' in DEFAULT_CONFIG_TOML
+    assert "OPENAI_API_KEY" in DEFAULT_CONFIG_TOML
+    secrets = REPO_ROOT / "packages/sbxloop/src/sbxloop/data/secrets.env.example"
+    assert "#OPENAI_API_KEY=" in secrets.read_text()
+
+
 def test_sbxloop_init_renders_the_example_file(tmp_path: Path, monkeypatch: Any) -> None:
     """End-to-end drift check: what `sbxloop init` actually writes into a
     temp dir has the same dotted key paths as the committed example."""

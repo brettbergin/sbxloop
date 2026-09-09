@@ -79,7 +79,7 @@ use the same supervised loop and publish the result without a code merge.
 ## Get started
 
 You'll need a host that supports [Docker Sandboxes](https://docs.docker.com/ai/sandboxes/)
-and either GitHub Copilot access or an Anthropic API key. sbxloop requires
+and GitHub Copilot access, an Anthropic API key, or an OpenAI API key. sbxloop requires
 Python 3.13 or newer; the installer sets up Python and the sandbox CLI for you.
 
 ### Install and initialize
@@ -136,6 +136,12 @@ backend = "claude"
 
 Then put `ANTHROPIC_API_KEY=your_api_key` in `secrets.env` instead.
 You only need the credential for the backend you choose.
+
+For Codex, use `backend = "codex"` and put `OPENAI_API_KEY=your_api_key` in
+`secrets.env`. Provisioning installs the Python Codex SDK in the agent sandbox.
+The [backend guide](docs/user-guide.md#agent-backends-copilot-claude-or-codex)
+covers setup and model listing; the [Codex implementation plan](docs/codex-backend.md)
+records its tool contract and verification limits.
 
 The home config holds your operator settings. For a project's build and
 check settings, `sbxloop init --project` creates a `sbxloop.toml` in the

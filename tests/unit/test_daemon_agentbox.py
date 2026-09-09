@@ -32,6 +32,7 @@ from tests.conftest import FakeSbx
 TOKENS = {
     "COPILOT_GITHUB_TOKEN": "github_pat_copilot",
     "ANTHROPIC_API_KEY": "sk-ant-test-key",
+    "OPENAI_API_KEY": "sk-test-openai-key",
 }
 
 
@@ -145,13 +146,14 @@ class TestLifecycle:
         assert created_names(fake_sbx) == [stale.name, agent.name]
         assert fake_sbx.invocations("rm") != []
 
+    @pytest.mark.parametrize("backend", ["claude", "codex"])
     def test_reuse_requires_the_configured_agent_backend(
-        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, backend: str
     ) -> None:
         """Switching [agent] backend must rebuild the box (#533).
 
         The worker is installed with the backend's extra, so a box built
-        under copilot carries the Copilot SDK and no Claude Code CLI — while
+        under copilot carries the Copilot SDK and no alternative runtime — while
         reporting the very same worker version. The version probe alone
         therefore kept it, and every concierge message then failed with
         BackendUnavailableError until an operator removed it by hand.
@@ -159,7 +161,7 @@ class TestLifecycle:
         stale = make_agent(fake_sbx, tmp_path, monkeypatch)
         stale.client()
         stale.close()
-        agent = make_agent(fake_sbx, tmp_path, monkeypatch, install_workers=True, backend="claude")
+        agent = make_agent(fake_sbx, tmp_path, monkeypatch, install_workers=True, backend=backend)
         # The reuse probes are scripted to PASS — a matching version and a
         # healthy entrypoint — so the only thing that can refuse this box is
         # the backend probe. Each is consumed once, leaving the blanket
@@ -177,7 +179,7 @@ class TestLifecycle:
         fake_sbx.script(
             f"exec {agent.name} {sys.executable} -c import sys; from sbxloop_worker.backends",
             returncode=1,
-            stderr="claude-agent-sdk is not installed; install sbxloop-worker[claude]",
+            stderr=f"backend runtime is not installed; install sbxloop-worker[{backend}]",
             once=True,
         )
         fake_sbx.script(f"exec {agent.name} python3 -m venv", once=True)

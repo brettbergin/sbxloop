@@ -22,6 +22,9 @@ copilot = ["github-copilot-sdk>=1.0.8"]
 # provisioning installs Node + @anthropic-ai/claude-code into the sandbox
 # when [agent] backend = "claude" is configured.
 claude = ["claude-agent-sdk>=0.1.0"]
+# The Python Codex SDK includes its matching CLI runtime. Pin the pair:
+# tool registration and environment suppression use the experimental API.
+codex = ["openai-codex==0.147.0"]
 
 [project.urls]
 Homepage = "https://github.com/brettbergin/sbxloop"
