@@ -811,6 +811,7 @@ class Provisioner:
         credentials: Sequence[str] = (),
         kind: RunKind = "code",
         continue_branch: ContinueBranch | None = None,
+        reuse_sandboxes: bool = False,
     ) -> SandboxPair:
         """Provision the run's sandbox pair around its workspace.
 
@@ -892,6 +893,7 @@ class Provisioner:
             expects_mount=expects_mount,
             credentials=credentials,
             kind=kind,
+            reuse_sandboxes=reuse_sandboxes,
         )
 
     def _data_dir(self, run_id: str) -> Path:
@@ -1408,6 +1410,7 @@ class Provisioner:
         expects_mount: bool = True,
         credentials: Sequence[str] = (),
         kind: RunKind = "code",
+        reuse_sandboxes: bool = False,
     ) -> SandboxPair:
         # The github sandbox (and its token requirement) exists only when the
         # GitHub integration is configured; without [github].repo a run has
@@ -1474,6 +1477,7 @@ class Provisioner:
         # threads, and a failure must still see everything the OTHER thread
         # created so rollback stays complete.
         rollback_lock = threading.Lock()
+        reusable = {info.name for info in self.cli.ls()} if reuse_sandboxes else set()
 
         def provision_one(spec: SandboxSpec) -> Sandbox:
             started = time.monotonic()
@@ -1489,7 +1493,8 @@ class Provisioner:
                 # sbx stamps *registered* secrets into the VM at create;
                 # purge leftovers parked at this name first (#576).
                 self._purge_stale_registrations(spec)
-            self.cli.create(spec)
+            if spec.name not in reusable:
+                self.cli.create(spec)
             log.debug(
                 "sandbox.created",
                 run=run_id,
@@ -1497,8 +1502,9 @@ class Provisioner:
                 duration_s=round(time.monotonic() - started, 1),
             )
             sandbox = Sandbox(self.cli, spec.name)
-            with rollback_lock:
-                created.append(sandbox)
+            if spec.name not in reusable:
+                with rollback_lock:
+                    created.append(sandbox)
             self._apply_policy(spec)
             reason = env_file_reasons[spec.role]
             if reason is not None:

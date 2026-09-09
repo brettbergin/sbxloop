@@ -136,6 +136,24 @@ class SessionHealth(ProtocolModel):
         return "; ".join(parts) or "healthy"
 
 
+class ProviderFailure(ProtocolModel):
+    """A terminal inference failure, never task output or a repair verdict.
+
+    Timing is UTC epoch seconds supplied by provider metadata. None means
+    unknown, including for billing failures. Reason/code contain sanitized
+    provider diagnostics, never arbitrary assistant or tool text.
+    """
+
+    backend: str
+    category: Literal["throttle", "quota", "billing", "unavailable", "unknown", "recovery"]
+    reason: str
+    code: str | None = None
+    http_status: int | None = None
+    retry_at: float | None = Field(default=None, ge=0, le=253402300799, allow_inf_nan=False)
+    reset_at: float | None = Field(default=None, ge=0, le=253402300799, allow_inf_nan=False)
+    partial_progress: bool = False
+
+
 class ErrorInfo(ProtocolModel):
     """Structured error carried in a JobResult or error event."""
 
@@ -145,6 +163,7 @@ class ErrorInfo(ProtocolModel):
     # HTTP status of a failed github.op, so the host can branch on the code
     # rather than on message wording (#221). None for non-HTTP failures.
     http_status: int | None = None
+    provider: ProviderFailure | None = None
 
 
 class HostToolSpec(ProtocolModel):
@@ -248,6 +267,9 @@ class JobRequest(ProtocolModel):
     system_preset: bool = True
     model: str | None = None
     resume_session_id: str | None = None
+    # Provider recovery must not replay tools in a fresh session if the
+    # interrupted session cannot be recovered.
+    require_resume: bool = False
     permission_mode: PermissionMode = "auto"
     expect: ExpectMode = "text"
     # Per-phase tool-call ceiling (#228): calls past it are turned away with

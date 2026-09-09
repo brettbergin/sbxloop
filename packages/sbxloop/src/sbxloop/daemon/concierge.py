@@ -80,6 +80,7 @@ from sbxloop.events import EventBus
 from sbxloop.ghids import chat_item_id, issue_item_id, normalize_item_id
 from sbxloop.ids import new_job_id, new_run_id
 from sbxloop.log import get_logger
+from sbxloop.provider import ProviderHeldError, ProviderHold
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import (
     HostToolCall,
@@ -391,6 +392,8 @@ class Concierge:
             reply = self._attempt(text, author=author, session_id=session_id, on_tool=on_tool)
         except SbxloopError as exc:
             retry = False
+            if isinstance(exc, ProviderHeldError):
+                return self._error_reply(exc, started)
             if session_id is not None and _looks_like_lost_session(exc):
                 # The sandbox forgot the session (rebuilt VM, expired
                 # store): start over rather than fail every message.
@@ -472,6 +475,8 @@ class Concierge:
         client = self.host.client()
         result = client.submit(job, agent=CONCIERGE_AGENT, tool_handler=handler)
         if result.status != "ok":
+            if result.error is not None and result.error.provider is not None:
+                raise ProviderHeldError(ProviderHold(result.error.provider, None, 0))
             message = result.error.message if result.error is not None else result.status
             if result.status == "timeout":
                 raise WorkerTimeoutError(message)

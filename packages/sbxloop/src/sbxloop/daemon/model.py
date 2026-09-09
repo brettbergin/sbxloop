@@ -178,6 +178,7 @@ class RunReport(NamedTuple):
 
 
 TickOutcome = Literal[
+    "provider_held",
     "done",
     "retry",
     "failed",
@@ -189,7 +190,7 @@ TickOutcome = Literal[
     "cancelled",
     "requeued",
 ]
-IdleKind = Literal["paused", "breaker", "daily_cap", "backoff", "no_work"]
+IdleKind = Literal["paused", "breaker", "daily_cap", "backoff", "no_work", "provider_held"]
 
 
 class TickResult(NamedTuple):
@@ -214,6 +215,7 @@ class TickResult(NamedTuple):
 # terminal ones mirrored to the channel so a human who is not reading the
 # thread still sees how it ended.
 NoticeKind = Literal[
+    "run.provider_held",
     "daemon.started",
     "daemon.stopped",
     "daemon.paused",
@@ -286,6 +288,7 @@ NoticeKind = Literal[
 # thread still needs to see.
 TERMINAL_NOTICE_KINDS: frozenset[str] = frozenset(
     {
+        "run.provider_held",
         "run.done",
         "run.failed",
         "run.exhausted",

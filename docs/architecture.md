@@ -1081,6 +1081,49 @@ opening cannot redirect the read outside the checkout. Artifact staging and
 regular-file PR uploads use the same reader and fail when a file cannot be
 opened safely. Hosts without directory-relative, no-follow opens fail closed.
 
+## Provider recovery
+
+Terminal inference failures cross the worker boundary as
+`ErrorInfo.provider` (`ProviderFailure`), before task JSON parsing. Claude
+uses `AssistantMessage.error`, `ResultMessage.is_error` and, when present,
+`api_error_status` and `RateLimitEvent.rate_limit_info`. Informational rate
+events and errors followed by a successful response do not fail a job.
+Text classification is confined to error envelopes. Fixed diagnostic
+reasons keep provider account/credential prose out of the chronology;
+session identity, partial output and usage remain on the error result.
+
+`provider.ProviderRecovery` guards every agent `WorkerClient.submit`,
+including steering and the concierge. The `provider_holds` and
+`provider_jobs` tables commit the credential-scoped hold and interrupted
+job together. Each backend currently has one inference credential source
+per home, so its repositories and models share a hold. GitHub tokens do
+not define an inference scope. Other adapters can use the same contract.
+
+Throttles and temporary unavailability allow three scheduled retries with
+exponential backoff and jitter, never earlier than supplied provider
+timing. Further rejection requires explicit recovery. Quotas wait for a
+future provider reset; unknown/elapsed resets and billing failures require
+operator recovery. No reset is inferred from prose. Cooldowns are durable
+dispatch eligibility, not sleeping agent calls, so status, pause, cancel
+and resume remain available without an inference call.
+
+A run parks as `provider_held`, retaining its stage, task state, workspace
+and sandbox session. Recovery continues the same run and interrupted job
+without spending a revision, replan, full-run attempt or crash resume.
+Surviving sandboxes are reused and setup commands skipped. Partial work
+requires the original session; a missing session or changed request parks
+for inspection instead of replaying side effects. Pending steering
+messages are persisted. Rejected attempts' usage is accumulated into the
+eventual result.
+
+SDK envelopes were checked at the minimum supported version v0.2.149 and
+commit `6bbd3093147c2fadcd4b868599b8fb6d9db3d523`. The former v0.1.0 floor
+lacked assistant errors and could not parse rate-limit events. Missing
+optional metadata stays unknown. Live provider
+timing and real sandbox session recovery are **field-unverified**.
+Synthetic adapter, serialization, fake-clock scheduling and CI sandbox
+tests cover the implementation.
+
 ## Workloads
 
 A run has a **kind** (`RunKind`: `code` or `workload`, `runs.kind`), and the

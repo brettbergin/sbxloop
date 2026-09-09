@@ -31,7 +31,14 @@ from typing import Any
 from sbxloop_worker._json import extract_json
 from sbxloop_worker.backends import BackendResult, EmitFn
 from sbxloop_worker.hosttools import request_tool, safe_call_id
-from sbxloop_worker.protocol import EventTypes, HostToolCall, JobRequest, SessionHealth, Usage
+from sbxloop_worker.protocol import (
+    EventTypes,
+    HostToolCall,
+    JobRequest,
+    ProviderFailure,
+    SessionHealth,
+    Usage,
+)
 
 # Backend identity stamped onto agent events and usage samples, so chat
 # can name provider+model.
@@ -125,6 +132,9 @@ class EchoBackend:
             ),
             turns=1,
             health=SessionHealth.model_validate(health) if health is not None else None,
+            failure=ProviderFailure.model_validate(response["provider_failure"])
+            if "provider_failure" in response
+            else None,
         )
 
     @staticmethod

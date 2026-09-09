@@ -518,7 +518,7 @@ class StateStore:
         as the run's ``stage``; a terminal one leaves ``stage`` alone, so a
         failed or blocked run still knows where a resume should re-enter."""
         values: dict[str, Any] = {"state": state, "updated_at": time.time()}
-        if state not in TERMINAL_RUN_STATES:
+        if state not in TERMINAL_RUN_STATES and state != "provider_held":
             values["stage"] = state
         with self._write() as session:
             self._set_run(session, run_id, **values)

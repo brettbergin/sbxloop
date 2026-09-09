@@ -30,10 +30,12 @@ from pathlib import Path
 from typing import TypeVar
 
 from sbxloop.config import Config
+from sbxloop.engine.store import StateStore
 from sbxloop.errors import DaemonError, SbxError, SbxloopError, WorkerError
 from sbxloop.events import EventBus
 from sbxloop.log import get_logger
 from sbxloop.paths import SbxloopHome
+from sbxloop.provider import ProviderRecovery
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import Sandbox
@@ -82,6 +84,7 @@ class DaemonAgent:
         self._sandbox: Sandbox | None = None
         self._client: WorkerClient | None = None
         self._mcp_client: WorkerClient | None = None
+        self._provider_store: StateStore | None = None
 
     @property
     def workspace(self) -> Path:
@@ -139,6 +142,9 @@ class DaemonAgent:
         """Forget the handle; the sandbox stays for the next daemon process
         (conversation memory lives inside it)."""
         self._sandbox, self._client = None, None
+        if self._provider_store is not None:
+            self._provider_store.close()
+            self._provider_store = None
         self._close_mcp()
 
     def _close_mcp(self) -> None:
@@ -221,6 +227,9 @@ class DaemonAgent:
             # instead of a reused box silently losing its credential (#592).
             job_env=self.provisioner.job_env("agent", sandbox=sandbox),
         )
+        if self._provider_store is None:
+            self._provider_store = StateStore(self.config.paths.state_db)
+        client.provider_recovery = ProviderRecovery(self._provider_store, self.config.agent.backend)
         from sbxloop.worker.mcp import McpBroker
 
         client.mcp_prepare = McpBroker(self._mcp_service).prepare

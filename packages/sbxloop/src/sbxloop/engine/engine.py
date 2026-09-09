@@ -200,6 +200,7 @@ from sbxloop.gh.permissions import workflows_write_granted
 from sbxloop.ids import branch_name, new_job_id, new_message_id, new_run_id
 from sbxloop.log import get_logger
 from sbxloop.policy import EgressGranter, egress_rejection
+from sbxloop.provider import ProviderHeldError, ProviderRecovery
 from sbxloop.sbx import registries
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
@@ -530,7 +531,7 @@ class LoopEngine:
         github = self.config.github.for_repo(repo, workspace=self.config.workspace_for_repo(repo))
         self.config = self.config.model_copy(update={"github": github})
 
-    def resume(self, run_id: str) -> RunResult:
+    def resume(self, run_id: str, *, release_provider_hold: bool = True) -> RunResult:
         """Continue a run from the last stage it committed.
 
         A run interrupted before it delivered anything re-enters its task
@@ -569,6 +570,19 @@ class LoopEngine:
             # earns its own or ends merged.
             self.store.set_run_reason(run_id, None)
         self._rehydrate_config(run_id)
+        recovery = ProviderRecovery(self.store, self.config.agent.backend)
+        if release_provider_hold and recovery.pending(run_id):
+            recovery.release()
+        recovery.check()
+        pending_chat: dict[str, str] = {}
+        for _, event in self.store.events(run_id, type_prefix="chat."):
+            message_id = event.data.get("message_id")
+            if event.type == "chat.provider_pending":
+                pending_chat[str(message_id)] = str(event.data["text"])
+            elif event.type == HostEventTypes.CHAT_REPLY:
+                pending_chat.pop(str(message_id), None)
+        for message_id, text in pending_chat.items():
+            self._chat_queue.put(ChatMessage(message_id, text))
         self.bus.emit(
             HostEventTypes.RUN_START,
             run_id,
@@ -721,6 +735,7 @@ class LoopEngine:
     ) -> RunResult:
         self._waited_s = 0.0
         deadline = self.clock() + self.config.budgets.max_wall_clock_s
+        ProviderRecovery(self.store, self.config.agent.backend).check()
         self._set_run_state(run_id, "provisioning")
         # A restart pins its clone to the branch the previous attempt pushed
         # BEFORE the workspace is cut (#600), so the agent starts from that
@@ -736,6 +751,8 @@ class LoopEngine:
         # run row so a resume re-provisions the same service sandbox — and
         # so is its kind (#755), which decides the sandboxes it gets.
         run_row = self.store.get_run(run_id)
+        provider_recovery = ProviderRecovery(self.store, self.config.agent.backend)
+        recovering_provider = provider_recovery.pending(run_id)
         credentials, kind = run_row.credentials, run_row.kind
         pair = provisioner.ensure_pair(
             run_id,
@@ -745,6 +762,7 @@ class LoopEngine:
             credentials=credentials,
             kind=kind,
             continue_branch=self._continue_branch(),
+            **({"reuse_sandboxes": True} if recovering_provider else {}),
         )
         assert pair.workspace is not None
         self._confirm_prior_checkout(run_id, pair)
@@ -778,6 +796,7 @@ class LoopEngine:
                             "agent", self.config.github.repo, sandbox=pair.agent
                         ),
                     )
+                    agent.provider_recovery = provider_recovery
                     github = (
                         WorkerClient(
                             pair.github,
@@ -841,9 +860,18 @@ class LoopEngine:
                     )
                     if self.install_workers:
                         self._install_workers(run_id, pair, agent, github, service_client)
-                    if service is not None:
+                    dependencies_ready = recovering_provider and any(
+                        row.phase == "dependencies" and row.status == "ok"
+                        for row in self.store.phase_attempts(run_id)
+                    )
+                    if service is not None and not dependencies_ready:
                         self._fetch_dependencies(run_id, service)
-                    if kind == "code":
+                    setup_complete = recovering_provider and stage not in (
+                        None,
+                        "created",
+                        "provisioning",
+                    )
+                    if kind == "code" and not setup_complete:
                         # `setup_commands` prepare a cloned checkout; a
                         # workload has none to prepare (#755).
                         self._run_setup_commands(run_id, pair, agent)
@@ -917,6 +945,15 @@ class LoopEngine:
                         # still alive here, and partial artifacts beat none.
                         self._harvest(run_id, pair, kind)
                         self._report_artifacts(run_id, pair, kind)
+                except ProviderHeldError as exc:
+                    # Covers dependency preparation as well as code,
+                    # workload and steering phases. Preserve the live VM.
+                    state, reason = "provider_held", str(exc)
+                    pair.keep = True
+                    self.store.set_run_kept(run_id, "provider")
+                    self._harvest(run_id, pair, kind)
+                    if self._cancel_event.is_set():
+                        self._check_cancelled_and_clock(run_id, deadline)
                 except SbxloopError:
                     # Infra failures (install, worker, sbx) are exactly what
                     # gets diagnosed in-sandbox; decide keep before pair exit.
@@ -948,6 +985,8 @@ class LoopEngine:
             )
         if reason:
             self.store.set_run_reason(run_id, reason)
+        if recovering_provider and state != "provider_held" and not pair.keep:
+            self.store.set_run_kept(run_id, None)
         self._set_run_state(run_id, state)
         run = self.store.get_run(run_id)
         tasks = self.store.get_tasks(run_id)
@@ -5005,6 +5044,15 @@ class LoopEngine:
                 verdict = phases.steer(
                     message.text, tasks=self.store.get_tasks(run_id), task=task, stage=stage
                 )
+            except ProviderHeldError:
+                self._steer_attempts -= 1
+                self.bus.emit(
+                    "chat.provider_pending",
+                    run_id,
+                    message_id=message.message_id,
+                    text=message.text,
+                )
+                raise
             except WorkerError as exc:
                 log.warning(
                     "run.steer_failed",

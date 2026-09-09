@@ -5,6 +5,20 @@ process streams — no sockets, no servers. All wire models live in
 `sbxloop_worker.protocol` (pydantic, `extra="forbid"`, versioned `v: 1`);
 the host imports the exact same module, so drift is a validation error.
 
+## Provider failures
+
+Agent results can carry `error.provider`, a `ProviderFailure` containing
+backend, category, sanitized reason/code, HTTP status, optional UTC epoch
+`retry_at`/`reset_at`, and whether partial progress was observed. The
+ordinary result fields retain session identity, partial output, turns and
+usage even when `status = "error"`. This failure precedes JSON extraction
+and must never become `ExpectedJsonMissing` or successful work.
+
+`JobRequest.require_resume` prevents a recovery request with partial work
+from silently falling back to a fresh SDK session. An unavailable session
+returns a provider recovery failure for operator inspection. Older job
+requests default this field to false.
+
 ## Filesystem layout (inside each sandbox)
 
 ```

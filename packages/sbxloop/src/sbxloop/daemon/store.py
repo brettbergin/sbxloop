@@ -2325,7 +2325,9 @@ class DaemonStore:
         recovery itself never starts engines."""
         self._update(item_id, now, state="queued")
 
-    def mark_resuming(self, item_id: str, run_id: str, now: float) -> None:
+    def mark_resuming(
+        self, item_id: str, run_id: str, now: float, *, provider_recovery: bool = False
+    ) -> None:
         """Resume the pinned run: back to running (the attempt count is
         unchanged — a resume is the same attempt) and record the resume in
         its own ledger so the daily cap and the per-item resume budget see
@@ -2342,9 +2344,10 @@ class DaemonStore:
             )
             if _rowcount(result) != 1:
                 raise KeyError(f"work item {item_id!r} does not carry run {run_id!r}")
-            session.execute(
-                insert(RunResumeRow).values(run_id=run_id, item_id=item_id, resumed_at=now)
-            )
+            if not provider_recovery:
+                session.execute(
+                    insert(RunResumeRow).values(run_id=run_id, item_id=item_id, resumed_at=now)
+                )
 
     def mark_done(
         self, item_id: str, now: float, *, pending_report: PendingReport | None = None

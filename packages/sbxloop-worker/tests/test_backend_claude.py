@@ -12,6 +12,7 @@ from __future__ import annotations
 import os
 import sys
 import types
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -208,6 +209,159 @@ def full_script(mod: types.ModuleType) -> None:
             },
         ),
     ]
+
+
+@pytest.mark.parametrize("expect", ["text", "json"])
+@pytest.mark.parametrize(
+    ("code", "reason", "status", "category", "reset"),
+    [
+        ("rate_limit", "Too many requests", 429, "throttle", None),
+        ("rate_limit", "Usage limit reached", 400, "quota", 2_000_000_000),
+        ("billing_error", "Credit balance is too low", 400, "billing", None),
+    ],
+)
+def test_terminal_provider_failure_survives_worker(
+    sdk, tmp_path: Path, expect, code, reason, status, category, reset
+) -> None:
+    from sbxloop_worker.protocol import JobResult
+    from sbxloop_worker.runner import JobRunner
+
+    rejected = AssistantMessage([TextBlock(reason)])
+    rejected.error = code
+    terminal = ResultMessage(
+        session_id="limited-session",
+        result=reason,
+        num_turns=2,
+        usage={"input_tokens": 120, "output_tokens": 15},
+    )
+    terminal.is_error = True
+    terminal.subtype = "success"
+    terminal.api_error_status = status
+    sdk.script = [AssistantMessage([TextBlock("Created the requested file")])]
+    if reset is not None:
+        event = type("RateLimitEvent", (), {})()
+        event.rate_limit_info = types.SimpleNamespace(
+            status="rejected",
+            rate_limit_type="five_hour",
+            resets_at=reset,
+        )
+        sdk.script.append(event)
+    sdk.script += [rejected, terminal]
+    path = tmp_path / "result.json"
+    result = JobRunner(
+        job(expect=expect, resume_session_id="limited-session"),
+        events_path=tmp_path / "events.jsonl",
+        result_path=path,
+        heartbeat_s=0,
+        backend_name="claude",
+    ).run()
+    assert result.status == "error"
+    assert result.error.type == "ProviderFailure"
+    failure = result.error.provider
+    assert failure.backend == "claude"
+    assert failure.category == category
+    assert failure.http_status == status
+    assert failure.reset_at == reset
+    assert result.session_id == "limited-session"
+    assert result.usage.input_tokens == 120
+    assert result.output_text == "Created the requested file"
+    assert reason not in result.output_text
+    assert len(sdk.opened_with) == 1
+    assert JobResult.model_validate_json(path.read_text()) == result
+
+
+@pytest.mark.parametrize("expect", ["text", "json"])
+def test_intermediate_limit_and_ordinary_content_are_not_terminal(sdk, expect):
+    warning = type("RateLimitEvent", (), {})()
+    warning.rate_limit_info = types.SimpleNamespace(
+        status="rejected",
+        rate_limit_type="five_hour",
+        resets_at=2_000_000_000,
+    )
+    intermediate = AssistantMessage([TextBlock("Too many requests")])
+    intermediate.error = "rate_limit"
+    final = ResultMessage(result='{"note": "rate limits and insufficient credit"}')
+    final.is_error = False
+    sdk.script = [warning, intermediate, AssistantMessage([TextBlock(final.result)]), final]
+    _, emit = collect_emit()
+    result = ClaudeBackend().run_session(job(expect=expect), emit)
+    assert result.failure is None
+    assert "rate limits" in result.output_text
+    assert len(sdk.opened_with) == 1
+
+
+@pytest.mark.parametrize("terminal", [False, True])
+def test_interrupted_usage_survives_without_double_counting(sdk, terminal):
+    progress = AssistantMessage([TextBlock("Created the file")], model="claude-test")
+    progress.usage = {"input_tokens": 10, "output_tokens": 4}
+    progress.message_id = "message-1"
+    error = AssistantMessage([TextBlock("Insufficient credit")])
+    error.error = "billing_error"
+    sdk.script = [progress, progress, error]
+    if terminal:
+        result = ResultMessage(usage={"input_tokens": 15, "output_tokens": 6})
+        result.is_error = True
+        sdk.script.append(result)
+    else:
+        sdk.script.append(RuntimeError("process exited"))
+    events, emit = collect_emit()
+    result = ClaudeBackend().run_session(job(), emit)
+    assert result.failure.category == "billing"
+    assert result.usage.input_tokens == (15 if terminal else 10)
+    assert result.usage.output_tokens == (6 if terminal else 4)
+    assert len([event for event in events if event.type == EventTypes.AGENT_USAGE]) == 1
+
+
+def test_provider_envelope_without_result_never_uses_resume_fallback(sdk):
+    error = AssistantMessage([TextBlock("Credit balance is too low; token=synthetic-secret")])
+    error.error = "billing_error"
+    sdk.script = [error, RuntimeError("process exited")]
+    events, emit = collect_emit()
+    result = ClaudeBackend().run_session(job(resume_session_id="prior"), emit)
+    assert result.failure.category == "billing"
+    assert result.session_id == "prior"
+    assert not result.output_text
+    assert "synthetic-secret" not in result.failure.reason
+    assert not [e for e in events if e.type == EventTypes.AGENT_MESSAGE]
+    assert len(sdk.opened_with) == 1
+
+
+def test_required_resume_cannot_start_a_fresh_session(sdk):
+    sdk.fail_on_resume = True
+    full_script(sdk)
+    _, emit = collect_emit()
+    result = ClaudeBackend().run_session(job(resume_session_id="lost", require_resume=True), emit)
+    assert result.failure.category == "recovery"
+    assert len(sdk.opened_with) == 1
+    assert sdk.queries == []
+
+
+def test_old_sdk_terminal_result_uses_only_error_envelope(sdk):
+    # v0.1.0's AssistantMessage had no error member; ResultMessage did
+    # expose is_error, but neither status nor timing.
+    terminal = ResultMessage(result="You've hit your limit. Reset time unavailable")
+    terminal.is_error = True
+    sdk.script = [terminal]
+    _, emit = collect_emit()
+    result = ClaudeBackend().run_session(job(), emit)
+    assert result.failure.category == "quota"
+    assert result.failure.reset_at is None
+    assert result.failure.http_status is None
+    assert not result.output_text
+
+
+def test_rejected_rate_event_without_completed_result_is_not_success(sdk):
+    rejected = type("RateLimitEvent", (), {})()
+    rejected.rate_limit_info = types.SimpleNamespace(
+        status="rejected",
+        rate_limit_type="seven_day",
+        resets_at=2_000_000_000,
+    )
+    sdk.script = [rejected]
+    _, emit = collect_emit()
+    result = ClaudeBackend().run_session(job(), emit)
+    assert result.failure.category == "quota"
+    assert result.failure.reset_at == 2_000_000_000
 
 
 # -- tests --------------------------------------------------------------------

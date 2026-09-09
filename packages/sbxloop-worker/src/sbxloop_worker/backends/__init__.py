@@ -7,7 +7,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from sbxloop_worker.protocol import Event, JobRequest, SessionHealth, Usage
+from sbxloop_worker.protocol import Event, JobRequest, ProviderFailure, SessionHealth, Usage
 
 # emit("agent.message", content="...") -> Event
 EmitFn = Callable[..., Event]
@@ -28,6 +28,7 @@ class BackendResult:
     turns: int | None = None
     health: SessionHealth | None = None
     artifacts: list[str] = field(default_factory=list)
+    failure: ProviderFailure | None = None
 
 
 class AgentBackend(Protocol):
