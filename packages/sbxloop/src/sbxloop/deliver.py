@@ -61,20 +61,26 @@ from __future__ import annotations
 import base64
 import json
 import re
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NamedTuple
 
-from sbxloop import hostgit
+from sbxloop import hostgit, repofiles
 from sbxloop.engine.model import (
     DEFAULT_ARTIFACT_EXCLUDES,
     PR_BODY_FILE,
     exclusion_hit,
     scan_artifacts,
 )
-from sbxloop.errors import DeliveryError, GithubOpsError
+from sbxloop.errors import (
+    DeliveryError,
+    DeliveryPermissionError,
+    EmptyDeliveryError,
+    GithubOpsError,
+)
 from sbxloop.gh.ops import GithubOps, PrRef
+from sbxloop.gh.permissions import WORKFLOWS_NEED, workflow_paths
 from sbxloop.ids import branch_name as branch_name  # re-export; shared with hostgit isolation
 from sbxloop.log import get_logger
 
@@ -220,6 +226,47 @@ def _explain_ref_refusal(exc: GithubOpsError) -> str:
     return "GitHub's refusal is quoted above; the repository's rules or state say why"
 
 
+# The permission as GitHub's App settings page spells it, for the remedy.
+_WORKFLOWS_WRITE = "workflows: write"
+
+
+def _is_forbidden(exc: GithubOpsError) -> bool:
+    """Whether GitHub refused the call outright for want of a permission —
+    a 403, "Resource not accessible by integration" for an App. The
+    structured status is the contract (#221); no prose matching."""
+    return exc.http_status == 403
+
+
+def _refuse_workflow_delivery(
+    touched: Sequence[str],
+    *,
+    known: bool,
+    cause: GithubOpsError | None = None,
+) -> DeliveryPermissionError:
+    """The error for a delivery GitHub holds to ``workflows: write`` (#752),
+    with the remedy in it. ``known`` is whether the credential's grants said
+    so up front (nothing was sent) or GitHub did (the tree POST was
+    refused with a 403 — ``cause``)."""
+    listed = ", ".join(f"`{path}`" for path in touched[:3])
+    if len(touched) > 3:
+        listed += f" and {len(touched) - 3} more"
+    if known:
+        why = f"the credential lacks `{_WORKFLOWS_WRITE}`"
+    else:
+        why = (
+            f"GitHub refused the tree with a 403 ({cause}), which on a tree carrying a "
+            f"workflow file means the credential lacks `{_WORKFLOWS_WRITE}`"
+        )
+    return DeliveryPermissionError(
+        f"delivery touches {listed} but {why} — grant `Workflows: Read and write` under the "
+        "GitHub App's repository permissions and accept it on the installation (a classic PAT "
+        "needs the `workflow` scope), then re-queue the item; `sbxloop doctor --probe` shows "
+        "the permission table. Nothing was delivered.",
+        paths=tuple(touched),
+        permission=WORKFLOWS_NEED.label,
+    )
+
+
 def _is_pr_collision(exc: GithubOpsError) -> bool:
     """Whether a PR create *may* have failed because that head already has
     an open PR. GitHub's answer is HTTP 422 "A pull request already exists
@@ -350,6 +397,7 @@ def deliver_workspace(
     commit_message: str | None = None,
     authored_body: str | None = None,
     verification: str | None = None,
+    workflows_write_granted: Callable[[], bool | None] | None = None,
 ) -> PrRef:
     """Publish source_dir as one commit on a branch and open (or update) a PR.
 
@@ -390,6 +438,15 @@ def deliver_workspace(
     (#621, :func:`render_naming`); unset, the loop's historical wording.
     A re-delivery whose title differs from the open PR's retitles it
     (``deliver.title_changed``) — how a fix round cures a title-lint check.
+
+    ``workflows_write_granted`` answers whether the credential may deliver
+    a file under ``.github/workflows/`` (#752) — asked only when the plan
+    carries one, so a run that never touches a workflow never pays the
+    lookup. ``False`` refuses before a blob is uploaded, with the remedy
+    named (:class:`DeliveryPermissionError`); ``None`` (grants unknown: a
+    fine-grained PAT) sends the tree and reads GitHub's 403 as the same
+    answer. A missing permission is not transient, so the caller ends the
+    run ``blocked`` rather than retrying it.
     """
     plan: DeliveryPlan | None = None
     if not _is_checkout_root(source_dir):
@@ -447,15 +504,43 @@ def deliver_workspace(
         uploads=len(plan.uploads),
         upload_bytes=sum(len(raw) for raw in plan.uploads.values()),
     )
+    # A workflow file in the plan is the one thing GitHub holds to a
+    # permission of its own (#752): refuse here, before a blob is spent,
+    # when the credential's grants say the permission is missing.
+    touched = workflow_paths(str(entry["path"]) for entry in plan.entries)
+    if touched and workflows_write_granted is not None and workflows_write_granted() is False:
+        log.warning(
+            "deliver.workflows_refused",
+            run=run_id,
+            repo=repo,
+            paths=list(touched),
+            permission=WORKFLOWS_NEED.label,
+        )
+        raise _refuse_workflow_delivery(touched, known=True)
     shas = _create_blobs(ops, repo, plan.uploads, run_id=run_id)
     entries = [
         {**entry, "sha": shas[entry["path"]]} if entry["path"] in shas else entry
         for entry in plan.entries
     ]
-    tree = _sha(
-        ops.raw("POST", f"/repos/{repo}/git/trees", {"base_tree": base_tree, "tree": entries}),
-        f"tree for {repo}",
-    )
+    try:
+        tree = _sha(
+            ops.raw("POST", f"/repos/{repo}/git/trees", {"base_tree": base_tree, "tree": entries}),
+            f"tree for {repo}",
+        )
+    except GithubOpsError as exc:
+        if touched and _is_forbidden(exc):
+            # Grants unknown up front (or wrong): the 403 on a tree with a
+            # workflow path is unambiguous, and just as permanent.
+            log.warning(
+                "deliver.workflows_refused",
+                run=run_id,
+                repo=repo,
+                paths=list(touched),
+                permission=WORKFLOWS_NEED.label,
+                http_status=exc.http_status,
+            )
+            raise _refuse_workflow_delivery(touched, known=False, cause=exc) from exc
+        raise
     commit = _sha(
         ops.raw(
             "POST",
@@ -662,7 +747,7 @@ def _is_checkout_root(source_dir: Path) -> bool:
 def _plan_snapshot(source_dir: Path, exclude: Sequence[str]) -> DeliveryPlan:
     scan = scan_artifacts(source_dir, exclude)
     if not scan.files:
-        raise DeliveryError(f"nothing to deliver: no files in {source_dir}")
+        raise EmptyDeliveryError(f"nothing to deliver: no files in {source_dir}")
     changes = [
         hostgit.WorkspaceChange(
             path=f.relative_to(source_dir).as_posix(), status="added", mode=hostgit.tree_mode(f)
@@ -691,7 +776,13 @@ def _blob_upload(source_dir: Path, change: hostgit.WorkspaceChange) -> tuple[dic
     whether the plan came from ``git diff`` or a walk of the tree."""
     full = source_dir / change.path
     entry = {"path": change.path, "mode": change.mode, "type": "blob"}
-    return entry, hostgit.blob_content(full, change.mode)
+    try:
+        if change.mode == hostgit.SYMLINK_MODE:
+            return entry, str(full.readlink()).encode()
+        with repofiles.open_file(source_dir, change.path) as source:
+            return entry, source.read()
+    except OSError as exc:
+        raise DeliveryError(f"cannot safely read repository file {change.path!r}") from exc
 
 
 def _plan_git_diff(source_dir: Path, base_sha: str, exclude: Sequence[str]) -> DeliveryPlan | None:
@@ -724,7 +815,7 @@ def _plan_git_diff(source_dir: Path, base_sha: str, exclude: Sequence[str]) -> D
         why = f"{source_dir} has no changes relative to {diff_base[:12]}"
         if skipped_notes:
             why += " that can be delivered: " + "; ".join(skipped_notes)
-        raise DeliveryError(f"nothing to deliver: {why}")
+        raise EmptyDeliveryError(f"nothing to deliver: {why}")
     entries: list[dict[str, Any]] = []
     uploads: dict[str, bytes] = {}
     lines: list[str] = []
@@ -921,11 +1012,8 @@ def pr_template(root: Path) -> tuple[str, str] | None:
     it, else ``None``. Read as bytes and decoded leniently — a template is
     prose, and one odd byte must not fail a delivery."""
     for rel in PR_TEMPLATE_PATHS:
-        path = root / rel
         try:
-            if not path.is_file():
-                continue
-            text = path.read_bytes()[:PR_TEMPLATE_CAP].decode("utf-8", "replace").strip()
+            text = repofiles.read_text(root, rel, limit=PR_TEMPLATE_CAP).strip()
         except OSError:
             continue
         if text:
@@ -944,7 +1032,7 @@ def conventional_titles(root: Path) -> str | None:
     package = root / "package.json"
     if package.is_file():
         try:
-            data = json.loads(package.read_bytes()[: PR_TEMPLATE_CAP * 4])
+            data = json.loads(repofiles.read_bytes(root, "package.json", limit=PR_TEMPLATE_CAP * 4))
         except (OSError, ValueError):
             data = None
         if isinstance(data, dict) and "commitlint" in data:
@@ -955,7 +1043,7 @@ def conventional_titles(root: Path) -> str | None:
             if path.suffix not in (".yml", ".yaml") or not path.is_file():
                 continue
             try:
-                text = path.read_bytes()[: PR_TEMPLATE_CAP * 4].decode("utf-8", "replace")
+                text = repofiles.read_text(root, path.relative_to(root), limit=PR_TEMPLATE_CAP * 4)
             except OSError:
                 continue
             for action in _TITLE_ACTIONS:

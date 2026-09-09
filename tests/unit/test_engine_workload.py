@@ -25,10 +25,12 @@ from sbxloop.engine.phases import (
     OPERATOR_SYSTEM_MESSAGE,
     ToolDigest,
 )
+from sbxloop.engine.skilltools import SKILL_TOOL_NAME
 from sbxloop.errors import WorkerError
 from sbxloop.events import HostEventTypes
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import FakeGithub
+from tests.fakes.rawdb import exec_raw
 from tests.unit.test_engine import BUILD, FILES_BUILD, Harness, task, taskgraph
 
 WORKLOAD_STATES = ["provisioning", "planning", "executing", "judging", "publishing", "completed"]
@@ -49,15 +51,17 @@ def jobs(harness: Harness, run_id: str, phase: str) -> list[dict[str, Any]]:
     """The agent-session jobs of one workload phase (``plan``, ``execute``,
     ``judge``), told apart by the actor's system prompt and the reply
     shape — job files carry no phase name and no order (keep_sandboxes
-    runs only)."""
+    runs only). The actor's message is the tail of a system message that
+    opens with the shared harness briefing, so it is matched by containment
+    rather than equality."""
     sessions = [j for j in harness.agent_jobs(run_id) if j["kind"] == "agent.session"]
     if phase == "judge":
-        return [j for j in sessions if j["system_message"] == JUDGE_SYSTEM_MESSAGE]
+        return [j for j in sessions if JUDGE_SYSTEM_MESSAGE in j["system_message"]]
     expect = "json" if phase == "plan" else "text"
     return [
         j
         for j in sessions
-        if j["system_message"] == OPERATOR_SYSTEM_MESSAGE and j["expect"] == expect
+        if OPERATOR_SYSTEM_MESSAGE in j["system_message"] and j["expect"] == expect
     ]
 
 
@@ -88,16 +92,15 @@ class TestWorkloadRun:
         assert start.data["kind"] == "workload"
         assert start.data["workspace"] is None
         assert start.data["workspace_source"] == "data-dir"
-        # The toolchain set is the config's answer, not a detection over an
-        # empty directory.
+        # No language toolchain at all (#801): a workload has no workspace
+        # to detect from and its operator needs none — the field showed
+        # every chat workload spending a minute installing python, dotnet
+        # and javascript it never used.
         (languages,) = [e for e in harness.events if e.type == "sandbox.languages"]
-        assert languages.data["source"] == "default"
+        assert languages.data["source"] == "none" and languages.data["languages"] == []
         # The operator planned and executed, the judge passed the task, and
         # the judgment re-ran the task's check on the finished workspace.
-        rows = [
-            (r["phase"], r["task_id"], r["status"])
-            for r in engine.store.phase_attempts(result.run_id)
-        ]
+        rows = [(r.phase, r.task_id, r.status) for r in engine.store.phase_attempts(result.run_id)]
         assert rows == [
             ("plan", None, "ok"),
             ("execute", "t1", "ok"),
@@ -182,9 +185,9 @@ class TestWorkloadRun:
         (judge,) = [
             r
             for r in engine.store.phase_attempts(result.run_id)
-            if r["phase"] == "judge" and r["task_id"] is None
+            if r.phase == "judge" and r.task_id is None
         ]
-        assert judge["status"] == "failed"
+        assert judge.status == "failed"
         run = engine.store.get_run(result.run_id)
         assert run.state == "failed" and run.stage == "judging"
 
@@ -195,7 +198,7 @@ class TestWorkloadRun:
         assert result.state == "failed"
         assert "judging" not in harness.run_states()
         rows = engine.store.phase_attempts(result.run_id)
-        assert not any(r["phase"] == "judge" and r["task_id"] is None for r in rows)
+        assert not any(r.phase == "judge" and r.task_id is None for r in rows)
 
 
 class TestOperatorAndJudge:
@@ -225,8 +228,8 @@ class TestOperatorAndJudge:
         assert t1.spec.needs.hosts == ["api.example.com"]
         assert t1.spec.needs.credentials == []
         assert t1.spec.needs.sink == "chat" and t1.spec.needs.repo is None
-        (row,) = [r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "plan"]
-        assert row["task_id"] is None and "Count the widgets" in row["output_json"]
+        (row,) = [r for r in engine.store.phase_attempts(result.run_id) if r.phase == "plan"]
+        assert row.task_id is None and "Count the widgets" in row.output_json
         # The operator's prompt carries the needs by name.
         (execute,) = jobs(harness, result.run_id, "execute")
         assert "api.example.com" in execute["prompt"] and "sink: chat" in execute["prompt"]
@@ -269,8 +272,12 @@ class TestOperatorAndJudge:
         assert all(j["permission_mode"] == "read_only" for j in judges)
         assert all(j["expect"] == "json" for j in judges)
         assert all(j["system_preset"] is False for j in plans + executes + judges)
-        # The judge's job carries no host tools: it reads and never calls out.
-        assert all(j["host_tools"] == [] for j in plans + judges)
+        # Neither actor gets a tool that calls out: the operator's plan
+        # stage and the judge reach nothing beyond the host. The judge does
+        # carry the skill door — a critic needs the verification procedure —
+        # and the operator has no skills of its own, so its list is empty.
+        assert all(j["host_tools"] == [] for j in plans)
+        assert all([t["name"] for t in j["host_tools"]] == [SKILL_TOOL_NAME] for j in judges)
 
     def test_a_failing_verdict_is_the_next_attempts_feedback(self, harness: Harness) -> None:
         """Judge fails once with unmet → re-executed with that feedback →
@@ -309,9 +316,9 @@ class TestOperatorAndJudge:
         # The second attempt sees the first attempt's own report.
         assert "wrote nothing" in second["prompt"]
         rows = [
-            (r["phase"], r["attempt"], r["status"])
+            (r.phase, r.attempt, r.status)
             for r in engine.store.phase_attempts(result.run_id)
-            if r["task_id"] == "t1"
+            if r.task_id == "t1"
         ]
         assert rows == [
             ("execute", 1, "ok"),
@@ -378,8 +385,8 @@ class TestOperatorAndJudge:
         assert result.reason is not None
         assert result.reason.startswith("the judge could not reach a verdict on task t1")
         assert result.reason.endswith("; the run fails closed")
-        (row,) = [r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "judge"]
-        assert row["status"] == "failed" and '"degraded": true' in row["output_json"]
+        (row,) = [r for r in engine.store.phase_attempts(result.run_id) if r.phase == "judge"]
+        assert row.status == "failed" and '"degraded": true' in row.output_json
 
     def test_a_failing_verdict_must_name_a_criterion(self, harness: Harness) -> None:
         """`passed: false` with an empty `unmet` is a malformed verdict: it
@@ -441,11 +448,9 @@ class TestOperatorAndJudge:
         assert "`Read`" in prompt and "— failed" in prompt
         assert "wrote hello.txt" in prompt, "the report is the judge's claim to check"
         assert "test -f hello.txt" in prompt and "exit 0" in prompt
-        (execute,) = [
-            r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "execute"
-        ]
-        assert '"tool_calls": 2' in execute["output_json"]
-        assert "echo hi > hello.txt" in execute["output_json"]
+        (execute,) = [r for r in engine.store.phase_attempts(result.run_id) if r.phase == "execute"]
+        assert '"tool_calls": 2' in (execute.output_json or "")
+        assert "echo hi > hello.txt" in (execute.output_json or "")
         # The relayed tool events carry the operator's name, not the builder's.
         tools = [e for e in harness.events if e.type == "agent.tool_end"]
         assert [e.data.get("agent") for e in tools] == ["operator", "operator"]
@@ -647,7 +652,7 @@ class TestWorkloadResume:
         # Still one sandbox, still the same data directory.
         assert harness.sandboxes_left() == []
         assert result.workspace == harness.home.runs / run_id / "workspace"
-        phases = [r["phase"] for r in harness.engine().store.phase_attempts(run_id)]
+        phases = [r.phase for r in harness.engine().store.phase_attempts(run_id)]
         assert phases.count("plan") == 1 and phases.count("execute") == 1
         assert "decompose" not in phases and "build" not in phases
 
@@ -666,9 +671,9 @@ class TestWorkloadResume:
         judged = [
             r
             for r in engine.store.phase_attempts(result.run_id)
-            if r["phase"] == "judge" and r["task_id"] is None
+            if r.phase == "judge" and r.task_id is None
         ]
-        assert [r["attempt"] for r in judged] == [1, 2]
+        assert [r.attempt for r in judged] == [1, 2]
 
     def test_resume_at_verifying_re_judges_the_persisted_report(self, harness: Harness) -> None:
         """Died between execute and judge: the judge reads the execute row
@@ -811,7 +816,7 @@ class TestNeeds:
         assert [e for e in harness.events if e.type == "policy.allow"] == []
         assert harness.run_states() == ["provisioning", "planning", "failed"]
         assert all(t.state == "pending" for t in engine.store.get_tasks(result.run_id))
-        phases = [r["phase"] for r in engine.store.phase_attempts(result.run_id)]
+        phases = [r.phase for r in engine.store.phase_attempts(result.run_id)]
         assert phases == ["plan"], "no task ran"
 
     def test_a_denied_host_is_refused_even_inside_the_profile(
@@ -952,7 +957,7 @@ class TestNeeds:
         assert kinds == {"service.http"}
         assert engine.store.get_run(run_id).state == "completed"
         # planned once: the re-provision resumed at executing
-        phases = [r["phase"] for r in engine.store.phase_attempts(run_id)]
+        phases = [r.phase for r in engine.store.phase_attempts(run_id)]
         assert phases.count("plan") == 1 and phases.count("execute") == 1
 
     def test_a_failed_re_provision_leaves_the_run_resumable(
@@ -988,7 +993,7 @@ class TestNeeds:
             "completed",
         ]
         assert self.granted(harness) == [], "granted once, on the first pass"
-        phases = [r["phase"] for r in engine.store.phase_attempts(run.run_id)]
+        phases = [r.phase for r in engine.store.phase_attempts(run.run_id)]
         assert phases.count("plan") == 1 and phases.count("execute") == 1
         self.assert_no_secret(harness)
 
@@ -1468,11 +1473,11 @@ class TestSinks:
         assert len(fake.issues_created) == 1
         # Park the run as if it had died after the issue, before the chat.
         engine.store.set_run_state(result.run_id, "publishing")
-        engine.store._conn.execute(
+        exec_raw(
+            engine.store,
             "UPDATE runs SET published = ? WHERE run_id = ?",
             (json.dumps([result.published[0].model_dump(mode="json")]), result.run_id),
         )
-        engine.store._conn.commit()
         harness.events.clear()
         harness.script([])
         resumed = harness.engine(
@@ -1555,18 +1560,67 @@ class TestSinks:
         (t1,) = engine.store.get_tasks(result.run_id)
         assert t1.output is not None
         row = {**t1.output.model_dump(mode="json"), "files": ["../escape"]}
-        engine.store._conn.execute(
+        exec_raw(
+            engine.store,
             "UPDATE tasks SET output_json = ? WHERE run_id = ? AND task_id = ?",
             (json.dumps(row), result.run_id, "t1"),
         )
-        engine.store._conn.execute(
+        exec_raw(
+            engine.store,
             "UPDATE runs SET published = '[]', state = 'publishing' WHERE run_id = ?",
             (result.run_id,),
         )
-        engine.store._conn.commit()
         harness.script([])
         resumed = harness.engine(**{**profiled, "workloads": [PUBLISHING]}).resume(result.run_id)
         assert resumed.state == "failed"
         assert resumed.reason == (
             "publishing to artifact failed: task t1 declared an unsafe path '../escape'"
         )
+
+
+class TestWorkloadLanguages:
+    """#801: a workload box provisions its profile's `languages`, empty by
+    default — never `[sandbox] languages`, which is a code run's set."""
+
+    def test_the_profile_names_the_toolchains(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1", verify=["test -f hello.txt"])), FILES_BUILD, PASS])
+        engine = harness.engine(
+            sandbox={"languages": ["dotnet", "javascript"]},
+            workloads=[{"name": "coder", "languages": ["go"]}],
+            workload={"default": "coder"},
+        )
+        result = engine.start("write hello.txt", kind="workload")
+        assert result.state == "completed"
+        (languages,) = [e for e in harness.events if e.type == "sandbox.languages"]
+        assert languages.data["source"] == "profile"
+        assert languages.data["languages"] == ["go"]
+
+    def test_sandbox_languages_do_not_apply_to_a_workload(self, harness: Harness) -> None:
+        harness.script([taskgraph(task("t1", verify=["test -f hello.txt"])), FILES_BUILD, PASS])
+        engine = harness.engine(
+            sandbox={"languages": ["dotnet", "javascript"]},
+            workloads=[{"name": "plain"}],
+            workload={"default": "plain"},
+        )
+        result = engine.start("write hello.txt", kind="workload")
+        assert result.state == "completed"
+        (languages,) = [e for e in harness.events if e.type == "sandbox.languages"]
+        assert languages.data["source"] == "none" and languages.data["languages"] == []
+        # A code run on the same config still gets the configured set.
+        harness.events.clear()
+        harness.script([taskgraph(task("t1")), BUILD])
+        assert harness.engine(sandbox={"languages": ["dotnet"]}).start("code").succeeded
+        (languages,) = [e for e in harness.events if e.type == "sandbox.languages"]
+        assert languages.data["source"] == "config" and languages.data["languages"] == ["dotnet"]
+
+    def test_profile_languages_are_normalized_and_checked(self) -> None:
+        from sbxloop.config import Config
+
+        config = Config.model_validate(
+            {"workloads": [{"name": "p", "languages": ["js", "python", "javascript"]}]}
+        )
+        assert config.workloads[0].languages == ["javascript", "python"]
+        with pytest.raises(
+            ValueError, match=r"unsupported workloads\[\]\.languages entries \['cobol'\]"
+        ):
+            Config.model_validate({"workloads": [{"name": "p", "languages": ["cobol"]}]})

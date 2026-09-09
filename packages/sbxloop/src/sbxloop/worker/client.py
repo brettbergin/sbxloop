@@ -229,6 +229,13 @@ class WorkerClient:
         # Provisioner.job_env — None means the sandbox's credentials arrive
         # another way (sbx secret proxy, or the env-file fallback).
         self.job_env = job_env
+        self.mcp_prepare: (
+            Callable[
+                [JobRequest, HostToolHandler | None],
+                contextlib.AbstractContextManager[tuple[JobRequest, HostToolHandler | None]],
+            ]
+            | None
+        ) = None
         # job_id -> agent persona (planner, executor, ...) supplied at
         # submit(); stamped onto that job's agent.* events so the transcript
         # can say who is speaking (the worker doesn't know which phase it
@@ -249,7 +256,7 @@ class WorkerClient:
         no_deps: bool = False,
         system_site_packages: bool = False,
         ensure_dev_tools: bool = False,
-        languages: Sequence[str] = (),
+        languages: Sequence[str] | None = None,
         versions: Mapping[str, toolchains.ToolchainVersion] | None = None,
         expect_prebaked: bool = False,
         apt_packages: Sequence[str] = (),
@@ -282,7 +289,10 @@ class WorkerClient:
 
         ``ensure_dev_tools`` additionally makes the sandbox dev-ready for
         the AGENT's own work (see _ensure_dev_tools) — the engine sets it
-        for the agent sandbox only, passing the configured ``languages``.
+        for the agent sandbox only, passing the run's resolved
+        ``languages``. ``None`` is the default set (Python); an empty
+        sequence is *no* language toolchain at all — a workload's box
+        (#801) gets the baseline tools and its backend's runtime only.
         ``versions`` selects the series each toolchain is provisioned at
         (#627): the workspace's ``requires-python`` / ``.nvmrc`` verdicts
         that ``toolchains.resolve_languages`` read on the host. Absent, or
@@ -299,7 +309,7 @@ class WorkerClient:
             role=self.role,
             expect_prebaked=expect_prebaked,
             ensure_dev_tools=ensure_dev_tools,
-            languages=list(languages) or None,
+            languages=None if languages is None else list(languages),
             versions={k: v.series for k, v in versions.items()} if versions else None,
         )
         if expect_prebaked and self._verify_prebaked():
@@ -565,7 +575,7 @@ class WorkerClient:
     def _top_up_prebaked(
         self,
         timeout: float,
-        languages: Sequence[str],
+        languages: Sequence[str] | None,
         versions: Mapping[str, toolchains.ToolchainVersion] | None = None,
     ) -> None:
         """Make a verified template dev-ready for THIS run's languages (#615).
@@ -586,7 +596,9 @@ class WorkerClient:
         """
         selected = (
             *toolchains.BASELINE_TOOLS,
-            *toolchains.resolve(languages or toolchains.DEFAULT_LANGUAGES, versions),
+            *toolchains.resolve(
+                toolchains.DEFAULT_LANGUAGES if languages is None else languages, versions
+            ),
         )
         missing = self.missing_toolchains(selected)
         if missing is None:
@@ -624,7 +636,7 @@ class WorkerClient:
     def _ensure_dev_tools(
         self,
         timeout: float,
-        languages: Sequence[str] = (),
+        languages: Sequence[str] | None = None,
         versions: Mapping[str, toolchains.ToolchainVersion] | None = None,
     ) -> None:
         """Best-effort: make the sandbox dev-ready for the agent's own work.
@@ -633,7 +645,7 @@ class WorkerClient:
         ``sbxloop.toolchains``) before the agent's first turn, so it does not
         burn revision budget bootstrapping its own compiler. Empty selects
         the default, which is Python — the case this ensure was born for.
-        ``toolchains.BASELINE_TOOLS`` (git, #252) is provisioned on top of
+        ``toolchains.BASELINE_TOOLS`` (git #252, yq/jq #751) is provisioned on top of
         whatever was selected: a project's tests shell out to git whatever
         its language, so it is not an opt-in.
 
@@ -657,7 +669,9 @@ class WorkerClient:
         """
         selected = (
             *toolchains.BASELINE_TOOLS,
-            *toolchains.resolve(languages or toolchains.DEFAULT_LANGUAGES, versions),
+            *toolchains.resolve(
+                toolchains.DEFAULT_LANGUAGES if languages is None else languages, versions
+            ),
         )
         missing = [tc for tc in selected if not self.sandbox.exec(["sh", "-c", tc.probe]).ok]
         if not missing:
@@ -954,6 +968,11 @@ class WorkerClient:
         """
         if self.credential_refresh is not None:
             self.credential_refresh()
+        if any(server.mediated for server in job.mcp_servers):
+            if self.mcp_prepare is None:
+                raise WorkerError("credentialed MCP has no host mediator")
+            with self.mcp_prepare(job, tool_handler) as (prepared, handler):
+                return self.submit(prepared, agent=agent, tool_handler=handler)
         if bool(job.host_tools) != (tool_handler is not None):
             raise WorkerError(
                 "job.host_tools and tool_handler must be given together "
@@ -987,6 +1006,7 @@ class WorkerClient:
 
         argv = [
             self.python,
+            *(["-I"] if self.role == "service" else []),
             "-m",
             "sbxloop_worker",
             "run",
@@ -1163,16 +1183,37 @@ class WorkerClient:
                 Event.now(EventTypes.WORKER_STDOUT, job.run_id, job_id=job.job_id, line=line)
             )
             return None
+        # A worker controls its stream and durable log. Host-only events
+        # can trigger actions (including file uploads), so they must never
+        # enter the host bus through this untrusted ingress.
+        worker_types = {value for name, value in vars(EventTypes).items() if name.isupper()}
+        if (
+            event.type not in worker_types
+            or event.run_id != job.run_id
+            or event.job_id not in (None, job.job_id)
+        ):
+            log.warning(
+                "worker.event_rejected",
+                job=job.job_id,
+                sandbox=self.sandbox.name,
+                event_type=event.type[:100],
+            )
+            return None
+        # Older workers omit job_id on some telemetry. The transport, not
+        # the payload, owns its identity; bind accepted events to this job.
+        event = event.model_copy(update={"run_id": job.run_id, "job_id": job.job_id})
         if self.role is not None and event.type in (
             EventTypes.SANDBOX_RESOURCES,
             EventTypes.SANDBOX_RESOURCES_WARNING,
         ):
-            event.data.setdefault("role", self.role)
+            event.data["role"] = self.role
         agent = self._job_agents.get(job.job_id)
         if event.type.startswith("agent."):
             if agent is not None:
-                event.data.setdefault("agent", agent)
+                event.data["agent"] = agent
             if self.backend is not None:
+                # Diagnostic data, not authority: a fallback worker can
+                # truthfully report a different backend from the config.
                 event.data.setdefault("backend", self.backend)
         self.bus.publish(event)
         if event.type == EventTypes.AGENT_TOOL_REQUEST:

@@ -43,10 +43,11 @@ loudly rather than pretending.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from typing import Any
-from urllib.parse import quote, unquote
+from urllib.parse import parse_qs, quote, unquote
 
 from sbxloop.errors import GithubOpsError
 from sbxloop.gh.ops import (
@@ -138,6 +139,7 @@ class FakeGithub(GithubOps):
             "mergeable": True,
             "mergeable_state": "clean",
             "head": {"sha": "commit0"},
+            "base": {"sha": "base123"},
         }
         # What `repo_get` answers (#620): every merge method allowed, so
         # `merge_method = "auto"` resolves to squash as it always did.
@@ -168,6 +170,13 @@ class FakeGithub(GithubOps):
         self.failed_logs_calls: list[str] = []
         self.reviews_payload: list[dict[str, Any]] = []
         self.comments_payload: list[dict[str, Any]] = []
+        # GET /pulls/{n}/files: patches describe the commentable diff, not
+        # the entire file. Tests can omit a patch (binary/oversized file),
+        # supply malformed responses, or move a ref while it is read.
+        self.files_payload: Any = [
+            {"filename": "hello.txt", "patch": "@@ -1,3 +1,3 @@\n-hi\n+hello\n second\n third"}
+        ]
+        self.files_after_read: dict[str, Any] = {}
         self.feedback = ""
         self.undraft_ok = True
         self.update_ok = True
@@ -211,6 +220,14 @@ class FakeGithub(GithubOps):
         # Branches with no merge base against the base branch (#600): the
         # compare endpoint 404s for them, as GitHub does.
         self.unrelated_branches: set[str] = set()
+        # How the repository and its refs answer a raw GET (#607): the
+        # repository itself absent (404), a repository with no commits at
+        # all (every ref GET is a 409), a base ref that is not there or not
+        # visible (404), a ref whose answer carries no sha.
+        self.repo_missing = False
+        self.empty_repo = False
+        self.missing_refs: set[str] = set()
+        self.malformed_refs: set[str] = set()
         self.pr_created = False
         self.pr_create_calls = 0
         self.threads: list[ReviewThread] = []
@@ -231,6 +248,8 @@ class FakeGithub(GithubOps):
         # single-label GET finds these, and creating one is a 422.
         self.labels_existing: set[str] = set()
         self.existing_issues: list[dict[str, Any]] = []
+        self.issue_search_payload: Any = None
+        self.issue_list_payload: Any = None
         self.resolved: list[str] = []
         self._comment_id = 0
         self._commits = 0
@@ -256,6 +275,15 @@ class FakeGithub(GithubOps):
         """Ledger one call whose non-2xx answer fails the worker job."""
         status = getattr(exc, "http_status", None)
         self.failed_jobs.append((op, method, path, status if isinstance(status, int) else None))
+
+    def _failed_op(self, op: str, method: str, path: str, exc: GithubOpsError) -> GithubOpsError:
+        """A recorded worker-error shape as the failed job it would be —
+        unless the caller declared the miss an answer (``_allow_missing``),
+        in which case a 404/409 is data and writes no ledger entry."""
+        status = getattr(exc, "http_status", None)
+        if not (self._missing_ok and status in (404, 409)):
+            self._record_failed_job(op, method, path, exc)
+        return exc
 
     @property
     def failed_job_paths(self) -> list[str]:
@@ -300,22 +328,39 @@ class FakeGithub(GithubOps):
         return dict(self.repo_payload)
 
     def repo_lookup(self, repo: str) -> dict[str, Any] | None:
+        """The real ``repo.get`` under ``allow_missing`` (#607): one raw
+        GET in the ledger, a 404 answered as None with no failed job, any
+        other refusal raised — so a test sees the probe and its cost."""
         self._maybe_fail("repo_lookup")
-        # The same payload ``repo_get`` answers with: the engine's up-front
-        # probe reads ``has_issues`` off it (#631).
-        payload = dict(self.repo_payload)
-        if self.has_issues is not None:
-            payload["has_issues"] = self.has_issues
-        return payload
+        with self._allow_missing():
+            try:
+                data = self.raw("GET", f"/repos/{repo}")
+            except GithubOpsError as exc:
+                if exc.http_status == 404:
+                    return None
+                raise
+        return data if isinstance(data, dict) else None
 
     def ref_lookup(self, repo: str, ref: str) -> str | None:
-        # A delivery branch (``sbxloop/<run>``) exists only once delivery
-        # created it, and then sits at the PR head; anything else is a base
-        # branch that is simply there.
-        branch = ref.removeprefix("heads/")
-        if branch.startswith("sbxloop/"):
-            return self.head_sha if branch in self.branches else None
-        return "base123"
+        """The real ``ref.get`` under ``allow_missing`` (#607): one raw GET
+        in the ledger; a 404 (no such ref) or 409 (an empty repository)
+        answers None with no failed job; any other refusal raises; and a
+        malformed answer or one without a sha raises the way the real
+        facade does, so the branches a defect can hide in are reachable."""
+        with self._allow_missing():
+            try:
+                data = self.raw("GET", f"/repos/{repo}/git/ref/{ref}")
+            except GithubOpsError as exc:
+                if exc.http_status in (404, 409):
+                    return None
+                raise
+        if not isinstance(data, dict):
+            raise GithubOpsError(f"ref.get returned a malformed result: {data!r}")
+        obj = data.get("object")
+        sha = obj.get("sha") if isinstance(obj, dict) else None
+        if not sha:
+            raise GithubOpsError(f"ref.get returned no sha for {ref!r}: {data!r}")
+        return str(sha)
 
     def label_lookup(self, repo: str, name: str) -> dict[str, Any] | None:
         """A repository label probe (#556): its data, or None when absent.
@@ -389,6 +434,26 @@ class FakeGithub(GithubOps):
         # fine-grained one with nothing to report.
         return None
 
+    def raw_lookup(
+        self,
+        method: str,
+        path: str,
+        body: dict[str, Any] | None = None,
+        *,
+        missing: Sequence[int] = (404,),
+    ) -> Any:
+        """The real one's contract (#558): a status in ``missing`` is an
+        answer (``None``) and not a failed worker job — the ledger entry
+        the raw call would have written is taken back."""
+        before = len(self.failed_jobs)
+        try:
+            return self.raw(method, path, body)
+        except GithubOpsError as exc:
+            if exc.http_status in missing:
+                del self.failed_jobs[before:]
+                return None
+            raise
+
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         self.raw_calls.append((method, path, body))
         self._maybe_fail("raw")
@@ -396,6 +461,44 @@ class FakeGithub(GithubOps):
         # list whole, so page one is the list and any later page is empty;
         # routing below matches on the path without its query.
         path, _, query = path.partition("?")
+        if method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+/pulls/\d+/files", path):
+            self._maybe_fail("pr_files")
+            self.pr.update(self.files_after_read)
+            if not isinstance(self.files_payload, list):
+                return self.files_payload
+            params = parse_qs(query)
+            size = int(params.get("per_page", ["30"])[0])
+            start = (int(params.get("page", ["1"])[0]) - 1) * size
+            return self.files_payload[start : start + size]
+        if method == "GET" and path == "/search/issues":
+            self._maybe_fail("issue_search")
+            if self.issue_search_payload is not None:
+                return self.issue_search_payload
+            params = parse_qs(query)
+            search = params["q"][0]
+            repo = search.split()[0].removeprefix("repo:")
+            terms = search.partition("in:title,body ")[2].lower().split()
+            items = [
+                dict(i)
+                for i in self.existing_issues
+                if "pull_request" not in i
+                and f"/{repo}/issues/" in str(i.get("html_url", ""))
+                and all(
+                    t in (str(i.get("title", "")) + " " + str(i.get("body", ""))).lower()
+                    for t in terms
+                )
+            ]
+            return {
+                "total_count": len(items),
+                "incomplete_results": False,
+                "items": items[: int(params.get("per_page", ["20"])[0])],
+            }
+        if method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+/issues/\d+", path):
+            self._maybe_fail("issue_read")
+            for issue in self.existing_issues:
+                if str(issue.get("number")) == path.rsplit("/", 1)[1]:
+                    return dict(issue)
+            raise GithubOpsError("issue not found", http_status=404)
         if method == "GET" and "page=" in query and not query.endswith("page=1"):
             return []
         if method == "GET" and path == "/user":
@@ -406,6 +509,34 @@ class FakeGithub(GithubOps):
             if self.user_type is not None:
                 user["type"] = self.user_type
             return user
+        if method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+", path):
+            # The repository itself, whichever one the run names: the fake
+            # answers for every repository with its one payload (#607).
+            if self.repo_missing:
+                raise self._failed_op("raw.api", method, path, github_error("repo_missing_404"))
+            # The same payload ``repo_get`` answers with: the engine's
+            # up-front probe reads ``has_issues`` off it (#631).
+            payload = dict(self.repo_payload)
+            if self.has_issues is not None:
+                payload["has_issues"] = self.has_issues
+            return payload
+        if method == "GET" and "/git/ref/" in path:
+            ref = path.split("/git/ref/", 1)[1]
+            branch = ref.removeprefix("heads/")
+            if self.empty_repo:
+                raise self._failed_op("raw.api", method, path, github_error("empty_repo_ref_409"))
+            # A delivery branch (``sbxloop/<run>``) exists only once delivery
+            # created it, and then sits at the PR head; anything else is a
+            # base branch that is simply there unless said otherwise.
+            gone = branch in self.missing_refs or (
+                branch.startswith("sbxloop/") and branch not in self.branches
+            )
+            if gone:
+                raise self._failed_op("raw.api", method, path, github_error("ref_missing_404"))
+            if branch in self.malformed_refs:
+                return {"ref": f"refs/{ref}", "object": {}}
+            sha = self.head_sha if branch.startswith("sbxloop/") else "base123"
+            return {"ref": f"refs/{ref}", "object": {"sha": sha, "type": "commit"}}
         if method == "GET" and "/git/commits/" in path:
             return {"tree": {"sha": "basetree"}}
         if method == "POST" and path.endswith("/git/trees"):
@@ -505,6 +636,9 @@ class FakeGithub(GithubOps):
             self.labels_created.append(str(body["name"]))
             return {"name": body["name"]}
         if method == "GET" and path.endswith("/issues") and "labels=" in query:
+            self._maybe_fail("issue_list")
+            if self.issue_list_payload is not None:
+                return self.issue_list_payload
             return list(self.existing_issues)
         if method == "POST" and path.endswith("/requested_reviewers"):
             # A review request (#675): recorded on the PR as GitHub does.
@@ -554,6 +688,17 @@ class FakeGithub(GithubOps):
             )
         self.issues_created.append((title, body, list(labels or [])))
         number = 900 + len(self.issues_created)
+        self.existing_issues.append(
+            {
+                "number": number,
+                "title": title,
+                "body": body,
+                "state": "open",
+                "state_reason": None,
+                "html_url": f"https://github.com/{repo}/issues/{number}",
+                "labels": [{"name": label} for label in labels or []],
+            }
+        )
         return IssueRef(number=number, url=f"https://github.com/{repo}/issues/{number}")
 
     def issue_comment(self, repo: str, number: int, body: str) -> str:
@@ -563,7 +708,8 @@ class FakeGithub(GithubOps):
 
     def pr_get(self, repo: str, number: int) -> dict[str, Any]:
         self._maybe_fail("pr_get")
-        return {**self.pr, "head": dict(self.pr["head"])}
+        head = self.pr.get("head")
+        return {**self.pr, "head": dict(head) if isinstance(head, dict) else head}
 
     def pr_required_checks(self, repo: str, number: int) -> tuple[str, ...]:
         self.rollup_calls += 1
@@ -614,7 +760,9 @@ class FakeGithub(GithubOps):
         comments: Sequence[ReviewComment] = (),
     ) -> SubmittedReview:
         self._maybe_fail("pr_review_create")
-        if self.refuse_inline_comments and comments:
+        if (self.refuse_inline_comments and comments) or any(
+            anchor_of(c) in self.refuse_anchors for c in comments
+        ):
             raise self._failed(
                 "raw.api",
                 "POST",

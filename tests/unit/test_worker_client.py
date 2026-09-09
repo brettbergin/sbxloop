@@ -72,10 +72,12 @@ def script_toolchain_probe(
 
 
 def script_git_probe(fake_sbx: FakeSbx, *, returncode: int = 0) -> None:
-    """Script the baseline git probe (#252). Unscripted it runs on the host,
-    where git is present on every dev machine and CI runner — so tests that
-    assert the exact apt command pin it rather than rely on that."""
-    fake_sbx.script(f"exec boxa sh -c {toolchains.GIT.probe}", returncode=returncode)
+    """Script every baseline tool probe (git #252, yq/jq #751) to the same
+    answer. Unscripted they run on the host, where git is present on every
+    dev machine and CI runner and yq varies — so tests that assert the
+    exact apt command pin them rather than rely on that."""
+    for tool in toolchains.BASELINE_TOOLS:
+        fake_sbx.script(f"exec boxa sh -c {tool.probe}", returncode=returncode)
 
 
 def script_toolchain_probe_batch(
@@ -548,6 +550,7 @@ class TestInstallFallbacks:
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
+        script_git_probe(fake_sbx, returncode=0)
         script_toolchain_probe(fake_sbx, "python", returncode=0)
         script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
@@ -628,6 +631,29 @@ class TestInstallFallbacks:
         ]
         assert len(scripts) == 1 and "python3.13" in scripts[0], scripts
 
+    def test_ensure_dev_tools_with_no_languages_installs_the_baseline_only(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # #801: an empty language set is "none", not "the default" — a
+        # workload's box gets git and yq/jq and no language toolchain; only
+        # None means the default Python.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_git_probe(fake_sbx, returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=())
+        apt_cmds = [
+            " ".join(c) for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)
+        ]
+        assert apt_cmds == [
+            "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git yq jq"
+        ]
+        python_probe = toolchains.resolve(["python"])[0].probe
+        assert not [c for c in fake_sbx.invocations("exec") if python_probe in " ".join(c)]
+
     def test_ensure_dev_tools_installs_git_as_baseline(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
@@ -648,7 +674,7 @@ class TestInstallFallbacks:
         ]
         assert apt_cmds == [
             "exec boxa sh -c sudo -n apt-get update -q && "
-            "sudo -n apt-get install -y -q git python3-venv python3-pip curl ca-certificates"
+            "sudo -n apt-get install -y -q git yq jq python3-venv python3-pip curl ca-certificates"
         ]
 
     def test_ensure_dev_tools_git_probe_success_installs_nothing(
@@ -1116,7 +1142,7 @@ class TestPrebakedTemplate:
         joined = [" ".join(c) for c in fake_sbx.invocations("exec")]
         assert not [j for j in joined if "-m venv" in j or "pip install" in j]
         assert joined[-1] == (
-            "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git"
+            "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git yq jq"
         )
 
     def test_verified_prebaked_logs_the_baked_languages(

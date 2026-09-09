@@ -251,11 +251,15 @@ class RunDetailScreen(ConsoleScreen):
         text.append_text(state_label(r.state, r.reason, emoji=emoji))
         if r.kind != "code":
             text.append(f" · {r.kind}", style="dim")
+            if detail.profile:
+                text.append(f" ({detail.profile})", style="dim")
         if r.stage:
             text.append(f" · stage {r.stage}", style="dim")
         text.append("\n")
         text.append(run_title(r))
         text.append("\n")
+        for line, style in self._needs_lines(detail):
+            text.append(line + "\n", style=style)
         bits = []
         if r.pr_number:
             bits.append(f"PR #{r.pr_number}")
@@ -284,6 +288,39 @@ class RunDetailScreen(ConsoleScreen):
         if not self.console_app.read_only:
             text.append("\n" + " · ".join(self._offers(detail)), style="dim")
         return text
+
+    @staticmethod
+    def _needs_lines(detail: RunDetail) -> list[tuple[str, str]]:
+        """A workload's bounds on its own screen (#804): the profile it ran
+        under, what the plan asked for and the grant gave (names only),
+        and a refused need with the sbxloop.toml key that would allow it."""
+        if detail.record.kind != "workload":
+            return []
+        lines: list[tuple[str, str]] = []
+        granted = detail.needs_granted
+        if granted is not None:
+            parts = [
+                f"{label} {', '.join(str(v) for v in values)}"
+                for label, values in (
+                    ("hosts", granted.data.get("hosts") or ()),
+                    ("credentials", granted.data.get("credentials") or ()),
+                    ("sinks", granted.data.get("sinks") or ()),
+                    ("repos", granted.data.get("repos") or ()),
+                )
+                if values
+            ]
+            lines.append(("granted: " + ("; ".join(parts) or "nothing declared"), "dim"))
+        refused = detail.needs_refused
+        if refused is not None:
+            need = refused.data.get("need")
+            value = refused.data.get("value")
+            key = refused.data.get("key")
+            what = f"{need} {value}" if need and value else str(refused.data.get("message") or "")
+            allow = f" — allow it with `{key}`" if key else ""
+            lines.append((f"refused: {what}{allow}", "yellow"))
+        if not lines and detail.profile is None:
+            lines.append(("no profile: every need but the chat sink is refused", "dim"))
+        return lines
 
     def _is_current(self, detail: RunDetail) -> bool:
         daemon = self.console_app.state.daemon
@@ -339,8 +376,8 @@ class RunDetailScreen(ConsoleScreen):
         rows = []
         totals = {"in": 0, "out": 0, "cr": 0, "cw": 0, "turns": 0}
         for row in detail.phases:
-            started = row["started_at"]
-            ended = row["ended_at"]
+            started = row.started_at
+            ended = row.ended_at
             for key, col in (
                 ("in", "input_tokens"),
                 ("out", "output_tokens"),
@@ -348,23 +385,23 @@ class RunDetailScreen(ConsoleScreen):
                 ("cw", "cache_write_tokens"),
                 ("turns", "turns"),
             ):
-                value = row[col]
+                value = getattr(row, col)
                 if value is not None:
                     totals[key] += int(value)
             rows.append(
                 (
-                    str(row["id"]),
+                    str(row.id),
                     (
-                        row["task_id"] or "—",
-                        row["phase"],
-                        str(row["attempt"]),
-                        row["status"],
+                        row.task_id or "—",
+                        row.phase,
+                        str(row.attempt),
+                        row.status,
                         clock(started),
                         duration((ended - started) if started and ended else None),
-                        tokens(row["input_tokens"]),
-                        tokens(row["output_tokens"]),
-                        f"{tokens(row['cache_read_tokens'])}/{tokens(row['cache_write_tokens'])}",
-                        str(row["turns"] if row["turns"] is not None else "—"),
+                        tokens(row.input_tokens),
+                        tokens(row.output_tokens),
+                        f"{tokens(row.cache_read_tokens)}/{tokens(row.cache_write_tokens)}",
+                        str(row.turns if row.turns is not None else "—"),
                     ),
                 )
             )

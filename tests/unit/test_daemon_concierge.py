@@ -264,6 +264,12 @@ class TestJobShape:
             "usage_today",
             "daemon_log",
             "start_workload",
+            "create_schedule",
+            "delete_schedule",
+            # Last, and never gated: it reaches nothing outside the host, and
+            # with `available_tools == []` it is this session's only way to
+            # read a procedure at all.
+            "load_skill",
         ]  # no github_get: no repo configured; the rest need nothing
         assert job.host_tools_dir is None  # the WorkerClient fills it in
         assert job.system_message and "sbxloop concierge" in job.system_message
@@ -871,6 +877,86 @@ class TestTools:
         assert numbers(everything.text) == {"#7", "#8", "#9", "#10"}
         assert "4 open issue(s)" in everything.text
         assert "NOT QUEUED" in everything.text
+
+    def test_list_issues_takes_several_states_and_negated_ones(self, tmp_path: Path) -> None:
+        """#609: "what needs a human?" is failed OR blocked — `states` says
+        so exactly, where `queued: false` swept in the backlog; and
+        `exclude_states` answers the negated question."""
+        issues = [
+            {
+                "number": 7,
+                "title": "Backlog",
+                "labels": [],
+                "created_at": "bogus",
+                "user": {"login": "ana"},
+                "comments": 0,
+                "html_url": "https://gh/i/7",
+            },
+            {
+                "number": 8,
+                "title": "Queued",
+                "labels": [{"name": "sbxloop:run"}],
+                "created_at": "bogus",
+                "user": {"login": "bo"},
+                "comments": 0,
+                "html_url": "https://gh/i/8",
+            },
+            {
+                "number": 9,
+                "title": "Failed",
+                "labels": [{"name": "sbxloop:failed"}],
+                "created_at": "bogus",
+                "user": {"login": "bo"},
+                "comments": 0,
+                "html_url": "https://gh/i/9",
+            },
+            {
+                "number": 10,
+                "title": "Blocked",
+                "labels": [{"name": "sbxloop:blocked"}],
+                "created_at": "bogus",
+                "user": {"login": "bo"},
+                "comments": 0,
+                "html_url": "https://gh/i/10",
+            },
+            {
+                "number": 11,
+                "title": "Running and once failed",
+                "labels": [{"name": "sbxloop:in-progress"}, {"name": "sbxloop:failed"}],
+                "created_at": "bogus",
+                "user": {"login": "bo"},
+                "comments": 0,
+                "html_url": "https://gh/i/11",
+            },
+        ]
+        github = FakeGithub({"/issues?": issues})
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {"calls": [("list_issues", {"states": ["failed", "blocked"]})]},
+                {"calls": [("list_issues", {"exclude_states": ["queued", "running"]})]},
+                {"calls": [("list_issues", {"state": "failed", "states": ["blocked"]})]},
+                {"calls": [("list_issues", {"states": ["failed"], "exclude_states": ["running"]})]},
+                {"calls": [("list_issues", {"states": ["bogus", 3]})]},
+            ],
+            github=github,
+        )
+        for text in ("needs a human?", "not being worked?", "both", "failed but idle", "junk"):
+            turn(concierge, text)
+        needs_human, idle, both, failed_idle, junk = client.responses
+
+        def numbers(text: str) -> set[str]:
+            return {line.split()[1] for line in text.splitlines() if line.startswith("- #")}
+
+        assert numbers(needs_human.text) == {"#9", "#10", "#11"}
+        assert "failed|blocked open issue(s)" in needs_human.text
+        assert numbers(idle.text) == {"#7", "#9", "#10"}
+        assert "not-queued|running open issue(s)" in idle.text
+        assert numbers(both.text) == {"#9", "#10", "#11"}  # `state` folds into `states`
+        assert numbers(failed_idle.text) == {"#9"}
+        assert "failed not-running" in failed_idle.text
+        # Unknown names are ignored, not an error: everything comes back.
+        assert numbers(junk.text) == {"#7", "#8", "#9", "#10", "#11"}
 
     def test_list_issues_all_parameter_controls_the_requested_state(self, tmp_path: Path) -> None:
         issues = [
@@ -1887,7 +1973,10 @@ class TestDaemonLogTool:
 
         configure_logging("DEBUG", fmt="console", stream=io.StringIO())
         yield
-        configure_logging("INFO")
+        # Back to the session default from tests/conftest.py, not to INFO:
+        # this handler is the process-wide ring buffer's, and leaving it
+        # above DEBUG silently drops later tests' records.
+        configure_logging("DEBUG")
 
     def _emit(self) -> None:
         from sbxloop.log import get_logger
@@ -2587,3 +2676,152 @@ class TestStartWorkload:
         # never gated on a "want me to queue it?" question
         assert "any subject, whether or not it concerns sbxloop" in tool.description
         assert "never ask whether to queue it" in tool.description
+
+
+class TestSchedules:
+    """#818: the concierge creates and deletes schedules in the daemon's
+    database through the loop — `create_schedule` after its interview,
+    `delete_schedule` on an explicit yes — and never touches the config."""
+
+    PROFILES: ClassVar[dict[str, Any]] = {
+        "workloads": [{"name": "research"}, {"name": "quiet"}],
+        "workload": {"default": "research"},
+    }
+
+    def _run(
+        self,
+        tmp_path: Path,
+        tool: str,
+        args: dict[str, Any],
+        *,
+        config: dict[str, Any] | None = None,
+        add: Callable[..., str] | None = None,
+        remove: Callable[..., str] | None = None,
+    ) -> tuple[str, Any]:
+        concierge, client, _, loop, _ = make(
+            tmp_path,
+            [{"calls": [(tool, args)], "text": "done"}],
+            config=self.PROFILES if config is None else config,
+        )
+        if add is not None:
+            loop.add_schedule = add  # type: ignore[attr-defined]
+        if remove is not None:
+            loop.remove_schedule = remove  # type: ignore[attr-defined]
+        concierge.submit_turn("please", author="Discord user `ana`", author_id="7").result(
+            timeout=10
+        )
+        (response,) = client.responses
+        assert response.ok
+        return response.text or "", loop
+
+    def test_create_stores_the_schedule_through_the_loop(self, tmp_path: Path) -> None:
+        seen: list[tuple[Any, str, str]] = []
+
+        def add(spec: Any, by: str, *, source: str) -> str:
+            seen.append((spec, by, source))
+            return "schedule morning-brief created: cron 0 7 * * mon-fri (Europe/London), x"
+
+        text, _ = self._run(
+            tmp_path,
+            "create_schedule",
+            {
+                "name": "morning-brief",
+                "ask": "Summarise what changed overnight",
+                "cron": "0 7 * * mon-fri",
+                "timezone": "Europe/London",
+            },
+            add=add,
+        )
+        ((spec, by, source),) = seen
+        assert spec.name == "morning-brief" and spec.profile == "research"  # the default
+        assert spec.ask == "Summarise what changed overnight"
+        assert spec.cron == "0 7 * * mon-fri" and spec.every is None
+        assert spec.timezone == "Europe/London"
+        assert by == "Discord user `ana` (via concierge)" and source == "discord"
+        assert text.startswith("schedule morning-brief created")
+        assert "`schedules pause morning-brief` parks it" in text
+        assert "`delete_schedule` removes it" in text
+
+    def test_create_names_a_profile_and_a_period(self, tmp_path: Path) -> None:
+        seen: list[Any] = []
+        _, _ = self._run(
+            tmp_path,
+            "create_schedule",
+            {"name": "hourly", "ask": "Check", "profile": "quiet", "every": "1h"},
+            add=lambda spec, by, *, source: seen.append(spec) or "ok",
+        )
+        (spec,) = seen
+        assert spec.profile == "quiet" and spec.every == "1h" and spec.cron is None
+
+    def test_create_refuses_bad_input_without_touching_the_loop(self, tmp_path: Path) -> None:
+        calls: list[Any] = []
+
+        def add(spec: Any, by: str, *, source: str) -> str:
+            calls.append(spec)
+            return "ok"
+
+        text, _ = self._run(tmp_path, "create_schedule", {"name": "x", "ask": "y"}, add=add)
+        assert "set exactly one of every / cron" in text
+        text, _ = self._run(
+            tmp_path, "create_schedule", {"name": "x", "ask": "y", "every": "soon"}, add=add
+        )
+        assert text.startswith("that schedule is not valid: schedules.x: every")
+        text, _ = self._run(
+            tmp_path,
+            "create_schedule",
+            {"name": "x", "ask": "y", "every": "1h", "profile": "nope"},
+            add=add,
+        )
+        assert "not declared under [[workloads]]" in text
+        text, _ = self._run(
+            tmp_path,
+            "create_schedule",
+            {"name": "x", "ask": "y", "every": "1h", "cron": "* * * * *"},
+            add=add,
+        )
+        assert "set exactly one of every / cron" in text
+        text, _ = self._run(tmp_path, "create_schedule", {"name": "", "ask": "y"}, add=add)
+        assert text == "a name and an ask are required"
+        assert calls == []
+
+    def test_create_needs_a_profile_when_no_default_is_set(self, tmp_path: Path) -> None:
+        text, _ = self._run(
+            tmp_path,
+            "create_schedule",
+            {"name": "x", "ask": "y", "every": "1h"},
+            config={"workloads": [{"name": "research"}]},
+            add=lambda *a, **k: "ok",
+        )
+        assert text.startswith("a schedule needs a profile") and "declared: research" in text
+
+    def test_create_reports_the_loops_refusal(self, tmp_path: Path) -> None:
+        def add(spec: Any, by: str, *, source: str) -> str:
+            raise ValueError("a schedule called 'x' already exists")
+
+        text, _ = self._run(
+            tmp_path, "create_schedule", {"name": "x", "ask": "y", "every": "1h"}, add=add
+        )
+        assert text == "creating the schedule failed: a schedule called 'x' already exists"
+
+    def test_delete_goes_through_the_loop(self, tmp_path: Path) -> None:
+        seen: list[tuple[str, str]] = []
+
+        def remove(name: str, by: str) -> str:
+            seen.append((name, by))
+            return f"schedule {name} removed; no further ticks"
+
+        text, _ = self._run(tmp_path, "delete_schedule", {"name": "hourly"}, remove=remove)
+        assert seen == [("hourly", "Discord user `ana` (via concierge)")]
+        assert text == "schedule hourly removed; no further ticks"
+
+        def unknown(name: str, by: str) -> str:
+            raise ValueError("no schedule called 'x' (stored: none)")
+
+        text, _ = self._run(tmp_path, "delete_schedule", {"name": "x"}, remove=unknown)
+        assert text == "deleting the schedule failed: no schedule called 'x' (stored: none)"
+        text, _ = self._run(tmp_path, "delete_schedule", {"name": ""}, remove=unknown)
+        assert text == "a schedule name is required"
+
+    def test_the_tools_are_offered(self, tmp_path: Path) -> None:
+        concierge, _, _, _, _ = make(tmp_path, [], config=self.PROFILES)
+        assert {"create_schedule", "delete_schedule"} <= set(concierge.tool_names)

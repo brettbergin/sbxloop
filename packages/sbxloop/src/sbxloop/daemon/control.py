@@ -57,7 +57,8 @@ COMMANDS: tuple[str, ...] = (
     "release <item|run>",
     "grant-rounds <run> <n>",
     "resume-repo <owner/name>",
-    "schedules [pause <name>|resume <name>]",
+    "schedules [add <name> --profile P --every 1h|--cron 0 7 * * mon-fri [--tz ZONE] "
+    "--ask TEXT…|remove <name>|pause <name>|resume <name>]",
     "log [--tail N] [--level LEVEL] [--grep TEXT]",
     "stop",
 )
@@ -260,20 +261,78 @@ def dispatch(
     return reply
 
 
+_SCHEDULES_USAGE = (
+    "usage: schedules [add <name> --profile P (--every 1h | --cron 0 7 * * mon-fri) "
+    "[--tz Europe/London] --ask TEXT… | remove <name> | pause <name> | resume <name>]"
+)
+
+
+def _schedule_add_args(name: str, args: list[str]) -> Any:
+    """``schedules add`` flags (#818): ``--profile``, one of ``--every`` /
+    ``--cron`` (five words), optional ``--tz``, and ``--ask`` taking every
+    word to the end of the line. A usage message for anything else; the
+    schedule's own validation names a bad cadence or zone."""
+    from sbxloop.config import ScheduleConfig
+
+    fields: dict[str, Any] = {"name": name}
+    i = 0
+    while i < len(args):
+        flag = args[i]
+        if flag == "--ask":
+            text = " ".join(args[i + 1 :]).strip()
+            if not text:
+                return _SCHEDULES_USAGE
+            fields["ask"] = text
+            break
+        if flag == "--cron":
+            words = args[i + 1 : i + 6]
+            if len(words) != 5 or any(w.startswith("--") for w in words):
+                return _SCHEDULES_USAGE
+            fields["cron"] = " ".join(words)
+            i += 6
+            continue
+        if flag in ("--profile", "--every", "--tz") and i + 1 < len(args):
+            fields[{"--tz": "timezone"}.get(flag, flag[2:])] = args[i + 1]
+            i += 2
+            continue
+        return _SCHEDULES_USAGE
+    if "ask" not in fields or "profile" not in fields:
+        return _SCHEDULES_USAGE
+    try:
+        return ScheduleConfig.model_validate(fields)
+    except ValueError as exc:
+        # pydantic's report is several lines; the first message is the one.
+        errors = getattr(exc, "errors", None)
+        first = errors()[0]["msg"] if callable(errors) else str(exc)
+        return f"schedules add failed: {first.removeprefix('Value error, ')}"
+
+
 def _schedules(loop: Any, args: list[str], by: str | None) -> CommandReply:
-    """`schedules` lists every `[[schedules]]` entry with its state;
-    `schedules pause <name>` / `schedules resume <name>` park one and
-    release it (#761). A daemon `pause` holds everything; this holds one."""
+    """`schedules` lists every stored schedule with its state; `schedules
+    add` creates one (#818), `remove` deletes one, `pause` / `resume`
+    park one and release it (#761). A daemon `pause` holds everything;
+    this holds one."""
     if args:
         verb = args[0].lower()
-        if verb not in ("pause", "resume") or len(args) != 2:
-            return CommandReply("usage: schedules [pause <name>|resume <name>]", ok=False)
+        if verb == "add":
+            if len(args) < 2 or args[1].startswith("--"):
+                return CommandReply(_SCHEDULES_USAGE, ok=False)
+            spec = _schedule_add_args(args[1], args[2:])
+            if isinstance(spec, str):
+                return CommandReply(spec, ok=False)
+            try:
+                return CommandReply(loop.add_schedule(spec, by, source="ctl"))
+            except ValueError as exc:
+                return CommandReply(f"schedules add failed: {exc}", ok=False)
+        if verb not in ("pause", "resume", "remove") or len(args) != 2:
+            return CommandReply(_SCHEDULES_USAGE, ok=False)
         try:
-            text = (
-                loop.pause_schedule(args[1], by)
-                if verb == "pause"
-                else loop.resume_schedule(args[1], by)
-            )
+            if verb == "pause":
+                text = loop.pause_schedule(args[1], by)
+            elif verb == "resume":
+                text = loop.resume_schedule(args[1], by)
+            else:
+                text = loop.remove_schedule(args[1], by)
         except ValueError as exc:
             return CommandReply(
                 f"schedules {verb} failed: {exc.args[0] if exc.args else exc}", ok=False
@@ -281,16 +340,28 @@ def _schedules(loop: Any, args: list[str], by: str | None) -> CommandReply:
         return CommandReply(text)
     rows = loop.schedules()
     if not rows:
-        return CommandReply("no schedules configured ([[schedules]] in sbxloop.toml).")
+        return CommandReply(
+            "no schedules — create one from chat (the concierge's `create_schedule`) or with "
+            "`schedules add <name> --profile P --every 1h --ask TEXT`."
+        )
     return CommandReply("\n".join(schedule_line(row, loop.clock()) for row in rows))
 
 
 def schedule_line(row: dict[str, Any], now: float) -> str:
     """One schedule as `schedules` shows it: name, cadence and zone, the
-    profile, the last fire and the next due, and who paused it."""
+    profile, the ask's first line, who made it, the last fire and the
+    next due, and who paused it."""
     parts = [
         f"**{row['name']}** · {row['cadence']} ({row['timezone']}) · profile {code(row['profile'])}"
     ]
+    ask = str(row.get("ask") or "")
+    first = next((ln.strip() for ln in ask.splitlines() if ln.strip()), "")
+    if first:
+        parts.append(f"“{first[:80]}{'…' if len(first) > 80 else ''}”")
+    source = row.get("source")
+    if source and source != "config":
+        who = row.get("created_by")
+        parts.append(f"by {who}" if who else f"via {source}")
     last = row.get("last_fired_at")
     if last is not None:
         parts.append(f"last fired {_ago(now - float(last))} ({row.get('last_item')})")
@@ -353,6 +424,11 @@ def _dispatch(
         ]
         if s.get("stopping"):
             lines.append("**stopping:** yes — nothing new is claimed; exits after the current run")
+        if s.get("source_failures"):
+            lines.append(
+                f"**source:** polling failed {s['source_failures']} time(s); "
+                f"retry in {s.get('source_retry_in_s', 0):.0f}s — check the daemon logs"
+            )
         repos = [r for r in (s.get("repos") or []) if isinstance(r, dict)]
         unwell = [r for r in repos if r.get("state") != "ok"]
         if unwell:

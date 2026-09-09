@@ -25,6 +25,7 @@ from sbxloop.gc import (
     workspace_pruned,
 )
 from sbxloop.paths import SbxloopHome
+from tests.fakes.rawdb import backdate
 
 runner = CliRunner()
 
@@ -65,10 +66,7 @@ def seed_run(
     store.set_run_state(run_id, state)  # type: ignore[arg-type]
     if kept:
         store.set_run_kept(run_id, kept)
-    store._conn.execute(
-        "UPDATE runs SET updated_at = ? WHERE run_id = ?", (NOW - age_days * DAY_S, run_id)
-    )
-    store._conn.commit()
+    backdate(store, run_id, NOW - age_days * DAY_S)
     return run_dir
 
 
@@ -188,10 +186,7 @@ class TestPrune:
         checkout = tmp_path / "checkout"
         checkout.mkdir()
         store.set_run_workspace("rbbbbbbb4", checkout, mounted=True)
-        store._conn.execute(
-            "UPDATE runs SET updated_at = ? WHERE run_id = ?", (NOW - 30 * DAY_S, "rbbbbbbb4")
-        )
-        store._conn.commit()
+        backdate(store, "rbbbbbbb4", NOW - 30 * DAY_S)
         result = prune_run_dirs(store, state_dir, older_than_s=RETENTION, now=NOW)
         assert result.pruned == ["rbbbbbbb4"]
         assert checkout.exists()
@@ -453,15 +448,8 @@ class TestCli:
         # re-age relative to now.
         import time
 
-        store._conn.execute(
-            "UPDATE runs SET updated_at = ? WHERE run_id = ?",
-            (time.time() - 30 * DAY_S, "reeeeeee1"),
-        )
-        store._conn.execute(
-            "UPDATE runs SET updated_at = ? WHERE run_id = ?",
-            (time.time() - 1 * DAY_S, "reeeeeee2"),
-        )
-        store._conn.commit()
+        backdate(store, "reeeeeee1", time.time() - 30 * DAY_S)
+        backdate(store, "reeeeeee2", time.time() - 1 * DAY_S)
         return store, old, young
 
     def test_gc_dry_run_reports_and_keeps(self, workdir: Path) -> None:

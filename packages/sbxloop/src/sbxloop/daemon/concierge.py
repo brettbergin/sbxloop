@@ -41,7 +41,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
 from urllib.parse import quote
 
 from sbxloop.cli.tui import format_event
-from sbxloop.config import SINK_NAMES, BridgeBackend, Config
+from sbxloop.config import SINK_NAMES, BridgeBackend, Config, ScheduleConfig
 from sbxloop.daemon.chat_choices import (
     ChoiceQuestion,
     PendingFiling,
@@ -61,8 +61,10 @@ from sbxloop.daemon.usage import (
     usage_rows,
 )
 from sbxloop.daemon.versions import VersionProbe
+from sbxloop.engine.harness import harness_context
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunState
 from sbxloop.engine.prompts import bullet_list, render
+from sbxloop.engine.skilltools import SKILL_TOOL_NAME, answer_skill_call, skill_tool_spec
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     ConfigError,
@@ -104,6 +106,9 @@ STATE_SESSION_ID = "concierge_session_id"
 STATE_SESSION_TURNS = "concierge_session_turns"
 
 _RUN_STATES = list(get_args(RunState))
+# The daemon's view of an issue, from its lifecycle labels (#565, #609):
+# the four labels, and `backlog` for an issue carrying none of them.
+_ISSUE_STATES: tuple[str, ...] = ("queued", "running", "failed", "blocked", "backlog")
 #: Run states that mean the run is over — nothing more will happen to it, so a
 #: watch on one of these is answered immediately instead of registered.
 _FINISHED_RUN_STATES = TERMINAL_RUN_STATES
@@ -450,6 +455,7 @@ class Concierge:
             expect="text",
             timeout_s=cfg.timeout_s,
             max_tool_calls=cfg.max_tool_calls,
+            mcp_servers=self.config.mcp_specs_for("concierge"),
             host_tools=[t.spec for t in self._tools.values()],
             host_tool_timeout_s=min(cfg.timeout_s, 120.0),
         )
@@ -572,7 +578,12 @@ class Concierge:
             f"`{daemon.workload_label}` label) ends `completed` once its result is "
             "published; it never opens a pull request unless a task asked for the `pr` sink",
         ]
-        return render(
+        # The situation briefing first, then the concierge's own template:
+        # the head is identical to what every other session in the loop is
+        # opened with (engine.harness), so the concierge's account of the
+        # machine cannot drift from the machine's.
+        briefing = harness_context(self.config, role="concierge")
+        body = render(
             "concierge",
             chat_name=self._chat_name,
             command_prefix=self._chat.command_prefix,
@@ -589,6 +600,7 @@ class Concierge:
             ),
             daemon_notes=bullet_list(notes),
         )
+        return f"{briefing}\n{body}"
 
     def _preamble(self, author: str) -> str:
         try:
@@ -663,14 +675,15 @@ class Concierge:
                         "retry <item> | requeue <item> | merge <item|run> | "
                         "release <item|run> | grant-rounds <run> <n> | "
                         "resume-repo <owner/name> | "
-                        "schedules [pause <name>|resume <name>]. Pass the "
+                        "schedules [pause <name>|resume <name>|remove <name>]. Pass the "
                         "command line without the prefix. Mutating commands take effect "
                         "immediately. merge approves a PR parked behind the merge gate; "
                         "release publishes a workload result the profile held back "
                         "(both only when the person asking clearly wants it). "
-                        "schedules lists the [[schedules]] workloads with their last fire "
-                        "and next due; schedules pause/resume parks one schedule's ticks "
-                        "without pausing the daemon. "
+                        "schedules lists the stored schedules (cadence, profile, ask, last "
+                        "fire, next due); schedules pause/resume parks one schedule's ticks "
+                        "without pausing the daemon; creating and deleting schedules are "
+                        "the `create_schedule` / `delete_schedule` tools, not this one. "
                         "grant-rounds gives a run that exhausted its fix "
                         'rounds n more and resumes it on its own PR at once ("give '
                         'rXXXX two more rounds"). Pause is a set '
@@ -849,6 +862,50 @@ class Concierge:
                 ),
                 self._tool_start_workload,
             ),
+            HostTool(
+                HostToolSpec(
+                    name="create_schedule",
+                    description=(
+                        "Create a SCHEDULE (#818): a workload the daemon queues by itself on "
+                        "a cadence, stored in the daemon's database and live from the next "
+                        "tick — no config file, no restart. `name` is an identifier "
+                        "(letters, digits, '.', '_', '-'); `ask` is the workload's ask in "
+                        "the person's words, as `start_workload` takes it; `profile` a "
+                        "`[[workloads]]` profile (omit for the daemon's default); exactly "
+                        'one of `every` (a period: "24h", "90m", "1h30m", at least '
+                        "1m, on a grid from now) or `cron` (five fields, names allowed: "
+                        '"0 7 * * mon-fri"); `timezone` an IANA zone the cron is read in '
+                        "(the daemon's run-cap zone when omitted). Interview first (see the "
+                        "guidance), then ONE call once every field is settled; the reply "
+                        "names the schedule and its first due tick."
+                    ),
+                    parameters=_schema(
+                        {
+                            "name": {"type": "string"},
+                            "ask": {"type": "string"},
+                            "profile": {"type": "string"},
+                            "every": {"type": "string"},
+                            "cron": {"type": "string"},
+                            "timezone": {"type": "string"},
+                        },
+                        ["name", "ask"],
+                    ),
+                ),
+                self._tool_create_schedule,
+            ),
+            HostTool(
+                HostToolSpec(
+                    name="delete_schedule",
+                    description=(
+                        "Delete a stored schedule by name (#818): no further ticks; a tick "
+                        "already queued or running is untouched. Only on an explicit yes "
+                        "naming the schedule — confirm with clickable choices first. To "
+                        "park one without deleting it, `sbx_control` `schedules pause`."
+                    ),
+                    parameters=_schema({"name": {"type": "string"}}, ["name"]),
+                ),
+                self._tool_delete_schedule,
+            ),
         ]
         if self.config.github.repo_list():
             tools.append(
@@ -996,8 +1053,11 @@ class Concierge:
                             "blocked), omit it for all, so the two views together cover every "
                             "issue exactly once. state narrows to one exact state: queued, "
                             "running, failed, blocked, or backlog (none of the daemon's four "
-                            "state labels); state and queued can be combined and both apply. "
-                            "Each line: number, "
+                            "state labels); states lists several (any of them matches — "
+                            "['failed', 'blocked'] is 'what needs a person'); exclude_states "
+                            "drops the listed ones (['queued', 'running'] leaves everything "
+                            "the daemon is not working on); state, states, exclude_states and "
+                            "queued can be combined and all apply. Each line: number, "
                             "title, labels, age, author, comments, url. Queue only what the "
                             "person names, with label_issue_for_run."
                         ),
@@ -1006,15 +1066,14 @@ class Concierge:
                                 "all": {"type": "boolean"},
                                 "label": {"type": "string"},
                                 "queued": {"type": "boolean"},
-                                "state": {
-                                    "type": "string",
-                                    "enum": [
-                                        "queued",
-                                        "running",
-                                        "failed",
-                                        "blocked",
-                                        "backlog",
-                                    ],
+                                "state": {"type": "string", "enum": list(_ISSUE_STATES)},
+                                "states": {
+                                    "type": "array",
+                                    "items": {"type": "string", "enum": list(_ISSUE_STATES)},
+                                },
+                                "exclude_states": {
+                                    "type": "array",
+                                    "items": {"type": "string", "enum": list(_ISSUE_STATES)},
                                 },
                                 "limit": {"type": "integer", "minimum": 1, "maximum": 50},
                                 "repo": {"type": "string"},
@@ -1096,7 +1155,23 @@ class Concierge:
                     self._tool_close_issue,
                 )
             )
+        # The skill tool last: it reaches nothing outside the host, so it is
+        # never gated on a repository or a credential the way the tools
+        # above are. It is also the concierge's ONLY door to a procedure —
+        # this session runs with `available_tools=[]`, so there is no reader
+        # and no shell to open a file with.
+        skill_spec = skill_tool_spec("concierge")
+        if skill_spec is not None:
+            tools.append(HostTool(skill_spec, self._tool_load_skill))
         return tools
+
+    @staticmethod
+    def _tool_load_skill(args: dict[str, Any], by: str) -> str:
+        call = HostToolCall(call_id="concierge", name=SKILL_TOOL_NAME, arguments=args)
+        response = answer_skill_call(call, "concierge")
+        if not response.ok:
+            raise ValueError(response.error or "no such skill")
+        return response.text
 
     def _thread_for(self, run_id: str) -> ChatThread | None:
         """The run's thread on the surface this turn is answered on, else
@@ -1451,6 +1526,66 @@ class Concierge:
             f"is published.{note}"
         )
 
+    def _tool_create_schedule(self, args: dict[str, Any], by: str) -> str:
+        name = str(args.get("name") or "").strip()
+        ask = str(args.get("ask") or "").strip()
+        if not name or not ask:
+            return "a name and an ask are required"
+        wanted = str(args.get("profile") or "").strip() or None
+        try:
+            profile = self.config.workload_profile(wanted)
+        except ConfigError as exc:
+            return str(exc)
+        if profile is None:
+            known = ", ".join(p.name for p in self.config.workloads) or "none"
+            return (
+                "a schedule needs a profile: no `[workload] default` is set, so name one "
+                f"(declared: {known})"
+            )
+        fields: dict[str, Any] = {"name": name, "profile": profile.name, "ask": ask}
+        for key in ("every", "cron", "timezone"):
+            value = str(args.get(key) or "").strip()
+            if value:
+                fields[key] = value
+        try:
+            spec = ScheduleConfig.model_validate(fields)
+        except ValueError as exc:
+            errors = getattr(exc, "errors", None)
+            first = errors()[0]["msg"] if callable(errors) else str(exc)
+            return f"that schedule is not valid: {first.removeprefix('Value error, ')}"
+        add = getattr(self.loop, "add_schedule", None)
+        if add is None:
+            return "this daemon cannot store schedules"
+        try:
+            text = str(add(spec, by, source=self._via))
+        except ValueError as exc:
+            return f"creating the schedule failed: {exc}"
+        log.info(
+            "concierge.schedule_created",
+            schedule=spec.name,
+            profile=spec.profile,
+            cadence=spec.cadence_text,
+            by=by,
+        )
+        return (
+            f"{text} `schedules` lists it; `schedules pause {spec.name}` parks it; "
+            "`delete_schedule` removes it."
+        )
+
+    def _tool_delete_schedule(self, args: dict[str, Any], by: str) -> str:
+        name = str(args.get("name") or "").strip()
+        if not name:
+            return "a schedule name is required"
+        remove = getattr(self.loop, "remove_schedule", None)
+        if remove is None:
+            return "this daemon cannot store schedules"
+        try:
+            text = str(remove(name, by))
+        except ValueError as exc:
+            return f"deleting the schedule failed: {exc}"
+        log.info("concierge.schedule_deleted", schedule=name, by=by)
+        return text
+
     def _tool_list_repos(self, args: dict[str, Any], by: str) -> str:
         entries = self.config.github.repo_list()
         if not entries:
@@ -1650,12 +1785,6 @@ class Concierge:
         queued_arg = args.get("queued")
         state_arg = str(args.get("state") or "").strip().lower()
         subset_parts: list[str] = []
-        state_labels = {
-            lifecycle.trigger,
-            lifecycle.in_progress,
-            lifecycle.failed,
-            lifecycle.blocked,
-        }
         active_labels = {lifecycle.trigger, lifecycle.in_progress}
         if queued_arg is not None:
             want_queued = bool(queued_arg)
@@ -1672,13 +1801,27 @@ class Concierge:
             "failed": lifecycle.failed,
             "blocked": lifecycle.blocked,
         }
-        if state_arg == "backlog":
-            issues = [d for d in issues if not (set(_label_names(d)) & state_labels)]
-            subset_parts.append("backlog")
-        elif state_arg in state_label_by_name:
-            wanted = state_label_by_name[state_arg]
-            issues = [d for d in issues if wanted in _label_names(d)]
-            subset_parts.append(state_arg)
+
+        def _states_of(issue: dict[str, Any]) -> set[str]:
+            labels = set(_label_names(issue))
+            found = {name for name, lb in state_label_by_name.items() if lb in labels}
+            return found or {"backlog"}
+
+        # One state, several (any matches, #609), or everything but some:
+        # "what needs a person" is failed OR blocked, which `state` alone
+        # could not say and `queued: false` says too broadly.
+        wanted_states = _state_list(args.get("states"))
+        if state_arg in _ISSUE_STATES:
+            wanted_states = [*wanted_states, state_arg]
+        excluded_states = _state_list(args.get("exclude_states"))
+        if wanted_states:
+            keep = set(wanted_states)
+            issues = [d for d in issues if _states_of(d) & keep]
+            subset_parts.append("|".join(dict.fromkeys(wanted_states)))
+        if excluded_states:
+            drop = set(excluded_states)
+            issues = [d for d in issues if not (_states_of(d) & drop)]
+            subset_parts.append("not-" + "|".join(dict.fromkeys(excluded_states)))
         subset = "".join(f" {part}" for part in subset_parts)
         if not issues:
             return f"no{subset} {openness} issues in {repo}" + (
@@ -1908,17 +2051,29 @@ def _label_names(data: Any) -> list[str]:
     return [str(lb.get("name")) for lb in data.get("labels") or [] if isinstance(lb, dict)]
 
 
+def _state_list(raw: Any) -> list[str]:
+    """The issue states an argument names — a list, or one name — kept to
+    the known ones, in order, without repeats."""
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, list | tuple):
+        return []
+    out: list[str] = []
+    for entry in raw:
+        name = str(entry or "").strip().lower()
+        if name in _ISSUE_STATES and name not in out:
+            out.append(name)
+    return out
+
+
 def _remove_label(ops: GithubOps, issue_path: str, label: str) -> None:
     """DELETE a label, treating "it was not there" (404 on the label
     resource) as success — same tolerance as ``GitHubIssueSource``. Swallowed
     inside the ``DaemonGithub.call`` lambda so a 404 never looks like a dead
     sandbox and triggers its drop-and-retry."""
-    try:
-        ops.raw("DELETE", f"{issue_path}/labels/{quote(label, safe='')}")
-    except GithubOpsError as exc:
-        missing = exc.http_status == 404 if exc.http_status is not None else "HTTP 404" in str(exc)
-        if not missing:
-            raise
+    from sbxloop.gh.ops import raw_lookup
+
+    raw_lookup(ops, "DELETE", f"{issue_path}/labels/{quote(label, safe='')}")
 
 
 def _work_item_note(item: WorkItem | None) -> str:

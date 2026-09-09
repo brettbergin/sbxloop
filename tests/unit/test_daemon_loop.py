@@ -7,6 +7,7 @@ StateStore run on a tmp db so persistence paths are exercised for real.
 from __future__ import annotations
 
 import shutil
+import sqlite3
 import threading
 import time
 from datetime import UTC, datetime
@@ -33,6 +34,7 @@ from sbxloop.engine.model import (
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
+from tests.fakes.rawdb import backdate, query_raw
 from tests.unit.test_hostgit import (
     git as git_cmd,
 )
@@ -1301,7 +1303,17 @@ class TestSourceBackoff:
         flaky = Flaky([gh_item()])
         h.loop.source = flaky
         interval = h.config.daemon.poll_interval_s
+        assert h.loop.status()["source_failures"] == 0
         h.loop.tick()  # failure 1 -> next poll in 2*interval
+        status = h.loop.status()
+        assert status["source_failures"] == 1
+        assert status["source_retry_in_s"] == 2 * interval
+        assert status["consecutive_failures"] == 0
+        from sbxloop.daemon.control import dispatch
+        from sbxloop.daemon.discord_format import COLOR_WARN, status_embed
+
+        assert "polling failed" in dispatch(h.loop, "status").text
+        assert status_embed(status).color == COLOR_WARN
         h.loop.tick()  # skipped
         assert polls == 1
         h.clock.t += 2 * interval
@@ -1315,6 +1327,34 @@ class TestSourceBackoff:
         result = h.loop.tick()  # recovers and dispatches
         assert polls == 4 and result.dispatched == "gh:issue:1"
         assert h.loop._source_failures == 0
+        assert h.loop.status()["source_failures"] == 0
+        assert h.loop.status()["source_retry_in_s"] == 0
+        assert "polling failed" not in dispatch(h.loop, "status").text
+
+    def test_one_unrecordable_item_does_not_take_the_daemon_down(self, tmp_path: Path) -> None:
+        """A poll that raises is backed off, but recording an item used to
+        have no guard at all: the exception left ``upsert_new``, went
+        through ``tick()`` and ``run_forever()`` and killed the process.
+        Discovery is deterministic, so the next start died on the same item
+        — on db that was six restarts before systemd gave up (2026-09-07).
+        The bad item is skipped and its healthy neighbours still queue."""
+        h = Harness(tmp_path)
+        poisoned, healthy = gh_item("1"), gh_item("2")
+
+        real = h.dstore.upsert_new
+
+        def explode(item: WorkItem, now: float) -> bool:
+            if item.item_id == poisoned.item_id:
+                raise sqlite3.IntegrityError("UNIQUE constraint failed")
+            return real(item, now)
+
+        h.dstore.upsert_new = explode  # type: ignore[method-assign]
+        h.loop.source = FakeSource([poisoned, healthy])
+
+        result = h.loop.tick()
+
+        assert result.dispatched == "gh:issue:2"
+        assert h.dstore.get("gh:issue:1") is None
 
     def test_recover_failed_run_takes_failure_path(self, tmp_path: Path) -> None:
         cfg = Config.model_validate(
@@ -1535,10 +1575,8 @@ class TestOperatorItemControls:
         h.loop.recover()
         assert h.source.calls == [("abandoned", "operator: doomed plan")]
         assert removed == ["sbxloop-r_dead-agent", "sbxloop-r_dead-github"]
-        row = h.dstore._conn.execute(
-            "SELECT result FROM daemon_runs WHERE run_id = 'r_dead'"
-        ).fetchone()
-        assert row["result"] == "abandoned"
+        rows = query_raw(h.dstore, "SELECT result FROM daemon_runs WHERE run_id = 'r_dead'")
+        assert rows[0][0] == "abandoned"
         item = h.dstore.get("gh:issue:1")
         assert item is not None and item.state == "failed" and item.run_id == "r_dead"
         assert h.loop.tick().idle_kind == "no_work"
@@ -1557,10 +1595,8 @@ class TestOperatorItemControls:
         h.store.set_run_state("r_dead", "building")
         h.dstore.requeue("gh:issue:1", 4.0)
         h.loop.recover()
-        row = h.dstore._conn.execute(
-            "SELECT result FROM daemon_runs WHERE run_id = 'r_dead'"
-        ).fetchone()
-        assert row["result"] == "requeued"
+        rows = query_raw(h.dstore, "SELECT result FROM daemon_runs WHERE run_id = 'r_dead'")
+        assert rows[0][0] == "requeued"
         assert not any(c[0] in ("abandoned", "cancelled") for c in h.source.calls)
         h.clock.t += 10_000
         assert h.loop.tick().outcome == "done"
@@ -2144,10 +2180,7 @@ class TestStaleRunReconciliation:
 
     @staticmethod
     def _age(h: Harness, run_id: str, updated_at: float) -> None:
-        h.store._conn.execute(
-            "UPDATE runs SET updated_at = ? WHERE run_id = ?", (updated_at, run_id)
-        )
-        h.store._conn.commit()
+        backdate(h.store, run_id, updated_at)
 
     @staticmethod
     def _stale_harness(tmp_path: Path) -> Harness:

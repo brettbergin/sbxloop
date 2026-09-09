@@ -35,6 +35,81 @@ def make_workspace(tmp_path: Path) -> Path:
     return root
 
 
+class TestRawLookupIsNotAFailedJob:
+    """#558: the fake's ``raw_lookup`` keeps the real one's contract — a
+    listed miss is an answer with no ledger entry, anything else records."""
+
+    def test_a_listed_miss_answers_none_without_a_ledger_entry(self) -> None:
+        fake = FakeGithub()
+        fake.fail_once["raw"] = GithubOpsError("not found", http_status=404)
+        assert fake.raw_lookup("GET", "/repos/o/r/compare/main...x") is None
+        fake.assert_no_failed_jobs()
+
+    def test_an_unlisted_status_still_records_and_raises(self) -> None:
+        fake = FakeGithub()
+        fake.fail_once["raw"] = GithubOpsError("forbidden", http_status=403)
+        with pytest.raises(GithubOpsError):
+            fake.raw_lookup("GET", "/repos/o/r/x")
+        assert fake.failed_job_paths == ["raw"]
+
+    def test_the_helper_falls_back_for_a_stand_in_without_the_method(self) -> None:
+        from sbxloop.gh.ops import raw_lookup
+
+        class Bare:
+            def raw(self, method: str, path: str, body: Any = None) -> Any:
+                raise GithubOpsError("gone", http_status=404)
+
+        assert raw_lookup(Bare(), "DELETE", "/x") is None
+        with pytest.raises(GithubOpsError):
+            raw_lookup(Bare(), "DELETE", "/x", missing=(422,))
+
+
+class TestLookupsAreRawCalls:
+    """#607: the repository and ref probes go through ``raw`` like the real
+    facade's ops do, so they appear in the ledger, a miss costs no failed
+    job, and the non-404 branches the real ``ref_lookup`` has — a refusal,
+    an empty repository's 409, a malformed answer — can be exercised."""
+
+    def test_repo_lookup_is_one_raw_get_and_a_miss_is_data(self) -> None:
+        fake = FakeGithub()
+        found = fake.repo_lookup("o/r")
+        assert found is not None and found["default_branch"] == fake.repo_payload["default_branch"]
+        assert found["has_issues"] is True  # the engine's up-front probe reads it (#631)
+        assert fake.raw_calls == [("GET", "/repos/o/r", None)]
+        fake.repo_missing = True
+        assert fake.repo_lookup("o/r") is None
+        fake.assert_no_failed_jobs()
+
+    def test_ref_lookup_is_one_raw_get_with_the_real_facades_branches(self) -> None:
+        fake = FakeGithub()
+        assert fake.ref_lookup("o/r", "heads/main") == "base123"
+        assert fake.raw_calls[-1] == ("GET", "/repos/o/r/git/ref/heads/main", None)
+        # A delivery branch exists only once delivery created it.
+        assert fake.ref_lookup("o/r", "heads/sbxloop/r1") is None
+        fake.branches.add("sbxloop/r1")
+        assert fake.ref_lookup("o/r", "heads/sbxloop/r1") == fake.head_sha
+        # A base that is gone, or not visible to the token.
+        fake.missing_refs.add("main")
+        assert fake.ref_lookup("o/r", "heads/main") is None
+        fake.assert_no_failed_jobs()  # every miss so far was an answer
+        # The empty-repository answer is a 409, and still an answer.
+        fake.empty_repo = True
+        assert fake.ref_lookup("o/r", "heads/main") is None
+        fake.assert_no_failed_jobs()
+        fake.empty_repo = False
+        # An answer without a sha raises the way the real facade does.
+        fake.malformed_refs.add("develop")
+        with pytest.raises(GithubOpsError, match="no sha"):
+            fake.ref_lookup("o/r", "heads/develop")
+
+    def test_a_refusal_on_a_lookup_records_and_raises(self) -> None:
+        fake = FakeGithub()
+        fake.fail_once["raw"] = GithubOpsError("forbidden", http_status=403)
+        with pytest.raises(GithubOpsError):
+            fake.ref_lookup("o/r", "heads/main")
+        assert fake.failed_job_paths == ["raw"]
+
+
 class TestLedgerRecordsFailures:
     """A raw() call GitHub refuses is a failed worker job, and says so."""
 

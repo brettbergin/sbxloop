@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import logging
 import subprocess
 import urllib.error
 from pathlib import Path
@@ -230,6 +231,28 @@ class TestMint:
             ),
         )
         assert mint_installation_token(self.creds(rsa_key), now=1000.0).permissions is None
+
+    def test_minted_log_line_renders_expiry_in_utc(
+        self, rsa_key: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """``github.app_token_minted`` logs ``expires_at`` in UTC with an
+        offset, next to the journal's UTC timestamps (#753) — never the
+        host's naive local time."""
+        monkeypatch.setattr(
+            "urllib.request.urlopen",
+            lambda request, timeout: _Resp(
+                {"token": "ghs_x", "expires_at": "2026-09-04T21:53:40Z"}
+            ),
+        )
+        with caplog.at_level(logging.INFO):
+            mint_installation_token(self.creds(rsa_key), now=1000.0)
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if r.name == "sbxloop.gh.appauth" and "app_token_minted" in r.getMessage()
+        ]
+        assert len(lines) == 1
+        assert "'expires_at': '2026-09-04T21:53:40+00:00'" in lines[0]
 
     def test_unparseable_expiry_falls_back_early(
         self, rsa_key: Path, monkeypatch: pytest.MonkeyPatch

@@ -22,7 +22,9 @@ class ReviewAgent:
     def __init__(self) -> None:
         self.prompts: list[str] = []
 
-    def submit(self, job: JobRequest, *, agent: str | None = None) -> JobResult:
+    def submit(
+        self, job: JobRequest, *, agent: str | None = None, tool_handler: Any = None
+    ) -> JobResult:
         assert job.prompt is not None
         self.prompts.append(job.prompt)
         return JobResult(

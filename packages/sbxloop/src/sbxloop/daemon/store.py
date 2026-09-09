@@ -31,14 +31,60 @@ import re
 import sqlite3
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
+from sqlalchemy import (
+    ColumnElement,
+    Integer,
+    Result,
+    Select,
+    Text,
+    delete,
+    func,
+    insert,
+    inspect,
+    select,
+    text,
+    update,
+)
+from sqlalchemy.dialects.sqlite import insert as sqlite_insert
+from sqlalchemy.engine import CursorResult
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.orm import InstrumentedAttribute, Session, aliased
+
+from sbxloop.config import ScheduleConfig
 from sbxloop.daemon.model import ItemState, PendingReport, WorkItem
 from sbxloop.daemon.schedule import ScheduleRow
+from sbxloop.db import begin_immediate, ensure_schema, open_engine
+from sbxloop.db.daemon_models import (
+    ChatThreadRow,
+    DaemonRunRow,
+    DaemonStateRow,
+    GatePromptRow,
+    LocalMessageRow,
+    MergeGateRow,
+    PendingClarificationRow,
+    PriorAttemptRow,
+    RequesterRow,
+    ReviewHoldRow,
+    RunResumeRow,
+    RunWatchRow,
+    ScheduleRowModel,
+    WorkItemRow,
+)
+from sbxloop.engine.model import RunKind
 from sbxloop.errors import DaemonError
-from sbxloop.ghids import CHAT_PREFIX, GH_PREFIX, SCHED_PREFIX, normalize_item_id, try_parse_gh_id
+from sbxloop.ghids import (
+    CHAT_PREFIX,
+    GH_PREFIX,
+    SCHED_PREFIX,
+    format_gh_id,
+    normalize_item_id,
+    try_parse_gh_id,
+)
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -107,11 +153,22 @@ _REQUESTERS_BODY = """(
 )"""
 
 _REQUESTERS_COLUMNS = "source_key, requester_id, created_at"
+
+
 # The repo-less rows that are repo-less by design (#760, #761): a
 # chat-started or scheduled workload has no repository to backfill,
 # attribute or drop it for. The ids are literal-prefixed, so the clause is
 # a constant, not a parameter.
-_NOT_LOCAL = f"item_id NOT LIKE '{CHAT_PREFIX}%' AND item_id NOT LIKE '{SCHED_PREFIX}%'"
+def _not_local() -> ColumnElement[bool]:
+    """Rows that belong to a repository at all.
+
+    A chat item or a schedule's item has no repository by design, not by
+    age, so the multi-repo settling passes must leave them alone.
+    """
+    return ~WorkItemRow.item_id.like(f"{CHAT_PREFIX}%") & ~WorkItemRow.item_id.like(
+        f"{SCHED_PREFIX}%"
+    )
+
 
 _CHAT_THREADS_BODY = (
     "(run_id TEXT NOT NULL, backend TEXT NOT NULL DEFAULT 'discord', "
@@ -125,6 +182,16 @@ _RUN_WATCHES_BODY = (
 )
 _RUN_WATCHES_COLUMNS = "run_id, watcher_id, created_at"
 
+# FROZEN. This schema, the table bodies above it and the ALTERs in
+# `apply_daemon_schema` are the daemon half of Alembic revision 0001, and
+# 0001 has shipped: every deployed database is already stamped at it, so
+# Alembic will never run this code against one again. A column added here
+# now reaches a fresh install and nothing else, and the field crashes on
+# the first query that selects it.
+#
+# To change the schema, add a revision under db/migrations/versions instead.
+# `tests/unit/test_db_schema.py` freezes the shape this produces and will
+# fail if it moves.
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS daemon_work_items {_WORK_ITEMS_BODY};
 CREATE INDEX IF NOT EXISTS idx_daemon_items_state ON daemon_work_items(state, created_at);
@@ -329,12 +396,18 @@ CREATE INDEX IF NOT EXISTS idx_local_messages_updated
 CREATE INDEX IF NOT EXISTS idx_local_messages_pending
     ON daemon_local_messages(id) WHERE direction = 'in' AND taken_at IS NULL;
 
--- One row per `[[schedules]]` entry the daemon has seen (#761). anchor is
--- when it was first seen — the origin of an `every` grid; last_due the
--- latest due instant acted on (fired, skipped or swallowed while paused),
--- so a late daemon catches up with one tick and never re-fires one;
--- last_fired_at / last_item the fire that actually queued something;
--- paused_by who parked the schedule (`schedules pause <name>`).
+-- One row per schedule (#761, #818): the schedule itself — profile, ask,
+-- one cadence (every or cron), timezone, where it came from and who made
+-- it — and its state. The daemon's database is the home of schedules: a
+-- `[[schedules]]` entry in sbxloop.toml is imported into a row once and
+-- is redundant after that. anchor is when the schedule was first seen —
+-- the origin of an `every` grid; last_due the latest due instant acted on
+-- (fired, skipped or swallowed while paused), so a late daemon catches up
+-- with one tick and never re-fires one; last_fired_at / last_item the
+-- fire that actually queued something; paused_by who parked the schedule
+-- (`schedules pause <name>`). A row whose ask is NULL is state left by a
+-- schedule that was removed, or written by a daemon from before the spec
+-- lived here: it fires nothing.
 CREATE TABLE IF NOT EXISTS daemon_schedules (
     name          TEXT PRIMARY KEY,
     anchor        REAL NOT NULL,
@@ -342,7 +415,15 @@ CREATE TABLE IF NOT EXISTS daemon_schedules (
     last_fired_at REAL,
     last_item     TEXT,
     paused_by     TEXT,
-    paused_at     REAL
+    paused_at     REAL,
+    profile       TEXT,
+    ask           TEXT,
+    every         TEXT,
+    cron          TEXT,
+    timezone      TEXT,
+    source        TEXT,
+    created_by    TEXT,
+    created_at    REAL
 );
 """
 #: The schema's index statements alone, for a rebuild to recreate inside
@@ -421,69 +502,92 @@ class ReviewHold(NamedTuple):
     detail: str | None
 
 
-def _row_to_hold(row: sqlite3.Row) -> ReviewHold:
+def _row_to_hold(row: ReviewHoldRow) -> ReviewHold:
     try:
-        notify = tuple(str(v) for v in json.loads(row["notify_ids"] or "[]"))
+        notify = tuple(str(v) for v in json.loads(row.notify_ids or "[]"))
     except ValueError:
         notify = ()
-    is_bot = row["is_bot"]
+    is_bot = row.is_bot
     return ReviewHold(
-        run_id=row["run_id"],
-        item_id=normalize_item_id(str(row["item_id"])),
-        repo=row["repo"],
-        pr_number=int(row["pr_number"]),
-        pr_url=row["pr_url"] or "",
-        branch=row["branch"],
-        login=str(row["login"] or ""),
+        run_id=row.run_id,
+        item_id=normalize_item_id(str(row.item_id)),
+        repo=row.repo,
+        pr_number=int(row.pr_number),
+        pr_url=row.pr_url or "",
+        branch=row.branch,
+        login=str(row.login or ""),
         is_bot=None if is_bot is None else bool(is_bot),
-        approvals_required=int(row["approvals_required"] or 0),
-        held_by_draft=bool(row["held_by_draft"]),
+        approvals_required=int(row.approvals_required or 0),
+        held_by_draft=bool(row.held_by_draft),
         notify_ids=notify,
-        state=row["state"],
-        created_at=row["created_at"],
-        since_at=row["since_at"],
-        next_poll_at=row["next_poll_at"],
-        polls=int(row["polls"] or 0),
-        resolved_at=row["resolved_at"],
-        resolved_by=row["resolved_by"],
-        detail=row["detail"],
+        state=row.state,
+        created_at=row.created_at,
+        since_at=row.since_at,
+        next_poll_at=row.next_poll_at,
+        polls=int(row.polls or 0),
+        resolved_at=row.resolved_at,
+        resolved_by=row.resolved_by,
+        detail=row.detail,
     )
 
 
-def _row_to_schedule(row: sqlite3.Row) -> ScheduleRow:
+def _row_to_schedule(row: ScheduleRowModel) -> ScheduleRow:
     return ScheduleRow(
-        name=str(row["name"]),
-        anchor=float(row["anchor"]),
-        last_due=None if row["last_due"] is None else float(row["last_due"]),
-        last_fired_at=None if row["last_fired_at"] is None else float(row["last_fired_at"]),
-        last_item=None if row["last_item"] is None else str(row["last_item"]),
-        paused_by=None if row["paused_by"] is None else str(row["paused_by"]),
-        paused_at=None if row["paused_at"] is None else float(row["paused_at"]),
+        name=str(row.name),
+        anchor=float(row.anchor),
+        last_due=None if row.last_due is None else float(row.last_due),
+        last_fired_at=None if row.last_fired_at is None else float(row.last_fired_at),
+        last_item=None if row.last_item is None else str(row.last_item),
+        paused_by=None if row.paused_by is None else str(row.paused_by),
+        paused_at=None if row.paused_at is None else float(row.paused_at),
     )
 
 
-def _row_to_gate(row: sqlite3.Row) -> MergeGate:
+def _row_to_spec(row: ScheduleRowModel) -> ScheduleConfig:
+    """The schedule a row holds. Validated on the way out as on the way
+    in, so a row an operator edited by hand cannot fire a cadence the
+    daemon cannot read."""
+    return ScheduleConfig(
+        name=str(row.name),
+        profile=str(row.profile),
+        ask=str(row.ask),
+        every=None if row.every is None else str(row.every),
+        cron=None if row.cron is None else str(row.cron),
+        timezone=None if row.timezone is None else str(row.timezone),
+    )
+
+
+class StoredSchedule(NamedTuple):
+    """A schedule as the store holds it: the spec plus its provenance."""
+
+    spec: ScheduleConfig
+    source: str  # "config" (imported from sbxloop.toml), "chat", "ctl", …
+    created_by: str | None
+    created_at: float | None
+
+
+def _row_to_gate(row: MergeGateRow) -> MergeGate:
     try:
-        notify = tuple(str(v) for v in json.loads(row["notify_ids"] or "[]"))
+        notify = tuple(str(v) for v in json.loads(row.notify_ids or "[]"))
     except ValueError:
         notify = ()
     return MergeGate(
-        run_id=row["run_id"],
-        item_id=normalize_item_id(str(row["item_id"])),
-        repo=row["repo"],
-        pr_number=int(row["pr_number"]),
-        pr_url=row["pr_url"] or "",
-        branch=row["branch"],
+        run_id=row.run_id,
+        item_id=normalize_item_id(str(row.item_id)),
+        repo=row.repo,
+        pr_number=int(row.pr_number),
+        pr_url=row.pr_url or "",
+        branch=row.branch,
         notify_ids=notify,
-        custom_id=row["custom_id"],
-        state=row["state"],
-        prompt_channel_id=row["prompt_channel_id"],
-        prompt_message_id=row["prompt_message_id"],
-        created_at=row["created_at"],
-        resolved_at=row["resolved_at"],
-        resolved_by=row["resolved_by"],
-        detail=row["detail"],
-        kind=str(row["kind"] or "merge"),
+        custom_id=row.custom_id,
+        state=row.state,
+        prompt_channel_id=row.prompt_channel_id,
+        prompt_message_id=row.prompt_message_id,
+        created_at=row.created_at,
+        resolved_at=row.resolved_at,
+        resolved_by=row.resolved_by,
+        detail=row.detail,
+        kind=str(row.kind or "merge"),
     )
 
 
@@ -533,44 +637,79 @@ class LocalMessage(NamedTuple):
     reply_to_direction: str | None = None
 
 
-def _row_to_local_message(row: sqlite3.Row) -> LocalMessage:
+def _row_to_local_message(row: Any) -> LocalMessage:
+    """One mailbox row.
+
+    Typed loosely because it is handed two shapes: a mapped
+    :class:`LocalMessageRow`, and the joined row the reads below select —
+    the same columns plus ``reply_to_direction`` off the self-join, which
+    is what tells an inbound reply to the bot from a reply to a person. A
+    bare model has no such attribute, hence the ``getattr``.
+    """
     try:
-        reactions = tuple(str(r) for r in json.loads(row["reactions_json"] or "[]"))
+        reactions = tuple(str(r) for r in json.loads(row.reactions_json or "[]"))
     except ValueError:
         reactions = ()
     return LocalMessage(
-        id=int(row["id"]),
-        direction=str(row["direction"]),
-        channel_id=str(row["channel_id"]),
-        kind=str(row["kind"]),
-        text=str(row["text"] or ""),
-        embed_json=_text_or_none(row["embed_json"]),
-        choices_json=_text_or_none(row["choices_json"]),
-        gate_run_id=_text_or_none(row["gate_run_id"]),
-        reply_to_id=None if row["reply_to_id"] is None else int(row["reply_to_id"]),
-        mention_users=bool(row["mention_users"]),
-        author_id=str(row["author_id"]),
-        author_name=str(row["author_name"]),
+        id=int(row.id),
+        direction=str(row.direction),
+        channel_id=str(row.channel_id),
+        kind=str(row.kind),
+        text=str(row.text or ""),
+        embed_json=_text_or_none(row.embed_json),
+        choices_json=_text_or_none(row.choices_json),
+        gate_run_id=_text_or_none(row.gate_run_id),
+        reply_to_id=None if row.reply_to_id is None else int(row.reply_to_id),
+        mention_users=bool(row.mention_users),
+        author_id=str(row.author_id),
+        author_name=str(row.author_name),
         reactions=reactions,
-        created_at=float(row["created_at"]),
-        edited_at=None if row["edited_at"] is None else float(row["edited_at"]),
-        updated_at=float(row["updated_at"] or 0.0),
-        taken_at=None if row["taken_at"] is None else float(row["taken_at"]),
-        reply_to_direction=_text_or_none(row["reply_to_direction"]),
+        created_at=float(row.created_at),
+        edited_at=None if row.edited_at is None else float(row.edited_at),
+        updated_at=float(row.updated_at or 0.0),
+        taken_at=None if row.taken_at is None else float(row.taken_at),
+        reply_to_direction=_text_or_none(getattr(row, "reply_to_direction", None)),
     )
 
 
-#: Everything the mailbox reads select, joined to the replied-to row's
-#: direction; shared by the store and the console's read-only handle.
-LOCAL_MESSAGE_SELECT = (
-    "SELECT m.*, r.direction AS reply_to_direction FROM daemon_local_messages m "
-    "LEFT JOIN daemon_local_messages r ON r.id = m.reply_to_id"
-)
-#: The same read, pinned to the change-stamp index for the changed-since poll.
-LOCAL_MESSAGE_SELECT_BY_UPDATE = LOCAL_MESSAGE_SELECT.replace(
-    "FROM daemon_local_messages m ",
-    "FROM daemon_local_messages m INDEXED BY idx_local_messages_updated ",
-)
+#: The replied-to row, joined in so a read can tell an inbound reply to the
+#: bot from a reply to a person.
+_REPLIED_TO = aliased(LocalMessageRow, name="r")
+
+
+def _local_message_select() -> Select[Any]:
+    """Everything a mailbox read selects, with the replied-to direction.
+
+    A function rather than a constant because a Select is mutable-by-copy
+    and every caller narrows it differently.
+    """
+    return select(LocalMessageRow, _REPLIED_TO.direction.label("reply_to_direction")).outerjoin(
+        _REPLIED_TO, _REPLIED_TO.id == LocalMessageRow.reply_to_id
+    )
+
+
+def _local_messages(session: Session, stmt: Select[Any]) -> list[LocalMessage]:
+    """Run a joined mailbox read and shape every row."""
+    return [_row_to_local_message(_Joined(row)) for row in session.execute(stmt)]
+
+
+class _Joined:
+    """The mapped row and its joined ``reply_to_direction`` as one object.
+
+    ``_row_to_local_message`` reads attributes; this puts the extra column
+    beside the model's own without copying every field by hand.
+    """
+
+    __slots__ = ("_extra", "_row")
+
+    def __init__(self, row: Any) -> None:
+        self._row = row[0]
+        self._extra = row.reply_to_direction
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "reply_to_direction":
+            return self._extra
+        return getattr(self._row, name)
 
 
 class ChatThread(NamedTuple):
@@ -585,13 +724,13 @@ class ChatThread(NamedTuple):
     backend: str = "discord"
 
 
-def _row_to_chat_thread(row: sqlite3.Row) -> ChatThread:
+def _row_to_chat_thread(row: ChatThreadRow) -> ChatThread:
     return ChatThread(
-        str(row["channel_id"]),
-        str(row["thread_id"]),
-        _text_or_none(row["headline_id"]),
-        _text_or_none(row["status_id"]),
-        str(row["backend"] or "discord"),
+        str(row.channel_id),
+        str(row.thread_id),
+        _text_or_none(row.headline_id),
+        _text_or_none(row.status_id),
+        str(row.backend or "discord"),
     )
 
 
@@ -629,11 +768,19 @@ def _id_variants(item_id: str) -> tuple[str, str]:
 
     Non-GitHub ids (``inbox:x.md``) come back duplicated, so callers can
     always bind exactly two parameters.
+
+    A **repo-qualified** id comes back duplicated too. The bare form encodes
+    only the issue number, so offering it as a variant of a qualified id
+    would let a lookup for one repository's issue #24 match a bare
+    ``gh:24`` row belonging to a different repository — the same
+    number-is-not-identity confusion that collides the primary key in
+    :meth:`DaemonStore._free_item_id`. A qualified id names its repository
+    and matches only itself.
     """
     parsed = try_parse_gh_id(item_id)
     if parsed is None:
         return (item_id, item_id)
-    if parsed.kind == "issue":
+    if parsed.kind == "issue" and parsed.repo is None:
         return (parsed.item_id, f"{GH_PREFIX}{parsed.number}")
     return (parsed.item_id, parsed.item_id)
 
@@ -644,39 +791,30 @@ def _id_match(item_id: str) -> tuple[str, tuple[str, str]]:
     return ("item_id IN (?, ?)", _id_variants(item_id))
 
 
-def _col(row: sqlite3.Row, name: str) -> Any:
-    """A column that may be absent from a row selected before its migration
-    ran (a raw pre-#600 database read by an older SELECT)."""
-    try:
-        return row[name]
-    except (IndexError, KeyError):
-        return None
-
-
-def _row_to_item(row: sqlite3.Row) -> WorkItem:
+def _row_to_item(row: WorkItemRow) -> WorkItem:
     return WorkItem(
-        item_id=row["item_id"],
-        source_key=row["source_key"],
-        title=row["title"],
-        body=row["body"],
-        url=row["url"],
-        state=row["state"],
-        attempts=row["attempts"],
-        claimed=bool(row["claimed"]),
-        run_id=row["run_id"],
-        last_error=row["last_error"],
-        created_at=row["created_at"],
-        updated_at=row["updated_at"],
-        pending_report=row["pending_report"],
-        requested_by=row["requested_by"],
-        repo=row["repo"] or None,
-        not_before=row["not_before"],
-        claim_token=row["claim_token"],
-        prior_run_id=_col(row, "prior_run_id"),
-        prior_branch=_col(row, "prior_branch"),
-        prior_pr_number=_col(row, "prior_pr_number"),
-        kind=_col(row, "run_kind") or "code",
-        profile=_col(row, "profile"),
+        item_id=row.item_id,
+        source_key=row.source_key,
+        title=row.title,
+        body=row.body,
+        url=row.url,
+        state=cast("ItemState", row.state),
+        attempts=row.attempts,
+        claimed=bool(row.claimed),
+        run_id=row.run_id,
+        last_error=row.last_error,
+        created_at=row.created_at,
+        updated_at=row.updated_at,
+        pending_report=cast("PendingReport | None", row.pending_report),
+        requested_by=row.requested_by,
+        repo=row.repo or None,
+        not_before=row.not_before,
+        claim_token=row.claim_token,
+        prior_run_id=row.prior_run_id,
+        prior_branch=row.prior_branch,
+        prior_pr_number=row.prior_pr_number,
+        kind=cast("RunKind", row.run_kind or "code"),
+        profile=row.profile,
     )
 
 
@@ -718,6 +856,371 @@ def _pk_columns(conn: sqlite3.Connection, table: str) -> list[str]:
     """The table's primary-key columns in key order (``pk`` is 1-based)."""
     rows = conn.execute(f"PRAGMA table_info({table})").fetchall()  # nosec B608
     return [str(row[1]) for row in sorted((r for r in rows if r[5] > 0), key=lambda r: r[5])]
+
+
+def _migrate_repo_columns(conn: sqlite3.Connection) -> None:
+    """Bring a store created before multi-repo to the current shape.
+
+    ``CREATE TABLE IF NOT EXISTS`` leaves an existing table alone, so a
+    daemon upgraded in place still has the single-repo shape — and its
+    key is the one that must change: ``UNIQUE(source_key)`` on
+    ``daemon_work_items`` (``PRIMARY KEY(source_key)`` on
+    ``daemon_requesters``) collides the moment two configured
+    repositories each have an issue with the same number, which is
+    exactly what an upgraded store is about to see. SQLite cannot drop a
+    constraint with ALTER, so the tables are rebuilt: new shape, rows
+    copied with ``repo = ''``, drop, rename, indexes recreated — all in
+    one transaction. Copied rows are then settled at daemon startup —
+    backfilled with the sole configured repository
+    (:meth:`backfill_repo`) or, when several are configured, named from
+    their issue URL (:meth:`attribute_repoless`), with whatever is left
+    over dropped if discovery can re-create it (:meth:`drop_repoless`)
+    and otherwise failed with an operator notice
+    (:meth:`strand_repoless`) — so they are never claimed by whichever
+    repo happens to be polled first.
+    """
+    rebuilds = (
+        ("daemon_work_items", _WORK_ITEMS_BODY, _WORK_ITEMS_COLUMNS),
+        ("daemon_requesters", _REQUESTERS_BODY, _REQUESTERS_COLUMNS),
+    )
+    todo = [
+        (table, body, f"{columns}, repo", f"{columns}, ''")
+        for table, body, columns in rebuilds
+        if "repo" not in _columns(conn, table)
+    ]
+    _rebuild_tables(conn, todo, rebuilt_for="repo")
+
+
+def _rebuild_tables(
+    conn: sqlite3.Connection, todo: list[tuple[str, str, str, str]], *, rebuilt_for: str
+) -> None:
+    """Rebuild each ``(table, body, insert_columns, select_expr)`` in one
+    transaction: new shape, rows copied, drop, rename, indexes recreated.
+
+    The indexes are issued statement by statement: ``executescript``
+    commits the open transaction first, which would leave a rebuilt
+    table with no indexes if the recreation failed."""
+    if not todo:
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        for table, body, insert_columns, select_expr in todo:
+            tmp = f"{table}__new"
+            conn.execute(f"CREATE TABLE {tmp} {body}")  # nosec B608 - literals above
+            conn.execute(
+                f"INSERT INTO {tmp} ({insert_columns}) "  # nosec B608 - literals above
+                f"SELECT {select_expr} FROM {table}"
+            )
+            conn.execute(f"DROP TABLE {table}")  # nosec B608 - literal above
+            conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")  # nosec B608
+            log.info("store.migrated", table=table, rebuilt_for=rebuilt_for)
+        # Dropping the old table took its indexes with it.
+        for ddl in _INDEX_DDL:
+            conn.execute(ddl)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+
+
+# Columns added after the multi-repo rebuild, applied idempotently on
+# open so a store written by an older daemon upgrades in place.
+_ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
+    (
+        "daemon_work_items",
+        "not_before",
+        "ALTER TABLE daemon_work_items ADD COLUMN not_before REAL",
+    ),
+    (
+        "daemon_work_items",
+        "claim_token",
+        "ALTER TABLE daemon_work_items ADD COLUMN claim_token TEXT",
+    ),
+    (
+        "daemon_work_items",
+        "prior_run_id",
+        "ALTER TABLE daemon_work_items ADD COLUMN prior_run_id TEXT",
+    ),
+    (
+        "daemon_work_items",
+        "prior_branch",
+        "ALTER TABLE daemon_work_items ADD COLUMN prior_branch TEXT",
+    ),
+    (
+        "daemon_work_items",
+        "prior_pr_number",
+        "ALTER TABLE daemon_work_items ADD COLUMN prior_pr_number INTEGER",
+    ),
+    (
+        "daemon_review_holds",
+        "held_by_draft",
+        "ALTER TABLE daemon_review_holds ADD COLUMN held_by_draft INTEGER NOT NULL DEFAULT 0",
+    ),
+    (
+        "daemon_work_items",
+        "run_kind",
+        "ALTER TABLE daemon_work_items ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'code'",
+    ),
+    (
+        "daemon_work_items",
+        "profile",
+        "ALTER TABLE daemon_work_items ADD COLUMN profile TEXT",
+    ),
+    (
+        "daemon_merge_gates",
+        "kind",
+        "ALTER TABLE daemon_merge_gates ADD COLUMN kind TEXT NOT NULL DEFAULT 'merge'",
+    ),
+    # The schedule itself moved into its row (#818); a daemon from
+    # before that wrote state-only rows, which the config import
+    # fills in on the next start.
+    *(
+        ("daemon_schedules", column, f"ALTER TABLE daemon_schedules ADD COLUMN {column} {kind}")
+        for column, kind in (
+            ("profile", "TEXT"),
+            ("ask", "TEXT"),
+            ("every", "TEXT"),
+            ("cron", "TEXT"),
+            ("timezone", "TEXT"),
+            ("source", "TEXT"),
+            ("created_by", "TEXT"),
+            ("created_at", "REAL"),
+        )
+    ),
+)
+
+
+def _migrate_added_columns(conn: sqlite3.Connection) -> None:
+    for table, column, ddl in _ADDED_COLUMNS:
+        if column in _columns(conn, table):
+            continue
+        conn.execute(ddl)
+        conn.commit()
+        log.info("store.migrated", table=table, added=column)
+
+
+def _migrate_discord_threads(conn: sqlite3.Connection) -> None:
+    """Fold a pre-Slack ``daemon_discord_threads`` table into
+    ``daemon_chat_threads``: same rows, ids cast to text, backend
+    ``discord``; the old table is dropped so this runs once. A row that
+    already exists in the new table (a store that was migrated and then
+    reopened by an older daemon which recreated the old table) is left
+    alone."""
+    if "daemon_discord_threads" not in _tables(conn):
+        return
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        moved = conn.execute(
+            "INSERT OR IGNORE INTO daemon_chat_threads "
+            "(run_id, backend, channel_id, thread_id, headline_id, status_id) "
+            "SELECT run_id, 'discord', CAST(channel_id AS TEXT), CAST(thread_id AS TEXT), "
+            "CAST(headline_id AS TEXT), CAST(status_id AS TEXT) "
+            "FROM daemon_discord_threads"
+        ).rowcount
+        conn.execute("DROP TABLE daemon_discord_threads")
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    log.info("store.migrated", table="daemon_chat_threads", moved=moved)
+
+
+def _migrate_backend_keys(conn: sqlite3.Connection) -> None:
+    """Key the chat state by backend, once.
+
+    A one-bridge daemon kept one thread and one watcher list per run,
+    and the gate's prompt on the gate row. The operator console's local
+    bridge runs beside the external one and opens its own thread for
+    the same run, so ``daemon_chat_threads`` is rebuilt on
+    ``(run_id, backend)`` and ``daemon_run_watches`` gains a ``backend``
+    column in its UNIQUE key (SQLite cannot widen a key with ALTER —
+    same rebuild as :meth:`_migrate_repo_columns`). The prompt location
+    moves into ``daemon_gate_prompts`` under the backend the run's
+    thread used; the old columns stay readable and are never written
+    again. Each step is guarded by the shape it changes, so a store
+    already migrated is left alone.
+    """
+    rebuilds: list[tuple[str, str, str, str]] = []
+    if _pk_columns(conn, "daemon_chat_threads") == ["run_id"]:
+        rebuilds.append(
+            (
+                "daemon_chat_threads",
+                _CHAT_THREADS_BODY,
+                _CHAT_THREADS_COLUMNS,
+                _CHAT_THREADS_COLUMNS,
+            )
+        )
+    watches_rebuilt = "backend" not in _columns(conn, "daemon_run_watches")
+    if watches_rebuilt:
+        rebuilds.append(
+            (
+                "daemon_run_watches",
+                _RUN_WATCHES_BODY,
+                _RUN_WATCHES_COLUMNS,
+                _RUN_WATCHES_COLUMNS,
+            )
+        )
+    _rebuild_tables(conn, rebuilds, rebuilt_for="backend")
+    # The backend a pre-upgrade row belongs to is the one that opened the
+    # run's thread, else the one external backend the store has seen at
+    # all (a daemon runs one), else Discord — never 'local', which no
+    # released daemon ran.
+    external = (
+        "(SELECT t.backend FROM daemon_chat_threads t WHERE t.run_id = %s "
+        "AND t.backend != 'local' LIMIT 1)"
+    )
+    sole = (
+        "(SELECT backend FROM daemon_chat_threads WHERE backend != 'local' "
+        "GROUP BY backend HAVING COUNT(*) = (SELECT COUNT(*) FROM daemon_chat_threads "
+        "WHERE backend != 'local') LIMIT 1)"
+    )
+    fallback = f"COALESCE({external}, {sole}, 'discord')"
+    if watches_rebuilt:
+        watch_backend = fallback % "daemon_run_watches.run_id"  # nosec B608 - literals only
+        conn.execute("UPDATE daemon_run_watches SET backend = " + watch_backend)  # nosec
+        conn.commit()
+    carry_gate_prompts(conn)
+
+
+def carry_gate_prompts(conn: sqlite3.Connection) -> None:
+    """Move a gate's prompt location off the gate row into the prompt table.
+
+    A one-bridge daemon kept the prompt on the gate row; it now lives in
+    ``daemon_gate_prompts``, one row per backend. This runs on **every**
+    read-write open, not once: an older daemon in a rollback window writes
+    those columns again, and the next start has to carry them again. It is a
+    shape-based step, not a one-shot marker — which is why it does not live
+    behind the schema version, where a stamped database would skip it.
+    """
+    external = (
+        "(SELECT t.backend FROM daemon_chat_threads t WHERE t.run_id = %s "
+        "AND t.backend != 'local' LIMIT 1)"
+    )
+    sole = (
+        "(SELECT backend FROM daemon_chat_threads WHERE backend != 'local' "
+        "GROUP BY backend HAVING COUNT(*) = (SELECT COUNT(*) FROM daemon_chat_threads "
+        "WHERE backend != 'local') LIMIT 1)"
+    )
+    fallback = f"COALESCE({external}, {sole}, 'discord')"
+    gate_backend = fallback % "g.run_id"  # nosec B608 - literals only
+    carry = (
+        "INSERT OR IGNORE INTO daemon_gate_prompts (run_id, backend, channel_id, message_id) "  # nosec B608
+        "SELECT g.run_id, {backend}, g.prompt_channel_id, g.prompt_message_id "
+        "FROM daemon_merge_gates g "
+        "WHERE g.prompt_message_id IS NOT NULL AND g.prompt_message_id != ''"
+    ).replace("{backend}", gate_backend)
+    moved = conn.execute(carry).rowcount
+    conn.execute(
+        "UPDATE daemon_merge_gates SET prompt_channel_id = NULL, prompt_message_id = NULL "
+        "WHERE prompt_message_id IS NOT NULL"
+    )
+    conn.commit()
+    if moved:
+        log.info("store.migrated", table="daemon_gate_prompts", moved=moved)
+
+
+def apply_daemon_schema(conn: sqlite3.Connection) -> None:
+    """Bring any daemon database this project ever wrote to the current shape.
+
+    Creates the tables from nothing on a fresh file and upgrades an existing
+    one in place: the repo-column rebuild, the idempotent ADD COLUMN set, the
+    pre-Slack thread fold and the backend rekey, in that order, then stamps
+    the schema version the operator console handshakes on.
+
+    This is the whole of the daemon side of Alembic revision 0001, which is
+    why it takes a bare connection rather than a store: it has to run against
+    a database no store could open yet.
+    """
+    conn.executescript(_SCHEMA)
+    _migrate_repo_columns(conn)
+    _migrate_added_columns(conn)
+    _migrate_discord_threads(conn)
+    _migrate_backend_keys(conn)
+    conn.execute(
+        "INSERT OR REPLACE INTO daemon_state (key, value) VALUES (?, ?)",
+        (SCHEMA_VERSION_KEY, SCHEMA_VERSION),
+    )
+    conn.commit()
+
+
+def _rowcount(result: Result[Any]) -> int:
+    """How many rows a DML statement touched.
+
+    Every compare-and-set in this store turns on it: zero means the WHERE
+    clause matched nothing, which is how a caller learns it lost a race
+    rather than silently writing nothing.
+    """
+    return cast("CursorResult[Any]", result).rowcount
+
+
+def _inserted_id(result: Result[Any]) -> int:
+    """The autoincrement id an INSERT just assigned."""
+    key = cast("CursorResult[Any]", result).inserted_primary_key
+    return int(key[0] or 0) if key else 0
+
+
+def _row_claimed(session: Session, statement: Any) -> bool:
+    """Whether a per-row compare-and-set actually took the row.
+
+    The claim *is* the state move, so a second sweeper that read the same
+    row loses it here rather than firing the same work twice.
+    """
+    return _rowcount(session.execute(statement)) == 1
+
+
+def _id_where(
+    item_id: str, column: InstrumentedAttribute[str] | None = None
+) -> ColumnElement[bool]:
+    """Match a row under either spelling of an item id.
+
+    Rendering is strict and parsing is lenient: every id sbxloop writes is
+    typed (``gh:issue:12``), but a row written before typed ids, or an id an
+    operator typed by hand, carries the bare ``gh:12`` form. Both resolve to
+    the same item, which is why no migration of existing rows was needed.
+
+    Defaults to the work item's own id; the ledger tables key by the same
+    value and pass their own column.
+    """
+    target = WorkItemRow.item_id if column is None else column
+    return target.in_(_id_variants(item_id))
+
+
+def _item_values(fields: Mapping[str, object], *, updated_at: float) -> dict[str, object]:
+    """Resolve keyword field names to mapped columns, refusing anything else.
+
+    The names come from this module's own calls rather than from input, but
+    resolving them against the mapper means a typo is an error here instead
+    of a column invented in a statement.
+    """
+    unknown = set(fields) - set(WorkItemRow.__mapper__.columns.keys())
+    if unknown:
+        raise ValueError(f"not work item columns: {sorted(unknown)}")
+    return {**fields, "updated_at": updated_at}
+
+
+def _refuse_pre_1_0(path: Path) -> None:
+    """Refuse a pre-1.0 store rather than failing on a missing column.
+
+    ``archive_legacy`` moves one aside, but only the daemon calls it. A CLI
+    command opening the file before the daemon's first start would otherwise
+    hit a confusing error deep in a query, so it is named here. Raw sqlite3
+    on purpose: this reads a schema that predates everything the models
+    describe, before any of them could open it.
+    """
+    if not path.is_file():
+        return
+    conn = sqlite3.connect(readonly_uri(path), uri=True)
+    try:
+        if "daemon_work_items" not in _tables(conn):
+            return
+        if "kind" not in _columns(conn, "daemon_work_items"):
+            return
+    finally:
+        conn.close()
+    raise DaemonError(
+        f"{path} is a pre-1.0 daemon state database; start `sbxloop daemon` once "
+        f"to archive it (to {path.name}{LEGACY_SUFFIX}) and begin a fresh store"
+    )
 
 
 class DaemonStore:
@@ -771,28 +1274,25 @@ class DaemonStore:
         self.path = path
         self.readonly = readonly
         # One connection shared by the daemon, bridge and CLI threads:
-        # sqlite3 rejects concurrent use of a connection from two threads
-        # ("bad parameter or other API misuse"), so EVERY statement — reads
-        # included — runs under this lock.
+        # SQLite rejects concurrent use of a connection from two threads, so
+        # EVERY statement — reads included — runs under this lock.
         self._lock = threading.RLock()
         if readonly:
             if not path.exists():
                 raise DaemonError(
                     f"{path} does not exist; start `sbxloop daemon` once to create it"
                 )
-            self._conn = sqlite3.connect(readonly_uri(path), uri=True, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA busy_timeout=5000")
-            tables = _tables(self._conn)
+            self._engine = open_engine(path, readonly=True)
+            tables = set(inspect(self._engine).get_table_names())
             if "daemon_local_messages" not in tables or "daemon_state" not in tables:
-                self._conn.close()
+                self._engine.dispose()
                 raise DaemonError(
                     f"{path} predates the operator console; start (or upgrade and restart) "
                     "`sbxloop daemon` so the store is migrated"
                 )
             version = self.get_value(SCHEMA_VERSION_KEY)
             if version is not None and version != SCHEMA_VERSION:
-                self._conn.close()
+                self._engine.dispose()
                 raise DaemonError(
                     f"{path} is at daemon schema {version}; this sbxloop expects "
                     f"{SCHEMA_VERSION} — upgrade the daemon and the console together"
@@ -800,259 +1300,44 @@ class DaemonStore:
             log.debug("store.opened", db=str(path), readonly=True)
             return
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        # WAL + NORMAL, as the engine store: a commit no longer fsyncs, and a
-        # crash can only lose the tail of the WAL. The mailbox commits on
-        # every chronology flush, so this is the difference between an
-        # fsync per status-line edit and none.
-        self._conn.execute("PRAGMA synchronous=NORMAL")
-        # The engine commits per event on the same file while a run is in
-        # flight; wait for it instead of failing on SQLITE_BUSY.
-        self._conn.execute("PRAGMA busy_timeout=5000")
-        if "daemon_work_items" in _tables(self._conn) and "kind" in _columns(
-            self._conn, "daemon_work_items"
-        ):
-            # Opened by a CLI command before the daemon's first start did
-            # the archive; say so rather than fail on a missing column.
-            self._conn.close()
-            raise DaemonError(
-                f"{path} is a pre-1.0 daemon state database; start `sbxloop daemon` once "
-                f"to archive it (to {path.name}{LEGACY_SUFFIX}) and begin a fresh store"
-            )
-        self._conn.executescript(_SCHEMA)
-        self._migrate_repo_columns()
-        self._migrate_added_columns()
-        self._migrate_discord_threads()
-        self._migrate_backend_keys()
-        self._conn.execute(
-            "INSERT OR REPLACE INTO daemon_state (key, value) VALUES (?, ?)",
-            (SCHEMA_VERSION_KEY, SCHEMA_VERSION),
-        )
-        self._conn.commit()
+        _refuse_pre_1_0(path)
+        self._engine = open_engine(path)
+        ensure_schema(self._engine)
+        # Not part of the schema, and so not behind its version: a stamped
+        # database still has to carry a prompt an older daemon wrote back
+        # onto a gate row. See `carry_gate_prompts`.
+        # `carry_gate_prompts` commits for itself, so it gets the connection
+        # rather than a transaction wrapped around one that would then be
+        # committed twice.
+        raw = self._engine.raw_connection()
+        try:
+            driver = raw.driver_connection
+            assert isinstance(driver, sqlite3.Connection)  # nosec B101 - SQLite is the only backend
+            carry_gate_prompts(driver)
+        finally:
+            raw.close()
         log.debug("store.opened", db=str(path), schema=SCHEMA_VERSION)
 
     def close(self) -> None:
-        self._conn.close()
+        self._engine.dispose()
 
-    def _migrate_repo_columns(self) -> None:
-        """Bring a store created before multi-repo to the current shape.
+    @contextmanager
+    def _write(self) -> Iterator[Session]:
+        """A session that commits on the way out, under the store's lock.
 
-        ``CREATE TABLE IF NOT EXISTS`` leaves an existing table alone, so a
-        daemon upgraded in place still has the single-repo shape — and its
-        key is the one that must change: ``UNIQUE(source_key)`` on
-        ``daemon_work_items`` (``PRIMARY KEY(source_key)`` on
-        ``daemon_requesters``) collides the moment two configured
-        repositories each have an issue with the same number, which is
-        exactly what an upgraded store is about to see. SQLite cannot drop a
-        constraint with ALTER, so the tables are rebuilt: new shape, rows
-        copied with ``repo = ''``, drop, rename, indexes recreated — all in
-        one transaction. Copied rows are then settled at daemon startup —
-        backfilled with the sole configured repository
-        (:meth:`backfill_repo`) or, when several are configured, named from
-        their issue URL (:meth:`attribute_repoless`), with whatever is left
-        over dropped if discovery can re-create it (:meth:`drop_repoless`)
-        and otherwise failed with an operator notice
-        (:meth:`strand_repoless`) — so they are never claimed by whichever
-        repo happens to be polled first.
+        Every statement in the block is one transaction, so the pairs that
+        have to move together — an item's state and its ledger row — either
+        both land or neither does.
         """
-        rebuilds = (
-            ("daemon_work_items", _WORK_ITEMS_BODY, _WORK_ITEMS_COLUMNS),
-            ("daemon_requesters", _REQUESTERS_BODY, _REQUESTERS_COLUMNS),
-        )
-        todo = [
-            (table, body, f"{columns}, repo", f"{columns}, ''")
-            for table, body, columns in rebuilds
-            if "repo" not in _columns(self._conn, table)
-        ]
-        self._rebuild_tables(todo, rebuilt_for="repo")
+        with self._lock, Session(self._engine) as session:
+            yield session
+            session.commit()
 
-    def _rebuild_tables(self, todo: list[tuple[str, str, str, str]], *, rebuilt_for: str) -> None:
-        """Rebuild each ``(table, body, insert_columns, select_expr)`` in one
-        transaction: new shape, rows copied, drop, rename, indexes recreated.
-
-        The indexes are issued statement by statement: ``executescript``
-        commits the open transaction first, which would leave a rebuilt
-        table with no indexes if the recreation failed."""
-        if not todo:
-            return
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            for table, body, insert_columns, select_expr in todo:
-                tmp = f"{table}__new"
-                self._conn.execute(f"CREATE TABLE {tmp} {body}")  # nosec B608 - literals above
-                self._conn.execute(
-                    f"INSERT INTO {tmp} ({insert_columns}) "  # nosec B608 - literals above
-                    f"SELECT {select_expr} FROM {table}"
-                )
-                self._conn.execute(f"DROP TABLE {table}")  # nosec B608 - literal above
-                self._conn.execute(f"ALTER TABLE {tmp} RENAME TO {table}")  # nosec B608
-                log.info("store.migrated", table=table, rebuilt_for=rebuilt_for)
-            # Dropping the old table took its indexes with it.
-            for ddl in _INDEX_DDL:
-                self._conn.execute(ddl)
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
-
-    # Columns added after the multi-repo rebuild, applied idempotently on
-    # open so a store written by an older daemon upgrades in place.
-    _ADDED_COLUMNS: tuple[tuple[str, str, str], ...] = (
-        (
-            "daemon_work_items",
-            "not_before",
-            "ALTER TABLE daemon_work_items ADD COLUMN not_before REAL",
-        ),
-        (
-            "daemon_work_items",
-            "claim_token",
-            "ALTER TABLE daemon_work_items ADD COLUMN claim_token TEXT",
-        ),
-        (
-            "daemon_work_items",
-            "prior_run_id",
-            "ALTER TABLE daemon_work_items ADD COLUMN prior_run_id TEXT",
-        ),
-        (
-            "daemon_work_items",
-            "prior_branch",
-            "ALTER TABLE daemon_work_items ADD COLUMN prior_branch TEXT",
-        ),
-        (
-            "daemon_work_items",
-            "prior_pr_number",
-            "ALTER TABLE daemon_work_items ADD COLUMN prior_pr_number INTEGER",
-        ),
-        (
-            "daemon_review_holds",
-            "held_by_draft",
-            "ALTER TABLE daemon_review_holds ADD COLUMN held_by_draft INTEGER NOT NULL DEFAULT 0",
-        ),
-        (
-            "daemon_work_items",
-            "run_kind",
-            "ALTER TABLE daemon_work_items ADD COLUMN run_kind TEXT NOT NULL DEFAULT 'code'",
-        ),
-        (
-            "daemon_work_items",
-            "profile",
-            "ALTER TABLE daemon_work_items ADD COLUMN profile TEXT",
-        ),
-        (
-            "daemon_merge_gates",
-            "kind",
-            "ALTER TABLE daemon_merge_gates ADD COLUMN kind TEXT NOT NULL DEFAULT 'merge'",
-        ),
-    )
-
-    def _migrate_added_columns(self) -> None:
-        for table, column, ddl in self._ADDED_COLUMNS:
-            if column in _columns(self._conn, table):
-                continue
-            self._conn.execute(ddl)
-            self._conn.commit()
-            log.info("store.migrated", table=table, added=column)
-
-    def _migrate_discord_threads(self) -> None:
-        """Fold a pre-Slack ``daemon_discord_threads`` table into
-        ``daemon_chat_threads``: same rows, ids cast to text, backend
-        ``discord``; the old table is dropped so this runs once. A row that
-        already exists in the new table (a store that was migrated and then
-        reopened by an older daemon which recreated the old table) is left
-        alone."""
-        if "daemon_discord_threads" not in _tables(self._conn):
-            return
-        self._conn.execute("BEGIN IMMEDIATE")
-        try:
-            moved = self._conn.execute(
-                "INSERT OR IGNORE INTO daemon_chat_threads "
-                "(run_id, backend, channel_id, thread_id, headline_id, status_id) "
-                "SELECT run_id, 'discord', CAST(channel_id AS TEXT), CAST(thread_id AS TEXT), "
-                "CAST(headline_id AS TEXT), CAST(status_id AS TEXT) "
-                "FROM daemon_discord_threads"
-            ).rowcount
-            self._conn.execute("DROP TABLE daemon_discord_threads")
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
-        log.info("store.migrated", table="daemon_chat_threads", moved=moved)
-
-    def _migrate_backend_keys(self) -> None:
-        """Key the chat state by backend, once.
-
-        A one-bridge daemon kept one thread and one watcher list per run,
-        and the gate's prompt on the gate row. The operator console's local
-        bridge runs beside the external one and opens its own thread for
-        the same run, so ``daemon_chat_threads`` is rebuilt on
-        ``(run_id, backend)`` and ``daemon_run_watches`` gains a ``backend``
-        column in its UNIQUE key (SQLite cannot widen a key with ALTER —
-        same rebuild as :meth:`_migrate_repo_columns`). The prompt location
-        moves into ``daemon_gate_prompts`` under the backend the run's
-        thread used; the old columns stay readable and are never written
-        again. Each step is guarded by the shape it changes, so a store
-        already migrated is left alone.
-        """
-        rebuilds: list[tuple[str, str, str, str]] = []
-        if _pk_columns(self._conn, "daemon_chat_threads") == ["run_id"]:
-            rebuilds.append(
-                (
-                    "daemon_chat_threads",
-                    _CHAT_THREADS_BODY,
-                    _CHAT_THREADS_COLUMNS,
-                    _CHAT_THREADS_COLUMNS,
-                )
-            )
-        watches_rebuilt = "backend" not in _columns(self._conn, "daemon_run_watches")
-        if watches_rebuilt:
-            rebuilds.append(
-                (
-                    "daemon_run_watches",
-                    _RUN_WATCHES_BODY,
-                    _RUN_WATCHES_COLUMNS,
-                    _RUN_WATCHES_COLUMNS,
-                )
-            )
-        self._rebuild_tables(rebuilds, rebuilt_for="backend")
-        # The backend a pre-upgrade row belongs to is the one that opened the
-        # run's thread, else the one external backend the store has seen at
-        # all (a daemon runs one), else Discord — never 'local', which no
-        # released daemon ran.
-        external = (
-            "(SELECT t.backend FROM daemon_chat_threads t WHERE t.run_id = %s "
-            "AND t.backend != 'local' LIMIT 1)"
-        )
-        sole = (
-            "(SELECT backend FROM daemon_chat_threads WHERE backend != 'local' "
-            "GROUP BY backend HAVING COUNT(*) = (SELECT COUNT(*) FROM daemon_chat_threads "
-            "WHERE backend != 'local') LIMIT 1)"
-        )
-        fallback = f"COALESCE({external}, {sole}, 'discord')"
-        if watches_rebuilt:
-            watch_backend = fallback % "daemon_run_watches.run_id"  # nosec B608 - literals only
-            self._conn.execute("UPDATE daemon_run_watches SET backend = " + watch_backend)  # nosec
-            self._conn.commit()
-        # The prompt location a one-bridge daemon kept on the gate row is
-        # carried into the prompt table and cleared from the row, so an
-        # older daemon writing it again (a rollback window) is carried again
-        # on the next start — a shape-based step, not a one-shot marker.
-        gate_backend = fallback % "g.run_id"  # nosec B608 - literals only
-        carry = (
-            "INSERT OR IGNORE INTO daemon_gate_prompts (run_id, backend, channel_id, message_id) "  # nosec B608
-            "SELECT g.run_id, {backend}, g.prompt_channel_id, g.prompt_message_id "
-            "FROM daemon_merge_gates g "
-            "WHERE g.prompt_message_id IS NOT NULL AND g.prompt_message_id != ''"
-        ).replace("{backend}", gate_backend)
-        moved = self._conn.execute(carry).rowcount
-        self._conn.execute(
-            "UPDATE daemon_merge_gates SET prompt_channel_id = NULL, prompt_message_id = NULL "
-            "WHERE prompt_message_id IS NOT NULL"
-        )
-        self._conn.commit()
-        if moved:
-            log.info("store.migrated", table="daemon_gate_prompts", moved=moved)
+    @contextmanager
+    def _read(self) -> Iterator[Session]:
+        """A session for a query, held under the lock for the same reason."""
+        with self._lock, Session(self._engine) as session:
+            yield session
 
     def backfill_repo(self, repo: str | None) -> int:
         """Give repo-less rows the daemon's sole configured repository.
@@ -1068,20 +1353,22 @@ class DaemonStore:
         if not repo:
             return 0
         updated = 0
-        with self._lock:
+        with self._write() as session:
             # A chat item (#760) has no repository by design, not by age.
             # Requester rows are the concierge's record of who asked for an
             # issue; a chat item carries its requester itself and writes none.
-            for table, extra in (
-                ("daemon_work_items", f" AND {_NOT_LOCAL}"),
-                ("daemon_requesters", ""),
-            ):
-                cur = self._conn.execute(
-                    f"UPDATE OR IGNORE {table} SET repo = ? WHERE repo = ''{extra}",  # nosec B608
-                    (repo,),
-                )
-                updated += cur.rowcount or 0
-            self._conn.commit()
+            statements = (
+                update(WorkItemRow)
+                .prefix_with("OR IGNORE")
+                .where(WorkItemRow.repo == "", _not_local())
+                .values(repo=repo),
+                update(RequesterRow)
+                .prefix_with("OR IGNORE")
+                .where(RequesterRow.repo == "")
+                .values(repo=repo),
+            )
+            for statement in statements:
+                updated += _rowcount(session.execute(statement)) or 0
         if updated:
             log.info("store.repo_backfilled", repo=repo, rows=updated)
         return updated
@@ -1102,21 +1389,27 @@ class DaemonStore:
         if not known:
             return 0
         updated = 0
-        with self._lock:
-            rows = self._conn.execute(
-                f"SELECT item_id, url FROM daemon_work_items WHERE repo = '' AND {_NOT_LOCAL}"  # nosec B608
-            ).fetchall()
-            for row in rows:
-                repo = known.get((_repo_from_url(row["url"]) or "").casefold())
+        with self._write() as session:
+            rows = session.execute(
+                select(WorkItemRow.item_id, WorkItemRow.url).where(
+                    WorkItemRow.repo == "", _not_local()
+                )
+            ).all()
+            for item_id, url in rows:
+                repo = known.get((_repo_from_url(url) or "").casefold())
                 if repo is None:
                     continue
-                cur = self._conn.execute(
-                    "UPDATE OR IGNORE daemon_work_items SET repo = ? "
-                    "WHERE item_id = ? AND repo = ''",
-                    (repo, row["item_id"]),
+                updated += (
+                    _rowcount(
+                        session.execute(
+                            update(WorkItemRow)
+                            .prefix_with("OR IGNORE")
+                            .where(WorkItemRow.item_id == item_id, WorkItemRow.repo == "")
+                            .values(repo=repo)
+                        )
+                    )
+                    or 0
                 )
-                updated += cur.rowcount or 0
-            self._conn.commit()
         if updated:
             log.info("store.repo_attributed_from_url", rows=updated)
         return updated
@@ -1149,23 +1442,21 @@ class DaemonStore:
         otherwise. Returns the number of rows deleted.
         """
         where = (
-            "WHERE repo = '' AND state = 'queued' AND claimed = 0 AND run_id IS NULL "
-            f"AND {_NOT_LOCAL}"
+            WorkItemRow.repo == "",
+            WorkItemRow.state == "queued",
+            WorkItemRow.claimed == 0,
+            WorkItemRow.run_id.is_(None),
+            _not_local(),
         )
-        with self._lock:
-            rows = self._conn.execute(
-                f"SELECT item_id FROM daemon_work_items {where}"  # nosec B608 - literal above
-            ).fetchall()
+        with self._write() as session:
+            rows = list(session.scalars(select(WorkItemRow.item_id).where(*where)))
             if not rows:
                 return 0
-            self._conn.execute(
-                f"DELETE FROM daemon_work_items {where}"  # nosec B608 - literal above
-            )
-            self._conn.commit()
+            session.execute(delete(WorkItemRow).where(*where))
         log.info(
             "store.repoless_items_dropped",
             rows=len(rows),
-            items=[str(r["item_id"]) for r in rows],
+            items=[str(r) for r in rows],
             reason="no configured repository to attribute them to; they were never "
             "claimed, so discovery will re-create them repo-qualified",
         )
@@ -1188,15 +1479,18 @@ class DaemonStore:
         issue URL, because their issue is left carrying
         ``sbxloop:in-progress`` for a human to clear.
         """
-        marks = ", ".join("?" * len(TERMINAL_ITEM_STATES))
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT * FROM daemon_work_items "  # nosec B608 - literals above
-                f"WHERE repo = '' AND state NOT IN ({marks})",
-                tuple(sorted(TERMINAL_ITEM_STATES)),
-            ).fetchall()
+        with self._write() as session:
+            rows = list(
+                session.scalars(
+                    select(WorkItemRow).where(
+                        WorkItemRow.repo == "",
+                        WorkItemRow.state.not_in(sorted(TERMINAL_ITEM_STATES)),
+                    )
+                )
+            )
             stranded = [_row_to_item(row) for row in rows]
-            for row in rows:
+            stored_ids = [row.item_id for row in rows]
+            for stored in stored_ids:
                 # Bind the id *as stored*, through the same either-spelling
                 # match every other mutator uses: ``_row_to_item`` normalises
                 # ``gh:<n>`` to ``gh:issue:<n>``, and a pre-upgrade store is
@@ -1204,13 +1498,16 @@ class DaemonStore:
                 # the normalised id updated zero rows there, so the row was
                 # reported settled while staying ``running`` (and was
                 # re-stranded on every start).
-                where, ids = _id_match(row["item_id"])
-                self._conn.execute(
-                    "UPDATE daemon_work_items SET state = 'failed', last_error = ?, "  # nosec B608
-                    f"pending_report = NULL, updated_at = ? WHERE {where}",
-                    (reason[:2000], now, *ids),
+                session.execute(
+                    update(WorkItemRow)
+                    .where(_id_where(stored))
+                    .values(
+                        state="failed",
+                        last_error=reason[:2000],
+                        pending_report=None,
+                        updated_at=now,
+                    )
                 )
-            self._conn.commit()
         if stranded:
             log.warning(
                 "store.repoless_items_stranded",
@@ -1246,7 +1543,7 @@ class DaemonStore:
         The requester the concierge recorded for the issue, if any, is
         copied onto the item.
         """
-        with self._lock:
+        with self._write() as session:
             repo = item.repo or ""
             # Identity is (issue, repository), matched exactly — with one
             # concession: an item whose id is *unqualified* can only come
@@ -1262,30 +1559,32 @@ class DaemonStore:
             # once every row that could be attributed has been.
             parsed = try_parse_gh_id(item.item_id)
             adopt_legacy = bool(repo) and (parsed is None or parsed.repo is None)
+            projection = select(
+                WorkItemRow.item_id,
+                WorkItemRow.state,
+                WorkItemRow.title,
+                WorkItemRow.body,
+                WorkItemRow.repo,
+                WorkItemRow.run_kind,
+            ).where(WorkItemRow.source_key == item.source_key)
             if adopt_legacy:
-                row = self._conn.execute(
-                    "SELECT item_id, state, title, body, repo, run_kind FROM daemon_work_items "
-                    "WHERE source_key = ? AND repo IN (?, '') ORDER BY repo = ? DESC LIMIT 1",
-                    (item.source_key, repo, repo),
-                ).fetchone()
-            else:
-                row = self._conn.execute(
-                    "SELECT item_id, state, title, body, repo, run_kind FROM daemon_work_items "
-                    "WHERE source_key = ? AND repo = ? LIMIT 1",
-                    (item.source_key, repo),
-                ).fetchone()
-            if row is not None and row["repo"] == "" and repo:
-                # Backfill: the item now knows its repository.
-                self._conn.execute(
-                    "UPDATE daemon_work_items SET repo = ? WHERE item_id = ?",
-                    (repo, row["item_id"]),
+                # The exact repository wins over the repo-less legacy row.
+                found = projection.where(WorkItemRow.repo.in_((repo, ""))).order_by(
+                    (WorkItemRow.repo == repo).desc()
                 )
-                self._conn.commit()
+            else:
+                found = projection.where(WorkItemRow.repo == repo)
+            row = session.execute(found.limit(1)).first()
+            if row is not None and row.repo == "" and repo:
+                # Backfill: the item now knows its repository.
+                session.execute(
+                    update(WorkItemRow).where(WorkItemRow.item_id == row.item_id).values(repo=repo)
+                )
             if row is not None:
-                terminal = row["state"] in TERMINAL_ITEM_STATES
+                terminal = row.state in TERMINAL_ITEM_STATES
                 # An issue re-labelled for the other kind of run (#760) is
                 # new work, however familiar its words.
-                changed = (row["title"], row["body"], row["run_kind"] or "code") != (
+                changed = (row.title, row.body, row.run_kind or "code") != (
                     item.title,
                     item.body,
                     item.kind,
@@ -1293,37 +1592,35 @@ class DaemonStore:
                 if not terminal:
                     return False
                 if not changed:
-                    self._requeue_terminal_row(str(row["item_id"]), str(row["state"]), now)
+                    self._requeue_terminal_row(session, str(row.item_id), str(row.state), now)
                     return True
                 log.debug(
                     "store.item_superseded",
-                    item=row["item_id"],
-                    previous_state=row["state"],
+                    item=row.item_id,
+                    previous_state=row.state,
                     reason="terminal row, content changed",
                 )
-                self._conn.execute(
-                    "DELETE FROM daemon_work_items WHERE item_id = ?", (row["item_id"],)
-                )
+                session.execute(delete(WorkItemRow).where(WorkItemRow.item_id == row.item_id))
             # Exact repository, plus — for the same reason as above — a note
             # written before notes carried one, but only for an unqualified
             # item (a single-repo daemon, where there is only one repository
             # the note can mean).
-            where, params = (
-                ("repo IN (?, '')", (item.source_key, repo))
-                if repo and adopt_legacy
-                else ("repo = ?", (item.source_key, repo))
-                if repo
-                else ("1 = 1", (item.source_key,))
+            note = select(RequesterRow.requester_id).where(
+                RequesterRow.source_key == item.source_key
             )
-            requester = self._conn.execute(
-                "SELECT requester_id FROM daemon_requesters "  # nosec B608 - literal above
-                f"WHERE source_key = ? AND {where} ORDER BY repo != '' DESC LIMIT 1",
-                params,
-            ).fetchone()
+            if repo and adopt_legacy:
+                note = note.where(RequesterRow.repo.in_((repo, "")))
+            elif repo:
+                note = note.where(RequesterRow.repo == repo)
+            # A qualified note wins over one written before notes carried a
+            # repository.
+            requester = session.scalars(
+                note.order_by((RequesterRow.repo != "").desc()).limit(1)
+            ).first()
             requested_by = (
                 item.requested_by
                 if item.requested_by
-                else (str(requester["requester_id"]) if requester is not None else None)
+                else (str(requester) if requester is not None else None)
             )
             # A row created here is not necessarily a first-ever attempt:
             # every non-finish path deletes the row (a lost claim race, a
@@ -1332,31 +1629,31 @@ class DaemonStore:
             # the last attempt pushed are recovered from the durable side
             # table — and failing that from the run history — instead of
             # being lost with the row (#600).
-            item_id = normalize_item_id(item.item_id)
-            prior = self._recover_prior(item.source_key, repo, item_id)
-            self._conn.execute(
-                "INSERT INTO daemon_work_items (item_id, source_key, title, body, url, state, "
-                "attempts, claimed, run_id, last_error, created_at, updated_at, requested_by, "
-                "repo, prior_run_id, prior_branch, prior_pr_number, run_kind, profile) "
-                "VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    item_id,
-                    item.source_key,
-                    item.title,
-                    item.body,
-                    item.url,
-                    now,
-                    now,
-                    requested_by,
-                    repo,
-                    prior.run_id if prior else None,
-                    prior.branch if prior else None,
-                    prior.pr_number if prior else None,
-                    item.kind,
-                    item.profile,
-                ),
+            item_id = self._free_item_id(session, normalize_item_id(item.item_id), repo)
+            prior = self._recover_prior(session, item.source_key, repo, item_id)
+            session.execute(
+                insert(WorkItemRow).values(
+                    item_id=item_id,
+                    source_key=item.source_key,
+                    title=item.title,
+                    body=item.body,
+                    url=item.url,
+                    state="queued",
+                    attempts=0,
+                    claimed=0,
+                    run_id=None,
+                    last_error=None,
+                    created_at=now,
+                    updated_at=now,
+                    requested_by=requested_by,
+                    repo=repo,
+                    prior_run_id=prior.run_id if prior else None,
+                    prior_branch=prior.branch if prior else None,
+                    prior_pr_number=prior.pr_number if prior else None,
+                    run_kind=item.kind,
+                    profile=item.profile,
+                )
             )
-            self._conn.commit()
             if prior is not None:
                 log.info(
                     "store.prior_attempt_recovered",
@@ -1368,30 +1665,80 @@ class DaemonStore:
                 )
             return True
 
+    @staticmethod
+    def _free_item_id(session: Session, item_id: str, repo: str) -> str:
+        """``item_id``, repo-qualified if the bare spelling belongs elsewhere.
+
+        Item identity is ``(source_key, repo)`` — the table says so — but
+        ``item_id`` is a global primary key, and a single-repo daemon mints
+        the unqualified form (``gh:issue:24``) that encodes only the number.
+        Those two facts collide the moment one number is used by two
+        repositories, which is not a multi-repo daemon's problem alone: a
+        daemon repointed at a new repository (``[github] repo``) leaves the
+        old repository's rows behind under the same unqualified namespace.
+        The insert then fails the primary key and, before this, took the
+        whole daemon down with it on every tick.
+
+        The caller has already established that this repository has no row
+        for the issue, so a row squatting the bare id belongs to a different
+        repository and the incoming item takes the qualified spelling
+        instead. The common case — nothing there — keeps the bare id, so
+        existing state, watches and operator commands resolve unchanged.
+
+        Both unqualified spellings are checked, because both are squatters:
+        the typed ``gh:issue:24`` would not fail the primary key against a
+        legacy bare ``gh:24`` row, but :func:`_id_variants` resolves the two
+        to each other, so leaving it unqualified would make one lookup match
+        two repositories' rows.
+        """
+        parsed = try_parse_gh_id(item_id)
+        if parsed is None or parsed.repo is not None or not repo:
+            # Not a GitHub id, already qualified, or no repository to
+            # qualify with: nothing to disambiguate it from.
+            return item_id
+        owner = session.scalars(
+            select(WorkItemRow.repo).where(_id_where(item_id), WorkItemRow.repo != repo).limit(1)
+        ).first()
+        if owner is None:
+            return item_id
+        qualified = format_gh_id(parsed.kind, parsed.number, repo=repo)
+        log.info(
+            "store.item_id_qualified",
+            item=qualified,
+            bare=item_id,
+            held_by=owner,
+            reason="the unqualified id is held by another repository's row",
+        )
+        return qualified
+
     # -- prior attempts (durable across row deletion) -------------------------
 
-    def _read_prior_side(self, source_key: str, repo: str) -> PriorAttempt | None:
+    @staticmethod
+    def _read_prior_side(session: Session, source_key: str, repo: str) -> PriorAttempt | None:
         """The recorded prior attempt for (issue, repository) from the side
         table, with the pre-multi-repo ``repo = ''`` row as a fallback.
-        Called with the lock held."""
-        row = self._conn.execute(
-            "SELECT run_id, branch, pr_number FROM daemon_prior_attempts "
-            "WHERE source_key = ? AND repo IN (?, '') ORDER BY repo = ? DESC LIMIT 1",
-            (source_key, repo, repo),
-        ).fetchone()
+        Runs on the caller's session, inside its transaction."""
+        row = session.execute(
+            select(PriorAttemptRow.run_id, PriorAttemptRow.branch, PriorAttemptRow.pr_number)
+            .where(PriorAttemptRow.source_key == source_key, PriorAttemptRow.repo.in_((repo, "")))
+            # The exact repository wins over the pre-multi-repo fallback.
+            .order_by((PriorAttemptRow.repo == repo).desc())
+            .limit(1)
+        ).first()
         if row is None:
             return None
-        if row["run_id"] is None and row["branch"] is None and row["pr_number"] is None:
+        run_id, branch, pr = row
+        if run_id is None and branch is None and pr is None:
             return None
-        pr = row["pr_number"]
         return PriorAttempt(
-            run_id=row["run_id"],
-            branch=row["branch"],
+            run_id=run_id,
+            branch=branch,
             pr_number=int(pr) if pr is not None else None,
         )
 
+    @staticmethod
     def _write_prior_side(
-        self,
+        session: Session,
         source_key: str,
         repo: str,
         *,
@@ -1401,62 +1748,80 @@ class DaemonStore:
     ) -> None:
         """Remember the prior attempt outside the work-item row, so deleting
         that row (discard, drop_repoless, supersede) cannot take it with it.
-        Fields left None keep whatever is already recorded. Called with the
-        lock held."""
+        Fields left None keep whatever is already recorded. Runs on the
+        caller's session, inside its transaction."""
         if run_id is None and branch is None and pr_number is None:
             return
-        self._conn.execute(
-            "INSERT INTO daemon_prior_attempts (source_key, repo, run_id, branch, pr_number, "
-            "updated_at) VALUES (?, ?, ?, ?, ?, 0) ON CONFLICT(source_key, repo) DO UPDATE SET "
-            "run_id = COALESCE(excluded.run_id, daemon_prior_attempts.run_id), "
-            "branch = COALESCE(excluded.branch, daemon_prior_attempts.branch), "
-            "pr_number = COALESCE(excluded.pr_number, daemon_prior_attempts.pr_number)",
-            (source_key, repo, run_id, branch, pr_number),
+        stmt = sqlite_insert(PriorAttemptRow).values(
+            source_key=source_key,
+            repo=repo,
+            run_id=run_id,
+            branch=branch,
+            pr_number=pr_number,
+            updated_at=0,
+        )
+        # COALESCE, not assignment: a field this call left None keeps what
+        # is already recorded rather than erasing it.
+        session.execute(
+            stmt.on_conflict_do_update(
+                index_elements=["source_key", "repo"],
+                set_={
+                    "run_id": func.coalesce(stmt.excluded.run_id, PriorAttemptRow.run_id),
+                    "branch": func.coalesce(stmt.excluded.branch, PriorAttemptRow.branch),
+                    "pr_number": func.coalesce(stmt.excluded.pr_number, PriorAttemptRow.pr_number),
+                },
+            )
         )
 
-    def _recover_prior(self, source_key: str, repo: str, item_id: str) -> PriorAttempt | None:
+    def _recover_prior(
+        self, session: Session, source_key: str, repo: str, item_id: str
+    ) -> PriorAttempt | None:
         """What a re-created row's item last pushed to origin: the side
         table first, then the engine's own run history for the same issue —
         the recovery :meth:`_requeue_terminal_row` does for a row written
-        before the ``prior_*`` columns existed. Called with the lock held."""
-        prior = self._read_prior_side(source_key, repo)
+        before the ``prior_*`` columns existed. Runs on the caller's
+        session, inside its transaction."""
+        prior = self._read_prior_side(session, source_key, repo)
         run_id = prior.run_id if prior else None
         branch = prior.branch if prior else None
         pr_number = prior.pr_number if prior else None
         if run_id is None:
-            runs = self._conn.execute(
-                "SELECT run_id FROM daemon_runs WHERE item_id IN (?, ?) "
-                "ORDER BY started_at DESC LIMIT 1",
-                _id_variants(item_id),
-            ).fetchone()
-            run_id = str(runs["run_id"]) if runs else None
+            run_id = session.scalars(
+                select(DaemonRunRow.run_id)
+                .where(DaemonRunRow.item_id.in_(_id_variants(item_id)))
+                .order_by(DaemonRunRow.started_at.desc())
+                .limit(1)
+            ).first()
         if run_id is None:
             return prior
-        branch, pr_number = self._fill_artifacts(run_id, branch, pr_number)
+        branch, pr_number = self._fill_artifacts(session, run_id, branch, pr_number)
         return PriorAttempt(run_id=run_id, branch=branch, pr_number=pr_number)
 
     def _fill_artifacts(
-        self, run_id: str, branch: str | None, pr_number: int | None
+        self, session: Session, run_id: str, branch: str | None, pr_number: int | None
     ) -> tuple[str | None, int | None]:
         """Fill in whatever branch/PR is missing for ``run_id`` from the
-        engine's run record and the merge-gate row. Called with the lock
-        held."""
+        engine's run record and the merge-gate row. Runs on the caller's
+        session, inside its transaction."""
         if branch is None or pr_number is None:
-            recorded = self._run_artifacts(run_id)
+            recorded = self._run_artifacts(session, run_id)
             if recorded is not None:
                 branch = branch or recorded[0]
                 pr_number = pr_number if pr_number is not None else recorded[1]
         if branch is None or pr_number is None:
-            gate = self._conn.execute(
-                "SELECT branch, pr_number FROM daemon_merge_gates WHERE run_id = ?",
-                (run_id,),
-            ).fetchone()
+            gate = session.execute(
+                select(MergeGateRow.branch, MergeGateRow.pr_number).where(
+                    MergeGateRow.run_id == run_id
+                )
+            ).first()
             if gate is not None:
-                branch = branch or gate["branch"]
-                pr_number = pr_number if pr_number is not None else gate["pr_number"]
+                branch = branch or gate.branch
+                pr_number = pr_number if pr_number is not None else gate.pr_number
         return branch, int(pr_number) if pr_number is not None else None
 
-    def _requeue_terminal_row(self, item_id: str, previous_state: str, now: float) -> None:
+    def _requeue_terminal_row(
+        self, session: Session, item_id: str, previous_state: str, now: float
+    ) -> None:
         """Put a finished row back in the queue because a human re-applied
         the trigger label (#600). Called with the lock held.
 
@@ -1467,51 +1832,64 @@ class DaemonStore:
         — and an already recorded prior attempt is never overwritten with
         nothing.
         """
-        prior_run = self._conn.execute(
-            "SELECT source_key, repo, run_id, prior_run_id, prior_branch, prior_pr_number "
-            "FROM daemon_work_items WHERE item_id = ?",
-            (item_id,),
-        ).fetchone()
-        source_key = str(prior_run["source_key"]) if prior_run else ""
-        repo = str(prior_run["repo"] or "") if prior_run else ""
+        prior_run = session.execute(
+            select(
+                WorkItemRow.source_key,
+                WorkItemRow.repo,
+                WorkItemRow.run_id,
+                WorkItemRow.prior_run_id,
+                WorkItemRow.prior_branch,
+                WorkItemRow.prior_pr_number,
+            ).where(WorkItemRow.item_id == item_id)
+        ).first()
+        source_key = str(prior_run.source_key) if prior_run else ""
+        repo = str(prior_run.repo or "") if prior_run else ""
         # The side table is the durable copy: a row that was discarded and
         # re-created has no prior_* of its own to read (#600).
-        side = self._read_prior_side(source_key, repo) if source_key else None
+        side = self._read_prior_side(session, source_key, repo) if source_key else None
         run_id = (
-            (prior_run["run_id"] if prior_run else None)
-            or (prior_run["prior_run_id"] if prior_run else None)
+            (prior_run.run_id if prior_run else None)
+            or (prior_run.prior_run_id if prior_run else None)
             or (side.run_id if side else None)
         )
         if run_id is None:
-            runs = self._conn.execute(
-                "SELECT run_id FROM daemon_runs WHERE item_id IN (?, ?) "
-                "ORDER BY started_at DESC LIMIT 1",
-                _id_variants(item_id),
-            ).fetchone()
-            run_id = str(runs["run_id"]) if runs else None
-        branch = (prior_run["prior_branch"] if prior_run else None) or (
-            side.branch if side else None
-        )
-        pr_number = prior_run["prior_pr_number"] if prior_run else None
+            run_id = session.scalars(
+                select(DaemonRunRow.run_id)
+                .where(DaemonRunRow.item_id.in_(_id_variants(item_id)))
+                .order_by(DaemonRunRow.started_at.desc())
+                .limit(1)
+            ).first()
+        branch = (prior_run.prior_branch if prior_run else None) or (side.branch if side else None)
+        pr_number = prior_run.prior_pr_number if prior_run else None
         if pr_number is None and side is not None:
             pr_number = side.pr_number
         if run_id is not None:
             # A row written before the prior_* columns existed has nothing
             # recorded, so what the attempt pushed is recovered from the
             # engine's own run record in the same state.db (#600).
-            branch, pr_number = self._fill_artifacts(run_id, branch, pr_number)
+            branch, pr_number = self._fill_artifacts(session, run_id, branch, pr_number)
         if source_key:
             self._write_prior_side(
-                source_key, repo, run_id=run_id, branch=branch, pr_number=pr_number
+                session, source_key, repo, run_id=run_id, branch=branch, pr_number=pr_number
             )
-        self._conn.execute(
-            "UPDATE daemon_work_items SET state = 'queued', claimed = 0, run_id = NULL, "
-            "last_error = NULL, attempts = 0, not_before = NULL, claim_token = NULL, "
-            "pending_report = NULL, prior_run_id = ?, prior_branch = ?, prior_pr_number = ?, "
-            "updated_at = ? WHERE item_id = ?",
-            (run_id, branch, pr_number, now, item_id),
+        session.execute(
+            update(WorkItemRow)
+            .where(WorkItemRow.item_id == item_id)
+            .values(
+                state="queued",
+                claimed=0,
+                run_id=None,
+                last_error=None,
+                attempts=0,
+                not_before=None,
+                claim_token=None,
+                pending_report=None,
+                prior_run_id=run_id,
+                prior_branch=branch,
+                prior_pr_number=pr_number,
+                updated_at=now,
+            )
         )
-        self._conn.commit()
         log.info(
             "store.item_requeued_by_label",
             item=item_id,
@@ -1522,51 +1900,65 @@ class DaemonStore:
             reason="trigger label re-applied to an unchanged issue",
         )
 
-    def _run_artifacts(self, run_id: str) -> tuple[str | None, int | None] | None:
+    def _run_artifacts(self, session: Session, run_id: str) -> tuple[str | None, int | None] | None:
         """The branch and PR the engine recorded for ``run_id`` in the
         shared ``state.db``, or None when there is nothing to read: no
         ``runs`` table (a daemon store without an engine history yet), a
         pre-1.0 ``runs`` shape with no PR columns, or no such run. Never
         raises — a restart with no recoverable artifact just starts fresh.
         """
-        if "runs" not in _tables(self._conn):
+        # The engine's table, not one of ours, and possibly at a shape that
+        # predates its PR columns — so it is introspected and read as text
+        # rather than through a model this store does not own.
+        #
+        # Bound to the session's own connection, not to the engine. The pool
+        # hands out one connection for the whole store, so an Inspector that
+        # opened its "own" would get that same one and roll the caller's
+        # open transaction back when it closed.
+        inspector = inspect(session.connection())
+        if "runs" not in inspector.get_table_names():
             return None
-        columns = _columns(self._conn, "runs")
-        if "branch" not in columns and "pr_number" not in columns:
+        columns = {c["name"] for c in inspector.get_columns("runs")}
+        wanted = [c for c in ("branch", "pr_number") if c in columns]
+        if not wanted:
             return None
-        select = ", ".join(c for c in ("branch", "pr_number") if c in columns)
+        projection = ", ".join(wanted)
         try:
-            row = self._conn.execute(
-                f"SELECT {select} FROM runs WHERE run_id = ?",  # nosec B608 - literals above
-                (run_id,),
-            ).fetchone()
-        except sqlite3.Error:
+            row = session.execute(
+                text(f"SELECT {projection} FROM runs WHERE run_id = :run_id"),  # nosec B608
+                {"run_id": run_id},
+            ).first()
+        except SQLAlchemyError:
             return None
         if row is None:
             return None
-        branch = _col(row, "branch")
-        pr = _col(row, "pr_number")
+        values = row._mapping
+        branch = values.get("branch")
+        pr = values.get("pr_number")
         return (str(branch) if branch else None, int(pr) if pr is not None else None)
 
     def prior_attempt(self, item_id: str) -> PriorAttempt | None:
         """What the item's previous attempt left on origin, if anything
         (#600): the run id, the branch it pushed and the PR it opened. None
         when the item has no recorded prior attempt."""
-        where, ids = _id_match(item_id)
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT prior_run_id, prior_branch, prior_pr_number "  # nosec B608 - literal above
-                f"FROM daemon_work_items WHERE {where} LIMIT 1",
-                ids,
-            ).fetchone()
+        with self._read() as session:
+            row = session.execute(
+                select(
+                    WorkItemRow.prior_run_id,
+                    WorkItemRow.prior_branch,
+                    WorkItemRow.prior_pr_number,
+                )
+                .where(_id_where(item_id))
+                .limit(1)
+            ).first()
         if row is None:
             return None
-        if row["prior_run_id"] is None and row["prior_branch"] is None:
+        run_id, branch, pr = row
+        if run_id is None and branch is None:
             return None
-        pr = row["prior_pr_number"]
         return PriorAttempt(
-            run_id=row["prior_run_id"],
-            branch=row["prior_branch"],
+            run_id=run_id,
+            branch=branch,
             pr_number=int(pr) if pr is not None else None,
         )
 
@@ -1586,29 +1978,29 @@ class DaemonStore:
         directly) and into ``daemon_prior_attempts``, which outlives the row
         — every path that is not a finish deletes the row, and a restart
         that lost the branch with it would rebuild the work from scratch."""
-        where, ids = _id_match(item_id)
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_work_items SET "  # nosec B608 - literal above
-                "prior_run_id = COALESCE(?, prior_run_id), "
-                "prior_branch = COALESCE(?, prior_branch), "
-                f"prior_pr_number = COALESCE(?, prior_pr_number) WHERE {where}",
-                (run_id, branch, pr_number, *ids),
+        with self._write() as session:
+            # COALESCE: a field this call left None keeps what is recorded.
+            session.execute(
+                update(WorkItemRow)
+                .where(_id_where(item_id))
+                .values(
+                    prior_run_id=func.coalesce(run_id, WorkItemRow.prior_run_id),
+                    prior_branch=func.coalesce(branch, WorkItemRow.prior_branch),
+                    prior_pr_number=func.coalesce(pr_number, WorkItemRow.prior_pr_number),
+                )
             )
-            row = self._conn.execute(
-                f"SELECT source_key, repo FROM daemon_work_items WHERE {where} "  # nosec B608
-                "LIMIT 1",
-                ids,
-            ).fetchone()
+            row = session.execute(
+                select(WorkItemRow.source_key, WorkItemRow.repo).where(_id_where(item_id)).limit(1)
+            ).first()
             if row is not None:
                 self._write_prior_side(
-                    str(row["source_key"]),
-                    str(row["repo"] or ""),
+                    session,
+                    str(row.source_key),
+                    str(row.repo or ""),
                     run_id=run_id,
                     branch=branch,
                     pr_number=pr_number,
                 )
-            self._conn.commit()
 
     def note_requester(
         self, source_key: str, requester_id: str, now: float, repo: str | None = None
@@ -1617,23 +2009,23 @@ class DaemonStore:
         write path), so the work item discovery builds from it carries the
         requester and the run's finish can ping them. ``repo`` scopes the
         note: the same issue number in two repositories is two requests."""
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO daemon_requesters "
-                "(source_key, repo, requester_id, created_at) VALUES (?, ?, ?, ?)",
-                (source_key, repo or "", requester_id, now),
+        with self._write() as session:
+            session.execute(
+                insert(RequesterRow)
+                .prefix_with("OR REPLACE")
+                .values(
+                    source_key=source_key,
+                    repo=repo or "",
+                    requester_id=requester_id,
+                    created_at=now,
+                )
             )
-            self._conn.commit()
 
     def get(self, item_id: str) -> WorkItem | None:
         """Look the item up under either spelling of its id: a row stored
         with a legacy ``gh:1234`` key resolves for ``gh:issue:1234`` too."""
-        where, params = _id_match(item_id)
-        with self._lock:
-            row = self._conn.execute(
-                f"SELECT * FROM daemon_work_items WHERE {where}",  # nosec B608
-                params,
-            ).fetchone()
+        with self._read() as session:
+            row = session.scalars(select(WorkItemRow).where(_id_where(item_id))).first()
             return _row_to_item(row) if row else None
 
     def next_queued(self, now: float, backoff_s: float) -> WorkItem | None:
@@ -1655,58 +2047,59 @@ class DaemonStore:
     def queued_in_order(self) -> list[WorkItem]:
         """Every queued item in the order :meth:`next_queued` considers them:
         interrupted runs awaiting resume first, then FIFO."""
-        with self._lock:
+        with self._read() as session:
+            # rowid breaks ties within a timestamp, keeping insertion order.
             return [
                 _row_to_item(row)
-                for row in self._conn.execute(
-                    "SELECT * FROM daemon_work_items WHERE state = 'queued' "
-                    "ORDER BY (run_id IS NULL) ASC, created_at ASC, rowid ASC"
+                for row in session.scalars(
+                    select(WorkItemRow)
+                    .where(WorkItemRow.state == "queued")
+                    .order_by(
+                        WorkItemRow.run_id.is_(None).asc(),
+                        WorkItemRow.created_at.asc(),
+                        text("rowid ASC"),
+                    )
                 )
             ]
 
     def run_items(self) -> dict[str, str]:
         """``run_id -> item_id`` for every run the daemon dispatched (the ledger)."""
-        with self._lock:
+        with self._read() as session:
             return {
-                str(r["run_id"]): str(r["item_id"])
-                for r in self._conn.execute("SELECT run_id, item_id FROM daemon_runs")
+                str(run_id): str(item_id)
+                for run_id, item_id in session.execute(
+                    select(DaemonRunRow.run_id, DaemonRunRow.item_id)
+                )
             }
 
     def queued(self) -> list[WorkItem]:
-        with self._lock:
+        with self._read() as session:
             return [
                 _row_to_item(row)
-                for row in self._conn.execute(
-                    "SELECT * FROM daemon_work_items WHERE state = 'queued' "
-                    "ORDER BY created_at ASC, rowid ASC"
+                for row in session.scalars(
+                    select(WorkItemRow)
+                    .where(WorkItemRow.state == "queued")
+                    .order_by(WorkItemRow.created_at.asc(), text("rowid ASC"))
                 )
             ]
 
     def running_items(self) -> list[WorkItem]:
-        with self._lock:
+        with self._read() as session:
             return [
                 _row_to_item(row)
-                for row in self._conn.execute(
-                    "SELECT * FROM daemon_work_items WHERE state = 'running'"
+                for row in session.scalars(
+                    select(WorkItemRow).where(WorkItemRow.state == "running")
                 )
             ]
 
     def items(self, states: Sequence[ItemState] | None = None) -> list[WorkItem]:
         """Every known item (optionally filtered by state), oldest first —
         the operator's view for ``sbxloop daemon items`` / ``!sbx items``."""
-        with self._lock:
-            if states:
-                marks = ", ".join("?" for _ in states)
-                rows = self._conn.execute(
-                    f"SELECT * FROM daemon_work_items WHERE state IN ({marks}) "  # nosec B608
-                    "ORDER BY created_at ASC, rowid ASC",
-                    tuple(states),
-                )
-            else:
-                rows = self._conn.execute(
-                    "SELECT * FROM daemon_work_items ORDER BY created_at ASC, rowid ASC"
-                )
-            return [_row_to_item(row) for row in rows]
+        stmt = select(WorkItemRow).order_by(WorkItemRow.created_at.asc(), text("rowid ASC"))
+        if states:
+            stmt = stmt.where(WorkItemRow.state.in_(list(states)))
+        with self._read() as session:
+            return [_row_to_item(row) for row in session.scalars(stmt)]
 
     # -- operator controls (#229) ------------------------------------------------
 
@@ -1794,18 +2187,17 @@ class DaemonStore:
         settles the item as done between the two must not have its verdict
         overwritten by a command issued on stale state. No row updated →
         re-read and refuse with the state that is actually there."""
-        assignments = ", ".join(f"{name} = ?" for name in fields)
-        marks = ", ".join("?" for _ in allowed)
-        where, ids = _id_match(item_id)
+        values = _item_values(fields, updated_at=now)
         item_id = normalize_item_id(item_id)
         with self._lock:
-            cursor = self._conn.execute(
-                f"UPDATE daemon_work_items SET {assignments}, updated_at = ? "  # nosec B608
-                f"WHERE {where} AND state IN ({marks})",
-                (*fields.values(), now, *ids, *allowed),
-            )
-            self._conn.commit()
-            if cursor.rowcount == 1:
+            with self._write() as session:
+                result = session.execute(
+                    update(WorkItemRow)
+                    .where(_id_where(item_id), WorkItemRow.state.in_(allowed))
+                    .values(**values)
+                )
+                changed = _rowcount(result)
+            if changed == 1:
                 fresh = self._require(item_id)
                 log.debug("store.transition", item=item_id, state=fresh.state, **_loggable(fields))
                 return fresh
@@ -1823,12 +2215,13 @@ class DaemonStore:
         """Items whose decision the source has not been told about yet
         (an operator's abandon / retry, or a run's merged / blocked outcome
         whose report did not land), oldest decision first."""
-        with self._lock:
+        with self._read() as session:
             return [
                 _row_to_item(row)
-                for row in self._conn.execute(
-                    "SELECT * FROM daemon_work_items WHERE pending_report IS NOT NULL "
-                    "ORDER BY updated_at ASC, rowid ASC"
+                for row in session.scalars(
+                    select(WorkItemRow)
+                    .where(WorkItemRow.pending_report.is_not(None))
+                    .order_by(WorkItemRow.updated_at.asc(), text("rowid ASC"))
                 )
             ]
 
@@ -1837,15 +2230,13 @@ class DaemonStore:
         none (or another thread already took it). Not ``_update``: this is
         not an item change and must not move ``updated_at``, the
         retry-backoff clock."""
-        where, ids = _id_match(item_id)
-        with self._lock:
-            cursor = self._conn.execute(
-                "UPDATE daemon_work_items SET pending_report = NULL "  # nosec B608
-                f"WHERE {where} AND pending_report IS NOT NULL",
-                ids,
+        with self._write() as session:
+            result = session.execute(
+                update(WorkItemRow)
+                .where(_id_where(item_id), WorkItemRow.pending_report.is_not(None))
+                .values(pending_report=None)
             )
-            self._conn.commit()
-            return cursor.rowcount == 1
+            return _rowcount(result) == 1
 
     def _require(self, item_id: str) -> WorkItem:
         item = self.get(item_id)
@@ -1870,12 +2261,17 @@ class DaemonStore:
     def half_claimed(self) -> list[WorkItem]:
         """Queued rows whose claim was started (token written) but never
         completed — the shape a crash between comment and persist leaves."""
-        with self._lock:
+        with self._read() as session:
             return [
                 _row_to_item(row)
-                for row in self._conn.execute(
-                    "SELECT * FROM daemon_work_items WHERE state = 'queued' "
-                    "AND claimed = 0 AND claim_token IS NOT NULL ORDER BY created_at, rowid"
+                for row in session.scalars(
+                    select(WorkItemRow)
+                    .where(
+                        WorkItemRow.state == "queued",
+                        WorkItemRow.claimed == 0,
+                        WorkItemRow.claim_token.is_not(None),
+                    )
+                    .order_by(WorkItemRow.created_at, text("rowid"))
                 )
             ]
 
@@ -1885,14 +2281,11 @@ class DaemonStore:
         Never a terminal state: ``failed`` is what discovery dedups against,
         and it is what made a lost claim race permanent (#530). If the
         trigger label comes back the next poll re-creates the row."""
-        where, ids = _id_match(item_id)
-        with self._lock:
-            cursor = self._conn.execute(
-                f"DELETE FROM daemon_work_items WHERE {where} AND state = 'queued'",  # nosec B608
-                ids,
+        with self._write() as session:
+            result = session.execute(
+                delete(WorkItemRow).where(_id_where(item_id), WorkItemRow.state == "queued")
             )
-            self._conn.commit()
-        dropped = cursor.rowcount == 1
+            dropped = _rowcount(result) == 1
         log.debug("store.discard", item=normalize_item_id(item_id), dropped=dropped)
         return dropped
 
@@ -1900,24 +2293,30 @@ class DaemonStore:
         """Move to running, count the attempt, and open the ledger row —
         all before the engine starts, so a crash still leaves the item→run
         link for recovery."""
-        where, ids = _id_match(item_id)
+        stored = item_id
         item_id = normalize_item_id(item_id)
-        with self._lock:
-            cursor = self._conn.execute(
-                "UPDATE daemon_work_items SET state = 'running', attempts = attempts + 1, "
-                f"run_id = ?, updated_at = ? WHERE {where}",  # nosec B608
-                (run_id, now, *ids),
+        # One transaction: the item's move and the ledger row land together
+        # or not at all. An unknown item must not leave an orphan ledger row
+        # that the daily cap would count, and raising inside the block is
+        # what rolls the whole thing back.
+        with self._write() as session:
+            result = session.execute(
+                update(WorkItemRow)
+                .where(_id_where(stored))
+                .values(
+                    state="running",
+                    attempts=WorkItemRow.attempts + 1,
+                    run_id=run_id,
+                    updated_at=now,
+                )
             )
-            if cursor.rowcount != 1:
-                # An unknown item must not leave an orphan ledger row that the
-                # daily cap would count.
-                self._conn.rollback()
+            if _rowcount(result) != 1:
                 raise KeyError(f"unknown work item {item_id!r}")
-            self._conn.execute(
-                "INSERT OR REPLACE INTO daemon_runs (run_id, item_id, started_at) VALUES (?, ?, ?)",
-                (run_id, item_id, now),
+            session.execute(
+                insert(DaemonRunRow)
+                .prefix_with("OR REPLACE")
+                .values(run_id=run_id, item_id=item_id, started_at=now)
             )
-            self._conn.commit()
 
     def mark_resume_pending(self, item_id: str, now: float) -> None:
         """Recovery found the item's run interrupted mid-flight: back to
@@ -1932,22 +2331,20 @@ class DaemonStore:
         its own ledger so the daily cap and the per-item resume budget see
         it. ``daemon_runs`` is keyed by run id, so a second segment of the
         same run cannot be a second row there."""
-        where, ids = _id_match(item_id)
+        stored = item_id
         item_id = normalize_item_id(item_id)
-        with self._lock:
-            cursor = self._conn.execute(
-                "UPDATE daemon_work_items SET state = 'running', not_before = NULL, "  # nosec B608
-                f"updated_at = ? WHERE {where} AND run_id = ?",
-                (now, *ids, run_id),
+        # One transaction, for the same reason as `mark_running`.
+        with self._write() as session:
+            result = session.execute(
+                update(WorkItemRow)
+                .where(_id_where(stored), WorkItemRow.run_id == run_id)
+                .values(state="running", not_before=None, updated_at=now)
             )
-            if cursor.rowcount != 1:
-                self._conn.rollback()
+            if _rowcount(result) != 1:
                 raise KeyError(f"work item {item_id!r} does not carry run {run_id!r}")
-            self._conn.execute(
-                "INSERT INTO daemon_run_resumes (run_id, item_id, resumed_at) VALUES (?, ?, ?)",
-                (run_id, item_id, now),
+            session.execute(
+                insert(RunResumeRow).values(run_id=run_id, item_id=item_id, resumed_at=now)
             )
-            self._conn.commit()
 
     def mark_done(
         self, item_id: str, now: float, *, pending_report: PendingReport | None = None
@@ -2077,18 +2474,10 @@ class DaemonStore:
         self._update(item_id, now, state="queued", run_id=None)
 
     def _update(self, item_id: str, now: float, **fields: object) -> None:
-        # Column names come from this module's own keyword calls, never from
-        # input; every value is a bound parameter.
-        assignments = ", ".join(f"{name} = ?" for name in fields)
-        where, ids = _id_match(item_id)
+        values = _item_values(fields, updated_at=now)
         item_id = normalize_item_id(item_id)
-        with self._lock:
-            self._conn.execute(
-                f"UPDATE daemon_work_items SET {assignments}, updated_at = ? "  # nosec B608
-                f"WHERE {where}",
-                (*fields.values(), now, *ids),
-            )
-            self._conn.commit()
+        with self._write() as session:
+            session.execute(update(WorkItemRow).where(_id_where(item_id)).values(**values))
         log.debug("store.update", item=item_id, **_loggable(fields))
 
     def set_state(self, item_id: str, state: ItemState, now: float) -> None:
@@ -2099,31 +2488,44 @@ class DaemonStore:
     def runs_started_since(self, ts: float) -> int:
         """Fresh starts plus resumes in the window: each resume spends a
         full engine wall clock, so the daily cap counts it (#254/#234)."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT (SELECT COUNT(*) FROM daemon_runs WHERE started_at >= ?) + "
-                "(SELECT COUNT(*) FROM daemon_run_resumes WHERE resumed_at >= ?) AS n",
-                (ts, ts),
-            ).fetchone()
-            return int(row["n"])
+        with self._read() as session:
+            started = (
+                select(func.count())
+                .select_from(DaemonRunRow)
+                .where(DaemonRunRow.started_at >= ts)
+                .scalar_subquery()
+            )
+            resumed = (
+                select(func.count())
+                .select_from(RunResumeRow)
+                .where(RunResumeRow.resumed_at >= ts)
+                .scalar_subquery()
+            )
+            return int(session.scalar(select(started + resumed)) or 0)
 
     def resumes_since(self, ts: float) -> int:
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM daemon_run_resumes WHERE resumed_at >= ?", (ts,)
-            ).fetchone()
-            return int(row["n"])
+        with self._read() as session:
+            return int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(RunResumeRow)
+                    .where(RunResumeRow.resumed_at >= ts)
+                )
+                or 0
+            )
 
     def resumes_for_item(self, item_id: str) -> int:
         """Resumes across ALL of the item's runs: the budget bounds total
         effort per item, not per plan."""
-        where, ids = _id_match(item_id)
-        with self._lock:
-            row = self._conn.execute(
-                f"SELECT COUNT(*) AS n FROM daemon_run_resumes WHERE {where}",  # nosec B608
-                ids,
-            ).fetchone()
-            return int(row["n"])
+        with self._read() as session:
+            return int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(RunResumeRow)
+                    .where(_id_where(item_id, RunResumeRow.item_id))
+                )
+                or 0
+            )
 
     def unsettled_runs(self) -> list[tuple[str, str]]:
         """``(run_id, item_id)`` for every ledger row the loop never closed
@@ -2133,12 +2535,13 @@ class DaemonStore:
         *offline* — the row-only CLI cannot report to the source or clean
         up the dead run's sandboxes, and the item is no longer ``running``
         so the ordinary reconciliation never sees it (#229)."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT run_id, item_id FROM daemon_runs "
-                "WHERE finished_at IS NULL OR result = 'interrupted' ORDER BY started_at ASC"
+        with self._read() as session:
+            rows = session.execute(
+                select(DaemonRunRow.run_id, DaemonRunRow.item_id)
+                .where(DaemonRunRow.finished_at.is_(None) | (DaemonRunRow.result == "interrupted"))
+                .order_by(DaemonRunRow.started_at.asc())
             )
-            return [(str(row["run_id"]), normalize_item_id(str(row["item_id"]))) for row in rows]
+            return [(str(run_id), normalize_item_id(str(item_id))) for run_id, item_id in rows]
 
     def finished_run_ids(self, run_ids: Sequence[str]) -> set[str]:
         """Which of these runs already have a ledger `finished_at`. Used at
@@ -2148,109 +2551,187 @@ class DaemonStore:
         leave it waiting for an event that will never come again."""
         if not run_ids:
             return set()
-        with self._lock:
-            placeholders = ", ".join("?" for _ in run_ids)
-            rows = self._conn.execute(
-                f"SELECT run_id FROM daemon_runs WHERE run_id IN ({placeholders}) "  # nosec B608
-                "AND finished_at IS NOT NULL",
-                tuple(run_ids),
-            )
-            return {str(r["run_id"]) for r in rows}
+        with self._read() as session:
+            return {
+                str(r)
+                for r in session.scalars(
+                    select(DaemonRunRow.run_id).where(
+                        DaemonRunRow.run_id.in_(list(run_ids)),
+                        DaemonRunRow.finished_at.is_not(None),
+                    )
+                )
+            }
 
     def finish_ledger(self, run_id: str, result: str, now: float) -> None:
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_runs SET finished_at = ?, result = ? WHERE run_id = ?",
-                (now, result, run_id),
+        with self._write() as session:
+            session.execute(
+                update(DaemonRunRow)
+                .where(DaemonRunRow.run_id == run_id)
+                .values(finished_at=now, result=result)
             )
-            self._conn.commit()
         log.debug("store.ledger_closed", run=run_id, result=result)
 
     def runs_for_item(self, item_id: str) -> list[str]:
         """Run ids the item has been dispatched under, oldest first."""
-        where, ids = _id_match(item_id)
-        with self._lock:
+        with self._read() as session:
             return [
-                str(r["run_id"])
-                for r in self._conn.execute(
-                    f"SELECT run_id FROM daemon_runs WHERE {where} "  # nosec B608
-                    "ORDER BY started_at",
-                    ids,
+                str(r)
+                for r in session.scalars(
+                    select(DaemonRunRow.run_id)
+                    .where(_id_where(item_id, DaemonRunRow.item_id))
+                    .order_by(DaemonRunRow.started_at)
                 )
             ]
 
-    # -- schedules (#761) ---------------------------------------------------------
+    # -- schedules (#761, #818) ----------------------------------------------------
+
+    def schedules(self) -> list[StoredSchedule]:
+        """Every schedule the daemon fires, by name: the rows that carry a
+        spec. State-only rows (a removed schedule's, or a pre-#818
+        daemon's) are not schedules."""
+        with self._read() as session:
+            rows = list(
+                session.scalars(
+                    select(ScheduleRowModel)
+                    .where(ScheduleRowModel.ask.is_not(None))
+                    .order_by(ScheduleRowModel.name)
+                )
+            )
+            out: list[StoredSchedule] = []
+            for row in rows:
+                try:
+                    spec = _row_to_spec(row)
+                except ValueError:
+                    log.warning("store.schedule_unreadable", schedule=str(row.name), exc_info=True)
+                    continue
+                out.append(
+                    StoredSchedule(
+                        spec,
+                        str(row.source or "config"),
+                        None if row.created_by is None else str(row.created_by),
+                        None if row.created_at is None else float(row.created_at),
+                    )
+                )
+        return out
+
+    def schedule(self, name: str) -> StoredSchedule | None:
+        """The schedule called ``name``, None when there is none."""
+        return next((s for s in self.schedules() if s.spec.name == name), None)
+
+    def add_schedule(
+        self, spec: ScheduleConfig, *, source: str, by: str | None, now: float
+    ) -> bool:
+        """Persist a schedule. A name already carrying a spec is left as it
+        is (False); a state-only row of that name — a schedule removed
+        earlier, or one a pre-#818 daemon anchored — keeps its grid and
+        takes the spec. The grid of a new schedule anchors at ``now``."""
+        # The check and the write are one transaction: two callers adding
+        # the same name must not both see "no spec yet".
+        with self._lock, begin_immediate(self._engine) as conn:
+            row = conn.execute(
+                select(ScheduleRowModel.ask).where(ScheduleRowModel.name == spec.name)
+            ).first()
+            if row is not None and row.ask is not None:
+                return False
+            if row is None:
+                conn.execute(insert(ScheduleRowModel).values(name=spec.name, anchor=now))
+            conn.execute(
+                update(ScheduleRowModel)
+                .where(ScheduleRowModel.name == spec.name)
+                .values(
+                    profile=spec.profile,
+                    ask=spec.ask,
+                    every=spec.every,
+                    cron=spec.cron,
+                    timezone=spec.timezone,
+                    source=source,
+                    created_by=by,
+                    created_at=now,
+                )
+            )
+            return True
+
+    def remove_schedule(self, name: str) -> bool:
+        """Forget a schedule, state and all: a schedule re-added under the
+        same name starts a fresh grid. False when there was none."""
+        with self._write() as session:
+            result = session.execute(
+                delete(ScheduleRowModel).where(
+                    ScheduleRowModel.name == name, ScheduleRowModel.ask.is_not(None)
+                )
+            )
+            return _rowcount(result) == 1
 
     def schedule_row(self, name: str, now: float) -> ScheduleRow:
         """The schedule's row, created at ``now`` on first sight — the
         anchor of its grid."""
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO daemon_schedules (name, anchor) VALUES (?, ?)",
-                (name, now),
+        with self._write() as session:
+            session.execute(
+                insert(ScheduleRowModel).prefix_with("OR IGNORE").values(name=name, anchor=now)
             )
-            self._conn.commit()
-            row = self._conn.execute(
-                "SELECT * FROM daemon_schedules WHERE name = ?", (name,)
-            ).fetchone()
+            session.flush()
+            row = session.scalars(
+                select(ScheduleRowModel).where(ScheduleRowModel.name == name)
+            ).one()
             return _row_to_schedule(row)
 
     def schedule_rows(self) -> dict[str, ScheduleRow]:
         """Every schedule row by name, whether or not still configured."""
-        with self._lock:
+        with self._read() as session:
             return {
-                str(r["name"]): _row_to_schedule(r)
-                for r in self._conn.execute("SELECT * FROM daemon_schedules ORDER BY name")
+                str(r.name): _row_to_schedule(r)
+                for r in session.scalars(select(ScheduleRowModel).order_by(ScheduleRowModel.name))
             }
 
     def schedule_due_handled(self, name: str, due: float) -> None:
         """Record that the tick due at ``due`` was dealt with without
         queueing anything (skipped, or swallowed while paused)."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_schedules SET last_due = ? WHERE name = ?", (due, name)
+        with self._write() as session:
+            session.execute(
+                update(ScheduleRowModel).where(ScheduleRowModel.name == name).values(last_due=due)
             )
-            self._conn.commit()
 
     def schedule_fired(self, name: str, due: float, item_id: str, now: float) -> None:
         """Record the fire for the tick due at ``due``: the item it queued
         and when."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_schedules SET last_due = ?, last_fired_at = ?, last_item = ? "
-                "WHERE name = ?",
-                (due, now, item_id, name),
+        with self._write() as session:
+            session.execute(
+                update(ScheduleRowModel)
+                .where(ScheduleRowModel.name == name)
+                .values(last_due=due, last_fired_at=now, last_item=item_id)
             )
-            self._conn.commit()
 
     def set_schedule_paused(self, name: str, by: str | None, now: float) -> bool:
         """Park (``by`` a name) or release (``by`` None) the schedule.
         False when it was already so."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT paused_by FROM daemon_schedules WHERE name = ?", (name,)
-            ).fetchone()
-            if row is None or (row["paused_by"] is None) == (by is None):
+        with self._write() as session:
+            row = session.execute(
+                select(ScheduleRowModel.paused_by).where(ScheduleRowModel.name == name)
+            ).first()
+            if row is None or (row.paused_by is None) == (by is None):
                 return False
-            self._conn.execute(
-                "UPDATE daemon_schedules SET paused_by = ?, paused_at = ? WHERE name = ?",
-                (by, now if by is not None else None, name),
+            session.execute(
+                update(ScheduleRowModel)
+                .where(ScheduleRowModel.name == name)
+                .values(paused_by=by, paused_at=now if by is not None else None)
             )
-            self._conn.commit()
             return True
 
     def live_schedule_item(self, name: str) -> WorkItem | None:
         """The tick of ``name`` still in flight — queued, running or parked
         behind a gate or a review — None when the last one has finished."""
-        marks = ", ".join("?" for _ in TERMINAL_ITEM_STATES)
         # `_` is a LIKE wildcard and a legal name character.
         pattern = SCHED_PREFIX + name.replace("\\", "\\\\").replace("_", "\\_") + ":%"
-        with self._lock:
-            row = self._conn.execute(
-                f"SELECT * FROM daemon_work_items WHERE item_id LIKE ? ESCAPE '\\' "  # nosec B608
-                f"AND state NOT IN ({marks}) ORDER BY created_at DESC, rowid DESC LIMIT 1",
-                (pattern, *TERMINAL_ITEM_STATES),
-            ).fetchone()
+        with self._read() as session:
+            row = session.scalars(
+                select(WorkItemRow)
+                .where(
+                    WorkItemRow.item_id.like(pattern, escape="\\"),
+                    WorkItemRow.state.not_in(list(TERMINAL_ITEM_STATES)),
+                )
+                .order_by(WorkItemRow.created_at.desc(), text("rowid DESC"))
+                .limit(1)
+            ).first()
             return _row_to_item(row) if row else None
 
     # -- generic daemon state ---------------------------------------------------
@@ -2258,39 +2739,37 @@ class DaemonStore:
     def get_value(self, key: str) -> str | None:
         """One ``daemon_state`` value (small process-level facts such as the
         concierge's SDK session id)."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT value FROM daemon_state WHERE key = ?", (key,)
-            ).fetchone()
-            return None if row is None or row["value"] is None else str(row["value"])
+        with self._read() as session:
+            value = session.scalars(
+                select(DaemonStateRow.value).where(DaemonStateRow.key == key)
+            ).first()
+            return None if value is None else str(value)
 
     def set_value(self, key: str, value: str | None) -> None:
         """Set (or, with ``None``, delete) one ``daemon_state`` value."""
-        with self._lock:
+        with self._write() as session:
             if value is None:
-                self._conn.execute("DELETE FROM daemon_state WHERE key = ?", (key,))
+                session.execute(delete(DaemonStateRow).where(DaemonStateRow.key == key))
             else:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO daemon_state (key, value) VALUES (?, ?)",
-                    (key, value),
+                session.execute(
+                    insert(DaemonStateRow).prefix_with("OR REPLACE").values(key=key, value=value)
                 )
-            self._conn.commit()
 
     # -- pending clarifications (ask, never block) ----------------------------
 
     @staticmethod
-    def _clarification(row: sqlite3.Row) -> PendingClarification:
+    def _clarification(row: PendingClarificationRow) -> PendingClarification:
         return PendingClarification(
-            id=int(row["id"]),
-            backend=str(row["backend"]),
-            channel_id=None if row["channel_id"] is None else str(row["channel_id"]),
-            asker_id=None if row["asker_id"] is None else str(row["asker_id"]),
-            asker_name=None if row["asker_name"] is None else str(row["asker_name"]),
-            question=str(row["question"]),
-            assumption=str(row["assumption"]),
-            deadline=float(row["deadline"]),
-            created_at=float(row["created_at"]),
-            state=str(row["state"]),
+            id=int(row.id),
+            backend=str(row.backend),
+            channel_id=None if row.channel_id is None else str(row.channel_id),
+            asker_id=None if row.asker_id is None else str(row.asker_id),
+            asker_name=None if row.asker_name is None else str(row.asker_name),
+            question=str(row.question),
+            assumption=str(row.assumption),
+            deadline=float(row.deadline),
+            created_at=float(row.created_at),
+            state=str(row.state),
         )
 
     def create_pending_clarification(
@@ -2307,35 +2786,34 @@ class DaemonStore:
     ) -> int | None:
         """Persist one filing-blocking ask's fallback; None over the cap
         (the question still posts — only the auto-file is shed)."""
-        with self._lock:
+        with self._write() as session:
             # The cap bounds what one bridge's sweeper will ever fire; rows a
             # backend nobody runs any more left behind do not count against
             # the one that does.
-            open_count = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM daemon_pending_clarifications "
-                "WHERE state = 'open' AND backend = ?",
-                (backend,),
-            ).fetchone()["n"]
-            if int(open_count) >= PENDING_CLARIFICATION_CAP:
+            open_count = session.scalar(
+                select(func.count())
+                .select_from(PendingClarificationRow)
+                .where(
+                    PendingClarificationRow.state == "open",
+                    PendingClarificationRow.backend == backend,
+                )
+            )
+            if int(open_count or 0) >= PENDING_CLARIFICATION_CAP:
                 log.warning("store.clarification_cap", cap=PENDING_CLARIFICATION_CAP)
                 return None
-            cur = self._conn.execute(
-                "INSERT INTO daemon_pending_clarifications "
-                "(backend, channel_id, asker_id, asker_name, question, assumption, "
-                "deadline, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    backend,
-                    _text_or_none(channel_id),
-                    _text_or_none(asker_id),
-                    _text_or_none(asker_name),
-                    question,
-                    assumption,
-                    deadline,
-                    now,
-                ),
+            result = session.execute(
+                insert(PendingClarificationRow).values(
+                    backend=backend,
+                    channel_id=_text_or_none(channel_id),
+                    asker_id=_text_or_none(asker_id),
+                    asker_name=_text_or_none(asker_name),
+                    question=question,
+                    assumption=assumption,
+                    deadline=deadline,
+                    created_at=now,
+                )
             )
-            self._conn.commit()
-            return int(cur.lastrowid or 0)
+            return _inserted_id(result)
 
     def take_due_clarifications(
         self, now: float, backend: str | None = None
@@ -2344,38 +2822,42 @@ class DaemonStore:
         per row), so two sweepers — or a sweep racing a restart — never fire
         the same ask twice. Every bridge sweeps its own ``backend``; a bare
         sweep takes them all."""
-        with self._lock:
-            if backend is None:
-                rows = self._conn.execute(
-                    "SELECT * FROM daemon_pending_clarifications "
-                    "WHERE state = 'open' AND deadline <= ? ORDER BY deadline",
-                    (now,),
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    "SELECT * FROM daemon_pending_clarifications "
-                    "WHERE state = 'open' AND deadline <= ? AND backend = ? ORDER BY deadline",
-                    (now, backend),
-                ).fetchall()
+        stmt = (
+            select(PendingClarificationRow)
+            .where(
+                PendingClarificationRow.state == "open",
+                PendingClarificationRow.deadline <= now,
+            )
+            .order_by(PendingClarificationRow.deadline)
+        )
+        if backend is not None:
+            stmt = stmt.where(PendingClarificationRow.backend == backend)
+        with self._write() as session:
+            rows = list(session.scalars(stmt))
             taken: list[PendingClarification] = []
             for row in rows:
-                cur = self._conn.execute(
-                    "UPDATE daemon_pending_clarifications SET state = 'firing' "
-                    "WHERE id = ? AND state = 'open'",
-                    (int(row["id"]),),
+                # CAS per row: the claim is the state move, so a second
+                # sweeper reading the same row loses it here.
+                claimed = _row_claimed(
+                    session,
+                    update(PendingClarificationRow)
+                    .where(
+                        PendingClarificationRow.id == int(row.id),
+                        PendingClarificationRow.state == "open",
+                    )
+                    .values(state="firing"),
                 )
-                if cur.rowcount == 1:
+                if claimed:
                     taken.append(self._clarification(row))
-            self._conn.commit()
             return taken
 
     def resolve_pending_clarification(self, clar_id: int, state: str, now: float) -> None:
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_pending_clarifications SET state = ?, resolved_at = ? WHERE id = ?",
-                (state, now, clar_id),
+        with self._write() as session:
+            session.execute(
+                update(PendingClarificationRow)
+                .where(PendingClarificationRow.id == clar_id)
+                .values(state=state, resolved_at=now)
             )
-            self._conn.commit()
 
     def resolve_open_clarifications_for(
         self, asker_id: str, channel_id: str | None, now: float
@@ -2383,66 +2865,63 @@ class DaemonStore:
         """Any engagement from the asker settles their open asks (scoped to
         the surface it happened on when that is known): the concierge
         handles the actual words in-session, so the fallback stands down."""
-        with self._lock:
-            if channel_id:
-                cur = self._conn.execute(
-                    "UPDATE daemon_pending_clarifications "
-                    "SET state = 'answered', resolved_at = ? "
-                    "WHERE state = 'open' AND asker_id = ? "
-                    "AND (channel_id IS NULL OR channel_id = ?)",
-                    (now, asker_id, str(channel_id)),
-                )
-            else:
-                cur = self._conn.execute(
-                    "UPDATE daemon_pending_clarifications "
-                    "SET state = 'answered', resolved_at = ? "
-                    "WHERE state = 'open' AND asker_id = ?",
-                    (now, asker_id),
-                )
-            self._conn.commit()
-            return int(cur.rowcount)
+        stmt = (
+            update(PendingClarificationRow)
+            .where(
+                PendingClarificationRow.state == "open",
+                PendingClarificationRow.asker_id == asker_id,
+            )
+            .values(state="answered", resolved_at=now)
+        )
+        if channel_id:
+            stmt = stmt.where(
+                PendingClarificationRow.channel_id.is_(None)
+                | (PendingClarificationRow.channel_id == str(channel_id))
+            )
+        with self._write() as session:
+            return int(_rowcount(session.execute(stmt)))
 
     def open_clarifications(self, backend: str | None = None) -> list[PendingClarification]:
-        with self._lock:
-            if backend is None:
-                rows = self._conn.execute(
-                    "SELECT * FROM daemon_pending_clarifications WHERE state = 'open' "
-                    "ORDER BY deadline"
-                ).fetchall()
-            else:
-                rows = self._conn.execute(
-                    "SELECT * FROM daemon_pending_clarifications "
-                    "WHERE state = 'open' AND backend = ? ORDER BY deadline",
-                    (backend,),
-                ).fetchall()
-            return [self._clarification(row) for row in rows]
+        stmt = (
+            select(PendingClarificationRow)
+            .where(PendingClarificationRow.state == "open")
+            .order_by(PendingClarificationRow.deadline)
+        )
+        if backend is not None:
+            stmt = stmt.where(PendingClarificationRow.backend == backend)
+        with self._read() as session:
+            return [self._clarification(row) for row in session.scalars(stmt)]
 
     def values_with_prefix(self, prefix: str) -> dict[str, str]:
         """Every ``daemon_state`` value whose key starts with ``prefix``."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT key, value FROM daemon_state WHERE key LIKE ? ESCAPE '\\'",
-                (prefix.replace("%", "\\%").replace("_", "\\_") + "%",),
+        pattern = prefix.replace("%", "\\%").replace("_", "\\_") + "%"
+        with self._read() as session:
+            rows = session.execute(
+                select(DaemonStateRow.key, DaemonStateRow.value).where(
+                    DaemonStateRow.key.like(pattern, escape="\\")
+                )
             )
-            return {str(r["key"]): str(r["value"]) for r in rows if r["value"] is not None}
+            return {str(k): str(v) for k, v in rows if v is not None}
 
     def clear_prefix(self, prefix: str) -> int:
         """Delete every ``daemon_state`` value whose key starts with ``prefix``."""
-        with self._lock:
-            cursor = self._conn.execute(
-                "DELETE FROM daemon_state WHERE key LIKE ? ESCAPE '\\'",
-                (prefix.replace("%", "\\%").replace("_", "\\_") + "%",),
+        pattern = prefix.replace("%", "\\%").replace("_", "\\_") + "%"
+        with self._write() as session:
+            return int(
+                _rowcount(
+                    session.execute(
+                        delete(DaemonStateRow).where(DaemonStateRow.key.like(pattern, escape="\\"))
+                    )
+                )
             )
-            self._conn.commit()
-            return int(cursor.rowcount)
 
     def item_for_run(self, run_id: str) -> str | None:
         """The work item a run was dispatched for (ledger lookup)."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT item_id FROM daemon_runs WHERE run_id = ?", (run_id,)
-            ).fetchone()
-            return None if row is None else normalize_item_id(str(row["item_id"]))
+        with self._read() as session:
+            item_id = session.scalars(
+                select(DaemonRunRow.item_id).where(DaemonRunRow.run_id == run_id)
+            ).first()
+            return None if item_id is None else normalize_item_id(str(item_id))
 
     # -- merge gates ([landing] merge_gate) --------------------------------------
 
@@ -2464,52 +2943,49 @@ class DaemonStore:
         at publishing (#760; ``pr_number`` 0). ``INSERT OR IGNORE``: a
         recovery re-settle of the same run must not clobber the standing
         gate (or a decision already taken on it)."""
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO daemon_merge_gates "
-                "(run_id, item_id, repo, pr_number, pr_url, branch, notify_ids, "
-                "custom_id, state, created_at, kind) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)",
-                (
-                    run_id,
-                    normalize_item_id(item_id),
-                    repo,
-                    pr_number,
-                    pr_url,
-                    branch,
-                    json.dumps(list(notify_ids)),
-                    custom_id,
-                    now,
-                    kind,
-                ),
+        with self._write() as session:
+            session.execute(
+                insert(MergeGateRow)
+                .prefix_with("OR IGNORE")
+                .values(
+                    run_id=run_id,
+                    item_id=normalize_item_id(item_id),
+                    repo=repo,
+                    pr_number=pr_number,
+                    pr_url=pr_url,
+                    branch=branch,
+                    notify_ids=json.dumps(list(notify_ids)),
+                    custom_id=custom_id,
+                    state="open",
+                    created_at=now,
+                    kind=kind,
+                )
             )
-            self._conn.commit()
         log.info("store.merge_gate_created", run=run_id, item=item_id, pr=pr_number, kind=kind)
 
     def merge_gate_for(self, target: str) -> MergeGate | None:
         """The gate for a run id or an item id (either spelling)."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM daemon_merge_gates WHERE run_id = ?", (target,)
-            ).fetchone()
+        with self._read() as session:
+            row = session.scalars(select(MergeGateRow).where(MergeGateRow.run_id == target)).first()
             if row is None:
-                where, ids = _id_match(target)
-                row = self._conn.execute(
-                    f"SELECT * FROM daemon_merge_gates WHERE {where} "  # nosec B608
-                    "ORDER BY created_at DESC LIMIT 1",
-                    ids,
-                ).fetchone()
+                row = session.scalars(
+                    select(MergeGateRow)
+                    .where(_id_where(target, MergeGateRow.item_id))
+                    .order_by(MergeGateRow.created_at.desc())
+                    .limit(1)
+                ).first()
             return _row_to_gate(row) if row else None
 
     def open_merge_gates(self) -> list[MergeGate]:
         """Gates a restart must re-arm: standing (open) and interrupted
         mid-approval (approving)."""
-        with self._lock:
+        with self._read() as session:
             return [
                 _row_to_gate(row)
-                for row in self._conn.execute(
-                    "SELECT * FROM daemon_merge_gates WHERE state IN ('open', 'approving') "
-                    "ORDER BY created_at"
+                for row in session.scalars(
+                    select(MergeGateRow)
+                    .where(MergeGateRow.state.in_(OPEN_GATE_STATES))
+                    .order_by(MergeGateRow.created_at)
                 )
             ]
 
@@ -2517,25 +2993,29 @@ class DaemonStore:
         """CAS ``open → approving``: exactly one click/command wins; a
         double-click loses here instead of double-merging. ``by`` records
         who won, for the resolution that follows to name."""
-        with self._lock:
-            cursor = self._conn.execute(
-                "UPDATE daemon_merge_gates SET state = 'approving', "
-                "resolved_by = COALESCE(?, resolved_by) WHERE run_id = ? AND state = 'open'",
-                (by, run_id),
+        with self._write() as session:
+            result = session.execute(
+                update(MergeGateRow)
+                .where(MergeGateRow.run_id == run_id, MergeGateRow.state == "open")
+                .values(
+                    state="approving",
+                    resolved_by=func.coalesce(by, MergeGateRow.resolved_by),
+                )
             )
-            self._conn.commit()
-            return cursor.rowcount == 1
+            return _rowcount(result) == 1
 
     def reopen_merge_gate(self, run_id: str, detail: str | None = None) -> None:
         """A failed or interrupted approval puts the gate back up; the
         prompt (and button) work again."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_merge_gates SET state = 'open', detail = ? "
-                "WHERE run_id = ? AND state IN ('open', 'approving')",
-                (detail, run_id),
+        with self._write() as session:
+            session.execute(
+                update(MergeGateRow)
+                .where(
+                    MergeGateRow.run_id == run_id,
+                    MergeGateRow.state.in_(OPEN_GATE_STATES),
+                )
+                .values(state="open", detail=detail)
             )
-            self._conn.commit()
         log.info("store.merge_gate_reopened", run=run_id, detail=detail)
 
     def resolve_merge_gate(
@@ -2549,13 +3029,12 @@ class DaemonStore:
         """Close the gate: ``merged`` (approved and landed), ``released``
         (a held result published, #760) or ``dismissed`` (abandoned / PR
         closed)."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_merge_gates SET state = ?, resolved_at = ?, resolved_by = ?, "
-                "detail = ? WHERE run_id = ?",
-                (state, now, by, detail, run_id),
+        with self._write() as session:
+            session.execute(
+                update(MergeGateRow)
+                .where(MergeGateRow.run_id == run_id)
+                .values(state=state, resolved_at=now, resolved_by=by, detail=detail)
             )
-            self._conn.commit()
         log.info("store.merge_gate_resolved", run=run_id, state=state, by=by)
 
     def set_gate_prompt(
@@ -2568,31 +3047,36 @@ class DaemonStore:
     ) -> None:
         """Where ``backend``'s prompt lives, so a restart can find/refresh
         it; an empty message id forgets it."""
-        with self._lock:
+        with self._write() as session:
             if not message_id:
-                self._conn.execute(
-                    "DELETE FROM daemon_gate_prompts WHERE run_id = ? AND backend = ?",
-                    (run_id, backend),
+                session.execute(
+                    delete(GatePromptRow).where(
+                        GatePromptRow.run_id == run_id, GatePromptRow.backend == backend
+                    )
                 )
             else:
-                self._conn.execute(
-                    "INSERT OR REPLACE INTO daemon_gate_prompts "
-                    "(run_id, backend, channel_id, message_id) VALUES (?, ?, ?, ?)",
-                    (run_id, backend, _text_or_none(channel_id), str(message_id)),
+                session.execute(
+                    insert(GatePromptRow)
+                    .prefix_with("OR REPLACE")
+                    .values(
+                        run_id=run_id,
+                        backend=backend,
+                        channel_id=_text_or_none(channel_id),
+                        message_id=str(message_id),
+                    )
                 )
-            self._conn.commit()
 
     def gate_prompt(self, run_id: str, backend: str) -> tuple[str | None, str] | None:
         """``(channel_id, message_id)`` of ``backend``'s prompt for the gate."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT channel_id, message_id FROM daemon_gate_prompts "
-                "WHERE run_id = ? AND backend = ?",
-                (run_id, backend),
-            ).fetchone()
-            if row is None or not row["message_id"]:
+        with self._read() as session:
+            row = session.execute(
+                select(GatePromptRow.channel_id, GatePromptRow.message_id).where(
+                    GatePromptRow.run_id == run_id, GatePromptRow.backend == backend
+                )
+            ).first()
+            if row is None or not row.message_id:
                 return None
-            return (_text_or_none(row["channel_id"]), str(row["message_id"]))
+            return (_text_or_none(row.channel_id), str(row.message_id))
 
     # -- review holds (#675) -----------------------------------------------------
 
@@ -2619,98 +3103,107 @@ class DaemonStore:
         list is the fresh one, and so is what it waits for — a review, or
         the PR marked ready, #677); a decision already taken on a finished
         row stands."""
-        with self._lock:
-            self._conn.execute(
-                "INSERT INTO daemon_review_holds (run_id, item_id, repo, pr_number, pr_url, "
-                "branch, login, is_bot, approvals_required, held_by_draft, notify_ids, state, "
-                "created_at, since_at, next_poll_at, polls) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?, ?, 0) "
-                "ON CONFLICT(run_id) DO UPDATE SET state = 'open', since_at = excluded.since_at, "
-                "next_poll_at = excluded.next_poll_at, notify_ids = excluded.notify_ids, "
-                "approvals_required = excluded.approvals_required, "
-                "held_by_draft = excluded.held_by_draft, login = excluded.login, "
-                "is_bot = excluded.is_bot, detail = NULL, resolved_at = NULL, resolved_by = NULL "
-                "WHERE daemon_review_holds.state IN ('open', 'fixing', 'paused', 'approving')",
-                (
-                    run_id,
-                    normalize_item_id(item_id),
-                    repo,
-                    pr_number,
-                    pr_url,
-                    branch,
-                    login,
-                    None if is_bot is None else int(is_bot),
-                    approvals_required,
-                    int(held_by_draft),
-                    json.dumps(list(notify_ids)),
-                    now,
-                    now,
-                    next_poll_at,
-                ),
+        stmt = sqlite_insert(ReviewHoldRow).values(
+            run_id=run_id,
+            item_id=normalize_item_id(item_id),
+            repo=repo,
+            pr_number=pr_number,
+            pr_url=pr_url,
+            branch=branch,
+            login=login,
+            is_bot=None if is_bot is None else int(is_bot),
+            approvals_required=approvals_required,
+            held_by_draft=int(held_by_draft),
+            notify_ids=json.dumps(list(notify_ids)),
+            state="open",
+            created_at=now,
+            since_at=now,
+            next_poll_at=next_poll_at,
+            polls=0,
+        )
+        # The upsert is gated on the existing state: a decision already
+        # taken on a finished row stands, and only an unfinished wait is
+        # re-opened.
+        with self._write() as session:
+            session.execute(
+                stmt.on_conflict_do_update(
+                    index_elements=["run_id"],
+                    set_={
+                        "state": "open",
+                        "since_at": stmt.excluded.since_at,
+                        "next_poll_at": stmt.excluded.next_poll_at,
+                        "notify_ids": stmt.excluded.notify_ids,
+                        "approvals_required": stmt.excluded.approvals_required,
+                        "held_by_draft": stmt.excluded.held_by_draft,
+                        "login": stmt.excluded.login,
+                        "is_bot": stmt.excluded.is_bot,
+                        "detail": None,
+                        "resolved_at": None,
+                        "resolved_by": None,
+                    },
+                    where=ReviewHoldRow.state.in_(("open", "fixing", "paused", "approving")),
+                )
             )
-            self._conn.commit()
         log.info("store.review_hold_created", run=run_id, item=item_id, pr=pr_number)
 
     def review_hold_for(self, target: str) -> ReviewHold | None:
         """The hold for a run id or an item id (either spelling); the newest
         when an item had several runs."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT * FROM daemon_review_holds WHERE run_id = ?", (target,)
-            ).fetchone()
+        with self._read() as session:
+            row = session.scalars(
+                select(ReviewHoldRow).where(ReviewHoldRow.run_id == target)
+            ).first()
             if row is None:
-                where, ids = _id_match(target)
-                row = self._conn.execute(
-                    f"SELECT * FROM daemon_review_holds WHERE {where} "  # nosec B608
-                    "ORDER BY created_at DESC LIMIT 1",
-                    ids,
-                ).fetchone()
+                row = session.scalars(
+                    select(ReviewHoldRow)
+                    .where(_id_where(target, ReviewHoldRow.item_id))
+                    .order_by(ReviewHoldRow.created_at.desc())
+                    .limit(1)
+                ).first()
             return _row_to_hold(row) if row else None
 
     def review_holds(self, states: Sequence[str] = ("open",)) -> list[ReviewHold]:
         """Holds in ``states``, oldest first."""
-        marks = ", ".join("?" for _ in states)
-        with self._lock:
+        with self._read() as session:
             return [
                 _row_to_hold(row)
-                for row in self._conn.execute(
-                    f"SELECT * FROM daemon_review_holds WHERE state IN ({marks}) "  # nosec B608
-                    "ORDER BY created_at",
-                    tuple(states),
+                for row in session.scalars(
+                    select(ReviewHoldRow)
+                    .where(ReviewHoldRow.state.in_(list(states)))
+                    .order_by(ReviewHoldRow.created_at)
                 )
             ]
 
     def due_review_holds(self, now: float) -> list[ReviewHold]:
         """The open holds whose next poll is due."""
-        with self._lock:
+        with self._read() as session:
             return [
                 _row_to_hold(row)
-                for row in self._conn.execute(
-                    "SELECT * FROM daemon_review_holds WHERE state = 'open' AND next_poll_at <= ? "
-                    "ORDER BY next_poll_at",
-                    (now,),
+                for row in session.scalars(
+                    select(ReviewHoldRow)
+                    .where(ReviewHoldRow.state == "open", ReviewHoldRow.next_poll_at <= now)
+                    .order_by(ReviewHoldRow.next_poll_at)
                 )
             ]
 
     def review_hold_polled(self, run_id: str, next_poll_at: float) -> None:
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_review_holds SET polls = polls + 1, next_poll_at = ? "
-                "WHERE run_id = ?",
-                (next_poll_at, run_id),
+        with self._write() as session:
+            session.execute(
+                update(ReviewHoldRow)
+                .where(ReviewHoldRow.run_id == run_id)
+                .values(polls=ReviewHoldRow.polls + 1, next_poll_at=next_poll_at)
             )
-            self._conn.commit()
 
     def claim_review_hold(self, run_id: str, state: str) -> bool:
         """CAS ``open → approving|fixing``: the poll that saw the review
         acts on it exactly once."""
-        with self._lock:
-            cursor = self._conn.execute(
-                "UPDATE daemon_review_holds SET state = ? WHERE run_id = ? AND state = 'open'",
-                (state, run_id),
+        with self._write() as session:
+            result = session.execute(
+                update(ReviewHoldRow)
+                .where(ReviewHoldRow.run_id == run_id, ReviewHoldRow.state == "open")
+                .values(state=state)
             )
-            self._conn.commit()
-            return cursor.rowcount == 1
+            return _rowcount(result) == 1
 
     def reopen_review_hold(
         self,
@@ -2728,48 +3221,52 @@ class DaemonStore:
         landing that parked again for a different reason (#677: a draft
         hold lifted, then the base wanted a review — or the reverse)
         passes what the wait is for now."""
-        with self._lock:
-            cursor = self._conn.execute(
-                "UPDATE daemon_review_holds SET state = 'open', detail = ?, next_poll_at = ?, "
-                "since_at = CASE WHEN ? THEN ? ELSE since_at END, "
-                "held_by_draft = COALESCE(?, held_by_draft), "
-                "approvals_required = COALESCE(?, approvals_required) "
-                "WHERE run_id = ? AND state IN ('open', 'approving', 'fixing', 'paused')",
-                (
-                    detail,
-                    now,
-                    int(restart),
-                    now,
-                    None if held_by_draft is None else int(held_by_draft),
-                    approvals_required,
-                    run_id,
-                ),
+        with self._write() as session:
+            result = session.execute(
+                update(ReviewHoldRow)
+                .where(
+                    ReviewHoldRow.run_id == run_id,
+                    ReviewHoldRow.state.in_(("open", "approving", "fixing", "paused")),
+                )
+                .values(
+                    state="open",
+                    detail=detail,
+                    next_poll_at=now,
+                    # `restart` begins the wait over; otherwise the clock
+                    # the hold has already been running on is kept.
+                    since_at=now if restart else ReviewHoldRow.since_at,
+                    held_by_draft=func.coalesce(
+                        None if held_by_draft is None else int(held_by_draft),
+                        ReviewHoldRow.held_by_draft,
+                    ),
+                    approvals_required=func.coalesce(
+                        approvals_required, ReviewHoldRow.approvals_required
+                    ),
+                )
             )
-            self._conn.commit()
+            reopened = _rowcount(result) == 1
         log.info("store.review_hold_reopened", run=run_id, detail=detail, restart=restart)
-        return cursor.rowcount == 1
+        return reopened
 
     def pause_review_hold(self, run_id: str, now: float, detail: str) -> None:
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_review_holds SET state = 'paused', detail = ? "
-                "WHERE run_id = ? AND state = 'open'",
-                (detail, run_id),
+        with self._write() as session:
+            session.execute(
+                update(ReviewHoldRow)
+                .where(ReviewHoldRow.run_id == run_id, ReviewHoldRow.state == "open")
+                .values(state="paused", detail=detail)
             )
-            self._conn.commit()
         log.info("store.review_hold_paused", run=run_id, detail=detail)
 
     def resolve_review_hold(
         self, run_id: str, state: str, by: str | None, now: float, detail: str | None = None
     ) -> None:
         """End the wait: ``merged`` or ``dismissed``."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_review_holds SET state = ?, resolved_at = ?, resolved_by = ?, "
-                "detail = ? WHERE run_id = ?",
-                (state, now, by, detail, run_id),
+        with self._write() as session:
+            session.execute(
+                update(ReviewHoldRow)
+                .where(ReviewHoldRow.run_id == run_id)
+                .values(state=state, resolved_at=now, resolved_by=by, detail=detail)
             )
-            self._conn.commit()
         log.info("store.review_hold_resolved", run=run_id, state=state, by=by)
 
     # -- circuit breaker ---------------------------------------------------------
@@ -2778,12 +3275,13 @@ class DaemonStore:
         """(opened_at, consecutive_failures) as last persisted. Kept in the
         db rather than on the loop object so a crash-restart cycle cannot
         reset the breaker (#254)."""
-        with self._lock:
+        with self._read() as session:
             rows = {
-                row["key"]: row["value"]
-                for row in self._conn.execute(
-                    "SELECT key, value FROM daemon_state WHERE key IN "
-                    "('breaker_opened_at', 'consecutive_failures')"
+                str(k): v
+                for k, v in session.execute(
+                    select(DaemonStateRow.key, DaemonStateRow.value).where(
+                        DaemonStateRow.key.in_(("breaker_opened_at", "consecutive_failures"))
+                    )
                 )
             }
         return parse_breaker(rows.get("breaker_opened_at"), rows.get("consecutive_failures"))
@@ -2794,15 +3292,22 @@ class DaemonStore:
             open=opened_at is not None,
             consecutive_failures=consecutive_failures,
         )
-        with self._lock:
-            self._conn.executemany(
-                "INSERT OR REPLACE INTO daemon_state (key, value) VALUES (?, ?)",
+        with self._write() as session:
+            # Both keys in one statement and one transaction: a breaker that
+            # opened without its failure count is not a state worth having.
+            session.execute(
+                insert(DaemonStateRow).prefix_with("OR REPLACE"),
                 [
-                    ("breaker_opened_at", "" if opened_at is None else repr(float(opened_at))),
-                    ("consecutive_failures", str(int(consecutive_failures))),
+                    {
+                        "key": "breaker_opened_at",
+                        "value": "" if opened_at is None else repr(float(opened_at)),
+                    },
+                    {
+                        "key": "consecutive_failures",
+                        "value": str(int(consecutive_failures)),
+                    },
                 ],
             )
-            self._conn.commit()
 
     # -- chat threads ----------------------------------------------------------
 
@@ -2811,32 +3316,31 @@ class DaemonStore:
         backend's — what a link in prose points at. A bridge names its
         own backend; the local console's thread is never the bare answer,
         since an external bridge cannot spell a pointer to it."""
-        with self._lock:
-            if backend is None:
-                row = self._conn.execute(
-                    "SELECT backend, channel_id, thread_id, headline_id, status_id "
-                    "FROM daemon_chat_threads WHERE run_id = ? AND backend != 'local' "
-                    "ORDER BY backend LIMIT 1",
-                    (run_id,),
-                ).fetchone()
-            else:
-                row = self._conn.execute(
-                    "SELECT backend, channel_id, thread_id, headline_id, status_id "
-                    "FROM daemon_chat_threads WHERE run_id = ? AND backend = ?",
-                    (run_id, backend),
-                ).fetchone()
+        stmt = select(ChatThreadRow).where(ChatThreadRow.run_id == run_id)
+        if backend is None:
+            stmt = (
+                stmt.where(ChatThreadRow.backend != "local")
+                .order_by(ChatThreadRow.backend)
+                .limit(1)
+            )
+        else:
+            stmt = stmt.where(ChatThreadRow.backend == backend)
+        with self._read() as session:
+            row = session.scalars(stmt).first()
             return _row_to_chat_thread(row) if row else None
 
     def chat_threads(self, backend: str) -> list[tuple[str, ChatThread]]:
         """Every run's thread on ``backend``, newest headline first."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT run_id, backend, channel_id, thread_id, headline_id, status_id "
-                "FROM daemon_chat_threads WHERE backend = ? "
-                "ORDER BY CAST(headline_id AS INTEGER) DESC, run_id",
-                (backend,),
-            ).fetchall()
-            return [(str(r["run_id"]), _row_to_chat_thread(r)) for r in rows]
+        with self._read() as session:
+            rows = session.scalars(
+                select(ChatThreadRow)
+                .where(ChatThreadRow.backend == backend)
+                # Snowflakes sort by magnitude, not lexically.
+                .order_by(
+                    func.cast(ChatThreadRow.headline_id, Integer).desc(), ChatThreadRow.run_id
+                )
+            )
+            return [(str(r.run_id), _row_to_chat_thread(r)) for r in rows]
 
     def set_chat_status_id(
         self, run_id: str, status_id: str | None, *, backend: str | None = None
@@ -2849,27 +3353,22 @@ class DaemonStore:
                 if known is None:
                     return
                 backend = known.backend
-            self._conn.execute(
-                "UPDATE daemon_chat_threads SET status_id = ? WHERE run_id = ? AND backend = ?",
-                (_text_or_none(status_id), run_id, backend),
-            )
-            self._conn.commit()
+            with self._write() as session:
+                session.execute(
+                    update(ChatThreadRow)
+                    .where(ChatThreadRow.run_id == run_id, ChatThreadRow.backend == backend)
+                    .values(status_id=_text_or_none(status_id))
+                )
 
     def run_for_thread(self, thread_id: str | int, backend: str | None = None) -> str | None:
         """The run whose thread this is; scoped to ``backend`` when given,
         since the local bridge's ids and a snowflake share no namespace."""
-        with self._lock:
-            if backend is None:
-                row = self._conn.execute(
-                    "SELECT run_id FROM daemon_chat_threads WHERE thread_id = ?",
-                    (str(thread_id),),
-                ).fetchone()
-            else:
-                row = self._conn.execute(
-                    "SELECT run_id FROM daemon_chat_threads WHERE thread_id = ? AND backend = ?",
-                    (str(thread_id), backend),
-                ).fetchone()
-            return str(row["run_id"]) if row else None
+        stmt = select(ChatThreadRow.run_id).where(ChatThreadRow.thread_id == str(thread_id))
+        if backend is not None:
+            stmt = stmt.where(ChatThreadRow.backend == backend)
+        with self._read() as session:
+            found = session.scalars(stmt).first()
+            return str(found) if found else None
 
     def record_chat_thread(
         self,
@@ -2880,13 +3379,18 @@ class DaemonStore:
         *,
         backend: str = "discord",
     ) -> None:
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO daemon_chat_threads "
-                "(run_id, backend, channel_id, thread_id, headline_id) VALUES (?, ?, ?, ?, ?)",
-                (run_id, backend, str(channel_id), str(thread_id), _text_or_none(headline_id)),
+        with self._write() as session:
+            session.execute(
+                insert(ChatThreadRow)
+                .prefix_with("OR REPLACE")
+                .values(
+                    run_id=run_id,
+                    backend=backend,
+                    channel_id=str(channel_id),
+                    thread_id=str(thread_id),
+                    headline_id=_text_or_none(headline_id),
+                )
             )
-            self._conn.commit()
 
     # The Discord view of the same rows: snowflakes as integers. What the
     # Discord bridge's tests and the concierge's Discord fixtures speak.
@@ -2923,61 +3427,58 @@ class DaemonStore:
 
     def add_run_watch(self, run_id: str, watcher_id: str, now: float, *, backend: str) -> None:
         """Register interest in a run's completion; idempotent per watcher."""
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR IGNORE INTO daemon_run_watches "
-                "(run_id, watcher_id, created_at, backend) VALUES (?, ?, ?, ?)",
-                (run_id, watcher_id, now, backend),
+        with self._write() as session:
+            session.execute(
+                insert(RunWatchRow)
+                .prefix_with("OR IGNORE")
+                .values(run_id=run_id, watcher_id=watcher_id, created_at=now, backend=backend)
             )
-            self._conn.commit()
 
     def run_watchers(self, run_id: str, backend: str | None = None) -> list[str]:
         """The run's watchers on ``backend`` — every backend's when none is
         named (a gate's or hold's notify list addresses them all)."""
-        with self._lock:
-            if backend is None:
-                rows = self._conn.execute(
-                    "SELECT watcher_id FROM daemon_run_watches WHERE run_id = ? ORDER BY rowid",
-                    (run_id,),
-                )
-            else:
-                rows = self._conn.execute(
-                    "SELECT watcher_id FROM daemon_run_watches "
-                    "WHERE run_id = ? AND backend = ? ORDER BY rowid",
-                    (run_id, backend),
-                )
-            return [str(r["watcher_id"]) for r in rows]
+        stmt = (
+            select(RunWatchRow.watcher_id)
+            .where(RunWatchRow.run_id == run_id)
+            .order_by(text("rowid"))
+        )
+        if backend is not None:
+            stmt = stmt.where(RunWatchRow.backend == backend)
+        with self._read() as session:
+            return [str(r) for r in session.scalars(stmt)]
 
     def take_run_watchers(self, run_id: str, backend: str) -> list[str]:
         """Return the run's watchers on ``backend`` and clear them in one
         transaction."""
-        with self._lock:
+        # Read and clear in one transaction, so a watcher cannot be
+        # notified twice or lost between the two statements.
+        with self._write() as session:
             watchers = [
-                str(r["watcher_id"])
-                for r in self._conn.execute(
-                    "SELECT watcher_id FROM daemon_run_watches "
-                    "WHERE run_id = ? AND backend = ? ORDER BY rowid",
-                    (run_id, backend),
+                str(r)
+                for r in session.scalars(
+                    select(RunWatchRow.watcher_id)
+                    .where(RunWatchRow.run_id == run_id, RunWatchRow.backend == backend)
+                    .order_by(text("rowid"))
                 )
             ]
-            self._conn.execute(
-                "DELETE FROM daemon_run_watches WHERE run_id = ? AND backend = ?",
-                (run_id, backend),
+            session.execute(
+                delete(RunWatchRow).where(
+                    RunWatchRow.run_id == run_id, RunWatchRow.backend == backend
+                )
             )
-            self._conn.commit()
             return watchers
 
     def all_run_watches(self, backend: str) -> dict[str, list[str]]:
         """Every pending watch on ``backend``, for reloading the bridge
         registry at startup."""
-        with self._lock:
+        with self._read() as session:
             watches: dict[str, list[str]] = {}
-            for r in self._conn.execute(
-                "SELECT run_id, watcher_id FROM daemon_run_watches WHERE backend = ? "
-                "ORDER BY rowid",
-                (backend,),
+            for run_id, watcher_id in session.execute(
+                select(RunWatchRow.run_id, RunWatchRow.watcher_id)
+                .where(RunWatchRow.backend == backend)
+                .order_by(text("rowid"))
             ):
-                watches.setdefault(str(r["run_id"]), []).append(str(r["watcher_id"]))
+                watches.setdefault(str(run_id), []).append(str(watcher_id))
             return watches
 
     def clear_run_watch(self, run_id: str, backend: str | None = None) -> None:
@@ -2986,15 +3487,11 @@ class DaemonStore:
         normal finish (a `WATCHERS_CAP` trim, or reconciling a reload
         against a run that already finished while the daemon was down),
         where `take_run_watchers`'s return value would just be discarded."""
-        with self._lock:
-            if backend is None:
-                self._conn.execute("DELETE FROM daemon_run_watches WHERE run_id = ?", (run_id,))
-            else:
-                self._conn.execute(
-                    "DELETE FROM daemon_run_watches WHERE run_id = ? AND backend = ?",
-                    (run_id, backend),
-                )
-            self._conn.commit()
+        stmt = delete(RunWatchRow).where(RunWatchRow.run_id == run_id)
+        if backend is not None:
+            stmt = stmt.where(RunWatchRow.backend == backend)
+        with self._write() as session:
+            session.execute(stmt)
 
     # -- the local bridge's mailbox ---------------------------------------------
 
@@ -3016,30 +3513,25 @@ class DaemonStore:
     ) -> int:
         """Append one row and return its id — the daemon's own posts, and
         (``direction="in"``) what a console typed or clicked."""
-        with self._lock:
-            cur = self._conn.execute(
-                "INSERT INTO daemon_local_messages (direction, channel_id, kind, text, "
-                "embed_json, choices_json, gate_run_id, reply_to_id, mention_users, "
-                "author_id, author_name, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    direction,
-                    channel_id,
-                    kind,
-                    text,
-                    embed_json,
-                    choices_json,
-                    gate_run_id,
-                    reply_to_id,
-                    int(mention_users),
-                    author_id,
-                    author_name,
-                    now,
-                    now,
-                ),
+        with self._write() as session:
+            result = session.execute(
+                insert(LocalMessageRow).values(
+                    direction=direction,
+                    channel_id=channel_id,
+                    kind=kind,
+                    text=text,
+                    embed_json=embed_json,
+                    choices_json=choices_json,
+                    gate_run_id=gate_run_id,
+                    reply_to_id=reply_to_id,
+                    mention_users=int(mention_users),
+                    author_id=author_id,
+                    author_name=author_name,
+                    created_at=now,
+                    updated_at=now,
+                )
             )
-            self._conn.commit()
-            return int(cur.lastrowid or 0)
+            return _inserted_id(result)
 
     def local_edit(
         self,
@@ -3053,93 +3545,96 @@ class DaemonStore:
         """Rewrite one of the daemon's rows in place; False when there is no
         such outbound row. ``embed_json`` / ``choices_json`` replace the
         stored ones only when given."""
-        with self._lock:
-            sets = ["text = ?", "edited_at = ?", "updated_at = ?"]
-            params: list[object] = [text, now, now]
-            if embed_json is not None:
-                sets.append("embed_json = ?")
-                params.append(embed_json)
-            if choices_json is not None:
-                sets.append("choices_json = ?")
-                params.append(choices_json)
-            params.append(message_id)
-            cur = self._conn.execute(
-                f"UPDATE daemon_local_messages SET {', '.join(sets)} "  # nosec B608 - literals
-                "WHERE id = ? AND direction = 'out'",
-                params,
+        values: dict[str, object] = {"text": text, "edited_at": now, "updated_at": now}
+        # Only what was given replaces what is stored.
+        if embed_json is not None:
+            values["embed_json"] = embed_json
+        if choices_json is not None:
+            values["choices_json"] = choices_json
+        with self._write() as session:
+            result = session.execute(
+                update(LocalMessageRow)
+                .where(LocalMessageRow.id == message_id, LocalMessageRow.direction == "out")
+                .values(**values)
             )
-            self._conn.commit()
-            return cur.rowcount == 1
+            return _rowcount(result) == 1
 
     def local_react(self, message_id: int, emoji: str, *, now: float) -> bool:
         """Add the daemon's reaction to a row (idempotent); False when the
         row does not exist."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT reactions_json FROM daemon_local_messages WHERE id = ?", (message_id,)
-            ).fetchone()
-            if row is None:
+        with self._write() as session:
+            stored = session.execute(
+                select(LocalMessageRow.reactions_json).where(LocalMessageRow.id == message_id)
+            ).first()
+            if stored is None:
                 return False
             try:
-                reactions = [str(r) for r in json.loads(row["reactions_json"] or "[]")]
+                reactions = [str(r) for r in json.loads(stored.reactions_json or "[]")]
             except ValueError:
                 reactions = []
             if emoji not in reactions:
                 reactions.append(emoji)
-                self._conn.execute(
-                    "UPDATE daemon_local_messages SET reactions_json = ?, updated_at = ? "
-                    "WHERE id = ?",
-                    (json.dumps(reactions), now, message_id),
+                session.execute(
+                    update(LocalMessageRow)
+                    .where(LocalMessageRow.id == message_id)
+                    .values(reactions_json=json.dumps(reactions), updated_at=now)
                 )
-                self._conn.commit()
             return True
 
     def local_clear_gate(self, message_id: int, *, now: float) -> None:
         """The gate prompt is resolved: the row no longer offers approval."""
-        with self._lock:
-            self._conn.execute(
-                "UPDATE daemon_local_messages SET gate_run_id = NULL, updated_at = ? WHERE id = ?",
-                (now, message_id),
+        with self._write() as session:
+            session.execute(
+                update(LocalMessageRow)
+                .where(LocalMessageRow.id == message_id)
+                .values(gate_run_id=None, updated_at=now)
             )
-            self._conn.commit()
 
     def local_message(self, message_id: int) -> LocalMessage | None:
-        with self._lock:
-            row = self._conn.execute(
-                f"{LOCAL_MESSAGE_SELECT} WHERE m.id = ?", (message_id,)
-            ).fetchone()
-            return _row_to_local_message(row) if row else None
+        with self._read() as session:
+            found = _local_messages(
+                session, _local_message_select().where(LocalMessageRow.id == message_id)
+            )
+            return found[0] if found else None
 
     def local_messages(
         self, channel_id: str, *, after_id: int = 0, limit: int = 500
     ) -> list[LocalMessage]:
         """A channel's transcript after ``after_id``, oldest first."""
-        with self._lock:
-            rows = self._conn.execute(
-                f"{LOCAL_MESSAGE_SELECT} WHERE m.channel_id = ? AND m.id > ? ORDER BY m.id LIMIT ?",
-                (channel_id, after_id, limit),
-            ).fetchall()
-            return [_row_to_local_message(r) for r in rows]
+        with self._read() as session:
+            return _local_messages(
+                session,
+                _local_message_select()
+                .where(LocalMessageRow.channel_id == channel_id, LocalMessageRow.id > after_id)
+                .order_by(LocalMessageRow.id)
+                .limit(limit),
+            )
 
     def take_local_inbound(self, now: float, *, limit: int = 50) -> list[LocalMessage]:
         """Claim the oldest unclaimed inbound rows (CAS on ``taken_at`` per
         row, so a restart racing a poll never handles one twice)."""
-        with self._lock:
-            rows = self._conn.execute(
-                f"{LOCAL_MESSAGE_SELECT} WHERE m.direction = 'in' AND m.taken_at IS NULL "
-                "ORDER BY m.id LIMIT ?",
-                (limit,),
-            ).fetchall()
+        with self._write() as session:
+            rows = _local_messages(
+                session,
+                _local_message_select()
+                .where(LocalMessageRow.direction == "in", LocalMessageRow.taken_at.is_(None))
+                .order_by(LocalMessageRow.id)
+                .limit(limit),
+            )
             taken: list[LocalMessage] = []
             for row in rows:
-                cur = self._conn.execute(
-                    "UPDATE daemon_local_messages SET taken_at = ?, updated_at = ? "
-                    "WHERE id = ? AND taken_at IS NULL",
-                    (now, now, int(row["id"])),
-                )
-                if cur.rowcount == 1:
-                    taken.append(_row_to_local_message(row))
-            self._conn.commit()
+                # CAS on `taken_at`: the claim is the write, so a restart
+                # racing a poll never handles the same row twice.
+                if _row_claimed(
+                    session,
+                    update(LocalMessageRow)
+                    .where(
+                        LocalMessageRow.id == int(row.id),
+                        LocalMessageRow.taken_at.is_(None),
+                    )
+                    .values(taken_at=now, updated_at=now),
+                ):
+                    taken.append(row)
             return taken
 
     def local_changed_since(
@@ -3148,74 +3643,93 @@ class DaemonStore:
         """Rows in the channel up to ``after_id`` that changed since
         ``since`` — an edit, a reaction, a claim, a resolved gate — what a
         console repaints in place beside the rows it has not seen."""
-        with self._lock:
+        with self._read() as session:
             # The (channel_id, updated_at) index answers this in the usual
             # case of nothing changed; the id bound is checked per hit.
-            rows = self._conn.execute(
-                f"{LOCAL_MESSAGE_SELECT_BY_UPDATE} WHERE m.channel_id = ? AND m.updated_at > ? "
-                "AND m.id <= ? ORDER BY m.id",
-                (channel_id, since, after_id),
-            ).fetchall()
-            return [_row_to_local_message(r) for r in rows]
+            return _local_messages(
+                session,
+                _local_message_select()
+                .with_hint(LocalMessageRow, "INDEXED BY idx_local_messages_updated")
+                .where(
+                    LocalMessageRow.channel_id == channel_id,
+                    LocalMessageRow.updated_at > since,
+                    LocalMessageRow.id <= after_id,
+                )
+                .order_by(LocalMessageRow.id),
+            )
 
     def local_latest_ids(self) -> dict[str, int]:
         """The newest row id per channel (unread counts)."""
-        with self._lock:
-            rows = self._conn.execute(
-                "SELECT channel_id, MAX(id) AS id FROM daemon_local_messages GROUP BY channel_id"
-            ).fetchall()
-            return {str(r["channel_id"]): int(r["id"]) for r in rows}
+        with self._read() as session:
+            rows = session.execute(
+                select(
+                    LocalMessageRow.channel_id, func.max(LocalMessageRow.id).label("id")
+                ).group_by(LocalMessageRow.channel_id)
+            )
+            return {str(channel_id): int(newest) for channel_id, newest in rows}
 
     def local_count_after(self, channel_id: str, after_id: int) -> int:
         """How many rows the channel has beyond ``after_id`` (an unread count)."""
-        with self._lock:
-            row = self._conn.execute(
-                "SELECT COUNT(*) AS n FROM daemon_local_messages WHERE channel_id = ? AND id > ?",
-                (channel_id, after_id),
-            ).fetchone()
-            return int(row["n"])
+        with self._read() as session:
+            return int(
+                session.scalar(
+                    select(func.count())
+                    .select_from(LocalMessageRow)
+                    .where(
+                        LocalMessageRow.channel_id == channel_id,
+                        LocalMessageRow.id > after_id,
+                    )
+                )
+                or 0
+            )
 
     def local_taken(self, message_ids: Sequence[int]) -> set[int]:
         """Which of the given inbound rows the daemon has claimed."""
         if not message_ids:
             return set()
-        marks = ",".join("?" for _ in message_ids)
-        with self._lock:
-            rows = self._conn.execute(
-                f"SELECT id FROM daemon_local_messages WHERE id IN ({marks}) "  # nosec B608
-                "AND taken_at IS NOT NULL",
-                tuple(message_ids),
-            ).fetchall()
-            return {int(r[0]) for r in rows}
+        with self._read() as session:
+            return {
+                int(r)
+                for r in session.scalars(
+                    select(LocalMessageRow.id).where(
+                        LocalMessageRow.id.in_(list(message_ids)),
+                        LocalMessageRow.taken_at.is_not(None),
+                    )
+                )
+            }
 
     def prune_local_messages(self, older_than: float) -> int:
         """Drop rows created before ``older_than``, keeping every prompt of
         a gate still open — it has no deadline, and the console's approve
         button is that row — and every row a thread is anchored on (its
         headline and status line), which the bridge still edits."""
-        with self._lock:
-            cur = self._conn.execute(
-                "DELETE FROM daemon_local_messages WHERE created_at < ? "
-                "AND (gate_run_id IS NULL OR gate_run_id NOT IN "
-                "(SELECT run_id FROM daemon_merge_gates WHERE state IN ('open', 'approving'))) "
-                "AND CAST(id AS TEXT) NOT IN (SELECT headline_id FROM daemon_chat_threads "
-                "WHERE backend = 'local' AND headline_id IS NOT NULL) "
-                "AND CAST(id AS TEXT) NOT IN (SELECT status_id FROM daemon_chat_threads "
-                "WHERE backend = 'local' AND status_id IS NOT NULL)",
-                (older_than,),
+        open_gates = select(MergeGateRow.run_id).where(MergeGateRow.state.in_(OPEN_GATE_STATES))
+
+        def anchored(column: InstrumentedAttribute[str | None]) -> Select[Any]:
+            """Ids a local thread is anchored on: its headline, its status line."""
+            return select(column).where(ChatThreadRow.backend == "local", column.is_not(None))
+
+        with self._write() as session:
+            result = session.execute(
+                delete(LocalMessageRow).where(
+                    LocalMessageRow.created_at < older_than,
+                    LocalMessageRow.gate_run_id.is_(None)
+                    | LocalMessageRow.gate_run_id.not_in(open_gates),
+                    func.cast(LocalMessageRow.id, Text).not_in(anchored(ChatThreadRow.headline_id)),
+                    func.cast(LocalMessageRow.id, Text).not_in(anchored(ChatThreadRow.status_id)),
+                )
             )
-            self._conn.commit()
-            return int(cur.rowcount)
+            return int(_rowcount(result))
 
     def set_local_heartbeat(self, now: float) -> None:
         """The local bridge is alive: what the console reads to say whether
         a daemon is listening without a ctl round trip."""
-        with self._lock:
-            self._conn.execute(
-                "INSERT OR REPLACE INTO daemon_state (key, value) VALUES (?, ?)",
-                (LOCAL_HEARTBEAT_KEY, repr(float(now))),
+        with self._write() as session:
+            session.execute(
+                insert(DaemonStateRow)
+                .prefix_with("OR REPLACE")
+                .values(key=LOCAL_HEARTBEAT_KEY, value=repr(float(now)))
             )
-            self._conn.commit()
 
 
 #: Public names for the row shapers the console's read-only handle reuses

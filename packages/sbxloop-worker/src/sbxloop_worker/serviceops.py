@@ -28,6 +28,7 @@ API echoes it — and never the request headers.
 
 from __future__ import annotations
 
+import base64
 import json
 import os
 import time
@@ -194,6 +195,12 @@ class FakeTransport:
         state.write_text(str(index + 1))
         response = responses[index]
         body = response.get("body", "")
+        if "body_base64" in response:
+            return (
+                int(response.get("status", 200)),
+                {str(k).lower(): str(v) for k, v in dict(response.get("headers", {})).items()},
+                base64.b64decode(response["body_base64"], validate=True),
+            )
         if not isinstance(body, str):
             body = json.dumps(body)
         return (

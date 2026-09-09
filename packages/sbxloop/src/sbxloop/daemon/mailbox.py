@@ -16,12 +16,15 @@ at once, and a sqlite3 connection tolerates one caller at a time.
 
 from __future__ import annotations
 
-import sqlite3
 import threading
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
+
+from sqlalchemy import insert
+from sqlalchemy.engine import CursorResult
+from sqlalchemy.orm import Session
 
 from sbxloop.config import TUI_CONTROL_CHANNEL
 from sbxloop.daemon.model import WorkItem
@@ -35,8 +38,10 @@ from sbxloop.daemon.store import (
     MergeGate,
     ReviewHold,
 )
+from sbxloop.db import open_engine
+from sbxloop.db.daemon_models import LocalMessageRow
 from sbxloop.engine.model import RunRecord, TaskRecord
-from sbxloop.engine.store import StateStore
+from sbxloop.engine.store import PhaseAttemptRecord, StateStore
 from sbxloop.log import get_logger
 from sbxloop_worker.protocol import Event
 
@@ -57,14 +62,20 @@ class MailboxClient:
         self._lock = threading.RLock()
         self.daemon = DaemonStore(path, readonly=True)
         self.engine = StateStore(path, readonly=True)
-        self._rw = sqlite3.connect(path, check_same_thread=False)
-        self._rw.execute("PRAGMA busy_timeout=5000")
+        # The console's one write path. A read-only handle cannot serve it
+        # and the read-only stores must stay read-only, so this is a third
+        # connection of its own — on the ORM's engine like everything else,
+        # but `owns_schema=False`: it runs no migration, and it does not set
+        # the journal mode either. The daemon has already put this file in
+        # WAL, and asking again would take an exclusive lock to assert
+        # something that is already true, against the process using it.
+        self._rw = open_engine(path, owns_schema=False)
 
     def close(self) -> None:
         with self._lock:
             self.daemon.close()
             self.engine.close()
-            self._rw.close()
+            self._rw.dispose()
 
     @contextmanager
     def read_engine(self) -> Iterator[StateStore]:
@@ -140,24 +151,26 @@ class MailboxClient:
     def _insert(
         self, channel_id: str, kind: str, text: str, *, reply_to_id: int | None, now: float
     ) -> int:
-        with self._lock:
-            cur = self._rw.execute(
-                "INSERT INTO daemon_local_messages (direction, channel_id, kind, text, "
-                "reply_to_id, author_id, author_name, created_at, updated_at) "
-                "VALUES ('in', ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    channel_id,
-                    kind,
-                    text,
-                    reply_to_id,
-                    self.operator_id,
-                    self.operator_name,
-                    now,
-                    now,
+        with self._lock, Session(self._rw) as session:
+            result = cast(
+                "CursorResult[Any]",
+                session.execute(
+                    insert(LocalMessageRow).values(
+                        direction="in",
+                        channel_id=channel_id,
+                        kind=kind,
+                        text=text,
+                        reply_to_id=reply_to_id,
+                        author_id=self.operator_id,
+                        author_name=self.operator_name,
+                        created_at=now,
+                        updated_at=now,
+                    )
                 ),
             )
-            self._rw.commit()
-            return int(cur.lastrowid or 0)
+            session.commit()
+            # The row id the console hands back as the message's identity.
+            return int(result.inserted_primary_key[0]) if result.inserted_primary_key else 0
 
     def post(
         self, channel_id: str, text: str, *, now: float, reply_to_id: int | None = None
@@ -183,8 +196,15 @@ class MailboxClient:
     # -- the daemon's and the engine's state, read-only --------------------------
 
     def runs(self, *, limit: int = 200) -> list[RunRecord]:
+        """The runs touched most recently. Ordering by when a run *started*
+        buried a run that merged this morning under ones that have not
+        moved in days, and truncated the same way."""
         with self._lock:
-            return self.engine.list_runs()[:limit]
+            return self.engine.recent_runs(limit)
+
+    def run_costs(self, run_ids: Sequence[str]) -> dict[str, tuple[int, float]]:
+        with self._lock:
+            return self.engine.run_costs(run_ids)
 
     def run(self, run_id: str) -> RunRecord | None:
         with self._lock:
@@ -197,7 +217,7 @@ class MailboxClient:
         with self._lock:
             return self.engine.get_tasks(run_id)
 
-    def phase_attempts(self, run_id: str) -> list[sqlite3.Row]:
+    def phase_attempts(self, run_id: str) -> list[PhaseAttemptRecord]:
         with self._lock:
             return self.engine.phase_attempts(run_id)
 

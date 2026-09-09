@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -19,7 +20,12 @@ from sbxloop.deliver import (
     deliver_workspace,
     ensure_repository,
 )
-from sbxloop.errors import DeliveryError, GithubOpsError
+from sbxloop.errors import (
+    DeliveryError,
+    DeliveryPermissionError,
+    EmptyDeliveryError,
+    GithubOpsError,
+)
 from sbxloop.gh.ops import PrRef
 from tests.fakes.github_errors import github_error
 from tests.fakes.gitserver import PrivateGitServer, bare_from
@@ -38,6 +44,29 @@ class StubOps:
         # Where the run's delivery branch already sits, or None when a prior
         # delivery never created it (the first round).
         self.branch_sha: str | None = None
+        # Calls whose non-2xx answer would fail a worker job (#606): the
+        # same ledger FakeGithub keeps (#559), so the delivery suite can
+        # assert a healthy round leaves the run's chronology clean.
+        self.failed_jobs: list[tuple[str, str, str, int | None]] = []
+
+    def _failed_op(self, op: str, method: str, path: str, exc: GithubOpsError) -> GithubOpsError:
+        """Ledger a refusal as the failed worker job it would be, and hand
+        the error back to raise."""
+        status = getattr(exc, "http_status", None)
+        self.failed_jobs.append((op, method, path, status if isinstance(status, int) else None))
+        return exc
+
+    @property
+    def failed_job_paths(self) -> list[str]:
+        return [path for _, _, path, _ in self.failed_jobs]
+
+    def assert_no_failed_jobs(self) -> None:
+        if self.failed_jobs:
+            calls = ", ".join(
+                f"{op} {method} {path}" + (f" (HTTP {status})" if status else "")
+                for op, method, path, status in self.failed_jobs
+            )
+            raise AssertionError(f"failed worker jobs recorded: {calls}")
 
     def repo_get(self, repo: str) -> dict[str, Any]:
         self.repo_get_calls.append(repo)
@@ -77,6 +106,12 @@ class StubOps:
         if path.endswith("/git/commits"):
             return {"sha": "commit789"}
         if path.endswith("/git/refs"):
+            if self.branch_sha is not None and str((body or {}).get("ref", "")).startswith(
+                "refs/heads/sbxloop/"
+            ):
+                # Creating a ref that exists is GitHub's 422 (#518): the
+                # doomed POST a re-delivery used to pay, in the ledger.
+                raise self._failed_op("raw.api", method, path, github_error("ref_exists_422"))
             return {"ref": body["ref"] if body else ""}
         if method == "PATCH" and "/git/refs/heads/" in path:
             return {"ref": path}
@@ -288,7 +323,12 @@ class TestDeliverWorkspace:
             def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
                 self.creates.append(kwargs)
                 if kwargs.get("draft"):
-                    raise github_error("pr_draft_unsupported_422")
+                    raise self._failed_op(
+                        "pr.create",
+                        "POST",
+                        f"/repos/{repo}/pulls",
+                        github_error("pr_draft_unsupported_422"),
+                    )
                 return super().pr_create(repo, **kwargs)
 
         ops = NoDraftsOps()
@@ -314,7 +354,9 @@ class TestDeliverWorkspace:
 
             def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
                 self.creates += 1
-                raise github_error("pr_no_commits_422")
+                raise self._failed_op(
+                    "pr.create", "POST", f"/repos/{repo}/pulls", github_error("pr_no_commits_422")
+                )
 
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "GET" and "/pulls?" in path:
@@ -336,7 +378,7 @@ class TestDeliverWorkspace:
     def test_empty_workspace_refused(self, tmp_path: Path) -> None:
         empty = tmp_path / "empty"
         empty.mkdir()
-        with pytest.raises(DeliveryError, match="nothing to deliver"):
+        with pytest.raises(EmptyDeliveryError, match="nothing to deliver"):
             deliver_workspace(
                 StubOps(),  # type: ignore[arg-type]
                 "o/r",
@@ -411,6 +453,117 @@ class TestDeliverWorkspace:
             source_dir=make_workspace(tmp_path),
         )
         assert len(ops.pr_kwargs["title"]) <= 72
+
+
+def make_workflow_workspace(tmp_path: Path) -> Path:
+    tmp_path.mkdir(exist_ok=True)
+    root = make_workspace(tmp_path)
+    (root / ".github" / "workflows").mkdir(parents=True)
+    (root / ".github" / "workflows" / "release-on-merge.yml").write_text("on: push\n")
+    return root
+
+
+class ForbiddenTreeOps(StubOps):
+    """GitHub's answer to a tree carrying a workflow file the credential
+    may not write (#752): the recorded 403 on the tree POST."""
+
+    def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
+        if method == "POST" and path.endswith("/git/trees"):
+            self.raw_calls.append((method, path, body))
+            raise self._failed_op("raw.api", method, path, github_error("trees_forbidden_403"))
+        return super().raw(method, path, body)
+
+
+class TestWorkflowPermission:
+    """A delivery touching ``.github/workflows/`` is refused up front when
+    the credential is known to lack ``workflows: write`` (#752), and
+    GitHub's 403 on the tree is read as the same answer when the grants
+    were unknown. Field: two 10-minute runs died on an opaque 403 that
+    doctor had already warned about."""
+
+    def _deliver(self, ops: StubOps, root: Path, **kwargs: Any) -> PrRef:
+        return deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r752",
+            outcome="ship a workflow",
+            source_dir=root,
+            **kwargs,
+        )
+
+    def test_known_missing_refuses_before_any_upload(self, tmp_path: Path) -> None:
+        ops = StubOps()
+        with pytest.raises(DeliveryPermissionError) as info:
+            self._deliver(
+                ops, make_workflow_workspace(tmp_path), workflows_write_granted=lambda: False
+            )
+        exc = info.value
+        text = str(exc)
+        assert "`.github/workflows/release-on-merge.yml`" in text
+        assert "`workflows: write`" in text
+        assert "Workflows: Read and write" in text and "installation" in text
+        assert "`workflow` scope" in text
+        assert "sbxloop doctor --probe" in text and "Nothing was delivered" in text
+        assert exc.paths == (".github/workflows/release-on-merge.yml",)
+        assert exc.permission == "workflows:write"
+        # Fail-closed and cheap: zero blobs, zero trees, zero commits.
+        assert ops.blob_batches == []
+        assert not [p for _, p, _ in ops.raw_calls if "/git/blobs" in p or p.endswith("/git/trees")]
+        assert not [p for _, p, _ in ops.raw_calls if p.endswith("/git/commits")]
+        assert ops.pr_kwargs == {}
+
+    def test_granted_delivers_normally(self, tmp_path: Path) -> None:
+        ops = StubOps()
+        pr = self._deliver(
+            ops, make_workflow_workspace(tmp_path), workflows_write_granted=lambda: True
+        )
+        assert pr.number == 7
+        assert ".github/workflows/release-on-merge.yml" in {e["path"] for e in tree_entries(ops)}
+
+    def test_a_plan_without_a_workflow_never_asks(self, tmp_path: Path) -> None:
+        asked: list[bool] = []
+
+        def granted() -> bool | None:
+            asked.append(True)
+            return False
+
+        ops = StubOps()
+        assert (
+            self._deliver(ops, make_workspace(tmp_path), workflows_write_granted=granted).number
+            == 7
+        )
+        assert asked == []
+
+    def test_no_answer_means_the_delivery_is_attempted(self, tmp_path: Path) -> None:
+        # Grants unknown (a fine-grained PAT) and GitHub content: delivered.
+        ops = StubOps()
+        one = make_workflow_workspace(tmp_path / "a")
+        assert self._deliver(ops, one, workflows_write_granted=None).number == 7
+        two = make_workflow_workspace(tmp_path / "b")
+        assert self._deliver(ops, two, workflows_write_granted=lambda: None).number == 7
+
+    def test_unknown_grants_read_the_403_off_the_tree(self, tmp_path: Path) -> None:
+        ops = ForbiddenTreeOps()
+        with pytest.raises(DeliveryPermissionError) as info:
+            self._deliver(
+                ops, make_workflow_workspace(tmp_path), workflows_write_granted=lambda: None
+            )
+        text = str(info.value)
+        assert "`.github/workflows/release-on-merge.yml`" in text
+        assert "`workflows: write`" in text and "403" in text
+        assert "Resource not accessible by integration" in text
+        assert info.value.paths == (".github/workflows/release-on-merge.yml",)
+        # The tree was sent once and refused; nothing after it.
+        assert len([p for _, p, _ in ops.raw_calls if p.endswith("/git/trees")]) == 1
+        assert not [p for _, p, _ in ops.raw_calls if p.endswith("/git/commits")]
+
+    def test_a_403_on_a_tree_without_a_workflow_is_not_reinterpreted(self, tmp_path: Path) -> None:
+        # Only the workflow-path + 403 combination is unambiguous; any other
+        # 403 stays what it was, for the caller to classify.
+        ops = ForbiddenTreeOps()
+        with pytest.raises(GithubOpsError) as info:
+            self._deliver(ops, make_workspace(tmp_path), workflows_write_granted=lambda: None)
+        assert not isinstance(info.value, DeliveryPermissionError)
 
 
 class MissingRepoOps(StubOps):
@@ -498,7 +651,12 @@ class TestEnsureRepository:
     def test_non_404_probe_errors_propagate(self) -> None:
         class ForbiddenOps(StubOps):
             def repo_lookup(self, repo: str) -> dict[str, Any] | None:
-                raise GithubOpsError("GET /repos -> HTTP 403: rate limited")
+                raise self._failed_op(
+                    "repo.get",
+                    "GET",
+                    f"/repos/{repo}",
+                    GithubOpsError("GET /repos -> HTTP 403: rate limited"),
+                )
 
         with pytest.raises(GithubOpsError, match="403"):
             ensure_repository(ForbiddenOps(), "o/r", create=True)  # type: ignore[arg-type]
@@ -572,7 +730,12 @@ class TestEmptyRepoBootstrap:
     def test_unrelated_ref_errors_still_raise(self, tmp_path: Path) -> None:
         class ForbiddenRefOps(StubOps):
             def ref_lookup(self, repo: str, ref: str) -> str | None:
-                raise GithubOpsError("GET ref -> HTTP 403: rate limited")
+                raise self._failed_op(
+                    "ref.get",
+                    "GET",
+                    f"/repos/{repo}/git/ref/{ref}",
+                    GithubOpsError("GET ref -> HTTP 403: rate limited"),
+                )
 
         with pytest.raises(GithubOpsError, match="403"):
             deliver_workspace(
@@ -590,7 +753,12 @@ class TestEmptyRepoBootstrap:
 
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "PUT" and path.endswith("/contents/README.md"):
-                    raise GithubOpsError("PUT contents -> HTTP 403: token lacks contents:write")
+                    raise self._failed_op(
+                        "raw.api",
+                        method,
+                        path,
+                        GithubOpsError("PUT contents -> HTTP 403: token lacks contents:write"),
+                    )
                 return super().raw(method, path, body)
 
         with pytest.raises(GithubOpsError, match="403"):
@@ -618,6 +786,7 @@ def git(*argv: str, cwd: Path) -> str:
             "GIT_COMMITTER_EMAIL": "t@example.com",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_SSL_CAINFO": os.environ.get("GIT_SSL_CAINFO", ""),
         },
     ).stdout.strip()
 
@@ -748,7 +917,7 @@ class TestGitDiffDelivery:
     def test_no_changes_refused(self, tmp_path: Path) -> None:
         clone, _ = make_clone_workspace(tmp_path)
         ops = StubOps()
-        with pytest.raises(DeliveryError, match="no changes relative to"):
+        with pytest.raises(EmptyDeliveryError, match="no changes relative to"):
             deliver(ops, clone)
         # nothing was written to GitHub
         assert not any(m == "POST" for m, _, _ in ops.raw_calls)
@@ -1058,9 +1227,36 @@ class TestRedeliveryCollisions:
     a `worker.error` panel per healthy re-delivery — before the force-move
     that was the real operation; the ref is now looked up first.
 
-    StubOps records calls but not failed worker jobs; the ledger assertion
-    that a healthy re-delivery leaves the chronology clean lives in
-    tests/test_fake_github_failed_jobs.py (#559)."""
+    StubOps keeps the same failed-worker-job ledger FakeGithub does (#606),
+    so the assertion that a healthy re-delivery leaves the chronology
+    clean lives here, next to the calls it is about."""
+
+    def test_second_round_records_no_failed_worker_job(self, tmp_path: Path) -> None:
+        """The check #518 lacked: not "it did not raise", but "the run's
+        chronology carries no failed worker job" — on the delivery stub."""
+        ops = StubOps()
+        ops.branch_sha = "e31ae110407f0000deadbeef"
+        deliver_workspace(
+            ops,  # type: ignore[arg-type]
+            "o/r",
+            run_id="r42",
+            outcome="x",
+            source_dir=make_workspace(tmp_path),
+            round_no=2,
+        )
+        assert ("POST", "/repos/o/r/git/refs") not in _refs_calls(ops), "a doomed create"
+        assert ops.failed_jobs == []
+        ops.assert_no_failed_jobs()
+
+    def test_the_ledger_sees_a_blind_create_on_an_existing_branch(self) -> None:
+        ops = StubOps()
+        ops.branch_sha = "e31ae110407f0000deadbeef"
+        with pytest.raises(GithubOpsError) as excinfo:
+            ops.raw("POST", "/repos/o/r/git/refs", {"ref": "refs/heads/sbxloop/r42", "sha": "x"})
+        assert excinfo.value.http_status == 422
+        assert ops.failed_jobs == [("raw.api", "POST", "/repos/o/r/git/refs", 422)]
+        with pytest.raises(AssertionError, match="failed worker jobs recorded"):
+            ops.assert_no_failed_jobs()
 
     def test_fresh_branch_is_created_with_one_call(
         self, tmp_path: Path, caplog: pytest.LogCaptureFixture
@@ -1138,7 +1334,7 @@ class TestRedeliveryCollisions:
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "POST" and path.endswith("/git/refs"):
                     self.raw_calls.append((method, path, body))
-                    raise github_error("ref_exists_422")
+                    raise self._failed_op("raw.api", method, path, github_error("ref_exists_422"))
                 return super().raw(method, path, body)
 
         ops = RacedOps()
@@ -1169,7 +1365,9 @@ class TestRedeliveryCollisions:
                 return super().raw(method, path, body)
 
             def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
-                raise github_error("pr_exists_422")
+                raise self._failed_op(
+                    "pr.create", "POST", f"/repos/{repo}/pulls", github_error("pr_exists_422")
+                )
 
         ops = PrExistsOps()
         pr = deliver_workspace(
@@ -1193,7 +1391,9 @@ class TestRedeliveryCollisions:
                 return super().raw(method, path, body)
 
             def pr_create(self, repo: str, **kwargs: Any) -> PrRef:
-                raise github_error("pr_exists_422")
+                raise self._failed_op(
+                    "pr.create", "POST", f"/repos/{repo}/pulls", github_error("pr_exists_422")
+                )
 
         with pytest.raises(GithubOpsError, match="already exists"):
             deliver_workspace(
@@ -1208,7 +1408,12 @@ class TestRedeliveryCollisions:
         class ForbiddenRefOps(StubOps):
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "POST" and path.endswith("/git/refs"):
-                    raise GithubOpsError("POST refs -> HTTP 403: token lacks contents:write")
+                    raise self._failed_op(
+                        "raw.api",
+                        method,
+                        path,
+                        GithubOpsError("POST refs -> HTTP 403: token lacks contents:write"),
+                    )
                 return super().raw(method, path, body)
 
         with pytest.raises(GithubOpsError, match="403"):
@@ -1632,7 +1837,9 @@ class TestNaming:
 
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "PATCH" and path.endswith("/pulls/12"):
-                    raise GithubOpsError("locked", http_status=403)
+                    raise self._failed_op(
+                        "raw.api", method, path, GithubOpsError("locked", http_status=403)
+                    )
                 return super().raw(method, path, body)
 
         pr = deliver_workspace(
@@ -1652,7 +1859,9 @@ class TestNaming:
         class RefusedRefOps(StubOps):
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "POST" and path.endswith("/git/refs"):
-                    raise github_error("ref_signature_required_422")
+                    raise self._failed_op(
+                        "raw.api", method, path, github_error("ref_signature_required_422")
+                    )
                 return super().raw(method, path, body)
 
         with pytest.raises(DeliveryError) as info:
@@ -1671,7 +1880,7 @@ class TestNaming:
         class RefusedRefOps(StubOps):
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "POST" and path.endswith("/git/refs"):
-                    raise github_error("ref_locked_422")
+                    raise self._failed_op("raw.api", method, path, github_error("ref_locked_422"))
                 return super().raw(method, path, body)
 
         with pytest.raises(DeliveryError, match="locked") as info:
@@ -1688,7 +1897,9 @@ class TestNaming:
         class RefusedRefOps(StubOps):
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "POST" and path.endswith("/git/refs"):
-                    raise github_error("ref_refused_unclassified_422")
+                    raise self._failed_op(
+                        "raw.api", method, path, github_error("ref_refused_unclassified_422")
+                    )
                 return super().raw(method, path, body)
 
         with pytest.raises(DeliveryError) as info:
@@ -1707,7 +1918,9 @@ class TestNaming:
         class RefusedRefOps(StubOps):
             def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
                 if method == "POST" and path.endswith("/git/refs"):
-                    raise github_error("ref_creation_restricted_422")
+                    raise self._failed_op(
+                        "raw.api", method, path, github_error("ref_creation_restricted_422")
+                    )
                 return super().raw(method, path, body)
 
         with pytest.raises(DeliveryError, match=r"\[github\] branch_prefix") as info:

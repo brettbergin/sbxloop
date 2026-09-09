@@ -8,7 +8,7 @@ from sbxloop.tui.widgets.chronology import ChronologyLog
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop.tui.widgets.statusbar import StatusBar
 from sbxloop.tui.widgets.tables import ConsoleTable
-from tests.unit.tui.conftest import FakeCtl, drive, live_status, make_app
+from tests.unit.tui.conftest import FakeCtl, drive, live_status, make_app, until
 
 
 def bar_text(app: object) -> str:
@@ -19,22 +19,34 @@ def bar_text(app: object) -> str:
     return bar.last.plain
 
 
-def test_overview_shows_the_live_run_queue_and_waits(seeded: SbxloopHome) -> None:
+def page_text(app: object) -> str:
+    """Everything the Overview's current page put on screen."""
+    from textual.containers import VerticalScroll
+
+    from sbxloop.tui.app import SbxloopTui
+
+    assert isinstance(app, SbxloopTui)
+    page = app.screen.query_one("#page", VerticalScroll)
+    return "\n".join(w.content_text for w in page.walk_children() if isinstance(w, TextPanel))
+
+
+def test_overview_reports_the_week_and_the_run_in_flight(seeded: SbxloopHome) -> None:
+    """Overview answers "is this working well": a live line for now, and a
+    page of analytics for the week. The queue, recent runs and who is
+    waiting live on the screens that own them (Queue, Runs, Daemon)."""
+
     async def scenario() -> None:
         app = make_app(seeded)
         async with app.run_test(size=(140, 45)) as pilot:
-            await pilot.pause(1.0)
+            await pilot.pause(1.5)
             bar = bar_text(app)
             assert "running" in bar and "r_live" in bar and "runs 4/12" in bar
             assert "bridge ✓" in bar and "9.9.9" in bar
-            current = app.screen.query_one("#current", TextPanel).content_text
-            assert "r_live" in current and "Add retries" in current
-            queue = app.screen.query_one("#queue", ConsoleTable)
-            assert queue.row_count == 1
-            recent = app.screen.query_one("#recent", ConsoleTable)
-            assert recent.row_count == 3
-            waits = app.screen.query_one("#notices", TextPanel).content_text
-            assert "gh:issue:40" in waits and "ready to merge" in waits
+            live = app.screen.query_one("#live", TextPanel).content_text
+            assert "running" in live and "r_live" in live
+            page = page_text(app)
+            assert "runs this week" in page, "the summary states its finding in a sentence"
+            assert "outcome" in page and "phases" in page
 
     drive(scenario)
 
@@ -43,13 +55,17 @@ def test_daemon_down_and_starting_read_in_the_bar(seeded: SbxloopHome) -> None:
     async def scenario() -> None:
         app = make_app(seeded, ctl=FakeCtl(down=True))
         async with app.run_test(size=(140, 45)) as pilot:
-            await pilot.pause(1.0)
+            await pilot.pause(1.5)
             assert "daemon down" in bar_text(app)
-            assert app.screen.query_one("#recent", ConsoleTable).row_count == 3, "history stays"
+            assert "no daemon answered" in app.screen.query_one("#live", TextPanel).content_text
+            assert "runs this week" in page_text(app), (
+                "the analytics are the store's, not the daemon's"
+            )
         app = make_app(seeded, ctl=FakeCtl(stale=True))
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause(1.0)
             assert "starting" in bar_text(app)
+            assert "starting" in app.screen.query_one("#live", TextPanel).content_text
         app = make_app(
             seeded,
             ctl=FakeCtl(live_status(paused=True, holds=["operator", "deploy-1"], current=None)),
@@ -57,6 +73,10 @@ def test_daemon_down_and_starting_read_in_the_bar(seeded: SbxloopHome) -> None:
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause(1.0)
             assert "paused (operator, deploy-1)" in bar_text(app)
+            assert (
+                "paused: operator, deploy-1"
+                in app.screen.query_one("#live", TextPanel).content_text
+            )
 
     drive(scenario)
 
@@ -70,8 +90,22 @@ def test_runs_screen_lists_filters_and_opens_a_run(seeded: SbxloopHome) -> None:
             await pilot.pause(0.5)
             table = app.screen.query_one("#runs", ConsoleTable)
             assert table.row_count == 3
-            row = table.get_row_at(table.get_row_index("r_failed"))
-            assert "orphaned" in str(row[1])
+            # The state cell is a word. Its reason is under the table, in
+            # full — inline and unclipped it sized the column and pushed
+            # every other one off the screen.
+            table.move_cursor(row=table.get_row_index("r_failed"))
+            await pilot.pause(0.3)
+            state = str(table.get_row_at(table.get_row_index("r_failed"))[1])
+            assert "failed" in state and "orphaned" not in state
+            detail = app.screen.query_one("#detail", TextPanel).content_text
+            assert "r_failed" in detail and "orphaned: daemon restarted" in detail
+            # The reason is still searchable even though it is off the row.
+            await pilot.press("slash")
+            await pilot.press(*"orphaned")
+            await pilot.pause(0.3)
+            assert table.row_count == 1
+            await pilot.press("escape")
+            await pilot.pause(0.3)
             await pilot.press("slash")
             await pilot.press(*"merged")
             await pilot.pause(0.3)
@@ -127,8 +161,11 @@ def test_queue_screen_and_help(seeded: SbxloopHome) -> None:
             await pilot.pause(0.5)
             await pilot.press("3")
             await pilot.pause(0.5)
+            # The fixture's items: 41 running, 44 queued, 40 done — and a
+            # done item is finished work that Runs lists, not queue.
+            assert app.screen.query_one("#running", ConsoleTable).row_count == 1
             assert app.screen.query_one("#queued", ConsoleTable).row_count == 1
-            assert app.screen.query_one("#items", ConsoleTable).row_count == 3
+            assert app.screen.query_one("#parked", ConsoleTable).row_count == 0
             assert "●" not in bar_text(app)
             await pilot.press("question_mark")
             await pilot.pause(0.3)
@@ -155,8 +192,8 @@ def test_a_busy_daemon_reads_as_alive_not_down(seeded: SbxloopHome) -> None:
         app = make_app(seeded, ctl=Busy())  # type: ignore[arg-type]
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause(1.0)
-            current = app.screen.query_one("#current", TextPanel).content_text
-            assert "busy" in current and "down" not in current
+            live = app.screen.query_one("#live", TextPanel).content_text
+            assert "busy" in live and "down" not in live
 
     drive(scenario)
 
@@ -193,11 +230,13 @@ def test_queue_lists_the_daemons_dispatch_order_and_eligibility(seeded: SbxloopH
             await pilot.pause(0.8)
             await pilot.press("3")
             await pilot.pause(0.8)
+            # The queued section leads with its rank, so the id is the
+            # second cell and the reason the last.
             table = app.screen.query_one("#queued", ConsoleTable)
             first = table.get_row_at(0)
-            assert str(first[0]) == "gh:issue:50" and "resume" in str(first[4])
+            assert str(first[1]) == "gh:issue:50" and "resume" in str(first[-1])
             row = table.get_row_at(table.get_row_index("gh:issue:51"))
-            assert str(row[4]) != "now"
+            assert str(row[-1]) != "now"
 
     drive(scenario)
 
@@ -261,3 +300,74 @@ def test_events_wait_while_follow_is_off(seeded: SbxloopHome) -> None:
             assert log.count == before + 1
 
     drive(scenario)
+
+
+def test_a_workload_run_header_shows_its_profile_and_needs(seeded: SbxloopHome) -> None:
+    """#804: a workload's screen says which profile bounded it, what the
+    plan asked for and the grant gave (names only), and a refused need
+    with the sbxloop.toml key that would allow it."""
+    import json
+
+    from sbxloop.engine.store import StateStore
+    from sbxloop_worker.protocol import Event
+
+    store = StateStore(seeded.state_db)
+    pinned = json.dumps({"workload": {"default": "research"}})
+    store.create_run("r_work", "Digest the week", pinned, kind="workload")
+    store.set_run_state("r_work", "completed")
+    store.append_event(
+        Event.now(
+            "run.needs_granted",
+            "r_work",
+            profile="research",
+            hosts=["api.example.com"],
+            credentials=["weather"],
+            sinks=["chat"],
+            repos=[],
+            message="granted",
+        )
+    )
+    store.create_run("r_refused", "Reach out", pinned, kind="workload")
+    store.set_run_state("r_refused", "failed")
+    store.append_event(
+        Event.now(
+            "run.needs_refused",
+            "r_refused",
+            profile="research",
+            need="host",
+            value="evil.example.com",
+            task_id="t1",
+            key="workloads.research.egress",
+            message="refused",
+        )
+    )
+    store.close()
+
+    def header_of(app: object) -> str:
+        from sbxloop.tui.app import SbxloopTui
+
+        assert isinstance(app, SbxloopTui)
+        return app.screen.query_one("#header", TextPanel).content_text
+
+    async def scenario() -> None:
+        app = make_app(seeded, run="r_work")
+        async with app.run_test(size=(140, 45)) as pilot:
+            # The header is filled in from the store after mount, so wait for
+            # it rather than for a duration: the placeholder is `run r_work`.
+            assert await until(pilot, lambda: "workload (research)" in header_of(app))
+            header = header_of(app)
+            assert "granted: hosts api.example.com; credentials weather; sinks chat" in header
+            assert "refused" not in header
+
+    drive(scenario)
+
+    async def refused() -> None:
+        app = make_app(seeded, run="r_refused")
+        async with app.run_test(size=(140, 45)) as pilot:
+            assert await until(pilot, lambda: "workload (research)" in header_of(app))
+            assert (
+                "refused: host evil.example.com — allow it with `workloads.research.egress`"
+                in header_of(app)
+            )
+
+    drive(refused)

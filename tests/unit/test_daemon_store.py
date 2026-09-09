@@ -12,6 +12,7 @@ from sbxloop.daemon.store import LEGACY_SUFFIX, SCHEMA_VERSION, DaemonStore
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import DaemonError
 from tests.fakes.legacy_db import daemon_db, insert_daemon_row
+from tests.fakes.rawdb import exec_raw, query_raw
 
 
 def item(key: str = "7", **overrides: object) -> WorkItem:
@@ -142,6 +143,83 @@ class TestUpsert:
         prior = store.prior_attempt("gh:issue:7")
         assert prior is not None
         assert (prior.run_id, prior.branch, prior.pr_number) == ("r1", "sbxloop/r1", 9)
+
+    def test_same_issue_number_in_a_second_repo_does_not_collide(self, tmp_path: Path) -> None:
+        """A daemon repointed at a new repository leaves the old
+        repository's rows behind, and a single-repo daemon mints ids that
+        encode only the issue number. Both repositories' issue #24 then
+        want the same primary key, and the INSERT used to raise
+        ``UNIQUE constraint failed: daemon_work_items.item_id`` out of
+        ``tick()`` on every poll — the daemon on db crash-looped six times
+        and systemd gave up (2026-09-07). The second repository's item takes
+        the repo-qualified id instead, and both rows survive."""
+        store = DaemonStore(tmp_path / "state.db")
+        old = item("24", repo="o/old", item_id="gh:issue:24")
+        assert store.upsert_new(old, now=1.0) is True
+        store.mark_done("gh:issue:24", now=2.0)
+
+        new = item("24", repo="o/new", item_id="gh:issue:24", title="a different issue 24")
+        assert store.upsert_new(new, now=3.0) is True
+
+        kept = store.get("gh:issue:24")
+        assert kept is not None and kept.repo == "o/old" and kept.state == "done"
+        moved = store.get("gh:o/new:issue:24")
+        assert moved is not None and moved.repo == "o/new" and moved.state == "queued"
+
+    def test_the_bare_id_is_kept_when_nothing_else_holds_it(self, tmp_path: Path) -> None:
+        """Qualification is only for an id already taken by another
+        repository. With the bare id free, a single-repo daemon keeps
+        writing it, so existing state and operator commands are unchanged."""
+        store = DaemonStore(tmp_path / "state.db")
+        assert store.upsert_new(item("24", repo="o/r", item_id="gh:issue:24"), now=1.0) is True
+        got = store.get("gh:issue:24")
+        assert got is not None and got.item_id == "gh:issue:24"
+
+    def test_a_requalified_item_is_still_deduped_by_repo(self, tmp_path: Path) -> None:
+        """Identity stays ``(source_key, repo)``: the second repository's
+        item is recognised on the next poll by its own repo, not by the id
+        it was given, so it is not queued twice."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("24", repo="o/old", item_id="gh:issue:24"), now=1.0)
+        new = item("24", repo="o/new", item_id="gh:issue:24")
+        assert store.upsert_new(new, now=2.0) is True
+        assert store.upsert_new(new, now=3.0) is False
+
+    def test_a_legacy_bare_row_in_another_repo_also_forces_qualification(
+        self, tmp_path: Path
+    ) -> None:
+        """Rows written before typed ids carry the bare ``gh:24``. That does
+        not fail the primary key against a typed ``gh:issue:24``, so the
+        insert would succeed — but ``_id_variants`` resolves the two to each
+        other, and one lookup would then match both repositories' rows. The
+        newcomer qualifies rather than sit in an ambiguous namespace."""
+        store = DaemonStore(tmp_path / "state.db")
+        exec_raw(
+            store,
+            "INSERT INTO daemon_work_items"
+            " (item_id, source_key, title, body, url, state, created_at, updated_at, repo)"
+            " VALUES ('gh:24', '24', 'legacy', '', '', 'done', 1.0, 1.0, 'o/old')",
+        )
+        assert store.upsert_new(item("24", repo="o/new", item_id="gh:issue:24"), now=2.0) is True
+
+        moved = store.get("gh:o/new:issue:24")
+        assert moved is not None and moved.repo == "o/new"
+        assert query_raw(store, "SELECT repo FROM daemon_work_items WHERE item_id = 'gh:24'") == [
+            ("o/old",)
+        ]
+
+    def test_a_qualified_id_never_resolves_to_another_repos_bare_row(self, tmp_path: Path) -> None:
+        """The bare form encodes only the number, so it must not be offered
+        as a spelling of a repo-qualified id — a state change aimed at
+        ``o/new`` #24 would otherwise land on ``o/old``'s ``gh:issue:24``."""
+        store = DaemonStore(tmp_path / "state.db")
+        store.upsert_new(item("24", repo="o/old", item_id="gh:issue:24"), now=1.0)
+        store.upsert_new(item("24", repo="o/new", item_id="gh:issue:24"), now=2.0)
+
+        store.mark_running("gh:o/new:issue:24", "r1", now=3.0)
+
+        theirs = store.get("gh:issue:24")
+        assert theirs is not None and theirs.state == "queued" and theirs.run_id is None
 
     def test_dropping_a_repoless_row_keeps_the_prior_branch_and_pr(self, tmp_path: Path) -> None:
         """``drop_repoless`` deletes rows for discovery to re-create
@@ -495,9 +573,7 @@ class TestLedgerAndThreads:
         store.record_chat_thread("r1", "control", "thread:9", "9", backend="local")
         assert store.chat_thread("r1", "discord") is not None
         assert store.chat_thread("r1", "local") is not None
-        pk = [
-            r[1] for r in store._conn.execute("PRAGMA table_info(daemon_chat_threads)") if r[5] > 0
-        ]
+        pk = [r[1] for r in query_raw(store, "PRAGMA table_info(daemon_chat_threads)") if r[5] > 0]
         assert pk == ["run_id", "backend"]
         store.close()
         assert DaemonStore(path).chat_thread("r2", "slack") is not None
@@ -526,7 +602,7 @@ class TestLedgerAndThreads:
         assert store.chat_thread("r2") == ("42", "4343", "101", "102", "discord")
         assert store.run_for_thread(4343) == "r2"
         tables = {
-            r[0] for r in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            r[0] for r in query_raw(store, "SELECT name FROM sqlite_master WHERE type='table'")
         }
         assert "daemon_discord_threads" not in tables
         # Reopening is a no-op.
@@ -548,8 +624,7 @@ class TestLedgerAndThreads:
         """The self-filing lanes are gone with their bookkeeping."""
         store = DaemonStore(tmp_path / "state.db")
         tables = {
-            str(r[0])
-            for r in store._conn.execute("SELECT name FROM sqlite_master WHERE type='table'")
+            str(r[0]) for r in query_raw(store, "SELECT name FROM sqlite_master WHERE type='table'")
         }
         assert tables >= {"daemon_work_items", "daemon_runs", "daemon_requesters"}
         assert not tables & {
@@ -886,7 +961,7 @@ class TestRepoScoping:
 
         store = DaemonStore(path)
         assert "repo" in {
-            str(r[1]) for r in store._conn.execute("PRAGMA table_info(daemon_work_items)")
+            str(r[1]) for r in query_raw(store, "PRAGMA table_info(daemon_work_items)")
         }
         got = store.get("gh:issue:7")
         assert got is not None and got.repo is None
@@ -1288,13 +1363,13 @@ class TestGatePrompts:
         store.record_chat_thread("r1", "42", "4242", "100", backend="discord")
         store.record_chat_thread("r_slack", "C1", "17.5", "17.5", backend="slack")
         for run in ("r1", "r_slack", "r_bare"):
-            store._conn.execute(
-                "UPDATE daemon_merge_gates SET prompt_channel_id = '42', prompt_message_id = '555' "
-                "WHERE run_id = ?",
+            exec_raw(
+                store,
+                "UPDATE daemon_merge_gates SET prompt_channel_id = '42', "
+                "prompt_message_id = '555' WHERE run_id = ?",
                 (run,),
             )
-        store._conn.execute("DELETE FROM daemon_gate_prompts")
-        store._conn.commit()
+        exec_raw(store, "DELETE FROM daemon_gate_prompts")
         store.close()
         again = DaemonStore(path)
         assert again.gate_prompt("r1", "discord") == ("42", "555")
@@ -1535,6 +1610,40 @@ class TestWorkloadItems:
         assert store.attribute_repoless(["o/a", "o/b"]) == 0
         assert store.drop_repoless() == 0
         assert store.get(tick) is not None
+
+    def test_schedules_live_in_the_store(self, tmp_path: Path) -> None:
+        """#818: the schedule itself — profile, ask, cadence, zone, who made
+        it — is a row, beside its state; a name is unique; removing one
+        forgets its grid; a state-only row (a pre-#818 daemon's) takes the
+        spec and keeps its anchor; a row edited into nonsense fires nothing."""
+        from sbxloop.config import ScheduleConfig
+
+        store = DaemonStore(tmp_path / "state.db")
+        assert store.schedules() == [] and store.schedule("daily") is None
+        daily = ScheduleConfig(name="daily", profile="brief", ask="Morning brief", every="24h")
+        assert store.add_schedule(daily, source="chat", by="brett", now=100.0) is True
+        assert store.add_schedule(daily, source="ctl", by="ana", now=200.0) is False  # taken
+        (stored,) = store.schedules()
+        assert stored.spec == daily and stored.source == "chat"
+        assert (stored.created_by, stored.created_at) == ("brett", 100.0)
+        assert store.schedule("daily") == stored
+        assert store.schedule_rows()["daily"].anchor == 100.0
+        # A state-only row keeps its grid and takes the spec.
+        store.schedule_row("hourly", now=50.0)
+        assert [s.spec.name for s in store.schedules()] == ["daily"]
+        hourly = ScheduleConfig(name="hourly", profile="brief", ask="Check", every="1h")
+        assert store.add_schedule(hourly, source="config", by=None, now=300.0) is True
+        assert store.schedule_rows()["hourly"].anchor == 50.0
+        assert [s.spec.name for s in store.schedules()] == ["daily", "hourly"]
+        # Removing forgets the state too: a re-add starts a fresh grid.
+        assert store.remove_schedule("daily") is True
+        assert store.remove_schedule("daily") is False
+        assert "daily" not in store.schedule_rows()
+        assert store.add_schedule(daily, source="chat", by="brett", now=400.0) is True
+        assert store.schedule_rows()["daily"].anchor == 400.0
+        # Validated on the way out: a hand-edited row cannot fire nonsense.
+        exec_raw(store, "UPDATE daemon_schedules SET every = 'soon' WHERE name = 'daily'")
+        assert [s.spec.name for s in store.schedules()] == ["hourly"]
 
     def test_schedule_rows_record_the_grid(self, tmp_path: Path) -> None:
         """#761: a schedule's row anchors on first sight, keeps the last due

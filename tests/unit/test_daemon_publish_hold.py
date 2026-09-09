@@ -18,6 +18,7 @@ import pytest
 
 from sbxloop.daemon.control import dispatch
 from sbxloop.daemon.model import WorkItem
+from tests.fakes.rawdb import exec_raw, query_raw
 from tests.unit.test_daemon_loop import FakeSource, Harness, gh_item
 from tests.unit.test_daemon_merge_gate import GateFrontend
 
@@ -54,10 +55,8 @@ def park(h: Harness, **item_overrides: Any) -> str:
 
 
 def ledger_result(h: Harness, run_id: str) -> str | None:
-    row = h.dstore._conn.execute(
-        "SELECT result FROM daemon_runs WHERE run_id = ?", (run_id,)
-    ).fetchone()
-    return None if row is None else row[0]
+    rows = query_raw(h.dstore, "SELECT result FROM daemon_runs WHERE run_id = ?", (run_id,))
+    return None if not rows else rows[0][0]
 
 
 def frontend(h: Harness) -> GateFrontend:
@@ -120,12 +119,12 @@ class TestParkOnHeld:
         # Rewind the store to the moment before the settle: the run ended
         # held and the item still says running.
         h.store.set_run_state(run_id, "held")
-        h.dstore._conn.execute(
+        exec_raw(
+            h.dstore,
             "UPDATE daemon_work_items SET state = 'running', pending_report = NULL "
             "WHERE item_id = ?",
             (ITEM,),
         )
-        h.dstore._conn.commit()
         h.loop.recover()
         item = h.dstore.get(ITEM)
         assert item is not None and (item.state, item.run_id) == ("gated", run_id)
@@ -264,16 +263,23 @@ class TestStore:
     def test_a_pre_kind_gate_table_upgrades_in_place(self, tmp_path: Path) -> None:
         import sqlite3
 
-        from sbxloop.daemon.store import DaemonStore
+        from sbxloop.daemon.store import DaemonStore, apply_daemon_schema
 
+        # Built by the pre-ORM schema functions and then cut back to the
+        # shape that predates `kind`, so it carries no schema stamp — which
+        # is what a database written by that version actually looks like.
+        # Creating a current one and dropping a column out of it would leave
+        # the stamp behind and describe a database that has never existed.
         db = tmp_path / "state.db"
-        store = DaemonStore(db)
-        store.create_merge_gate(
-            "r1", "gh:issue:7", "o/r", 9, "https://x/pull/9", None, [], "t", 1.0
-        )
-        store.close()
         conn = sqlite3.connect(db)
+        apply_daemon_schema(conn)
         conn.execute("ALTER TABLE daemon_merge_gates DROP COLUMN kind")
+        conn.execute(
+            "INSERT INTO daemon_merge_gates (run_id, item_id, repo, pr_number, pr_url, "
+            "branch, notify_ids, custom_id, state, created_at) "
+            "VALUES ('r1', 'gh:issue:7', 'o/r', 9, 'https://x/pull/9', NULL, '[]', 't', "
+            "'open', 1.0)"
+        )
         conn.commit()
         conn.close()
         store = DaemonStore(db)

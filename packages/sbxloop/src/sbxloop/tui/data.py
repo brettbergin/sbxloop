@@ -8,7 +8,7 @@ screens only ever see the frozen snapshots built here.
 
 from __future__ import annotations
 
-import sqlite3
+import json
 import time
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
@@ -21,6 +21,7 @@ from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.store import ChatThread, MergeGate, ReviewHold, dispatch_eligible_at
 from sbxloop.daemon.usage import RunUsage, usage_for_run
 from sbxloop.engine.model import RunRecord, TaskRecord
+from sbxloop.engine.store import PhaseAttemptRecord
 from sbxloop.events import HostEventTypes
 from sbxloop_worker.protocol import Event
 
@@ -109,6 +110,9 @@ class RunsSnapshot:
     item_by_run: dict[str, str]
     repo_by_item: dict[str, str]
     last_event_by_run: dict[str, float]
+    #: Turns spent and seconds worked, per run — what a run cost, beside
+    #: what it did.
+    cost_by_run: dict[str, tuple[int, float]] = field(default_factory=dict)
 
     def item_for(self, run_id: str) -> str | None:
         return self.item_by_run.get(run_id)
@@ -116,6 +120,9 @@ class RunsSnapshot:
     def repo_for(self, run_id: str) -> str | None:
         item = self.item_by_run.get(run_id)
         return self.repo_by_item.get(item) if item else None
+
+    def cost_for(self, run_id: str) -> tuple[int, float]:
+        return self.cost_by_run.get(run_id, (0, 0.0))
 
 
 def build_runs(mailbox: MailboxClient, *, limit: int = 200) -> RunsSnapshot:
@@ -132,7 +139,8 @@ def build_runs(mailbox: MailboxClient, *, limit: int = 200) -> RunsSnapshot:
         if item.run_id:
             item_by_run[item.run_id] = item.item_id
     last = mailbox.last_event_ts_many([r.run_id for r in runs[:30]])
-    return RunsSnapshot(runs, item_by_run, repo_by_item, last)
+    costs = mailbox.run_costs([r.run_id for r in runs])
+    return RunsSnapshot(runs, item_by_run, repo_by_item, last, costs)
 
 
 @dataclass(frozen=True)
@@ -157,7 +165,7 @@ def build_items(mailbox: MailboxClient, *, retry_backoff_s: float) -> ItemsSnaps
 class RunDetail:
     record: RunRecord
     tasks: tuple[TaskRecord, ...]
-    phases: tuple[sqlite3.Row, ...]
+    phases: tuple[PhaseAttemptRecord, ...]
     item: WorkItem | None
     gate: MergeGate | None
     hold: ReviewHold | None
@@ -165,6 +173,12 @@ class RunDetail:
     last_event_ts: float | None
     landing_events: tuple[Event, ...]
     usage: RunUsage | None = None
+    #: A workload's profile (#804): the one its run config pins, else the
+    #: one the grant named; None for a code run or a run with no profile.
+    profile: str | None = None
+    #: What the plan declared and the grant did (#804): names only.
+    needs_granted: Event | None = None
+    needs_refused: Event | None = None
 
 
 def build_run_detail(
@@ -196,6 +210,14 @@ def build_run_detail(
     else:
         with mailbox.read_engine() as engine:
             usage = usage_for_run(engine, run_id)
+    profile: str | None = None
+    granted = refused = None
+    if record.kind == "workload":
+        granted = mailbox.last_event(run_id, HostEventTypes.RUN_NEEDS_GRANTED)
+        refused = mailbox.last_event(run_id, HostEventTypes.RUN_NEEDS_REFUSED)
+        profile = workload_profile_of(mailbox, run_id)
+        if profile is None and granted is not None:
+            profile = str(granted.data.get("profile") or "") or None
     return RunDetail(
         record=record,
         tasks=tuple(mailbox.tasks(run_id)),
@@ -207,7 +229,24 @@ def build_run_detail(
         last_event_ts=last_event_ts,
         landing_events=tuple(landing),
         usage=usage,
+        profile=profile,
+        needs_granted=granted,
+        needs_refused=refused,
     )
+
+
+def workload_profile_of(mailbox: MailboxClient, run_id: str) -> str | None:
+    """The profile a workload run was pinned to (#804): `for_workload_profile`
+    writes it into the run's persisted config as `[workload] default`."""
+    try:
+        with mailbox.read_engine() as engine:
+            raw = engine.get_run_config(run_id)
+        data = json.loads(raw) if raw else {}
+    except Exception:  # a pre-config row, or a store on its way out
+        return None
+    workload = data.get("workload") if isinstance(data, dict) else None
+    default = workload.get("default") if isinstance(workload, dict) else None
+    return str(default) if default else None
 
 
 class EventTail:

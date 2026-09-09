@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import contextlib
 import os
+import signal
 import subprocess
+import tempfile
 import threading
 import time
 import traceback
+from dataclasses import asdict
 from pathlib import Path
 
 from sbxloop_worker.backends import get_backend
@@ -21,6 +25,102 @@ from sbxloop_worker.protocol import (
 from sbxloop_worker.resources import LEVEL_SEVERITY, classify_level, sample_resources
 
 OUTPUT_TAIL_CHARS = 20_000
+
+# How long anything a command leaves running gets to honour SIGTERM before
+# the group is killed outright. A dev server or a database shutting down
+# cleanly takes milliseconds; nothing a verify command starts deserves
+# longer, and the wait ends as soon as the group is empty.
+GROUP_TERM_GRACE_S = 2.0
+
+
+def run_isolated_command(command: str, *, cwd: str | None, timeout_s: float) -> tuple[int, str]:
+    """Run one shell command so it can neither see nor outlive itself.
+
+    Verify commands are model-authored text, and running them the obvious
+    way — ``sh -c '<the whole command>'`` sharing the worker's process
+    group — gave that text two ways to break a check that was otherwise
+    correct.
+
+    It could **see itself**. ``pkill``/``pgrep`` match against the full
+    command line, and ``sh -c`` puts the entire command *on* the command
+    line, so any pattern drawn from the command's own text also matches the
+    shell running it. A check that started a dev server on a port and
+    cleaned up with ``pkill -f <port>`` signalled its own shell: it died
+    with a SIGTERM exit and no output, identically on every attempt, with
+    the work correct and every other gate green (field failure rkbgkf32a,
+    a run abandoned as unverifiable). Passing the command as a *script
+    file* keeps the text out of the process table, so a pattern kill
+    reaches what the command started and nothing else.
+
+    It could **outlive itself**. Anything backgrounded and not reaped kept
+    running after the command returned — holding its port against the next
+    attempt, and holding the captured pipe open so reading the output
+    blocked until the whole job timed out. Each command gets a session of
+    its own, which makes its leftovers a process group this can signal, and
+    output goes to a file rather than to a pipe an orphan can hold open.
+
+    Stdin is ``/dev/null`` for the same reason: a check that reads it is
+    already wrong, and inheriting the worker's would let it block there
+    until the job's timeout instead of failing in front of the builder.
+
+    Returns the exit code and the combined stdout/stderr. Raises
+    :class:`subprocess.TimeoutExpired` when ``timeout_s`` passes, after
+    tearing the group down.
+    """
+    with tempfile.TemporaryDirectory(prefix="sbxloop-cmd-") as tmp:
+        script = Path(tmp) / "command.sh"
+        script.write_text(command, encoding="utf-8")
+        output_path = Path(tmp) / "output"
+        with output_path.open("wb") as sink:
+            # nosec below: executing the job's command inside the sandbox IS
+            # this worker's contract. `sh <file>` runs the command exactly as
+            # `sh -c` did, without publishing it to every reader of the
+            # process table; start_new_session makes the command and its
+            # children a group of their own, so the reap below can never
+            # reach the worker or a sibling command.
+            proc = subprocess.Popen(  # nosec B603 B607
+                ["sh", str(script)],
+                stdout=sink,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                cwd=cwd,
+                start_new_session=True,
+            )
+            try:
+                exit_code = proc.wait(timeout=timeout_s)
+            except subprocess.TimeoutExpired:
+                # Signal the group while the leader is still in it, then
+                # collect the leader itself.
+                _reap_group(proc.pid)
+                proc.wait()
+                raise
+            _reap_group(proc.pid)
+        # Explicit UTF-8: the sandbox's locale is not guaranteed, and a
+        # check whose output carries a non-ASCII byte must still be readable
+        # rather than raising or arriving mangled.
+        return exit_code, output_path.read_text(encoding="utf-8", errors="replace")
+
+
+def _reap_group(pgid: int) -> None:
+    """SIGTERM, then SIGKILL, whatever is left in the command's process group.
+
+    The group id is the leader's pid. ``ProcessLookupError`` is the normal
+    case and the fast path: the command left nothing behind, so the group is
+    already gone.
+    """
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    deadline = time.monotonic() + GROUP_TERM_GRACE_S
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        try:
+            os.killpg(pgid, 0)
+        except (ProcessLookupError, PermissionError):
+            return
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(pgid, signal.SIGKILL)
 
 
 class JobRunner:
@@ -118,6 +218,35 @@ class JobRunner:
             return self._run_shell_check()
         if self.job.kind == "shell.batch":
             return self._run_shell_batch()
+        if self.job.kind == "git.merge":
+            from sbxloop_worker.gitops import merge_from_base
+
+            assert self.job.cwd is not None
+            bundle = (
+                Path(self.job.params["bundle_path"]) if self.job.params.get("bundle_path") else None
+            )
+            try:
+                merged = merge_from_base(
+                    Path(self.job.cwd),
+                    self.job.params["base_branch"],
+                    timeout_s=self.job.timeout_s,
+                    base_sha=self.job.params["base_sha"],
+                    bundle_path=bundle,
+                )
+            finally:
+                if bundle is not None:
+                    with contextlib.suppress(OSError):
+                        bundle.unlink(missing_ok=True)
+            return JobResult(job_id=self.job.job_id, status="ok", output_json=asdict(merged))
+        if self.job.kind == "service.mcp":
+            from sbxloop_worker.mcpops import execute
+
+            output = execute(
+                self.job.params,
+                self.result_path.parent / "mcp-sessions",
+                timeout_s=self.job.timeout_s,
+            )
+            return JobResult(job_id=self.job.job_id, status="ok", output_json=output)
         if self.job.kind == "service.http":
             return self._run_service_http(writer)
         if self.job.kind == "service.fetch":
@@ -177,21 +306,15 @@ class JobRunner:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise subprocess.TimeoutExpired(command, self.job.timeout_s)
-            # nosec below: executing the job's commands inside the sandbox IS
-            # this worker's contract, same as shell.check's argv.
-            proc = subprocess.run(  # nosec B603 B607
-                ["sh", "-c", command],
-                capture_output=True,
-                text=True,
+            exit_code, output = run_isolated_command(
+                command,
                 cwd=self.job.cwd,
-                timeout=min(per_command, remaining),
-                check=False,
+                timeout_s=min(per_command, remaining),
             )
-            output = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
             results.append(
                 BatchCommandResult(
                     command=command,
-                    exit_code=proc.returncode,
+                    exit_code=exit_code,
                     output=output[-OUTPUT_TAIL_CHARS:],
                 )
             )
@@ -232,49 +355,32 @@ class JobRunner:
         return JobResult(job_id=self.job.job_id, status="ok", output_json=output)
 
     def _run_service_fetch(self, writer: EventWriter) -> JobResult:
-        """One dependency fetch in the service sandbox (#766): the argv the
-        host composed, in the workspace, with the sandbox's own environment
-        (the registry credential and the cache location are in it). Exit
-        code and output tail come back like shell.check's; the host decides
-        what a non-zero exit means."""
-        assert self.job.argv is not None
+        """Read registry bytes with fixed operations; never evaluate the project."""
+        from sbxloop_worker.registryops import execute_fetch
+
         summary = {
-            "ecosystem": self.job.params.get("ecosystem"),
-            "verb": self.job.params.get("verb"),
-            "argv": list(self.job.argv),
+            "registry": self.job.params.get("registry"),
+            "operation": self.job.params.get("operation", "download"),
+            "path": self.job.params.get("path"),
         }
         writer.emit(EventTypes.SERVICE_FETCH_START, **summary)
         started = time.monotonic()
-        # nosec below: running the host-authored fetch argv inside the
-        # sandbox IS this job kind's contract; list argv, never shell=True.
-        proc = subprocess.run(  # nosec B603
-            self.job.argv,
-            capture_output=True,
-            text=True,
-            cwd=self.job.cwd,
-            timeout=self.job.timeout_s,
-            check=False,
+        output = execute_fetch(
+            self.job.params,
+            self.result_path.with_suffix(".artifact"),
+            timeout_s=self.job.timeout_s,
         )
-        output = proc.stdout + (("\n" + proc.stderr) if proc.stderr else "")
-        # The output goes back to the host and into the ledger; a package
-        # manager is free to echo a URL with the token in it. The host names
-        # the variables holding the secrets (names, not values); their
-        # values are blanked out here, where they are.
-        for name in self.job.params.get("scrub_env") or ():
-            value = os.environ.get(str(name), "")
-            if len(value) >= 8:
-                output = output.replace(value, "***")
         writer.emit(
             EventTypes.SERVICE_FETCH_END,
-            exit_code=proc.returncode,
+            bytes=output["bytes"],
+            sha256=output["sha256"],
             duration_s=round(time.monotonic() - started, 2),
             **summary,
         )
         return JobResult(
             job_id=self.job.job_id,
             status="ok",
-            exit_code=proc.returncode,
-            output_text=output[-OUTPUT_TAIL_CHARS:],
+            output_json=output,
         )
 
     # -- helpers -----------------------------------------------------------

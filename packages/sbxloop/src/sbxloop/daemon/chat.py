@@ -99,6 +99,8 @@ from sbxloop.ghids import normalize_item_id
 from sbxloop.log import get_logger
 
 if TYPE_CHECKING:
+    from concurrent.futures import Future
+
     from sbxloop.daemon.concierge import Concierge, ConciergeReply
     from sbxloop_worker.protocol import HostToolResponse
 
@@ -222,6 +224,7 @@ class _ConciergeTurn:
         self.message = message
         self.channel = message.channel
         self.note: Any = None  # the "🛠 …" line, posted on the first tool call
+        self.note_lock = asyncio.Lock()
         self.calls: list[str] = []
         self.failed = 0
         self.last_edit = 0.0
@@ -1038,8 +1041,27 @@ class ChatBridge(ABC):
         if behind > 0:
             await self._send(channel, f"⏳ queued behind {behind} other question(s)…")
 
+        loop = asyncio.get_running_loop()
+        notes: list[Future[None]] = []
+
         def on_tool(name: str, args: dict[str, Any], response: HostToolResponse) -> None:
-            self._schedule(self._concierge_tool_note(turn, name, args, response))
+            notes.append(
+                asyncio.run_coroutine_threadsafe(
+                    self._concierge_tool_note(turn, name, args, response), loop
+                )
+            )
+
+        async def finish_notes() -> None:
+            # Tool callbacks run before the concierge future resolves, but
+            # their posts may still be queued or awaiting the transport.
+            # Drain them before the final edit and completion reaction.
+            results = await asyncio.gather(
+                *(asyncio.wrap_future(note) for note in notes), return_exceptions=True
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    self.log.warning("chat.concierge_note_failed", error=str(result))
+            await self._finish_concierge_note(turn)
 
         author = self._author_name(msg)
         self._remember_requester(author, msg.author_id)
@@ -1061,14 +1083,17 @@ class ChatBridge(ABC):
                 )
                 reply = await asyncio.wrap_future(future)
         except asyncio.CancelledError:
+            for note in notes:
+                note.cancel()
             raise
         except Exception as exc:
             # A closed concierge (shutdown race) or a lost future: say so, once.
             self.log.warning("chat.concierge_turn_failed", by=author, error=str(exc), exc_info=True)
+            await finish_notes()
             await self._react(msg.raw, "⚠")
             await self._send(channel, f"⚠ concierge: {_one_line(str(exc), 300)}", reply_to=msg.raw)
             return
-        await self._finish_concierge_note(turn)
+        await finish_notes()
         await self._post_concierge_reply(msg, reply, nudge=nudge)
 
     async def _post_concierge_reply(
@@ -1468,14 +1493,17 @@ class ChatBridge(ABC):
         the audit trail for actions taken without a confirmation step."""
         if self.chat.chronology_level == "quiet":
             return
-        turn.calls.append(_tool_call_summary(name, args))
-        if not response.ok:
-            turn.failed += 1
-        if turn.note is None:
-            turn.note = await self._send(turn.channel, turn.render())
-            turn.last_edit = time.monotonic()
-            return
-        self._schedule_note_edit(turn)
+        # The first send can yield: serialize callbacks so later tools edit
+        # that note instead of posting another while it is still in flight.
+        async with turn.note_lock:
+            turn.calls.append(_tool_call_summary(name, args))
+            if not response.ok:
+                turn.failed += 1
+            if turn.note is None:
+                turn.note = await self._send(turn.channel, turn.render())
+                turn.last_edit = time.monotonic()
+                return
+            self._schedule_note_edit(turn)
 
     def _schedule_note_edit(self, turn: _ConciergeTurn) -> None:
         if turn.edit_task is not None and not turn.edit_task.done():

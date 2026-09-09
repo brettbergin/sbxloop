@@ -30,38 +30,54 @@ import hashlib
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
+from functools import partial
 from pathlib import Path
 from typing import Literal, NamedTuple, TypeVar
 
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter
 
 from sbxloop import toolchains
 from sbxloop.config import Config
 from sbxloop.deliver import pr_conventions
-from sbxloop.engine.model import JudgeVerdict, SteerVerdict, TaskGraph, TaskRecord, WorkloadPlan
+from sbxloop.engine.harness import ROLE_BY_PHASE, brief_for_phase
+from sbxloop.engine.issue_lookup import IssueLookup
+from sbxloop.engine.model import (
+    JudgeVerdict,
+    SteerVerdict,
+    TaskGraph,
+    TaskRecord,
+    VerifyReauthor,
+    WorkloadPlan,
+)
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.repocontext import repo_conventions
 from sbxloop.engine.review import ReviewGuard, ReviewVerdict
-from sbxloop.engine.service import FETCH_TOOL_NAME
+from sbxloop.engine.service import FETCH_TIMEOUT_S, FETCH_TOOL_NAME
+from sbxloop.engine.skilltools import SKILL_TOOL_NAME, answer_skill_call, skill_tool_spec
 from sbxloop.errors import InvalidOutputTwice, WorkerError
 from sbxloop.events import EventBus
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
 from sbxloop.verifylint import (
     UV_LOCKFILE,
+    command_heads,
     config_override_example,
     gate_problems,
     gate_rule,
     lint_verify_commands,
     project_gate,
     reviewer_gate_rule,
+    runs_gate,
 )
 from sbxloop.worker.client import WorkerClient
 from sbxloop.worker.hosttools import HostToolHandler
+from sbxloop_worker.gitops import MergeResult
 from sbxloop_worker.protocol import (
     BatchCommandResult,
     Event,
     EventTypes,
+    HostToolCall,
+    HostToolResponse,
     HostToolSpec,
     JobRequest,
     JobResult,
@@ -193,6 +209,8 @@ AGENT_NAMES = {
     "operator_plan": "operator",
     "operator_execute": "operator",
     "operator_judge": "judge",
+    # The one actor allowed to change the exam rather than the work.
+    "reauthor_verify": "verify editor",
 }
 # The phases whose session gets the run's host tools: the one doing the
 # work that may need a service. Planners and critics read and judge.
@@ -362,6 +380,7 @@ class PhaseRunner:
         if bool(host_tools) != (tool_handler is not None):
             raise ValueError("host_tools and tool_handler must be given together")
         self.host_tools: tuple[HostToolSpec, ...] = tuple(host_tools)
+        self.issue_lookup: IssueLookup | None = None
         self.tool_handler = tool_handler
         # Canonical in-VM working directory for every job in this run: the
         # discovered workspace mount, or the harvest dir. Evidence and verify
@@ -443,8 +462,9 @@ class PhaseRunner:
                 "\n\n## Dependencies\n\n"
                 "This project's private registries are reached only from the run's "
                 "service sandbox, which holds the credential; this sandbox is offline "
-                "for those ecosystems and installs from the shared cache. Ask for "
-                "packages through this tool; every fetch is logged:\n\n" + "\n".join(lines)
+                "for those ecosystems. Download metadata and artifacts through the host, "
+                "then resolve, populate caches and install here. Every fetch is logged:\n\n"
+                + "\n".join(lines)
             )
         return text
 
@@ -482,13 +502,30 @@ class PhaseRunner:
         # Only the working phases get the host tools: the planners and the
         # critics read and judge; the builder and the operator's executor
         # are the ones whose work may need a service.
-        host_tools = self.host_tools if phase in TOOLED_PHASES else ()
+        service_tools = self.host_tools if phase in TOOLED_PHASES else ()
+        # The skill tool is NOT narrowed to the tooled phases: a critic needs
+        # the verification procedure exactly as much as the builder does, and
+        # unlike a service call it reaches nothing outside the host.
+        host_tools, tool_handler = self._tools_for(phase, service_tools)
+        if phase == "review" and self.issue_lookup is not None:
+            lookup = self.issue_lookup
+            other_handler = tool_handler
+
+            def review_handler(call: HostToolCall) -> HostToolResponse:
+                if call.name == lookup.tool_spec().name:
+                    return lookup.handle(call)
+                if other_handler is not None:
+                    return other_handler(call)
+                return HostToolResponse(call_id=call.call_id, ok=False, error="unknown tool")
+
+            host_tools = (*host_tools, lookup.tool_spec())
+            tool_handler = review_handler
         job = JobRequest(
             job_id=new_job_id(),
             run_id=self.run_id,
             kind="agent.session",
             prompt=prompt,
-            system_message=system_message,
+            system_message=brief_for_phase(self.config, phase, system_message),
             system_preset=system_preset,
             model=self.config.model,
             permission_mode=permission_mode,
@@ -500,6 +537,19 @@ class PhaseRunner:
             # attempt's session so the work already done is not re-derived.
             resume_session_id=resume_session_id,
             host_tools=list(host_tools),
+            # Give an artifact operation time to finish and transfer its
+            # file before the agent abandons the host-tool response.
+            host_tool_timeout_s=(
+                FETCH_TIMEOUT_S + 30
+                if any(tool.name == FETCH_TOOL_NAME for tool in service_tools)
+                else 120.0
+            ),
+            # Role-filtered: `[[mcp]] roles` decides which sessions get a
+            # server, and the default excludes critics — a read-only review
+            # reaching a third-party service is a capability nobody asked
+            # for, and both backends already fail closed on an unknown MCP
+            # tool in read-only mode.
+            mcp_servers=self.config.mcp_specs_for(ROLE_BY_PHASE[phase]),
         )
         started = time.monotonic()
         log.info(
@@ -518,7 +568,7 @@ class PhaseRunner:
             # The handler rides along only when the job carries tools: a run
             # without them submits exactly the call it always did.
             result = (
-                self.agent.submit(job, agent=agent_name, tool_handler=self.tool_handler)
+                self.agent.submit(job, agent=agent_name, tool_handler=tool_handler)
                 if host_tools
                 else self.agent.submit(job, agent=agent_name)
             )
@@ -544,6 +594,36 @@ class PhaseRunner:
             assert result.error is not None
             raise WorkerError(f"agent job failed ({result.error.type}): {result.error.message}")
         return result
+
+    def _tools_for(
+        self, phase: str, service_tools: Sequence[HostToolSpec]
+    ) -> tuple[tuple[HostToolSpec, ...], HostToolHandler | None]:
+        """The host tools one phase's session gets, and the handler that
+        answers them.
+
+        Two sources meet here. The run's own tools (a service call, a
+        dependency fetch) are the caller's and only the working phases get
+        them. The skill tool is the loop's, every phase gets it, and it is
+        answered from package data without leaving the host — so a run with
+        no service tools still gets one, which is why the handler cannot
+        simply be ``self.tool_handler``.
+        """
+        role = ROLE_BY_PHASE[phase]
+        skill_spec = skill_tool_spec(role)
+        if skill_spec is None:
+            return tuple(service_tools), self.tool_handler if service_tools else None
+        delegate = self.tool_handler
+
+        def handler(call: HostToolCall) -> HostToolResponse:
+            if call.name == SKILL_TOOL_NAME:
+                return answer_skill_call(call, role)
+            if delegate is None:  # pragma: no cover - no tool but the skill one exists
+                return HostToolResponse(
+                    call_id=call.call_id, ok=False, error=f"unknown tool {call.name!r}"
+                )
+            return delegate(call)
+
+        return (*service_tools, skill_spec), handler
 
     def _watch_tools(self, job_id: str, digest: ToolDigest | None) -> Callable[[], None]:
         """Feed one job's tool events to ``digest`` while it runs; a no-op
@@ -634,6 +714,30 @@ class PhaseRunner:
         )
         raise InvalidOutputTwice(f"{prompt_name} produced invalid output twice: {last_error}")
 
+    def merge_from_base(
+        self, base_branch: str, *, base_sha: str, bundle: Path | None = None
+    ) -> MergeResult:
+        """Mutate the checkout only in the agent's uncredentialed sandbox."""
+        job_id = new_job_id()
+        params = {"base_branch": base_branch, "base_sha": base_sha}
+        if bundle is not None:
+            destination = f"/tmp/sbxloop-base-{job_id}.bundle"  # nosec B108 - path inside agent VM
+            self.agent.sandbox.cp_in(bundle, destination)
+            params["bundle_path"] = destination
+        job = JobRequest(
+            job_id=job_id,
+            run_id=self.run_id,
+            kind="git.merge",
+            cwd=self.workdir,
+            params=params,
+            timeout_s=self.config.budgets.per_job_timeout_s,
+        )
+        result = self.agent.submit(job)
+        if result.status != "ok":
+            assert result.error is not None
+            raise WorkerError(f"base merge failed ({result.error.type}): {result.error.message}")
+        return TypeAdapter(MergeResult).validate_python(result.output_json)
+
     def shell_batch(
         self, commands: Sequence[str], *, cwd: str | None = None
     ) -> list[BatchCommandResult]:
@@ -694,6 +798,101 @@ class PhaseRunner:
             check=self._check_taskgraph,
         )
         return graph
+
+    # Commands that decide nothing: a "replacement" made of these passes
+    # whatever the workspace contains, which is a deleted check wearing the
+    # shape of one.
+    _NO_OP_HEADS = frozenset({"true", ":", "echo", "printf", "exit"})
+
+    def reauthor_verify(
+        self,
+        task: TaskRecord,
+        *,
+        suspect_command: str,
+        suspect_output: str,
+        builder_report: str,
+    ) -> VerifyReauthor:
+        """Decide what happens to one verify command that cannot pass.
+
+        The command has failed identically across attempts and approaches, so
+        the loop knows no further work on the code can change it. Until this
+        existed the loop could only say so and abandon the run, throwing away
+        work that was finished (field failure rkbgkf32a). Here the check
+        itself is the thing that gets to change.
+
+        Scoped to the one suspect command: everything else on the task is
+        passed as context and stays byte-identical whatever comes back. The
+        answer is held to the same mechanical gate a decomposition is —
+        toolchain conventions, no environment mutation, no network, no
+        pattern kills — plus two rules only this phase needs: a replacement
+        may not be a no-op, and the command carrying the project's own gate
+        may be replaced but never dropped.
+        """
+        gate_note = self._reauthor_gate_note(suspect_command)
+        answer, _ = self._agent_json(
+            VerifyReauthor,
+            "reauthor_verify",
+            {
+                "task_title": f"{task.spec.id}: {task.spec.title}",
+                "task_description": task.spec.description or "(no description)",
+                "acceptance_criteria": bullet_list(task.spec.acceptance_criteria),
+                "suspect_command": suspect_command,
+                "suspect_output": suspect_output.strip() or "(no output at all)",
+                "other_commands": bullet_list(
+                    [c for c in task.spec.verify_commands if c != suspect_command]
+                ),
+                "builder_report": builder_report or "(the builder said nothing about it)",
+                "gate_rule": gate_note,
+            },
+            permission_mode="read_only",
+            check=partial(self._check_reauthor, suspect_command=suspect_command),
+        )
+        return answer
+
+    def _reauthor_gate_note(self, suspect_command: str) -> str:
+        """The extra rule when the suspect check is the one carrying the
+        project's own gate: it may be rewritten, never removed."""
+        gate = self.project_gate()
+        if not gate or not runs_gate(suspect_command, gate):
+            return ""
+        return (
+            "This check runs the project's own gate, so it may be replaced but never "
+            f"dropped: whatever replaces it must run `{gate}` too."
+        )
+
+    def _check_reauthor(self, answer: VerifyReauthor, *, suspect_command: str) -> None:
+        """Reject an answer that would weaken the exam rather than fix it.
+
+        The lint is the same one a decomposition is held to, so a
+        replacement cannot smuggle in what the decomposer is forbidden. The
+        two rules beyond it exist because this phase, unlike the decomposer,
+        is talking to a model that has just been told a check is in its way:
+        a replacement that cannot fail is a deleted check wearing the shape
+        of one, and the command carrying the project's gate is the last one
+        that should quietly disappear.
+        """
+        gate = self.project_gate()
+        carries_gate = bool(gate and runs_gate(suspect_command, gate))
+        if answer.verdict == "drop" and carries_gate:
+            raise ValueError(
+                "this check runs the project's own gate and cannot be dropped — "
+                "replace it with one that still runs it, or keep it"
+            )
+        if answer.verdict != "replace":
+            return
+        if problems := self._lint_verify_commands([answer.command]):
+            raise ValueError("; ".join(problems))
+        heads = command_heads(answer.command)
+        if heads and all(head in self._NO_OP_HEADS for head in heads):
+            raise ValueError(
+                f"`{answer.command}` cannot fail whatever the workspace contains, so it "
+                "is not a check — give one that can fail, or keep the existing check"
+            )
+        if carries_gate and not runs_gate(answer.command, gate or ""):
+            raise ValueError(
+                f"the check being replaced runs this project's gate (`{gate}`); "
+                "the replacement must run it too"
+            )
 
     def repo_conventions(self) -> str:
         """The repository's own instruction files as a prompt section

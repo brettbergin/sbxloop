@@ -342,6 +342,8 @@ def configure_logging(
     systemd; the file is the copy a host without a journal, a ``tail -f``
     over ssh, or the console reads.
     """
+    from sbxloop.telemetry import capture_log
+
     level_no = _level_no(level)
 
     shared: list[Any] = [
@@ -358,6 +360,7 @@ def configure_logging(
         processors=[
             structlog.stdlib.filter_by_level,
             *shared,
+            capture_log,
             structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
         logger_factory=structlog.stdlib.LoggerFactory(),

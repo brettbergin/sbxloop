@@ -18,6 +18,7 @@ from git import GitCommandError, Repo
 
 from sbxloop import hostgit
 from sbxloop.errors import DeliveryError, ProvisionError
+from sbxloop_worker.gitops import GitMergeError, merge_from_base
 from tests.fakes.gitserver import PrivateGitServer, bare_from
 
 
@@ -35,6 +36,7 @@ def git(*argv: str, cwd: Path) -> None:
             "GIT_COMMITTER_EMAIL": "t@example.com",
             "GIT_CONFIG_GLOBAL": "/dev/null",
             "GIT_CONFIG_SYSTEM": "/dev/null",
+            "GIT_SSL_CAINFO": os.environ.get("GIT_SSL_CAINFO", ""),
         },
     )
 
@@ -721,7 +723,7 @@ class TestMergeFromBase:
         commit_all(clone, "run work")
         new_sha = push_upstream_commit(tmp_path, upstream)
 
-        result = hostgit.merge_from_base(clone, "main")
+        result = merge_from_base(clone, "main")
 
         assert result.merged is True
         assert result.conflicts == ()
@@ -744,7 +746,7 @@ class TestMergeFromBase:
         (clone / "hello.txt").write_text("edited but not committed\n")
         new_sha = push_upstream_commit(tmp_path, upstream)
 
-        result = hostgit.merge_from_base(clone, "main")
+        result = merge_from_base(clone, "main")
 
         assert result.merged is True
         with Repo(clone) as repo:
@@ -779,7 +781,7 @@ class TestMergeFromBase:
         before = commit_all(clone, "run edit")
         push_upstream_edit(tmp_path, upstream, "hello.txt", "upstream's line\n")
 
-        result = hostgit.merge_from_base(clone, "main")
+        result = merge_from_base(clone, "main")
 
         assert result.merged is False
         assert result.conflicts == ("hello.txt",)
@@ -797,14 +799,14 @@ class TestMergeFromBase:
         (clone / "hello.txt").write_text("the run's line\n")
         commit_all(clone, "run edit")
         new_sha = push_upstream_edit(tmp_path, upstream, "hello.txt", "upstream's line\n")
-        assert hostgit.merge_from_base(clone, "main").merged is False
+        assert merge_from_base(clone, "main").merged is False
 
         (clone / "hello.txt").write_text("the run's line\nupstream's line\n")
         git("add", "-A", cwd=clone)
         git("commit", "--no-edit", cwd=clone)
 
         assert not (clone / ".git" / "MERGE_HEAD").exists()
-        again = hostgit.merge_from_base(clone, "main")
+        again = merge_from_base(clone, "main")
         assert again.merged is True and again.conflicts == ()
         assert "already contains origin/main" in again.message
         with Repo(clone) as repo:
@@ -815,7 +817,7 @@ class TestMergeFromBase:
         (clone / "work.txt").write_text("the run's work\n")
         before = commit_all(clone, "run work")
 
-        result = hostgit.merge_from_base(clone, "main")
+        result = merge_from_base(clone, "main")
 
         assert result.merged is True
         assert result.conflicts == ()
@@ -826,7 +828,7 @@ class TestMergeFromBase:
     def test_no_origin_remote_reports_rather_than_raising(self, tmp_path: Path) -> None:
         repo = make_repo(tmp_path)
         before = rev(repo)
-        result = hostgit.merge_from_base(repo, "main")
+        result = merge_from_base(repo, "main")
         assert result.merged is False
         assert result.conflicts == ()
         assert "no origin remote" in result.message
@@ -836,8 +838,8 @@ class TestMergeFromBase:
         _, clone = make_run_clone(tmp_path)
         git("remote", "set-url", "origin", str(tmp_path / "gone.git"), cwd=clone)
         before = rev(clone)
-        with pytest.raises(ProvisionError, match="git fetch origin main failed"):
-            hostgit.merge_from_base(clone, "main")
+        with pytest.raises(GitMergeError, match="git fetch origin main failed"):
+            merge_from_base(clone, "main")
         assert rev(clone) == before
 
     def test_non_content_merge_failure_aborts_and_raises(self, tmp_path: Path) -> None:
@@ -857,16 +859,16 @@ class TestMergeFromBase:
         git("clone", "--bare", "-q", str(stranger), str(stranger_bare), cwd=tmp_path)
         git("remote", "set-url", "origin", str(stranger_bare), cwd=clone)
 
-        with pytest.raises(ProvisionError, match="merging origin/main into"):
-            hostgit.merge_from_base(clone, "main")
+        with pytest.raises(GitMergeError, match="merging origin/main into"):
+            merge_from_base(clone, "main")
 
         assert rev(clone) == before
         assert not (clone / ".git" / "MERGE_HEAD").exists()
         assert not hostgit.is_dirty(clone)
 
     def test_not_a_repo_raises_provision_error(self, tmp_path: Path) -> None:
-        with pytest.raises(ProvisionError, match="cannot merge into"):
-            hostgit.merge_from_base(tmp_path / "nope", "main")
+        with pytest.raises(GitMergeError, match="cannot merge into"):
+            merge_from_base(tmp_path / "nope", "main")
 
 
 def git_out(*argv: str, cwd: Path) -> str:
@@ -979,7 +981,7 @@ class TestCloneSize:
         assert remote_branches(clone) == ["origin/sbxloop/r1"]
         assert hostgit.resolve_diff_base(clone, new_base) != new_base  # not fetched yet
 
-        result = hostgit.merge_from_base(clone, "other")
+        result = merge_from_base(clone, "other")
         assert result.merged, result.message
         assert "origin/other" in remote_branches(clone)
         assert (clone / "base-moved.txt").read_text() == "moved\n"
@@ -1114,7 +1116,7 @@ class TestPrivateRemoteClone:
         assert env["GIT_CONFIG_KEY_1"] == "credential.helper"
         assert "x-access-token" in env["GIT_CONFIG_VALUE_1"]
         assert "s3cr3t-value" not in env["GIT_CONFIG_VALUE_1"]
-        assert "GIT_CONFIG_COUNT" not in hostgit._clone_env(None)
+        assert hostgit._clone_env(None)["GIT_CONFIG_COUNT"] == "1"
 
 
 class TestIsTracked:
@@ -1255,7 +1257,9 @@ class TestSubmodules:
             with pytest.raises(ProvisionError) as excinfo:
                 hostgit.populate_submodules(clone, source=None, token=None)
             assert "vendor/lib" in str(excinfo.value)
-            populated = hostgit.populate_submodules(clone, source=None, token=token)
+            populated = hostgit.populate_submodules(
+                clone, source=None, token=token, credential_url=private.url
+            )
             assert populated == [("vendor/lib", "remote")]
             assert (clone / "vendor" / "lib" / "lib.txt").read_text() == "v1\n"
             assert token not in (clone / ".git" / "config").read_text()
@@ -1664,7 +1668,9 @@ class TestFetchTags:
             assert hostgit.tag_count(host) == 0
             clone = tmp_path / "run"
             hostgit.clone_for_run(host, clone, "sbxloop/r1")
-            fetched = hostgit.fetch_tags(clone, source=host, token="ghs_tags")
+            fetched = hostgit.fetch_tags(
+                clone, source=host, token="ghs_tags", credential_url=private.url
+            )
             assert fetched == hostgit.TagFetch(tags=1, source="remote")
             assert describe(clone) == "v2.0.0"
             assert private.requests
@@ -1682,10 +1688,12 @@ class TestFetchTags:
             clone = tmp_path / "run"
             hostgit.clone_from_remote(url, clone, "sbxloop/r1", token="ghs_tags")
             with pytest.raises(ProvisionError) as excinfo:
-                hostgit.fetch_tags(clone, source=None, token="wrong")
+                hostgit.fetch_tags(clone, source=None, token="wrong", credential_url=private.url)
             assert 'fetch_tags = "never"' in str(excinfo.value)
             assert hostgit.tag_count(clone) == 0
-            fetched = hostgit.fetch_tags(clone, source=None, token="ghs_tags")
+            fetched = hostgit.fetch_tags(
+                clone, source=None, token="ghs_tags", credential_url=private.url
+            )
             assert fetched == hostgit.TagFetch(tags=1, source="remote")
             assert describe(clone) == "v0.9"
 

@@ -5,6 +5,7 @@ the run — not guessed from the task."""
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Any
 
 from sbxloop import toolchains
 from sbxloop.config import Config
@@ -17,7 +18,9 @@ class RecordingAgent:
     def __init__(self) -> None:
         self.prompts: list[str] = []
 
-    def submit(self, job: JobRequest, *, agent: str | None = None) -> JobResult:
+    def submit(
+        self, job: JobRequest, *, agent: str | None = None, tool_handler: Any = None
+    ) -> JobResult:
         assert job.prompt is not None
         self.prompts.append(job.prompt)
         return JobResult(job_id=job.job_id, status="ok", output_text="done")

@@ -23,10 +23,21 @@ PROTOCOL_VERSION = 1
 HOST_TOOL_NAME_RE = r"^[A-Za-z0-9_-]{1,64}$"
 
 JobKind = Literal[
-    "agent.session", "shell.check", "shell.batch", "github.op", "service.http", "service.fetch"
+    "agent.session",
+    "shell.check",
+    "shell.batch",
+    "github.op",
+    "service.http",
+    "service.fetch",
+    "service.mcp",
+    "git.merge",
 ]
 JobStatus = Literal["ok", "error", "timeout"]
 PermissionMode = Literal["auto", "read_only"]
+#: How an external MCP server is reached. The three transports both agent
+#: SDKs express, so one spec materialises onto either backend without the
+#: host knowing which one will run it.
+McpTransport = Literal["stdio", "http", "sse"]
 ExpectMode = Literal["text", "json"]
 
 
@@ -150,6 +161,47 @@ class HostToolSpec(ProtocolModel):
     parameters: dict[str, Any] = Field(default_factory=lambda: {"type": "object", "properties": {}})
 
 
+class McpServerSpec(ProtocolModel):
+    """One external MCP server the agent session should be given.
+
+    The host resolves the operator's ``[[mcp]]`` entry into this; the
+    backend materialises it into whatever its SDK wants. Both SDKs express
+    the same three transports with the same fields, so this is their common
+    shape rather than either one's dialect (field-verified 2026-09-06
+    against github-copilot-sdk 1.0.8 and claude-agent-sdk 0.2.149).
+
+    Credentialed servers carry only a mediated descriptor. The host replaces
+    it with scoped host tools before dispatch, keeping credentials in the
+    service sandbox. Native SDK configs are credential-free.
+    """
+
+    name: str = Field(pattern=HOST_TOOL_NAME_RE)
+    transport: McpTransport = "stdio"
+    # transport == "stdio"
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    env: dict[str, str] = Field(default_factory=dict)
+    # transport in ("http", "sse")
+    url: str | None = None
+    headers: dict[str, str] = Field(default_factory=dict)
+    # Replaced with host tools before the job enters an agent sandbox.
+    mediated: bool = False
+
+    @model_validator(mode="after")
+    def _check_transport(self) -> McpServerSpec:
+        if self.transport == "stdio":
+            if not self.command:
+                raise ValueError("a stdio MCP server needs a command")
+            if self.url or self.headers:
+                raise ValueError("a stdio MCP server takes no url or headers")
+        else:
+            if not self.url:
+                raise ValueError(f"a {self.transport} MCP server needs a url")
+            if self.command or self.args or self.env:
+                raise ValueError(f"a {self.transport} MCP server takes no command, args or env")
+        return self
+
+
 class HostToolCall(ProtocolModel):
     """One host-tool invocation — the ``data`` of an ``agent.tool_request`` event."""
 
@@ -213,11 +265,13 @@ class JobRequest(ProtocolModel):
     # SDK built-in tool allowlist: None = the SDK's default set, [] = no
     # built-ins (host tools only). Host tool names are always allowed.
     available_tools: list[str] | None = None
+    # External MCP servers this session gets, already filtered by the host
+    # to the ones the phase's role may use. Empty for every run that
+    # configures none, which is the default.
+    mcp_servers: list[McpServerSpec] = Field(default_factory=list)
 
-    # kind == "shell.check"; kind == "service.fetch": the package manager's
-    # argv as the host composed it from the ecosystem's fixed recipe (#766),
-    # run in the service sandbox with ``params`` naming the ecosystem and
-    # verb for the events — never a shell, never an argv the model wrote.
+    # kind == "shell.check": commands execute only in the agent sandbox.
+    # A service.fetch request cannot carry executable arguments.
     argv: list[str] | None = None
 
     # kind == "shell.batch": shell command strings, each run via ``sh -c``
@@ -230,7 +284,7 @@ class JobRequest(ProtocolModel):
     # always bounds the job as a whole).
     command_timeout_s: float | None = None
 
-    # agent.session + shell.check + service.fetch: in-sandbox working
+    # agent.session + shell.check: in-sandbox working
     # directory. The worker process chdirs here (via --cwd) so agent
     # sessions and shell commands run in the run's canonical workspace.
     cwd: str | None = None
@@ -255,7 +309,10 @@ class JobRequest(ProtocolModel):
     @property
     def _has_host_tool_fields(self) -> bool:
         return bool(
-            self.host_tools or self.host_tools_dir is not None or self.available_tools is not None
+            self.host_tools
+            or self.host_tools_dir is not None
+            or self.available_tools is not None
+            or self.mcp_servers
         )
 
     @model_validator(mode="after")
@@ -267,7 +324,8 @@ class JobRequest(ProtocolModel):
                 raise ValueError("agent.session must not set argv, commands, or op")
         elif self._has_host_tool_fields:
             raise ValueError(
-                f"{self.kind} must not set host_tools, host_tools_dir, or available_tools"
+                f"{self.kind} must not set host_tools, host_tools_dir, available_tools, "
+                "or mcp_servers"
             )
         if self.kind == "shell.check":
             if not self.argv:
@@ -292,15 +350,51 @@ class JobRequest(ProtocolModel):
                 raise ValueError("service.http must not set op")
             if self.prompt is not None or self.argv is not None or self.commands is not None:
                 raise ValueError("service.http must not set prompt, argv, or commands")
+        elif self.kind == "git.merge":
+            sha = self.params.get("base_sha")
+            if (
+                not isinstance(sha, str)
+                or len(sha) not in (40, 64)
+                or any(c not in "0123456789abcdef" for c in sha)
+            ):
+                raise ValueError("git.merge requires a full base_sha")
+            if (
+                not self.cwd
+                or not isinstance(self.params.get("base_branch"), str)
+                or not self.params["base_branch"]
+            ):
+                raise ValueError("git.merge requires cwd and base_branch")
+            if (
+                self.prompt is not None
+                or self.argv is not None
+                or self.commands is not None
+                or self.op is not None
+            ):
+                raise ValueError("git.merge must not set prompt, argv, commands, or op")
         elif self.kind == "service.fetch":
-            if not self.argv:
-                raise ValueError("service.fetch requires a non-empty argv")
-            missing = [k for k in ("ecosystem", "verb") if not self.params.get(k)]
-            if missing:
-                raise ValueError(f"service.fetch requires params {missing}")
-            if self.prompt is not None or self.commands is not None or self.op is not None:
-                raise ValueError("service.fetch must not set prompt, commands, or op")
+            if any(
+                value is not None
+                for value in (self.argv, self.prompt, self.commands, self.op, self.cwd)
+            ):
+                raise ValueError("service.fetch must not set argv, prompt, commands, op, or cwd")
+            RegistryFetchParams.model_validate(self.params)
+        elif self.kind == "service.mcp":
+            if any(
+                value is not None
+                for value in (self.argv, self.prompt, self.commands, self.op, self.cwd)
+            ):
+                raise ValueError("service.mcp must not carry executable fields")
+            McpOpParams.model_validate(self.params)
         return self
+
+
+class McpOpParams(ProtocolModel):
+    model_config = ConfigDict(extra="forbid")
+    server: str = Field(pattern=HOST_TOOL_NAME_RE)
+    session: str = Field(pattern=r"^[a-zA-Z0-9_-]{1,128}$")
+    action: Literal["tools/list", "tools/call", "close"]
+    tool: str | None = None
+    arguments: dict[str, Any] = Field(default_factory=dict)
 
 
 class BatchCommandResult(ProtocolModel):
@@ -313,6 +407,19 @@ class BatchCommandResult(ProtocolModel):
     command: str
     exit_code: int
     output: str = ""
+
+
+class RegistryFetchParams(ProtocolModel):
+    """Read-only artifact request; every authority and credential comes from the host."""
+
+    registry: str = Field(min_length=1, max_length=256)
+    path: str = Field(min_length=1, max_length=8192)
+    operation: Literal["download", "git"] = "download"
+    ref: str = Field(
+        default="HEAD",
+        pattern=r"^(HEAD|[0-9a-f]{40}|[0-9a-f]{64}|refs/(heads|tags)/[A-Za-z0-9][A-Za-z0-9._/-]*)$",
+    )
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class JobResult(ProtocolModel):
@@ -407,9 +514,8 @@ class EventTypes:
     # and where it went (method, path, status) — never the header it sent.
     SERVICE_HTTP_START = "service.http_start"
     SERVICE_HTTP_END = "service.http_end"
-    # A service.fetch job in the service sandbox (#766): which ecosystem
-    # and verb, the argv, and how it ended — never the environment it ran
-    # with (the credential is in it).
+    # A service.fetch job: registry, operation, path and artifact metadata;
+    # no executable argv, artifact contents or authentication headers.
     SERVICE_FETCH_START = "service.fetch_start"
     SERVICE_FETCH_END = "service.fetch_end"
 

@@ -18,7 +18,6 @@ from sbxloop.sbx.provision import (
     service_policy_allows,
 )
 from sbxloop.sbx.registries import domains as registry_domains
-from sbxloop.sbx.registries import languages as registry_languages
 
 PHASES: tuple[tuple[str, str], ...] = (
     ("decompose", "baseline"),
@@ -74,11 +73,7 @@ def policy_view(config: Config) -> PolicyView:
     service: str | None = None
     credentialed = config.credentialed_registries_for()
     if credentialed:
-        service = ", ".join(
-            service_policy_allows(
-                (), credentialed, registry_languages(credentialed), config.policy.deny
-            )
-        )
+        service = ", ".join(service_policy_allows((), credentialed, (), config.policy.deny))
     return PolicyView(
         PHASES, baseline, registries, mirrors, well_known, allow, deny, github, service
     )

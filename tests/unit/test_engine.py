@@ -16,6 +16,7 @@ all the way to ``merged`` without a network.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import sys
 import threading
@@ -24,7 +25,7 @@ from typing import Any, ClassVar
 
 import pytest
 
-from sbxloop import hostgit, toolchains
+from sbxloop import hostgit
 from sbxloop.config import Config
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.model import (
@@ -32,6 +33,7 @@ from sbxloop.engine.model import (
     RESUMABLE_RUN_STATES,
     TERMINAL_RUN_STATES,
 )
+from sbxloop.engine.phases import PhaseRunner, toolchains
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import (
     BudgetExceededError,
@@ -58,6 +60,7 @@ from tests.fakes.fake_github import (
     human_comment,
     human_review,
 )
+from tests.fakes.rawdb import exec_raw
 
 # -- scripted responses ------------------------------------------------------
 
@@ -88,6 +91,11 @@ def task(
 # BUILD plans and executes in one session and reports in prose (expect=text),
 # so one scripted entry covers one whole task attempt.
 BUILD = {"text": "work complete, files changed"}
+# The re-author phase's answer when the check is right and the work is not.
+# A suspect verify asks it before spending the fresh-session replan, so a
+# script that drives a task to verify-suspect needs one of these; "keep" is
+# the verdict that leaves the loop on the path these tests predate.
+KEEP_VERIFY = {"json": {"verdict": "keep", "command": "", "reason": "the check is right"}}
 # A delivery needs something to deliver: the pipeline tests' builder writes
 # a file (the workspace is a plain directory, so delivery snapshots it).
 FILES_BUILD = {"text": "wrote hello.txt", "files": {"hello.txt": "hi\n"}}
@@ -386,9 +394,9 @@ class TestHappyPath:
         engine = harness.engine()
         result = engine.start("record phases")
         rows = engine.store.phase_attempts(result.run_id)
-        assert [row["phase"] for row in rows] == ["decompose", "build", "verify", "gate"]
+        assert [row.phase for row in rows] == ["decompose", "build", "verify", "gate"]
         # A project that declares no gate records the skip, not a pass.
-        assert rows[-1]["status"] == "skipped"
+        assert rows[-1].status == "skipped"
 
     def test_phase_attempts_carry_usage(self, harness: Harness) -> None:
         """Every agent phase row bills its session's tokens and turns; the
@@ -396,12 +404,12 @@ class TestHappyPath:
         harness.script([taskgraph(task("t1")), *HAPPY_TASK])
         engine = harness.engine()
         result = engine.start("bill phases")
-        rows = {row["phase"]: row for row in engine.store.phase_attempts(result.run_id)}
+        rows = {row.phase: row for row in engine.store.phase_attempts(result.run_id)}
         for phase in ("decompose", "build"):
-            assert rows[phase]["input_tokens"] is not None, phase
-            assert rows[phase]["turns"] == 1, phase
-        assert rows["verify"]["input_tokens"] is None
-        assert rows["verify"]["turns"] is None
+            assert rows[phase].input_tokens is not None, phase
+            assert rows[phase].turns == 1, phase
+        assert rows["verify"].input_tokens is None
+        assert rows["verify"].turns is None
 
 
 class TestReviseAndVerify:
@@ -432,7 +440,8 @@ class TestReviseAndVerify:
             [
                 taskgraph(task("t1", verify=["test -f done.txt"])),
                 BUILD,
-                BUILD,  # same failure twice -> verify-suspect replan, fresh session
+                BUILD,  # same failure twice -> verify-suspect
+                KEEP_VERIFY,  # the check stands -> replan, fresh session
                 {"text": "fresh approach, wrote done.txt", "files": {"done.txt": "ok\n"}},
             ]
         )
@@ -457,7 +466,9 @@ class TestReviseAndVerify:
         # A verify command no attempt can satisfy: revisions burn, one
         # fresh-session replan burns, then the task fails — the loop is
         # bounded.
-        harness.script([taskgraph(task("t1", verify=["false"])), *([BUILD] * 6)])
+        harness.script(
+            [taskgraph(task("t1", verify=["false"])), BUILD, BUILD, KEEP_VERIFY, *([BUILD] * 6)]
+        )
         result = harness.engine().start("verify never passes")
         assert result.state == "failed"
         assert "verify command that never changed its result" in (result.reason or "")
@@ -598,7 +609,7 @@ class TestResume:
         result = engine2.resume(run_id)
         assert result.state == "completed"
         assert result.tasks[0].state == "done"
-        phases = [row["phase"] for row in engine2.store.phase_attempts(run_id)]
+        phases = [row.phase for row in engine2.store.phase_attempts(run_id)]
         assert phases.count("decompose") == 1
         # the crashed attempt never committed a phase row - that is exactly the
         # "uncommitted phases re-run" resume semantic
@@ -755,8 +766,7 @@ class TestResume:
         run_id = self._crashed_run(harness)
         engine = harness.engine()
         original = engine.store.get_run(run_id).workspace
-        engine.store._conn.execute("UPDATE runs SET config_json = '{}' WHERE run_id = ?", (run_id,))
-        engine.store._conn.commit()
+        exec_raw(engine.store, "UPDATE runs SET config_json = '{}' WHERE run_id = ?", (run_id,))
 
         elsewhere = harness.tmp_path / "elsewhere"
         harness.script([*HAPPY_TASK])
@@ -1669,7 +1679,7 @@ class TestPipeline:
         assert run.branch == f"sbxloop/{result.run_id}"
         assert run.head_sha == "commit2"
         assert run.last_verdict == "approve"
-        phases = [(row["phase"], row["status"]) for row in engine.store.phase_attempts(run.run_id)]
+        phases = [(row.phase, row.status) for row in engine.store.phase_attempts(run.run_id)]
         assert phases == [
             ("decompose", "ok"),
             ("build", "ok"),
@@ -1707,8 +1717,8 @@ class TestPipeline:
         assert all("the greeting is specified as hi" in p for p in second)
         (retry,) = [p for p in second if "already refuted" in p]
         assert "hello.txt:1" in retry
-        rows = [r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "review"]
-        assert [r["attempt"] for r in rows] == [1, 2]
+        rows = [r for r in engine.store.phase_attempts(result.run_id) if r.phase == "review"]
+        assert [r.attempt for r in rows] == [1, 2]
 
     def test_fix_round_reconciliation_is_persisted_and_survives_reopen(
         self, harness: Harness
@@ -1726,10 +1736,10 @@ class TestPipeline:
         rows = [
             r
             for r in reopened.phase_attempts(result.run_id)
-            if r["phase"] == "build" and r["task_id"] == "fix-1"
+            if r.phase == "build" and r.task_id == "fix-1"
         ]
         assert rows
-        assert json.loads(rows[-1]["output_json"])["reconciled"] == [
+        assert json.loads(rows[-1].output_json or "{}")["reconciled"] == [
             {
                 "anchor": "hello.txt:1",
                 "status": "refuted",
@@ -1740,9 +1750,9 @@ class TestPipeline:
         t1 = [
             r
             for r in reopened.phase_attempts(result.run_id)
-            if r["phase"] == "build" and r["task_id"] == "t1"
+            if r.phase == "build" and r.task_id == "t1"
         ]
-        assert "reconciled" not in json.loads(t1[-1]["output_json"])
+        assert "reconciled" not in json.loads(t1[-1].output_json or "{}")
 
     def test_reconciliation_replies_and_resolves_before_the_next_review(
         self, harness: Harness
@@ -1804,8 +1814,8 @@ class TestPipeline:
         result = engine.start("write hello.txt")
         assert result.state == "merged"
 
-        rows = [r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "review"]
-        first = json.loads(rows[0]["output_json"])
+        rows = [r for r in engine.store.phase_attempts(result.run_id) if r.phase == "review"]
+        first = json.loads(rows[0].output_json or "{}")
         assert first["review"]["id"] is not None
         assert [p["anchor"] for p in first["posted"]] == ["hello.txt:1"]
 
@@ -1887,11 +1897,9 @@ class TestPipeline:
         (thread,) = [t for t in fake.threads if t.anchor == "hello.txt:1"]
         assert thread.is_resolved and thread.has_reply_from(fake.user_login)
         # The review record is the comment's url, so the merge gate is satisfied.
-        rows = [r for r in harness_rows(harness, result.run_id) if r["phase"] == "review"]
-        assert all(
-            json.loads(r["output_json"])["review"]["url"].startswith("https://") for r in rows
-        )
-        assert json.loads(rows[0]["output_json"])["review"]["event"] == "COMMENT"
+        rows = [r for r in harness_rows(harness, result.run_id) if r.phase == "review"]
+        assert all(json.loads(r.output_json)["review"]["url"].startswith("https://") for r in rows)
+        assert json.loads(rows[0].output_json or "{}")["review"]["event"] == "COMMENT"
         assert fake.merges == [(7, "squash", "commit2")]
 
     def test_self_review_degrades_a_refused_anchor_per_finding(self, harness: Harness) -> None:
@@ -1905,8 +1913,8 @@ class TestPipeline:
             "Findings without a thread of their own:\n- `hello.txt:1` [major]"
             in (fake.issue_comments[0])
         )
-        rows = [r for r in harness_rows(harness, result.run_id) if r["phase"] == "review"]
-        posted = json.loads(rows[0]["output_json"])["posted"]
+        rows = [r for r in harness_rows(harness, result.run_id) if r.phase == "review"]
+        posted = json.loads(rows[0].output_json or "{}")["posted"]
         assert posted[0]["anchor"] == "hello.txt:1" and posted[0]["comment_id"] is None
 
     def test_a_distinct_reviewer_identity_still_uses_the_review_feature(
@@ -1994,6 +2002,8 @@ class TestPipeline:
     }
 
     def _followup_script(self) -> list[dict[str, Any]]:
+        from tests.fakes.followups import with_lookups
+
         minor = {
             "path": "hello.txt",
             "line": 2,
@@ -2006,8 +2016,12 @@ class TestPipeline:
             "text": "Fixed.\n\naddressed: hello.txt:1 — hello\ndeferred: hello.txt:2 — docs later"
         }
         round_two = review("approve", "fixed; the nit is deferred")
-        round_two["json"]["followups"] = [self.FOLLOWUP_A_AGAIN, self.FOLLOWUP_B]
-        return [taskgraph(task("t1")), FILES_BUILD, round_one, fix, round_two]
+        round_two["json"]["followups"] = [
+            self.FOLLOWUP_A_AGAIN,
+            self.FOLLOWUP_B,
+            {"title": "the greeting is not documented", "body": "The fix round deferred it."},
+        ]
+        return with_lookups([taskgraph(task("t1")), FILES_BUILD, round_one, fix, round_two])
 
     def test_a_landed_run_files_deduped_followups_never_queued(self, harness: Harness) -> None:
         """#517: the reviewer's out-of-scope notes and the fix round's
@@ -2028,7 +2042,7 @@ class TestPipeline:
             assert "sbxloop:run" not in labels
             assert "Out of scope for [PR #7]" in body and f"run `{result.run_id}`" in body
             assert "<!-- sbxloop-followup run=" in body
-        assert "the fix round deferred" in fake.issues_created[2][1]
+        assert "The fix round deferred" in fake.issues_created[2][1]
         assert fake.labels_created == ["sbxloop:follow-up"]
         # The PR gets one pointer comment listing them.
         pointer = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
@@ -2038,8 +2052,8 @@ class TestPipeline:
         # Filed after the merge, recorded per issue.
         merged_at = harness.event_types().index(HostEventTypes.RUN_MERGED)
         assert harness.event_types().index(HostEventTypes.RUN_FOLLOWUPS) > merged_at
-        rows = [r for r in harness_rows(harness, result.run_id) if r["phase"] == "followup"]
-        assert [r["status"] for r in rows] == ["filed", "filed", "filed", "listed"]
+        rows = [r for r in harness_rows(harness, result.run_id) if r.phase == "followup"]
+        assert [r.status for r in rows] == ["filed", "filed", "filed", "listed"]
 
     def test_a_failed_run_files_nothing(self, harness: Harness) -> None:
         fake = FakeGithub()
@@ -2681,15 +2695,18 @@ class TestPipeline:
         fake = FakeGithub()
         fake.pr["mergeable"] = False
         fake.pr["mergeable_state"] = "dirty"
-        merges: list[tuple[Path, str]] = []
+        merges: list[tuple[str | None, str]] = []
 
         def merge_from_base(
-            repo_path: Path, base_branch: str, *, remote: str = "origin"
+            self: PhaseRunner, base_branch: str, *, base_sha: str, bundle: Path | None = None
         ) -> hostgit.MergeResult:
-            merges.append((repo_path, base_branch))
+            merges.append((self.workdir, base_branch))
             return hostgit.MergeResult(False, ("docs/x.md",), "merged origin/main: 1 conflict")
 
-        harness.monkeypatch.setattr(hostgit, "merge_from_base", merge_from_base)
+        harness.monkeypatch.setattr(PhaseRunner, "merge_from_base", merge_from_base)
+        harness.monkeypatch.setattr(
+            hostgit, "base_bundle", lambda *a, **kw: contextlib.nullcontext(("a" * 40, None))
+        )
         harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
         engine = harness.pipeline(fake)
 
@@ -2705,7 +2722,7 @@ class TestPipeline:
         assert result.mounted and result.workspace is not None
         # The run's own clone, against the repository's default branch
         # (FakeGithub's repo_get says main; no [github] deliver_base is set).
-        assert merges == [(result.workspace, "main")]
+        assert len(merges) == 1 and merges[0][1] == "main"
         (fix_round,) = self._events(harness, HostEventTypes.FIX_ROUND)
         assert fix_round.data["kind"] == "conflict"
         assert fix_round.data["task_id"] == "fix-1"
@@ -2726,11 +2743,14 @@ class TestPipeline:
         fake.pr["mergeable_state"] = "dirty"
 
         def merge_from_base(
-            repo_path: Path, base_branch: str, *, remote: str = "origin"
+            self: PhaseRunner, base_branch: str, *, base_sha: str, bundle: Path | None = None
         ) -> hostgit.MergeResult:
             raise ProvisionError("git fetch origin main failed: no route to host")
 
-        harness.monkeypatch.setattr(hostgit, "merge_from_base", merge_from_base)
+        harness.monkeypatch.setattr(PhaseRunner, "merge_from_base", merge_from_base)
+        harness.monkeypatch.setattr(
+            hostgit, "base_bundle", lambda *a, **kw: contextlib.nullcontext(("a" * 40, None))
+        )
         harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK, BUILD, REVIEW_OK])
         engine = harness.pipeline(fake)
 
@@ -2947,6 +2967,19 @@ class TestPipeline:
         (merged,) = self._events(harness, HostEventTypes.RUN_MERGED)
         assert merged.data["sha"] == "human123" and merged.data["by_human"] is True
 
+    def test_empty_delivery_blocks_without_repeating_the_agent(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        harness.script([taskgraph(task("t1")), BUILD])
+        engine = harness.pipeline(fake)
+        result = engine.start("check whether the requested change is still needed")
+        assert result.state == "blocked"
+        assert result.reason and "nothing to deliver" in result.reason
+        assert "automatic retries" in result.reason
+        assert engine.store.get_run(result.run_id).state == "blocked"
+        assert result.pr_number is None
+        assert harness.consumed() == 2
+        assert not any(method != "GET" for method, _, _ in fake.raw_calls)
+
     def test_failed_graph_never_delivers(self, harness: Harness) -> None:
         fake = FakeGithub()
         harness.script([taskgraph(task("t1", verify=["false"])), BUILD])
@@ -3003,8 +3036,8 @@ class TestPipeline:
         assert types.index("chat.reply") < types.index(HostEventTypes.RUN_END)
         reply = next(e for e in harness.events if e.type == "chat.reply")
         assert reply.data["reply"] == "still waiting on CI"
-        steer = next(r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "steer")
-        assert steer["task_id"] is None
+        steer = next(r for r in engine.store.phase_attempts(result.run_id) if r.phase == "steer")
+        assert steer.task_id is None
 
     def test_steer_task_on_a_fix_task_restarts_its_build(self, harness: Harness) -> None:
         fake = FakeGithub()
@@ -3041,7 +3074,7 @@ class TestPipeline:
         builds = [
             r
             for r in engine.store.phase_attempts(result.run_id)
-            if r["phase"] == "build" and r["task_id"] == "fix-1"
+            if r.phase == "build" and r.task_id == "fix-1"
         ]
         assert len(builds) == 2
         prompts = [
@@ -3149,7 +3182,7 @@ class TestPipeline:
         result = harness.pipeline(fake).resume(run_id)
         assert result.state == "merged"
         assert harness.consumed() == 0
-        reviews = [r for r in engine.store.phase_attempts(run_id) if r["phase"] == "review"]
+        reviews = [r for r in engine.store.phase_attempts(run_id) if r.phase == "review"]
         assert len(reviews) == 1
 
     def test_resume_at_landing_lands(self, harness: Harness) -> None:
@@ -3208,10 +3241,10 @@ class TestInteractiveChat:
         assert reply.data["message_id"] == message_id
         assert "chat.action" not in harness.event_types()
         attempts = engine.store.phase_attempts(result.run_id)
-        steer = [a for a in attempts if a["phase"] == "steer"]
+        steer = [a for a in attempts if a.phase == "steer"]
         assert len(steer) == 1
-        assert steer[0]["status"] == "continue"
-        assert steer[0]["task_id"] == "t1"
+        assert steer[0].status == "continue"
+        assert steer[0].task_id == "t1"
 
     def test_steer_run_persists_standing_guidance(self, harness: Harness) -> None:
         harness.script([taskgraph(task("t1")), self.STEER_RUN, *HAPPY_TASK])
@@ -3250,9 +3283,9 @@ class TestInteractiveChat:
         assert action.data["task_id"] == "t1"
         assert "restarting task t1" in action.data["message"]
         attempts = engine.store.phase_attempts(result.run_id)
-        steer = next(a for a in attempts if a["phase"] == "steer")
-        assert steer["status"] == "steer_task"
-        output = json.loads(steer["output_json"])
+        steer = next(a for a in attempts if a.phase == "steer")
+        assert steer.status == "steer_task"
+        output = json.loads(steer.output_json)
         assert output["applied"] == "steer_task"
         assert output["message"] == "do it in Go"
 
@@ -3266,8 +3299,8 @@ class TestInteractiveChat:
         reply = next(e for e in harness.events if e.type == "chat.reply")
         assert "error" in reply.data
         attempts = engine.store.phase_attempts(result.run_id)
-        steer = next(a for a in attempts if a["phase"] == "steer")
-        assert steer["status"] == "error"
+        steer = next(a for a in attempts if a.phase == "steer")
+        assert steer.status == "error"
 
     def test_invalid_steer_verdict_is_retried(self, harness: Harness) -> None:
         # steer_task without guidance fails SteerVerdict validation; the
@@ -3311,8 +3344,8 @@ class TestInteractiveChat:
         assert result.state == "completed"
         types = harness.event_types()
         assert types.index("chat.reply") < types.index(HostEventTypes.RUN_END)
-        steer = next(r for r in engine.store.phase_attempts(result.run_id) if r["phase"] == "steer")
-        assert steer["task_id"] is None
+        steer = next(r for r in engine.store.phase_attempts(result.run_id) if r.phase == "steer")
+        assert steer.task_id is None
 
     def test_resume_replays_persisted_guidance_into_prompts(self, harness: Harness) -> None:
         from sbxloop.engine.phases import PhaseRunner
@@ -3362,6 +3395,97 @@ class TestReviewPostFallback:
     nits anchored to lines outside the diff, GitHub 422'd the APPROVE and its
     COMMENT fallback alike, and nothing reached the PR. The findings matter
     more than their anchors."""
+
+    @pytest.mark.parametrize("self_review", [False, True])
+    @pytest.mark.parametrize("path,line", [("unchanged.txt", 1), ("hello.txt", 99)])
+    def test_outside_diff_findings_never_attempt_an_inline_post(
+        self, harness: Harness, self_review: bool, path: str, line: int
+    ) -> None:
+        fake = FakeGithub(self_review=self_review)
+        anchor = f"{path}:{line}"
+        fake.refuse_anchors = {anchor}
+        valid = {"path": "hello.txt", "line": 1, "body": "valid nit", "severity": "nit"}
+        outside = {"path": path, "line": line, "body": "outside nit", "severity": "nit"}
+        harness.script(
+            [taskgraph(task("t1")), FILES_BUILD, review("approve", "reviewed", valid, outside)]
+        )
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
+
+        assert result.state == "merged"
+        fake.assert_no_failed_jobs()
+        assert [t.anchor for t in fake.threads] == ["hello.txt:1"]
+        bodies = fake.issue_comments if self_review else [b for _, b, _ in fake.reviews]
+        assert f"`{anchor}` [nit] outside nit" in bodies[0]
+        assert "valid nit" not in bodies[0]
+        records = engine.store.posted_findings(result.run_id)
+        assert [(r.anchor, r.body_only) for r in records] == [
+            ("hello.txt:1", False),
+            (anchor, True),
+        ]
+
+    @pytest.mark.parametrize("self_review", [False, True])
+    @pytest.mark.parametrize(
+        "unavailable", ["missing_patch", "malformed_list", "moved_head", "read_error"]
+    )
+    def test_unverified_locations_preserve_the_finding_in_the_body(
+        self, harness: Harness, self_review: bool, unavailable: str
+    ) -> None:
+        fake = FakeGithub(self_review=self_review)
+        fake.refuse_anchors = {"hello.txt:1"}
+        if unavailable == "missing_patch":
+            fake.files_payload = [{"filename": "hello.txt"}]
+        elif unavailable == "malformed_list":
+            fake.files_payload = {}
+        elif unavailable == "moved_head":
+            fake.files_after_read = {"head": {"sha": "moved"}}
+        else:
+            fake.fail_once["pr_files"] = GithubOpsError("unavailable", http_status=503)
+        nit = {"path": "hello.txt", "line": 1, "body": "keep this nit", "severity": "nit"}
+        harness.script([taskgraph(task("t1")), FILES_BUILD, review("approve", "reviewed", nit)])
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
+        bodies = fake.issue_comments if self_review else [b for _, b, _ in fake.reviews]
+        assert "`hello.txt:1` [nit] keep this nit" in bodies[0]
+        assert fake.threads == []
+        assert not any(status == 422 for _, _, _, status in fake.failed_jobs)
+        (record,) = engine.store.posted_findings(result.run_id)
+        assert record.anchor == "hello.txt:1" and record.body_only
+
+    def test_no_findings_does_not_read_diff_locations(self, harness: Harness) -> None:
+        fake = FakeGithub()
+        fake.fail_always["pr_files"] = AssertionError("no inline candidates")
+        harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
+        assert harness.pipeline(fake).start("write hello.txt").state == "merged"
+
+    @pytest.mark.parametrize("self_review", [False, True])
+    def test_outside_diff_blocker_still_drives_one_fix_and_is_reconciled(
+        self, harness: Harness, self_review: bool
+    ) -> None:
+        fake = FakeGithub(self_review=self_review)
+        fake.refuse_anchors = {"unchanged.txt:42"}
+        blocker = {**FINDING, "path": "unchanged.txt", "line": 42}
+        fix = {"text": "Fixed.\n\naddressed: unchanged.txt:42 — corrected the greeting"}
+        harness.script(
+            [
+                taskgraph(task("t1")),
+                FILES_BUILD,
+                review("request_changes", "fix it", blocker),
+                fix,
+                REVIEW_OK,
+            ]
+        )
+        engine = harness.pipeline(fake)
+        result = engine.start("write hello.txt")
+        assert result.state == "merged"
+        assert harness.consumed() == 5
+        fake.assert_no_failed_jobs()
+        assert fake.threads == []
+        (record,) = engine.store.posted_findings(result.run_id)
+        assert record.anchor == "unchanged.txt:42" and record.body_only
+        assert any(
+            "unchanged.txt:42" in body and "addressed" in body for body in fake.issue_comments
+        )
 
     def test_a_review_refused_for_its_anchors_is_reposted_in_the_body(
         self, harness: Harness

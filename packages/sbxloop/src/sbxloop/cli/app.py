@@ -26,6 +26,7 @@ from rich.table import Table
 from rich.tree import Tree
 
 import sbxloop
+from sbxloop import telemetry
 from sbxloop.backends import backend_for
 from sbxloop.cli.doctor import run_doctor
 from sbxloop.cli.tui import ChatInput, Dashboard, format_event, plain_printer, render_event
@@ -56,7 +57,7 @@ from sbxloop.engine.model import (
 )
 from sbxloop.engine.sinks import published_line
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import SbxloopError
+from sbxloop.errors import ConfigError, SbxloopError
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
 from sbxloop.ghids import normalize_item_id, try_parse_gh_id
@@ -127,11 +128,33 @@ def _main_callback(
     # Every command sees the home's secrets.env (tokens + SBXLOOP_* settings);
     # real environment variables always take precedence.
     load_secrets_env()
+    # Repair commands (init/config/doctor) must remain usable when config is
+    # invalid. Each command still owns its normal config error handling.
+    try:
+        telemetry_config = load_config().telemetry
+    except ConfigError:
+        pass
+    else:
+        telemetry.configure_telemetry(telemetry_config)
     # Temporary files land in the home too, once there is one (`sbxloop
     # init`); before that the platform default stands.
     tmp = resolve_home_root() / "tmp"
     if tmp.is_dir():
         tempfile.tempdir = str(tmp)
+
+
+def _require_supported_host() -> None:
+    """Refuse, by name, a host that cannot boot a sandbox (#596) — before
+    any state is written or a microVM is attempted. Read-only commands
+    are not gated: `sbxloop doctor` on the same host says the same thing
+    as a row."""
+    from sbxloop.hostos import host_support
+
+    support = host_support()
+    if support.supported:
+        return
+    console.print(f"[bold red]{support.refusal}[/]")
+    raise typer.Exit(2)
 
 
 def _config_with_overrides(**overrides: Any) -> Config:
@@ -693,6 +716,7 @@ def run(
     With a GitHub repository configured the run carries its work all the
     way: a draft pull request, its own review, fix rounds, CI, and the merge.
     """
+    _require_supported_host()
     config = _config_with_overrides(
         model=model,
         keep_sandboxes=keep_sandboxes,
@@ -852,6 +876,7 @@ def resume(
     ] = 0,
 ) -> None:
     """Resume an unfinished run (fresh sandboxes, persisted state and config)."""
+    _require_supported_host()
     config = _run_config()
     engine = LoopEngine(config)
     try:
@@ -1081,6 +1106,7 @@ def shell(
     Attaching to an in-flight run is meant as observation: the worker owns
     its env files and workspace, so avoid mutating them mid-phase.
     """
+    _require_supported_host()
     if role not in ("agent", "github", "service"):
         console.print(f"[bold red]invalid --role {role!r}:[/] must be agent, github or service")
         raise typer.Exit(2)
@@ -1903,6 +1929,33 @@ def _migrate_home(
     say("next: `sbxloop doctor`")
 
 
+@app.command("update")
+def update_command(
+    check: Annotated[
+        bool, typer.Option("--check", help="Compare versions without installing anything.")
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Check versions and show the installation command.")
+    ] = False,
+) -> None:
+    """Check PyPI and update this home's sbxloop and worker to the latest release."""
+    from sbxloop.update import UpdateError, update_home
+
+    if check and dry_run:
+        console.print("choose either --check or --dry-run", markup=False)
+        raise typer.Exit(2)
+    try:
+        update_home(
+            SbxloopHome(resolve_home_root()),
+            check=check,
+            dry_run=dry_run,
+            say=lambda line: console.print(line, markup=False, soft_wrap=True),
+        )
+    except UpdateError as exc:
+        console.print(f"update failed: {exc}", markup=False, soft_wrap=True)
+        raise typer.Exit(1) from exc
+
+
 backup_app = typer.Typer(
     help="Snapshots of the home's config, secrets, units and state.db.",
     invoke_without_command=True,
@@ -2075,6 +2128,7 @@ def daemon(
     Subcommands inspect and steer
     individual work items; `sbxloop daemon ctl CMD` talks to the running
     daemon instead."""
+    _require_supported_host()
     if ctx.invoked_subcommand is not None:
         return
     from sbxloop.daemon.agentbox import DaemonAgent
@@ -2168,15 +2222,6 @@ def daemon(
     # backend and no `[github]` runs on those alone.
     # (`--once` skips the concierge but still runs what one already queued.)
     chat_intake = config.chat_backend is not None and bool(config.concierge.enabled)
-    if not config.github.enabled and not chat_intake and not config.schedules:
-        log.error(
-            "daemon.no_repository",
-            hint="set --repo owner/name (or [github] repo / [[github.repos]]): the "
-            "daemon's work is the labeled issues of the configured repositories — or "
-            "configure a chat backend with the concierge on, and workloads asked for "
-            "in chat are its work — or declare [[schedules]], and their ticks are",
-        )
-        raise typer.Exit(2)
     if config.github.enabled and not config.github.enabled_repos():
         log.error(
             "daemon.no_enabled_repository",
@@ -2208,6 +2253,23 @@ def daemon(
     archived = DaemonStore.archive_legacy(db_path)
     store = _store(config)
     dstore = DaemonStore(db_path)
+    # Schedules live in the store (#818): a daemon with stored schedules
+    # and nothing else is a valid daemon, as one with `[[schedules]]` was.
+    if (
+        not config.github.enabled
+        and not chat_intake
+        and not config.schedules
+        and not dstore.schedules()
+    ):
+        log.error(
+            "daemon.no_repository",
+            hint="set --repo owner/name (or [github] repo / [[github.repos]]): the "
+            "daemon's work is the labeled issues of the configured repositories — or "
+            "configure a chat backend with the concierge on, and workloads asked for "
+            "in chat are its work — or create a schedule (`sbxloop daemon ctl schedules "
+            "add …`), and its ticks are",
+        )
+        raise typer.Exit(2)
     # Rows a single-repo daemon wrote carry no repository. Name it now, from
     # the config, rather than letting whichever repository is polled first
     # adopt them. With several repos configured there is no sole owner to
@@ -2268,7 +2330,6 @@ def daemon(
     source: WorkSource
     if config.github.enabled:
         github = DaemonGithub(config, sbx, bus, worker_python=config.worker_python)
-        github.remove_stale()
         labels = GitHubLabels(
             config.daemon.trigger_label,
             config.daemon.in_progress_label,
@@ -2295,21 +2356,13 @@ def daemon(
             suspend_after=config.daemon.repo_suspend_after,
             persist=persist_repo_health,
         )
-        if chat_intake or config.schedules:
-            # Chat-started (#760) and scheduled (#761) workloads ride the
-            # same queue; the composite routes each item back to where it
-            # came from.
-            source = CompositeSource(
-                source,
-                ChatSource() if chat_intake else None,
-                ScheduleSource() if config.schedules else None,
-            )
+        # Chat-started (#760) and scheduled (#761) workloads ride the same
+        # queue; the composite routes each item back to where it came
+        # from. The schedule source always rides: a schedule may be
+        # created from chat while the daemon runs (#818).
+        source = CompositeSource(source, ChatSource() if chat_intake else None, ScheduleSource())
     else:
-        source = CompositeSource(
-            None,
-            ChatSource() if chat_intake else None,
-            ScheduleSource() if config.schedules else None,
-        )
+        source = CompositeSource(None, ChatSource() if chat_intake else None, ScheduleSource())
 
     # One line an operator can read back from the journal to know exactly
     # what this daemon is: its home, what it polls, and every guardrail.
@@ -2375,7 +2428,7 @@ def daemon(
         raise typer.Exit(code)
 
     loop = DaemonLoop(config, store=store, dstore=dstore, source=source, sbx=sbx, github=github)
-    polled = source.github if isinstance(source, CompositeSource) else source
+    polled = source.github
     if isinstance(polled, MultiRepoIssueSource):
         polled.notify = loop.source_notice
     # One probe, shared: the startup drift check below warms its PyPI memo, so
@@ -2832,6 +2885,7 @@ def bake(
     reinstalling it on every provision (and fall back to the normal
     install if the template goes stale).
     """
+    _require_supported_host()
     config = load_config()
     cli = SbxCLI(app_name=config.app_name or None)
     try:
@@ -2975,7 +3029,13 @@ def doctor(
 
 
 def main() -> None:
-    app()
+    try:
+        app()
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        raise
+    finally:
+        telemetry.shutdown_telemetry()
 
 
 if __name__ == "__main__":

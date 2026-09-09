@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -95,6 +96,62 @@ class TestRunnerInProcess:
         result, events = run_job(tmp_path, job)
         assert result.status == "timeout"  # type: ignore[attr-defined]
         assert EventTypes.WORKER_ERROR in [e.type for e in events]
+
+    def test_batch_command_text_is_not_on_its_own_command_line(self, tmp_path: Path) -> None:
+        """Field failure rkbgkf32a: a check started a dev server on a port and
+        cleaned up with `pkill -f <port>`, which matched the `sh -c` shell
+        carrying the command's own text. The check SIGTERMed itself before
+        reaching its assertion — exit -15, no output, identically on every
+        attempt, with the work correct and every other gate green. Nothing a
+        command says about itself may reach the process table."""
+        token = "sbxloop-selfmatch-token"
+        job = JobRequest(
+            job_id="j2",
+            run_id="r1",
+            kind="shell.batch",
+            commands=[f"ps -o args= -p $$ | grep -c {token} || true"],
+            timeout_s=20.0,
+        )
+        result, _ = run_job(tmp_path, job)
+        (only,) = result.output_json  # type: ignore[attr-defined]
+        assert only["output"].strip() == "0"
+
+    def test_batch_command_output_survives_a_leaked_background_process(
+        self, tmp_path: Path
+    ) -> None:
+        """A backgrounded process that inherits the captured pipe holds it
+        open after the command returns; reading it then blocks until the job
+        times out. Output goes to a file, so the command's own result is
+        complete the moment it exits."""
+        job = JobRequest(
+            job_id="j2",
+            run_id="r1",
+            kind="shell.batch",
+            commands=["sleep 30 & echo done"],
+            timeout_s=20.0,
+        )
+        result, _ = run_job(tmp_path, job)
+        (only,) = result.output_json  # type: ignore[attr-defined]
+        assert only["output"] == "done\n"
+        assert only["exit_code"] == 0
+
+    def test_batch_reaps_what_a_command_leaves_running(self, tmp_path: Path) -> None:
+        """A leaked server holds its port against the next attempt, so the
+        command's process group does not outlive the command."""
+        marker = tmp_path / "still-running"
+        command = f"sh -c 'sleep 30; touch {marker}' & echo started"
+        job = JobRequest(
+            job_id="j2",
+            run_id="r1",
+            kind="shell.batch",
+            commands=[command],
+            timeout_s=20.0,
+        )
+        result, _ = run_job(tmp_path, job)
+        assert result.exit_code == 0  # type: ignore[attr-defined]
+        # The child is gone with the command, not still counting down.
+        assert subprocess.run(["pgrep", "-f", str(marker)], check=False).returncode != 0
+        assert not marker.exists()
 
     def test_shell_timeout(self, tmp_path: Path) -> None:
         job = JobRequest(
@@ -429,55 +486,19 @@ class TestPersistentEnvFile:
 
 
 class TestServiceFetch:
-    """`service.fetch` (#766): the host-composed argv runs in the given
-    directory; the exit code and output come back; the values of the named
-    secret variables never leave in the output."""
-
-    def fetch_job(self, argv: list[str], cwd: Path, **params: object) -> JobRequest:
-        return JobRequest(
+    def test_missing_registry_is_an_error_result(self, tmp_path: Path) -> None:
+        job = JobRequest(
             job_id="f1",
             run_id="r1",
             kind="service.fetch",
-            argv=argv,
-            cwd=str(cwd),
-            params={"ecosystem": "npm", "verb": "fetch", **params},
-        )
-
-    def test_runs_the_argv_in_the_workdir_and_reports_the_exit(self, tmp_path: Path) -> None:
-        job = self.fetch_job(["sh", "-c", "pwd; echo fetched >&2; exit 3"], tmp_path)
-        result, events = run_job(tmp_path, job)
-        assert result.status == "ok"  # type: ignore[attr-defined]
-        assert result.exit_code == 3  # type: ignore[attr-defined]
-        assert str(tmp_path.resolve()) in result.output_text  # type: ignore[attr-defined]
-        assert "fetched" in result.output_text  # type: ignore[attr-defined]
-        start = next(e for e in events if e.type == EventTypes.SERVICE_FETCH_START)
-        end = next(e for e in events if e.type == EventTypes.SERVICE_FETCH_END)
-        assert (start.data["ecosystem"], start.data["verb"]) == ("npm", "fetch")
-        assert end.data["exit_code"] == 3 and end.data["argv"] == job.argv
-
-    def test_scrubs_the_named_secrets_from_the_output(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("REG_TOKEN", "registry-token-4f2c")
-        monkeypatch.setenv("SHORT", "abc")  # too short to blank safely
-        job = self.fetch_job(
-            ["sh", "-c", 'echo "GET https://u:$REG_TOKEN@reg.example.com/ $SHORT"'],
-            tmp_path,
-            scrub_env=["REG_TOKEN", "SHORT", "UNSET_NAME"],
+            params={"registry": "ungranted", "path": "/package"},
         )
         result, _ = run_job(tmp_path, job)
-        assert result.exit_code == 0  # type: ignore[attr-defined]
-        assert "registry-token-4f2c" not in result.output_text  # type: ignore[attr-defined]
-        assert "u:***@reg.example.com" in result.output_text  # type: ignore[attr-defined]
-        assert "abc" in result.output_text  # type: ignore[attr-defined]
-
-    def test_a_missing_tool_is_an_error_result_not_a_crash(self, tmp_path: Path) -> None:
-        result, _ = run_job(tmp_path, self.fetch_job(["no-such-package-manager-xyz"], tmp_path))
         assert result.status == "error"  # type: ignore[attr-defined]
-        assert result.error.type == "FileNotFoundError"  # type: ignore[attr-defined]
+        assert result.error.type == "RegistryFetchError"  # type: ignore[attr-defined]
 
-    def test_the_kind_needs_argv_and_the_ecosystem(self) -> None:
-        with pytest.raises(ValueError, match="argv"):
-            JobRequest(job_id="f", run_id="r", kind="service.fetch", params={"ecosystem": "npm"})
-        with pytest.raises(ValueError, match="ecosystem"):
-            JobRequest(job_id="f", run_id="r", kind="service.fetch", argv=["npm", "ci"])
+    def test_requires_a_catalogue_entry_and_path(self) -> None:
+        with pytest.raises(ValueError, match="registry"):
+            JobRequest(job_id="f", run_id="r", kind="service.fetch", params={"path": "/a"})
+        with pytest.raises(ValueError, match="path"):
+            JobRequest(job_id="f", run_id="r", kind="service.fetch", params={"registry": "r"})

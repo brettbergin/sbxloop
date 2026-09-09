@@ -96,7 +96,7 @@ $repo_conventions
 - Your verify commands are the task's whole mechanical exam, and the
   builder **cannot edit** them — a wrong check burns the task's entire
   revision budget against something no revision can fix. They run under
-  POSIX `sh -c` (not bash) from the **workspace root**: if the work lands
+  POSIX `sh` (not bash) from the **workspace root**: if the work lands
   in a subdirectory, every command must name it explicitly
   (`cd app && <test runner>`); a bare `test -f <manifest>` fails when the
   file lives one level down, and a test runner aimed at a directory
@@ -130,7 +130,13 @@ $repo_conventions
   against anything but a local address: a verify command judges the
   workspace, not the network — an API rate limit or a flake must not be
   able to fail work that is done. Check the local files or run the local
-  tests instead.
+  tests instead. Never `pkill` or `killall`: they select processes by
+  pattern or by name, so they reach far more than whatever this command
+  started — including the command's own shell. A check that starts a
+  server to probe it captures that background process's pid into a shell
+  variable and signals only that pid; or it leaves the cleanup out
+  entirely, since each verify command runs in a process group of its own
+  and anything it leaves running is killed for it.
 - If the suite needs **external services the sandbox does not have** — a
   database, a broker, a browser, anything a compose file, a test-container
   dependency or a `services:` block in the CI workflow provides — scope the

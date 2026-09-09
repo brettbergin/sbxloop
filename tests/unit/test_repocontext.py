@@ -110,7 +110,9 @@ class PromptAgent:
         self.responses = list(responses)
         self.prompts: list[tuple[str, str]] = []  # (agent persona, prompt)
 
-    def submit(self, job: JobRequest, *, agent: str | None = None) -> JobResult:
+    def submit(
+        self, job: JobRequest, *, agent: str | None = None, tool_handler: Any = None
+    ) -> JobResult:
         assert job.prompt is not None
         self.prompts.append((agent or "", job.prompt))
         answer = self.responses.pop(0)

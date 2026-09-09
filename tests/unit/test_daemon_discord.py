@@ -741,6 +741,74 @@ class TestBridge:
         finally:
             bridge.close()
 
+    @pytest.mark.parametrize("outcome", ["reply", "error", "exception"])
+    @pytest.mark.parametrize("send_yields", [False, True])
+    def test_completed_concierge_waits_for_its_tool_notes(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        outcome: str,
+        send_yields: bool,
+    ) -> None:
+        from sbxloop.daemon.concierge import ConciergeReply
+
+        result = "two runs today"
+        reply: Any = ConciergeReply(result)
+        if outcome == "error":
+            reply = ConciergeReply("", ok=False, error="turn failed")
+            result = "⚠ concierge: turn failed"
+        elif outcome == "exception":
+            reply = RuntimeError("turn failed")
+            result = "⚠ concierge: turn failed"
+        concierge = FakeConcierge([reply])
+        concierge.tool_calls = [
+            ("sbx_control", {"command": "status"}, True),
+            ("sbx_control", {"command": "queue"}, True),
+        ]
+        submit_turn = concierge.submit_turn
+
+        def completed_turn(*args: Any, **kwargs: Any) -> Any:
+            future = submit_turn(*args, **kwargs)
+            # Finish on the worker thread before the bridge can wrap the
+            # future. Tool-note callbacks are queued but have not run yet.
+            future.exception(timeout=5)
+            return future
+
+        monkeypatch.setattr(concierge, "submit_turn", completed_turn)
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        bridge.client = client
+        control = client.channels[42]
+        send = control.send
+
+        async def yielding_send(text: str | None = None, **kwargs: Any) -> FakeMessage:
+            if send_yields:
+                # Model a transport that yields while its first note is
+                # being posted, so the next tool callback can catch up.
+                await asyncio.sleep(0)
+            return await send(text, **kwargs)
+
+        monkeypatch.setattr(control, "send", yielding_send)
+        msg = FakeMessage("<@777> status?", control, mentions=[BOT_USER])
+
+        async def exercise() -> None:
+            bridge._aloop = asyncio.get_running_loop()
+            inbound = bridge._inbound(msg)
+            assert inbound is not None
+            await bridge._concierge_turn(inbound, "status?")
+            # A completion reaction must imply the audit trail has landed:
+            # one note, fully updated, followed by the reply or warning.
+            assert len(control.sent) == 2
+            assert control.sent[0].startswith("🛠 concierge: sbx_control(status)")
+            assert control.sent[1] == result
+            note = control.messages[min(control.messages)]
+            assert note.content == "🛠 concierge: sbx_control(status) · sbx_control(queue)"
+            assert msg.reactions == ["⏳", "✅" if outcome == "reply" else "⚠"]
+
+        try:
+            asyncio.run(exercise())
+        finally:
+            bridge.dstore.close()
+
     def test_reply_to_bot_message_goes_to_the_concierge(self, tmp_path: Path) -> None:
         concierge = FakeConcierge()
         bridge, client, _ = make_bridge(tmp_path, concierge=concierge)

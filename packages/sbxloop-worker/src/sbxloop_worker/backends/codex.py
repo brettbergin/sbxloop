@@ -95,6 +95,12 @@ class CodexBackend:
         ensure_runtime()
 
     def run_session(self, job: JobRequest, emit: EmitFn) -> BackendResult:
+        if job.mcp_servers:
+            raise RuntimeError(
+                "Codex does not support native MCP servers; remove native [[mcp]] entries "
+                "or select a backend that supports them. Credentialed HTTP MCP must be "
+                "mediated into host tools before dispatch."
+            )
         self.ensure_available()
         deadline = time.monotonic() + job.timeout_s
         state = _SessionState(job, emit, deadline)

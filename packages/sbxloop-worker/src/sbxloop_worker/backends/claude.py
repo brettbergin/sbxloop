@@ -48,6 +48,7 @@ from sbxloop_worker.backends.copilot import (
     excerpt_output,
 )
 from sbxloop_worker.hosttools import HostToolTimeout, request_tool, safe_call_id
+from sbxloop_worker.mcp import server_configs
 from sbxloop_worker.protocol import (
     EventTypes,
     HostToolCall,
@@ -81,6 +82,11 @@ ANTHROPIC_TOKEN_ENV = "ANTHROPIC_API_KEY"  # nosec B105 - env var name
 ANTHROPIC_TOKEN_PREFIX = "sk-ant-"  # nosec B105 - shape marker, not a credential
 
 TOOL_ARGS_CLIP = 400
+
+
+#: This SDK's spelling of the stdio transport (the Copilot SDK says
+#: ``local``); field-verified against claude-agent-sdk 0.2.149.
+MCP_STDIO_TYPE = "stdio"
 
 
 def read_only_denial(tool_name: str) -> str | None:
@@ -303,6 +309,11 @@ class ClaudeBackend:
             # `.claude/settings.json` (hooks, permission rules) must not
             # reconfigure an unattended session under it.
             "setting_sources": [],
+            # Claude otherwise carries a successful `cd` into later Bash
+            # calls, so another root-relative command can target subdir/subdir.
+            # Override the CLI child's environment on every launch, including
+            # resumes and their fresh-session fallback, without mutating ours.
+            "env": {"CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1"},
         }
         if job.model and job.model != "auto":
             kwargs["model"] = job.model
@@ -310,10 +321,17 @@ class ClaudeBackend:
             kwargs["cwd"] = job.cwd
         if resume:
             kwargs["resume"] = resume
+        servers: dict[str, Any] = {}
         if job.host_tools:
             if not job.host_tools_dir:
                 raise RuntimeError("host_tools need host_tools_dir")
-            kwargs["mcp_servers"] = {HOST_TOOL_SERVER: self._host_tool_server(job, emit)}
+            servers[HOST_TOOL_SERVER] = self._host_tool_server(job, emit)
+        # The operator's servers alongside the in-process one, never
+        # instead of it: the host tools ARE an MCP server here, and
+        # replacing the dict would silently take the run's own tools away.
+        servers.update(server_configs(job.mcp_servers, stdio_type=MCP_STDIO_TYPE))
+        if servers:
+            kwargs["mcp_servers"] = servers
         if job.permission_mode == "auto" and governor.cap is None and job.available_tools is None:
             # The microVM (network policy + secret proxy) is the security
             # boundary; inside it the agent runs unattended. Any of a
@@ -360,10 +378,26 @@ class ClaudeBackend:
 
     @staticmethod
     def _system_prompt(job: JobRequest) -> Any:
+        message = job.system_message
+        if job.cwd and (job.available_tools is None or "Bash" in job.available_tools):
+            # Describe this backend's actual shell contract for every persona.
+            # Keep it out of shared phase prompts: other backends own their
+            # cwd behavior, and host-tools-only sessions have no Bash tool.
+            shell_contract = (
+                f"Every Bash tool call starts in the workspace directory {json.dumps(job.cwd)}. "
+                "Directory changes do not carry over between calls. Use paths relative to "
+                "this directory or quoted absolute paths. Within one call, directory changes "
+                "still affect later commands: isolate independent directory changes in "
+                "subshell groups and join required checks with &&. Guard each cd with && "
+                "so a failed directory change stops the dependent command. For Bash pipelines "
+                "that check success, use set -o pipefail so an output filter cannot hide a "
+                "failed check."
+            )
+            message = f"{message}\n\n{shell_contract}" if message else shell_contract
         if not job.system_preset:
-            return job.system_message
-        if job.system_message:
-            return {"type": "preset", "preset": "claude_code", "append": job.system_message}
+            return message
+        if message:
+            return {"type": "preset", "preset": "claude_code", "append": message}
         return {"type": "preset", "preset": "claude_code"}
 
     def _host_tool_server(self, job: JobRequest, emit: EmitFn) -> Any:

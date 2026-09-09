@@ -121,8 +121,11 @@ class TestPresets:
     ) -> None:
         """#762: `sbxloop init --preset workload` is a config `load_config`
         accepts with the example variable set — a credential, a profile
-        bounded to it and named the default, and a schedule asking for it."""
-        (tmp_path / "sbxloop.toml").write_text(render_config_template("workload"))
+        bounded to it and named the default. The schedule asking for it is
+        not declared in the file: schedules live in the daemon's database
+        (#818), so the preset says how to create one instead."""
+        text = render_config_template("workload")
+        (tmp_path / "sbxloop.toml").write_text(text)
         monkeypatch.setenv("WEATHER_API_KEY", "value_never_shown")
         config = load_config(tmp_path)
         assert [c.name for c in config.credentials] == ["weather"]
@@ -130,9 +133,9 @@ class TestPresets:
         assert profile.name == "research" and profile.credentials == ["weather"]
         assert profile.sinks == ["chat", "artifact"] and profile.repo is False
         assert config.workload.default == "research"
-        (schedule,) = config.schedules
-        assert schedule.profile == "research" and schedule.cadence_text == "cron 0 7 * * mon-fri"
-        assert schedule.timezone == "Europe/London"
+        assert config.schedules == []
+        assert not any(line.strip() == "[[schedules]]" for line in text.splitlines())
+        assert "schedules add morning-brief --profile research" in text
         header = config_presets()["workload"]
         assert "sbxloop init --preset workload" in header
         assert "ONLY its inference credential" in header  # the separation, stated
@@ -184,6 +187,16 @@ class TestPresets:
 # Derived internals the engine sets on a narrowed config; never configured.
 # `home` is SBXLOOP_HOME, never a file key (sbxloop.paths).
 INTERNAL_KEYS = {"github.enabled_repo_count", "workload.result_issue", "home"}
+# Legacy keys the example no longer shows (#818): a `[[schedules]]` entry
+# still loads, for the daemon to import into its database once.
+LEGACY_KEYS = {
+    "schedules.name",
+    "schedules.profile",
+    "schedules.ask",
+    "schedules.every",
+    "schedules.cron",
+    "schedules.timezone",
+}
 
 
 def test_example_mentions_every_key_the_config_model_knows() -> None:
@@ -203,7 +216,7 @@ def test_example_mentions_every_key_the_config_model_knows() -> None:
                 for sub in nested:
                     walk(sub, f"{prefix}{name}.")
                 continue
-            if f"{prefix}{name}" in INTERNAL_KEYS:
+            if f"{prefix}{name}" in INTERNAL_KEYS | LEGACY_KEYS:
                 continue
             if not re.search(rf"^#?\s*{re.escape(name)}\s*=", text, re.MULTILINE):
                 missing.append(f"{prefix}{name}")
@@ -225,6 +238,7 @@ SOURCE_ROOT = REPO_ROOT / "packages" / "sbxloop" / "src" / "sbxloop"
 
 # Credentials the code reads by name; each must be documented in .env.example.
 CREDENTIAL_ENVS = {
+    "GLITCHTIP_DSN",
     "COPILOT_GITHUB_TOKEN",
     "GH_TOKEN",
     "GITHUB_TOKEN",
@@ -410,7 +424,7 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             parsed = tomllib.loads(f"{key} = {value}")
         except tomllib.TOMLDecodeError:
             continue  # a multi-line value (the exclude list); covered below
-        if section in ("registries", "credentials", "workloads", "schedules"):
+        if section in ("registries", "credentials", "workloads", "schedules", "mcp"):
             continue  # array-of-tables entries load as whole blocks, below
         if section == "github.repos":
             doc: dict[str, Any] = {"github": {"repos": [{"repo": "you/your-repo", **parsed}]}}
@@ -483,10 +497,17 @@ def test_example_workload_profile_loads_with_its_credential() -> None:
     assert entry.credentials == [credential["name"]]
     assert entry.budgets.set_keys == sorted(profile["budgets"])
     assert config.workload_profile() is entry
-    # The commented `[[schedules]]` entry shows both cadences; either one
-    # alone, with the profile above, is a working schedule (#761).
-    schedule = block_after("[[schedules]]")
-    assert schedule["profile"] == profile["name"]
+    # Schedules live in the daemon's database (#818): the example declares
+    # none and says how to create one; a legacy `[[schedules]]` entry still
+    # loads (the daemon imports it once), with the same one-cadence rule.
+    assert not any(line.strip() == "[[schedules]]" for line in EXAMPLE.read_text().splitlines())
+    schedule = {
+        "name": "morning-brief",
+        "profile": profile["name"],
+        "ask": "Summarise what changed overnight.",
+        "every": "24h",
+        "cron": "0 7 * * mon-fri",
+    }
     for drop in ("every", "cron"):
         one = {k: v for k, v in schedule.items() if k != drop}
         scheduled = Config.model_validate(
@@ -498,6 +519,40 @@ def test_example_workload_profile_loads_with_its_credential() -> None:
         Config.model_validate(
             {"credentials": [credential], "workloads": [profile], "schedules": [schedule]}
         )
+
+
+def test_example_mcp_entry_loads_with_its_credential() -> None:
+    """The commented `[[mcp]]` entry loads as one block beside the
+    `[[credentials]]` entry it names: its keys are coupled by `transport`
+    (a stdio entry takes a command and no url), so it is validated whole.
+    Uncommenting the two together is a working server for the builder."""
+
+    def block_after(header: str) -> dict[str, Any]:
+        text = ""
+        in_block = False
+        for line in EXAMPLE.read_text().splitlines():
+            stripped = re.sub(r"^#\s?", "", line)
+            if stripped == header:
+                in_block = True
+            elif in_block and line.startswith("#") and re.match(r"^[a-z_]+ = ", stripped):
+                text += stripped + "\n"
+            elif in_block and not line.strip():
+                break
+        return tomllib.loads(text)
+
+    entry = block_after("[[mcp]]")
+    credential = block_after("[[credentials]]")
+    config = Config.model_validate({"credentials": [credential], "mcp": [entry]})
+    (server,) = config.mcp
+    assert server.name == entry["name"]
+    assert server.credential == credential["name"]
+    assert server.hosts == entry["hosts"] == [credential["host"]]
+    # The builder asked for it gets a spec carrying a reference, never a
+    # value; the read-only critic is not among its roles.
+    (spec,) = config.mcp_specs_for("builder")
+    assert spec.mediated and spec.url == entry["url"]
+    assert spec.env == {} and spec.headers == {}
+    assert config.mcp_specs_for("critic") == []
 
 
 def test_example_credential_entry_loads() -> None:

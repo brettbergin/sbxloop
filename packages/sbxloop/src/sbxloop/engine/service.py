@@ -10,43 +10,48 @@ speaks to a credential's host:
   host checks it against the run's grant and submits one ``service.http``
   job, and the response body — the credential's value redacted wherever
   an API echoes it — goes back to the model as the tool result.
-* ``fetch_dependencies`` — the agent asks for an ecosystem's dependencies;
-  the host builds the argv from the ecosystem's fixed recipe
-  (``sbxloop.sbx.registries``) and submits one ``service.fetch`` job that
-  runs it in the service sandbox's view of the shared workspace, with the
-  package manager's own hooks off. The same op runs once at setup for
-  every credentialed ecosystem the workspace has a manifest for.
+* ``fetch_dependencies`` — catalogue discovery or a fixed authenticated
+  download. The host copies the artifact into the agent; all native
+  dependency resolution and project code run there without registry secrets.
 
-What the ledger sees is one ``service.call`` event per request (the
-credential's name, the method, the path, the status and the duration) and
-one ``sandbox.fetch`` per fetch (ecosystem, verb, argv, exit code). Never
-a body, never a header, never a value.
+The ledger records request names and result metadata, never artifact bytes
+or authorization headers. No sandbox listens for another sandbox's calls.
 """
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import json
+import re
+import tempfile
 import time
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import Any, NoReturn
 
 from sbxloop.config import CredentialConfig, RegistryConfig, RegistryKind
-from sbxloop.errors import ServiceOpsError
+from sbxloop.errors import SbxError, ServiceOpsError
 from sbxloop.events import EventBus, HostEventTypes
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
 from sbxloop.sbx import registries
+from sbxloop.sbx.sandbox import RESULTS_DIR
 from sbxloop.worker.client import WorkerClient
-from sbxloop_worker.protocol import HostToolCall, HostToolResponse, HostToolSpec, JobRequest
+from sbxloop_worker.protocol import (
+    HostToolCall,
+    HostToolResponse,
+    HostToolSpec,
+    JobRequest,
+    RegistryFetchParams,
+)
 from sbxloop_worker.serviceops import METHODS
 
 log = get_logger(__name__)
 
 TOOL_NAME = "call_service"
 FETCH_TOOL_NAME = "fetch_dependencies"
-# How long one fetch may run: a cold `npm ci` or `mvn dependency:go-offline`
-# against a private registry is minutes, not seconds.
+# Bound a large artifact download or an offline preparation command.
 FETCH_TIMEOUT_S = 900.0
 
 # What the model reads back per call. The worker already clips the body;
@@ -62,7 +67,7 @@ class ServiceOps:
     sandbox is built from the same list, so a name outside it is refused
     here — before a job is built — and would be refused in the sandbox too.
     ``registries_`` are the run's credentialed registries (#766), ``workdir``
-    the service sandbox's view of the workspace the fetches run in and
+    the agent sandbox's workspace for offline preparation, and
     ``workspace`` the host's (where the manifests are looked for); without
     registries there is nothing to fetch and no tool for it.
     """
@@ -79,6 +84,7 @@ class ServiceOps:
         workspace: Path | None = None,
         timeout_s: float = 120.0,
         fetch_timeout_s: float = FETCH_TIMEOUT_S,
+        agent: WorkerClient | None = None,
     ) -> None:
         self.client = client
         self.run_id = run_id
@@ -91,6 +97,7 @@ class ServiceOps:
         self.workspace = workspace
         self.timeout_s = timeout_s
         self.fetch_timeout_s = fetch_timeout_s
+        self.agent = agent
 
     # -- the op -------------------------------------------------------------
 
@@ -176,24 +183,24 @@ class ServiceOps:
         ecosystem: str,
         packages: Sequence[str] = (),
         *,
-        manifests: Sequence[str] = (),
         phase: str | None = None,
         task_id: str | None = None,
+        path: str | None = None,
+        registry: str | None = None,
+        operation: str = "download",
+        ref: str = "HEAD",
+        sha256: str | None = None,
+        filename: str | None = None,
     ) -> dict[str, Any]:
-        """One dependency fetch in the service sandbox: ``fetch`` from the
-        workspace's manifest when ``packages`` is empty, ``add`` of the
-        named packages otherwise. ``manifests`` is what the host workspace
-        has for the ecosystem (:func:`registries.workspace_manifests`).
-        Returns ``{exit_code, output, argv}``; raises
-        :class:`ServiceOpsError` when the ecosystem is not one the run's
-        registries cover, the verb or a package is outside the recipe, or
-        the sandbox could not run it. A non-zero exit is an answer, not an
-        error — the caller decides (setup fails the run; the agent's tool
-        reads the output)."""
-        verb = "add" if packages else "fetch"
+        """Return registry discovery data or copy one artifact to the agent.
+
+        The service authenticates a fixed read against its catalogue; the
+        host verifies the bytes during transfer. No manifest or command is
+        ever sent to the credential-bearing worker.
+        """
         event: dict[str, Any] = {
             "ecosystem": ecosystem,
-            "verb": verb,
+            "verb": operation,
             "phase": phase,
             "task_id": task_id,
         }
@@ -204,27 +211,57 @@ class ServiceOps:
                 f"no credentialed registry of kind {ecosystem!r} for run {self.run_id} "
                 f"(configured: {covered})",
             )
-        if self.workdir is None:
-            self._refuse_fetch(event, "the service sandbox has no view of the workspace")
-        kind: RegistryKind = ecosystem
+        entries = [
+            entry
+            for entry in registries.catalogue_entries(self.registries)
+            if entry["kind"] == ecosystem
+        ]
+        if path is None:
+            return {
+                "registries": [
+                    {key: value for key, value in entry.items() if key not in ("env", "user")}
+                    for entry in entries
+                ],
+                "cache": registries.cache_dir(ecosystem),
+                "packages": list(packages),
+                "instructions": (
+                    "Resolve manifests and run package managers in this agent sandbox. "
+                    "Call this tool with a registry name and absolute path to download "
+                    "metadata or package files; operation=git fetches an HTTPS Git bundle. "
+                    "Read the returned local files, recursively fetch dependencies, and "
+                    "populate the ecosystem's offline cache. No code runs in the service."
+                ),
+            }
+        if self.agent is None:
+            self._refuse_fetch(event, "artifact transfer requires the agent sandbox")
+        if registry is None and len(entries) == 1:
+            registry = entries[0]["name"]
+        if registry not in {entry["name"] for entry in entries}:
+            self._refuse_fetch(event, "select a registry from this ecosystem's catalogue")
         try:
-            plan = registries.fetch_plan(kind, verb, packages, manifests=manifests)
+            request = RegistryFetchParams.model_validate(
+                {
+                    "registry": registry,
+                    "path": path,
+                    "operation": operation,
+                    "ref": ref,
+                    "sha256": sha256,
+                }
+            )
         except ValueError as exc:
             self._refuse_fetch(event, str(exc))
-        event["argv"] = list(plan.argv)
+        # The output path is in the agent VM, under a fresh host-generated
+        # directory. Neither worker responses nor request paths select a
+        # host path or the credential-bearing VM's artifact path.
+        name = filename or ("dependency.bundle" if operation == "git" else "registry-data")
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,239}", name):
+            self._refuse_fetch(event, "filename must be a simple artifact basename")
+        event.update(registry=registry, path=path)
         job = JobRequest(
             job_id=new_job_id(),
             run_id=self.run_id,
             kind="service.fetch",
-            argv=list(plan.argv),
-            cwd=self.workdir,
-            params={
-                "ecosystem": ecosystem,
-                "verb": verb,
-                # Names, not values: the worker blanks these variables'
-                # values out of the output before it leaves the sandbox.
-                "scrub_env": [r.auth_env for r in self.registries if r.auth_env],
-            },
+            params=request.model_dump(),
             timeout_s=self.fetch_timeout_s,
         )
         started = time.monotonic()
@@ -236,22 +273,35 @@ class ServiceOps:
             self.bus.emit(HostEventTypes.SANDBOX_FETCH, self.run_id, job_id=job.job_id, **event)
             log.warning("service.fetch_failed", run=self.run_id, job=job.job_id, **event)
             raise ServiceOpsError(
-                f"dependency fetch {ecosystem} {verb} failed: "
+                f"dependency fetch {ecosystem} {operation} failed: "
                 f"{result.error.type}: {result.error.message}"
             )
-        exit_code = result.exit_code if result.exit_code is not None else 0
-        output = result.output_text or ""
-        event["exit_code"] = exit_code
-        if exit_code != 0:
-            event["detail"] = output[-2000:]
+        metadata = dict(result.output_json or {})
+        remote = f"{RESULTS_DIR}/{job.job_id}.artifact"
+        directory = f"/tmp/sbxloop-dependency-{job.job_id}"  # nosec B108 - agent VM path
+        destination = f"{directory}/{name}"
+        try:
+            with tempfile.TemporaryDirectory(prefix="sbxloop-dependency-") as temporary:
+                local = Path(temporary) / "artifact"
+                self.client.sandbox.cp_out(remote, local)
+                with local.open("rb") as stream:
+                    digest = hashlib.file_digest(stream, "sha256").hexdigest()
+                if local.stat().st_size != metadata.get("bytes") or digest != metadata.get(
+                    "sha256"
+                ):
+                    raise ServiceOpsError("registry artifact changed during host transfer")
+                local.chmod(0o644)
+                self.agent.sandbox.mkdirs(directory)
+                self.agent.sandbox.cp_in(local, destination)
+        except (OSError, SbxError) as exc:
+            self._refuse_fetch(event, f"registry artifact transfer failed: {exc}")
+        finally:
+            with contextlib.suppress(SbxError):
+                self.client.sandbox.exec(["rm", "-f", remote])
+        event.update(bytes=metadata["bytes"], sha256=digest, exit_code=0)
         self.bus.emit(HostEventTypes.SANDBOX_FETCH, self.run_id, job_id=job.job_id, **event)
-        log.info(
-            "service.fetch",
-            run=self.run_id,
-            job=job.job_id,
-            **{k: v for k, v in event.items() if k != "detail"},
-        )
-        return {"exit_code": exit_code, "output": output, "argv": list(plan.argv)}
+        log.info("service.fetch", run=self.run_id, job=job.job_id, **event)
+        return {"path": destination, "bytes": metadata["bytes"], "sha256": digest}
 
     def manifests(self, ecosystem: str) -> tuple[str, ...]:
         """The ecosystem's manifests present in the host workspace — what
@@ -287,13 +337,16 @@ class ServiceOps:
         return HostToolSpec(
             name=FETCH_TOOL_NAME,
             description=(
-                "Fetch this project's dependencies from its private registry into the "
-                "shared dependency cache. This sandbox is OFFLINE for these ecosystems "
-                "(the registry credential lives elsewhere): after editing the manifest "
-                "(package.json, requirements.txt, go.mod, …) call this with no packages "
-                "to re-fetch from it, or name packages to fetch them directly (npm, pypi, "
-                "go). Then install/build offline as usual. Returns the exit code and the "
-                f"package manager's output. Ecosystems: {', '.join(self.kinds)}."
+                "Fetch private dependency metadata, archives or Git bundles as data. "
+                "With ecosystem alone, discover its registry names, index URLs and cache. "
+                "Then supply registry and an absolute path on that registry's host. "
+                "Returns a local file path, byte count and SHA-256. Resolve dependencies, "
+                "inspect metadata, unpack artifacts and populate offline caches HERE in "
+                "the agent sandbox. The service only downloads bytes; it never runs "
+                "package managers or reads project files. Use operation=git with an HTTPS "
+                "repository path and ref to obtain a bundle for VCS dependencies. "
+                "Credentials stay in the service; do not try to extract them. "
+                f"Ecosystems: {', '.join(self.kinds)}."
             ),
             parameters={
                 "type": "object",
@@ -303,9 +356,30 @@ class ServiceOps:
                         "type": "array",
                         "items": {"type": "string"},
                         "description": (
-                            "Package specs to fetch (e.g. left-pad@1.3.0, requests>=2); "
-                            "omit to fetch everything the manifest names."
+                            "Optional package names to retain with the catalogue response; "
+                            "resolution and installation are performed in this sandbox."
                         ),
+                    },
+                    "registry": {
+                        "type": "string",
+                        "description": "Registry name from the catalogue.",
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Absolute HTTP path; omit to discover registries.",
+                    },
+                    "operation": {"type": "string", "enum": ["download", "git"]},
+                    "ref": {
+                        "type": "string",
+                        "description": "Git HEAD, full SHA, or full branch/tag ref.",
+                    },
+                    "filename": {
+                        "type": "string",
+                        "description": "Local basename, including the archive extension.",
+                    },
+                    "sha256": {
+                        "type": "string",
+                        "description": "Expected SHA-256 from trusted dependency metadata.",
                     },
                 },
                 "required": ["ecosystem"],
@@ -432,23 +506,24 @@ class ServiceOps:
             packages = args.get("packages") or []
             if not isinstance(packages, list):
                 raise ServiceOpsError("packages must be an array of strings")
-            # The lockfile is left out on purpose: the agent calls this
-            # after editing the manifest, and `npm ci` refuses a lockfile
-            # the edit outdated — `npm install` reconciles it. The setup
-            # fetch (no edit yet) keeps `ci`.
-            manifests = tuple(m for m in self.manifests(ecosystem) if m != "package-lock.json")
+            if args.get("filename") is not None and not isinstance(args["filename"], str):
+                raise ServiceOpsError("filename must be a string")
             output = self.fetch(
                 ecosystem,
                 [str(p) for p in packages],
-                manifests=manifests,
                 phase=phase,
                 task_id=task_id,
+                path=args.get("path"),
+                registry=args.get("registry"),
+                operation=str(args.get("operation", "download")),
+                ref=str(args.get("ref", "HEAD")),
+                sha256=args.get("sha256"),
+                filename=args.get("filename"),
             )
         except ServiceOpsError as exc:
             return HostToolResponse(call_id=call.call_id, ok=False, error=str(exc))
         text = json.dumps(output, ensure_ascii=False)
         if len(text) > MAX_TOOL_TEXT:
             text = text[:MAX_TOOL_TEXT] + "…"
-        # A failed fetch is an answer the model needs to read (the package
-        # manager says why); only a fetch that never ran is not ok.
+        # Only validated discovery data or a transferred artifact reaches this point.
         return HostToolResponse(call_id=call.call_id, ok=True, text=text)

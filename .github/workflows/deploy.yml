@@ -167,6 +167,14 @@ jobs:
             echo "::notice::deploying ${current} -> ${{ steps.target.outputs.version }}"
           fi
 
+      - name: Check the host before upgrading
+        if: steps.installed.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          # An existing login or host failure cannot be repaired by rolling
+          # the package back. Detect it before changing the running install.
+          "${SBXLOOP}" doctor
+
       - name: Take the deploy hold
         id: hold
         if: steps.installed.outputs.changed == 'true'
@@ -305,8 +313,9 @@ jobs:
             "${DIST}/sbxloop-${VERSION}-py3-none-any.whl[discord,slack]"
           "${VENV_SBXLOOP}" --version
           # Idempotent: refreshes the launchers and the rendered units for
-          # the new version, keeps config, secrets and sbx as they are.
-          "${SBXLOOP}" init --systemd
+          # the new version. --no-sbx preserves the operator's runtime;
+          # plain init would reinstall this release's pinned sbx version.
+          "${SBXLOOP}" init --systemd --no-sbx
           mkdir -p "${SBXLOOP_HOME}/logs/deploy"
           echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ${{ steps.installed.outputs.current }} -> ${VERSION} run=${{ github.run_id }}" >> "${SBXLOOP_HOME}/logs/deploy/history.log"
 
@@ -383,6 +392,7 @@ jobs:
           echo "::notice::${HOST} is healthy on ${VERSION}"
 
       - name: Roll back
+        id: rollback
         # Only once the upgrade ran: a failure before it (wheels, the wait)
         # has changed nothing on the host, and a rollback restart would be
         # exactly the needless restart this pipeline exists to avoid.
@@ -391,19 +401,27 @@ jobs:
           PREV: ${{ steps.installed.outputs.current }}
         run: |
           set -euo pipefail
+          echo "restored=false" >> "$GITHUB_OUTPUT"
           echo "::error::deploy failed — rolling back to ${PREV}"
           # PyPI is safe here: PREV has been published for a while, so its index
           # page is long since warm. No just-published version to race.
           # The same extras as the upgrade (#619): a rollback that drops one
           # rolls a host on that backend back to a build that cannot start.
           "${UV}" pip install --python "${VENV_PYTHON}" --upgrade "sbxloop[discord,slack]==${PREV}" "sbxloop-worker==${PREV}"
-          "${SBXLOOP}" init --systemd || true
+          "${SBXLOOP}" init --systemd --no-sbx || true
           systemctl --user reset-failed "${UNIT}" || true
           timeout 300 systemctl --user restart "${UNIT}"
           sleep 15
-          systemctl --user is-active --quiet "${UNIT}" \
-            && echo "rolled back to $("${VENV_SBXLOOP}" --version | awk '{print $2}')" \
-            || echo "::error::ROLLBACK ALSO FAILED — ${HOST} needs a human"
+          if systemctl --user is-active --quiet "${UNIT}" \
+            && [ "$("${VENV_SBXLOOP}" --version | awk '{print $2}')" = "${PREV}" ] \
+            && "${SBXLOOP}" doctor \
+            && "${SBXLOOP}" daemon ctl status --json --timeout 300 >/dev/null; then
+            echo "restored=true" >> "$GITHUB_OUTPUT"
+            echo "rolled back to ${PREV}; health checks passed"
+          else
+            echo "::error::ROLLBACK ALSO FAILED — ${HOST} needs a human"
+            exit 1
+          fi
 
       - name: Restore the other holds
         # Runs after a rollback too: whatever version is live, the operator's
@@ -444,6 +462,7 @@ jobs:
           RESULT: ${{ job.status }}
           WAITED_S: ${{ steps.drain.outputs.waited_s }}
           UPGRADED: ${{ steps.upgrade.outcome }}
+          RESTORED: ${{ steps.rollback.outputs.restored }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         continue-on-error: true
         run: |
@@ -456,8 +475,10 @@ jobs:
             MSG="✅ \`${HOST}\` restarted on sbxloop \`${VERSION}\`${waited} — [run](${RUN_URL})"
           elif [ "${UPGRADED}" = "skipped" ]; then
             MSG="❌ deploy of sbxloop \`${VERSION}\` to \`${HOST}\` **${RESULT}** before anything was installed — still on \`${FROM}\`, daemon untouched. [run](${RUN_URL})"
-          else
+          elif [ "${RESTORED}" = "true" ]; then
             MSG="❌ deploy of sbxloop \`${VERSION}\` to \`${HOST}\` **${RESULT}** — rolled back to \`${FROM}\`. [run](${RUN_URL})"
+          else
+            MSG="❌ deploy of sbxloop \`${VERSION}\` to \`${HOST}\` **${RESULT}** — rollback could not restore health; ${HOST} needs a human. [run](${RUN_URL})"
           fi
           # Through the configured [chat] backend (#639): sbxloop reads its
           # own secrets file; this job reads no secrets and no config.

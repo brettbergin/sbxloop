@@ -14,15 +14,17 @@ import getpass
 import json
 import os
 import shutil
-import sqlite3
+import tempfile
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from contextlib import ExitStack
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from rich.console import Console
 from rich.table import Table
+from sqlalchemy.exc import SQLAlchemyError
 
 import sbxloop
 from sbxloop import toolchains
@@ -30,7 +32,7 @@ from sbxloop.backends import backend_for
 from sbxloop.config import Config, MergeMethod, RepoConfig, load_config, load_config_with_sources
 from sbxloop.engine.landing import allowed_merge_methods, resolve_merge_method
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError
+from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError, StateError
 from sbxloop.gh.labels import lifecycle_specs, missing_labels
 from sbxloop.gh.ops import GithubOps
 from sbxloop.gh.permissions import (
@@ -172,7 +174,9 @@ def daemon_repo_health(
         return {}
     out: dict[str, dict[str, Any]] = {}
     try:
-        store = DaemonStore(db)
+        # Read-only: doctor runs while the daemon is live, and a diagnostic
+        # that migrates the schema out from under it is not a diagnostic.
+        store = DaemonStore(db, readonly=True)
         try:
             for key, value in store.values_with_prefix(REPO_HEALTH_KEY).items():
                 try:
@@ -186,6 +190,27 @@ def daemon_repo_health(
     except Exception:  # a store doctor cannot read is its own row elsewhere
         return {}
     return out
+
+
+def _count_orphans(cli: SbxCLI, state_db: Path) -> int:
+    """Orphan count, without doctor ever writing to the state database.
+
+    Read-only when the file is there: doctor runs while the daemon is live,
+    and a diagnostic that migrates the schema under it is not a diagnostic.
+    When it is not there, the sandboxes are classified against an empty
+    store in a temporary directory rather than against the real path — a
+    host with no database has recorded no runs, so a sandbox on it is
+    unaccounted for exactly as it always was, and doctor still does not
+    create the file it was asked to inspect.
+    """
+    with ExitStack() as stack:
+        if state_db.is_file():
+            store = StateStore(state_db, readonly=True)
+        else:
+            scratch = Path(stack.enter_context(tempfile.TemporaryDirectory()))
+            store = StateStore(scratch / "state.db")
+        stack.callback(store.close)
+        return count_orphans(cli, store)
 
 
 def repo_checks(
@@ -442,6 +467,15 @@ def workspace_origin_mismatches(config: Config) -> list[WorkspaceOriginMismatch]
         if expected is not None and origin != expected:
             mismatches.append(WorkspaceOriginMismatch(entry.repo, path, origin))
     return mismatches
+
+
+def host_check() -> Check:
+    """The host itself (#596): a hard failure on native Windows, naming
+    the WSL2 path; a note under WSL2; a pass elsewhere."""
+    from sbxloop.hostos import host_support
+
+    support = host_support()
+    return Check("host", support.supported, support.detail, hard=not support.supported)
 
 
 def workspace_checks(config: Config) -> list[Check]:
@@ -824,21 +858,69 @@ def credentials_checks(config: Config, env: dict[str, str]) -> list[Check]:
     ]
 
 
+def mcp_checks(config: Config, env: dict[str, str]) -> list[Check]:
+    """Rows when `[[mcp]]` declares anything: what each server is, and
+    whether the two things that make it work are actually in place.
+
+    A missing credential fails provisioning by name, so it is a hard row.
+    A server whose hosts are not on the agent sandbox's allowlist would
+    instead fail at its first request, inside the sandbox, looking like a
+    hang — the config loader cannot catch that because the allowlist is
+    assembled at provisioning, so it is checked here.
+    """
+    if not config.mcp:
+        return []
+    rows: list[Check] = []
+    listed = "; ".join(
+        f"{s.name} ({s.transport} → {', '.join(s.hosts) or 'no hosts declared'}; "
+        f"roles {', '.join(s.roles)})"
+        for s in config.mcp
+    )
+    rows.append(Check("mcp servers", True, listed, hard=False))
+
+    unset = [
+        (server.name, entry.env)
+        for server in config.mcp
+        if server.credential is not None
+        for entry in [config.credential(server.credential)]
+        if entry is not None and not env.get(entry.env)
+    ]
+    if unset:
+        missing = ", ".join(f"{name} ({var})" for name, var in unset)
+        rows.append(
+            Check(
+                "mcp credentials",
+                False,
+                f"not set in the daemon's environment — {missing}; export them where the "
+                "daemon reads its secrets, or drop `credential` from those entries "
+                "(provisioning fails by name otherwise)",
+            )
+        )
+
+    hostless = [server.name for server in config.mcp if not server.hosts]
+    if hostless:
+        rows.append(
+            Check(
+                "mcp egress",
+                False,
+                f"{', '.join(hostless)} declare no `hosts`, so the agent sandbox's "
+                "allowlist will refuse whatever they contact — the server fails at its "
+                "first request rather than at startup; list the domains each one needs",
+            )
+        )
+    return rows
+
+
 def workload_profile_checks(config: Config) -> list[Check]:
     """One row when `[[workloads]]` declares anything (#758): the profiles
     by name with what each bounds, and which one runs by default. The
     config loader already refused a profile naming an unknown credential
     or a default naming no profile; this row is the at-a-glance view."""
+    from sbxloop.cli.workloadview import profile_summary
+
     if not config.workloads:
         return []
-    listed = "; ".join(
-        f"{p.name}"
-        + (" (default)" if p.name == config.workload.default else "")
-        + f": hosts {', '.join(p.egress) or '-'}, credentials "
-        + f"{', '.join(p.credentials) or '-'}, sinks {', '.join(p.sinks) or '-'}, "
-        + f"repo {'yes' if p.repo else 'no'}"
-        for p in config.workloads
-    )
+    listed = "; ".join(profile_summary(config, p) for p in config.workloads)
     if config.workload.default is None:
         listed += (
             " — no \\[workload] default: a run names one with --profile or runs "
@@ -847,22 +929,66 @@ def workload_profile_checks(config: Config) -> list[Check]:
     return [Check("workload profiles", True, listed)]
 
 
-def schedule_checks(config: Config) -> list[Check]:
-    """One row when `[[schedules]]` declares anything (#761): each schedule
-    with its cadence, zone and profile. The loader already refused a
-    schedule naming no profile or a cadence it cannot read; this row is
-    the at-a-glance view, and a reminder that the ticks are the daemon's."""
-    if not config.schedules:
+def stored_schedules(config: Config) -> list[Any]:
+    """The schedules the daemon fires, from its state db (#818) — read
+    only when that file exists, so doctor never creates one; an
+    unreadable db reads as none."""
+    from sbxloop.daemon.store import DaemonStore
+
+    db = config.paths.state_db
+    if not db.is_file():
         return []
-    listed = "; ".join(
-        f"{s.name}: {s.cadence_text} ({s.timezone or config.daemon.run_cap_timezone}) "
-        f"→ profile {s.profile}"
-        for s in config.schedules
-    )
-    return [Check("schedules", True, f"{listed} — fired by `sbxloop daemon`", hard=False)]
+    try:
+        store = DaemonStore(db, readonly=True)
+        try:
+            return list(store.schedules())
+        finally:
+            store.close()
+    except Exception:  # doctor reports, never raises: an unreadable db is "none"
+        return []
 
 
-def daemon_intake_checks(config: Config) -> list[Check]:
+def schedule_checks(config: Config, stored: Sequence[Any]) -> list[Check]:
+    """The schedules row (#761, #818): each stored schedule with its
+    cadence, zone and profile — and a warning when sbxloop.toml still
+    carries `[[schedules]]`, which the daemon imports once and then
+    ignores. A stored schedule whose profile the config no longer
+    declares is named: its ticks are skipped."""
+    checks: list[Check] = []
+    profiles = {p.name for p in config.workloads}
+    if stored:
+        listed = "; ".join(
+            f"{s.spec.name}: {s.spec.cadence_text} "
+            f"({s.spec.timezone or config.daemon.run_cap_timezone}) → profile {s.spec.profile}"
+            + (" (NOT DECLARED — ticks skipped)" if s.spec.profile not in profiles else "")
+            for s in stored
+        )
+        ok = all(s.spec.profile in profiles for s in stored)
+        checks.append(
+            Check(
+                "schedules",
+                ok,
+                f"{listed} — in the daemon's database, fired by `sbxloop daemon`",
+                hard=False,
+            )
+        )
+    if config.schedules:
+        names = ", ".join(s.name for s in config.schedules)
+        checks.append(
+            Check(
+                "schedules in sbxloop.toml",
+                False,
+                f"{names} — schedules live in the daemon's database now: the daemon "
+                "imports these once on start and ignores the file's copy after that; remove "
+                "the `\\[\\[schedules]]` entries and manage schedules from chat "
+                "(`create_schedule`) or `sbxloop daemon ctl schedules add …`",
+                hard=False,
+            )
+        )
+    return checks
+
+
+def daemon_intake_checks(config: Config, stored: Sequence[Any] = ()) -> list[Check]:
     """Where the daemon's work would come from (#762): the configured
     repositories' labeled issues, chat asks (a backend with the concierge
     on), the schedules' ticks. A daemon with none refuses to start
@@ -875,8 +1001,8 @@ def daemon_intake_checks(config: Config) -> list[Check]:
     backend = config.chat_backend
     if backend is not None and config.concierge.enabled:
         sources.append(f"chat asks ({backend}, concierge on)")
-    if config.schedules:
-        count = len(config.schedules)
+    count = len({s.spec.name for s in stored} | {s.name for s in config.schedules})
+    if count:
         sources.append(f"{count} schedule{'s' if count != 1 else ''}")
     if not sources:
         return [
@@ -884,8 +1010,9 @@ def daemon_intake_checks(config: Config) -> list[Check]:
                 "daemon intake",
                 False,
                 "nothing would be work: set \\[github] repo (labeled issues), a chat "
-                "backend with the concierge on (asks in chat), or \\[\\[schedules]] "
-                "(ticks) — `sbxloop daemon` refuses to start without one",
+                "backend with the concierge on (asks in chat), or a schedule (ticks; "
+                "`sbxloop daemon ctl schedules add …`) — `sbxloop daemon` refuses to "
+                "start without one",
                 hard=False,
             )
         ]
@@ -901,6 +1028,7 @@ def collect_checks(
     config, sources = load_config_with_sources(env=env)
     cli = cli or SbxCLI(app_name=config.app_name or None)
     checks: list[Check] = []
+    checks.append(host_check())
     report = progress or (lambda _message: None)
 
     # sbx binary + version. The very first sbx invocation may trigger
@@ -943,8 +1071,8 @@ def collect_checks(
         if logged_in:
             report("checking for orphaned sandboxes")
             try:
-                orphans = count_orphans(cli, StateStore(config.paths.state_db))
-            except (SbxError, OSError, sqlite3.Error):
+                orphans = _count_orphans(cli, config.paths.state_db)
+            except (SbxError, OSError, StateError, SQLAlchemyError):
                 orphans = None
             if orphans is not None:
                 checks.append(
@@ -1109,8 +1237,10 @@ def collect_checks(
     )
     checks.extend(registry_credential_checks(config, env))
     checks.extend(credentials_checks(config, env))
+    checks.extend(mcp_checks(config, env))
     checks.extend(workload_profile_checks(config))
-    checks.extend(schedule_checks(config))
+    stored = stored_schedules(config)
+    checks.extend(schedule_checks(config, stored))
     # A github credential matters only when the GitHub integration is
     # configured; an unconfigured integration is a valid (GitHub-less)
     # setup, not a failure. A PAT or GitHub App credentials both satisfy it;
@@ -1210,7 +1340,7 @@ def collect_checks(
             )
         )
 
-    checks.extend(daemon_intake_checks(config))
+    checks.extend(daemon_intake_checks(config, stored))
     # daemon's chat bridge (only when a backend is configured)
     backend = config.chat_backend
     if backend is not None:

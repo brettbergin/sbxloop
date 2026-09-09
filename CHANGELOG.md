@@ -1,10 +1,281 @@
-# Changelog
-
-All notable changes to sbxloop are documented here. The project adheres to
-[Semantic Versioning](https://semver.org/) and both distributions (`sbxloop`,
-`sbxloop-worker`) release in lockstep.
-
 ## [Unreleased]
+
+### Added
+
+- **A verify command that cannot pass can now be re-authored instead of
+  ending the run.** The loop has always been able to *recognise* a check
+  that no amount of work can satisfy - the same command failing with
+  identical output across attempts and across approaches - and it has never
+  been able to do anything about one. The verify commands are
+  decomposer-authored, the builder is told it cannot edit them, and nothing
+  re-ran decompose, so the only lever was a fresh session against the same
+  impossible command. When no approach existed, the run was abandoned with
+  the work finished and every other check green.
+
+  A suspect check now escalates first, to one bounded re-author that sees
+  that command and no other. It may **replace** the check with one that
+  tests the same property and can pass, **drop** it when the property is not
+  testable in this environment at all (a running server, a rendering engine,
+  a deployed address), or **keep** it, which says the check is right and the
+  work is not - and falls through to exactly the fresh-session replan that
+  ran before. The rest of the task's checks are untouchable either way.
+
+  Guarded, because the phase is asked to edit the exam having just been told
+  a check is in its way: a replacement is held to the same mechanical lint a
+  decomposition is, a replacement that cannot fail whatever the workspace
+  contains is refused, and the command carrying the project's own gate may
+  be rewritten but never removed. Every change is reported on the run, so a
+  reviewer knows the exam moved and what stopped being tested. Budgeted by
+  `[budgets] max_verify_reauthors_per_task` (default 1); 0 restores the old
+  behaviour.
+
+### Fixed
+
+- **The re-authoring counter now reaches databases that already exist.**
+  `tasks.verify_reauthors` was added to the body of Alembic revision 0001
+  rather than to a revision of its own. 0001 had already shipped, and
+  Alembic does not re-run a revision a database is stamped at - so the
+  column reached a fresh install and nothing else. The daemon crash-looped
+  on the first `select(Task)` after upgrading (`no such column: tasks.verify_reauthors`), taking the run it was serving down with it, on
+  the very feature meant to rescue such runs.
+
+  Revision 0004 carries the column, and adds it only if it is absent, so an
+  installation recovered by hand with the shipped `ALTER` still upgrades.
+
+  The baseline is now frozen against `tests/fakes/baseline_0001.sql`, and a
+  database stamped at 0001 - the state every deployed installation is in -
+  is migrated to head and compared against the ORM models. Between them, a
+  schema change that skips a revision fails the suite instead of the field.
+
+- **`pkill` in a verify command is now rejected at plan time.** A check that
+  starts a server to probe it has to stop it again, and `pkill -f <pattern>`
+  is the obvious way to write that — but the pattern is matched against
+  every process's full command line, so one drawn from the command's own
+  text (a port, a binary name) reaches sibling commands and the agent's own
+  runtime as well as the server. The decomposer is told not to write them
+  and `verifylint` rejects them at JSON acceptance, alongside the existing
+  environment-mutation and network rules, so a violation costs one retry
+  with the rule quoted rather than a task's whole revision budget against a
+  check the builder is forbidden to edit. Killing a pid the command recorded
+  stays legal, and so does no cleanup at all: each verify command runs in a
+  process group of its own, and what it leaves running is reaped for it.
+
+- **A verify command could kill itself, and did.** Verify commands ran as
+  `sh -c '<the whole command>'` in the worker's own process group, which put
+  the command's text on a command line and its children in a group nobody
+  reaped. Both halves broke checks that were otherwise correct. A check that
+  started a dev server on a port and cleaned up with `pkill -f <port>`
+  matched the shell running it, because that shell's command line contained
+  the port: it SIGTERMed itself before reaching its own assertion and
+  reported a signal exit with no output — identically on every attempt, so
+  the loop flagged the check as unpassable and abandoned the run, with the
+  work complete and every other gate green. Separately, anything a command
+  backgrounded and did not kill kept running after the command returned,
+  holding its port against the next attempt and holding the captured pipe
+  open, so reading the command's output blocked until the whole job timed
+  out.
+
+  Each command now runs from a script file, so its text never reaches the
+  process table and a pattern kill reaches only what the command started; in
+  a session of its own, so whatever it leaves running is a process group the
+  worker tears down (SIGTERM, then SIGKILL) when the command returns or times
+  out; and with its output on a file rather than a pipe an orphan can hold
+  open.
+
+- **The Config screen showed `repr`, not values.** Floats carried a `.0`
+  tail every duration and interval in the config has (`60.0`, `14400.0`),
+  strings came wrapped in quotes (`'claude'`), bools were Python's
+  (`True`), an unset key spelled out `None`, and an empty string was an
+  empty cell. Values now read the way they are written in the file and
+  typed into the editor: `60`, `claude`, `true`, `—` for unset, `""` for
+  empty, a list as its items. A string that would be mistaken for another
+  type keeps its quotes, so `"60"` and `"true"` are never read as the
+  number or the bool, and whitespace collapses so a multi-line
+  commit-message template stays one row. The filter now matches what is on
+  screen rather than the `repr` behind it, and the value column is bounded
+  so the source column survives beside the console's rail at 120 columns.
+
+- **The Runs screen showed two columns.** Nine were defined — run, state,
+  stage, item, repo, title, PR, rounds, updated — but the state cell
+  carried its failure reason inline and unclipped, so a 409-character
+  `github op` error sized that column and pushed every other one off the
+  screen. The tab was an id and a state; the title, the pull request and
+  the age were all defined and none of them were visible.
+
+  The state is a word now. Its reason appears **in full** under the table
+  for the row the cursor is on, with the branch, the PR URL and whatever
+  exhausted the run — and it stays searchable by `/` even though it is no
+  longer on the row. Columns drop weakest-first as the terminal narrows
+  instead of overflowing, and each cell is held to its column's width, so
+  no single long value can take the space budgeted to the rest.
+
+- **Runs were ordered by the wrong clock.** The list came back
+  newest-*started* first while its last column showed when each run was
+  last *touched*: on the field host 9 of 47 runs sat in a different place
+  under the two orders, and a run that began on Tuesday and merged this
+  morning was far down a list whose own row said "2m ago". The limit was
+  applied to that order too, so a long-lived run could fall off the end
+  while it was still being worked on. `StateStore.recent_runs` orders and
+  limits by `updated_at`, and the screen pins the run in flight on top.
+
+### Added
+
+- **Runs shows what a run cost.** Turns spent and time worked, per run, in
+  the list — `StateStore.run_costs` folds them in one grouped query rather
+  than one per run. `p` opens a run's pull request; on a host with no
+  browser the outcome carries the URL, which is what an operator on the
+  other end of an ssh session needs.
+
+- **The Overview pages carry real analysis now.** They shipped filling
+  15–22% of the screen: five pages behind a rail, for content that would
+  have fitted on one. Each page gained the analysis the store could already
+  answer but nothing asked it, and fill is now 49–68% against a real week.
+
+  **Cost** says *which phase* burns the turns rather than only how many —
+  on the field host `build` is 64% of every turn — and how much context
+  each phase re-sends: `build` reads 1.2x what it writes, `execute` 37x.
+  It also carries the median and p90 turns per run, because one run being
+  22% of a week is invisible in a mean.
+
+  **Flow** gained how long work took to land, end to end: a median of 17
+  minutes against a p90 of 11 hours on the same week, which is the parked
+  time showing up where a person actually feels it.
+
+  **Health** gained where the loop went round again — `followup` retried 14
+  of 23 attempts, `review` 6 of 21 — plus the phase table, task revisions
+  and replans, and review/CI rounds.
+
+  **Summary** and every other page gained a week-over-week delta, a
+  day-by-day strip split by outcome, and one "biggest lever" line naming
+  whichever cost is furthest out of proportion.
+
+  `phases_between` now returns tokens, cache reads and retries per phase,
+  and `task_totals_between` is new; the fold reads the window before this
+  one so every headline can say whether it is better or worse.
+
+### Fixed
+
+- **Overview's page rail drew on top of the console's rail.** Both were
+  docked to the screen's left edge, and two widgets docked to the same edge
+  of one container overlay each other rather than stacking — so the page
+  rail covered Overview, Runs, Queue, Chat, Sandboxes and Daemon, leaving
+  only Config, Doctor and Help visible below it. The page rail now sits in
+  a `Horizontal` beside the page, in the space the docked rail leaves. A
+  test asserts the two rails' regions do not intersect: every content
+  assertion passed while the screen was unreadable, so geometry is the only
+  thing that catches this.
+
+### Added
+
+- **Overview reports how the loop has been performing.** The screen was
+  four panels — the run in flight, the queue, recent runs, who is waiting
+  on you — three of which have their own screen, and none of which answered
+  the question you open a console with. It is now a live line and five
+  pages behind Overview's own rail (`s` Summary, `f` Flow, `c` Cost, `t`
+  Time, `h` Health; `o` opens the window's costliest run), each stating its
+  finding in a sentence before drawing a bar.
+
+  Three things it insists on, each of which was a wrong answer first.
+  **Active is not elapsed:** a run's wall-clock is dominated by time spent
+  waiting for a human — on this project's own host active time has run at
+  about a sixth of elapsed — so both are carried and named, and the runs
+  that waited longest are listed. **Turns are the cost:** every turn
+  re-sends the session context, so turns lead and tokens-per-turn is the
+  number that moves when a prompt grows; the costliest runs are ranked by
+  name so an outlier is not averaged away. **A cancelled run is a decision,
+  not a failure:** it is counted and reported but kept out of the success
+  rate's denominator.
+
+  Code and workload runs are never blended — they differ by an order of
+  magnitude in turns and duration. `StateStore.runs_between` and
+  `phases_between` fold each window in one grouped pass, and
+  `sbxloop.tui.analytics` turns those rows into the report on a slow timer
+  of its own, so a growing store is not rescanned between console ticks.
+
+- **A navigation rail down the left of the console.** Every screen with the
+  key that reaches it, the one you are on marked, and a badge where a screen
+  you are *not* on wants attention: the queue's depth, unread
+  control-channel rows, the gates and holds waiting for a human. Clicking a
+  row is the same verb as pressing its key. The screens were reachable only
+  by number keys listed in a footer that also carries whatever the current
+  screen binds, so where you *are* and where you can *go* were mixed in with
+  what you can *do*; the rail is the map and the footer keeps its row for
+  the verbs. Below 90 columns the rail hides itself and the keys still reach
+  everything.
+
+  `sbxloop.tui.widgets.navrail.NAV` is the single source of the console's
+  shape — the rail renders it and the app builds its bindings from it, so a
+  screen cannot be reachable by key and missing from the map. The rail is
+  docked, so no screen composes it and no screen body moved.
+
+### Removed
+
+- **The console's file editor.** The Config screen no longer carries a
+  draft buffer, a `$EDITOR` hand-off or a whole-file save (`i`, `V`, `W`,
+  `ctrl+s`, `E`, `L` are gone with it, and so is the Edit tab). Popping a
+  file and leaving the operator to find the line is what per-key editing
+  replaced; a change no key describes is made by editing
+  `~/.sbxloop/config/sbxloop.toml` on the host. Every edit now starts from
+  the file as it is on disk, so there is no buffered draft to go stale and
+  a change made outside the console is never silently overwritten.
+
+### Fixed
+
+- **The console edited a file nothing read.** On a `~/.sbxloop` home
+  install, the Config screen anchored its editor to
+  `<the daemon's directory>/sbxloop.toml` while the Resolved tab resolved
+  its configuration from the directory the console was *started* in. Those
+  are two different roots, and neither is where the operator config lives
+  (`~/.sbxloop/config/sbxloop.toml`, the home layer the loader reads
+  whatever the working directory). So a save landed in a stray
+  `~/.sbxloop/sbxloop.toml`: the resolved row kept the old value however
+  often it was refreshed, editing the key again answered "already says
+  that" (the *draft* had changed and nothing else had), and the daemon —
+  which does read that stray file, as a layer *above* the operator config
+  — would silently pick the change up at its next restart while the
+  console still showed the old value.
+
+  The console now edits the home's `config/sbxloop.toml` and resolves from
+  the home too, so the file it writes is the file it reads and the file the
+  daemon reads. A `sbxloop.toml` sitting in the home is named on the Edit
+  tab as shadowing the operator config, and a per-key edit says when it
+  still wins. **If a console before this wrote to `~/.sbxloop/sbxloop.toml`,
+  move what it says into `~/.sbxloop/config/sbxloop.toml` and delete it** —
+  the daemon is reading it today.
+
+## [1.5.0] — 2026-09-06
+
+The 1.0 line, from the one-run redesign to the sbxloop home, cut as one
+minor release: every entry below shipped as a 1.0.x patch since 0.7.0 and
+is on the field host. The version jumps to 1.5 to mark the install and
+layout cutover (the home) as the boundary a host must cross with
+`sbxloop init --migrate`; see "The sbxloop home" under Changed and the
+"1.0 cutover" section for the two manual steps in this line.
+
+### Added
+
+- **The console edits configuration one setting at a time.** The Config
+  screen's Resolved tab is now the place changes are made, not just read.
+  Every setting is one addressable key — arrays of tables walked down to
+  `github.repos[1].deliver_base`, free-form maps down to
+  `sandbox.env.RAILS_ENV`, so nothing is a blob you have to find in a file
+  — and `Enter` on a row (or `e`) opens that key alone: what it accepts
+  (its type, the set a `Literal` allows, the bounds the model carries),
+  what it holds now and which layer is answering, and the file the answer
+  is written to. The widget follows the type — a picker for a bool or a
+  fixed set, one item per line for a list, a line of text otherwise — so a
+  string needs no quotes and a bad value is named before the loader sees
+  it; `^U` unsets the key instead. `a` adds a key by dotted path (an index
+  one past the end appends an entry), and `Enter` on the Repos tab narrows
+  the view to that repository's keys.
+
+  The write goes into the draft at that path and nowhere else, **every
+  comment in the file kept** (`tomlkit` round-trips it), and then through
+  the same gate the whole-file editor uses: the real loader validates the
+  entire draft, and only a draft it accepts is saved — atomically, with the
+  timestamped backup, and the restart offered. A key the environment or the
+  home config also sets is still written, and the verdict says which layer
+  wins and what the loop actually sees.
 
 ### Changed
 

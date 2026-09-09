@@ -15,7 +15,7 @@ import pytest
 from sbxloop_worker.backends import BackendUnavailableError, codex_runtime, get_backend
 from sbxloop_worker.backends.codex import CodexBackend
 from sbxloop_worker.backends.codex_runtime import authenticated_client
-from sbxloop_worker.protocol import Event, HostToolResponse, HostToolSpec, JobRequest
+from sbxloop_worker.protocol import Event, HostToolResponse, HostToolSpec, JobRequest, McpServerSpec
 
 
 def job(**overrides: Any) -> JobRequest:
@@ -236,6 +236,37 @@ def test_workload_replaces_persona_and_returns_final_json(sdk: Any, emitted: Any
     )
     assert result.output_json == {"ok": True}
     assert sdk.clients[0].thread_params[0]["baseInstructions"] == "You are an operator."
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        McpServerSpec(
+            name="private-server",
+            command="private-command",
+            args=["secret-value"],
+        ),
+        McpServerSpec(
+            name="private-server",
+            transport="http",
+            url="https://private.example.com/secret-value",
+        ),
+        McpServerSpec(
+            name="private-server",
+            transport="sse",
+            url="https://private.example.com/secret-value",
+        ),
+    ],
+)
+def test_native_mcp_is_rejected_before_sdk_startup(
+    sdk: Any, emitted: Any, server: McpServerSpec
+) -> None:
+    with pytest.raises(RuntimeError, match="native MCP") as error:
+        CodexBackend().run_session(job(mcp_servers=[server]), emitted[1])
+    assert sdk.clients == []
+    assert sdk.calls == []
+    assert "private" not in str(error.value)
+    assert "secret-value" not in str(error.value)
 
 
 def test_concierge_exposes_only_host_tools_and_denies_stale_builtins(
