@@ -1,7 +1,7 @@
 """The agent backend descriptor (#617).
 
 ``[agent] backend`` picks which SDK the agent sandbox runs — GitHub Copilot
-(the default) or Claude — and everything on the host that is *about* that
+(the default), Claude or Codex — and everything on the host that is *about* that
 choice reads it from here: which env var carries the credential and which
 host sbx binds it to, which hosts the credential path must reach, what the
 credential is called when it is missing, and where its model ids come from.
@@ -45,6 +45,12 @@ COPILOT_TOKEN_HOST = "api.github.com"  # nosec B105 - hostname, not a secret
 # spawns.
 ANTHROPIC_TOKEN_ENV = "ANTHROPIC_API_KEY"  # nosec B105 - env var name, not a secret
 ANTHROPIC_TOKEN_HOST = "api.anthropic.com"  # nosec B105 - hostname, not a secret
+
+# The Codex backend authenticates the bundled app server with this API key
+# over its local JSON-RPC transport. No account login or host auth store is
+# imported into the sandbox.
+OPENAI_TOKEN_ENV = "OPENAI_API_KEY"  # nosec B105 - env var name, not a secret
+OPENAI_TOKEN_HOST = "api.openai.com"  # nosec B105 - hostname, not a secret
 
 
 @dataclass(frozen=True)
@@ -131,9 +137,29 @@ CLAUDE = AgentBackend(
     models_source="the Anthropic Models API",
 )
 
+CODEX = AgentBackend(
+    name="codex",
+    label="codex",
+    token_env=OPENAI_TOKEN_ENV,
+    token_host=OPENAI_TOKEN_HOST,
+    token_hosts=(OPENAI_TOKEN_HOST,),
+    credential="an OpenAI API key",
+    create_url="https://platform.openai.com/api-keys",
+    missing_token_detail=(
+        "not set — create an OpenAI API key and export "
+        f'{OPENAI_TOKEN_ENV}, or switch [agent] backend back to "copilot"'
+    ),
+    missing_token_error=(
+        f'{OPENAI_TOKEN_ENV} is not set on the host but [agent] backend = "codex". '
+        "Create an OpenAI API key and export it, or switch back to "
+        'backend = "copilot".'
+    ),
+    models_source="the Codex SDK",
+)
+
 #: Every backend ``[agent] backend`` accepts, default first. The config
 #: Literal and ``daemon.discord_format.KNOWN_BACKENDS`` name the same set.
-BACKENDS: tuple[AgentBackend, ...] = (COPILOT, CLAUDE)
+BACKENDS: tuple[AgentBackend, ...] = (COPILOT, CLAUDE, CODEX)
 
 _BY_NAME = {backend.name: backend for backend in BACKENDS}
 

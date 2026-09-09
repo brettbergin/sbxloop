@@ -21,7 +21,7 @@ Every run gets an isolated microVM agent sandbox — plus, when the GitHub integ
 
 | Sandbox                 | Credential                                                                                                                                                                                                  | Purpose                                                                                                                                                                                                                                    |
 | ----------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `sbxloop-<run>-agent`   | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission) — or `ANTHROPIC_API_KEY` with `[agent] backend = "claude"` ([Agent backends](#agent-backends-copilot-or-claude))                   | Runs the configured agent SDK — [GitHub Copilot SDK](https://github.com/github/copilot-sdk) by default, or the Claude Agent SDK. All model calls and tool executions happen inside this VM.                                                |
+| `sbxloop-<run>-agent`   | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission) — `ANTHROPIC_API_KEY` for Claude or `OPENAI_API_KEY` for Codex ([Agent backends](#agent-backends-copilot-claude-or-codex))         | Runs the configured agent SDK — [GitHub Copilot SDK](https://github.com/github/copilot-sdk) by default, the Claude Agent SDK or the Python Codex SDK. All model calls and tool executions happen inside this VM.                           |
 | `sbxloop-<run>-github`  | `GH_TOKEN` (fine-grained PAT with the permissions in [docs/permissions.md](docs/permissions.md)) — or a GitHub App installation token, host-minted and auto-refreshed ([GitHub App auth](#github-app-auth)) | Performs the GitHub operations (branch, PR, review, CI polling, merge, issue labels) against the one configured repository. Only provisioned when `[github] repo` is set.                                                                  |
 | `sbxloop-<run>-service` | The `[[credentials]]` a run was granted by name — operator secrets, each bound to one host (#765)                                                                                                           | Makes the authenticated requests the agent asks for through its `call_service` tool, one fixed `service.http` op at a time, redacting the credential from what comes back. Only provisioned for a run granted a credential; none is today. |
 
@@ -44,7 +44,7 @@ interim hardening proposed in #592). Sandboxes are cattle: they are
 torn down at run end and re-provisioned on resume, while all durable state
 (workspace, SQLite checkpoints, event log) lives on the host.
 
-### Agent backends: Copilot or Claude
+### Agent backends: Copilot, Claude or Codex
 
 The SDK that runs the agent personas is configurable (#533) — Copilot stays
 the default with unchanged behaviour:
@@ -59,6 +59,7 @@ backend = "claude"   # default: "copilot"
 | --------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
 | `copilot` | `COPILOT_GITHUB_TOKEN` (PAT, *Copilot Requests*)                             | `github-copilot-sdk` (worker `[copilot]` extra; wheels bundle the Copilot CLI)                                                       |
 | `claude`  | `ANTHROPIC_API_KEY` ([console](https://console.anthropic.com/settings/keys)) | `claude-agent-sdk` (worker `[claude]` extra) + the Claude Code CLI, which provisioning installs (Node + `@anthropic-ai/claude-code`) |
+| `codex`   | `OPENAI_API_KEY` ([API keys](https://platform.openai.com/api-keys))          | Python `openai-codex==0.147.0` (worker `[codex]` extra), including its matching Codex CLI runtime; no Node dependency                |
 
 Everything else is backend-agnostic: the top-level `model` key names the
 model the chosen backend runs (`"auto"` lets it pick its default), every
@@ -78,6 +79,20 @@ the backend reads one descriptor (`sbxloop.backends`, #617): `sbxloop doctor` ch
 Copilot-SDK rows under claude), `sbxloop secrets list|clean|rotate` manage
 that credential's registration, `sbxloop list-models` lists that backend's
 models, and `--model` help says so.
+
+To use Codex, set `[agent] backend = "codex"` and put `OPENAI_API_KEY` in
+the home's secrets file. Provisioning installs the Python SDK only in the
+agent sandbox and allows `api.openai.com`. Code phases, workloads and the
+concierge use the same worker protocol and chronology.
+
+Codex uses worker-controlled shell/file tools and host tools so the
+tool-call budget is checked before execution. Its read-only reviewers get
+read/list/search tools; the concierge gets only its host tools. The
+interactive Codex tool catalog, plugins and subscription login are not
+enabled. The SDK/runtime pair is pinned because dynamic tool registration
+and native tool suppression use experimental protocol fields. See the
+[design and implementation plan](docs/codex-backend.md) for the contract and
+the **field-unverified** live-sandbox checks.
 
 ## Quickstart
 
@@ -151,6 +166,11 @@ sbxloop list-models --json       # machine-readable, for scripting
 Under `[agent] backend = "claude"` the same command asks the Anthropic Models
 API with `ANTHROPIC_API_KEY` (id, name, release date; no SDK needed on the
 host).
+
+Under `[agent] backend = "codex"`, install the optional host
+`sbxloop[codex]` extra for `list-models`. It uses `OPENAI_API_KEY` and the
+Codex model catalogue, including supported reasoning levels, without
+starting a model turn. Running jobs needs no host SDK extra.
 
 Or as a library:
 
@@ -2059,6 +2079,7 @@ The notable knobs:
 
 | Key                                                                            | Default                                         | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | ------------------------------------------------------------------------------ | ----------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `[agent] backend`                                                              | `copilot`                                       | Agent SDK: `copilot`, `claude` or `codex`. Codex uses `OPENAI_API_KEY` and the worker codex extra; see Agent backends.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
 | `model`                                                                        | `auto`                                          | Model id for the configured `[agent] backend` (`--model` overrides per run; `sbxloop list-models` lists them).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 | `keep_sandboxes` / `keep_on_failure`                                           | `false`                                         | Sandbox retention for debugging (see above).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `secret_strategy`                                                              | `proxy`                                         | `proxy` keeps token values out of the VM; `plain-env` skips the sbx proxy — tokens are piped per job over worker stdin when this sbx supports it, else written to an in-VM env file. On current sbx the cached exec-visibility verdict makes the non-proxy / env-file fallback the common case even under `proxy`, not an edge case (#46; interim hardening #592).                                                                                                                                                                                                                                                          |

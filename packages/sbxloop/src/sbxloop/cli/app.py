@@ -1308,7 +1308,8 @@ def secrets_rotate(
             "--prompt",
             help="Read the new token from a hidden interactive prompt instead of "
             "the configured agent backend's environment variable "
-            "(COPILOT_GITHUB_TOKEN, or ANTHROPIC_API_KEY under the claude backend) / ./.env.",
+            "(COPILOT_GITHUB_TOKEN, ANTHROPIC_API_KEY, or OPENAI_API_KEY, "
+            "according to [agent] backend) / ./.env.",
         ),
     ] = False,
     verify: Annotated[
@@ -1323,7 +1324,7 @@ def secrets_rotate(
     """Rotate the agent credential's sbx registration in one step.
 
     Which credential follows `[agent] backend` (the Copilot token by
-    default, the Anthropic key under the claude backend). Replaces the
+    default, the Anthropic key for claude, the OpenAI key for codex). Replaces the
     existing registration (wherever its scope) with a global one carrying
     the canonical host binding — the rm + set-custom dance provisioning
     would otherwise perform mid-run. The token is read from the
@@ -2873,7 +2874,7 @@ def list_models(
 
     Queries the backend directly on the host (no sandbox) with the same
     credential agent sessions use — the Copilot SDK by default, the
-    Anthropic Models API under `[agent] backend = "claude"` — so the ids
+    Anthropic Models API for claude, the Codex SDK for codex — so the ids
     shown here are valid values for `model` in sbxloop.toml and
     `sbxloop run --model`.
     """

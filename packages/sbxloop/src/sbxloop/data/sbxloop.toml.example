@@ -55,7 +55,10 @@ secret_strategy = "proxy"
 # COPILOT_GITHUB_TOKEN; "claude" runs the Claude Agent SDK (the Claude Code
 # harness) and needs ANTHROPIC_API_KEY — provisioning then installs Node and
 # the Claude Code CLI into the agent sandbox and allows api.anthropic.com
-# egress. Either way the credential is injected into the agent sandbox
+# egress. "codex" runs the Python Codex SDK with its pinned CLI runtime and
+# needs OPENAI_API_KEY; provisioning allows api.openai.com. Codex uses
+# worker-controlled tools so read-only review and tool-call limits apply.
+# The chosen credential is injected into the agent sandbox
 # alone, and the top-level `model` names the model the chosen backend runs.
 # backend = "copilot"
 

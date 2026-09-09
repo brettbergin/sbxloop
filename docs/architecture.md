@@ -350,6 +350,19 @@ are listed — lives on one descriptor per backend in `sbxloop.backends`
 (#617); provisioning, doctor, `sbxloop secrets`, `sbxloop list-models` and
 sandbox pruning read it rather than assuming Copilot.
 
+The `codex` descriptor selects the Python `openai-codex` SDK and
+`OPENAI_API_KEY`, bound to `api.openai.com`. The worker's `codex` extra pins
+both the SDK and its bundled CLI runtime. `CodexClient` talks to that
+runtime over stdio inside the agent VM; it creates no listener. Native
+environment tools are disabled and worker-controlled dynamic tools enforce
+permissions and the tool-call ceiling before execution. Host tools retain
+the event/file relay. Read-only Codex sessions expose file read, directory
+listing and text search; the concierge exposes only its host tools. The
+adapter isolates Codex state/configuration from the target checkout and
+uses an ephemeral API-key credential store. See
+[the Codex backend design](codex-backend.md), including the experimental
+API pin and **field-unverified** live-sandbox checks.
+
 Under the default `proxy` secret strategy, sbxloop first attempts sbx's
 keychain-backed injection, where **token values never enter the VM**.
 Field reality (sbx 0.35): that injection feeds only the interactive agent

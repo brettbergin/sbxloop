@@ -1150,6 +1150,7 @@ class TestShutdownAndRecovery:
         assert secret_calls == [
             {"host": "api.github.com", "env": "COPILOT_GITHUB_TOKEN", "sandbox": agent},
             {"host": "api.anthropic.com", "env": "ANTHROPIC_API_KEY", "sandbox": agent},
+            {"host": "api.openai.com", "env": "OPENAI_API_KEY", "sandbox": agent},
             {"service": "github", "sandbox": gh},
         ]
         assert h.runs == [("r_live", True)]
@@ -1182,7 +1183,7 @@ class TestShutdownAndRecovery:
         h.loop.recover()
         h.loop.tick()
         # One agent secret_rm per backend (#617) plus the github service secret.
-        assert len(calls) == 3
+        assert len(calls) == 4
         assert h.runs == [("r_live", True)]
 
     @staticmethod

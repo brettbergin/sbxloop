@@ -218,7 +218,7 @@ UNKNOWN_BACKEND = "unknown"
 UNKNOWN_MODEL = "unknown"
 #: The agent backends the config accepts (config.AgentConfig.backend). Kept
 #: literal here so this module stays importable without the config package.
-KNOWN_BACKENDS = ("copilot", "claude")
+KNOWN_BACKENDS = ("copilot", "claude", "codex")
 
 
 def agent_model_label(backend: object, model: object) -> str:

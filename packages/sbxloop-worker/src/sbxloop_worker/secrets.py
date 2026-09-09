@@ -23,9 +23,13 @@ GITHUB_TOKEN_PREFIXES = ("gho_", "ghu_", "ghp_", "ghs_", "github_pat_")
 # Anthropic API keys (the claude agent backend, #533).
 ANTHROPIC_TOKEN_PREFIXES = ("sk-ant-",)
 
+# OpenAI inference API keys (the Codex backend), including project and
+# service-account keys. Proxy sentinels are still classified first.
+OPENAI_TOKEN_PREFIXES = ("sk-",)
+
 # Every credential shape a sandbox may legitimately hold; what the
 # visibility/shadow probes classify as "a real token".
-TOKEN_PREFIXES = (*GITHUB_TOKEN_PREFIXES, *ANTHROPIC_TOKEN_PREFIXES)
+TOKEN_PREFIXES = (*GITHUB_TOKEN_PREFIXES, *ANTHROPIC_TOKEN_PREFIXES, *OPENAI_TOKEN_PREFIXES)
 
 # sbx's proxy placeholders — the values we will override an existing
 # environment variable for. ``sbx-cs-…`` is the custom-secret shape;
@@ -56,8 +60,8 @@ def is_sbx_sentinel(value: str) -> bool:
 
 def shell_token_case() -> str:
     """The `case` pattern a probe uses to classify a value inside the VM,
-    kept in step with :data:`TOKEN_PREFIXES` (GitHub shapes plus Anthropic
-    API keys). Shape-mimicking sentinels match these prefixes too — probes
+    kept in step with :data:`TOKEN_PREFIXES` (GitHub, Anthropic and OpenAI
+    credentials). Shape-mimicking sentinels match these prefixes too — probes
     must test :func:`shell_sentinel_case` FIRST."""
     return "|".join(f"{prefix}*" for prefix in TOKEN_PREFIXES)
 
@@ -84,6 +88,8 @@ _REDACTION_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?:gho_|ghu_|ghp_|ghs_|github_pat_)[A-Za-z0-9_]{8,}"),
     # Anthropic API keys (the claude agent backend, #533).
     re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}"),
+    # OpenAI inference keys, including project/service-account prefixes.
+    re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_\-]{8,}"),
     # sbx secret-proxy sentinels.
     re.compile(rf"{SBX_SENTINEL_PREFIX}{_TOKEN_CHARS}{{4,}}"),
     # AWS access key ids.

@@ -91,7 +91,6 @@ from sbxloop.sbx.sandbox import (
     Sandbox,
 )
 from sbxloop.sbx.secretstate import (
-    ANTHROPIC_TOKEN_HOST,
     custom_rm_candidates,
     service_rm_candidates,
     set_secret_replacing,
@@ -324,7 +323,7 @@ def agent_policy_allows(
             # The repository's own GitHub (#623): github.com is in the
             # constant above; an Enterprise Server host is not.
             *config.github.allow_domains,
-            *((ANTHROPIC_TOKEN_HOST,) if claude else ()),
+            *backends.backend_for(config).token_hosts,
             *baseline_allows((*PROMPT_ADVERTISED_DOMAINS, *installers), config.policy.deny),
             # Operator-declared hosts: a private registry the operator
             # configured is reachable like extra_allow_domains is, deny or
@@ -561,7 +560,7 @@ class Provisioner:
         explicit value wins over a derived one), and the loop's own
         selector last so nothing an operator writes can shadow it. The
         worker resolves its backend from ``SBXLOOP_WORKER_BACKEND`` (default
-        copilot), so only the claude backend needs it delivered;
+        copilot), so other backends need it delivered;
         ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`` keeps the Claude Code
         CLI hermetic — no telemetry or auto-update calls to hosts the
         balanced network policy would only refuse. Nothing secret goes
@@ -573,8 +572,9 @@ class Provisioner:
             **registries.offline_env(self.config.credentialed_registries_for(repo)),
             **self.config.sandbox_env_for(repo),
         }
+        if not self.backend().is_default:
+            env["SBXLOOP_WORKER_BACKEND"] = self.agent_backend()
         if self.agent_backend() == "claude":
-            env["SBXLOOP_WORKER_BACKEND"] = "claude"
             env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
         return env
 

@@ -45,7 +45,7 @@ from pydantic import (
     model_validator,
 )
 
-from sbxloop.backends import ANTHROPIC_TOKEN_ENV, COPILOT_TOKEN_ENV
+from sbxloop.backends import ANTHROPIC_TOKEN_ENV, COPILOT_TOKEN_ENV, OPENAI_TOKEN_ENV
 from sbxloop.errors import ConfigError
 from sbxloop.ids import DEFAULT_BRANCH_PREFIX
 from sbxloop.log import LogFormat, LogLevel, get_logger
@@ -67,7 +67,14 @@ RESERVED_ENV_KEYS = frozenset({"worker_backend", "echo_script", "home"})
 # clobber the run's credential or be clobbered silently, and neither is a
 # setting.
 LOOP_MANAGED_ENV = frozenset(
-    {"GH_TOKEN", "GITHUB_TOKEN", "GH_REPO", COPILOT_TOKEN_ENV, ANTHROPIC_TOKEN_ENV}
+    {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_REPO",
+        COPILOT_TOKEN_ENV,
+        ANTHROPIC_TOKEN_ENV,
+        OPENAI_TOKEN_ENV,
+    }
 )
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -1851,13 +1858,15 @@ class AgentConfig(_ConfigModel):
     Claude Agent SDK — the Claude Code harness — and needs
     ``ANTHROPIC_API_KEY`` on the host; provisioning installs Node and the
     Claude Code CLI into the agent sandbox and allows ``api.anthropic.com``
-    egress. Either way the credential is injected into the agent sandbox
-    alone, and the top-level ``model`` key names the model the chosen
-    backend runs (``"auto"`` lets the backend pick its default).
+    egress. ``codex`` runs the Codex Python SDK and its bundled runtime with
+    ``OPENAI_API_KEY``, reaching ``api.openai.com``. The credential is
+    injected into the agent sandbox alone, and the top-level ``model`` key
+    names the model the chosen backend runs (``"auto"`` lets the backend
+    pick its default).
     An unknown value fails config loading with the accepted choices named.
     """
 
-    backend: Literal["copilot", "claude"] = "copilot"
+    backend: Literal["copilot", "claude", "codex"] = "copilot"
 
 
 # Where a workload's result may go when the run publishes (#759 delivers
