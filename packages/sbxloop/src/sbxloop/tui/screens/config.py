@@ -33,6 +33,7 @@ from textual.notifications import SeverityLevel
 from textual.widgets import Input, TabbedContent, TabPane
 from textual.worker import get_current_worker
 
+from sbxloop.backends import backend_for
 from sbxloop.cli.doctor import stored_schedules
 from sbxloop.cli.policyview import PolicyView, policy_view
 from sbxloop.cli.workloadview import NO_PROFILE_NOTE, ProfileView, profile_views
@@ -49,6 +50,7 @@ from sbxloop.tui.configedit import (
 from sbxloop.tui.screens.base import ConsoleScreen
 from sbxloop.tui.screens.configvalue import ValueEdit, ValueScreen
 from sbxloop.tui.screens.modals import ConfirmScreen, TextPromptScreen
+from sbxloop.tui.screens.modelvalue import ModelScreen
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop.tui.widgets.tables import ConsoleTable
 
@@ -383,16 +385,19 @@ class ConfigScreen(ConsoleScreen):
         spec = configkeys.describe(dotted)
         value = self.flat.get(dotted)
         source = configkeys.source_for(dotted, self.sources) if dotted in self.flat else "unset"
-        self.app.push_screen(
-            ValueScreen(
+        args: dict[str, Any] = {"source": source, "target": str(self.path), "in_file": in_file}
+        screen = (
+            ModelScreen(
                 spec,
                 value,
-                source=source,
-                target=str(self.path),
-                in_file=in_file,
-            ),
-            self._key_edited,
+                **args,
+                home=self.console_app.deps.home,
+                backend=backend_for(self.config),
+            )
+            if self.config is not None and configkeys.is_model_key(dotted)
+            else ValueScreen(spec, value, **args)
         )
+        self.app.push_screen(screen, self._key_edited)
 
     def file_text(self) -> str:
         """The operator config as it is on disk right now. There is no
@@ -447,7 +452,7 @@ class ConfigScreen(ConsoleScreen):
         if self.path is not None:
             self.console_app.perform(
                 actions.save_config(self.console_app.deps, self.path, text, key=edit.path),
-                on_success=self._saved,
+                on_success=lambda: self._saved(edit.path),
             )
 
     def _answered_by(self, edit: ValueEdit, verdict: Verdict) -> tuple[str | None, SeverityLevel]:
@@ -471,9 +476,14 @@ class ConfigScreen(ConsoleScreen):
             "warning",
         )
 
-    def _saved(self) -> None:
+    def _saved(self, key: str = "") -> None:
         self._file_status()
         self.load()
+        if configkeys.is_model_key(key):
+            self.app.notify(
+                "Model settings refresh before the next phase or concierge turn.", title="config"
+            )
+            return
 
         def decided(restart: bool | None) -> None:
             if restart:

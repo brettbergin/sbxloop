@@ -1318,7 +1318,7 @@ persisting — a crash and a `kill -9` look identical to the store — and
 1. rehydrates the config persisted at run creation (tokens still come from
    the current environment; the home stays the one that located the run;
    the `keep_sandboxes`/`keep_on_failure` debug toggles stay resume-time
-   choices) and pins the workspace from the `runs` table — editing config between
+   choices; model settings refresh at each new phase) and pins the workspace from the `runs` table — editing config between
    start and resume, or resuming from another directory, cannot silently
    change budgets/toggles or relocate the workspace. Any difference from
    the current on-disk config is reported as a `run.config_drift` event,
@@ -1329,6 +1329,65 @@ persisting — a crash and a `kill -9` look identical to the store — and
    is idempotent: the branch is force-moved and the open PR reused; a
    review that never committed its verdict runs again). A phase whose
    result was never committed re-runs from its start; nothing is replayed.
+
+### Model policy at phase boundaries
+
+`agentmodels.py` resolves the eight phase keys independently from persona
+labels (the operator plans and executes under different keys). Every request
+keeps the run's single backend. Selection is run `--model`, repository role,
+global role, then the top-level fallback. Concierge resolution has no run or
+repository override.
+
+Loaded configs carry their original discovery directory and an in-memory
+copy of environment overrides; only the directory and explicit run override
+are serialized, never environment values. Resume adopts the current environment
+and keeps the original home and source directory. `refreshed_models` loads those
+layers for every new phase, copies only model fields onto the pinned run config,
+and fails closed on malformed config or a changed backend. Directly constructed
+configs have no discovery directory and stay under their embedding caller's
+control. Per-run copies prevent repository overrides leaking across workers.
+
+JSON repair shares one selection with the original attempt. Review response
+checkpoints also retain that selection and restore the completed responses'
+session identities after a restart. Legacy response checkpoints inherit the
+run's original top-level model. A provider recovery
+checkpoint records `requested_model` (nullable migration `0006` for old rows).
+Recovery may restore that model only if the rest of the semantic job identity
+matches; changing a model cannot bypass a credential hold or replay a different
+job. The old request completes before a new phase adopts new policy.
+
+Build and execute phase outputs record the session's requested model. Resume
+loads this mapping and only reuses a session with a known matching model; a
+change or legacy unknown identity starts fresh with the ordinary task brief,
+prior reports, feedback, and workspace intact. Codex also includes the requested
+model in its capability fingerprint. Concierge stores its session model identity
+beside its session id, rotates on change, and defers rotation during interrupted
+call recovery.
+
+The host stamps `agent_phase`, `requested_model`, and `model_source` on agent
+events without overwriting the SDK's reported `model`. Usage groups phase and
+reported model separately from persona totals, so `operator_plan` and
+`operator_execute` remain distinguishable. Status resolves current policy for
+active runs; historical headlines label a snapshot as the initial fallback.
+Model ids are provider-owned strings; catalogue misses are diagnostic rather
+than a closed validation list.
+
+`modelcatalog.py` caches successful host-side `list-models` discovery under
+`SbxloopHome.model_catalogs`, one JSON file per backend. The bounded schema
+stores only picker metadata and a timestamp; atomic replacement keeps a failed
+or empty refresh from destroying the last successful result. Agent worker
+installation and concierge readiness trigger a background refresh when the
+catalog is missing or at least one day old. An in-process lock deduplicates
+automatic discovery, with a five-minute retry floor. No catalog lookup adds
+model turns or changes the run trail, and provisioning does not wait for it.
+The same optional host SDKs and credentials as `list-models` are required.
+
+The TUI's `ModelScreen` loads the current backend's cache, filters names and
+slugs locally, and returns the existing `ValueEdit` to the validated config
+save path. Refresh runs in a Textual worker, keeping the cached choices usable
+while discovery is pending or unavailable. Inheritance and `auto` are separate
+choices; custom input is an explicit action. Provider-disabled entries cannot
+be picked, and a configured alias absent from the catalog remains visible.
 
 ### Run reconciliation
 

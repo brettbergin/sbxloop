@@ -23,12 +23,21 @@ from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import TaskSpec
 from sbxloop.engine.store import StateStore
+from sbxloop.errors import SbxloopError
 from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import ExecResult, SandboxInfo
 from sbxloop.tui.app import SbxloopTui
 from sbxloop.tui.runner import RunOutcome
 from sbxloop_worker.protocol import Event
+
+
+@pytest.fixture(autouse=True)
+def no_live_model_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unavailable(*args: Any, **kwargs: Any) -> None:
+        raise SbxloopError("Model discovery is unavailable in this test.")
+
+    monkeypatch.setattr("sbxloop.modelcatalog.fetch_backend_rows", unavailable)
 
 
 class FakeCtl:

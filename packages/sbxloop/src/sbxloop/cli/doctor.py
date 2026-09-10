@@ -28,6 +28,7 @@ from sqlalchemy.exc import SQLAlchemyError
 
 import sbxloop
 from sbxloop import toolchains
+from sbxloop.agentmodels import model_for_phase, model_plan
 from sbxloop.backends import backend_for
 from sbxloop.config import Config, MergeMethod, RepoConfig, load_config, load_config_with_sources
 from sbxloop.engine.landing import allowed_merge_methods, resolve_merge_method
@@ -1399,7 +1400,7 @@ def collect_checks(
             Check(
                 "chat concierge",
                 has_token,
-                f"model {config.concierge.model or config.model}, "
+                f"model {model_for_phase(config, 'concierge').model}, "
                 f"{config.concierge.timeout_s:.0f}s per message: "
                 + (
                     f"{token_env} present"
@@ -1409,6 +1410,20 @@ def collect_checks(
                 hard=False,
             )
         )
+
+    # Model policy is a local diagnostic, not a paid capability probe.
+    for model_repo in (None, *(entry.repo for entry in config.github.repos)):
+        for phase, choice in model_plan(config, repo=model_repo).items():
+            if model_repo is not None and not choice.source.startswith("github.repos["):
+                continue
+            checks.append(
+                Check(
+                    f"model {model_repo + ':' if model_repo else ''}{phase}",
+                    True,
+                    f"{agent.name} · {choice.model} ({choice.source})",
+                    hard=False,
+                )
+            )
 
     # worker wheel
     wheel = resolve_worker_wheel()

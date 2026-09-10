@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from sbxloop.config import Config, load_config
 from sbxloop.engine.phases import PhaseRunner, clip_diff
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import InvalidOutputTwice
@@ -28,8 +30,12 @@ class RecoveringAgent(ScriptedAgent):
         super().__init__(responses)
         self.recovery = recovery
 
+    @property
+    def provider_recovery(self) -> ProviderRecovery:
+        return self.recovery
+
     def submit(
-        self, job: JobRequest, *, agent: str | None = None, tool_handler: Any = None
+        self, job: JobRequest, *, agent: str | None = None, tool_handler: Any = None, **kwargs: Any
     ) -> JobResult:
         def transport(actual: JobRequest) -> JobResult:
             return super(RecoveringAgent, self).submit(
@@ -39,8 +45,10 @@ class RecoveringAgent(ScriptedAgent):
         return self.recovery.submit(job, transport, EventBus())
 
 
-def persisted_runner(agent: ScriptedAgent, workspace: Path, store: StateStore) -> PhaseRunner:
-    phases = runner(agent, workspace)
+def persisted_runner(
+    agent: ScriptedAgent, workspace: Path, store: StateStore, config: Config | None = None
+) -> PhaseRunner:
+    phases = runner(agent, workspace, config)
     phases.store = store
     return phases
 
@@ -65,9 +73,13 @@ def throttled() -> dict[str, Any]:
 
 
 @pytest.mark.parametrize("held_attempt", [1, 2])
+@pytest.mark.parametrize("change_model", [False, True])
 def test_cooldown_resumes_the_same_repair_after_reopening_store(
-    tmp_path: Path, held_attempt: int
+    tmp_path: Path, held_attempt: int, change_model: bool
 ) -> None:
+    path = tmp_path / "sbxloop.toml"
+    path.write_text('model = "fallback"\n[agent.models]\nreview = "first"\n')
+    config = load_config(tmp_path, env={})
     database = tmp_path / "state.db"
     store = StateStore(database)
     now = [1000.0]
@@ -89,20 +101,25 @@ def test_cooldown_resumes_the_same_repair_after_reopening_store(
     agent = RecoveringAgent(responses, manager)
     try:
         with pytest.raises(ProviderHeldError):
-            review(persisted_runner(agent, tmp_path, store))
+            review(persisted_runner(agent, tmp_path, store, config))
         hold = manager.hold()
         assert hold is not None and hold.next_at is not None
         now[0] = hold.next_at
         store.close()
         store = StateStore(database)
         agent.recovery = ProviderRecovery(store, "claude", clock=lambda: now[0])
-        resumed = persisted_runner(agent, tmp_path, store)
+        if change_model:
+            path.write_text('model = "new-fallback"\n[agent.models]\nreview = "next"\n')
+        restored_config = Config.model_validate_json(config.model_dump_json())
+        restored_config._model_env = {}
+        resumed = persisted_runner(agent, tmp_path, store, restored_config)
 
         result = review(resumed)
 
         assert result.findings[0].body == MAJOR["body"]
         assert result.findings[0].severity == "major"
         assert len(agent.jobs) == held_attempt + 2
+        assert {job.model for job in agent.jobs} == {"first"}
         assert sum(job.available_tools is None for job in agent.jobs) == 1
         for job in agent.jobs[1:]:
             assert job.available_tools == [] and job.host_tools == [] and job.mcp_servers == []
@@ -149,6 +166,66 @@ def test_unparseable_correction_stays_spent_after_provider_recovery(tmp_path: Pa
         assert sum(job.available_tools is None for job in agent.jobs) == 1
         assert sum(row.input_tokens or 0 for row in store.phase_attempts("r1")) == 142
         assert not agent.responses
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("completed_responses", [1, 2])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_restart_keeps_checkpoint_model_and_session_after_config_edit(
+    tmp_path: Path, completed_responses: int, legacy: bool
+) -> None:
+    path = tmp_path / "sbxloop.toml"
+    path.write_text('model = "first"\n' if legacy else '[agent.models]\nreview = "first"\n')
+    config = load_config(tmp_path, env={})
+    invalid = verdict({**MAJOR, "category": "unsupported"})
+
+    class RestartingAgent(ScriptedAgent):
+        interrupted = False
+
+        def submit(self, job: JobRequest, **kwargs: Any) -> JobResult:
+            if len(self.jobs) == completed_responses and not self.interrupted:
+                self.interrupted = True
+                raise RuntimeError("host restarted")
+            return super().submit(job, **kwargs)
+
+    agent = RestartingAgent(
+        [reply(invalid, session_id=f"response-{index}") for index in range(completed_responses)]
+        + [reply(verdict(MAJOR))]
+    )
+    database = tmp_path / "state.db"
+    store = StateStore(database)
+    try:
+        with pytest.raises(RuntimeError, match="host restarted"):
+            review(persisted_runner(agent, tmp_path, store, config))
+        if legacy:
+            # Old response checkpoints predate per-agent model metadata.
+            row = store.phase_attempts("r1")[-1]
+            payload = json.loads(row.output_json)
+            payload.pop("requested_model")
+            payload.pop("model_source")
+            store.record_phase(
+                "r1",
+                row.phase,
+                task_id=row.task_id,
+                attempt=row.attempt,
+                status=row.status,
+                output_json=json.dumps(payload),
+                started_at=row.started_at,
+            )
+        store.close()
+        store = StateStore(database)
+        path.write_text('model = "next"\n[agent.models]\nreview = "next"\n')
+        restored = Config.model_validate_json(config.model_dump_json())
+        restored._model_env = {}
+
+        result = review(persisted_runner(agent, tmp_path, store, restored))
+
+        assert result.findings[0].body == MAJOR["body"]
+        assert len(agent.jobs) == completed_responses + 1
+        assert {job.model for job in agent.jobs} == {"first"}
+        assert agent.jobs[-1].resume_session_id == f"response-{completed_responses - 1}"
+        assert agent.jobs[-1].available_tools == []
     finally:
         store.close()
 

@@ -37,6 +37,8 @@ class RunUsage(NamedTuple):
     # single producer always has both to hand.
     turns_by_agent: dict[str, int]
     jobs_by_agent: dict[str, int]
+    # Per-phase/model attribution is separate from legacy persona totals.
+    by_phase_model: dict[str, Usage] | None = None
 
     @property
     def recorded(self) -> bool:
@@ -73,6 +75,7 @@ def usage_for_run(store: StateStore, run_id: str, *, since: float = 0.0) -> RunU
     total = Usage()
     by_agent: dict[str, Usage] = {}
     models: list[str] = []
+    by_phase_model: dict[str, Usage] = {}
     samples = 0
     # One `agent.usage` event is one assistant turn, and turns — not
     # jobs — are what a run is billed and timed by: every turn re-sends
@@ -84,6 +87,10 @@ def usage_for_run(store: StateStore, run_id: str, *, since: float = 0.0) -> RunU
         if event.ts < since:
             continue
         sample = usage_from_event(event.data)
+        phase = event.data.get("agent_phase")
+        if phase:
+            label = f"{phase} · {agent_model_label(sample.backend, sample.model)}"
+            by_phase_model[label] = by_phase_model.get(label, Usage()).merged(sample)
         total = total.merged(sample)
         who = str(event.data.get("agent") or "unknown")
         by_agent[who] = by_agent.get(who, Usage()).merged(sample)
@@ -98,7 +105,15 @@ def usage_for_run(store: StateStore, run_id: str, *, since: float = 0.0) -> RunU
             if label not in models:
                 models.append(label)
         samples += 1
-    return RunUsage(total, by_agent, models, samples, turns, {k: len(v) for k, v in jobs.items()})
+    return RunUsage(
+        total,
+        by_agent,
+        models,
+        samples,
+        turns,
+        {k: len(v) for k, v in jobs.items()},
+        by_phase_model,
+    )
 
 
 def tokens_text(value: int | None) -> str:
@@ -157,6 +172,9 @@ def usage_lines(usage: RunUsage) -> list[str]:
     lines = usage_rows(usage.by_agent, usage.turns_by_agent, usage.jobs_by_agent)
     lines.append(usage_row("total", usage.total, turns=usage.samples))
     lines.append(SPEND_NOT_REPORTED)
+    if len(usage.models) > 1 and usage.by_phase_model:
+        lines.append("by phase and reported model:")
+        lines.extend(usage_rows(usage.by_phase_model))
     return lines
 
 

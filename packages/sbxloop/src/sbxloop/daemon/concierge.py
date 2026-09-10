@@ -40,6 +40,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
 from urllib.parse import quote
 
+from sbxloop.agentmodels import ModelSelection, model_for_phase, refreshed_models
 from sbxloop.cli.tui import format_event
 from sbxloop.config import SINK_NAMES, BridgeBackend, Config, ScheduleConfig
 from sbxloop.daemon.chat_choices import (
@@ -80,7 +81,7 @@ from sbxloop.events import EventBus
 from sbxloop.ghids import chat_item_id, issue_item_id, normalize_item_id
 from sbxloop.ids import new_job_id, new_run_id
 from sbxloop.log import get_logger
-from sbxloop.provider import ProviderHeldError, ProviderHold
+from sbxloop.provider import ProviderHeldError, ProviderHold, ProviderRecovery
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import (
     HostToolCall,
@@ -106,6 +107,7 @@ CONCIERGE_RUN_ID = "concierge"
 # daemon_state keys
 STATE_SESSION_ID = "concierge_session_id"
 STATE_SESSION_TURNS = "concierge_session_turns"
+STATE_SESSION_MODEL = "concierge_session_model"
 
 _RUN_STATES = list(get_args(RunState))
 # The daemon's view of an issue, from its lifecycle labels (#565, #609):
@@ -255,6 +257,7 @@ class Concierge:
         thread_link: Callable[[ChatThread], str] | None = None,
     ) -> None:
         self.config = config
+        self._turn_model = model_for_phase(config, "concierge")
         # The active chat backend's section (prefix, threading) and its proper
         # name for the prompt; a config with no chat at all (tests, a headless
         # daemon) reads Discord's defaults so every string still renders.
@@ -372,6 +375,7 @@ class Concierge:
     def reset_session(self) -> None:
         self.dstore.set_value(STATE_SESSION_ID, None)
         self.dstore.set_value(STATE_SESSION_TURNS, None)
+        self.dstore.set_value(STATE_SESSION_MODEL, None)
         log.info("concierge.session_reset")
 
     def close(self) -> None:
@@ -386,6 +390,27 @@ class Concierge:
     # -- one turn ---------------------------------------------------------------
 
     def _run_turn(self, text: str, *, author: str, on_tool: ToolCallback | None) -> ConciergeReply:
+        started = time.monotonic()
+        try:
+            selection = model_for_phase(refreshed_models(self.config), "concierge")
+        except SbxloopError as exc:
+            return self._error_reply(exc, started)
+        recorded = self.dstore.get_value(STATE_SESSION_MODEL)
+        identity = json.dumps([self.config.agent.backend, selection.model])
+        recovering = ProviderRecovery(self.store, self.config.agent.backend).pending(
+            CONCIERGE_RUN_ID
+        )
+        if recovering and recorded:
+            try:
+                old_backend, old_model = json.loads(recorded)
+            except (ValueError, TypeError):
+                return self._error_reply(ConfigError("invalid concierge session model"), started)
+            if old_backend != self.config.agent.backend or not isinstance(old_model, str):
+                return self._error_reply(ConfigError("concierge recovery backend changed"), started)
+            selection = ModelSelection(old_model, "interrupted call")
+        elif recorded != identity:
+            self.reset_session()
+        self._turn_model = selection
         session_id, turns = self._session()
         if turns >= self.config.concierge.session_turns:
             log.info("concierge.session_rotated", turns=turns)
@@ -446,6 +471,9 @@ class Concierge:
         on_tool: ToolCallback | None,
     ) -> tuple[str | None, str]:
         cfg = self.config.concierge
+        self.dstore.set_value(
+            STATE_SESSION_MODEL, json.dumps([self.config.agent.backend, self._turn_model.model])
+        )
         job = JobRequest(
             job_id=new_job_id(),
             run_id=CONCIERGE_RUN_ID,
@@ -453,7 +481,7 @@ class Concierge:
             prompt=self._preamble(author) + "\n---\n" + text,
             recovery_key=json.dumps([author, text]),
             system_message=self._system_message(),
-            model=cfg.model or self.config.model,
+            model=self._turn_model.model,
             resume_session_id=session_id,
             # Nothing to edit in the scratch sandbox: read-only, and no SDK
             # built-ins at all — every capability is a host tool.
@@ -477,7 +505,13 @@ class Concierge:
             return response
 
         client = self.host.client()
-        result = client.submit(job, agent=CONCIERGE_AGENT, tool_handler=handler)
+        result = client.submit(
+            job,
+            agent=CONCIERGE_AGENT,
+            tool_handler=handler,
+            agent_phase="concierge",
+            model_source=self._turn_model.source,
+        )
         if result.status != "ok":
             if result.error is not None and result.error.provider is not None:
                 raise ProviderHeldError(ProviderHold(result.error.provider, None, 0))
@@ -598,7 +632,7 @@ class Concierge:
             command_prefix=self._chat.command_prefix,
             repo=self._repo_label(),
             repos=bullet_list(self._repo_lines()) or "(no GitHub repository configured)",
-            model=self.config.concierge.model or self.config.model,
+            model=self._turn_model.model,
             trigger_label=self.config.daemon.trigger_label,
             workload_label=daemon.workload_label,
             workloads=bullet_list(self._workload_lines())

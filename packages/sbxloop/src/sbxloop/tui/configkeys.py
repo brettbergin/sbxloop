@@ -31,7 +31,7 @@ from typing import Any, Literal
 import tomlkit
 from pydantic import BaseModel
 
-from sbxloop.config import Config
+from sbxloop.config import AgentModels, Config
 
 #: One step of a path: a table/mapping key, or an index into an array.
 PathPart = str | int
@@ -51,11 +51,21 @@ ValueKind = Literal["choice", "int", "float", "str", "list", "raw"]
 #: environment, and only the environment moves it.
 ENV_ONLY_KEYS: dict[str, str] = {
     "home": "the sbxloop home comes from SBXLOOP_HOME (else HOME), never from a file",
+    "run_model_override": "set by run --model; not a file setting",
+    "run_model_repo": "recorded by the run; not a file setting",
+    "model_source_dir": "recorded by the config loader; not a file setting",
 }
 
 
 class PathError(ValueError):
     """A dotted path that is not addressable."""
+
+
+def is_model_key(dotted: str) -> bool:
+    if dotted in {"model", "concierge.model"}:
+        return True
+    match = re.fullmatch(r"(?:agent\.models|github\.repos\[\d+\]\.agent_models)\.([^.]+)", dotted)
+    return match is not None and match.group(1) in AgentModels.model_fields
 
 
 def parse_path(dotted: str) -> tuple[PathPart, ...]:

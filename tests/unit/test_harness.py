@@ -126,7 +126,13 @@ class BriefingAgent:
         self.briefings: list[tuple[str, str | None]] = []  # (persona, system_message)
 
     def submit(
-        self, job: JobRequest, *, agent: str | None = None, tool_handler: Any = None
+        self,
+        job: JobRequest,
+        *,
+        agent: str | None = None,
+        tool_handler: Any = None,
+        agent_phase: str | None = None,
+        model_source: str | None = None,
     ) -> JobResult:
         self.briefings.append((agent or "", job.system_message))
         answer = self.responses.pop(0)

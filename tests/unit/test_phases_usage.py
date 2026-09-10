@@ -22,7 +22,13 @@ class UsageAgent:
         self.responses = list(responses)
 
     def submit(
-        self, job: JobRequest, *, agent: str | None = None, tool_handler: Any = None
+        self,
+        job: JobRequest,
+        *,
+        agent: str | None = None,
+        tool_handler: Any = None,
+        agent_phase: str | None = None,
+        model_source: str | None = None,
     ) -> JobResult:
         output_json, usage, turns = self.responses.pop(0)
         return JobResult(

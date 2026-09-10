@@ -10,7 +10,7 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from sbxloop.config import Config
+from sbxloop.config import Config, load_config
 from sbxloop.engine.issue_lookup import IssueLookup
 from sbxloop.engine.phases import PhaseRunner
 from sbxloop.engine.review import ReviewFinding, ReviewGuard, ReviewVerdict
@@ -68,7 +68,7 @@ class ScriptedAgent:
         self.handlers: list[Any] = []
 
     def submit(
-        self, job: JobRequest, *, agent: str | None = None, tool_handler: Any = None
+        self, job: JobRequest, *, agent: str | None = None, tool_handler: Any = None, **kwargs: Any
     ) -> JobResult:
         self.jobs.append(job)
         self.handlers.append(tool_handler)
@@ -195,6 +195,37 @@ def test_repair_without_a_session_id_still_receives_the_complete_response(tmp_pa
     assert_response_only(repaired)
     assert repaired.resume_session_id is None
     assert contains_json(repaired.prompt or "", first)
+
+
+def test_response_corrections_keep_model_until_the_next_review(tmp_path: Path) -> None:
+    path = tmp_path / "sbxloop.toml"
+    path.write_text('[agent.models]\nreview = "first"\n')
+    invalid = verdict({**MAJOR, "category": "unsupported"})
+
+    class EditingAgent(ScriptedAgent):
+        def submit(self, job: JobRequest, **kwargs: Any) -> JobResult:
+            result = super().submit(job, **kwargs)
+            path.write_text('[agent.models]\nreview = "next"\n')
+            return result
+
+    agent = EditingAgent(
+        [
+            reply(invalid, session_id="review"),
+            reply(invalid, session_id="repair"),
+            reply(verdict(MAJOR)),
+            reply(verdict(MAJOR)),
+        ]
+    )
+    phases = runner(agent, tmp_path, load_config(tmp_path, env={}))
+
+    review(phases)
+    review(phases)
+
+    assert [job.model for job in agent.jobs] == ["first", "first", "first", "next"]
+    assert agent.jobs[1].resume_session_id == "review"
+    assert agent.jobs[2].resume_session_id == "repair"
+    for job in agent.jobs[1:3]:
+        assert_response_only(job)
 
 
 @pytest.mark.parametrize("session_id", [None, "review-session"])

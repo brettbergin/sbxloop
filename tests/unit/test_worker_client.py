@@ -146,14 +146,23 @@ class TestStreamTransport:
         bus.subscribe(seen.append)
 
         client = make_client(sandbox, bus)
-        result = client.submit(agent_job(), agent="planner")
+        result = client.submit(
+            agent_job(model="requested"),
+            agent="planner",
+            agent_phase="decompose",
+            model_source="agent.models.decompose",
+        )
 
         assert result.status == "ok"
         messages = [e for e in seen if e.type == EventTypes.AGENT_MESSAGE]
         assert messages and all(e.data["agent"] == "planner" for e in messages)
+        assert all(e.data["agent_phase"] == "decompose" for e in messages)
+        assert all(e.data["requested_model"] == "requested" for e in messages)
+        assert all(e.data["model_source"] == "agent.models.decompose" for e in messages)
         starts = [e for e in seen if e.type == EventTypes.WORKER_START]
         assert starts and "agent" not in starts[0].data
         assert client._job_agents == {}
+        assert client._model_context == {}
 
     def test_shell_check_job(self, sandbox: Sandbox) -> None:
         job = JobRequest(
