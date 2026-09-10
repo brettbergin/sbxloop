@@ -148,7 +148,9 @@ for the concierge, Opus for the builder, and Sonnet for review. Configure
 `[agent.models]`, optional per-repository `agent_models`, and `[concierge] model`.
 Unset roles inherit top-level `model`; `--model` forces all run agents for that
 run. Edits take effect before the next phase, with a fresh session when the
-model changes. See [Agent models](docs/user-guide.md#agent-models).
+model changes. The TUI offers a searchable model picker backed by a cached
+backend catalog; successful provisioning and `list-models` refresh that cache.
+See [Agent models](docs/user-guide.md#agent-models).
 
 The home config holds your operator settings. For a project's build and
 check settings, `sbxloop init --project` creates a `sbxloop.toml` in the

@@ -2997,6 +2997,13 @@ def list_models(
         # error text must not be parsed as rich markup.
         console.print(f"[bold red]list-models failed:[/] {rich_escape(str(exc))}")
         raise typer.Exit(2) from exc
+    if rows:
+        from sbxloop.modelcatalog import save_catalog
+
+        try:
+            save_catalog(config.paths, backend, rows)
+        except (OSError, ValueError):
+            typer.echo("Models listed, but the TUI model cache could not be updated.", err=True)
     if json_output:
         # bare JSON on stdout, nothing else — `sbxloop list-models --json | jq`
         typer.echo(json.dumps([row.raw or {"id": row.id, "name": row.name} for row in rows]))

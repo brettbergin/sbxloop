@@ -1372,6 +1372,23 @@ active runs; historical headlines label a snapshot as the initial fallback.
 Model ids are provider-owned strings; catalogue misses are diagnostic rather
 than a closed validation list.
 
+`modelcatalog.py` caches successful host-side `list-models` discovery under
+`SbxloopHome.model_catalogs`, one JSON file per backend. The bounded schema
+stores only picker metadata and a timestamp; atomic replacement keeps a failed
+or empty refresh from destroying the last successful result. Agent worker
+installation and concierge readiness trigger a background refresh when the
+catalog is missing or at least one day old. An in-process lock deduplicates
+automatic discovery, with a five-minute retry floor. No catalog lookup adds
+model turns or changes the run trail, and provisioning does not wait for it.
+The same optional host SDKs and credentials as `list-models` are required.
+
+The TUI's `ModelScreen` loads the current backend's cache, filters names and
+slugs locally, and returns the existing `ValueEdit` to the validated config
+save path. Refresh runs in a Textual worker, keeping the cached choices usable
+while discovery is pending or unavailable. Inheritance and `auto` are separate
+choices; custom input is an explicit action. Provider-disabled entries cannot
+be picked, and a configured alias absent from the catalog remains visible.
+
 ### Run reconciliation
 
 Because the run row is only ever written by the in-process run loop, a dead

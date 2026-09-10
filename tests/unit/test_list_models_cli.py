@@ -32,6 +32,25 @@ from sbxloop.errors import SbxloopError
 runner = CliRunner()
 
 
+def test_successful_listing_caches_only_picker_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("SBXLOOP_HOME", str(home))
+    install_stub_sdk(monkeypatch, SAMPLE_MODELS)
+
+    result = runner.invoke(app, ["list-models", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout) == [model.to_dict() for model in SAMPLE_MODELS]
+    cache = json.loads((home / "cache" / "models" / "copilot.json").read_text())
+    assert cache["backend"] == "copilot"
+    assert [entry["id"] for entry in cache["models"]] == [model.id for model in SAMPLE_MODELS]
+    assert cache["fetched_at"] > 0
+    assert "raw" not in cache["models"][0]
+
+
 @pytest.fixture
 def workdir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.chdir(tmp_path)

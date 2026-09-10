@@ -102,6 +102,10 @@ class DaemonAgent:
         if self._client is None:
             log.info("concierge_sandbox.provision_needed", sandbox=self.name)
             self._client = self._ensure()
+            if self.install_workers:
+                from sbxloop.modelcatalog import refresh_after_provision
+
+                refresh_after_provision(self.config)
         return self._client
 
     def call(self, fn: Callable[[WorkerClient], T]) -> T:

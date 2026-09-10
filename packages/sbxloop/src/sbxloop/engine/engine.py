@@ -1135,6 +1135,10 @@ class LoopEngine:
                 ),
             )
 
+        from sbxloop.modelcatalog import refresh_after_provision
+
+        refresh_after_provision(self.config)
+
     def _fetch_dependencies(self, run_id: str, service: ServiceOps) -> None:
         """Prepare dependencies in the agent, then verify its offline cache.
 
