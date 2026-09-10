@@ -55,6 +55,7 @@ class ProviderJobRow(Base):
     scope: Mapped[str] = mapped_column(Text)
     result_json: Mapped[str] = mapped_column(Text)
     pending: Mapped[int] = mapped_column(Integer)
+    requested_model: Mapped[str | None] = mapped_column(Text)
 
 
 class Run(Base):

@@ -156,6 +156,29 @@ class ProviderRecovery:
             row = session.get(ProviderJobRow, (run_id, key))
             return JobResult.model_validate_json(row.result_json) if row and row.pending else None
 
+    def pin_model(self, job: JobRequest) -> JobRequest:
+        """Model edits take effect after recovery, never inside an interrupted call.
+
+        Only the model may differ: the existing semantic fingerprint must
+        match with the recorded selection substituted. Unknown legacy
+        selections still fail closed through the normal checkpoint check.
+        """
+        with self.store._read() as session:
+            rows = session.scalars(
+                select(ProviderJobRow).where(
+                    ProviderJobRow.run_id == job.run_id,
+                    ProviderJobRow.scope == self.scope,
+                    ProviderJobRow.pending == 1,
+                )
+            ).all()
+            for row in rows:
+                if row.requested_model is None:
+                    continue
+                candidate = job.model_copy(update={"model": row.requested_model})
+                if self.job_key(candidate) == row.job_key:
+                    return candidate
+        return job
+
     def park_recovery(self, reason: str) -> ProviderHeldError:
         failure = ProviderFailure(backend=self.backend, category="recovery", reason=reason)
         with self._write() as session:
@@ -220,6 +243,7 @@ class ProviderRecovery:
                     scope=self.scope,
                     result_json=result.model_dump_json(),
                     pending=1,
+                    requested_model=job.model,
                 )
             )
         return ProviderHold(failure, next_at, attempts, generation)
@@ -232,6 +256,7 @@ class ProviderRecovery:
     ) -> JobResult:
         prior_hold = self.hold()
         self.check()
+        job = self.pin_model(job)
         key = self.job_key(job)
         previous = self.checkpoint(job.run_id, key)
         if previous is None and self.pending(job.run_id):

@@ -39,6 +39,7 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     ValidationError,
     ValidationInfo,
     field_validator,
@@ -158,6 +159,26 @@ _UNSET = _Unset()
 
 class _ConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class AgentModels(_ConfigModel):
+    """Sparse model overrides, keyed by agent phase rather than tool role."""
+
+    decompose: str | None = None
+    build: str | None = None
+    review: str | None = None
+    steer: str | None = None
+    reauthor_verify: str | None = None
+    operator_plan: str | None = None
+    operator_execute: str | None = None
+    operator_judge: str | None = None
+
+    @field_validator("*")
+    @classmethod
+    def _nonblank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("a model override must not be blank; omit it to inherit")
+        return value
 
 
 class SandboxConfig(_ConfigModel):
@@ -741,6 +762,7 @@ class RepoConfig(_ConfigModel):
     """
 
     repo: str
+    agent_models: AgentModels = Field(default_factory=AgentModels)
     # The host checkout of *this* repository that runs clone and refresh.
     # None falls back to the legacy ``[sandbox] workspace``, but only when
     # that checkout demonstrably belongs to this repo (see
@@ -1972,6 +1994,7 @@ class AgentConfig(_ConfigModel):
     """
 
     backend: Literal["copilot", "claude", "codex"] = "copilot"
+    models: AgentModels = Field(default_factory=AgentModels)
 
 
 # Where a workload's result may go when the run publishes (#759 delivers
@@ -2230,6 +2253,14 @@ class TelemetryConfig(_ConfigModel):
 
 class Config(_ConfigModel):
     model: str = "auto"
+    # Runtime provenance, not operator knobs. Persisted so CLI precedence
+    # and the original config location survive a resume from another cwd.
+    run_model_override: str | None = None
+    # None uses the selected GitHub repo; "" explicitly selects no repo.
+    run_model_repo: str | None = None
+    model_source_dir: Path | None = None
+    # Environment values (including secrets) never enter the snapshot.
+    _model_env: dict[str, str] | None = PrivateAttr(default=None)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     # sbx --app-name. Empty (the default) shares the user's normal sbx
     # application state, so their `sbx login` and `sbx policy init balanced`
@@ -3007,15 +3038,21 @@ def load_config_with_sources(
         if dotted in sources:
             raise ConfigError(f"{dotted!r} (from {sources[dotted]}) is no longer a setting: {why}")
 
+    for internal in ("run_model_override", "run_model_repo", "model_source_dir"):
+        if internal in merged:
+            raise ConfigError(f"{internal!r} is run bookkeeping, not a configuration setting")
+
     # The home is the env's business, never a file's: SBXLOOP_HOME, else
     # HOME/.sbxloop, else the process home — resolved from the mapping the
     # loader was handed so a hermetic caller decides where state lands.
     merged["home"] = str(resolve_home_root(env))
+    merged["model_source_dir"] = discovery.root.resolve()
 
     try:
         config = Config.model_validate(merged)
     except ValidationError as exc:
         raise ConfigError(f"invalid sbxloop configuration: {exc}") from exc
+    config._model_env = dict(env)
 
     gh_host = (env.get("GH_HOST") or "").strip()
     if gh_host and gh_host.casefold() != config.github.web_host.casefold():

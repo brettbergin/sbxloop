@@ -186,7 +186,14 @@ class TestPresets:
 
 # Derived internals the engine sets on a narrowed config; never configured.
 # `home` is SBXLOOP_HOME, never a file key (sbxloop.paths).
-INTERNAL_KEYS = {"github.enabled_repo_count", "workload.result_issue", "home"}
+INTERNAL_KEYS = {
+    "github.enabled_repo_count",
+    "workload.result_issue",
+    "home",
+    "run_model_override",
+    "model_source_dir",
+    "run_model_repo",
+}
 # Legacy keys the example no longer shows (#818): a `[[schedules]]` entry
 # still loads, for the daemon to import into its database once.
 LEGACY_KEYS = {
@@ -412,7 +419,7 @@ def test_every_commented_key_is_a_real_config_key() -> None:
     checked = 0
     for line in EXAMPLE.read_text().splitlines():
         stripped = re.sub(r"^#\s?", "", line)
-        header = re.match(r"^\[\[?([a-z.]+)\]\]?$", stripped)
+        header = re.match(r"^\[\[?([a-z_.]+)\]\]?$", stripped)
         if header:
             section = header.group(1)
             continue
@@ -428,6 +435,10 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             continue  # array-of-tables entries load as whole blocks, below
         if section == "github.repos":
             doc: dict[str, Any] = {"github": {"repos": [{"repo": "you/your-repo", **parsed}]}}
+        elif section == "github.repos.agent_models":
+            doc = {"github": {"repos": [{"repo": "you/your-repo", "agent_models": parsed}]}}
+        elif section == "agent.models":
+            doc = {"agent": {"models": parsed}}
         elif section == "github":
             # `[github]` needs a repository before any other key is meaningful.
             doc = {"github": {"repo": "you/your-repo", **parsed}}

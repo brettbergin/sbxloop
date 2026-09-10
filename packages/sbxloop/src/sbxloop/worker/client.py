@@ -246,6 +246,7 @@ class WorkerClient:
         # (see sbxloop.worker.hosttools); registered for the life of submit().
         self._brokers: dict[str, HostToolBroker] = {}
         self.provider_recovery: ProviderRecovery | None = None
+        self._model_context: dict[str, dict[str, str | None]] = {}
 
     # -- install -----------------------------------------------------------
 
@@ -959,14 +960,32 @@ class WorkerClient:
         *,
         agent: str | None = None,
         tool_handler: HostToolHandler | None = None,
+        agent_phase: str | None = None,
+        model_source: str | None = None,
     ) -> JobResult:
-        if job.kind == "agent.session" and self.provider_recovery is not None:
-            return self.provider_recovery.submit(
-                job,
-                lambda request: self._submit_once(request, agent=agent, tool_handler=tool_handler),
-                self.bus,
-            )
-        return self._submit_once(job, agent=agent, tool_handler=tool_handler)
+        if job.kind == "agent.session":
+            if self.provider_recovery is not None:
+                pinned = self.provider_recovery.pin_model(job)
+                if pinned.model != job.model:
+                    model_source = "interrupted call"
+                job = pinned
+            self._model_context[job.job_id] = {
+                "requested_model": job.model,
+                "model_source": model_source,
+                "agent_phase": agent_phase,
+            }
+        try:
+            if job.kind == "agent.session" and self.provider_recovery is not None:
+                return self.provider_recovery.submit(
+                    job,
+                    lambda request: self._submit_once(
+                        request, agent=agent, tool_handler=tool_handler
+                    ),
+                    self.bus,
+                )
+            return self._submit_once(job, agent=agent, tool_handler=tool_handler)
+        finally:
+            self._model_context.pop(job.job_id, None)
 
     def _submit_once(
         self,
@@ -1226,6 +1245,8 @@ class WorkerClient:
             event.data["role"] = self.role
         agent = self._job_agents.get(job.job_id)
         if event.type.startswith("agent."):
+            # Host-owned request metadata, separate from SDK-reported identity.
+            event.data.update(self._model_context.get(job.job_id, {}))
             if agent is not None:
                 event.data["agent"] = agent
             if self.backend is not None:

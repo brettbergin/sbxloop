@@ -467,6 +467,29 @@ def _open_key(screen: ConfigScreen, key: str) -> None:
     table.move_cursor(row=table.get_row_index(key))
 
 
+def test_model_edit_applies_without_offering_restart(seeded: SbxloopHome, hermetic: None) -> None:
+    _seed_config(seeded, '[agent.models]\nbuild = "first"\n')
+
+    async def scenario() -> None:
+        app = make_app(seeded, **REFRESH)
+        async with app.run_test(size=(160, 50)) as pilot:
+            await pilot.press("7")
+            await pilot.pause(1.5)
+            screen = app.screen
+            assert isinstance(screen, ConfigScreen)
+            _open_key(screen, "agent.models.build")
+            await pilot.press("enter")
+            await pilot.pause(0.5)
+            assert isinstance(app.screen, ValueScreen)
+            app.screen.query_one("#value-text", Input).value = "second"
+            await pilot.press("enter")
+            await pilot.pause(2.0)
+            assert 'build = "second"' in _config_text(seeded)
+            assert isinstance(app.screen, ConfigScreen), "model edits need no restart"
+
+    drive(scenario)
+
+
 def test_a_key_is_edited_from_the_resolved_view(seeded: SbxloopHome, hermetic: None) -> None:
     """The point of the tab: pick the row, type the value, done — the file
     keeps every comment it had, and the restart is offered as always."""
@@ -739,9 +762,7 @@ def test_an_edit_shows_up_in_the_resolved_view_at_once(
             app.screen.query_one("#value-text", Input).value = "claude-haiku-4-5-20251001"
             await pilot.press("enter")
             await pilot.pause(2.0)
-            assert isinstance(app.screen, ConfirmScreen)
-            await pilot.press("n")
-            await pilot.pause(1.5)
+            assert isinstance(app.screen, ConfigScreen), "model edits apply without a restart"
 
             # The file the daemon reads carries it …
             assert 'model = "claude-haiku-4-5-20251001"' in _config_text(seeded)
