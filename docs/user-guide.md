@@ -175,8 +175,31 @@ These keys follow normal operator config layering: the home config, untracked
 `pyproject.toml` (`[tool.sbxloop]`), untracked `sbxloop.toml`, then environment overrides such as
 `SBXLOOP_AGENT__MODELS__BUILD`. Tracked project config cannot change model
 policy. Put operator choices in the home config or an untracked file. The TUI
-config editor supports the nested keys; unset a key
-to restore inheritance. Use `sbxloop doctor` for local model resolution and
+config editor opens a searchable model picker for top-level `model`, each
+agent model, repository overrides, and `concierge.model`. Search by model name
+or slug, use the arrow keys to select, and press Enter to apply. Choose
+**Inherit** or press Ctrl+U to remove an override; **auto** explicitly delegates
+selection to the backend. Ctrl+T opens custom entry for aliases or models the
+catalog does not yet list. Search text alone never becomes a model value.
+
+The picker reads the last successful catalog from the home's
+`cache/models/<backend>.json`, showing its timestamp and whether it is stale.
+Successful agent provisioning (including concierge reuse after restart)
+refreshes missing or day-old catalogs in the background. Opening the picker
+also refreshes a missing or stale catalog; Ctrl+R refreshes on demand.
+`sbxloop list-models` refreshes the same cache after a successful nonempty
+listing, including with `--json`. Failed discovery keeps the last successful
+catalog and does not interrupt provisioning or discard configured model ids.
+Catalogs are separate per backend and contain only model ids, display names,
+policy state, and the fetch timestamp. The cache is advisory, not proof of
+current account access; refresh it after changing credentials.
+
+Discovery has the same host credential and optional SDK requirements as
+[`list-models`](#which-models-can-i-use). Claude needs no host SDK extra;
+Copilot and Codex require their respective extras. The picker reports lookup
+failures and still offers the cached models, current value, auto, and custom entry.
+
+Use `sbxloop doctor` for local model resolution and
 `sbxloop list-models --repo your-org/your-project` to compare those choices
 against the backend's catalogue. A model absent from that catalogue is
 reported, not rejected: aliases and account-specific availability vary.
@@ -283,6 +306,8 @@ landed; a run whose languages the template lacks — a Go repo on a Python bake,
 say — keeps the baked worker and provisions the missing toolchain on top, and
 the `sandbox.prebaked` event and `sbxloop doctor` both say so, so you know
 when a re-bake would stop paying for that per provision.
+
+#### Which models can I use?
 
 Wondering what to put in `model = "..."` (or `--model`)? Ask the configured
 backend which models your credential can actually use:

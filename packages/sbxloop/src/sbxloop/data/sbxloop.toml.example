@@ -74,6 +74,8 @@ secret_strategy = "proxy"
 # Omit a key to inherit top-level model. Explicit "auto" asks the backend
 # to choose, even when the inherited model is pinned. IDs are backend-specific;
 # use `sbxloop list-models`. Model settings are reread before each agent phase.
+# The TUI offers a searchable backend-model picker. Successful provisioning
+# and list-models populate its cache; Ctrl+R refreshes, Ctrl+U restores inheritance.
 # `run --model ID` forces every run agent for that run, never the concierge.
 # SBXLOOP_AGENT__MODELS__BUILD overrides the build key through the environment.
 # decompose = "auto"
