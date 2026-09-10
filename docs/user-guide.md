@@ -64,9 +64,9 @@ backend = "claude"   # default: "copilot"
 | `claude`  | `ANTHROPIC_API_KEY` ([console](https://console.anthropic.com/settings/keys)) | `claude-agent-sdk` (worker `[claude]` extra) + the Claude Code CLI, which provisioning installs (Node + `@anthropic-ai/claude-code`)       |
 | `codex`   | `OPENAI_API_KEY` ([API keys](https://platform.openai.com/api-keys))          | Python `openai-codex==0.147.0` (worker `[codex]` extra), including its matching Codex CLI runtime and Code Mode helper; no Node dependency |
 
-The run protocol is shared across backends: the top-level `model` key names the
-model the chosen backend runs (`"auto"` lets it pick its default), every
-persona (decompose, build, review, fix, the concierge) runs the same, token
+The run protocol is shared across backends: the top-level `model` key supplies
+the default model (`"auto"` lets the backend pick). Each agent can override it
+independently, while all agents use the same backend. Token
 usage is reported through the same `run_usage`/`usage_today` accounting, and
 the credential split holds — the agent sandbox carries the chosen agent
 credential and never a GitHub token. With the claude backend, provisioning
@@ -129,6 +129,77 @@ enabled. The SDK/runtime pair is pinned because dynamic tool registration
 and native tool suppression use experimental protocol fields. See the
 [design and implementation plan](codex-backend.md) for the contract and
 the **field-unverified** live-sandbox checks.
+
+### Agent models
+
+Choose a model for each of the eight run agents under `[agent.models]`.
+`[concierge] model` selects the control-channel agent separately. For example,
+with the Claude backend, use aliases supported by your credential:
+
+```toml
+model = "sonnet"
+
+[agent]
+backend = "claude"
+
+[agent.models]
+decompose = "sonnet"
+build = "opus"
+review = "sonnet"
+steer = "haiku"
+reauthor_verify = "sonnet"
+operator_plan = "sonnet"
+operator_execute = "opus"
+operator_judge = "sonnet"
+
+[concierge]
+model = "haiku"
+
+[[github.repos]]
+repo = "your-org/your-project"
+
+[github.repos.agent_models]
+review = "opus"
+```
+
+Run-agent precedence is `--model MODEL`, then the selected repository's
+`agent_models.<phase>`, then `agent.models.<phase>`, then top-level `model`.
+Omit a key to inherit; setting `"auto"` explicitly asks the backend to choose
+and stops inheritance. Unknown role names and blank role models are errors.
+The concierge uses `concierge.model` or top-level `model`; repository choices
+and a run's `--model` never affect it. Repo-less workloads use global settings.
+Models do not change permissions, tools, credentials, or the backend.
+Private dependency preparation uses the builder's model policy too.
+
+These keys follow normal operator config layering: the home config, untracked
+`pyproject.toml` (`[tool.sbxloop]`), untracked `sbxloop.toml`, then environment overrides such as
+`SBXLOOP_AGENT__MODELS__BUILD`. Tracked project config cannot change model
+policy. Put operator choices in the home config or an untracked file. The TUI
+config editor supports the nested keys; unset a key
+to restore inheritance. Use `sbxloop doctor` for local model resolution and
+`sbxloop list-models --repo your-org/your-project` to compare those choices
+against the backend's catalogue. A model absent from that catalogue is
+reported, not rejected: aliases and account-specific availability vary.
+
+sbxloop rereads model settings automatically before each new phase, including
+in active and resumed runs. The source directory and home stay pinned to the
+run; environment overrides use the running process's environment (the current
+environment after a restart). Other settings retain their existing lifecycle.
+An invalid config or a backend change stops the next dispatch with an error.
+A run's `--model` remains in force after edits and resumes.
+
+An in-flight call, its JSON repair retry, and recovery of a provider-interrupted
+call keep their original requested model. The next phase sees the new choice.
+When a builder or operator changes model, sbxloop starts a fresh SDK session
+with the existing workspace, task brief, feedback, and prior reports. It also
+rotates the concierge session before its next turn if its model changes.
+Legacy sessions without a recorded requested model start fresh conservatively.
+
+`sbxloop status RUN` shows the next phase's model policy and its source;
+terminal runs show their initial policy. Events separately record the requested
+model and the SDK-reported model, so `auto` remains a request rather than a claim
+about which model answered. Mixed-model usage reports show phase/model token
+totals; unavailable usage stays unknown and no price is inferred.
 
 ## Quickstart
 
@@ -2282,7 +2353,10 @@ The notable knobs:
 | Key                                                                            | Default                                         | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | ------------------------------------------------------------------------------ | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `[agent] backend`                                                              | `copilot`                                       | Agent SDK: `copilot`, `claude` or `codex`. Codex uses `OPENAI_API_KEY` and the worker codex extra; see [Agent backends](#agent-backends-copilot-claude-or-codex).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `model`                                                                        | `auto`                                          | Model id for the configured `[agent] backend` (`--model` overrides per run; `sbxloop list-models` lists them).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `model`                                                                        | `auto`                                          | Default model id for the single `[agent] backend`; roles inherit it when unset. `--model` forces all run agents and survives resume; concierge is unchanged. See [Agent models](#agent-models).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `[agent.models] decompose` / `build` / `review` / `steer` / `reauthor_verify`  | unset                                           | Independent code-agent model choices; inherit top-level `model`. Reread before each new phase.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `[agent.models] operator_plan` / `operator_execute` / `operator_judge`         | unset                                           | Independent workload-agent model choices, with the same inheritance and live refresh.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `[github.repos.agent_models] <phase>`                                          | unset                                           | Sparse per-repository overrides for any of the eight role keys. Unset roles inherit global `[agent.models]`, then `model`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `keep_sandboxes` / `keep_on_failure`                                           | `false`                                         | Sandbox retention for debugging (see above).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `secret_strategy`                                                              | `proxy`                                         | `proxy` keeps token values out of the VM; `plain-env` skips the sbx proxy — tokens are piped per job over worker stdin when this sbx supports it, else written to an in-VM env file. On current sbx the cached exec-visibility verdict makes the non-proxy / env-file fallback the common case even under `proxy`, not an edge case (#46; interim hardening #592).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `[sandbox] template`                                                           | unset                                           | Baked template ref from `sbxloop bake`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |

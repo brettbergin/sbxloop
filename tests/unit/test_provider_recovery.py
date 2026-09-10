@@ -144,6 +144,28 @@ def test_missing_session_with_partial_work_never_replays(recovery):
         manager.submit(job(), lambda _: pytest.fail("must not call agent"), EventBus())
 
 
+def test_model_edit_waits_for_interrupted_job_and_does_not_bypass_hold(recovery):
+    manager, now = recovery
+    manager.record(job(model="original"), rejected())
+    edited = job(model="new", job_id="j2")
+    with pytest.raises(ProviderHeldError):
+        manager.submit(edited, lambda _: pytest.fail("hold must prevent dispatch"), EventBus())
+    again = ProviderRecovery(manager.store, "claude", clock=lambda: now[0])
+    assert again.pin_model(edited).model == "original"
+    assert again.pin_model(job(model="new", prompt="different task")).model == "new"
+    now[0] = manager.hold().next_at
+    calls = []
+
+    def complete(request):
+        calls.append(request)
+        return JobResult(job_id=request.job_id, status="ok", session_id="s1")
+
+    again.submit(edited, complete, EventBus())
+    assert calls[0].model == "original"
+    assert calls[0].require_resume
+    assert again.pin_model(edited).model == "new"
+
+
 def test_concierge_repeats_interrupted_request_after_status_changes(
     tmp_path, recovery, monkeypatch
 ):

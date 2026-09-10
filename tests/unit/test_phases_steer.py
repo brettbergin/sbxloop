@@ -19,7 +19,13 @@ class StubAgent:
         self.jobs: list[JobRequest] = []
 
     def submit(
-        self, job: JobRequest, *, agent: str | None = None, tool_handler: Any = None
+        self,
+        job: JobRequest,
+        *,
+        agent: str | None = None,
+        tool_handler: Any = None,
+        agent_phase: str | None = None,
+        model_source: str | None = None,
     ) -> JobResult:
         self.jobs.append(job)
         self.agents: list[str | None] = getattr(self, "agents", [])

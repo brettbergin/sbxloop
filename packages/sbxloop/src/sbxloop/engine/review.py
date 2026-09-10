@@ -31,10 +31,11 @@ the same path sees, and shows the fixer the earlier rounds too.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from collections.abc import Mapping, Sequence
 from typing import Literal, NamedTuple
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from sbxloop.engine.model import PR_BODY_FILE, FixKind, TaskSpec
 from sbxloop.gh.ops import FailedCheck, ReviewComment, ReviewEvent
@@ -689,7 +690,7 @@ class ReviewGuard:
     rule quoted; the next verdict is accepted whatever it says — the
     reviewer has now been told and insists, and a run that fails on that
     disagreement would be worse than one that spends a fix round on it.
-    One trip in total: the acceptance path retries exactly once.
+    One trip in total, even when schema repair needs another correction.
     """
 
     def __init__(self, refuted: set[str]) -> None:
@@ -726,6 +727,61 @@ class ReviewGuard:
                 "that fails on this tree. A finding you cannot reproduce is `minor` "
                 "at most."
             )
+
+    def check_repair(self, original: object, verdict: ReviewVerdict) -> None:
+        """Keep completed review evidence through a response-only correction.
+
+        Read recognized fields from the original solely to protect them;
+        accepting the repaired response still requires the full strict schema.
+        Refuted anchors may disappear under the existing review rule. Missing
+        severity or reproduction can be corrected, but a reproduced, explicitly
+        blocking finding cannot be downgraded or replaced with different evidence.
+        """
+        if not isinstance(original, dict) or not isinstance(original.get("findings"), list):
+            return
+        protected: list[tuple[ReviewFinding, bool]] = []
+        for raw in original["findings"]:
+            if not isinstance(raw, dict):
+                continue
+            known = {key: value for key, value in raw.items() if key in ReviewFinding.model_fields}
+            try:
+                finding = ReviewFinding.model_validate(known)
+            except ValidationError:
+                continue
+            if finding.anchor not in self.refuted:
+                reproduced = raw.get("severity") in BLOCKING_SEVERITIES and bool(
+                    finding.repro.strip()
+                )
+                protected.append((finding, reproduced))
+        missing = Counter(finding.anchor for finding, _ in protected) - Counter(
+            finding.anchor for finding in verdict.findings
+        )
+        if missing:
+            raise ValueError(
+                "review response repair must preserve findings at " + ", ".join(sorted(missing))
+            )
+        if (
+            original.get("verdict") == "request_changes"
+            and any(reproduced for _, reproduced in protected)
+            and verdict.verdict != "request_changes"
+        ):
+            raise ValueError(
+                "review response repair must retain request_changes while a reproduced "
+                "blocking/major finding remains unresolved"
+            )
+        for finding, reproduced in protected:
+            if reproduced and not any(
+                candidate.anchor == finding.anchor
+                and candidate.body == finding.body
+                and candidate.repro == finding.repro
+                and candidate.blocking
+                and (finding.severity != "blocking" or candidate.severity == "blocking")
+                for candidate in verdict.findings
+            ):
+                raise ValueError(
+                    "review response repair must preserve the reproduced blocking/major finding "
+                    f"at {finding.anchor}, including its body, reproduction and blocking severity"
+                )
 
 
 # The old name, kept for callers that predate the repro rule.

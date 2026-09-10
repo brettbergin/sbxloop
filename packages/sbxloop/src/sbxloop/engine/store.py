@@ -1054,6 +1054,27 @@ class StateStore:
             rows = session.scalars(stmt.order_by(PhaseAttempt.id)).all()
             return [_attempt_record(row) for row in rows]
 
+    def session_models(self, run_id: str) -> dict[str, str]:
+        """Requested identities of completed builder/operator sessions.
+
+        Legacy rows have no identity: their workspace/report still survives,
+        but an SDK session must not silently resume under a different model.
+        """
+        models: dict[str, str] = {}
+        for row in self.phase_attempts(run_id):
+            if row.phase not in {"build", "execute"} or not row.output_json:
+                continue
+            try:
+                data = json.loads(row.output_json)
+            except ValueError:
+                continue
+            if not isinstance(data, dict):
+                continue
+            session_id, model = data.get("session_id"), data.get("requested_model")
+            if isinstance(session_id, str) and isinstance(model, str):
+                models[session_id] = model
+        return models
+
     def posted_findings(self, run_id: str) -> list[PostedRecord]:
         """Every review finding this run posted on its PR, oldest round first.
 

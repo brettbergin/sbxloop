@@ -118,7 +118,13 @@ class ToolAgent:
         self.handlers: list[Any] = []
 
     def submit(
-        self, job: JobRequest, *, agent: str | None = None, tool_handler: Any = None
+        self,
+        job: JobRequest,
+        *,
+        agent: str | None = None,
+        tool_handler: Any = None,
+        agent_phase: str | None = None,
+        model_source: str | None = None,
     ) -> JobResult:
         self.jobs.append((agent or "", job))
         self.handlers.append(tool_handler)

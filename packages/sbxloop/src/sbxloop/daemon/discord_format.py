@@ -261,9 +261,28 @@ def agent_ident_from_config_json(raw: object) -> dict[str, str]:
         data = {}
     agent = data.get("agent")
     backend = agent.get("backend") if isinstance(agent, dict) else None
+    model = str(data.get("model") or "") or UNKNOWN_MODEL
+    if data.get("run_model_override"):
+        model = f"{data['run_model_override']} (run override)"
+    else:
+        role_models = agent.get("models") if isinstance(agent, dict) else None
+        github = data.get("github")
+        repos = github.get("repos") if isinstance(github, dict) else None
+        per_repo = isinstance(repos, list) and any(
+            isinstance(entry, dict)
+            and isinstance(entry.get("agent_models"), dict)
+            and any(entry["agent_models"].values())
+            for entry in repos
+        )
+        if (
+            data.get("model_source_dir")
+            or per_repo
+            or (isinstance(role_models, dict) and any(role_models.values()))
+        ):
+            model = f"per-agent; initial fallback {model}"
     return {
         "backend": str(backend or "") or UNKNOWN_BACKEND,
-        "model": str(data.get("model") or "") or UNKNOWN_MODEL,
+        "model": model,
     }
 
 

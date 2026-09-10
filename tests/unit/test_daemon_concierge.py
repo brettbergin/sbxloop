@@ -62,6 +62,8 @@ class FakeClient:
         job: JobRequest,
         *,
         agent: str | None = None,
+        agent_phase: str | None = None,
+        model_source: str | None = None,
         tool_handler: Callable[[HostToolCall], HostToolResponse] | None = None,
     ) -> JobResult:
         self.jobs.append(job)

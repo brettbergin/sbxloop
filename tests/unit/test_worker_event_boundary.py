@@ -96,3 +96,36 @@ def test_genuine_host_publications_still_reach_the_bus() -> None:
     bus.subscribe(received.append)
     bus.emit("run.published", "r1", sink="chat", paths=["host-approved-artifact"])
     assert received[0].data["paths"] == ["host-approved-artifact"]
+
+
+def test_host_model_attribution_does_not_overwrite_sdk_reported_model(monkeypatch) -> None:
+    from sbxloop_worker.protocol import JobResult
+
+    client = WorkerClient(Sandbox(SbxCLI(), "unused"), backend="claude")
+    job = JobRequest(job_id="j1", run_id="r1", kind="agent.session", prompt="task", model="auto")
+    received = []
+    client.bus.subscribe(received.append)
+
+    def submit(request):
+        client._handle_line(
+            request,
+            Event.now(
+                "agent.usage",
+                "r1",
+                job_id="j1",
+                model="actual-model",
+                requested_model="forged",
+                agent_phase="forged",
+                model_source="forged",
+                input_tokens=10,
+            ).to_json_line(),
+        )
+        return JobResult(job_id="j1", status="ok")
+
+    monkeypatch.setattr(client, "_submit", submit)
+    client.submit(job, agent="operator", agent_phase="operator_plan", model_source="model")
+    data = received[0].data
+    assert data["model"] == "actual-model" and data["requested_model"] == "auto"
+    assert data["agent_phase"] == "operator_plan" and data["model_source"] == "model"
+    assert data["backend"] == "claude" and data["agent"] == "operator"
+    assert client._model_context == {}

@@ -432,6 +432,64 @@ class TestSession:
 
 
 class TestOptions:
+    @pytest.mark.parametrize("resume", [None, "existing", "missing"])
+    def test_response_only_sessions_remove_builtin_tools(
+        self, sdk: types.ModuleType, resume: str | None
+    ) -> None:
+        sdk.script = [ResultMessage(session_id="corrected", result="ok")]
+        sdk.fail_on_resume = resume == "missing"
+        _, emit = collect_emit()
+
+        ClaudeBackend().run_session(
+            job(
+                available_tools=[],
+                permission_mode="read_only",
+                system_message="Correct the supplied response. All tools are disabled.",
+                system_preset=False,
+                resume_session_id=resume,
+            ),
+            emit,
+        )
+
+        assert len(sdk.opened_with) == (2 if resume == "missing" else 1)
+        for options in sdk.opened_with:
+            assert options.kwargs["tools"] == []
+            assert callable(options.kwargs["can_use_tool"])
+            assert "mcp_servers" not in options.kwargs
+
+    @pytest.mark.parametrize(
+        "overrides",
+        [
+            {},
+            {"available_tools": ["Read"]},
+            {
+                "available_tools": [],
+                "host_tools": [HostToolSpec(name="lookup", description="Look up a record")],
+                "host_tools_dir": "/tmp/host-tools",
+            },
+            {
+                "available_tools": [],
+                "mcp_servers": [
+                    {
+                        "name": "reference",
+                        "transport": "http",
+                        "url": "https://reference.example.com/mcp",
+                    }
+                ],
+            },
+        ],
+        ids=["ordinary-session", "read-tool", "host-tools-only", "external-mcp"],
+    )
+    def test_other_sessions_keep_their_existing_tool_configuration(
+        self, sdk: types.ModuleType, overrides: dict[str, Any]
+    ) -> None:
+        sdk.script = [ResultMessage(session_id="s", result="ok")]
+        _, emit = collect_emit()
+
+        ClaudeBackend().run_session(job(**overrides), emit)
+
+        assert "tools" not in sdk.opened_with[0].kwargs
+
     @pytest.mark.parametrize("resume", [None, "existing", "expired"])
     @pytest.mark.parametrize("system_preset", [True, False])
     def test_shell_directory_contract_survives_resume_and_fallback(

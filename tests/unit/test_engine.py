@@ -1694,29 +1694,45 @@ class TestPipeline:
 
     def test_review_rounds_carry_history_and_refutations(self, harness: Harness) -> None:
         """Round 2 sees round 1's findings and the fixer's response; a
-        verdict built only on a refuted finding is sent back once."""
+        refuted-only verdict gets a correction without another investigation."""
         fake = FakeGithub()
         refute = {"text": "Left as is.\n\nrefuted: hello.txt:1 — the greeting is specified as hi"}
         harness.script(
-            [taskgraph(task("t1")), FILES_BUILD, REVIEW_RC, refute, REVIEW_RC, REVIEW_OK]
+            [
+                taskgraph(task("t1")),
+                FILES_BUILD,
+                REVIEW_RC,
+                refute,
+                {**REVIEW_RC, "session_id": "second-review-session"},
+                REVIEW_OK,
+            ]
         )
         engine = harness.pipeline(fake, keep_sandboxes=True)
         result = engine.start("write hello.txt")
         assert result.state == "merged"
         assert [event for event, _, _ in fake.reviews] == ["REQUEST_CHANGES", "APPROVE"]
+        jobs = harness.agent_jobs(result.run_id)
         reviews = [
-            j
-            for j in harness.agent_jobs(result.run_id)
-            if (j.get("prompt") or "").startswith("# Review the pull request")
+            j for j in jobs if (j.get("prompt") or "").startswith("# Review the pull request")
         ]
-        assert len(reviews) == 3  # round 1, round 2, round 2's retry
+        assert len(reviews) == 2  # round 1 and round 2; correction does not repeat the review
         (first,) = [j for j in reviews if "(first review of this pull request)" in j["prompt"]]
         assert "### Round" not in first["prompt"]
-        second = [j["prompt"] for j in reviews if "### Round 1 — request_changes" in j["prompt"]]
-        assert len(second) == 2
-        assert all("the greeting is specified as hi" in p for p in second)
-        (retry,) = [p for p in second if "already refuted" in p]
-        assert "hello.txt:1" in retry
+        (second,) = [j for j in reviews if "### Round 1 — request_changes" in j["prompt"]]
+        assert "the greeting is specified as hi" in second["prompt"]
+        (correction,) = [
+            j for j in jobs if (j.get("prompt") or "").startswith("# Correct the review response")
+        ]
+        assert "already refuted" in correction["prompt"]
+        assert "hello.txt:1" in correction["prompt"]
+        assert "the greeting is specified as hi" in correction["prompt"]
+        assert json.dumps(REVIEW_RC["json"]) in correction["prompt"]
+        assert correction["resume_session_id"] == "second-review-session"
+        assert correction["available_tools"] == []
+        assert correction["host_tools"] == []
+        assert correction["mcp_servers"] == []
+        assert correction["system_preset"] is False
+        assert correction["permission_mode"] == "read_only"
         rows = [r for r in engine.store.phase_attempts(result.run_id) if r.phase == "review"]
         assert [r.attempt for r in rows] == [1, 2]
 

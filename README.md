@@ -143,6 +143,13 @@ The [backend guide](docs/user-guide.md#agent-backends-copilot-claude-or-codex)
 covers setup and model listing; the [Codex implementation plan](docs/codex-backend.md)
 records its tool contract and verification limits.
 
+Models can differ by agent while sharing one backend: for example, use Haiku
+for the concierge, Opus for the builder, and Sonnet for review. Configure
+`[agent.models]`, optional per-repository `agent_models`, and `[concierge] model`.
+Unset roles inherit top-level `model`; `--model` forces all run agents for that
+run. Edits take effect before the next phase, with a fresh session when the
+model changes. See [Agent models](docs/user-guide.md#agent-models).
+
 The home config holds your operator settings. For a project's build and
 check settings, `sbxloop init --project` creates a `sbxloop.toml` in the
 current directory. Tracked project config cannot change your credentials,
