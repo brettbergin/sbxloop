@@ -295,6 +295,8 @@ Respond with exactly one fenced JSON block:
   `blocking` and `major` findings justify `request_changes`; a PR with only
   minor findings and nits is approved, with those findings listed so the
   author sees them.
+- Every finding must explicitly include `severity`. Its only supported keys
+  are `path`, `line`, `body`, `severity` and `repro`; do not add metadata keys.
 - `line` is a line of the *changed* file the finding is about (omit it for
   a finding with no single line). `path` is relative to the repository
   root.

@@ -901,6 +901,7 @@ class LoopEngine:
                         # The judge's tool digest is read off the bus (#756);
                         # a code run's phases never ask for one.
                         bus=self.bus if kind == "workload" else None,
+                        store=self.store,
                     )
                     # Replay persisted chat guidance (steer_run verdicts)
                     # so a resumed run keeps the direction the user set.
@@ -2909,6 +2910,7 @@ class LoopEngine:
             history=render_review_history(rounds),
             refuted=closed_anchors(rounds),
             verification=self._verification_note(run_id),
+            head_sha=run.head_sha,
         )
         # Round n+1's word on a finding an earlier round raised belongs in
         # that finding's own thread, not restated in a fresh review body
