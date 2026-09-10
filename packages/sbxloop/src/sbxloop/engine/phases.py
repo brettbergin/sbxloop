@@ -27,14 +27,15 @@ Session strategy per phase (a deliberate design decision):
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from functools import partial
 from pathlib import Path
-from typing import Literal, NamedTuple, TypeVar
+from typing import Any, Literal, NamedTuple, TypeVar
 
-from pydantic import BaseModel, TypeAdapter
+from pydantic import BaseModel, Field, TypeAdapter
 
 from sbxloop import toolchains
 from sbxloop.agentmodels import ModelSelection, model_for_phase, refreshed_models, run_model_repo
@@ -55,6 +56,7 @@ from sbxloop.engine.repocontext import repo_conventions
 from sbxloop.engine.review import ReviewGuard, ReviewVerdict
 from sbxloop.engine.service import FETCH_TIMEOUT_S, FETCH_TOOL_NAME
 from sbxloop.engine.skilltools import SKILL_TOOL_NAME, answer_skill_call, skill_tool_spec
+from sbxloop.engine.store import StateStore
 from sbxloop.errors import InvalidOutputTwice, WorkerError
 from sbxloop.events import EventBus
 from sbxloop.ids import new_job_id
@@ -87,6 +89,39 @@ from sbxloop_worker.protocol import (
 )
 
 OUTPUT_CLIP = 6_000
+REVIEW_RESPONSE_PHASE = "review_response_repair"
+
+
+class _ReviewResponseCheckpoint(BaseModel):
+    """Completed responses replayed around an interrupted provider request.
+
+    A string is an ExpectedJsonMissing error. Keep it in the attempt list
+    too: an unparseable correction still consumes one of the two attempts.
+    """
+
+    original: JobResult
+    repairs: list[JobResult | str] = Field(default_factory=list, max_length=2)
+    requested_model: str | None = None
+    model_source: str = "model"
+
+
+def _review_response_schema(model_cls: type[BaseModel]) -> str:
+    """Send validation rules without developer-only model docstrings."""
+
+    def without_descriptions(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {
+                key: without_descriptions(item)
+                for key, item in value.items()
+                if not (key == "description" and isinstance(item, str))
+            }
+        if isinstance(value, list):
+            return [without_descriptions(item) for item in value]
+        return value
+
+    return json.dumps(without_descriptions(model_cls.model_json_schema()), ensure_ascii=False)
+
+
 # Verify output keeps head + tail (#253): a pytest run over hundreds of
 # tests prints the failing assertions in the middle/top of its output and
 # only a "N failed" summary at the bottom, so a tail-only clip handed the
@@ -366,12 +401,14 @@ class PhaseRunner:
         tool_handler: HostToolHandler | None = None,
         bus: EventBus | None = None,
         session_models: Mapping[str, str] | None = None,
+        store: StateStore | None = None,
     ) -> None:
         self.agent = agent
         self.config = config
         self.run_id = run_id
         self.session_models = dict(session_models or {})
         self.outcome = outcome
+        self.store = store
         # The run's event bus, when the caller has one: where a job's tool
         # calls are read back from for the judge's digest (#756). None
         # (embedders, tests) leaves the digest empty.
@@ -502,6 +539,7 @@ class PhaseRunner:
         system_preset: bool = True,
         digest: ToolDigest | None = None,
         selection: ModelSelection | None = None,
+        response_only: bool = False,
     ) -> JobResult:
         selection = selection or model_for_phase(
             refreshed_models(self.config), phase, repo=run_model_repo(self.config)
@@ -515,7 +553,7 @@ class PhaseRunner:
         # the verification procedure exactly as much as the builder does, and
         # unlike a service call it reaches nothing outside the host.
         host_tools, tool_handler = self._tools_for(phase, service_tools)
-        if phase == "review" and self.issue_lookup is not None:
+        if phase == "review" and self.issue_lookup is not None and not response_only:
             lookup = self.issue_lookup
             other_handler = tool_handler
 
@@ -528,12 +566,19 @@ class PhaseRunner:
 
             host_tools = (*host_tools, lookup.tool_spec())
             tool_handler = review_handler
+        if response_only:
+            host_tools = ()
+            tool_handler = None
         job = JobRequest(
             job_id=new_job_id(),
             run_id=self.run_id,
             kind="agent.session",
             prompt=prompt,
-            system_message=brief_for_phase(self.config, phase, system_message),
+            system_message=(
+                system_message
+                if response_only
+                else brief_for_phase(self.config, phase, system_message)
+            ),
             system_preset=system_preset,
             model=selection.model,
             permission_mode=permission_mode,
@@ -541,9 +586,10 @@ class PhaseRunner:
             cwd=self.workdir,
             timeout_s=self.config.budgets.per_job_timeout_s,
             max_tool_calls=self.config.budgets.max_tool_calls_per_phase or None,
-            # Only BUILD ever passes one: a revision continues its own prior
-            # attempt's session so the work already done is not re-derived.
+            # Builds continue their work; review corrections continue the
+            # completed investigation with every tool surface disabled.
             resume_session_id=resume_session_id,
+            available_tools=[] if response_only else None,
             host_tools=list(host_tools),
             # Give an artifact operation time to finish and transfer its
             # file before the agent abandons the host-tool response.
@@ -557,7 +603,7 @@ class PhaseRunner:
             # reaching a third-party service is a capability nobody asked
             # for, and both backends already fail closed on an unknown MCP
             # tool in read-only mode.
-            mcp_servers=self.config.mcp_specs_for(ROLE_BY_PHASE[phase]),
+            mcp_servers=[] if response_only else self.config.mcp_specs_for(ROLE_BY_PHASE[phase]),
         )
         recovery = getattr(self.agent, "provider_recovery", None)
         if recovery is not None:
@@ -675,8 +721,14 @@ class PhaseRunner:
         check: Callable[[ModelT], None] | None = None,
         system_message: str | None = None,
         system_preset: bool = True,
+        repair_check: Callable[[object, ModelT], None] | None = None,
+        repair_identity: str = "",
     ) -> tuple[ModelT, JobResult]:
-        """Run a JSON-expecting agent job; one retry with what went wrong.
+        """Run a JSON-expecting job, normally with one validation retry.
+
+        A parsed review instead gets at most two response-only corrections.
+        Completed responses survive provider holds and replay without tools
+        or further model calls before continuing the interrupted correction.
 
         Retryable failures: schema mismatch (ValidationError), semantic
         rejection by ``check`` (host-side validation on the parsed model;
@@ -688,22 +740,66 @@ class PhaseRunner:
 
         Returns the validated model together with the raw JobResult.
         """
+        checkpoint_key: str | None = None
+        checkpoint: _ReviewResponseCheckpoint | None = None
+        if prompt_name == "review" and self.store is not None:
+            identity = {
+                "prompt": render(prompt_name, retry_context="", **context),
+                "system_message": brief_for_phase(self.config, prompt_name, system_message),
+                "system_preset": system_preset,
+                "permission_mode": permission_mode,
+                # Keep the run's original fallback in the identity for legacy
+                # checkpoints. The actual selection travels with the response;
+                # live model edits must not restart a pending correction.
+                "model": self.config.model,
+                "backend": self.config.agent.backend,
+                "cwd": self.workdir,
+                "schema": _review_response_schema(model_cls),
+                "guard": repair_identity,
+                "mcp": [
+                    spec.model_dump(mode="json")
+                    for spec in self.config.mcp_specs_for(ROLE_BY_PHASE[prompt_name])
+                ],
+            }
+            checkpoint_key = hashlib.sha256(
+                json.dumps(identity, sort_keys=True).encode()
+            ).hexdigest()
+            saved = self.store.latest_phase_output(
+                self.run_id, checkpoint_key, REVIEW_RESPONSE_PHASE
+            )
+            if saved is not None:
+                checkpoint = _ReviewResponseCheckpoint.model_validate_json(saved)
         retry_context = ""
         last_error: Exception | None = None
-        selection = model_for_phase(
-            refreshed_models(self.config), prompt_name, repo=run_model_repo(self.config)
-        )
+        if checkpoint is None:
+            selection = model_for_phase(
+                refreshed_models(self.config), prompt_name, repo=run_model_repo(self.config)
+            )
+        else:
+            # Checkpoints written before per-agent models used the run's
+            # top-level model. Restore session identities as well as responses
+            # so a host restart can continue the same review conversation.
+            selection = ModelSelection(
+                checkpoint.requested_model or self.config.model, checkpoint.model_source
+            )
+            for response in (checkpoint.original, *checkpoint.repairs):
+                if isinstance(response, JobResult) and response.session_id:
+                    self.session_models[response.session_id] = selection.model
         for _ in range(2):
             prompt = render(prompt_name, retry_context=retry_context, **context)
             try:
-                result = self._agent_job(
-                    prompt,
-                    phase=prompt_name,
-                    permission_mode=permission_mode,
-                    expect="json",
-                    system_message=system_message,
-                    system_preset=system_preset,
-                    selection=selection,
+                result = (
+                    checkpoint.original
+                    if checkpoint is not None
+                    else self._agent_job(
+                        prompt,
+                        phase=prompt_name,
+                        permission_mode=permission_mode,
+                        expect="json",
+                        system_message=system_message,
+                        system_preset=system_preset,
+                        selection=selection,
+                    )
                 )
             except WorkerError as exc:
                 if "ExpectedJsonMissing" not in str(exc):
@@ -728,6 +824,25 @@ class PhaseRunner:
                     check(model)
                 return model, result
             except ValueError as exc:  # includes pydantic's ValidationError
+                if prompt_name == "review":
+                    if checkpoint is None:
+                        checkpoint = _ReviewResponseCheckpoint(
+                            original=result,
+                            requested_model=selection.model,
+                            model_source=selection.source,
+                        )
+                        self._save_review_checkpoint(checkpoint_key, checkpoint)
+                    return self._repair_review_response(
+                        model_cls,
+                        result,
+                        exc,
+                        check=check,
+                        repair_check=repair_check,
+                        checkpoint_key=checkpoint_key,
+                        checkpoint=checkpoint,
+                        prior_rounds=context["prior_rounds"],
+                        selection=selection,
+                    )
                 last_error = exc
                 log.warning(
                     "phase.retry",
@@ -745,6 +860,114 @@ class PhaseRunner:
             "phase.invalid_twice", run=self.run_id, prompt=prompt_name, error=str(last_error)[:300]
         )
         raise InvalidOutputTwice(f"{prompt_name} produced invalid output twice: {last_error}")
+
+    def _save_review_checkpoint(
+        self, key: str | None, checkpoint: _ReviewResponseCheckpoint
+    ) -> None:
+        if self.store is None or key is None:
+            return
+        # Persist accounting with the completed responses. Replaying these
+        # responses adds no spend; an interrupted provider job is accounted
+        # when ProviderRecovery returns its cumulative result after resume.
+        self.store.record_phase(
+            self.run_id,
+            REVIEW_RESPONSE_PHASE,
+            task_id=key,
+            attempt=len(checkpoint.repairs) + 1,
+            status="checkpoint",
+            output_json=checkpoint.model_dump_json(),
+            started_at=time.time(),
+            usage=self._spend_usage if self._spend_usage != Usage() else None,
+            turns=self._spend_turns or None,
+        )
+        self.drain_spend()
+
+    def _repair_review_response(
+        self,
+        model_cls: type[ModelT],
+        result: JobResult,
+        error: ValueError,
+        *,
+        check: Callable[[ModelT], None] | None,
+        repair_check: Callable[[object, ModelT], None] | None,
+        checkpoint_key: str | None,
+        checkpoint: _ReviewResponseCheckpoint,
+        prior_rounds: str,
+        selection: ModelSelection,
+    ) -> tuple[ModelT, JobResult]:
+        """Correct a completed review at most twice, without another investigation.
+
+        Carry the actual response even when the backend cannot resume its
+        session. Keep the same semantic guard and strict schema: corrections
+        spend model tokens, but cannot run tests, read files or redo lookups.
+        """
+        last_error: Exception = error
+        original_response = result.output_json
+        schema = _review_response_schema(model_cls)
+        for attempt in range(1, 3):
+            log.warning(
+                "phase.response_repair",
+                run=self.run_id,
+                prompt="review",
+                attempt=attempt,
+                error=str(last_error)[:300],
+            )
+            prompt = render(
+                "review_repair",
+                prior_response=json.dumps(result.output_json, ensure_ascii=False),
+                original_response=(
+                    ""
+                    if result.output_json == original_response
+                    else "## Original response to preserve\n\n```json\n"
+                    + json.dumps(original_response, ensure_ascii=False)
+                    + "\n```\n"
+                ),
+                validation_error=str(last_error),
+                schema=schema,
+                prior_rounds=prior_rounds or "(no earlier review rounds)",
+            )
+            if attempt <= len(checkpoint.repairs):
+                completed = checkpoint.repairs[attempt - 1]
+                if isinstance(completed, str):
+                    last_error = WorkerError(completed)
+                    continue
+                result = completed
+            else:
+                try:
+                    result = self._agent_job(
+                        prompt,
+                        phase="review",
+                        permission_mode="read_only",
+                        expect="json",
+                        resume_session_id=result.session_id,
+                        system_message=(
+                            "Correct the supplied review response. All tools are disabled."
+                        ),
+                        system_preset=False,
+                        response_only=True,
+                        selection=selection,
+                    )
+                except WorkerError as exc:
+                    if "ExpectedJsonMissing" not in str(exc):
+                        raise
+                    checkpoint.repairs.append(str(exc))
+                    self._save_review_checkpoint(checkpoint_key, checkpoint)
+                    last_error = exc
+                    continue
+                checkpoint.repairs.append(result)
+                self._save_review_checkpoint(checkpoint_key, checkpoint)
+            try:
+                model = model_cls.model_validate(result.output_json)
+                if repair_check is not None:
+                    repair_check(original_response, model)
+                if check is not None:
+                    check(model)
+                return model, result
+            except ValueError as exc:
+                last_error = exc
+        raise InvalidOutputTwice(
+            f"review response remained invalid after two repair attempts: {last_error}"
+        )
 
     def merge_from_base(
         self, base_branch: str, *, base_sha: str, bundle: Path | None = None
@@ -1056,6 +1279,7 @@ class PhaseRunner:
         history: str,
         refuted: set[str],
         verification: str = "",
+        head_sha: str | None = None,
     ) -> ReviewVerdict:
         """Review the delivered PR: a fresh read-only session over its diff.
 
@@ -1079,6 +1303,7 @@ class PhaseRunner:
             ],
             empty="(no tasks recorded)",
         )
+        guard = ReviewGuard(refuted)
         verdict, _ = self._agent_json(
             ReviewVerdict,
             "review",
@@ -1097,7 +1322,19 @@ class PhaseRunner:
                 "repo_conventions": self.repo_conventions(),
             },
             permission_mode="read_only",
-            check=ReviewGuard(refuted).check,
+            check=guard.check,
+            repair_check=guard.check_repair,
+            repair_identity=json.dumps(
+                {
+                    "refuted": sorted(refuted),
+                    "head_sha": head_sha,
+                    # The prompt's clipped middle is not a code identity.
+                    "diff_sha256": hashlib.sha256(diff.encode()).hexdigest()
+                    if diff is not None
+                    else None,
+                },
+                sort_keys=True,
+            ),
         )
         return verdict
 

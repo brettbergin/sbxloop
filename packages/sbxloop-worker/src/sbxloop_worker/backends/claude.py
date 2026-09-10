@@ -351,6 +351,11 @@ class ClaudeBackend:
             # resumes and their fresh-session fallback, without mutating ours.
             "env": {"CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1"},
         }
+        if job.available_tools == [] and not job.host_tools and not job.mcp_servers:
+            # Response corrections need no tool definitions, not merely a
+            # permission rejection after the model spends a turn calling one.
+            # Keep host-tool/MCP sessions' existing discovery behavior.
+            kwargs["tools"] = []
         if job.model and job.model != "auto":
             kwargs["model"] = job.model
         if job.cwd:
