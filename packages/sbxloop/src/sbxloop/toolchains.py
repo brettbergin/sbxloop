@@ -270,6 +270,10 @@ def _series_satisfying(
         source=source,
         constraint=constraint,
         candidates=list(candidates),
+        hint="the repository pins a toolchain series no series this host can install "
+        "satisfies, so the run stops before provisioning one the project would refuse; "
+        "pin an installable series, widen the declaration, or add the series to the "
+        "host's registry",
     )
     raise UnsatisfiablePin(
         f"{source} pins {toolchain} to {constraint!r}, which no series this host can "

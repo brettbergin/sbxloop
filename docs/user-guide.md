@@ -2168,6 +2168,7 @@ the home's `config/sbxloop.toml`:
 [telemetry]
 dsn_env = "GLITCHTIP_DSN"
 environment = "production"
+log_fields = "diagnostic"
 ```
 
 Reports include unhandled CLI exceptions, sbxloop ERROR events, and WARNING
@@ -2175,10 +2176,45 @@ events logged with an exception. They carry the sbxloop release, deployment
 label, static event name, exception types and messages, chained exceptions,
 exception-group members, and stack filenames, paths, functions, line numbers,
 and source context. Recognizable credential patterns are redacted using the
-same filter as local logs. Local variables, command arguments, and structured
-log fields are not collected. Messages and source context can include
-application data; configure a reporting destination appropriate for that data.
-Individual text values are limited to 100,000 characters by the SDK.
+same filter as local logs. Local variables and command arguments are not
+collected. Messages and source context can include application data; configure
+a reporting destination appropriate for that data. Individual text values are
+limited to 100,000 characters by the SDK.
+
+#### What an exception-less error report carries
+
+Most ERROR events are not exceptions: a circuit breaker opening, a work item
+abandoned, a sandbox that could not be provisioned. They reach the server with
+no traceback, so on their own they are a bare event name and nothing to act on.
+Three things travel with them instead:
+
+- **The call site**, as the report's culprit (`sbxloop.daemon.loop in _handle_failure`) — the same class of fact a traceback frame carries, so two
+  call sites that log the same event name no longer read alike.
+- **The event's `hint`**, the static sentence the call site writes for an
+  operator reading the journal, as the report's title line
+  (`breaker.opened: <hint>`). It is this repository's own prose, identical on
+  every occurrence, so a report that explains itself still groups with the
+  others of its kind.
+- **The record's structured fields**, as far as `log_fields` allows.
+
+`log_fields` decides how much of the record travels, because a log field can
+hold a target repository's content:
+
+| Value        | What travels                                                                                                                                                                                                |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `none`       | Nothing of the record: the event name and the call site alone, as before this setting existed.                                                                                                              |
+| `diagnostic` | The default. Numbers and flags (attempt counts, durations, cooldowns, failure streaks), the static `hint`, and enum-valued keys sbxloop writes itself (`role`, `backend`, `kind`, `stage`, `state`, …).     |
+| `all`        | Everything above plus the free-text fields — `reason`, `error`, item ids, branch names, urls — which say *which* run failed and why. Choose this only for a reporting server that may hold repository text. |
+
+Under every value, fields whose key names a credential are already masked by
+the same filter local logs use, free-text values are scrubbed for credential
+shapes and trimmed to 2,000 characters, and nothing the SDK itself would add
+(breadcrumbs, request, user, server name, module list) is ever sent.
+
+Reports upgrading from an earlier version regroup once: adding the culprit and
+the hint changes the fingerprint the server derives, so existing issues for
+these events stop receiving new occurrences and a new issue opens in their
+place.
 
 The SDK is confined to the host: no DSN is injected into sandboxes and no
 sandbox egress rule is added. Session tracking, tracing, profiling, metrics,
@@ -2193,6 +2229,7 @@ Remove or empty the DSN to disable reporting, then restart the daemon.
 | ----------------------- | --------------- | ------------------------------------------------------------------------- |
 | `telemetry.dsn_env`     | `GLITCHTIP_DSN` | Name of the environment variable containing the DSN; never the DSN value. |
 | `telemetry.environment` | `production`    | Deployment label attached to reports.                                     |
+| `telemetry.log_fields`  | `diagnostic`    | How much of a log record a report carries: `none`, `diagnostic`, `all`.   |
 
 These are host settings, with no per-repository override; tracked project
 configuration cannot change the reporting destination.

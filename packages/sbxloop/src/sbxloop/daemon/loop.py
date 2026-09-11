@@ -118,6 +118,16 @@ log = get_logger(__name__)
 # bookkeeping, not part of the outcome the agent should read.
 _MARKER_RE = HIDDEN_MARKER_RE
 
+# What an operator reading this failure needs to do about it. Static prose,
+# so it is the one part of an error record that can be forwarded to an error
+# reporter (``[telemetry] log_fields``) whatever else the record holds.
+_BREAKER_HINT = (
+    "`[daemon] max_consecutive_failures` runs failed in a row, so dispatch is "
+    "paused for `breaker_cooldown_s` and one probe run follows; a breaker that "
+    "keeps opening is usually the host, the agent credential or the base branch "
+    "rather than any one item — `sbxloop daemon ctl status` says what is held"
+)
+
 
 @contextmanager
 def defer_signals(signals: Sequence[int] = (signal.SIGINT, signal.SIGTERM)) -> Iterator[None]:
@@ -1897,6 +1907,9 @@ class DaemonLoop:
                 url=report.pr[1] if report.pr else None,
                 reason=reason,
                 pr=report.pr[0] if report.pr else None,
+                hint="the run stopped at something only a human can settle (a gate, a "
+                "conflict, a decision the agent must not take); the item stays claimed "
+                "until someone acts on it — `sbxloop daemon ctl status` lists what is held",
             )
             return "blocked"
         reason = str(error) if error is not None else (report.reason or f"run ended {report.state}")
@@ -1937,6 +1950,9 @@ class DaemonLoop:
                 reason=reason,
                 attempts=item.attempts,
                 consecutive_failures=self._consecutive_failures,
+                hint="the item spent every attempt `[daemon] max_attempts_per_item` "
+                "allows and was handed back to its source; nothing retries it on its "
+                "own — re-apply the trigger label (or `retry <item>`) to run it again",
             )
             outcome = "failed"
         self._frontend_finished(item, report)
@@ -1949,6 +1965,7 @@ class DaemonLoop:
                 level="error",
                 consecutive_failures=self._consecutive_failures,
                 cooldown_s=self.config.daemon.breaker_cooldown_s,
+                hint=_BREAKER_HINT,
             )
         return outcome
 
@@ -2042,7 +2059,14 @@ class DaemonLoop:
         if pr_number is None:
             # A gate without a PR cannot be approved; hand over instead of
             # parking dead. Should be unreachable — Gated comes after deliver.
-            log.error("gate.no_pr", run=run_id, item=item.item_id)
+            log.error(
+                "gate.no_pr",
+                run=run_id,
+                item=item.item_id,
+                hint="a run ended gated but no pull request was recorded for it, so "
+                "there is nothing to approve; this should be unreachable — the item is "
+                "blocked for a human and the run record is the place to look",
+            )
             self.dstore.mark_blocked(item.item_id, "run ended gated without a PR", now)
             fresh = self.dstore.get(item.item_id) or item
             self._deliver_report(fresh)
@@ -2166,7 +2190,14 @@ class DaemonLoop:
         if pr_number is None and report.pr is not None:
             pr_number, pr_url = report.pr
         if pr_number is None:
-            log.error("review.no_pr", run=run_id, item=item.item_id)
+            log.error(
+                "review.no_pr",
+                run=run_id,
+                item=item.item_id,
+                hint="a run ended awaiting review but no pull request was recorded for "
+                "it, so there is nothing to watch; this should be unreachable — the item "
+                "is blocked for a human and the run record is the place to look",
+            )
             self.dstore.mark_blocked(item.item_id, "run ended awaiting_review without a PR", now)
             fresh = self.dstore.get(item.item_id) or item
             self._deliver_report(fresh)
@@ -3309,6 +3340,9 @@ class DaemonLoop:
             granted_rounds=record.granted_rounds,
             pr=pr[0] if pr else None,
             consecutive_failures=self._consecutive_failures,
+            hint="the run used every fix round it was granted and the checks it was "
+            "fixing are still not passing; the PR stands and nothing retries on its own "
+            "— grant more rounds to continue it, or retry the item for a fresh plan",
         )
         self._frontend_finished(item, report)
         if self._consecutive_failures >= self.config.daemon.max_consecutive_failures:
@@ -3320,6 +3354,7 @@ class DaemonLoop:
                 level="error",
                 consecutive_failures=self._consecutive_failures,
                 cooldown_s=self.config.daemon.breaker_cooldown_s,
+                hint=_BREAKER_HINT,
             )
         return "failed"
 

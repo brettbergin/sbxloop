@@ -2323,7 +2323,13 @@ def daemon(
     except ValidationError as exc:
         # Before the pipeline is configured with the daemon's own settings:
         # the WARNING-level default from the app callback carries this.
-        log.error("daemon.invalid_option", error=exc.errors()[0]["msg"])
+        log.error(
+            "daemon.invalid_option",
+            error=exc.errors()[0]["msg"],
+            hint="a command-line option the daemon was started with is not a valid "
+            "value for that setting; the daemon refuses to start rather than run on a "
+            "silently different one",
+        )
         raise typer.Exit(2) from exc
     # stderr → journald under systemd, and the same records to the home's
     # logs/daemon.log for a host without a journal, a tail over ssh, or the

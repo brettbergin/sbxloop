@@ -359,6 +359,9 @@ class DaemonAgent:
                 sandbox=self.name,
                 duration_s=round(time.monotonic() - started, 1),
                 error=str(exc),
+                hint="the long-lived sandbox the concierge answers chat from could not "
+                "be created, so chat intake is off until it can be; the sandbox backend, "
+                "its image and the host's disk are what to check — `sbxloop doctor`",
             )
             raise DaemonError(f"cannot provision the concierge sandbox: {exc}") from exc
         self._sandbox = sandbox

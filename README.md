@@ -299,6 +299,7 @@ sends host failures to your own project. Set the DSN in the home's secrets file.
 | ----------------------- | --------------- | ---------------------------------------------------------------------------------- |
 | `telemetry.dsn_env`     | `GLITCHTIP_DSN` | Environment variable holding the reporting DSN; empty or unset disables reporting. |
 | `telemetry.environment` | `production`    | Deployment label on error reports.                                                 |
+| `telemetry.log_fields`  | `diagnostic`    | How much of a log record a report carries: `none`, `diagnostic`, `all`.            |
 
 ## Contributing
 

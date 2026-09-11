@@ -451,3 +451,63 @@ class TestDaemonLogFile:
             assert json.loads(line)["event"] == "daemon.starting"
         finally:
             configure_logging("WARNING")
+
+
+class TestErrorEventsExplainThemselves:
+    """An ERROR logged without an exception has no traceback behind it. In
+    the journal it is one line; forwarded to an error reporter it is a bare
+    event name and nothing to act on. The ``hint`` is what makes it mean
+    something, so every such call site writes one."""
+
+    @staticmethod
+    def _error_sites() -> list[tuple[str, str, int, set[str]]]:
+        """``(event, file, line, keywords)`` for every ERROR-level log call
+        with a literal event name, found by reading the source."""
+        import ast
+
+        root = Path(__file__).resolve().parents[2] / "packages"
+        sites: list[tuple[str, str, int, set[str]]] = []
+        for path in sorted(root.rglob("*.py")):
+            tree = ast.parse(path.read_text(), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = getattr(node.func, "attr", None) or getattr(node.func, "id", None)
+                keywords = {kw.arg for kw in node.keywords if kw.arg}
+                if name in {"error", "critical", "exception"}:
+                    level = name
+                elif name in {"_notice", "notice"}:
+                    level = next(
+                        (
+                            kw.value.value
+                            for kw in node.keywords
+                            if kw.arg == "level" and isinstance(kw.value, ast.Constant)
+                        ),
+                        "info",
+                    )
+                else:
+                    continue
+                if level not in {"error", "critical"}:
+                    continue
+                if not node.args or not isinstance(node.args[0], ast.Constant):
+                    continue
+                event = node.args[0].value
+                if not isinstance(event, str) or "." not in event:
+                    continue
+                sites.append((event, str(path.relative_to(root)), node.lineno, keywords))
+        return sites
+
+    def test_the_scan_finds_the_call_sites_it_is_meant_to_guard(self) -> None:
+        found = {event for event, _, _, _ in self._error_sites()}
+        assert {"breaker.opened", "run.abandoned", "github_sandbox.provision_failed"} <= found
+
+    def test_every_exception_less_error_carries_an_operator_hint(self) -> None:
+        missing = [
+            f"{file}:{line} {event}"
+            for event, file, line, keywords in self._error_sites()
+            if "exc_info" not in keywords and "hint" not in keywords
+        ]
+        assert not missing, (
+            "ERROR events with neither an exception nor a hint explain nothing to "
+            f"whoever reads them: {missing}"
+        )
