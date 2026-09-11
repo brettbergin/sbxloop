@@ -445,6 +445,9 @@ def test_every_commented_key_is_a_real_config_key() -> None:
         elif section == "workload":
             # `[workload] default` names a profile that must exist.
             doc = {"workload": parsed, "workloads": [{"name": parsed.get("default", "p")}]}
+        elif section == "mattermost":
+            # `[mattermost]` needs the instance before a channel is meaningful.
+            doc = {"mattermost": {"url": "https://mattermost.example.com", **parsed}}
         elif section == "chat":
             # `[chat] backend` names a section that must carry a channel_id.
             doc = {

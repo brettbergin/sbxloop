@@ -30,6 +30,7 @@ if TYPE_CHECKING:
 DISCORD_TOKEN_ENV = "DISCORD_BOT_TOKEN"  # nosec B105 - env var name, not a secret
 SLACK_BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"  # nosec B105 - env var name, not a secret
 SLACK_APP_TOKEN_ENV = "SLACK_APP_TOKEN"  # nosec B105 - env var name, not a secret
+MATTERMOST_TOKEN_ENV = "MATTERMOST_BOT_TOKEN"  # nosec B105 - env var name, not a secret
 
 
 @dataclass(frozen=True)
@@ -97,10 +98,22 @@ SLACK = ChatService(
     bridge_class="SlackBridge",
 )
 
+MATTERMOST = ChatService(
+    name="mattermost",
+    label="Mattermost",
+    section="mattermost",
+    token_envs=(MATTERMOST_TOKEN_ENV,),
+    extra="mattermost",
+    import_name="aiohttp",
+    sdk_label="aiohttp",
+    module="sbxloop.daemon.mattermost",
+    bridge_class="MattermostBridge",
+)
+
 #: Every service ``[chat] backend`` accepts. The ``ChatBackend`` Literal in
 #: the config package names the same set; ``test_config_chat`` pins the two
 #: together.
-CHAT_SERVICES: tuple[ChatService, ...] = (DISCORD, SLACK)
+CHAT_SERVICES: tuple[ChatService, ...] = (DISCORD, SLACK, MATTERMOST)
 
 #: Every bridge the daemon can run, the always-on local one included. The
 #: ``BridgeBackend`` Literal names the same set.
@@ -131,6 +144,8 @@ __all__ = [
     "DISCORD",
     "DISCORD_TOKEN_ENV",
     "LOCAL_BACKEND",
+    "MATTERMOST",
+    "MATTERMOST_TOKEN_ENV",
     "SLACK",
     "SLACK_APP_TOKEN_ENV",
     "SLACK_BOT_TOKEN_ENV",

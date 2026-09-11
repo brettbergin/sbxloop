@@ -152,9 +152,8 @@ class TestServiceDescriptors:
             assert bridge.label == service.label
 
     def test_unknown_backend_names_the_known_ones(self) -> None:
-        with pytest.raises(
-            ValueError, match=r"unknown chat backend 'irc' \(known: discord, slack\)"
-        ):
+        known = ", ".join(service.name for service in CHAT_SERVICES)
+        with pytest.raises(ValueError, match=rf"unknown chat backend 'irc' \(known: {known}\)"):
             service_named("irc")
 
     def test_missing_extra_detail_names_the_sdk_and_its_extra(self) -> None:

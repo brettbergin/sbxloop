@@ -71,7 +71,8 @@ enable_error_code = ["ignore-without-code", "redundant-expr", "truthy-bool"]
 
 [[tool.mypy.overrides]]
 # Optional extras: the host SDK ([copilot]) and the daemon's chat bridges
-# ([discord], [slack]) are deferred imports that resolve only when installed.
+# ([discord], [slack], [mattermost]) are deferred imports that resolve only
+# when installed.
 module = [
     "copilot",
     "copilot.*",
@@ -85,6 +86,8 @@ module = [
     "discord.*",
     "slack_sdk",
     "slack_sdk.*",
+    "aiohttp",
+    "aiohttp.*",
 ]
 ignore_missing_imports = true
 
