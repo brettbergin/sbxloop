@@ -1352,13 +1352,14 @@ warning and a `sbxloop doctor` row to make that edit unhurried
 migrated, and the old lanes' issues and labels are closed by hand;
 [CHANGELOG → 1.0 cutover](../CHANGELOG.md#10-cutover) has the steps.
 
-### Chat: chronology out, steering in — Discord or Slack
+### Chat: chronology out, steering in — Discord, Slack or Mattermost
 
-The daemon's human channel is one chat service, chosen by `[chat] backend = "discord" | "slack"` — or inferred from whichever of `[discord]` / `[slack]`
-carries a `channel_id`; configuring both without choosing is a config error,
-and neither means the daemon runs headless (`sbxloop daemon ctl` only).
-Everything in this section works the same on both: Discord is described
-first, the Slack differences follow. With `pip install 'sbxloop[discord]'`,
+The daemon's human channel is one chat service, chosen by `[chat] backend = "discord" | "slack" | "mattermost"` — or inferred from whichever of
+`[discord]` / `[slack]` / `[mattermost]` carries a `channel_id`; configuring
+more than one without choosing is a config error, and none means the daemon
+runs headless (`sbxloop daemon ctl` only).
+Everything in this section works the same on each: Discord is described
+first, the Slack and Mattermost differences follow. With `pip install 'sbxloop[discord]'`,
 `DISCORD_BOT_TOKEN` in the environment, and `[discord] channel_id` set, a
 gateway bot posts a headline card per run in the control channel (source issue, run id, branch, PR,
 task tally — colour follows the state) and streams that run's
@@ -1517,9 +1518,13 @@ that typing still works, and a click that arrives late (or on a question
 already answered, or after a daemon restart, which forgets them — nothing
 is persisted) gets a private nudge to answer in the channel instead. The
 bot never waits on a click: a Discord that rejects the components, or a
-host without them, simply gets the plain numbered question. Backends
-without interactive components — Slack today — always get that prose
-rendering, so nothing about them changes.
+host without them, simply gets the plain numbered question. Every backend
+posts that same numbered prose and stays answerable by typing; what differs
+is the affordance laid on top. Slack adds Block Kit buttons. Mattermost
+seeds the question with one emoji per choice — reacting 1️⃣/2️⃣ answers it —
+because Mattermost's own interactive buttons post to a callback URL, which
+would cost the daemon the dial-out property its bridge is built on, while a
+reaction arrives on the websocket already open.
 "What's open?" lists the repository's open issues and which are queued or
 running; `queued: false` shows everything the daemon is not currently
 queued or running — the backlog plus issues that failed or are blocked and
@@ -1616,6 +1621,36 @@ no "reply to a message" outside threads, so the concierge and steering are
 tokens present. Switching backends is a config change plus a daemon
 restart; runs recorded under the other backend keep their thread rows but
 are not re-posted.
+
+**Mattermost instead.** For an instance you host. `pip install 'sbxloop[mattermost]'`, set `[mattermost] url` to the instance (scheme
+included — a private hostname and a port are ordinary here) and
+`[mattermost] channel_id` to the channel's 26-character id (channel name →
+*View Info*, not a `~name`), and put `MATTERMOST_BOT_TOKEN` in the
+environment / `.env` — never in `sbxloop.toml`. Create a bot account in the
+*System Console* → *Integrations* → *Bot Accounts*, then add it to the
+control channel. The bridge connects over a **websocket**, so like Slack's
+Socket Mode it dials out: no public URL, no inbound hole, and a daemon
+behind NAT works.
+On Mattermost's shapes: the run thread is the reply stream under the
+headline post (its post id is the thread id; `thread_per_run = false` posts
+everything top-level), and Mattermost does not nest, so the one-level
+chronology is the shape it already wants. Reactions use the standard emoji
+names. Mattermost has no allowed-mentions control, so agent prose is passed
+through a mention guard — a zero-width space parks every `@name` that would
+resolve, leaving it readable and inert — which is why a run's prose can
+never ping `@channel`. Replying on Mattermost means posting in a thread
+rather than answering one message, so — as on Slack — the concierge and
+steering are @mention-only (`@your-bot` in the control channel or in a
+run's thread), and people can talk to each other in a run's thread without
+the bot answering. `sbxloop doctor` shows one
+`chat bridge (mattermost)` row: extra installed, token present.
+Cards are coloured message attachments (`[mattermost] embeds`) — a post the
+server rejects is retried text-only, so a run's chronology never goes
+missing over presentation — a workload result's files are uploaded up to
+`max_attachment_bytes` and named by host path beyond it (or if an upload
+fails; a named file is never silently dropped), and the merge gate's
+approve button is a seeded ✅: reacting with it approves, exactly as
+`!sbx merge` does.
 
 ## Artifacts
 
@@ -2512,7 +2547,7 @@ The notable knobs:
 | `[daemon] backups_keep`                                                        | `10`                                            | Snapshots kept under `~/.sbxloop/backups/` by the daily sweep (`0` keeps all).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `[daemon] workspace_isolation`                                                 | `clone`                                         | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `[daemon] refresh_workspace`                                                   | `true`                                          | `git fetch` + fast-forward the workspace checkout before each fresh daemon run.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `[tui] operator_id` / `emoji` / `daemon_unit` / `refresh_s` / `retention_days` | `""` / `true` / `sbxloop-daemon` / `0.5` / `14` | The operator console (`sbxloop tui`), always on: who it speaks as (empty = the login name), glyph markers, the systemd user unit it tails and restarts, its live refresh interval, and how long the daemon keeps the console's mailbox rows (`0` keeps them). The rendering knobs are the `[discord]` / `[slack]` ones.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `[tui] operator_id` / `emoji` / `daemon_unit` / `refresh_s` / `retention_days` | `""` / `true` / `sbxloop-daemon` / `0.5` / `14` | The operator console (`sbxloop tui`), always on: who it speaks as (empty = the login name), glyph markers, the systemd user unit it tails and restarts, its live refresh interval, and how long the daemon keeps the console's mailbox rows (`0` keeps them). The rendering knobs are the `[discord]` / `[slack]` / `[mattermost]` ones.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
 sbxloop does not size the sandbox: `sbx create` is called without CPU or
 memory flags, so the microVM is whatever size sbx gives every sandbox.

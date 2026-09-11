@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from pydantic import BaseModel
 
+from sbxloop.chatservices import CHAT_SERVICES
 from sbxloop.config import Config, load_config, load_secrets_env
 from sbxloop.data import DEFAULT_CONFIG_TOML, config_presets, render_config_template
 
@@ -65,6 +66,16 @@ def test_codex_selection_is_documented_in_the_shipped_examples() -> None:
     assert "OPENAI_API_KEY" in DEFAULT_CONFIG_TOML
     secrets = REPO_ROOT / "packages/sbxloop/src/sbxloop/data/secrets.env.example"
     assert "#OPENAI_API_KEY=" in secrets.read_text()
+
+
+def test_every_chat_backend_credential_is_in_the_secrets_example() -> None:
+    """A bridge's token has to appear in the file an operator actually fills
+    in. Generic over the descriptor set, so a fourth service cannot land with
+    its credential documented nowhere."""
+    secrets = (REPO_ROOT / "packages/sbxloop/src/sbxloop/data/secrets.env.example").read_text()
+    for service in CHAT_SERVICES:
+        for env in service.token_envs:
+            assert f"#{env}=" in secrets, f"{service.name}: {env} is not in secrets.env.example"
 
 
 def test_sbxloop_init_renders_the_example_file(tmp_path: Path, monkeypatch: Any) -> None:
@@ -445,6 +456,9 @@ def test_every_commented_key_is_a_real_config_key() -> None:
         elif section == "workload":
             # `[workload] default` names a profile that must exist.
             doc = {"workload": parsed, "workloads": [{"name": parsed.get("default", "p")}]}
+        elif section == "mattermost":
+            # `[mattermost]` needs the instance before a channel is meaningful.
+            doc = {"mattermost": {"url": "https://mattermost.example.com", **parsed}}
         elif section == "chat":
             # `[chat] backend` names a section that must carry a channel_id.
             doc = {

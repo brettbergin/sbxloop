@@ -26,7 +26,8 @@ pauses the agent and can rewrite the running task's plan, so it takes the
 same deliberate "@mention the bot" as talking to the concierge does.
 
 Ids are compared as text so a backend may hand in whatever it has —
-Discord's integer snowflakes, Slack's ``U…``/``C…`` strings.
+Discord's integer snowflakes, Slack's ``U…``/``C…`` strings, a
+Mattermost username.
 """
 
 from __future__ import annotations
@@ -41,6 +42,11 @@ RouteKind = Literal["command", "concierge", "steer", "ignore"]
 DISCORD_MENTION_RE = re.compile(r"<@!?(\d+)>")
 #: Slack: ``<@U0123>`` and the labelled form ``<@U0123|name>``.
 SLACK_MENTION_RE = re.compile(r"<@([A-Z0-9]+)(?:\|[^>]*)?>")
+#: Mattermost: ``@username`` — a handle, not an id, which is why that
+#: bridge hands ``route_message`` the bot's username as its "user id".
+#: Usernames are lowercase alphanumerics with dots, dashes and
+#: underscores; a trailing one of those is punctuation, not the handle.
+MATTERMOST_MENTION_RE = re.compile(r"@([a-z0-9]+(?:[._-]+[a-z0-9]+)*)")
 
 
 class Route(NamedTuple):
