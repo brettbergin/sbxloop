@@ -229,7 +229,12 @@ def tool_task(config: Config, target: str) -> TaskSpec:
             "not proof; an empty findings list is not proof that the repository is safe."
         ),
         command=command,
-        verify_commands=[f"python {scanner} --check --output {output}"],
+        # `python3`, never `python`: the sandbox provisions python3 and uv's
+        # managed interpreter, and no `python` alias — the scan command gets
+        # its name resolved inside `uv run`, the check runs in the raw shell.
+        # The check imports the standard library only, so the sandbox's own
+        # python3 is enough and no runtime is resolved for it.
+        verify_commands=[f"python3 {scanner} --check --output {output}"],
         result_files=[f"{output}/report.md", f"{output}/report.json"],
         needs=TaskNeeds(hosts=_hosts(config, target), repo=None if public else target, sink="chat"),
     )

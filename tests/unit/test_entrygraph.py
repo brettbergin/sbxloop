@@ -260,3 +260,20 @@ def test_the_registry_is_how_the_daemon_reaches_a_recipe() -> None:
     assert recipe.task is entrygraph.tool_task
     with pytest.raises(ConfigError, match="entrygraph"):
         get_recipe("no-such-recipe")
+
+
+def test_no_recipe_command_relies_on_a_bare_python() -> None:
+    """The sandbox has `python3` and uv's managed interpreter, never a
+    `python` alias: a check written as `python …` dies with exit 127 in
+    the raw shell before the scanner runs (seen in the field). The scan
+    command is exempt because `uv run … python` resolves the name itself."""
+    import shlex
+
+    from sbxloop.entrygraph import tool_task
+
+    for target in ("org/one", "https://git.example.org/team/repo.git"):
+        task = tool_task(config(github={"repo": "org/one"}), target)
+        assert task.command is not None
+        for command in task.verify_commands:
+            assert shlex.split(command)[0] == "python3", command
+        assert not task.command.startswith("python ")
