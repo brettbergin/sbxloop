@@ -5,7 +5,10 @@ import sqlite3
 from pathlib import Path
 
 import pytest
+from sqlalchemy import select
 
+from sbxloop.db import begin_immediate
+from sbxloop.db.engine_models import Run
 from sbxloop.engine.model import Published, TaskOutput, TaskRecord, TaskSpec
 from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import StateError
@@ -24,9 +27,9 @@ def make_task(id: str = "t1") -> TaskRecord:
 
 class TestPragmas:
     def test_wal_mode_with_normal_synchronous(self, store: StateStore) -> None:
-        conn = store._conn
-        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
-        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
+        with store._engine.connect() as conn:
+            assert conn.exec_driver_sql("PRAGMA journal_mode").scalar() == "wal"
+            assert conn.exec_driver_sql("PRAGMA synchronous").scalar() == 1
 
 
 class TestRuns:
@@ -85,9 +88,11 @@ class TestRuns:
         and the run still lists and resumes."""
         store.create_run("r1", "x")
         store.create_run("r2", "y")
-        store._conn.execute("UPDATE runs SET state = 'running' WHERE run_id = 'r1'")
-        store._conn.execute("UPDATE runs SET state = 'finalizing' WHERE run_id = 'r2'")
-        store._conn.commit()
+        # Written raw: no store method will produce these spellings any
+        # more, which is the point — they are what is already on disk.
+        with store._engine.begin() as conn:
+            conn.exec_driver_sql("UPDATE runs SET state = 'running' WHERE run_id = 'r1'")
+            conn.exec_driver_sql("UPDATE runs SET state = 'finalizing' WHERE run_id = 'r2'")
         assert store.get_run("r1").state == "building"
         assert store.get_run("r2").state == "building"
         assert {r.run_id: r.state for r in store.list_runs()} == {
@@ -102,8 +107,8 @@ class TestRuns:
         store.create_run("r1", "x")
         store.set_run_state("r1", "awaiting_ci")
         before = store.get_run("r1")
-        store._conn.execute("UPDATE runs SET updated_at = 1.0 WHERE run_id = 'r1'")
-        store._conn.commit()
+        with store._engine.begin() as conn:
+            conn.exec_driver_sql("UPDATE runs SET updated_at = 1.0 WHERE run_id = 'r1'")
         store.touch_run("r1")
         after = store.get_run("r1")
         assert after.updated_at > 1.0
@@ -221,9 +226,9 @@ class TestPhasesAndEvents:
             "r1", "plan", task_id="t1", attempt=1, status="ok", output_json=None, started_at=2.0
         )
         all_attempts = store.phase_attempts("r1")
-        assert [row["phase"] for row in all_attempts] == ["decompose", "plan"]
+        assert [row.phase for row in all_attempts] == ["decompose", "plan"]
         t1_attempts = store.phase_attempts("r1", "t1")
-        assert [row["phase"] for row in t1_attempts] == ["plan"]
+        assert [row.phase for row in t1_attempts] == ["plan"]
 
     def test_phase_usage_roundtrips(self, store: StateStore) -> None:
         store.create_run("r1", "x")
@@ -244,11 +249,11 @@ class TestPhasesAndEvents:
             turns=3,
         )
         row = store.phase_attempts("r1")[0]
-        assert row["input_tokens"] == 1200
-        assert row["output_tokens"] == 34
-        assert row["cache_read_tokens"] == 900
-        assert row["cache_write_tokens"] == 10
-        assert row["turns"] == 3
+        assert row.input_tokens == 1200
+        assert row.output_tokens == 34
+        assert row.cache_read_tokens == 900
+        assert row.cache_write_tokens == 10
+        assert row.turns == 3
 
     def test_phase_usage_defaults_to_null(self, store: StateStore) -> None:
         """A mechanical phase (verify) records no usage — columns stay NULL."""
@@ -257,9 +262,9 @@ class TestPhasesAndEvents:
             "r1", "verify", task_id="t1", attempt=1, status="ok", output_json=None, started_at=1.0
         )
         row = store.phase_attempts("r1")[0]
-        assert row["input_tokens"] is None
-        assert row["output_tokens"] is None
-        assert row["turns"] is None
+        assert row.input_tokens is None
+        assert row.output_tokens is None
+        assert row.turns is None
 
     def test_pre_usage_database_migrates_in_place(self, tmp_path: Path) -> None:
         """A state.db whose phase_attempts predates the usage columns opens
@@ -286,7 +291,7 @@ class TestPhasesAndEvents:
 
         store = StateStore(db)
         old_row = store.phase_attempts("r1")[0]
-        assert old_row["input_tokens"] is None
+        assert old_row.input_tokens is None
         store.record_phase(
             "r1",
             "execute",
@@ -298,7 +303,7 @@ class TestPhasesAndEvents:
             usage=Usage(input_tokens=5),
             turns=1,
         )
-        assert store.phase_attempts("r1")[1]["input_tokens"] == 5
+        assert store.phase_attempts("r1")[1].input_tokens == 5
         # reopening does not re-apply the ALTERs
         StateStore(db).phase_attempts("r1")
 
@@ -494,10 +499,13 @@ class TestReconciliation:
         assert after == before
 
     def test_opens_db_missing_reason_column(self, tmp_path: Path) -> None:
+        # Built raw and never opened by the current code, so it carries no
+        # schema stamp — which is what a database written by a version that
+        # predates these columns actually looks like. Creating a current one
+        # and then dropping a table out of it would leave the stamp behind
+        # and describe a database that has never existed.
         db = tmp_path / "state.db"
-        StateStore(db).close()
         conn = sqlite3.connect(db)
-        conn.execute("DROP TABLE runs")
         conn.execute(
             "CREATE TABLE runs ("
             " run_id TEXT PRIMARY KEY, outcome TEXT NOT NULL, state TEXT NOT NULL,"
@@ -748,23 +756,33 @@ class TestWriterSerialization:
     on a different thread from the engine) slipped through.
     """
 
-    def test_every_committing_method_holds_the_lock(self) -> None:
+    def test_the_session_helpers_take_the_lock(self) -> None:
+        """Both ways into a session hold it, so every caller is serialised."""
+        import inspect
+
+        from sbxloop.engine import store as store_module
+
+        for name in ("_write", "_read"):
+            body = inspect.getsource(getattr(store_module.StateStore, name))
+            assert "with self._lock" in body, f"{name} does not take the store's lock"
+
+    def test_no_method_opens_a_session_of_its_own(self) -> None:
+        """Every statement goes through `_write`, `_read` or `begin_immediate`.
+
+        Those are what hold the lock. A method that built its own
+        ``Session(self._engine)`` would run unserialised on the single
+        shared connection — which is the bug this class exists for, and the
+        shape ``reconcile_run`` once slipped through in.
+        """
         import inspect
         import re
 
         from sbxloop.engine import store as store_module
 
-        source = inspect.getsource(store_module).split("\n")
-        current, lock_at, unguarded = None, -1, []
-        for i, line in enumerate(source):
-            match = re.match(r"    def (\w+)", line)
-            if match:
-                current, lock_at = match.group(1), -1
-            if "with self._lock:" in line:
-                lock_at = i
-            if "_conn.commit()" in line and lock_at < 0 and current != "__init__":
-                unguarded.append(current)
-        assert not unguarded, f"writers commit without self._lock: {unguarded}"
+        source = inspect.getsource(store_module)
+        rogue = re.findall(r"Session\(\s*self\._engine", source)
+        # `_write` and `_read` are the two sanctioned constructions.
+        assert len(rogue) == 2, f"a method opens its own session: {len(rogue)} sites, expected 2"
 
 
 class TestEphemeralDeltas:
@@ -914,3 +932,90 @@ class TestPostedFindings:
         )
         self._record(store, 3, None, [{"comment_id": 5}, {"anchor": "a.py:1", "comment_id": 9}])
         assert store.posted_findings("r1") == [PostedRecord(3, "a.py:1", 9, None, None)]
+
+
+class TestTheClaimIsAtomic:
+    """`append_event_if_state` is the gc claim, and it has to stay one step.
+
+    A sweep in one process must not take a run that a resume in another has
+    just moved back into flight, and the resume must not slip in between the
+    sweep's check and its marker. `BEGIN IMMEDIATE` holds the write lock
+    across both halves, which is what these prove — through two separate
+    connections on one file, the way the daemon and a CLI command meet.
+    """
+
+    @staticmethod
+    def _event(run_id: str) -> Event:
+        return Event(ts=1.0, run_id=run_id, job_id=None, type="gc.claim", data={})
+
+    def test_a_claim_against_a_matching_state_is_appended(self, tmp_path: Path) -> None:
+        store = StateStore(tmp_path / "state.db")
+        try:
+            store.create_run("r1", "x")
+            store.set_run_state("r1", "building")
+            assert store.append_event_if_state(self._event("r1"), frozenset({"building"})) is True
+            assert [e.type for _, e in store.events("r1")] == ["gc.claim"]
+        finally:
+            store.close()
+
+    def test_a_state_another_connection_moved_first_loses_the_claim(self, tmp_path: Path) -> None:
+        """The race the claim exists for, run in the order that loses it."""
+        path = tmp_path / "state.db"
+        sweeper = StateStore(path)
+        resumer = StateStore(path)
+        try:
+            sweeper.create_run("r1", "x")
+            sweeper.set_run_state("r1", "building")
+            # The resume lands first, on its own connection.
+            resumer.set_run_state("r1", "gating")
+            claimed = sweeper.append_event_if_state(self._event("r1"), frozenset({"building"}))
+            assert claimed is False
+            assert list(sweeper.events("r1")) == []
+        finally:
+            sweeper.close()
+            resumer.close()
+
+    def test_a_claim_writes_nothing_when_it_loses(self, tmp_path: Path) -> None:
+        """A refused claim leaves no partial row behind — it rolls back."""
+        store = StateStore(tmp_path / "state.db")
+        try:
+            store.create_run("r1", "x")
+            store.set_run_state("r1", "merged")
+            assert store.append_event_if_state(self._event("r1"), frozenset({"building"})) is False
+            assert store.last_event_ts("r1") is None
+        finally:
+            store.close()
+
+    def test_an_unknown_run_is_never_claimed(self, tmp_path: Path) -> None:
+        store = StateStore(tmp_path / "state.db")
+        try:
+            assert (
+                store.append_event_if_state(self._event("nope"), frozenset({"building"})) is False
+            )
+        finally:
+            store.close()
+
+    def test_the_claim_holds_the_write_lock_across_check_and_insert(self, tmp_path: Path) -> None:
+        """A second writer cannot commit inside the claim's transaction.
+
+        With the busy timeout dropped to nothing, a write attempted from
+        another connection while the claim is open must fail rather than
+        interleave — which is only true if the claim took the write lock at
+        BEGIN rather than at its INSERT.
+        """
+        path = tmp_path / "state.db"
+        store = StateStore(path)
+        try:
+            store.create_run("r1", "x")
+            store.set_run_state("r1", "building")
+            other = sqlite3.connect(path, timeout=0)
+            try:
+                with begin_immediate(store._engine) as conn:
+                    conn.execute(select(Run.state).where(Run.run_id == "r1")).scalar_one()
+                    with pytest.raises(sqlite3.OperationalError, match="locked"):
+                        other.execute("UPDATE runs SET state = 'gating' WHERE run_id = 'r1'")
+                        other.commit()
+            finally:
+                other.close()
+        finally:
+            store.close()

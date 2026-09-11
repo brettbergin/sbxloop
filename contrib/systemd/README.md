@@ -72,7 +72,8 @@ and is picked up on the next start.
 By hand, as the daemon's user, once nothing is running. Take a named hold
 so the daemon stops claiming, wait for idle, snapshot, install the exact
 version into the home's venv, re-run init (idempotent: it refreshes the
-launchers and units for the new version and keeps your config), restart:
+launchers and units for the new version and keeps your config), restart.
+Use `--no-sbx` to preserve the installed sandbox runtime:
 
 ```bash
 sbxloop daemon ctl pause --hold upgrade
@@ -80,7 +81,7 @@ until [ "$({ sbxloop daemon ctl status --json 2>/dev/null || echo '{}'; } | jq -
 
 sbxloop backup --label pre-X.Y.Z
 ~/.sbxloop/bin/uv pip install --python ~/.sbxloop/venv/bin/python --upgrade 'sbxloop[discord,slack]==X.Y.Z' 'sbxloop-worker==X.Y.Z'
-sbxloop init --systemd
+sbxloop init --systemd --no-sbx
 systemctl --user reset-failed sbxloop-daemon && systemctl --user restart sbxloop-daemon
 ```
 
@@ -90,6 +91,11 @@ matters: `StartLimitBurst=5` per 600s leaves a unit that crash-looped in
 **unpaused** regardless — holds are in-memory only — so re-take any you want
 to keep. A downgrade is the same commands with an older version, or
 `sbxloop backup restore <name>` for the config and state of a snapshot.
+
+These commands upgrade or roll back sbxloop only. Change sbx separately with an explicit
+`sbxloop init --sbx-version X.Y.Z` after compatibility checks, draining the daemon and
+backing up the stopped runtime's state and binaries; see
+[Upgrading the sandbox runtime](../../docs/deploy.md#upgrading-the-sandbox-runtime).
 
 To automate exactly this (plus a health check and rollback) from a GitHub
 Actions runner on the host, copy

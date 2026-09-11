@@ -24,20 +24,26 @@ and leaves it alone.
 from __future__ import annotations
 
 import hashlib
+import json
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
 
 from sbxloop.config import Config
-from sbxloop.errors import DaemonError, SbxError, SbxloopError, WorkerError
+from sbxloop.engine.store import StateStore
+from sbxloop.errors import DaemonError, SbxError, SbxloopError, WorkerError, WorkerTimeoutError
 from sbxloop.events import EventBus
+from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
 from sbxloop.paths import SbxloopHome
+from sbxloop.provider import ProviderRecovery
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import Sandbox
 from sbxloop.worker.client import WorkerClient
+from sbxloop_worker.protocol import JobRequest
+from sbxloop_worker.rate_limits import MAX_REPORT_BYTES, QUERY_TIMEOUT_S, RateLimitReport
 
 log = get_logger(__name__)
 
@@ -81,6 +87,8 @@ class DaemonAgent:
         self.provisioner = Provisioner(sbx, config, bus=bus)
         self._sandbox: Sandbox | None = None
         self._client: WorkerClient | None = None
+        self._mcp_client: WorkerClient | None = None
+        self._provider_store: StateStore | None = None
 
     @property
     def workspace(self) -> Path:
@@ -94,6 +102,10 @@ class DaemonAgent:
         if self._client is None:
             log.info("concierge_sandbox.provision_needed", sandbox=self.name)
             self._client = self._ensure()
+            if self.install_workers:
+                from sbxloop.modelcatalog import refresh_after_provision
+
+                refresh_after_provision(self.config)
         return self._client
 
     def call(self, fn: Callable[[WorkerClient], T]) -> T:
@@ -105,6 +117,56 @@ class DaemonAgent:
             if not self.note_failure(exc):
                 raise
             return fn(self.client())
+
+    def agent_rate_limits(self) -> RateLimitReport:
+        """Read status beside the active turn; never provision, retry or remove.
+
+        A new client/worker process in the SAME agent sandbox has its own
+        job id and transport bookkeeping. The concierge's worker may be
+        blocked waiting for this host-tool response throughout the query.
+        """
+        backend = self.config.agent.backend
+        unavailable = RateLimitReport(
+            backend=backend,
+            status="unavailable",
+            reason="Agent sandbox status is unavailable; capacity and resets are unknown.",
+        )
+        active = self._client
+        if active is None:
+            return unavailable
+        probe = WorkerClient(
+            active.sandbox,
+            self.bus,
+            python=active.python,
+            transport="stream",
+            grace_s=2,
+            role="agent",
+            backend=backend,
+            job_env=active.job_env,
+        )
+        job = JobRequest(
+            job_id=new_job_id(),
+            run_id=CONCIERGE_RUN_ID,
+            kind="agent.rate_limits",
+            params={"backend": backend},
+            timeout_s=min(QUERY_TIMEOUT_S, self.config.concierge.timeout_s / 2),
+        )
+        try:
+            result = probe.submit(job)
+            if result.status != "ok" or not isinstance(result.output_json, dict):
+                return unavailable
+            if len(json.dumps(result.output_json).encode()) > MAX_REPORT_BYTES:
+                return unavailable
+            report = RateLimitReport.model_validate(result.output_json)
+            return report if report.backend == backend else unavailable
+        except WorkerTimeoutError:
+            return unavailable.model_copy(
+                update={"status": "timeout", "reason": "Agent sandbox status query timed out."}
+            )
+        except Exception:
+            # Never publish transport/SDK exception text or send a query
+            # failure through note_failure(): the active session stays alive.
+            return unavailable
 
     def note_failure(self, exc: BaseException) -> bool:
         """A caller's job failed: drop the sandbox so the next :meth:`client`
@@ -138,9 +200,59 @@ class DaemonAgent:
         """Forget the handle; the sandbox stays for the next daemon process
         (conversation memory lives inside it)."""
         self._sandbox, self._client = None, None
+        if self._provider_store is not None:
+            self._provider_store.close()
+            self._provider_store = None
+        self._close_mcp()
+
+    def _close_mcp(self) -> None:
+        client, self._mcp_client = self._mcp_client, None
+        if client is not None:
+            try:
+                client.sandbox.rm()
+            except SbxError:
+                log.warning("concierge_mcp.remove_failed")
+
+    def _mcp_service(self) -> WorkerClient:
+        if self._mcp_client is None:
+            config = self.config.model_copy(
+                update={
+                    "mcp": [server for server in self.config.mcp if "concierge" in server.roles],
+                    "registries": [],
+                }
+            )
+            provisioner = Provisioner(self.sbx, config, bus=self.bus)
+            credentials = [cred.name for cred in config.mcp_credentials()]
+            clients: list[WorkerClient] = []
+
+            def install(sandbox: Sandbox, _role: str) -> None:
+                client = WorkerClient(
+                    sandbox,
+                    self.bus,
+                    transport=config.worker_transport,
+                    python=self.worker_python,
+                    role="service",
+                    limits=config.limits,
+                    job_env=provisioner.job_env(
+                        "service", sandbox=sandbox, credentials=credentials
+                    ),
+                )
+                if self.install_workers:
+                    client.install(expect_prebaked=bool(config.sandbox.template))
+                clients.append(client)
+
+            provisioner.ensure_service(
+                self.name + "-mcp",
+                self.workspace,
+                credentials,
+                post_create=install,
+            )
+            self._mcp_client = clients[0]
+        return self._mcp_client
 
     def remove(self) -> None:
         """Delete the sandbox (explicit: reprovision, operator cleanup)."""
+        self._close_mcp()
         sandbox, self._sandbox, self._client = self._sandbox, None, None
         if sandbox is None:
             sandbox = Sandbox(self.sbx, self.name)
@@ -159,7 +271,7 @@ class DaemonAgent:
     # -- provisioning ------------------------------------------------------
 
     def _make_client(self, sandbox: Sandbox) -> WorkerClient:
-        return WorkerClient(
+        client = WorkerClient(
             sandbox,
             self.bus,
             transport=self.config.worker_transport,
@@ -173,6 +285,13 @@ class DaemonAgent:
             # instead of a reused box silently losing its credential (#592).
             job_env=self.provisioner.job_env("agent", sandbox=sandbox),
         )
+        if self._provider_store is None:
+            self._provider_store = StateStore(self.config.paths.state_db)
+        client.provider_recovery = ProviderRecovery(self._provider_store, self.config.agent.backend)
+        from sbxloop.worker.mcp import McpBroker
+
+        client.mcp_prepare = McpBroker(self._mcp_service).prepare
+        return client
 
     def _is_reusable(self, client: WorkerClient) -> bool:
         """Can the existing box be kept, or must it be rebuilt?

@@ -1,0 +1,41 @@
+# Headless browser tools for Copilot or Claude code runs.
+# Generate a fresh config with `sbxloop init --preset playwright`.
+# For an existing config, merge these sections and append the setup commands;
+# do not overwrite repository-specific languages or setup work.
+#
+# The package and its matching Chromium browser live in the agent's home,
+# outside the target checkout. npm lifecycle scripts are disabled. The
+# installer uses the public registry and its own cache even when the target
+# project's dependency cache is offline. No service credential is needed.
+# Add the application's external API/asset hosts to `hosts` below as needed.
+#
+# setup_commands run for code runs only, and are not run by `sbxloop bake`.
+# To grant this server to workload operators, first install the same runtime
+# into a custom sandbox template, then add "operator" to roles. Keep critics
+# and the concierge excluded. Native MCP requires Copilot or Claude.
+
+[agent]
+backend = "copilot" # Change to "claude" to use the Claude Agent SDK.
+
+[sandbox]
+languages = ["javascript"] # Include the target project's other languages here.
+setup_commands = [
+  'npm install --prefix "$HOME/.sbxloop/playwright-mcp" --registry=https://registry.npmjs.org --offline=false --cache "$HOME/.sbxloop/playwright-mcp/npm-cache" --no-save --package-lock=false --ignore-scripts --no-audit --no-fund @playwright/mcp@0.0.80',
+  'node "$HOME/.sbxloop/playwright-mcp/node_modules/playwright/cli.js" install --with-deps chromium',
+]
+
+[[mcp]]
+name = "playwright"
+transport = "stdio"
+command = [
+  "sh", "-c",
+  'exec node "$HOME/.sbxloop/playwright-mcp/node_modules/@playwright/mcp/cli.js" --browser chromium --headless --isolated',
+]
+hosts = [
+  "registry.npmjs.org",
+  "cdn.playwright.dev",
+  "playwright.download.prss.microsoft.com",
+  "storage.googleapis.com",
+]
+roles = ["builder"]
+description = "Inspect and exercise the target application's UI in a headless browser"

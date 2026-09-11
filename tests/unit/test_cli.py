@@ -26,6 +26,7 @@ from sbxloop.paths import SbxloopHome
 from sbxloop_worker.protocol import Event as ProtocolEvent
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import FakeGithub
+from tests.fakes.rawdb import exec_raw
 
 runner = CliRunner()
 
@@ -211,10 +212,10 @@ class TestStatusAndLogs:
         # forever; --follow must notice the silence and exit, not spin.
         store = seed_store(workdir)
         store.set_run_state("rseeded11", "building")
-        store._conn.execute(  # backdate the state change (no public setter)
-            "UPDATE runs SET updated_at = 1.0 WHERE run_id = 'rseeded11'"
+        exec_raw(
+            store,  # backdate the state change (no public setter)
+            "UPDATE runs SET updated_at = 1.0 WHERE run_id = 'rseeded11'",
         )
-        store._conn.commit()
         result = runner.invoke(app, ["logs", "rseeded11", "--follow"])
         assert result.exit_code == 0
         # single words: rich may wrap the note anywhere between words
@@ -1190,14 +1191,17 @@ class TestDoctor:
         result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.output
         assert "workload profiles" in result.output
-        assert "research: hosts *.example.com, credentials -, sinks chat, repo no" in result.output
+        assert (
+            "research: egress 1 pattern, credentials 0, sinks 1 (chat), repo no, publish auto"
+            in result.output
+        )
         assert "no [workload] default" in result.output
         (workdir / "sbxloop.toml").write_text(
             '[[workloads]]\nname = "research"\n\n[workload]\ndefault = "research"\n'
         )
         result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.output
-        assert "research (default): hosts -" in result.output
+        assert "research (default): egress 0 patterns" in result.output
         assert "no [workload] default" not in result.output
         # nothing declared, no row
         (workdir / "sbxloop.toml").write_text("")
@@ -1207,7 +1211,8 @@ class TestDoctor:
     def test_doctor_lists_schedules_and_where_the_daemon_gets_its_work(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """#761/#762: `[[schedules]]` gets an informational row, and a
+        """#761/#762/#818: a `[[schedules]]` entry left in the file gets a
+        warning row (schedules live in the daemon's database now), and a
         `daemon intake` row says what would be work — a config with no
         repository, no chat intake and no schedules is told the daemon
         would refuse to start (soft: a CLI-only host never starts one)."""
@@ -1221,8 +1226,9 @@ class TestDoctor:
         )
         result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.output
-        assert "daily: cron 0 7 * * mon-fri (Europe/London) → profile brief" in result.output
-        assert "hourly: every 1h (UTC) → profile brief" in result.output
+        assert "schedules in sbxloop.toml" in result.output
+        assert "daily, hourly" in result.output
+        assert "schedules live in the daemon's database now" in result.output
         assert "daemon intake" in result.output and "2 schedules" in result.output
         # the repository and chat asks are named too
         (workdir / "sbxloop.toml").write_text(
@@ -1237,7 +1243,7 @@ class TestDoctor:
         result = runner.invoke(app, ["doctor"], env={"COLUMNS": "200"})
         assert result.exit_code == 0, result.output  # soft
         assert "nothing would be work" in result.output
-        assert "[[schedules]]" in result.output
+        assert "schedules add" in result.output
 
     def _bake_record(
         self,
@@ -2346,6 +2352,11 @@ class TestRunCommand:
                 },
                 # 3 builds burn the revisions, then the replan's fresh
                 # session burns 3 more — verify ("false") fails them all.
+                # The re-author phase is asked once when the check first
+                # repeats; "keep" leaves the loop on the path above.
+                execute,
+                execute,
+                {"json": {"verdict": "keep", "command": "", "reason": "the check is right"}},
                 *[execute] * 6,
             ],
         )
@@ -3434,6 +3445,41 @@ class TestDoctorRepoHealthRow:
         store.close()
         got = daemon_repo_health(config, sources, env)
         assert got == {"acme/alpha": {"suspended": True, "reason": "x"}}
+
+    def test_reading_health_never_migrates_the_store(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """doctor runs while the daemon is live, so it opens read-only.
+
+        A diagnostic that migrates the schema out from under a running
+        daemon is not a diagnostic. This pins the shape of the database
+        before and after — including its `alembic_version` — so a
+        read-write open here would show up as a difference.
+        """
+        import sqlite3
+
+        from sbxloop.cli.doctor import daemon_repo_health, stored_schedules
+        from sbxloop.config import load_config_with_sources
+        from sbxloop.daemon.store import DaemonStore
+
+        (workdir / "sbxloop.toml").write_text('[[github.repos]]\nrepo = "acme/alpha"\n')
+        config, sources = load_config_with_sources()
+        env = dict(os.environ)
+        DaemonStore(config.paths.state_db).close()
+
+        def snapshot() -> list[tuple[str, str]]:
+            conn = sqlite3.connect(config.paths.state_db)
+            try:
+                return conn.execute(
+                    "SELECT name, sql FROM sqlite_master WHERE sql IS NOT NULL ORDER BY name"
+                ).fetchall()
+            finally:
+                conn.close()
+
+        before = snapshot()
+        assert daemon_repo_health(config, sources, env) == {}
+        assert stored_schedules(config) == []
+        assert snapshot() == before
 
 
 class TestDoctorBranchProtection:

@@ -36,6 +36,7 @@ run_log = get_logger(RUN_LOGGER_NAME)
 
 WARNING_TYPES: frozenset[str] = frozenset(
     {
+        "provider.held",
         EventTypes.WORKER_ERROR,
         EventTypes.SANDBOX_TOOLING_WARNING,
         EventTypes.SANDBOX_RESOURCES_WARNING,
@@ -47,6 +48,7 @@ WARNING_TYPES: frozenset[str] = frozenset(
 
 INFO_TYPES: frozenset[str] = frozenset(
     {
+        "provider.recovered",
         HostEventTypes.RUN_START,
         HostEventTypes.RUN_STATE,
         HostEventTypes.RUN_ARTIFACTS,

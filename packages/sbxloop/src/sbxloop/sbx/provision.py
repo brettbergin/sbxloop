@@ -51,9 +51,9 @@ from pathlib import Path
 from typing import Literal, NamedTuple
 
 from sbxloop import backends, hostgit, toolchains
-from sbxloop.config import Config, CredentialConfig, RegistryConfig, RepoConfig
+from sbxloop.config import Config, CredentialConfig, RegistryConfig, RepoConfig, SandboxConfig
 from sbxloop.engine.model import RunKind
-from sbxloop.errors import GithubOpsError, ProvisionError, SbxError
+from sbxloop.errors import ConfigError, GithubOpsError, ProvisionError, SbxError
 from sbxloop.events import EventBus
 from sbxloop.gh.appauth import (
     APP_ID_ENV,
@@ -91,7 +91,6 @@ from sbxloop.sbx.sandbox import (
     Sandbox,
 )
 from sbxloop.sbx.secretstate import (
-    ANTHROPIC_TOKEN_HOST,
     custom_rm_candidates,
     service_rm_candidates,
     set_secret_replacing,
@@ -177,6 +176,26 @@ class GhApp:
 
 
 GhCredential = GhPat | GhApp
+
+
+class ContinueBranch(NamedTuple):
+    """Cut the run's clone from ``branch`` — published work to continue —
+    instead of a fresh branch off the base (#646). ``optional`` says an
+    unfetchable branch is survivable: a restart continuing a previous
+    attempt's push (#600) starts fresh with a logged reason, while a
+    resume that must find its own work fails. The engine passes one to
+    :meth:`Provisioner.ensure_pair`; ``[sandbox] continue_branch`` is the
+    operator's way to ask for the same thing by hand."""
+
+    branch: str
+    optional: bool = False
+
+
+def continue_from_config(sandbox: SandboxConfig) -> ContinueBranch | None:
+    """The operator's ``[sandbox] continue_branch`` knob as a parameter."""
+    if not sandbox.continue_branch:
+        return None
+    return ContinueBranch(sandbox.continue_branch, sandbox.continue_branch_optional)
 
 
 class GhCredentialStatus(NamedTuple):
@@ -285,12 +304,18 @@ def dedupe_domains(domains: Iterable[str]) -> list[str]:
     return seen
 
 
+#: The only session role the daemon's long-lived agent box ever runs, so
+#: it is the only one whose MCP servers it needs egress and secrets for.
+CONCIERGE_MCP_ROLES: tuple[str, ...] = ("concierge",)
+
+
 def agent_policy_allows(
     config: Config,
     languages: Sequence[str],
     repo: str | None = None,
     *,
     extra_domains: Sequence[str] = (),
+    mcp_roles: Sequence[str] | None = None,
 ) -> list[str]:
     """The agent sandbox's network allowlist for ``languages`` (and
     ``repo``'s private registries, #680; ``extra_domains`` are what the
@@ -324,7 +349,7 @@ def agent_policy_allows(
             # The repository's own GitHub (#623): github.com is in the
             # constant above; an Enterprise Server host is not.
             *config.github.allow_domains,
-            *((ANTHROPIC_TOKEN_HOST,) if claude else ()),
+            *backends.backend_for(config).token_hosts,
             *baseline_allows((*PROMPT_ADVERTISED_DOMAINS, *installers), config.policy.deny),
             # Operator-declared hosts: a private registry the operator
             # configured is reachable like extra_allow_domains is, deny or
@@ -332,6 +357,11 @@ def agent_policy_allows(
             # ones (#766): a registry with a credential is the service
             # sandbox's host, and this sandbox never speaks to it.
             *registries.domains(config.open_registries_for(repo)),
+            # The hosts the operator's [[mcp]] servers need. Declared on
+            # purpose like a registry is, so they are reachable whether or
+            # not a deny tier would otherwise have refused them; deduped
+            # with everything above because a repeated rule is fatal.
+            *config.mcp_hosts_for(mcp_roles),
             *config.sandbox.extra_allow_domains,
             *extra_domains,
         ]
@@ -413,6 +443,9 @@ class Provisioner:
         self.bus = bus or EventBus()
         self.env = os.environ if env is None else env
         self.post_create = post_create
+        # What the next ensure_pair cuts the clone from (#646): the operator's
+        # knob until a caller passes its own.
+        self._continue: ContinueBranch | None = continue_from_config(config.sandbox)
         self._sbx_version: str | None = None
         self._sbx_version_known = False
         # Serializes the version lookup and the cache file's read-modify-
@@ -470,7 +503,7 @@ class Provisioner:
                 repo,
                 extra_domains=self._submodule_hosts(run_id, workspace, languages, repo),
             ),
-            secrets=[self._agent_secret_spec()],
+            secrets=self._agent_secret_specs(),
             persistent_env=self.agent_persistent_env(repo),
             files=self.agent_files(repo),
         )
@@ -509,10 +542,29 @@ class Provisioner:
             )
         return hosts
 
-    def resolve_languages(self, workspace: Path | None) -> toolchains.LanguageResolution:
+    def resolve_languages(
+        self, workspace: Path | None, *, kind: RunKind = "code"
+    ) -> toolchains.LanguageResolution:
         """The language set a run on ``workspace`` provisions (#624):
         ``[sandbox] languages`` when set, else what the workspace's manifests
-        declare, else the default."""
+        declare, else the default. A workload's set is its profile's
+        ``languages`` list (#801), empty unless the profile names some:
+        the operator persona needs its backend's runtime (ensured
+        separately) and no compiler, and the field showed every chat
+        workload spending a minute installing toolchains it never used.
+        """
+        if kind == "workload":
+            try:
+                profile = self.config.workload_profile()
+            except ConfigError:
+                profile = None
+            languages = tuple(profile.languages) if profile is not None else ()
+            return toolchains.LanguageResolution(
+                languages,
+                "profile" if languages else "none",
+                {},
+                toolchains.toolchain_versions(languages, None),
+            )
         return toolchains.resolve_languages(self.config.sandbox.languages, workspace)
 
     # -- tokens ------------------------------------------------------------
@@ -555,13 +607,13 @@ class Provisioner:
         What the repository's private registries need first — the
         credential-less ones' ``GOPRIVATE`` / ``PIP_INDEX_URL`` (#680), and
         for the credentialed ones the OFFLINE configuration (#766) that
-        points each package manager at the cache the service sandbox
-        fills, so nothing in this sandbox ever asks that registry — then
+        points each package manager at the cache the agent prepares from
+        downloaded artifacts, so it never needs registry credentials — then
         the repository's ``[sandbox] env`` (#679) over it (an operator's
         explicit value wins over a derived one), and the loop's own
         selector last so nothing an operator writes can shadow it. The
         worker resolves its backend from ``SBXLOOP_WORKER_BACKEND`` (default
-        copilot), so only the claude backend needs it delivered;
+        copilot), so other backends need it delivered;
         ``CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC`` keeps the Claude Code
         CLI hermetic — no telemetry or auto-update calls to hosts the
         balanced network policy would only refuse. Nothing secret goes
@@ -573,8 +625,9 @@ class Provisioner:
             **registries.offline_env(self.config.credentialed_registries_for(repo)),
             **self.config.sandbox_env_for(repo),
         }
+        if not self.backend().is_default:
+            env["SBXLOOP_WORKER_BACKEND"] = self.agent_backend()
         if self.agent_backend() == "claude":
-            env["SBXLOOP_WORKER_BACKEND"] = "claude"
             env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
         return env
 
@@ -610,20 +663,13 @@ class Provisioner:
         values = {name: self.env[name] for name in names}
         return {**values, **registries.secret_env(regs, values)}
 
-    def registry_files(self, repo: str | None = None) -> dict[str, str]:
-        """The client files for ``repo``'s credentialed registries, for the
-        service sandbox; the netrc kinds embed the credential, so this
-        raises like :meth:`registry_secret_env` when one is unset."""
-        regs = self.config.credentialed_registries_for(repo)
-        if not regs:
-            return {}
-        return {
-            f.path: f.text for f in registries.client_files(regs, self.registry_secret_env(repo))
-        }
-
     def _agent_secret_spec(self) -> SecretSpec:
         env, host = self.backend().secret
         return SecretSpec(kind="custom", host=host, env=env)
+
+    def _agent_secret_specs(self, roles: Sequence[str] | None = None) -> list[SecretSpec]:
+        """Only the inference credential belongs in the agent sandbox."""
+        return [self._agent_secret_spec()]
 
     def gh_credential(self, repo: str | None = None) -> GhCredential:
         """The credential the github sandbox authenticates with, scoped to
@@ -764,8 +810,15 @@ class Provisioner:
         expects_mount: bool | None = None,
         credentials: Sequence[str] = (),
         kind: RunKind = "code",
+        continue_branch: ContinueBranch | None = None,
+        reuse_sandboxes: bool = False,
     ) -> SandboxPair:
         """Provision the run's sandbox pair around its workspace.
+
+        ``continue_branch`` (#646) cuts the clone from published work — a
+        restart adopting the branch a previous attempt pushed — instead of
+        a fresh branch off the base; None falls back to the operator's
+        ``[sandbox] continue_branch``.
 
         ``expects_mount`` says whether the agent sandbox must see the
         workspace: None lets the workspace's origin decide (an explicit path
@@ -783,6 +836,11 @@ class Provisioner:
         directory that starts empty. Its ``workspace`` is passed only by a
         resume, pinning the same data directory.
         """
+        self._continue = (
+            continue_branch
+            if continue_branch is not None
+            else continue_from_config(self.config.sandbox)
+        )
         if workspace is not None:
             # An explicit workspace is authoritative: it is either the
             # resume pin from the runs table (which must be reused in place
@@ -809,7 +867,7 @@ class Provisioner:
         # so "which toolchains" has to be known before the spec is built —
         # and it is decided exactly once, so the install and the lint
         # cannot disagree with the allowlist.
-        languages = self.resolve_languages(workspace if kind == "code" else None)
+        languages = self.resolve_languages(workspace if kind == "code" else None, kind=kind)
         self.bus.emit(
             "sandbox.languages",
             run_id,
@@ -838,6 +896,7 @@ class Provisioner:
             expects_mount=expects_mount,
             credentials=credentials,
             kind=kind,
+            reuse_sandboxes=reuse_sandboxes,
         )
 
     def _data_dir(self, run_id: str) -> Path:
@@ -1012,7 +1071,8 @@ class Provisioner:
                 "PATH to clone it from its remote"
             )
         url = f"{self.config.github.web_url}/{repo}"
-        continue_branch = self.config.sandbox.continue_branch
+        continuing = self._continue
+        continue_branch = continuing.branch if continuing is not None else None
         branch = continue_branch or self._branch_name(run_id, repo)
         clone_filter = self.config.sandbox.clone_filter
         token = self._clone_token(repo)
@@ -1027,10 +1087,12 @@ class Provisioner:
                 token=token,
             )
         except ProvisionError as exc:
-            if continue_branch and self.config.sandbox.continue_branch_optional:
+            if continuing is not None and continuing.optional:
                 # The offered branch is not on the remote any more: start
                 # fresh rather than fail the run (#600).
-                branch = self._fresh_after_missing_continue(run_id, continue_branch, exc, clone_dir)
+                branch = self._fresh_after_missing_continue(
+                    run_id, continuing.branch, exc, clone_dir
+                )
                 sha = hostgit.clone_from_remote(
                     url, clone_dir, branch, clone_filter=clone_filter, token=token
                 )
@@ -1082,7 +1144,10 @@ class Provisioner:
             return
         source_tags = source is not None and hostgit.tag_count(source) > 0
         fetched = hostgit.fetch_tags(
-            clone_dir, source=source, token=None if source_tags else token()
+            clone_dir,
+            source=source,
+            token=None if source_tags else token(),
+            credential_url=self.config.github.web_url,
         )
         evidence = [f"{m.path}: {m.marker}" for m in markers]
         self.bus.emit(
@@ -1177,7 +1242,9 @@ class Provisioner:
                 reason="[sandbox] clone_submodules = false",
             )
             return
-        populated = hostgit.populate_submodules(clone_dir, source=source, token=token())
+        populated = hostgit.populate_submodules(
+            clone_dir, source=source, token=token(), credential_url=self.config.github.web_url
+        )
         if not populated:
             return
         self.bus.emit(
@@ -1272,7 +1339,8 @@ class Provisioner:
             )
             return clone_dir
         clone_dir.parent.mkdir(parents=True, exist_ok=True)
-        existing = self.config.sandbox.continue_branch
+        continuing = self._continue
+        existing = continuing.branch if continuing is not None else None
         sha: str | None = None
         message = ""
         if existing:
@@ -1283,7 +1351,7 @@ class Provisioner:
             try:
                 sha = hostgit.clone_existing_branch(source, clone_dir, existing)
             except ProvisionError as exc:
-                if not self.config.sandbox.continue_branch_optional:
+                if continuing is None or not continuing.optional:
                     raise
                 # A restart offered a branch that is no longer fetchable
                 # (deleted on origin, never fetched here): a fresh start is
@@ -1345,6 +1413,7 @@ class Provisioner:
         expects_mount: bool = True,
         credentials: Sequence[str] = (),
         kind: RunKind = "code",
+        reuse_sandboxes: bool = False,
     ) -> SandboxPair:
         # The github sandbox (and its token requirement) exists only when the
         # GitHub integration is configured; without [github].repo a run has
@@ -1357,7 +1426,13 @@ class Provisioner:
         github_enabled = self.config.github.enabled and (
             kind == "code" or self._workload_needs_github()
         )
-        creds = self.config.credentials_named(credentials)
+        creds = self.config.credentials_named(
+            list(
+                dict.fromkeys(
+                    [*credentials, *(cred.name for cred in self.config.mcp_credentials())]
+                )
+            )
+        )
         # ... or, since #766, for a repository whose registries carry a
         # credential: the box fetches the dependencies the agent sandbox
         # then builds from offline.
@@ -1405,6 +1480,7 @@ class Provisioner:
         # threads, and a failure must still see everything the OTHER thread
         # created so rollback stays complete.
         rollback_lock = threading.Lock()
+        reusable = {info.name for info in self.cli.ls()} if reuse_sandboxes else set()
 
         def provision_one(spec: SandboxSpec) -> Sandbox:
             started = time.monotonic()
@@ -1420,7 +1496,8 @@ class Provisioner:
                 # sbx stamps *registered* secrets into the VM at create;
                 # purge leftovers parked at this name first (#576).
                 self._purge_stale_registrations(spec)
-            self.cli.create(spec)
+            if spec.name not in reusable:
+                self.cli.create(spec)
             log.debug(
                 "sandbox.created",
                 run=run_id,
@@ -1428,8 +1505,9 @@ class Provisioner:
                 duration_s=round(time.monotonic() - started, 1),
             )
             sandbox = Sandbox(self.cli, spec.name)
-            with rollback_lock:
-                created.append(sandbox)
+            if spec.name not in reusable:
+                with rollback_lock:
+                    created.append(sandbox)
             self._apply_policy(spec)
             reason = env_file_reasons[spec.role]
             if reason is not None:
@@ -1512,9 +1590,7 @@ class Provisioner:
                 sandboxes["agent"].mkdirs(agent_workdir)
             service_workdir: str | None = None
             if regs:
-                service_workdir = self._share_deps_cache(
-                    run_id, workspace, sandboxes["agent"], agent_workdir, sandboxes["service"]
-                )
+                self._prepare_deps_cache(run_id, workspace, sandboxes["agent"], agent_workdir)
             return SandboxPair(
                 run_id,
                 agent=sandboxes["agent"],
@@ -1629,33 +1705,36 @@ class Provisioner:
         ``repo``, its credentialed ``[[registries]]`` (#766). No proxy
         secrets, no agent; an allowlist of the credentials' and registries'
         hosts (plus the fetch baseline when there are registries); the
-        catalogue and the registries' plain environment ride the
+        catalogue and registry authority metadata ride the
         persistent env, the values ride the non-proxy road (per-job stdin,
-        or the 0600 env file) exactly as GH_TOKEN does, and the registries'
-        client files land in this sandbox's ``$HOME``."""
+        or the 0600 env file) exactly as GH_TOKEN does, with no package-manager client files."""
         regs = self.config.credentialed_registries_for(repo)
         return SandboxSpec(
             name=sandbox_name(run_id, "service"),
             role="service",
             workspace=workspace,
             template=self.config.sandbox.template,
-            policy_allows=service_policy_allows(
-                credentials, regs, registries.languages(regs), self.config.policy.deny
-            ),
+            policy_allows=service_policy_allows(credentials, regs, (), self.config.policy.deny),
             persistent_env=self.service_persistent_env(credentials, repo),
             secret_env=self.service_secret_env(credentials, repo),
-            files=self.registry_files(repo),
         )
 
     def service_persistent_env(
         self, credentials: Sequence[CredentialConfig], repo: str | None = None
     ) -> dict[str, str]:
-        """The catalogue the service worker resolves a job's credential name
-        against (JSON, non-secret, one env variable) and, for the
-        credentialed registries, the client environment and the fetch
-        environment — each package manager pointed at its cache."""
+        """Non-secret catalogues for the service's fixed HTTP and registry ops."""
         regs = self.config.credentialed_registries_for(repo)
-        env: dict[str, str] = {**registries.plain_env(regs), **registries.fetch_env(regs)}
+        env: dict[str, str] = {}
+        if self.config.mcp_credentials():
+            env["SBXLOOP_MCP_SERVERS"] = json.dumps(
+                [
+                    {"name": server.name, "url": server.url, "credential": server.credential}
+                    for server in self.config.mcp
+                    if server.credential is not None
+                ]
+            )
+        if regs:
+            env["SBXLOOP_REGISTRIES"] = json.dumps(registries.catalogue_entries(regs))
         if credentials:
             env[CATALOGUE_ENV] = json.dumps([cred.catalogue_entry() for cred in credentials])
         return env
@@ -1702,49 +1781,29 @@ class Provisioner:
             spec, "", reason="service", post_create=post_create, run_id=run_id
         )
 
-    def _share_deps_cache(
+    def _prepare_deps_cache(
         self,
         run_id: str,
         workspace: Path,
         agent: Sandbox,
         agent_workdir: str,
-        service: Sandbox,
-    ) -> str:
-        """Make the dependency cache one directory in both sandboxes (#766).
+    ) -> None:
+        """Prepare and Git-exclude the agent's offline dependency cache.
 
-        The service sandbox's mount is discovered like the agent's; a run
-        with credentialed registries whose workspace the service sandbox
-        cannot see fails closed here, naming the probe — a fetch into a
-        tree the agent never sees is not a fallback. Then each sandbox
-        gets the fixed link :data:`registries.DEPS_HOME` → the cache inside
-        its own view of the workspace, so the environment written before
-        the mount was known (``GOMODCACHE``, ``PIP_FIND_LINKS``, …) points
-        at the right place in both. The cache is excluded from the host
-        checkout's git so the agent never commits it. Returns the service
-        sandbox's in-VM workspace path.
+        The service receives no cache link and needs no workspace mount
+        discovery. Downloaded data arrives through host-mediated copies.
         """
-        service_workdir, why = self._discover_mount(run_id, service, workspace, expects_mount=True)
-        if service_workdir is None:
-            raise ProvisionError(
-                f"workspace {workspace} was not visible inside the service sandbox "
-                f"{service.name}: {why}. The run's [[registries]] carry a credential, "
-                "so its dependencies are fetched there and built here — both sandboxes "
-                "must see the workspace. Check the sandbox row of `sbxloop doctor` "
-                "(workspace-mount probe) and the sbx version"
-            )
-        for sandbox, workdir in ((agent, agent_workdir), (service, service_workdir)):
-            cache = f"{workdir.rstrip('/')}/{registries.DEPS_WORKSPACE_DIR}"
-            sandbox.mkdirs(cache, registries.DEPS_HOME.rsplit("/", 1)[0])
-            sandbox.exec(["ln", "-sfn", cache, registries.DEPS_HOME])
+        cache = f"{agent_workdir.rstrip('/')}/{registries.DEPS_WORKSPACE_DIR}"
+        agent.mkdirs(cache, registries.DEPS_HOME.rsplit("/", 1)[0])
+        agent.exec(["ln", "-sfn", cache, registries.DEPS_HOME])
         exclude_from_git(workspace, registries.DEPS_WORKSPACE_DIR.split("/", 1)[0] + "/")
         self.bus.emit(
             "sandbox.deps_cache",
             run_id,
-            name=service.name,
-            workdir=service_workdir,
+            name=agent.name,
+            workdir=agent_workdir,
             cache=registries.DEPS_WORKSPACE_DIR,
         )
-        return service_workdir
 
     def github_only_spec(self, name: str, workspace: Path, repo: str | None = None) -> SandboxSpec:
         """A github-role spec that is not tied to a run — the daemon's
@@ -1768,8 +1827,12 @@ class Provisioner:
             role="agent",
             workspace=workspace,
             template=self.config.sandbox.template,
-            policy_allows=agent_policy_allows(self.config, self.config.sandbox.effective_languages),
-            secrets=[self._agent_secret_spec()],
+            policy_allows=agent_policy_allows(
+                self.config,
+                self.config.sandbox.effective_languages,
+                mcp_roles=CONCIERGE_MCP_ROLES,
+            ),
+            secrets=self._agent_secret_specs(CONCIERGE_MCP_ROLES),
             persistent_env=self.agent_persistent_env(),
             files=self.agent_files(),
         )
@@ -2567,7 +2630,13 @@ class Provisioner:
                 self.agent_token_env(): self.agent_token(),
             }
         if role == "service":
-            creds = self.config.credentials_named(credentials)
+            creds = self.config.credentials_named(
+                list(
+                    dict.fromkeys(
+                        [*credentials, *(cred.name for cred in self.config.mcp_credentials())]
+                    )
+                )
+            )
             return lambda: {
                 **self.service_persistent_env(creds, repo),
                 **self.service_secret_env(creds, repo),

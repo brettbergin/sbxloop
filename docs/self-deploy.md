@@ -7,6 +7,7 @@ departs from that pattern and the facts about the host that operating it needs.
 
 ```
 merge to main → Release (tag + PyPI, ~4 min) → Deploy the daemon (self-hosted runner on db)
+                                                 ├─ check the existing host with doctor
                                                  ├─ take a named pause hold (deploy-<run id>)
                                                  ├─ wait — no cap — for the in-flight run to finish
                                                  ├─ pip install the release wheels
@@ -89,7 +90,8 @@ ssh db 'journalctl --user -u sbxloop-daemon -f'         # from the host
 ssh db 'systemctl --user status github-runner sbx-sandboxd sbxloop-daemon'
 ```
 
-Rolling back is just deploying the older version — the workflow pins exactly. If a deploy
+Rolling back is just deploying the older version — the workflow pins exactly. A rollback
+passes only after its version, service, doctor and control checks pass. If a deploy
 fails *and* its rollback fails, the job says `ROLLBACK ALSO FAILED — db needs a human`; fix
 by hand with the commands in the generic guide, from any directory. Every deploy leaves a
 snapshot under `~/.sbxloop/backups/` and a line in `~/.sbxloop/logs/deploy/history.log`.

@@ -7,7 +7,8 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from sbxloop_worker.protocol import Event, JobRequest, SessionHealth, Usage
+from sbxloop_worker.protocol import Event, JobRequest, ProviderFailure, SessionHealth, Usage
+from sbxloop_worker.rate_limits import RateLimitReport
 
 # emit("agent.message", content="...") -> Event
 EmitFn = Callable[..., Event]
@@ -28,6 +29,7 @@ class BackendResult:
     turns: int | None = None
     health: SessionHealth | None = None
     artifacts: list[str] = field(default_factory=list)
+    failure: ProviderFailure | None = None
 
 
 class AgentBackend(Protocol):
@@ -36,6 +38,8 @@ class AgentBackend(Protocol):
     def ensure_available(self) -> None: ...
 
     def run_session(self, job: JobRequest, emit: EmitFn) -> BackendResult: ...
+
+    def rate_limits(self, *, timeout_s: float) -> RateLimitReport: ...
 
 
 def get_backend(name: str | None = None) -> AgentBackend:
@@ -53,6 +57,10 @@ def get_backend(name: str | None = None) -> AgentBackend:
         from sbxloop_worker.backends.claude import ClaudeBackend
 
         return ClaudeBackend()
+    if resolved == "codex":
+        from sbxloop_worker.backends.codex import CodexBackend
+
+        return CodexBackend()
     raise BackendUnavailableError(f"unknown agent backend {resolved!r}")
 
 

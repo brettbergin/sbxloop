@@ -23,12 +23,21 @@ from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.model import TaskSpec
 from sbxloop.engine.store import StateStore
+from sbxloop.errors import SbxloopError
 from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import ExecResult, SandboxInfo
 from sbxloop.tui.app import SbxloopTui
 from sbxloop.tui.runner import RunOutcome
 from sbxloop_worker.protocol import Event
+
+
+@pytest.fixture(autouse=True)
+def no_live_model_discovery(monkeypatch: pytest.MonkeyPatch) -> None:
+    def unavailable(*args: Any, **kwargs: Any) -> None:
+        raise SbxloopError("Model discovery is unavailable in this test.")
+
+    monkeypatch.setattr("sbxloop.modelcatalog.fetch_backend_rows", unavailable)
 
 
 class FakeCtl:
@@ -306,6 +315,7 @@ def make_app(
     sbx: SbxCLI | None = None,
     read_only: bool = False,
     daemon: dict[str, Any] | None = None,
+    cwd: Path | None = None,
     **tui: Any,
 ) -> SbxloopTui:
     config = Config.model_validate(
@@ -322,13 +332,31 @@ def make_app(
         runner=runner or FakeRunner(),
         sbx_factory=lambda: box,
         read_only=read_only,
-        cwd=state_dir.root,
+        cwd=cwd or state_dir.root,
     )
 
 
 def drive(coro_fn: Callable[[], Coroutine[Any, Any, None]]) -> None:
     """Run one async console scenario from a synchronous test."""
     asyncio.run(coro_fn())
+
+
+async def until(pilot: Any, pred: Callable[[], bool], timeout: float = 10.0) -> bool:
+    """Pump the console until ``pred`` holds, rather than guessing a duration.
+
+    A screen fills itself in from a worker, so anything it reads from the
+    store lands some time after mount. `pilot.pause(<n>)` guesses how long
+    that takes, and the guess is made on an idle laptop — under a loaded
+    `-n auto` run the same wait can expire mid-refresh and the assertion
+    reads the placeholder. This waits for the thing itself and returns as
+    soon as it is there, so it is both steadier and quicker.
+    """
+    end = time.monotonic() + timeout
+    while time.monotonic() < end:
+        if pred():
+            return True
+        await pilot.pause(0.05)
+    return pred()
 
 
 __all__ = [
@@ -341,4 +369,5 @@ __all__ = [
     "drive",
     "live_status",
     "make_app",
+    "until",
 ]

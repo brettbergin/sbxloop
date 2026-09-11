@@ -36,6 +36,8 @@ Section rules:
   ("beyond the outcome's scope is a defect" — test_build_and_review_share_the_scope_rule);
   the greenfield framing ("write all outputs", "when creating the project")
   must not come back (test_build_is_framed_as_a_branch_not_an_artifact).
+- The `yq`/`jq` line (#751) must stay: the builder hunted for a YAML parser
+  across four turns on a workflow-editing task (test_prompts_name_yq_for_yaml).
 - Each ECOSYSTEM_NOTES row must keep its markers under "Ecosystem notes"
   (test_prompts_carry_ecosystem_notes, #142).
 - "workspace root", "cannot edit", "blocked domain", "egress", "sudo",
@@ -73,6 +75,11 @@ Resolved toolchains for this repository: $toolchains.
   note those in your summary instead.
 - Do not create top-level files unless the task asks for them. Never write
   outside $work_dir.
+- `yq` and `jq` are on every sandbox. `yq` is the jq-syntax YAML tool
+  (`yq -r '.on' .github/workflows/ci.yml`,
+  `yq -y '.jobs.build.steps += [...]' file.yml`) — use them to read,
+  validate and edit YAML/JSON. Do not install PyYAML, Ruby, or a venv just
+  to parse YAML.
 
 $repo_conventions
 

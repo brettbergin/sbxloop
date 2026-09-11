@@ -179,7 +179,7 @@ That single answer builds the installer allowlist, drives the worker
 install, and scopes the project gate, so none of them can disagree. A fresh
 run clone has its submodules populated first (`hostgit.populate_submodules`,
 #692) — from the host checkout's copy when it has the recorded commit, else
-from the `.gitmodules` URL under the run's credential — and the hosts they
+from the `.gitmodules` URL — and the hosts they
 fetch from join that allowlist (`sandbox.submodule_hosts`). A clone whose
 `.gitattributes` routes files through Git LFS is populated the same way
 (`hostgit.populate_lfs`, #693) — the host checkout's LFS store first, the
@@ -192,6 +192,26 @@ blob. A clone whose manifests name a tag-derived versioning tool
 runs `git describe` on it would otherwise report the wrong version — from the
 host checkout when it has them, else from origin under the run's credential;
 `[sandbox] fetch_tags` overrides the detection.
+The host's one-shot Git helper releases the run's PAT or App installation
+token only to the configured GitHub HTTPS host and port. This same scope
+travels through every nested submodule; a repository-supplied URL cannot
+expand it. Other hosts can be fetched anonymously, but authentication
+challenges there fail without the GitHub token. Clone, tag, LFS and base
+fetches keep credentials in the process environment, never in Git config,
+remote URLs, command arguments or bundles.
+Host Git reads use a temporary, host-owned metadata view (`safegit.read_repo`)
+that carries refs, index and object access but excludes the agent's config
+and hooks. Diff drivers and recursive submodule scans are disabled; each
+submodule is inspected through its own private view. LFS comparison uses a
+host-authored byte-hashing filter under isolated Python, without invoking
+the repository's configured driver. Before a fix round, the host fetches
+from the configured repository into that private view using the existing
+host clone credential source. It copies a bundle of new Git objects into
+the agent sandbox, with no token, helper or configuration. Add, commit and
+merge then run through the `git.merge` worker job, where repository hooks
+and drivers have the same authority as other agent code. This preserves
+host-initiated transport and mediation between the credential and agent
+planes; no new listener or box-to-box channel is introduced.
 The github sandbox exists only when the GitHub integration is configured
 (`[github] repo = "owner/repo"`, or at least one `[[github.repos]]` entry);
 without it, `pair.github` is `None`, `GH_TOKEN`
@@ -303,52 +323,64 @@ echoed it. Each call is one `service.call` ledger event — credential name,
 method, path, status, duration; never a body or a header. The agent sandbox's
 allowlist does not carry the credential hosts: the agent never speaks to them.
 
-The same box is the run's dependency **fetcher** (#766). A `[[registries]]`
-entry with `auth_env` is a credentialed registry, and its token, client file
-(`~/.npmrc`, `~/.netrc`, …) and host go to the service sandbox only — the
-agent sandbox gets neither the file nor the host, and is configured offline
-for that ecosystem (`registries.offline_env`: `npm_config_offline`,
-`PIP_NO_INDEX`/`PIP_FIND_LINKS`, `GOPROXY=off`, `CARGO_NET_OFFLINE`,
-`MAVEN_ARGS=-o`, `NUGET_PACKAGES`, `BUNDLE_LOCAL`). Both boxes see the one
-workspace mount, and the cache is inside it — `<workspace>/.sbxloop/deps/<kind>`,
-excluded from git through `.git/info/exclude`, reached in either VM through a
-stable `~/.sbxloop/deps` symlink so the offline variables hold one path — so a
-fetch in the service box is an install in the agent box. The service box
-therefore needs the workspace view the agent's has (its own toolchains for the
-credentialed kinds too, ensured at install like the agent's) and fails
-provisioning naming the mount otherwise; its allowlist grows by the registry
-hosts and the ecosystem's public baseline (`registry.npmjs.org`, `pypi.org`,
-`proxy.golang.org`, …) so a virtual repository that proxies upstream resolves.
-It runs one more job kind, `service.fetch`: an argv the host authored from a
-fixed per-ecosystem recipe (`registries.fetch_plan` — `npm ci --ignore-scripts`
-/ `npm install --ignore-scripts [pkgs]`, `pip download -d <cache>`, `go mod download`, `cargo fetch`, `mvn -B dependency:go-offline`, `dotnet restore --packages`, `bundle cache --all --no-install`) in the workspace, never a
-shell; a package spec is one token matching `_PACKAGE_RE` (never a leading
-`-`), and an ecosystem the run has no credentialed registry for, a non-spec, or
-a package list for a manifest-only kind is refused on the host before a job
-exists. `Engine._fetch_dependencies` runs the manifest recipe for every
-credentialed kind whose manifest the workspace carries, right after the worker
-installs and before `setup_commands`; a non-zero exit is a `ProvisionError`
-carrying the argv and the output tail, and the run stays resumable like any
-infrastructure failure. The build session holds a second host tool,
-`fetch_dependencies(ecosystem, packages?)` — packages → the `add` recipe,
-none → re-fetch from the manifest the agent just edited — and reads the
-package manager's exit code and output back as the tool's answer (a failed
-fetch is an answer, not a tool error, so the agent can fix the manifest). Every
-fetch, refused or run, is one `sandbox.fetch` ledger event with the ecosystem,
-verb, argv, exit code and phase; the worker scrubs the credential's value from
-the output before it leaves the box. `sbxloop config policy` prints the service
-sandbox's allowlist as a second line; `sbxloop doctor` lists unset `auth_env`
-names in its `registry credentials` row. A registry without `auth_env` is an
-open registry and stays exactly as #680 built it: agent allowlist, agent client
-file, no service box. The `[sandbox] secret_env` key that once carried such a
-token into the agent sandbox is refused by name at config load with this
-design as the message (#766).
+The same box downloads private dependency **data**. Credentialed registries
+are a host-authored `SBXLOOP_REGISTRIES` catalogue containing each registry's
+name, ecosystem, HTTPS authority and credential environment name. The fixed
+`service.fetch` operation accepts a catalogue name and absolute URL path,
+plus an optional expected SHA-256. It streams bytes into a private artifact
+beside the worker result, with a 1 GiB bound and credential-echo detection.
+Same-authority HTTPS redirects are allowed; other authorities are refused.
+For Git dependencies, `operation=git` fetches objects into fresh bare
+metadata and returns a bundle: no checkout, hooks, submodules, repository
+configuration or credential helper is evaluated.
+
+The service never runs a package manager, reads project metadata, extracts
+an archive or writes the dependency cache. Its worker starts with Python
+isolated mode, receives no project cwd, and needs no registry client files
+or package-manager toolchains. Credentials still enter only through the
+service's per-job stdin or private env file. Host-initiated `sbx cp` moves
+the artifact through a temporary host file into the agent; the host checks
+its size and SHA-256 and removes the service copy. No response chooses a
+host path, and no listener, proxy, socket or VM-to-VM channel is involved.
+
+The agent resolves dependencies, reads downloaded metadata, extracts
+packages and runs all package managers and build hooks. Its offline cache
+remains `<workspace>/.sbxloop/deps`, excluded from Git and linked at
+`~/.sbxloop/deps` in the agent only. Before setup commands, one dependency
+preparation session receives the `fetch_dependencies` tool, the target's
+conventions and the commands the host will verify offline. Its usage is
+recorded under the `dependencies` phase. A missing preparation result or a
+failed offline verification stops provisioning with a resumable failure.
+The build/execute session keeps the tool to fetch new dependencies after
+manifest edits. Without a path, the tool returns registry discovery and
+cache information; with a path, it returns the copied file's agent path,
+byte count and SHA-256. It never claims a catalogue query installed packages.
+
+Each download is a `sandbox.fetch` event naming the registry, path,
+ecosystem, operation and result metadata, never artifact content or an
+authorization header. Open registries retain their agent-side client
+configuration and direct fetching. Native private-registry resolution
+across all supported ecosystems remains **field-unverified** until exercised
+against those registries; tests cover the isolation and transfer contracts.
 
 What the agent credential *is* — its env var, the host sbx binds it to, the
 hosts it must reach, how doctor names it when missing, where its model ids
 are listed — lives on one descriptor per backend in `sbxloop.backends`
 (#617); provisioning, doctor, `sbxloop secrets`, `sbxloop list-models` and
 sandbox pruning read it rather than assuming Copilot.
+
+The `codex` descriptor selects the Python `openai-codex` SDK and
+`OPENAI_API_KEY`, bound to `api.openai.com`. The worker's `codex` extra pins
+both the SDK and its bundled CLI runtime. `CodexClient` talks to that
+runtime over stdio inside the agent VM; it creates no listener. Native
+environment tools are disabled and worker-controlled dynamic tools enforce
+permissions and the tool-call ceiling before execution. Host tools retain
+the event/file relay. Read-only Codex sessions expose file read, directory
+listing and text search; the concierge exposes only its host tools. The
+adapter isolates Codex state/configuration from the target checkout and
+uses an ephemeral API-key credential store. See
+[the Codex backend design](codex-backend.md), including the experimental
+API pin and **field-unverified** live-sandbox checks.
 
 Under the default `proxy` secret strategy, sbxloop first attempts sbx's
 keychain-backed injection, where **token values never enter the VM**.
@@ -530,7 +562,11 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
 
 - the **github-ops box** (`daemon/github.py`) — polling and issue lifecycle
   with `GH_TOKEN`, provisioned lazily, dropped and re-provisioned on
-  failure at most once per five minutes, removed at daemon start/stop;
+  failure at most once per five minutes, removed before provisioning and
+  at daemon stop. Each provision checks inventory and removes only this
+  instance's stale box. Inventory or removal failures stop that attempt;
+  polling backoff retries cleanup after authentication or the sandbox
+  service recovers, while daemon control stays available;
 - the **concierge box** (`daemon/agentbox.py`) — the control channel's
   agent (`daemon/concierge.py`), a Copilot session with the agent token
   and **no built-in tools**: everything it can do is a *host tool*
@@ -640,6 +676,9 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   and a draft PR (see [Delivery](#delivery)); every later round re-delivers
   onto the same branch, so one run is one PR. A checkout delivers its git
   diff against the base, a history-less workspace a snapshot, and both
+  stop a code run as `blocked` when no deliverable changes or files remain.
+  This outcome asks for triage without an automatic daemon retry: empty
+  output alone proves neither completion nor a transient failure. Otherwise both
   go through one tree builder (`deliver._blob_upload`, #695) that keeps
   exec bits (`100755`) and symlinks (`120000`) as `hostgit.tree_mode`
   reads them from disk. The repository's own
@@ -664,12 +703,21 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   in a top-level comment; GitHub refuses `REQUEST_CHANGES`/`APPROVE` from
   an author, so the review feature is not asked), and as an
   `APPROVE`/`REQUEST_CHANGES` review (`COMMENT` fallback) when a distinct
-  identity reviews.
+  identity reviews. Before either posting path sends inline findings, the
+  host checks their locations against GitHub's paginated PR file patches
+  and checks that the head and base stayed fixed during the read. Only
+  RIGHT-side additions and context lines in complete, understood hunks
+  qualify. Findings outside that diff, files without a usable patch, and
+  findings whose locations could not be verified go directly into the
+  review body with their original anchors and severity; they remain in
+  the verdict and reconciliation history. The lookup is skipped when
+  there are no inline candidates and adds no agent turn. GitHub refusals
+  after the check still use the existing fallback.
 - **FIX** — one seeded task (`fix-N`), built and verified like any other
   under the same revision/replan budgets, whose exam is the union of the
   decomposer's verify commands plus the gate. Then back to GATE. Every
   round first merges the current base into the run's clone
-  (`hostgit.merge_from_base`): CI judges GitHub's test merge of the branch
+  (`git.merge`, dispatched to the agent worker): CI judges GitHub's test merge of the branch
   with its base, so a red check may exist only there, and a real conflict
   becomes markers in the fixer's working tree — delivery overlays files
   onto the current base tree and would otherwise overwrite the
@@ -693,8 +741,8 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   round if the base requires the check, one if it does not.
 - **LAND** — see below. Once the PR has merged — never before — the
   review's `followups` (real, out of scope, kept out of `findings` so they
-  cost no fix round) and the fix rounds' `deferred:` findings are filed as
-  follow-up issues on the repository (#517): `engine/followups.py` merges
+  cost no fix round) and the fix rounds' `deferred:` findings are candidates
+  for follow-up issues on the repository (#517): `engine/followups.py` merges
   duplicates across rounds by title, each issue carries a
   `<!-- sbxloop-followup run=… key=… -->` marker and is recorded as a
   `followup` phase row before the next is filed (a resume between filing
@@ -702,6 +750,24 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   by `[landing] max_followups_per_run`, and the label is
   `followup_label`, **never** the trigger label — the 1.0 rule that the
   loop files no work of its own stands; a human promotes a follow-up.
+  Before proposing an issue, the reviewer calls the read-only
+  `lookup_followup` host tool (`engine/issue_lookup.py`), searching open and
+  closed issues with up to three symptom/component queries. The existing
+  review session compares meaning; there is no additional agent phase.
+  A `followup_lookup` phase row binds the lookup ID to the repository, run,
+  exact proposal and returned issues. Filing requires that receipt and a
+  decision (`new`, `tracked`, `regression`, `uncertain`); search is refreshed
+  before writing, and changed, incomplete, failed or absent evidence leaves
+  the note on the PR for triage. `tracked` links the canonical issue without
+  changing its labels or state. Regressions require a completed issue and a
+  fresh reproduction; declined work is never resurrected automatically.
+  Old saved verdicts and unchecked deferrals therefore remain PR notes.
+  Each review permits ten lookup calls, at most twenty results per query
+  and 24,000 characters of combined evidence; exceeding a limit refuses
+  automatic filing. Earlier follow-ups are included in review history, and
+  marker matching spans runs. GitHub search is eventually consistent;
+  the marker-list check covers retry windows but is not a distributed lock
+  against simultaneous writers on different hosts.
   `followups = "comment"` posts one checklist comment on the PR instead;
   `"off"` drops them. A repository with Issues disabled (#631) downgrades
   `issues` to that comment — decided up front from `has_issues` on the
@@ -739,7 +805,18 @@ bounds the agent's work; time spent waiting on GitHub (CI, landing) is not
 charged to it and is bounded separately by `[landing] ci_timeout_s`.
 
 Structured JSON phases are validated against pydantic models with one retry
-that feeds the validation error back to the agent.
+that feeds the validation error back to the agent. A parsed review response
+that fails schema or semantic validation instead gets at most two response
+corrections. Each carries the previous response, prior-round evidence, validation
+feedback and the schema generated by the host. The reviewer resumes its session
+when available; the complete response also lets a fresh session correct it without
+investigating again. Built-in, host and MCP tools are disabled for corrections. Strict schema
+validation and the review guard remain in place, and all correction usage counts
+toward the run. Completed responses and their spend are checkpointed in phase
+rows, so a provider cooldown or restart resumes the pending correction with the
+same attempt budget instead of starting another investigation. A changed review
+request does not reuse those responses. An initial response missing JSON still
+follows the ordinary one-retry path.
 
 Every stage is a run state — `building`, `gating`, `delivering`,
 `reviewing`, `fixing`, `awaiting_ci`, `landing` — and the last one entered
@@ -874,6 +951,99 @@ through like `uv run`. eslint and golangci-lint deliberately have no entry:
 both keep applying their configured ignores to paths given on the command
 line, so an explicit path there is a narrowing the lint must not reject.
 
+What the loop is gets said once, to every session. `engine.harness` holds
+one situation briefing — the run is a sequence of stages, each its own
+session that sees no other's transcript; the microVM is the boundary, so
+tool access is real; egress is an allowlist that fails closed; only the
+workspace survives the sandbox — plus one tail per role
+(`ROLE_BY_PHASE` maps each prompt name to `planner`, `builder`, `critic`,
+`operator` or `concierge`). `PhaseRunner._agent_job` composes it onto every
+engine session through `harness.brief_for_phase`, and the concierge prepends
+the same head to its own template, so the four personas can no longer drift
+from each other or from the machine. It rides the **system message**, not
+the prompt: identical on every turn of every stage, it caches, where the
+same text in a phase prompt is re-sent with each turn (goal 3, "spend
+scales with turns"). The briefing is domain-neutral by test — no language,
+no toolchain, no incident — and the pull-request framing appears only when
+`[github] repo` makes delivery real.
+
+Procedures the agent needs *sometimes* are skills, not prompt text.
+`sbxloop.skills` ships a tree of `<name>/SKILL.md` files — YAML frontmatter
+(`name`, `description`, `roles`) over a Markdown body, deliberately the
+shape a Claude-native skills directory uses, so the same tree can later be
+handed to a backend that loads it from a filesystem without a second source
+of truth. Today the door is a host tool: `engine.skilltools.skill_tool_spec`
+builds a `load_skill` spec whose `name` enum is exactly the skills that
+role may load, and whose description carries the catalogue, so the listing
+costs the tool schema rather than a section in every phase prompt and a body
+costs nothing until it is asked for (goal 3 again). `answer_skill_call`
+answers host-side and logs `skill.loaded`; a name outside the caller's role
+is refused rather than returned, and every malformed call is answered rather
+than raised, because a model that asked for a procedure must always get
+something it can act on.
+
+A host tool rather than a file read is the floor, not a fallback: the
+concierge runs with `available_tools=[]` and `permission_mode="read_only"`,
+so it has no reader and no shell, and this is the only way it can reach a
+procedure at all. That is also why `PhaseRunner._tools_for` does **not**
+narrow the skill tool to `TOOLED_PHASES` the way the run's service tools are
+narrowed — a critic needs the verification procedure as much as the builder
+does, and unlike `call_service` the skill tool reaches nothing outside the
+host. Its consequence is that every agent job now carries at least one host
+tool, so the handler always rides along; `_tools_for` composes the run's own
+handler behind the skill one, and a run with no credentials still gets a
+working `load_skill`. The four shipped skills are `run-shape` (planner,
+builder, critic), `verify-gate` (builder, critic), `deliver-pr` (builder)
+and `operate-sbxloop` (concierge, and the one written for a human asking how
+to set the loop up). Bodies are gated as prompt bodies are:
+`scripts/check_self_references.py` reads `skills/*/SKILL.md` alongside
+`engine/prompts/*.md`.
+
+`[[mcp]]` is the extensibility point: external MCP servers an agent session
+may use, on either backend. `McpConfig` names the server, its `transport`
+(`stdio` with a `command` argv, or `http`/`sse` with a `url`), the `hosts` it
+contacts, an optional `credential` naming a `[[credentials]]` entry, and the
+`roles` that get it — defaulting to builder and operator, never a critic,
+because a read-only review session reaching a third-party service is a
+capability nobody asked for. `Config.mcp_specs_for(role)` resolves an entry
+into the protocol's neutral `McpServerSpec`, `JobRequest.mcp_servers`
+carries it, and `sbxloop_worker.mcp.server_configs` materialises it into
+each SDK's dialect. The two agree on everything except the stdio token —
+`"stdio"` to the Claude Agent SDK, `"local"` to the Copilot SDK — which is
+the entire reason the protocol carries a neutral transport and the backends
+pass their own `stdio_type` (field-verified 2026-09-06 against
+github-copilot-sdk 1.0.8 and claude-agent-sdk 0.2.149). On the claude
+backend the operator's servers are merged *alongside* the in-process
+`sbxloop` host-tool server, never over it.
+
+Credential-free servers use the native SDK transports above. Credentialed
+servers require Streamable HTTP at their credential's HTTPS host. Their
+keys are delivered only to the service sandbox, through the same stdin or
+private env-file transport as other service credentials. They are never
+registered as agent proxy secrets or expanded in agent code. Credentialed
+stdio and legacy SSE transports are refused at configuration loading.
+
+The host discovers tools through fixed `service.mcp` jobs, then replaces
+credentialed server descriptors with host tools before staging an agent
+job. Each job gets only the servers selected for its role. Calls go through
+the existing host-tool event and response-file channel; the host submits a
+fixed authenticated JSON-RPC request in the service VM. No listener,
+subprocess, repository code, or agent runs there. MCP credentials do not
+implicitly grant the generic `call_service` tool access to them. The
+concierge lazily provisions its own service VM with its role's MCP grants.
+
+The service negotiates protocol versions 2025-11-25, 2025-06-18 or
+2025-03-26, supporting tool discovery, pagination and calls with JSON or SSE
+response framing. Remote session IDs remain inside that VM; job cleanup
+requests session deletion. Redirects and automatic request replay are
+refused. Resources, prompts, sampling, elicitation, legacy SSE endpoints
+and resumable streams are unsupported. Compatibility with deployed remote
+servers is **field-unverified**; the tests exercise synthetic transports.
+
+Only credential-free MCP hosts are added to agent egress. Credentialed MCP
+hosts belong to the service allowlist. Configuration continues to reject
+token-shaped command arguments; values never belong in configuration,
+job files, events, logs or `sbx` arguments.
 The repository's own instruction files reach every phase the same way
 (#688). `engine.repocontext.read_repo_context` reads `AGENTS.md`,
 `CLAUDE.md`, `.cursorrules`, `.github/copilot-instructions.md`, the
@@ -892,6 +1062,109 @@ the Claude backend passes `setting_sources=[]` explicitly (the SDK's own
 default, which loads no filesystem settings), so a target repository's
 `.claude/settings.json` cannot reconfigure an unattended session and
 CLAUDE.md costs its tokens once, through the prompt.
+
+Claude sessions with a working directory also carry a shell contract in
+their system prompt, including workload personas that decline the coding
+preset. The backend sets
+`CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR=1` in the CLI child's environment:
+each Bash call starts from the session's initial working directory,
+including resumed sessions and a fresh session after a missed resume.
+This matches the independent working-directory contract of mechanical
+verification. It prevents a successful `cd app` in one call from making
+the next call's `cd app` look for `app/app`. Host-tool-only sessions receive
+no shell instructions, and the Claude-specific behavior is not promised
+by the shared phase prompts to other backends.
+
+Directory changes still affect later commands within the same Bash call.
+The contract asks agents to use absolute paths or isolated command groups,
+guard directory changes, and preserve failures when combining commands or
+trimming output. Tests cover the SDK options and prompt contract across
+fresh, resumed and fallback sessions; the external CLI's behavior remains
+**field-unverified** until exercised on a CI runner. The reset flag's
+semantics are documented in
+[Anthropic's Bash tool reference](https://code.claude.com/docs/en/tools-reference#what-persists-between-commands).
+
+Host reads of these convention files and PR templates use `repofiles`:
+directory-relative opens with kernel symlink following disabled, resolving
+links only within the checkout. Links between repository files still work;
+links to host files are omitted. Replacing a path between inspection and
+opening cannot redirect the read outside the checkout. Artifact staging and
+regular-file PR uploads use the same reader and fail when a file cannot be
+opened safely. Hosts without directory-relative, no-follow opens fail closed.
+
+### Concierge provider capacity
+
+The `agent_rate_limits` host tool delegates to `DaemonAgent.agent_rate_limits`.
+It submits a separate `agent.rate_limits` job to the active **agent** sandbox,
+with its existing credential delivery and an independent worker client/job id.
+The original concierge session may be waiting for that host-tool reply: the
+query never acquires its session or starts/resumes a model conversation.
+Provider failures return a sanitized report and never enter the sandbox's
+retry/reprovision path. The worker query budget is ten seconds (plus at most
+one second of Copilot runtime cleanup); the host transport uses two seconds
+of grace. Normalized results are at most 32 KiB, with at most 32 limits.
+
+Backend adapters own both the query and normalization. Copilot uses the
+documented but experimental `account.getQuota` RPC, with explicit capability
+failure for SDK/runtime mismatches. Its snapshot timestamp and window lengths
+are unknown. Claude reads organization ceilings through the Rate Limits API
+using only the configured inference credential; insufficient admin scope is
+unsupported, not an invitation to switch credentials. It cannot establish
+remaining quota or effective workspace limits. Codex currently reports
+unsupported. This evidence is independent of recorded token accounting and
+does not feed the run recovery or scheduling state machine.
+
+Source contracts checked against the
+[Copilot SDK v1.0.8 declarations](https://github.com/github/copilot-sdk/blob/v1.0.8/python/copilot/generated/rpc.py),
+[Copilot usage documentation](https://docs.github.com/en/copilot/how-tos/copilot-sdk/features/usage-and-billing)
+and [Claude Rate Limits API](https://platform.claude.com/docs/en/manage-claude/rate-limits-api).
+**Field-unverified:** live account permissions, quota payload freshness and
+the provider query inside a real sbx sandbox. Synthetic provider and sandbox
+transport regressions run in CI; this feature does not make live inference
+calls to probe capacity.
+
+## Provider recovery
+
+Terminal inference failures cross the worker boundary as
+`ErrorInfo.provider` (`ProviderFailure`), before task JSON parsing. Claude
+uses `AssistantMessage.error`, `ResultMessage.is_error` and, when present,
+`api_error_status` and `RateLimitEvent.rate_limit_info`. Informational rate
+events and errors followed by a successful response do not fail a job.
+Text classification is confined to error envelopes. Fixed diagnostic
+reasons keep provider account/credential prose out of the chronology;
+session identity, partial output and usage remain on the error result.
+
+`provider.ProviderRecovery` guards every agent `WorkerClient.submit`,
+including steering and the concierge. The `provider_holds` and
+`provider_jobs` tables commit the credential-scoped hold and interrupted
+job together. Each backend currently has one inference credential source
+per home, so its repositories and models share a hold. GitHub tokens do
+not define an inference scope. Other adapters can use the same contract.
+
+Throttles and temporary unavailability allow three scheduled retries with
+exponential backoff and jitter, never earlier than supplied provider
+timing. Further rejection requires explicit recovery. Quotas wait for a
+future provider reset; unknown/elapsed resets and billing failures require
+operator recovery. No reset is inferred from prose. Cooldowns are durable
+dispatch eligibility, not sleeping agent calls, so status, pause, cancel
+and resume remain available without an inference call.
+
+A run parks as `provider_held`, retaining its stage, task state, workspace
+and sandbox session. Recovery continues the same run and interrupted job
+without spending a revision, replan, full-run attempt or crash resume.
+Surviving sandboxes are reused and setup commands skipped. Partial work
+requires the original session; a missing session or changed request parks
+for inspection instead of replaying side effects. Pending steering
+messages are persisted. Rejected attempts' usage is accumulated into the
+eventual result.
+
+SDK envelopes were checked at the minimum supported version v0.2.149 and
+commit `6bbd3093147c2fadcd4b868599b8fb6d9db3d523`. The former v0.1.0 floor
+lacked assistant errors and could not parse rate-limit events. Missing
+optional metadata stays unknown. Live provider
+timing and real sandbox session recovery are **field-unverified**.
+Synthetic adapter, serialization, fake-clock scheduling and CI sandbox
+tests cover the implementation.
 
 ## Workloads
 
@@ -1022,9 +1295,25 @@ leftover of the layouts the home replaced. `sbxloop init` builds it (`homeinit.p
 
 ## Persistence and resume
 
-`StateStore` is a WAL-mode SQLite database at `~/.sbxloop/state/state.db` (the home's
-`state/`, see *The home* below) with
-four tables: `runs`, `tasks`, `phase_attempts`, `events`. A workload task's
+`~/.sbxloop/state/state.db` (the home's `state/`, see *The home* below) is one
+WAL-mode SQLite database holding **nineteen** tables, and two stores read it
+through separate connections. `StateStore` owns five — `runs`, `tasks`,
+`phase_attempts`, `reconciliations`, `events` — and `DaemonStore` the
+fourteen `daemon_*` ones (the queue, the run ledger, the resume budget,
+key/value state, run watches, requesters, prior attempts, chat threads,
+merge gates and their prompts, review holds, pending clarifications, the
+operator console's mailbox and the schedules).
+
+Both are SQLAlchemy models under `sbxloop/db/` (#539), and Alembic owns the
+upgrade path — one revision chain for the whole file, applied when a store
+opens it, so an unattended daemon still migrates itself with no operator
+step. Revision 0001 is not a schema: it is the hand-written migrator both
+stores ran before, so a database in any of the sixteen shapes this project
+has released comes up to the current one by the code that already did that.
+Revisions are **additive only**, because a failed deploy rolls back by
+restarting the previous version against the database the new one migrated.
+
+A workload task's
 row also carries its `TaskOutput` (`tasks.output_json`, #757): the
 `## Result` section of the operator's report, its first line as the
 summary, and the names of the files the attempt left in the data directory
@@ -1049,7 +1338,7 @@ persisting — a crash and a `kill -9` look identical to the store — and
 1. rehydrates the config persisted at run creation (tokens still come from
    the current environment; the home stays the one that located the run;
    the `keep_sandboxes`/`keep_on_failure` debug toggles stay resume-time
-   choices) and pins the workspace from the `runs` table — editing config between
+   choices; model settings refresh at each new phase) and pins the workspace from the `runs` table — editing config between
    start and resume, or resuming from another directory, cannot silently
    change budgets/toggles or relocate the workspace. Any difference from
    the current on-disk config is reported as a `run.config_drift` event,
@@ -1060,6 +1349,65 @@ persisting — a crash and a `kill -9` look identical to the store — and
    is idempotent: the branch is force-moved and the open PR reused; a
    review that never committed its verdict runs again). A phase whose
    result was never committed re-runs from its start; nothing is replayed.
+
+### Model policy at phase boundaries
+
+`agentmodels.py` resolves the eight phase keys independently from persona
+labels (the operator plans and executes under different keys). Every request
+keeps the run's single backend. Selection is run `--model`, repository role,
+global role, then the top-level fallback. Concierge resolution has no run or
+repository override.
+
+Loaded configs carry their original discovery directory and an in-memory
+copy of environment overrides; only the directory and explicit run override
+are serialized, never environment values. Resume adopts the current environment
+and keeps the original home and source directory. `refreshed_models` loads those
+layers for every new phase, copies only model fields onto the pinned run config,
+and fails closed on malformed config or a changed backend. Directly constructed
+configs have no discovery directory and stay under their embedding caller's
+control. Per-run copies prevent repository overrides leaking across workers.
+
+JSON repair shares one selection with the original attempt. Review response
+checkpoints also retain that selection and restore the completed responses'
+session identities after a restart. Legacy response checkpoints inherit the
+run's original top-level model. A provider recovery
+checkpoint records `requested_model` (nullable migration `0006` for old rows).
+Recovery may restore that model only if the rest of the semantic job identity
+matches; changing a model cannot bypass a credential hold or replay a different
+job. The old request completes before a new phase adopts new policy.
+
+Build and execute phase outputs record the session's requested model. Resume
+loads this mapping and only reuses a session with a known matching model; a
+change or legacy unknown identity starts fresh with the ordinary task brief,
+prior reports, feedback, and workspace intact. Codex also includes the requested
+model in its capability fingerprint. Concierge stores its session model identity
+beside its session id, rotates on change, and defers rotation during interrupted
+call recovery.
+
+The host stamps `agent_phase`, `requested_model`, and `model_source` on agent
+events without overwriting the SDK's reported `model`. Usage groups phase and
+reported model separately from persona totals, so `operator_plan` and
+`operator_execute` remain distinguishable. Status resolves current policy for
+active runs; historical headlines label a snapshot as the initial fallback.
+Model ids are provider-owned strings; catalogue misses are diagnostic rather
+than a closed validation list.
+
+`modelcatalog.py` caches successful host-side `list-models` discovery under
+`SbxloopHome.model_catalogs`, one JSON file per backend. The bounded schema
+stores only picker metadata and a timestamp; atomic replacement keeps a failed
+or empty refresh from destroying the last successful result. Agent worker
+installation and concierge readiness trigger a background refresh when the
+catalog is missing or at least one day old. An in-process lock deduplicates
+automatic discovery, with a five-minute retry floor. No catalog lookup adds
+model turns or changes the run trail, and provisioning does not wait for it.
+The same optional host SDKs and credentials as `list-models` are required.
+
+The TUI's `ModelScreen` loads the current backend's cache, filters names and
+slugs locally, and returns the existing `ValueEdit` to the validated config
+save path. Refresh runs in a Textual worker, keeping the cached choices usable
+while discovery is pending or unavailable. Inheritance and `auto` are separate
+choices; custom input is an explicit action. Provider-disabled entries cannot
+be picked, and a configured alias absent from the catalog remains visible.
 
 ### Run reconciliation
 
@@ -1389,20 +1737,30 @@ repo-attribution passes (`backfill_repo`, `attribute_repoless`,
 queued ask. With `[chat]` configured and `[github]` absent the daemon runs on
 `ChatSource` alone.
 
-The third source is time (#761). `[[schedules]]` declares workloads the
-daemon asks for by itself: a `name`, the `profile` to run under, the `ask`,
-and one cadence — `every` (a period, `"24h"`, `"90m"`, parsed by
+The third source is time (#761). A schedule is a workload the daemon asks
+for by itself: a `name`, the `profile` to run under, the `ask`, and one
+cadence — `every` (a period, `"24h"`, `"90m"`, parsed by
 `daemon/schedule.py::parse_every`) or `cron` (five fields, `CronSpec`),
-read in `timezone` (`[daemon] run_cap_timezone` when unset). The loop's
-`tick` calls `_fire_schedules` right after the poll: for each schedule it
-reads (creating on first sight) its `daemon_schedules` row — `anchor`, the
+read in `timezone` (`[daemon] run_cap_timezone` when unset). Schedules live
+in the daemon's database (#818): the `daemon_schedules` row carries the
+schedule itself (profile, ask, cadence, zone, `source` and `created_by`)
+beside its state, `DaemonStore.add_schedule` / `remove_schedule` /
+`schedules` are the whole API, and `DaemonLoop.add_schedule` (the
+concierge's `create_schedule` tool, `ctl schedules add`) makes one live from
+the next tick with no restart. A `[[schedules]]` entry in `sbxloop.toml` is
+legacy: `DaemonLoop._import_config_schedules` stores it once at start,
+`daemon.schedules_imported` tells the operator to drop it from the file,
+and doctor's `schedules in sbxloop.toml` row says the same. The loop's
+`tick` calls `_fire_schedules` right after the poll: for each stored
+schedule it reads (creating on first sight) its row's state — `anchor`, the
 origin of an `every` grid; `last_due`, the latest due instant handled —
 and asks `Cadence.latest_due(row.base, now, tz)` for the most recent due in
 `(last_due, now]`. None: nothing. Otherwise exactly one tick is handled, at
 its *due* time: a paused schedule (`schedules pause <name>`, `paused_by` on
 the row) swallows it; a schedule whose previous tick is still live
 (`live_schedule_item`: a `sched:<name>:%` row outside the terminal states)
-skips it and says so (`daemon.schedule_skipped`); otherwise the loop
+skips it and says so (`daemon.schedule_skipped`), as does one whose profile
+the config no longer declares; otherwise the loop
 upserts `WorkItem(sched:<name>:<due UTC minute>, kind=workload, profile, body=ask)` and records the fire (`schedule_fired`). So a late daemon does
 not shift the grid, a daemon down for several ticks catches up with one,
 and `every = "1h"` restarted at *t*+1h30 after firing at *t*+1h fires next

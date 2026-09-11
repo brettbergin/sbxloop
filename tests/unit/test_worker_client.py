@@ -72,10 +72,12 @@ def script_toolchain_probe(
 
 
 def script_git_probe(fake_sbx: FakeSbx, *, returncode: int = 0) -> None:
-    """Script the baseline git probe (#252). Unscripted it runs on the host,
-    where git is present on every dev machine and CI runner — so tests that
-    assert the exact apt command pin it rather than rely on that."""
-    fake_sbx.script(f"exec boxa sh -c {toolchains.GIT.probe}", returncode=returncode)
+    """Script every baseline tool probe (git #252, yq/jq #751) to the same
+    answer. Unscripted they run on the host, where git is present on every
+    dev machine and CI runner and yq varies — so tests that assert the
+    exact apt command pin them rather than rely on that."""
+    for tool in toolchains.BASELINE_TOOLS:
+        fake_sbx.script(f"exec boxa sh -c {tool.probe}", returncode=returncode)
 
 
 def script_toolchain_probe_batch(
@@ -144,14 +146,23 @@ class TestStreamTransport:
         bus.subscribe(seen.append)
 
         client = make_client(sandbox, bus)
-        result = client.submit(agent_job(), agent="planner")
+        result = client.submit(
+            agent_job(model="requested"),
+            agent="planner",
+            agent_phase="decompose",
+            model_source="agent.models.decompose",
+        )
 
         assert result.status == "ok"
         messages = [e for e in seen if e.type == EventTypes.AGENT_MESSAGE]
         assert messages and all(e.data["agent"] == "planner" for e in messages)
+        assert all(e.data["agent_phase"] == "decompose" for e in messages)
+        assert all(e.data["requested_model"] == "requested" for e in messages)
+        assert all(e.data["model_source"] == "agent.models.decompose" for e in messages)
         starts = [e for e in seen if e.type == EventTypes.WORKER_START]
         assert starts and "agent" not in starts[0].data
         assert client._job_agents == {}
+        assert client._model_context == {}
 
     def test_shell_check_job(self, sandbox: Sandbox) -> None:
         job = JobRequest(
@@ -548,6 +559,7 @@ class TestInstallFallbacks:
         wheel = tmp_path / "w.whl"
         wheel.write_bytes(b"x")
         client = make_client(sandbox, EventBus())
+        script_git_probe(fake_sbx, returncode=0)
         script_toolchain_probe(fake_sbx, "python", returncode=0)
         script_search_fallback_probe(fake_sbx)
         fake_sbx.script("exec boxa python3 -m venv", returncode=0)
@@ -628,6 +640,29 @@ class TestInstallFallbacks:
         ]
         assert len(scripts) == 1 and "python3.13" in scripts[0], scripts
 
+    def test_ensure_dev_tools_with_no_languages_installs_the_baseline_only(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        # #801: an empty language set is "none", not "the default" — a
+        # workload's box gets git and yq/jq and no language toolchain; only
+        # None means the default Python.
+        wheel = tmp_path / "w.whl"
+        wheel.write_bytes(b"x")
+        client = make_client(sandbox, EventBus())
+        script_git_probe(fake_sbx, returncode=1)
+        script_search_fallback_probe(fake_sbx)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        self._script_happy_install(fake_sbx)
+        client.install(wheel=wheel, ensure_dev_tools=True, languages=())
+        apt_cmds = [
+            " ".join(c) for c in fake_sbx.invocations("exec") if any("apt-get" in a for a in c)
+        ]
+        assert apt_cmds == [
+            "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git yq jq"
+        ]
+        python_probe = toolchains.resolve(["python"])[0].probe
+        assert not [c for c in fake_sbx.invocations("exec") if python_probe in " ".join(c)]
+
     def test_ensure_dev_tools_installs_git_as_baseline(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
@@ -648,7 +683,7 @@ class TestInstallFallbacks:
         ]
         assert apt_cmds == [
             "exec boxa sh -c sudo -n apt-get update -q && "
-            "sudo -n apt-get install -y -q git python3-venv python3-pip curl ca-certificates"
+            "sudo -n apt-get install -y -q git yq jq python3-venv python3-pip curl ca-certificates"
         ]
 
     def test_ensure_dev_tools_git_probe_success_installs_nothing(
@@ -1116,7 +1151,7 @@ class TestPrebakedTemplate:
         joined = [" ".join(c) for c in fake_sbx.invocations("exec")]
         assert not [j for j in joined if "-m venv" in j or "pip install" in j]
         assert joined[-1] == (
-            "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git"
+            "exec boxa sh -c sudo -n apt-get update -q && sudo -n apt-get install -y -q git yq jq"
         )
 
     def test_verified_prebaked_logs_the_baked_languages(
@@ -1412,6 +1447,65 @@ class TestHostTools:
         script = tmp_path / "script.json"
         script.write_text(json.dumps([{"text": "asked", "host_tool_calls": calls}]))
         monkeypatch.setenv("SBXLOOP_ECHO_SCRIPT", str(script))
+
+    @pytest.mark.parametrize("transport", ["stream", "poll"])
+    def test_rate_query_round_trip_preserves_waiting_session(
+        self, sandbox, fake_sbx, tmp_path, monkeypatch, transport
+    ):
+        from sbxloop.config import Config
+        from sbxloop.daemon.agentbox import DaemonAgent
+        from sbxloop_worker.protocol import HostToolResponse, HostToolSpec
+
+        self._script(
+            tmp_path,
+            monkeypatch,
+            [
+                {"name": "agent_rate_limits", "arguments": {}},
+                {"name": "still_here", "arguments": {}},
+            ],
+        )
+        bus = EventBus()
+        seen = []
+        bus.subscribe(seen.append)
+        client = make_client(sandbox, bus, transport=transport, poll_interval=0.1)
+        agent = DaemonAgent(
+            Config.model_validate({"home": str(tmp_path / "home"), "agent": {"backend": "codex"}}),
+            sandbox.cli,
+            bus,
+            worker_python=sys.executable,
+        )
+        agent._client, agent._sandbox = client, sandbox
+        calls = []
+
+        def handler(call):
+            calls.append(call.name)
+            assert "waiting" in client._brokers
+            if call.name == "agent_rate_limits":
+                report = agent.agent_rate_limits()
+                assert report.backend == "codex" and report.status == "unsupported"
+                return HostToolResponse(
+                    call_id=call.call_id, ok=True, text=report.model_dump_json()
+                )
+            return HostToolResponse(call_id=call.call_id, ok=True, text="conversation survived")
+
+        job = agent_job(
+            job_id="waiting",
+            host_tools=[
+                HostToolSpec(name="agent_rate_limits", description="capacity"),
+                HostToolSpec(name="still_here", description="continue"),
+            ],
+        )
+        result = client.submit(job, tool_handler=handler)
+        assert result.status == "ok" and "conversation survived" in result.output_text
+        assert calls == ["agent_rate_limits", "still_here"]
+        assert agent._client is client and agent._sandbox is sandbox
+        assert agent._last_reprovision_at is None and not fake_sbx.invocations("rm")
+        starts = [event for event in seen if event.type == EventTypes.WORKER_START]
+        assert sorted(event.data["kind"] for event in starts) == [
+            "agent.rate_limits",
+            "agent.session",
+        ]
+        assert len({event.job_id for event in starts}) == 2
 
     def _job(self, **overrides: object) -> JobRequest:
         from sbxloop_worker.protocol import HostToolSpec

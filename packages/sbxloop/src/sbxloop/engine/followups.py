@@ -16,8 +16,9 @@ and never with the trigger label: a human promotes a follow-up to work.
 That last rule is load-bearing. The 1.0 cutover removed every path by which
 the loop filed its own work, because issues used to force the loop forward
 had become a spiral (#498). A follow-up is filed with its own label, capped
-per run, deduplicated by title within the run and by marker against the
-repository, and left for a person.
+per run, deduplicated by title within the run and by marker across runs,
+and left for a person. Creation also requires the reviewer's completed
+issue lookup (``issue_lookup.py``); unchecked notes remain on the PR.
 """
 
 from __future__ import annotations
@@ -131,6 +132,16 @@ def issue_body(
     point at a label that does nothing.
     """
     lines = [candidate.followup.body.strip() or candidate.followup.title.strip(), ""]
+    if candidate.followup.decision == "regression":
+        lines.extend(
+            [
+                f"Regression of issue #{candidate.followup.existing_issue}: "
+                + candidate.followup.rationale.strip(),
+                "",
+                "Reproduction: " + candidate.followup.repro.strip(),
+                "",
+            ]
+        )
     if candidate.followup.anchor:
         lines.append(f"Where: `{candidate.followup.anchor}`")
         lines.append("")
@@ -164,6 +175,7 @@ def checklist_comment(
     run_id: str,
     filed: Sequence[tuple[str, str]] = (),
     reason: str | None = None,
+    held: Sequence[tuple[Candidate, str]] = (),
 ) -> str:
     """The PR comment listing follow-ups — the whole record when filing is
     off (``[landing] followups = "comment"``), or a pointer to the issues
@@ -172,14 +184,17 @@ def checklist_comment(
     disabled on the repository (#631)."""
     lines = ["## Follow-ups", ""]
     if filed:
-        lines.append("Real but out of scope here; filed as issues (not queued for the loop):")
+        lines.append("Real but out of scope here; tracked in issues (not queued by this run):")
         lines.append("")
-        lines.extend(f"- [{title}]({url})" for title, url in filed)
-    else:
+        lines.extend(f"- [{title}]({url})" for title, url in dict.fromkeys(filed))
+    elif not held:
         why = reason or '`[landing] followups = "comment"`'
         lines.append(f"Real but out of scope here. Not filed as issues ({why}); a human may:")
         lines.append("")
         lines.extend(f"- [ ] {c.followup.render()[2:]}" for c in candidates)
+    if held:
+        lines.extend(["", "Not filed — issue lookup needs triage:", ""])
+        lines.extend(f"{c.followup.render()}\n  Reason: {why}" for c, why in held)
     lines.append("")
     lines.append(f"<!-- sbxloop-followups run={run_id} -->")
     return "\n".join(lines)

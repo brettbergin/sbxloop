@@ -41,7 +41,7 @@ from typing import Any, NamedTuple, Protocol, cast
 from zoneinfo import ZoneInfo
 
 from sbxloop import __version__, entrygraph, hostgit
-from sbxloop.config import Config, GithubConfig, SandboxConfig
+from sbxloop.config import Config, GithubConfig, SandboxConfig, ScheduleConfig
 from sbxloop.daemon.github import DaemonGithub
 from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
 from sbxloop.daemon.logsink import event_log_subscriber
@@ -105,6 +105,7 @@ from sbxloop.ghids import (
 )
 from sbxloop.ids import new_run_id
 from sbxloop.log import bind_run, clear_run, get_logger
+from sbxloop.provider import ProviderHeldError, ProviderRecovery
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.provision import sandbox_name
@@ -322,6 +323,14 @@ class DaemonLoop:
         self._source_failures = 0
         self._source_next_poll = 0.0
         self._last_gc: float | None = None
+        # Schedules live in the store (#818); a `[[schedules]]` entry still
+        # in sbxloop.toml is imported once, at first sight (the first tick
+        # or schedule command, so its grid anchors where it always did),
+        # and the operator is told the file's copy is now redundant.
+        self._config_schedules_imported: list[str] | None = None
+        # The import is reached from the loop thread (a tick) and from a
+        # concierge command alike; one of them does it.
+        self._schedules_lock = threading.Lock()
 
     # -- external control ---------------------------------------------------------
 
@@ -699,16 +708,47 @@ class DaemonLoop:
                     hint="engine still running past shutdown grace; the run stays resumable",
                 )
 
+    def _provider_recovery(self) -> ProviderRecovery:
+        return ProviderRecovery(self.store, self.config.agent.backend, clock=self.clock)
+
+    def _provider_item(self, target: str) -> WorkItem | None:
+        for item in self.dstore.items():
+            if (
+                item.run_id is not None
+                and (target == item.run_id or normalize_item_id(target) == item.item_id)
+                and item.state in ("queued", "cancelled")
+                and self._provider_recovery().pending(item.run_id)
+            ):
+                return item
+        return None
+
+    def cancel_provider(self, target: str, by: str | None = None) -> str:
+        item = self._provider_item(target)
+        if item is None or item.run_id is None:
+            raise ValueError(f"{target!r} has no parked provider run")
+        reason = f"cancelled by {by or 'operator'} while waiting for the provider"
+        self.dstore.mark_cancelled(item.item_id, reason, self.clock())
+        self.store.set_run_state(item.run_id, "cancelled")
+        self.store.set_run_reason(item.run_id, reason)
+        self.store.append_event(Event.now("run.cancelled", item.run_id, reason=reason))
+        return f"{item.item_id}: cancelled; checkpoint retained for resume"
+
     def status(self) -> dict[str, Any]:
         now = self.clock()
         day_start, day_end = day_window(now, self.config.daemon.run_cap_timezone)
         with self._current_lock:
             handle = self._current
+        provider_hold = self._provider_recovery().hold()
         return {
+            "provider_hold": provider_hold.summary() if provider_hold else None,
             "current": {
                 "item_id": handle.item.item_id,
                 "run_id": handle.run_id,
                 "title": handle.item.title,
+                # A workload and its profile (#804): the console's "now"
+                # line says which bounds the run is under.
+                "kind": handle.item.kind,
+                "profile": handle.item.profile,
             }
             if handle
             else None,
@@ -741,6 +781,11 @@ class DaemonLoop:
             ],
             # Where work comes from (#760): "github", "chat", or both.
             "source": self.source.name,
+            # Polling has its own backoff, independent of failed runs. A
+            # daemon that cannot discover work must not appear healthy
+            # merely because it has no failed runs or queued items.
+            "source_failures": self._source_failures,
+            "source_retry_in_s": max(0.0, self._source_next_poll - now),
         }
 
     # -- multi-repo polling health (#516) -----------------------------------------
@@ -832,11 +877,18 @@ class DaemonLoop:
         self._review_tick(now)
         if self.paused:
             return TickResult(idle_kind="paused")
+        provider_hold = self._provider_recovery().hold()
+        if provider_hold is not None and provider_hold.blocked(now):
+            return TickResult(idle_kind="provider_held", idle_detail=provider_hold.summary())
         if self._breaker_open(now):
             return TickResult(idle_kind="breaker")
         day_start, day_end = day_window(now, self.config.daemon.run_cap_timezone)
         started_today = self.dstore.runs_started_since(day_start)
-        if started_today >= self.config.daemon.max_runs_per_day:
+        provider_resume = any(
+            item.run_id and self._provider_recovery().pending(item.run_id)
+            for item in self.dstore.queued()
+        )
+        if started_today >= self.config.daemon.max_runs_per_day and not provider_resume:
             if now - self._last_cap_log > 3600:
                 self._last_cap_log = now
                 cap = self.config.daemon.max_runs_per_day
@@ -918,6 +970,10 @@ class DaemonLoop:
         forever (#234)."""
         run_id = item.run_id
         assert run_id is not None
+        if self._provider_recovery().pending(run_id):
+            # Provider downtime neither spends the crash-resume budget nor
+            # destroys the VM containing the interrupted SDK session.
+            return self._dispatch(item, resume_run_id=run_id)
         gate = self.dstore.merge_gate_for(run_id)
         if gate is not None and gate.kind == "publish" and gate.state == "approving":
             # Not an interruption (#760): a held result was released and
@@ -1167,7 +1223,26 @@ class DaemonLoop:
             )
         fresh = 0
         for item in found:
-            if self.dstore.upsert_new(item, now):
+            # Per item, because recording one is not worth the daemon. A
+            # poll that raises is already caught above and backed off; an
+            # item that raises used to travel all the way out of tick() and
+            # kill the process, and since discovery is deterministic the
+            # next start died on the same item until systemd gave up. One
+            # unrecordable item now costs that item, and the run carries on.
+            try:
+                queued = self.dstore.upsert_new(item, now)
+            except Exception:
+                log.warning(
+                    "item.record_failed",
+                    source=source.name,
+                    item=item.item_id,
+                    repo=item.repo or None,
+                    url=item.url or None,
+                    hint="item skipped; the rest of the poll is unaffected",
+                    exc_info=True,
+                )
+                continue
+            if queued:
                 fresh += 1
                 self._notice(
                     "item.queued",
@@ -1185,21 +1260,117 @@ class DaemonLoop:
         )
         return fresh
 
-    # -- schedules (#761) --------------------------------------------------------------
+    # -- schedules (#761, #818) --------------------------------------------------------
+
+    def _ensure_config_schedules(self) -> None:
+        """Move every `[[schedules]]` entry of sbxloop.toml into the store
+        (#818), once per process and at first sight: a name the store
+        already carries keeps the stored schedule — the file is the legacy
+        copy, not the source of truth — and the operator is told the
+        file's copy is now redundant."""
+        with self._schedules_lock:
+            if self._config_schedules_imported is not None:
+                return
+            imported: list[str] = []
+            now = self.clock()
+            for spec in self.config.schedules:
+                if self.dstore.add_schedule(spec, source="config", by=None, now=now):
+                    imported.append(spec.name)
+                    log.info("schedule.imported", schedule=spec.name, cadence=spec.cadence_text)
+                else:
+                    log.debug(
+                        "schedule.import_skipped", schedule=spec.name, reason="already stored"
+                    )
+            self._config_schedules_imported = imported
+        names = [s.name for s in self.config.schedules]
+        if not names:
+            return
+        fresh = imported
+        what = (
+            f"imported {', '.join(fresh)} from sbxloop.toml"
+            if fresh
+            else f"{', '.join(names)} in sbxloop.toml already live in the daemon's database"
+        )
+        self._notice(
+            "daemon.schedules_imported",
+            f"📅 schedules: {what} — schedules live in the daemon's database now; remove the "
+            "`[[schedules]]` entries from sbxloop.toml (the file's copy is ignored from here on, "
+            "and `schedules` / `create_schedule` in chat manage them)",
+            schedules=names,
+            imported=fresh,
+            level="warning",
+        )
 
     def _schedule_tz(self, name: str) -> ZoneInfo:
-        spec = self.config.schedule(name)
-        tz = spec.timezone if spec is not None and spec.timezone else None
+        self._ensure_config_schedules()
+        stored = self.dstore.schedule(name)
+        tz = stored.spec.timezone if stored is not None and stored.spec.timezone else None
         return ZoneInfo(tz or self.config.daemon.run_cap_timezone)
 
+    def add_schedule(self, spec: ScheduleConfig, by: str | None, *, source: str) -> str:
+        """Create a schedule (#818): live from the next tick, no restart.
+        The profile must be one `[[workloads]]` declares — a tick that
+        refused at dispatch would fire every cadence — and the name must
+        be free. Returns the line to answer with; ``ValueError`` says why
+        not."""
+        profile = next((p for p in self.config.workloads if p.name == spec.profile), None)
+        if profile is None:
+            known = ", ".join(p.name for p in self.config.workloads) or "none"
+            raise ValueError(
+                f"profile {spec.profile!r} is not declared under [[workloads]] (declared: {known})"
+            )
+        self._ensure_config_schedules()
+        now = self.clock()
+        if not self.dstore.add_schedule(spec, source=source, by=by, now=now):
+            raise ValueError(f"a schedule called {spec.name!r} already exists")
+        tz = self._schedule_tz(spec.name)
+        next_due = Cadence.parse(spec.every, spec.cron).next_due(now, tz)
+        who = by or "operator"
+        self._notice(
+            "daemon.schedule_added",
+            f"📅 schedule {spec.name} created by {who}: {spec.cadence_text} ({tz.key}), "
+            f"profile `{spec.profile}`; first tick due {format_due(next_due)}",
+            schedule=spec.name,
+            by=by,
+            source=source,
+            cadence=spec.cadence_text,
+            profile=spec.profile,
+            next_due=next_due,
+        )
+        return (
+            f"schedule {spec.name} created: {spec.cadence_text} ({tz.key}), profile "
+            f"`{spec.profile}`; first tick due {format_due(next_due)} — it fires without a "
+            "restart."
+        )
+
+    def remove_schedule(self, name: str, by: str | None) -> str:
+        """Delete a schedule and its state (#818); a tick already queued
+        or running is untouched. ``ValueError`` names an unknown one."""
+        self._ensure_config_schedules()
+        if self.dstore.schedule(name) is None:
+            raise ValueError(self._unknown_schedule(name))
+        self.dstore.remove_schedule(name)
+        who = by or "operator"
+        self._notice(
+            "daemon.schedule_removed",
+            f"🗑 schedule {name} removed by {who}; no further ticks",
+            schedule=name,
+            by=by,
+        )
+        return f"schedule {name} removed; no further ticks (a tick already queued still runs)."
+
     def _fire_schedules(self, now: float) -> int:
-        """Queue every `[[schedules]]` tick that has come due since the
-        last one handled — at most one per schedule, the latest, recorded
-        at its due time so the grid never drifts. A tick whose previous
-        item is still live is skipped and said so; a paused schedule's
-        ticks are swallowed. Returns how many items were queued."""
+        """Queue every schedule tick that has come due since the last one
+        handled — at most one per schedule, the latest, recorded at its
+        due time so the grid never drifts. A tick whose previous item is
+        still live is skipped and said so; a paused schedule's ticks are
+        swallowed; a schedule whose profile the config no longer declares
+        skips its tick, named. Returns how many items were queued."""
+        self._ensure_config_schedules()
         fresh = 0
-        for spec in self.config.schedules:
+        profiles = {p.name for p in self.config.workloads}
+        for stored in self.dstore.schedules():
+            spec = stored.spec
             cadence = Cadence.parse(spec.every, spec.cron)
             tz = self._schedule_tz(spec.name)
             row = self.dstore.schedule_row(spec.name, now)
@@ -1210,6 +1381,21 @@ class DaemonLoop:
             if row.paused_by is not None:
                 self.dstore.schedule_due_handled(spec.name, due)
                 log.debug("schedule.tick_paused", schedule=spec.name, due=when, by=row.paused_by)
+                continue
+            if spec.profile not in profiles:
+                # Fail closed and loud (#758): a run under a profile that
+                # is gone would refuse every need it declares.
+                self.dstore.schedule_due_handled(spec.name, due)
+                self._notice(
+                    "daemon.schedule_skipped",
+                    f"⏭ schedule {spec.name}: tick due {when} skipped — its profile "
+                    f"`{spec.profile}` is no longer declared under [[workloads]]; declare it "
+                    f"again or `schedules remove {spec.name}`",
+                    schedule=spec.name,
+                    due=when,
+                    profile=spec.profile,
+                    level="warning",
+                )
                 continue
             live = self.dstore.live_schedule_item(spec.name)
             if live is not None:
@@ -1261,12 +1447,15 @@ class DaemonLoop:
         )
 
     def schedules(self) -> list[dict[str, Any]]:
-        """Every configured schedule with its state, for `schedules`: cadence,
-        timezone, profile, last fire, next due, who paused it."""
+        """Every stored schedule with its state, for `schedules`: cadence,
+        timezone, profile, ask, provenance, last fire, next due, who
+        paused it."""
+        self._ensure_config_schedules()
         now = self.clock()
         rows = self.dstore.schedule_rows()
         out: list[dict[str, Any]] = []
-        for spec in self.config.schedules:
+        for stored in self.dstore.schedules():
+            spec = stored.spec
             cadence = Cadence.parse(spec.every, spec.cron)
             tz = self._schedule_tz(spec.name)
             row = rows.get(spec.name) or ScheduleRow(name=spec.name, anchor=now)
@@ -1276,6 +1465,10 @@ class DaemonLoop:
                     "cadence": cadence.describe(),
                     "timezone": str(tz.key),
                     "profile": spec.profile,
+                    "ask": spec.ask,
+                    "source": stored.source,
+                    "created_by": stored.created_by,
+                    "created_at": stored.created_at,
                     "last_due": row.last_due,
                     "last_fired_at": row.last_fired_at,
                     "last_item": row.last_item,
@@ -1290,7 +1483,8 @@ class DaemonLoop:
         """Park one schedule: its ticks are swallowed until `schedules
         resume <name>`. The daemon's own holds are untouched. Returns the
         line to answer with; ``ValueError`` names an unknown schedule."""
-        if self.config.schedule(name) is None:
+        self._ensure_config_schedules()
+        if self.dstore.schedule(name) is None:
             raise ValueError(self._unknown_schedule(name))
         now = self.clock()
         self.dstore.schedule_row(name, now)
@@ -1308,7 +1502,9 @@ class DaemonLoop:
     def resume_schedule(self, name: str, by: str | None) -> str:
         """Release a parked schedule: it fires again from its next tick
         (a tick that passed while paused is not made up)."""
-        if self.config.schedule(name) is None:
+        self._ensure_config_schedules()
+        stored = self.dstore.schedule(name)
+        if stored is None:
             raise ValueError(self._unknown_schedule(name))
         now = self.clock()
         row = self.dstore.schedule_row(name, now)
@@ -1316,8 +1512,7 @@ class DaemonLoop:
             return f"schedule {name} is not paused."
         # Whatever came due while parked is handled, so a daemon that was
         # down for part of the pause does not fire a catch-up on resume.
-        spec = self.config.schedule(name)
-        assert spec is not None
+        spec = stored.spec
         due = Cadence.parse(spec.every, spec.cron).latest_due(
             row.base, now, self._schedule_tz(name)
         )
@@ -1334,8 +1529,8 @@ class DaemonLoop:
         return f"schedule {name} resumed; fires from its next tick."
 
     def _unknown_schedule(self, name: str) -> str:
-        known = ", ".join(s.name for s in self.config.schedules) or "none"
-        return f"no schedule called {name!r} (configured: {known})"
+        known = ", ".join(s.spec.name for s in self.dstore.schedules()) or "none"
+        return f"no schedule called {name!r} (stored: {known})"
 
     # -- dispatch ----------------------------------------------------------------------
 
@@ -1353,7 +1548,12 @@ class DaemonLoop:
             if item.entrygraph_target is None:
                 self._refresh_workspace(self._item_repo(item))
         else:
-            self.dstore.mark_resuming(item.item_id, run_id, now)
+            self.dstore.mark_resuming(
+                item.item_id,
+                run_id,
+                now,
+                provider_recovery=self._provider_recovery().pending(run_id),
+            )
             item = self.dstore.get(item.item_id) or item
         log.info(
             "run.dispatch",
@@ -1595,6 +1795,23 @@ class DaemonLoop:
         """
         now = self.clock()
         report = self._report(run_id, result)
+        if (result is not None and result.state == "provider_held") or isinstance(
+            error, ProviderHeldError
+        ):
+            reason = str(error) if error else result.reason if result else None
+            self.store.set_run_reason(run_id, reason)
+            self.store.set_run_state(run_id, "provider_held")
+            self.dstore.finish_ledger(run_id, "provider_held", now)
+            self.dstore.mark_resume_pending(item.item_id, now)
+            self._notice(
+                "run.provider_held",
+                f"⏸ {item.item_id}: {reason}",
+                item=item.item_id,
+                run=run_id,
+                reason=reason,
+            )
+            self._frontend_finished(item, report._replace(state="provider_held", reason=reason))
+            return "provider_held"
         self._remember_pushed_work(item, report)
         state = result.state if result is not None else None
         if state == "gated":
@@ -2210,6 +2427,15 @@ class DaemonLoop:
         """Operator ``resume <item|run>`` on a review wait (#675): check the
         PR now and start the wait over — the way to re-arm a paused hold,
         or to poll at once instead of at the next interval."""
+        recovery = self._provider_recovery()
+        if target == self.config.agent.backend and recovery.hold() is not None:
+            recovery.release()
+            return f"{target}: provider hold released by {by or 'operator'}"
+        item = self._provider_item(target)
+        if item is not None:
+            recovery.release()
+            self.dstore.mark_resume_pending(item.item_id, self.clock())
+            return f"{item.item_id}: provider hold released; continuing run {item.run_id}"
         hold = self.dstore.review_hold_for(target.strip())
         if hold is None:
             raise ValueError(f"{target!r} is not waiting for a review")
@@ -2956,7 +3182,7 @@ class DaemonLoop:
         assert handle is not None and handle.run_id == run_id
         engine = handle.engine
         if resume:
-            return engine.resume(run_id)
+            return engine.resume(run_id, release_provider_hold=False)
         if item.entrygraph_target is not None:
             item_config = entrygraph.scan_config(item_config, item.entrygraph_target)
             engine.config = item_config

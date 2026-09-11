@@ -203,11 +203,12 @@ def redact_secrets(
 # Provider token shapes that are secrets wherever they appear, with no key
 # name to go on: GitHub's ``ghp_``/``gho_``/``ghu_``/``ghs_``/``ghr_`` and
 # the fine-grained ``github_pat_`` prefix, plus Anthropic API keys
-# (``sk-ant-``, the claude agent backend, #533).
+# (``sk-ant-``, the claude agent backend, #533), and OpenAI API keys.
 _TOKEN_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
     re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
     re.compile(r"\bsk-ant-[A-Za-z0-9_\-]{8,}"),
+    re.compile(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_\-]{20,}"),
 )
 
 _AUTH_RE = re.compile(r"(?i)\b(authorization\s*[:=]\s*)((?:bearer|token|basic)\s+)?([^\s'\"]+)")
@@ -341,6 +342,8 @@ def configure_logging(
     systemd; the file is the copy a host without a journal, a ``tail -f``
     over ssh, or the console reads.
     """
+    from sbxloop.telemetry import capture_log
+
     level_no = _level_no(level)
 
     shared: list[Any] = [
@@ -357,6 +360,7 @@ def configure_logging(
         processors=[
             structlog.stdlib.filter_by_level,
             *shared,
+            capture_log,
             structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
         ],
         logger_factory=structlog.stdlib.LoggerFactory(),

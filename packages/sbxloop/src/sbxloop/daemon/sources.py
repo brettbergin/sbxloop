@@ -41,7 +41,14 @@ from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.engine.model import RunKind
 from sbxloop.engine.sinks import published_line
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
-from sbxloop.gh.ops import GithubOps, Identity, identities_match, raw_pages, user_identity
+from sbxloop.gh.ops import (
+    GithubOps,
+    Identity,
+    identities_match,
+    raw_lookup,
+    raw_pages,
+    user_identity,
+)
 from sbxloop.ghids import is_chat_id, is_schedule_id, issue_item_id, try_parse_gh_id
 from sbxloop.log import get_logger
 
@@ -293,16 +300,12 @@ class GitHubIssueSource:
             raise self._label_error(exc, number, "add", labels) from exc
 
     def _remove_label(self, ops: GithubOps, number: str, label: str) -> None:
+        # Already absent is fine (404 on the label resource) — and, since
+        # #558, not a failed job either: the miss travels as data.
         try:
-            ops.raw("DELETE", f"{self._issue_path(number)}/labels/{quote(label, safe='')}")
+            raw_lookup(ops, "DELETE", f"{self._issue_path(number)}/labels/{quote(label, safe='')}")
         except GithubOpsError as exc:
-            # Already absent is fine (404 on the label resource). Message
-            # grep is the fallback for a pre-#221 worker only.
-            missing = (
-                exc.http_status == 404 if exc.http_status is not None else "HTTP 404" in str(exc)
-            )
-            if not missing:
-                raise self._label_error(exc, number, "remove", [label]) from exc
+            raise self._label_error(exc, number, "remove", [label]) from exc
 
     def _label_error(
         self, exc: GithubOpsError, number: str, verb: str, labels: Sequence[str]
@@ -881,17 +884,26 @@ class GitHubIssueSource:
 
         def go(ops: GithubOps) -> bool:
             n = item.source_key
-            self._comment(
-                ops,
-                n,
-                f"sbxloop could not finish: {reason}\n\n{_pr_ref(pr_number, pr_url)} passed "
-                "the loop's own review and checks but GitHub would not let the loop land it. "
-                "A human needs to look: merge or fix it by hand and close this issue, or "
-                f"re-add `{self.labels.trigger_for(item)}` once the cause is dealt with — "
-                f"the issue does not need to be edited and `{self.labels.blocked}` does not "
-                "need removing by hand (the claim clears it), and the restart continues on "
-                "this branch and pull request.",
-            )
+            if pr_number is None:
+                # Blocked before anything reached GitHub (#752): there is no
+                # pull request to merge by hand, only a cause to remove.
+                what = (
+                    "Nothing was delivered. A human needs to act on the cause named above, "
+                    f"then re-add `{self.labels.trigger_for(item)}` — the issue does not need "
+                    f"to be edited and `{self.labels.blocked}` does not need removing by hand "
+                    "(the claim clears it)."
+                )
+            else:
+                what = (
+                    f"{_pr_ref(pr_number, pr_url)} passed the loop's own review and checks but "
+                    "GitHub would not let the loop land it. A human needs to look: merge or fix "
+                    "it by hand and close this issue, or re-add "
+                    f"`{self.labels.trigger_for(item)}` once the cause is dealt with — the "
+                    f"issue does not need to be edited and `{self.labels.blocked}` does not "
+                    "need removing by hand (the claim clears it), and the restart continues on "
+                    "this branch and pull request."
+                )
+            self._comment(ops, n, f"sbxloop could not finish: {reason}\n\n{what}")
             self._remove_label(ops, n, self.labels.in_progress)
             # A trigger label still on the issue would make the human's
             # re-add a no-op — GitHub fires no event for a label already

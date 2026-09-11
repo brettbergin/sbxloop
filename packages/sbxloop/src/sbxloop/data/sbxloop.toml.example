@@ -49,15 +49,43 @@ secret_strategy = "proxy"
 # worker_python = "/home/agent/.sbxloop/venv/bin/python"
 # install_workers = true
 
+# [telemetry]
+# Optional host error reporting to GlitchTip (or a Sentry-compatible server).
+# Put the DSN value in ~/.sbxloop/config/secrets.env; unset/empty disables reporting.
+# dsn_env = "GLITCHTIP_DSN"          # environment variable NAME, never the DSN
+# environment = "production"        # deployment label attached to reports
+# Reports contain exception messages/chains/groups, stack source context and static event names.
+# Recognizable credentials are redacted; locals and log fields stay on the host. No tracing/log export.
+
 # [agent]
 # Which SDK runs the agent personas inside the agent sandbox:
 # "copilot" (the default) runs the GitHub Copilot SDK and needs
 # COPILOT_GITHUB_TOKEN; "claude" runs the Claude Agent SDK (the Claude Code
 # harness) and needs ANTHROPIC_API_KEY — provisioning then installs Node and
 # the Claude Code CLI into the agent sandbox and allows api.anthropic.com
-# egress. Either way the credential is injected into the agent sandbox
+# egress. "codex" runs the Python Codex SDK with its pinned CLI runtime and
+# needs OPENAI_API_KEY; provisioning allows api.openai.com. Codex uses
+# worker-controlled tools so read-only review and tool-call limits apply.
+# The chosen credential is injected into the agent sandbox
 # alone, and the top-level `model` names the model the chosen backend runs.
 # backend = "copilot"
+
+# [agent.models]
+# Omit a key to inherit top-level model. Explicit "auto" asks the backend
+# to choose, even when the inherited model is pinned. IDs are backend-specific;
+# use `sbxloop list-models`. Model settings are reread before each agent phase.
+# The TUI offers a searchable backend-model picker. Successful provisioning
+# and list-models populate its cache; Ctrl+R refreshes, Ctrl+U restores inheritance.
+# `run --model ID` forces every run agent for that run, never the concierge.
+# SBXLOOP_AGENT__MODELS__BUILD overrides the build key through the environment.
+# decompose = "auto"
+# build = "auto"
+# review = "auto"
+# steer = "auto"
+# reauthor_verify = "auto"
+# operator_plan = "auto"
+# operator_execute = "auto"
+# operator_judge = "auto"
 
 # [sandbox]
 # Custom sandbox template reference (defaults to the sbx shell template).
@@ -86,12 +114,13 @@ secret_strategy = "proxy"
 # run when that language is in the sandbox. Set "" to say this project has no
 # gate.
 # gate_command = "make check"
-# Continue existing work on this branch instead of starting fresh. Set by the
-# engine when a run is resumed after its clone was pruned; never by hand.
+# Cut a run's clone from an existing branch — published work to continue —
+# instead of a fresh branch off the base. An operator's knob for a one-off
+# run; the engine passes its own (a restart continuing a previous attempt's
+# pushed work) without touching this key.
 # continue_branch = "sbxloop/some-run-id"
-# Whether a continue_branch that cannot be fetched is fatal. False (a resume)
-# fails the run; true (a restart continuing a previous attempt's pushed work)
-# logs why the branch was unusable and cuts a fresh one from base instead.
+# Whether a continue_branch that cannot be fetched is fatal. False fails the
+# run; true logs why the branch was unusable and cuts a fresh one from base.
 # continue_branch_optional = false
 # Extra network allow rules applied to both sandboxes.
 # extra_allow_domains = []
@@ -235,6 +264,37 @@ secret_strategy = "proxy"
 # scheme = ""
 # description = "read-only weather forecasts"
 
+# For headless browser tools on Copilot/Claude code runs, generate a complete
+# setup with `sbxloop init --stdout --preset playwright`. It includes Node,
+# a pinned Playwright MCP package, Chromium installation and the host allows.
+# Merge its sections into an existing config rather than adding duplicate tables.
+#
+# External MCP servers the agent sessions may use — the extensibility
+# point. Each entry is given to every session whose role is listed, on
+# whichever `[agent] backend` runs (the two SDKs spell the transports
+# slightly differently; the loop translates). `transport`: "stdio" (the
+# default; `command` is the argv) or "http"/"sse" (`url`). `hosts`: the
+# domains the server contacts — the agent sandbox's allowlist is
+# least-privilege and refuses anything not listed here, and an undeclared
+# host fails at the server's first request rather than at startup.
+# credential: a [[credentials]] name kept in the service sandbox.
+# Credentialed servers require Streamable HTTP at that credential's HTTPS
+# host. The host mediates tool calls; no key enters agent code or sbx argv.
+# Credentialed stdio and legacy SSE transports are refused. Never put a
+# token in command. Roles:
+# which sessions get it — "planner", "builder", "critic", "operator",
+# "concierge"; the default is builder + operator, and adding "critic" hands
+# a third-party service to a read-only review session.
+# [[mcp]]
+# name = "weather"
+# transport = "http"
+# command = [] # Used only with credential-free stdio, e.g. ["npx", "weather-mcp-server"].
+# url = "https://api.weather.example.com/mcp"
+# hosts = ["api.weather.example.com"]
+# credential = "weather"
+# roles = ["builder"]
+# description = "forecast lookups for the builder"
+
 # Named bounds for `--kind workload` runs. The operator's plan
 # declares what each task needs — hosts, credentials by name, a sink, a
 # repository — and the run's profile decides what is granted; a need
@@ -266,6 +326,11 @@ secret_strategy = "proxy"
 # repo = false
 # publish = "auto"
 # budgets = { max_tasks = 8, max_wall_clock_s = 3600.0 }
+# The language toolchains the workload's agent box is provisioned with:
+# none by default — a workload box gets git, yq/jq and the agent backend's
+# own runtime, not `[sandbox] languages` — so name some only when the asks
+# under this profile run code (the same names `[sandbox] languages` takes).
+# languages = []
 
 # [workload]
 # The profile a workload run gets when `sbxloop run --profile` names none.
@@ -274,23 +339,21 @@ secret_strategy = "proxy"
 # tell the loop's results from the work it is asked to do.
 # result_label = "sbxloop:result"
 
-# Workloads the daemon asks for by itself, on a cadence. Each entry
-# is one schedule: `every` (a period — "24h", "90m", "1h30m" — on a grid
-# from the moment the daemon first saw the schedule) or `cron` (five
-# fields, read in `timezone`, `[daemon] run_cap_timezone` when unset),
-# never both. Each tick queues `ask` as a workload under `profile`, exactly
-# the run a chat ask gets; a tick whose previous run is still live is
-# skipped and said so in the control channel. A tick is recorded at its
-# due time — a late daemon catches up with one tick, never one per missed
-# tick. `!sbx schedules` lists them; `schedules pause <name>` parks one
-# without pausing the daemon.
-# [[schedules]]
-# name = "morning-brief"
-# profile = "research"
-# ask = "Summarise what changed on the watched sites overnight and post the digest in the thread."
-# every = "24h"
-# cron = "0 7 * * mon-fri"
-# timezone = "Europe/London"
+# Workloads the daemon asks for by itself, on a cadence, are SCHEDULES —
+# and they live in the daemon's database, not in this file. Create
+# one from chat ("every weekday morning, summarise …": the concierge
+# interviews you and stores it) or from the host:
+#   sbxloop daemon ctl schedules add morning-brief --profile research \
+#       --cron 0 7 * * mon-fri --tz Europe/London --ask Summarise what changed overnight
+# A schedule is live from the daemon's next tick — no restart. Each entry
+# has a `profile` (a [[workloads]] entry), the `ask` (a workload's ask, in
+# your words), and one cadence: `--every` (a period — "24h", "90m",
+# "1h30m" — on a grid from creation) or `--cron` (five fields, read in the
+# timezone, `[daemon] run_cap_timezone` when unset). `!sbx schedules`
+# lists them with the last fire and the next due; `schedules pause <name>`
+# parks one without pausing the daemon; `schedules remove <name>` deletes
+# it. A `[[schedules]]` entry in this file still loads: the daemon imports
+# it into its database once and ignores the file's copy after that.
 
 # [policy]
 # Bounds for plan-declared egress. At PLAN time the agent may declare extra
@@ -400,6 +463,17 @@ secret_strategy = "proxy"
 # apt_packages = ["libpq-dev"]     # OS packages beside the toolchains; a set list REPLACES [sandbox]'s
 # setup_commands = ["make setup"]  # run in the workspace before the first phase; REPLACES [sandbox]'s
 # verify_mode = "advisory"         # "full" | "advisory" | "ci-only"; unset uses [sandbox]'s
+# [github.repos.agent_models]
+# Sparse per-key overrides over [agent.models]; omit to inherit. The same
+# eight phase keys are supported. `list-models --repo you/your-repo` shows them.
+# decompose = "auto"
+# build = "auto"
+# review = "auto"
+# steer = "auto"
+# reauthor_verify = "auto"
+# operator_plan = "auto"
+# operator_execute = "auto"
+# operator_judge = "auto"
 # [[github.repos]]
 # repo = "you/other-repo"
 # enabled = false              # registered but not polled
@@ -455,6 +529,7 @@ secret_strategy = "proxy"
 # ignore_checks = []         # fnmatch patterns never waited on, fixed or reported, e.g. ["codecov/*"]
 # ignore_reviewers = []      # User-type logins treated as automated reviewers (a bot on a personal token): one fix round, never a block
 # followups = "issues"       # after the merge, the review's out-of-scope notes: issues | comment | off
+# Issues require a completed lookup; existing matches are linked, uncertain notes stay on the PR.
 # followup_label = "sbxloop:follow-up"  # never the trigger label — a human promotes a follow-up
 # max_followups_per_run = 5
 # review_diff_max_chars = 150000  # diff budget handed to the self-review
@@ -489,6 +564,14 @@ secret_strategy = "proxy"
 # and tool cap — `sbxloop init --preset large-repo` writes them.
 # max_revisions_per_task = 2
 # max_replans_per_task = 1
+# Verify commands that may be re-authored on one task after proving
+# unpassable — the same check failing identically across attempts AND
+# approaches, so no further work on the code can change it. The re-author
+# sees only that one command and may replace it, drop it, or let it stand;
+# the rest of the task's checks are untouchable, and a dropped check is
+# reported so a reviewer knows what stopped being tested. 0 turns the
+# escalation off: a suspect check fails the task instead.
+# max_verify_reauthors_per_task = 1
 # max_tasks = 20
 # max_wall_clock_s = 7200.0
 # per_job_timeout_s = 1800.0

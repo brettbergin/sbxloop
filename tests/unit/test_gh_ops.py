@@ -658,6 +658,35 @@ class TestLanding:
         ops, _ = make_ops({"raw.api": Fails("update_branch_refused_422")})
         assert ops.pr_update_branch("o/r", 42, expected_head_sha="beef") is False
 
+    def test_raw_lookup_asks_the_worker_to_answer_the_miss_as_data(self) -> None:
+        """#558: the miss travels as ``allow_missing_statuses`` and comes back
+        as None; a present resource passes through."""
+        ops, client = make_ops({"raw.api": {"missing": True, "http_status": 404}})
+        assert ops.raw_lookup("GET", "/repos/o/r/x") is None
+        (job,) = client.jobs
+        assert job.params == {
+            "method": "GET",
+            "path": "/repos/o/r/x",
+            "allow_missing_statuses": [404],
+        }
+        ops, client = make_ops({"raw.api": {"sha": "abc"}})
+        assert ops.raw_lookup("DELETE", "/x", {"k": 1}, missing=(404, 422)) == {"sha": "abc"}
+        assert client.jobs[0].params["allow_missing_statuses"] == [404, 422]
+        assert client.jobs[0].params["body"] == {"k": 1}
+
+    def test_raw_lookup_reads_a_pre_558_workers_error_the_same_way(self) -> None:
+        # A worker that still raises: the status on the error decides.
+        ops, _ = make_ops({"raw.api": Fails("ref_missing_404")})
+        assert ops.raw_lookup("GET", "/x") is None
+        ops, _ = make_ops({"raw.api": "FAIL"})
+        with pytest.raises(GithubOpsError):
+            ops.raw_lookup("GET", "/x")
+
+    def test_merge_base_miss_is_none_and_no_failed_job(self) -> None:
+        ops, client = make_ops({"raw.api": {"missing": True, "http_status": 404}})
+        assert ops.merge_base("o/r", "main", "feature") is None
+        assert client.jobs[0].params["allow_missing_statuses"] == [404]
+
     def test_branch_delete_tolerates_an_absent_ref(self) -> None:
         """The merge already happened; a branch a repo setting removed first
         must not be reported as a failure of it."""

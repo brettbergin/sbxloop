@@ -10,7 +10,10 @@ from sbxloop.errors import ConfigError
 
 def test_defaults(tmp_path: Path) -> None:
     config = load_config(cwd=tmp_path, env={})
-    assert config == Config()
+    assert config.model_dump(exclude={"model_source_dir"}) == Config().model_dump(
+        exclude={"model_source_dir"}
+    )
+    assert config.model_source_dir == tmp_path.resolve()
     assert config.model == "auto"
     assert config.worker_transport == "stream"
     assert config.secret_strategy == "proxy"

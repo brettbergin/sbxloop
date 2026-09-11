@@ -393,6 +393,24 @@ def test_baseline_tools_have_a_probe_and_an_apt_path() -> None:
     assert "git" in toolchains.apt_packages(toolchains.BASELINE_TOOLS)
 
 
+def test_yq_and_jq_are_baseline_tooling_not_a_language() -> None:
+    # #751: YAML shows up on every repository (workflows, compose, Helm)
+    # and no language toolchain ships a parser, so yq/jq ride the baseline
+    # like git — on every sandbox, never selectable, never a language.
+    assert toolchains.YQ in toolchains.BASELINE_TOOLS
+    assert toolchains.YQ not in toolchains.TOOLCHAINS
+    assert toolchains.normalize_language("yq") is None
+    assert "yq" not in toolchains.supported_languages()
+    assert not toolchains.YQ.install_domains  # apt-only: no installer host
+    # One pooled apt call carries both, exactly once each.
+    packages = toolchains.apt_packages(
+        (*toolchains.BASELINE_TOOLS, *toolchains.resolve(["python"]))
+    )
+    assert packages.count("yq") == 1 and packages.count("jq") == 1
+    # The probe wants both binaries: the Debian `yq` is a wrapper over `jq`.
+    assert "yq" in toolchains.YQ.probe and "jq" in toolchains.YQ.probe
+
+
 def test_python_installs_uv_pinned_and_checksum_verified() -> None:
     # #250: every other runtime is pinned and verified; Python was the one
     # left on "whatever the template ships". uv comes from its GitHub

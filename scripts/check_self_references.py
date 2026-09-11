@@ -59,6 +59,10 @@ PERSONAL = re.compile(
 )
 
 PROMPTS = SRC / "engine" / "prompts"
+# Skill bodies are prompt bodies: the agent reads them verbatim, and a
+# skill is loaded into a run on someone else's repository, where a bare
+# `#12` reads as an issue in THEIR tracker.
+SKILLS = SRC / "skills"
 TEMPLATES = [
     SRC / "data" / "sbxloop.toml.example",
     *(SRC / "data" / "presets").glob("*.toml"),
@@ -102,7 +106,7 @@ def check_prompt_bodies() -> list[Finding]:
     """Prompt bodies below the contract header; the header is stripped
     before the model sees the file and is written for humans."""
     found: list[Finding] = []
-    for path in sorted(PROMPTS.glob("*.md")):
+    for path in [*sorted(PROMPTS.glob("*.md")), *sorted(SKILLS.glob("*/SKILL.md"))]:
         raw = path.read_text(encoding="utf-8")
         body_start = 0
         if raw.startswith("<!--"):
@@ -250,7 +254,11 @@ def run() -> tuple[list[Finding], list[tuple[str, str]]]:
     used: set[tuple[str, str]] = set()
     kept: list[Finding] = []
     for finding in findings:
-        rel = str(finding.path.relative_to(ROOT))
+        # POSIX separators on both sides: the allowlist is written with "/"
+        # and str() of a relative path yields "\" on Windows, so a developer
+        # running the gate there saw every allowed entry reported twice —
+        # once as an unallowed finding, once as a stale allowlist line.
+        rel = finding.path.relative_to(ROOT).as_posix()
         hit = next(((p, t) for p, t in allow if p == rel and t == finding.text), None)
         if hit is None:
             kept.append(finding)

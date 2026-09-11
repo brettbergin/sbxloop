@@ -1,93 +1,15 @@
-"""What each ``[[registries]]`` entry writes into a sandbox (#680, #766).
+"""Registry configuration and agent-side offline dependency preparation.
 
-A private registry needs three things before a dependency install can
-succeed: the host must be reachable (it joins a sandbox's allowlist), the
-ecosystem's client must be told to use it, and the credential must be where
-that client looks. This module answers the second and third per kind, as
-data the provisioner delivers — and, since #766, says WHICH sandbox:
+Open registries receive client files and non-secret environment in the
+agent. Credentialed registries produce a service catalogue and credential
+environment instead; the service downloads bytes through fixed operations.
+All native resolution, extraction, metadata hooks and cache population run
+in the agent. Fetch recipes below are only used to verify that preparation
+offline. Disabling package-manager scripts alone is not a security boundary.
 
-* A registry without ``auth_env`` is the agent sandbox's own: there is no
-  secret to keep from the agent, so :func:`plain_env` and
-  :func:`client_files` land there as they always did.
-* A registry with ``auth_env`` belongs to the SERVICE sandbox. The
-  credential (:func:`secret_env`), the client files and the host go there;
-  the agent sandbox — the one running the model's commands — gets none of
-  them. Instead the service sandbox FETCHES the dependencies into a cache
-  inside the shared workspace (:func:`fetch_argv`, one fixed recipe per
-  kind, package code disabled) and the agent sandbox builds offline from
-  that cache (:func:`offline_env`).
-
-* :func:`plain_env` — non-secret environment (``PIP_INDEX_URL``,
-  ``GOPRIVATE``), folded into the persistent env of whichever sandbox
-  owns the registry.
-* :func:`secret_env` — environment carrying the credential
-  (``CARGO_REGISTRIES_<NAME>_TOKEN``, ``BUNDLE_<HOST>``, and the
-  ``auth_env`` variable itself), delivered the way the loop delivers its
-  own credentials: per-job stdin or the 0600 env file, never an ``sbx``
-  argument.
-* :func:`client_files` — the client files, written with ``sbx cp`` and
-  chmod 600. Wherever the ecosystem expands environment variables in its
-  config (npm ``${VAR}``, Maven ``${env.VAR}``, NuGet ``%VAR%``) the file
-  names the variable and holds no secret; the ``.netrc`` kinds (pypi, go,
-  generic) have no such form, so ``~/.netrc`` holds the value at rest —
-  in the service sandbox, where nothing the model writes runs.
-
-Per kind:
-
-==========  =================================================================
-npm         ``~/.npmrc``: ``@scope:registry=URL`` (or ``registry=URL`` when
-            unscoped) and ``//host/path/:_authToken=${AUTH_ENV}``. Read by
-            npm, pnpm and yarn classic.
-pypi        ``PIP_INDEX_URL`` and ``UV_DEFAULT_INDEX`` set to the URL — the
-            registry IS the index (point it at a virtual/group repository
-            that proxies PyPI); credential in ``~/.netrc``.
-go          ``GOPRIVATE`` names the host (which also disables the checksum
-            database and proxy for it); credential in ``~/.netrc`` for the
-            git fetch.
-cargo       ``~/.cargo/config.toml`` ``[registries.NAME] index = "sparse+URL"``;
-            token in ``CARGO_REGISTRIES_<NAME>_TOKEN``.
-maven       ``~/.m2/settings.xml``: a ``<mirror>`` of ``*`` (the registry
-            stands in for every remote repository — a virtual repository
-            that proxies Central) and a ``<server>`` whose password is
-            ``${env.AUTH_ENV}``.
-nuget       ``~/.nuget/NuGet/NuGet.Config``: a package source plus
-            ``<packageSourceCredentials>`` with ``%AUTH_ENV%``; nuget.org
-            stays unless the repository's own NuGet.Config clears it.
-gem         ``BUNDLE_<HOST>=user:token`` for bundler; with ``url``, also
-            ``~/.gemrc`` listing it as the gem source.
-generic     host only, plus a ``~/.netrc`` entry when ``auth_env`` is set.
-==========  =================================================================
-
-The fetch recipes (service sandbox → cache → agent sandbox), all with the
-package manager's own hooks off so a private package's install script never
-runs beside the token that fetched it:
-
-==========  ======================================  ==========================
-kind        service sandbox (``fetch`` / ``add``)   agent sandbox (offline)
-==========  ======================================  ==========================
-npm         ``npm ci|install --ignore-scripts``     ``npm_config_offline=true``
-            into ``npm_config_cache``               (``npm rebuild`` runs the
-                                                    scripts)
-pypi        ``pip download -d <cache>``             ``PIP_NO_INDEX`` +
-            (``-r requirements.txt`` / ``.``)       ``PIP_FIND_LINKS``, the
-                                                    ``UV_*`` twins
-go          ``go mod download``                     ``GOPROXY=off``
-            (``GOMODCACHE=<cache>``)
-cargo       ``cargo fetch`` (``CARGO_HOME=<cache>``)  ``CARGO_NET_OFFLINE=true``
-maven       ``mvn dependency:go-offline``           ``MAVEN_ARGS=-o``
-            (``-Dmaven.repo.local=<cache>``)
-nuget       ``dotnet restore --packages <cache>``   ``NUGET_PACKAGES=<cache>``
-gem         ``bundle cache --all --no-install``     ``BUNDLE_LOCAL=true``
-            (into ``vendor/cache``)
-generic     no fetch — host only
-==========  ======================================  ==========================
-
-The cache lives at ``<workspace>/.sbxloop/deps`` — the one directory both
-sandboxes see — reached through the stable link :data:`DEPS_HOME` in each
-sandbox's ``$HOME`` (the mount path differs per VM and is discovered after
-the environment is written). Every flag here is from the tool's own
-documentation and exercised only against the fake sandbox: field-unverified
-until the first run with a private registry.
+The agent cache is inside the workspace and linked at DEPS_HOME. It is not
+mounted or linked as a cache in the service. The host moves downloaded data
+between sandboxes using sbx cp, with no listener or cross-sandbox channel.
 """
 
 from __future__ import annotations
@@ -110,14 +32,13 @@ NUGET_CONFIG = f"{SANDBOX_HOME}/.nuget/NuGet/NuGet.Config"
 GEMRC = f"{SANDBOX_HOME}/.gemrc"
 
 
-# The dependency cache the service sandbox fills and the agent sandbox reads:
-# a directory inside the shared workspace, reached through a link at a fixed
-# path in each sandbox's $HOME (see the module docstring).
+# The agent populates this workspace cache from downloaded artifacts.
+# Only the agent gets the stable link in its home directory.
 DEPS_WORKSPACE_DIR = ".sbxloop/deps"
 DEPS_HOME = f"{SANDBOX_HOME}/.sbxloop/deps"
 
 # The toolchain (``[sandbox] languages`` name) a kind's package manager
-# comes with — what the service sandbox must have installed to fetch.
+# comes with — used for agent-side dependency preparation.
 KIND_LANGUAGES: Mapping[RegistryKind, str] = {
     "npm": "node",
     "pypi": "python",
@@ -158,9 +79,9 @@ class ClientFile(NamedTuple):
 
 
 class FetchPlan(NamedTuple):
-    """One fetch as the service sandbox runs it: the argv (host-authored,
+    """One dependency preparation command for the agent: the argv (host-authored,
     never a shell) and the manifest it was chosen for (None for ``add``).
-    The environment is the sandbox's own (:func:`fetch_env`)."""
+    The engine verifies this in the agent's offline environment."""
 
     argv: tuple[str, ...]
     manifest: str | None
@@ -171,6 +92,26 @@ def domains(registries: Sequence[RegistryConfig]) -> list[str]:
     return list(dict.fromkeys(r.host for r in registries))
 
 
+def catalogue_entries(registries: Sequence[RegistryConfig]) -> list[dict[str, str]]:
+    """Non-secret authority and authentication metadata for fixed artifact reads."""
+    return [
+        {
+            "name": registry_key(r),
+            "kind": r.kind,
+            "url": r.url or f"https://{r.host}",
+            "env": r.auth_env,
+            "user": r.auth_user or "",
+        }
+        for r in registries
+        if r.auth_env
+    ]
+
+
+def registry_key(registry: RegistryConfig) -> str:
+    suffix = f":{registry.scope or 'default'}" if registry.kind == "npm" else ""
+    return f"{registry.kind}:{registry.effective_name}{suffix}"
+
+
 def kinds(registries: Sequence[RegistryConfig]) -> list[RegistryKind]:
     """The kinds ``registries`` cover, in configuration order, deduped —
     ``generic`` excluded: nothing fetches from it."""
@@ -178,7 +119,7 @@ def kinds(registries: Sequence[RegistryConfig]) -> list[RegistryKind]:
 
 
 def languages(registries: Sequence[RegistryConfig]) -> list[str]:
-    """The toolchains the service sandbox needs to fetch for ``registries``."""
+    """The native toolchains used to prepare these dependencies in the agent."""
     return list(dict.fromkeys(KIND_LANGUAGES[k] for k in kinds(registries)))
 
 
@@ -187,8 +128,7 @@ def cache_dir(kind: RegistryKind) -> str:
 
 
 def fetch_env(registries: Sequence[RegistryConfig]) -> dict[str, str]:
-    """The service sandbox's fetch environment: each kind's package manager
-    pointed at its cache under :data:`DEPS_HOME`, online."""
+    """Native cache locations, retained for callers preparing data in the agent."""
     env: dict[str, str] = {}
     for kind in kinds(registries):
         if kind == "npm":
@@ -263,7 +203,7 @@ def fetch_plan(
     *,
     manifests: Sequence[str] = (),
 ) -> FetchPlan:
-    """The recipe for one fetch in the service sandbox.
+    """A native dependency recipe, executed only in the agent sandbox.
 
     ``fetch`` resolves the workspace's manifest (``manifests`` is what the
     workspace has, from :data:`KIND_MANIFESTS`'s candidates; the first

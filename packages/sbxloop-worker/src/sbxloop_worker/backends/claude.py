@@ -25,8 +25,8 @@ Contract parity with the Copilot backend:
   only the read-shaped built-ins and fails closed on anything unknown;
 - host tools are registered as an in-process MCP server whose handlers
   relay to the host through ``sbxloop_worker.hosttools``;
-- resume is an optimisation, never a requirement: a session the CLI cannot
-  resume costs a fresh session, nothing more;
+- ordinary resume can fall back to a fresh session; provider recovery of
+  partial work requires the original session;
 - usage lands in the protocol :class:`Usage` (tokens + model), so
   ``run_usage`` / ``usage_today`` report Claude spend exactly like Copilot.
 """
@@ -41,6 +41,7 @@ from typing import Any
 
 from sbxloop_worker._json import extract_json
 from sbxloop_worker.backends import BackendResult, BackendUnavailableError, EmitFn
+from sbxloop_worker.backends.claude_errors import failure_from_envelope
 from sbxloop_worker.backends.copilot import (
     SessionHealthTracker,
     ToolCallGovernor,
@@ -48,14 +49,17 @@ from sbxloop_worker.backends.copilot import (
     excerpt_output,
 )
 from sbxloop_worker.hosttools import HostToolTimeout, request_tool, safe_call_id
+from sbxloop_worker.mcp import server_configs
 from sbxloop_worker.protocol import (
     EventTypes,
     HostToolCall,
     HostToolSpec,
     JobRequest,
+    ProviderFailure,
     Usage,
 )
-from sbxloop_worker.secrets import is_sbx_sentinel
+from sbxloop_worker.rate_limits import RateLimitReport
+from sbxloop_worker.secrets import is_sbx_sentinel, redact_secrets
 
 # The in-process MCP server host tools are registered under; the SDK exposes
 # each tool to the model as ``mcp__<server>__<tool>``.
@@ -81,6 +85,11 @@ ANTHROPIC_TOKEN_ENV = "ANTHROPIC_API_KEY"  # nosec B105 - env var name
 ANTHROPIC_TOKEN_PREFIX = "sk-ant-"  # nosec B105 - shape marker, not a credential
 
 TOOL_ARGS_CLIP = 400
+
+
+#: This SDK's spelling of the stdio transport (the Copilot SDK says
+#: ``local``); field-verified against claude-agent-sdk 0.2.149.
+MCP_STDIO_TYPE = "stdio"
 
 
 def read_only_denial(tool_name: str) -> str | None:
@@ -200,6 +209,11 @@ def usage_from_result(message: Any, model: str | None) -> Usage:
 class ClaudeBackend:
     name = "claude"
 
+    def rate_limits(self, *, timeout_s: float) -> RateLimitReport:
+        from sbxloop_worker.backends.claude_limits import query
+
+        return query(timeout_s=timeout_s)
+
     def ensure_available(self) -> None:
         """What this backend needs before a session can start (see
         ``backends.ensure_available``): the SDK from the worker's
@@ -249,6 +263,19 @@ class ClaudeBackend:
             # sees the miss for free: a fresh session comes back with a
             # different id than the one it asked to resume
             # (`phase.resume_missed`).
+            if job.require_resume:
+                return BackendResult(
+                    session_id=job.resume_session_id,
+                    failure=ProviderFailure(
+                        backend=BACKEND_NAME,
+                        category="recovery",
+                        partial_progress=True,
+                        reason=(
+                            "The interrupted session could not resume; "
+                            "inspect preserved work before recovery"
+                        ),
+                    ),
+                )
             if not job.resume_session_id or state.saw_output:
                 raise
             state = _SessionState(job, emit, tracker, governor)
@@ -259,21 +286,36 @@ class ClaudeBackend:
     async def _session(self, job: JobRequest, options: Any, state: _SessionState) -> BackendResult:
         from claude_agent_sdk import ClaudeSDKClient
 
-        async with ClaudeSDKClient(options=options) as client:
-            assert job.prompt is not None
-            await client.query(job.prompt)
-            async for message in client.receive_response():
-                state.handle(message)
+        try:
+            async with ClaudeSDKClient(options=options) as client:
+                assert job.prompt is not None
+                await client.query(job.prompt)
+                async for message in client.receive_response():
+                    state.handle(message)
+        except Exception:
+            # A process error after a provider envelope must not lose that
+            # envelope or fall through to the fresh-session retry.
+            state.finish_failure()
+            if state.failure is None:
+                raise
+        state.finish_failure()
         text = state.result_text or "\n".join(state.final_text)
         return BackendResult(
-            output_text=text,
-            output_json=extract_json(text) if job.expect == "json" else None,
+            output_text=redact_secrets(text),
+            output_json=extract_json(text)
+            if job.expect == "json" and state.failure is None
+            else None,
             session_id=state.session_id,
             usage=(
                 state.usage.merged(Usage(backend=BACKEND_NAME)) if state.usage != Usage() else None
             ),
             turns=state.turns,
             health=state.tracker.health(state.governor),
+            failure=(
+                state.failure.model_copy(update={"partial_progress": state.saw_output})
+                if state.failure is not None
+                else None
+            ),
         )
 
     def _options(
@@ -303,17 +345,34 @@ class ClaudeBackend:
             # `.claude/settings.json` (hooks, permission rules) must not
             # reconfigure an unattended session under it.
             "setting_sources": [],
+            # Claude otherwise carries a successful `cd` into later Bash
+            # calls, so another root-relative command can target subdir/subdir.
+            # Override the CLI child's environment on every launch, including
+            # resumes and their fresh-session fallback, without mutating ours.
+            "env": {"CLAUDE_BASH_MAINTAIN_PROJECT_WORKING_DIR": "1"},
         }
+        if job.available_tools == [] and not job.host_tools and not job.mcp_servers:
+            # Response corrections need no tool definitions, not merely a
+            # permission rejection after the model spends a turn calling one.
+            # Keep host-tool/MCP sessions' existing discovery behavior.
+            kwargs["tools"] = []
         if job.model and job.model != "auto":
             kwargs["model"] = job.model
         if job.cwd:
             kwargs["cwd"] = job.cwd
         if resume:
             kwargs["resume"] = resume
+        servers: dict[str, Any] = {}
         if job.host_tools:
             if not job.host_tools_dir:
                 raise RuntimeError("host_tools need host_tools_dir")
-            kwargs["mcp_servers"] = {HOST_TOOL_SERVER: self._host_tool_server(job, emit)}
+            servers[HOST_TOOL_SERVER] = self._host_tool_server(job, emit)
+        # The operator's servers alongside the in-process one, never
+        # instead of it: the host tools ARE an MCP server here, and
+        # replacing the dict would silently take the run's own tools away.
+        servers.update(server_configs(job.mcp_servers, stdio_type=MCP_STDIO_TYPE))
+        if servers:
+            kwargs["mcp_servers"] = servers
         if job.permission_mode == "auto" and governor.cap is None and job.available_tools is None:
             # The microVM (network policy + secret proxy) is the security
             # boundary; inside it the agent runs unattended. Any of a
@@ -360,10 +419,26 @@ class ClaudeBackend:
 
     @staticmethod
     def _system_prompt(job: JobRequest) -> Any:
+        message = job.system_message
+        if job.cwd and (job.available_tools is None or "Bash" in job.available_tools):
+            # Describe this backend's actual shell contract for every persona.
+            # Keep it out of shared phase prompts: other backends own their
+            # cwd behavior, and host-tools-only sessions have no Bash tool.
+            shell_contract = (
+                f"Every Bash tool call starts in the workspace directory {json.dumps(job.cwd)}. "
+                "Directory changes do not carry over between calls. Use paths relative to "
+                "this directory or quoted absolute paths. Within one call, directory changes "
+                "still affect later commands: isolate independent directory changes in "
+                "subshell groups and join required checks with &&. Guard each cd with && "
+                "so a failed directory change stops the dependent command. For Bash pipelines "
+                "that check success, use set -o pipefail so an output filter cannot hide a "
+                "failed check."
+            )
+            message = f"{message}\n\n{shell_contract}" if message else shell_contract
         if not job.system_preset:
-            return job.system_message
-        if job.system_message:
-            return {"type": "preset", "preset": "claude_code", "append": job.system_message}
+            return message
+        if message:
+            return {"type": "preset", "preset": "claude_code", "append": message}
         return {"type": "preset", "preset": "claude_code"}
 
     def _host_tool_server(self, job: JobRequest, emit: EmitFn) -> Any:
@@ -426,19 +501,60 @@ class _SessionState:
         self.registry = ToolCallRegistry()
         self.final_text: list[str] = []
         self.result_text: str | None = None
-        self.session_id: str | None = None
+        self.session_id: str | None = job.resume_session_id
         self.usage = Usage()
         self.turns: int | None = None
         self.saw_output = False
         self.model_slug = job.model if job.model and job.model != "auto" else None
+        self.failure: ProviderFailure | None = None
+        self.limit: Any = None
+        self.saw_result = False
+        self.assistant_usage: dict[str | int, Usage] = {}
+
+    def finish_failure(self) -> None:
+        # A process can exit after the error envelope, before aggregate
+        # ResultMessage usage arrives. Message IDs deduplicate blocks from
+        # the same assistant turn; never add these to the aggregate result.
+        if not self.saw_result and self.assistant_usage:
+            for sample in self.assistant_usage.values():
+                self.usage = self.usage.merged(sample)
+            self.assistant_usage.clear()
+            self.emit(EventTypes.AGENT_USAGE, **self.usage.model_dump(exclude_none=True))
+        if (
+            not self.saw_result
+            and self.failure is None
+            and getattr(self.limit, "status", None) == "rejected"
+        ):
+            self.failure = failure_from_envelope("rate_limit", "", limit=self.limit)
 
     def handle(self, message: Any) -> None:
         name = type(message).__name__
+        session_id = getattr(message, "session_id", None)
+        if isinstance(session_id, str):
+            self.session_id = session_id
+        if name == "RateLimitEvent":
+            self.limit = getattr(message, "rate_limit_info", None)
+            return
+        if name == "SystemMessage" and getattr(message, "subtype", None) == "init":
+            self.session_id = getattr(message, "data", {}).get("session_id") or self.session_id
         if name == "AssistantMessage":
-            self.saw_output = True
             model = getattr(message, "model", None) or self.model_slug
             if isinstance(model, str):
                 self.model_slug = model
+            if getattr(message, "usage", None):
+                message_id = getattr(message, "message_id", None) or id(message)
+                self.assistant_usage[message_id] = usage_from_result(message, self.model_slug)
+            error = getattr(message, "error", None)
+            if error:
+                self.failure = failure_from_envelope(
+                    error,
+                    _result_text(getattr(message, "content", None)) or "",
+                    limit=self.limit,
+                )
+                return
+            # A later real response means an intermediate error recovered.
+            self.failure = None
+            self.saw_output = True
             for block in getattr(message, "content", None) or []:
                 self._assistant_block(block)
         elif name == "UserMessage":
@@ -494,10 +610,22 @@ class _SessionState:
         )
 
     def _result(self, message: Any) -> None:
-        self.saw_output = True
+        self.saw_result = True
         self.session_id = getattr(message, "session_id", None) or self.session_id
         result = getattr(message, "result", None)
-        if isinstance(result, str) and result.strip():
+        is_error = getattr(message, "is_error", None)
+        if is_error is True:
+            errors = getattr(message, "errors", None) or []
+            diagnostic = "\n".join(s for s in [result, *errors] if isinstance(s, str))
+            self.failure = failure_from_envelope(
+                self.failure.code if self.failure is not None else None,
+                diagnostic,
+                status=getattr(message, "api_error_status", None),
+                limit=self.limit,
+            )
+        elif is_error is False:
+            self.failure = None
+        if self.failure is None and isinstance(result, str) and result.strip():
             self.result_text = result
         turns = getattr(message, "num_turns", None)
         if isinstance(turns, int):

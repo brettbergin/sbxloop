@@ -5,6 +5,26 @@ process streams — no sockets, no servers. All wire models live in
 `sbxloop_worker.protocol` (pydantic, `extra="forbid"`, versioned `v: 1`);
 the host imports the exact same module, so drift is a validation error.
 
+## Provider failures
+
+Agent results can carry `error.provider`, a `ProviderFailure` containing
+backend, category, sanitized reason/code, HTTP status, optional UTC epoch
+`retry_at`/`reset_at`, and whether partial progress was observed. The
+ordinary result fields retain session identity, partial output, turns and
+usage even when `status = "error"`. This failure precedes JSON extraction
+and must never become `ExpectedJsonMissing` or successful work.
+
+`JobRequest.require_resume` prevents a recovery request with partial work
+from silently falling back to a fresh SDK session. An unavailable session
+returns a provider recovery failure for operator inspection. Older job
+requests default this field to false.
+
+`JobRequest.recovery_key` optionally identifies the same user request when
+its prompt includes changing status. The concierge includes the complete
+request and author, omitting its time/queue preamble. Absent this field,
+the host fingerprints the entire prompt. Model, system instructions and
+output/permission modes always participate in checkpoint matching.
+
 ## Filesystem layout (inside each sandbox)
 
 ```
@@ -55,7 +75,26 @@ delivery tier provisioning chose (see docs/architecture.md):
 | `shell.batch`   | `commands`, `command_timeout_s?`, `cwd?`                                                                                                     | `output_json`: list of `{command, exit_code, output}` (one per command, in order); job `exit_code` is the first nonzero. Nonzero exits are still **ok** results                |
 | `github.op`     | `op`, `params`                                                                                                                               | op-specific JSON (see below)                                                                                                                                                   |
 | `service.http`  | `params: {credential, method, path, query?, headers?, body?, timeout_s?}`                                                                    | `{credential, method, path, status, headers, body (clipped, credential value redacted), truncated, elapsed_s}` — see "Service ops"                                             |
-| `service.fetch` | `argv`, `cwd`, `params: {ecosystem, verb, scrub_env}`                                                                                        | `exit_code` + captured output with every `scrub_env` variable's value blanked — see "Service ops"; a nonzero exit is an **ok** result                                          |
+| `service.fetch` | `params: {registry, path, operation?, ref?, sha256?}`                                                                                        | Artifact metadata `{registry, operation, bytes, sha256}`; bytes stay in a separate artifact for host-mediated transfer                                                         |
+
+The `agent.rate_limits` job runs in the existing agent sandbox, using
+`params: {backend}` and a positive timeout of at most ten seconds. It rejects
+credentials, executable fields and session-resume fields. It calls the
+backend's read-only status method without opening a model session. Its
+`output_json` is a `RateLimitReport` (`sbxloop_worker.rate_limits`): backend,
+status, observation/snapshot times, source, freshness, scope, capabilities,
+reason, retry timing and up to 32 normalized limits. Null fields are unknown;
+short-term rate limits and longer-term quotas have distinct categories.
+Reports are bounded to 32 KiB and provider text is sanitized before leaving
+the sandbox. Provider query failures are successful worker jobs carrying an
+explicit unavailable/unsupported/authentication/throttled/timeout report,
+not failed inference jobs. They trigger no recovery or scheduling mutation.
+
+The `git.merge` job runs only on the agent worker. It requires `cwd` and
+`params: {base_branch, base_sha, bundle_path?}` and returns
+`{merged, conflicts, message}`. The host stages an optional Git bundle;
+the job receives no remote URL or credential and needs no authenticated
+network fetch. Repository hooks and drivers execute only in the agent VM.
 
 `system_preset` (default `true`) keeps the backend's own coding-agent system
 prompt under `system_message`; a workload's operator and judge sessions send
@@ -64,6 +103,16 @@ not present as an operator. The Claude backend then passes the message alone
 in place of its `claude_code` preset; the Copilot backend's SDK takes a system
 message in `append` mode only, so the flag has no effect there —
 the operator prompts are written to hold up under a coding-agent preamble.
+The Codex backend uses `baseInstructions` to replace the preset when this
+flag is false, and `developerInstructions` to extend it when true.
+
+The `codex` backend preserves the same job and result envelopes. Its SDK
+communicates with the bundled runtime over stdio inside the agent VM.
+Native environment tools are disabled; worker-owned dynamic tools apply
+the job's permissions and tool-call governor before execution, and host
+tools use the existing event/file relay. Codex read-only sessions expose
+read, list and search tools; `available_tools=[]` exposes only host tools.
+See [Codex backend](codex-backend.md) for the SDK pin and limitations.
 
 `permission_mode="auto"` approves every Copilot SDK permission request — the
 microVM is the security boundary. `read_only` allows only `read`, `url`, and
@@ -86,9 +135,19 @@ retry, so nothing was lost.
 the job JSON, boot a cold Python under `sbx exec`, fetch the result) that
 dwarfs a mechanical command's real work: the host batches all verify
 commands into one job, and the scrutinizer's evidence commands into
-another. Each command runs via `sh -c` sequentially in the job's `cwd` with
-`command_timeout_s` (default `timeout_s`) as its individual cap; `timeout_s`
-bounds the whole job.
+another. The commands run sequentially in the job's `cwd` with
+`command_timeout_s` (default `timeout_s`) as each one's individual cap;
+`timeout_s` bounds the whole job.
+
+Each command is isolated from itself and from the ones around it. It runs
+from a script file rather than `sh -c`, so its text never reaches the
+process table — a command that pattern-matches processes (`pkill -f`,
+`pgrep -f`) cannot match the shell running it — in a session of its own, so
+whatever it leaves running is a process group the worker tears down (SIGTERM,
+then SIGKILL) when the command returns or times out. Output goes to a file,
+not a pipe, so a backgrounded process that inherits it cannot hold the
+command's result open. A verify command therefore cannot kill itself, hold a
+port against the next attempt, or hang the job it belongs to.
 
 ## Host tools (agent.session)
 
@@ -226,21 +285,30 @@ body is clipped head+tail and the credential's value replaced with `***`
 wherever an API echoed it; request headers are never returned. Events:
 `service.http_start {credential, method, path}` and `service.http_end {status, elapsed_s}`.
 
-`service.fetch` jobs execute in the same box for a run whose repository has a
-credentialed `[[registries]]` entry (#766): the package manager's argv exactly
-as the host composed it from the ecosystem's fixed recipe (`npm ci --ignore-scripts`, `pip download -d <cache>`, `go mod download`, …), run in
-the workspace mount the box shares with the agent box — never a shell, never
-an argv the model wrote. `params.ecosystem` and `params.verb` name the fetch
-for the events; `params.scrub_env` lists the registry credential variables
-whose values the worker blanks out of the output before it leaves the box.
-Events: `service.fetch_start {ecosystem, verb}` and `service.fetch_end {exit_code, elapsed_s}`.
+`service.fetch` downloads registry data in the credential-bearing service
+sandbox. It accepts `params: {registry, path, operation?, ref?, sha256?}`;
+`argv`, `cwd`, `commands`, `prompt` and `op` are forbidden. The registry name
+resolves through the host-authored `SBXLOOP_REGISTRIES` catalogue. Download
+URLs and redirects stay on that entry's HTTPS authority. `operation=git`
+fetches a ref into fresh bare Git metadata and emits a bundle without
+checking out files. Neither operation loads manifests or invokes a package
+manager. The worker starts in Python isolated mode.
 
-On the host, the build session's `call_service` host tool is answered by
-`ServiceOps`: the credential name is checked against the run's grant before
-any job is built, and each call is one `service.call` host event
-(`credential`, `method`, `path`, `status` or `error`, `duration_s`); its
-`fetch_dependencies` tool the same way, each fetch — refused on the host or
-run — one `sandbox.fetch` event (`ecosystem`, `verb`, `argv`, `exit_code`).
+Successful output is `{registry, operation, bytes, sha256}`. Artifact bytes
+are written beside the result as `<job_id>.artifact`, bounded to 1 GiB and
+checked for echoed service credentials. The host copies that fixed path
+out, verifies its digest and size, copies the data into the agent, and
+removes the service artifact. A failed fetch is an error result. Events are
+`service.fetch_start {registry, operation, path}` and
+`service.fetch_end {registry, operation, path, bytes, sha256, duration_s}`.
+
+On the host, `ServiceOps` checks each tool request against the run's grants.
+`call_service` records a `service.call` event; `fetch_dependencies` records
+`sandbox.fetch` with its ecosystem, registry, path, operation and result
+metadata. Content and credentials never enter those events. The agent's
+tool response names the copied local file; it contains no artifact bytes.
+A discovery-only fetch returns registry names, URLs and cache information
+without submitting a service job.
 
 `SBXLOOP_SERVICE_FAKE=<path>` (tests) swaps the HTTPS transport for scripted
 responses from that JSON file, each request appended to

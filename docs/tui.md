@@ -31,15 +31,31 @@ opens that run's screen at once; `--read-only` removes every action.
 ## Layout and navigation
 
 ```
-┌────────────────────────────────────────────────────────────────────────────┐
-│ ● running  r7ab3kq2m · Add retries   queue 2   runs 4/12 UTC   failures 0  │
-│ sbxloop 1.4.2   bridge ✓   up since 2d ago   ctl 12 ms   14:02:11          │
-├────────────────────────────────────────────────────────────────────────────┤
-│                            <active screen>                                 │
-├────────────────────────────────────────────────────────────────────────────┤
-│ 1 Overview 2 Runs 3 Queue 4 Chat 5 Sandboxes 6 Daemon 7 Config 8 Doctor ? │
-└────────────────────────────────────────────────────────────────────────────┘
+┌─────────────┬──────────────────────────────────────────────────────────────┐
+│             │ ● running  r7ab3kq2m · Add retries   queue 2   runs 4/12 UTC  │
+│ 1 Overview  │ sbxloop 1.5.2   bridge ✓   up since 2d ago   ctl 12 ms        │
+│ 2 Runs      ├──────────────────────────────────────────────────────────────┤
+│ 3 Queue   2 │                                                              │
+│ 4 Chat      │                     <active screen>                          │
+│ 5 Sandboxes │                                                              │
+│ 6 Daemon  1 │                                                              │
+│ 7 Config    │                                                              │
+│ 8 Doctor    ├──────────────────────────────────────────────────────────────┤
+│ ? Help      │ / Filter  r Refresh  q Quit                     ^p palette    │
+└─────────────┴──────────────────────────────────────────────────────────────┘
 ```
+
+The **navigation rail** runs down the left of every screen: every screen
+with the key that reaches it, the one you are on marked, and a badge where
+a screen you are *not* on wants attention — the queue's depth, unread
+control-channel rows, gates and holds waiting for a human. Clicking a row
+is the same verb as pressing its key. It is the console's map; the footer
+keeps its row for the verbs of whichever screen is up. Below 90 columns the
+rail hides itself and the keys still reach everything.
+
+`sbxloop.tui.widgets.navrail.NAV` is the single source of the console's
+shape — the rail renders it and the app builds its bindings from it, so a
+screen cannot be reachable by key and missing from the map.
 
 The two-line **status bar** is on every screen: the daemon (`●` running,
 `◌` idle, `⏸` paused with its holds, `🛑` breaker open, `…` starting, `✖`
@@ -52,34 +68,133 @@ Screens are **modes**: each keeps its cursor and scroll when you jump away
 and back. A run opens as a pushed screen over the one you were on; `Esc`
 returns.
 
-| key               | where                       | what                                                               |
-| ----------------- | --------------------------- | ------------------------------------------------------------------ |
-| `1` … `8`         | anywhere                    | Overview, Runs, Queue, Chat, Sandboxes, Daemon, Config, Doctor     |
-| `?`               | anywhere                    | Help                                                               |
-| `ctrl+p`          | anywhere                    | the command palette: screens and argument-less verbs by name       |
-| `r`               | anywhere                    | refresh now (store and `ctl status`)                               |
-| `q`               | anywhere                    | quit                                                               |
-| `j`/`k`, arrows   | any list                    | move                                                               |
-| `g`/`G`           | any list                    | first / last row                                                   |
-| `ctrl+d`/`ctrl+u` | any list                    | page                                                               |
-| `/`               | Runs, Events tab            | filter (Runs: any column; Events: a type prefix such as `policy.`) |
-| `Esc`             | anywhere                    | clear a filter, close a run                                        |
-| `Enter`           | Runs, Queue, Overview lists | open the run                                                       |
-| `f`               | a run                       | toggle following the event tail                                    |
-| `v`               | a run                       | Thread tab as the `sbxloop run` transcript or as dense lines       |
+| key                     | where                       | what                                                               |
+| ----------------------- | --------------------------- | ------------------------------------------------------------------ |
+| `1` … `8`               | anywhere                    | Overview, Runs, Queue, Chat, Sandboxes, Daemon, Config, Doctor     |
+| `s` `f` `c` `t` `h` `d` | Overview                    | Summary, Flow, Cost, Time, Health, Spread                          |
+| click                   | the rail                    | the same as that row's key                                         |
+| `?`                     | anywhere                    | Help                                                               |
+| `ctrl+p`                | anywhere                    | the command palette: screens and argument-less verbs by name       |
+| `r`                     | anywhere                    | refresh now (store and `ctl status`)                               |
+| `q`                     | anywhere                    | quit                                                               |
+| `j`/`k`, arrows         | any list                    | move                                                               |
+| `g`/`G`                 | any list                    | first / last row                                                   |
+| `ctrl+d`/`ctrl+u`       | any list                    | page                                                               |
+| `/`                     | Runs, Events tab            | filter (Runs: any column; Events: a type prefix such as `policy.`) |
+| `Esc`                   | anywhere                    | clear a filter, close a run                                        |
+| `Enter`                 | Runs, Queue, Overview lists | open the run                                                       |
+| `Enter`                 | Config, Resolved tab        | edit that setting (`e` too); `a` adds one by dotted path           |
+| `f`                     | a run                       | toggle following the event tail                                    |
+| `v`                     | a run                       | Thread tab as the `sbxloop run` transcript or as dense lines       |
 
 ### Overview
 
-The run in flight (state, stage, title, PR, rounds, last-event age), the
-queue in dispatch order, who is **waiting on a human** (open merge gates,
-review holds), the most recent runs, and the daemon's own answer to
-`status` when it is up. With no daemon answering, history stays browsable.
+**How the loop has been performing, a page at a time.** The screen used to
+be four panels — the run in flight, the queue, recent runs, who is waiting
+on you — three of which have their own screen (Runs, Queue, Daemon), and
+none of which answered the question you open a console with: *is this
+working well?*
+
+One live line on top (the run in flight and its stage, or idle/paused, or
+the daemon being down, starting or busy), a narrow rail of pages beside the
+console's own, and a page that states its finding in a sentence before it
+draws a bar. The pages take **letters** — the digits belong to the console's
+rail — and `o` opens the window's costliest run.
+
+- **Summary** (`s`) — the week in a sentence, then outcome, elapsed split
+  into active/parked, and where the working time went — each a horizontal
+  stacked plot against a value axis, so a share can be read off as a
+  quantity (`23h 51m`) and not only as a proportion. Then the change
+  against the week before, the week itself as one stacked plot with a day
+  per bucket, and one "biggest lever" line naming whichever cost is
+  furthest out of proportion. A split that is all zero has no proportion
+  to draw, so that row falls back to the one-row band.
+- **Flow** (`f`) — runs per day by outcome, each kind's rates with its own
+  turns, active and parked per run, and **how long work took to land** end
+  to end (median and p90, slowest named). Code and workload runs differ by
+  an order of magnitude, so they are never blended. Runs per day is one
+  stacked plot with a day per bucket.
+- **Cost** (`c`) — turns lead, because every turn re-sends the session
+  context and spend tracks turns rather than jobs. **Which phase** burns
+  them, not only how many, and **how much context each phase re-sends** —
+  the cache-to-fresh ratio is a per-phase fact and the phases differ by an
+  order of magnitude. The costliest runs are named and ranked against a
+  scale, with the median and p90 beside them, so an outlier is visible
+  instead of averaged away. **Turns per day** is a plot with a labelled
+  scale rather than a sparkline: the sparkline drew the shape but named no
+  value on it, so a quiet week and a heavy one looked the same.
+- **Time** (`t`) — **active** is what the loop did; **parked** is what it
+  waited on a human for. These are wildly different: on this project's own
+  host active time has run at about a sixth of elapsed, so reporting
+  elapsed as "duration" says the loop is slow when the loop is fast and the
+  human is not. The runs that waited longest are ranked against a duration
+  axis, so `21h 35m` is readable off the plot and not only `68%`.
+- **Health** (`h`) — failures grouped by cause, so a common cause reads as
+  one row rather than several one-offs; **where the loop went round again**
+  (retries per phase — a phase that retries constantly is spending turns
+  nobody asked for); the phase table; and the rework the week cost in task
+  revisions, replans and review/CI rounds. A ranked plot keeps the exact
+  counts on a line beneath it, because a bar approximates and a note like
+  `3 of 12` carries more than the bar can.
+- **Spread** (`d`) — how the week's runs are *distributed*, rather than what
+  they totalled. Two histograms (turns per run, working time per run) and a
+  scatter of turns against elapsed, one dot per run. Median and p90 say
+  where the middle is; they cannot tell one hump from two humps either side
+  of it, and the run whose cost its wall-clock does not explain is the one
+  sitting away from the crowd. Under eight runs there is no shape to see,
+  so the page states the median-and-p90 sentence and draws nothing.
+
+A **cancelled** run is a decision, not an outcome: it is counted and
+reported but kept out of the success rate's denominator.
+
+Every share, trend and ranking on Overview is a plot
+(`sbxloop.tui.widgets.chart`, over `textual-plotext`). Their axes are ruled
+in whole runs and read in the same `1h 20m` units as the rest of the
+screen, and they follow the console's theme.
+
+`sbxloop.tui.widgets.band` drew all of these as one-row bars until it was
+used in anger: a band paints with *background* colour and no glyph, so a
+single row is a thin stripe that is easy to miss on a low-contrast
+terminal, and it carries no scale — a full bar and a stub tell you the
+ranking and not one number. Band is still the right tool outside Overview,
+and is still the fallback for a split that is all zero, where a plot would
+rule an axis across an empty frame to say nothing.
+
+One trap worth knowing if you add a plot: **plotext does not raise on a
+colour it cannot read.** `color="#22C55E"` and `color="not-a-colour"` both
+draw in its default, so a `band.py` palette entry handed straight to
+plotext silently paints every series the same blue. Convert it with
+`chart.rgb` first; `tests/unit/tui/test_tui_charts.py` asserts on the
+painted output rather than on the argument for exactly this reason.
+
+The numbers are `sbxloop.tui.analytics`, folded from
+`StateStore.runs_between` / `phases_between` in one grouped pass each and
+recomputed on a slow timer of its own — nothing in a week-long window
+changes between console ticks. An empty window says so rather than drawing
+an empty screen.
 
 ### Runs and a run
 
-Runs lists every run newest first: id, state (the reason dimmed after it,
-as `sbxloop status` prints it), stage, item, repository, title, PR, review
-and CI rounds, last update. A run has six tabs:
+Runs lists every run the store knows, **most recently touched first** with
+the run in flight pinned on top — observing wants the live one, reviewing
+wants what moved. Ordering by when a run *started* buried a run that began
+on Tuesday and merged this morning under runs that had not moved in days,
+and applied its limit the same way.
+
+Columns: run, state, title, updated, PR, turns, took, stage, rounds, item,
+repo — dropped weakest-first as the terminal narrows rather than
+overflowing, and each cell held to its column's width. The state is a
+**word**: its reason used to be appended inline and unclipped, and a
+409-character `github op` error sized the column and pushed the other
+eight off the screen. The reason now appears **in full** under the table
+for the row the cursor is on, along with the branch, the pull request URL
+and whatever exhausted the run.
+
+`/` filters on any of it — including the reason, which is searchable even
+though it is no longer on the row. `Enter` opens the run; `p` opens its
+pull request (on a host with no browser the outcome carries the URL).
+
+A run has six tabs:
 
 - **Thread** — the run's transcript: the same renderers `sbxloop run --tui` uses (agent messages as Markdown panels, tool calls as lines,
   failed calls with their excerpt), tailed from the persisted events.
@@ -98,9 +213,41 @@ and CI rounds, last update. A run has six tabs:
 
 ### Queue
 
-What the daemon will dispatch next (with the backoff's `not before`) and
-every work item with its repository, state, attempts, pinned run, title,
-last error and last update. `Enter` opens the item's run.
+**What is stuck, and what runs next.** The screen used to be two tables —
+the dispatch order, and a dump of every item that ever existed — with no
+filter, half its verbs hidden from the footer, and the merge gates and
+review holds loaded into state but never drawn. Pressing `m` on the wrong
+row answered "no open merge gate", which is the console telling you to
+guess again.
+
+It is grouped by **what you would do about it**, in the order a person
+triages. A stat strip leads: `7 queued · oldest 2d · median wait 12m · 2 waiting on you` — the age of what is waiting *now*, since a work item
+carries no dispatch timestamp for a queued-to-started time.
+
+- **waiting on you** — `gated`, `awaiting_review`, `paused_review`, each
+  row naming what holds it (`merge #170`, `review #182`) and the key that
+  clears it. These are the rows the loop is blocked on.
+- **running now** — the pinned run and how long since it moved.
+- **queued next** — the daemon's own dispatch order, numbered, with the
+  item's own reason: `now`, `resume, first`, `retry 14:20`, `backoff 3 · 14:20`.
+- **parked / failed** — `failed`, `blocked`, `cancelled` from the last 7
+  days, matching Overview's window. Older ones are counted in the heading
+  and reachable with `/`, which lifts the window.
+
+`done` is not here: it is finished work, and Runs lists it.
+
+Two layers decide whether anything moves and **both are shown, because
+both are true**. An item has its own reason; the daemon has a global one —
+its breaker, the daily cap, a pause, or not answering at all. When the
+daemon is blocked nothing dispatches whatever the rows say, so the block
+is stated once in a banner and the queued rows are dimmed, keeping their
+own reason rather than all claiming the daemon's.
+
+The footer offers **only the verbs the selected row allows**, so `m`
+appears on a row with an open gate and nowhere else. `/` filters every
+section on id, repository, state, title and error; `Enter` opens the
+item's run; `j`/`k` and the arrows cross a section boundary rather than
+trapping the cursor in whichever table it landed in.
 
 ## Chat
 
@@ -272,30 +419,71 @@ orphan verdicts (the prompt says so, and their kept marker is cleared).
 
 ### Config (`7`)
 
-- **Resolved** — every key with its value and the layer that set it (user
-  config, `pyproject.toml`, `sbxloop.toml`, env, default), as
-  `sbxloop config show` prints; `/` filters keys, values and sources.
+Three tabs, and every change made from the first of them one key at a
+time. **There is no text editor here.** Handing the operator a file and
+leaving them to find the line is what this screen replaced; for a change
+no key describes, edit `~/.sbxloop/config/sbxloop.toml` on the host.
+
+**Which file an edit lands in:** the home's `config/sbxloop.toml` — what
+`sbxloop init` writes, what a deploy preserves and what `sbxloop backup`
+snapshots. Its path is the first line of the Resolved tab. The loader
+reads it out of the home whatever directory anything was started in, so
+the console writes the same file the daemon reads no matter where either
+was launched. A `sbxloop.toml` in a working directory is *project* config
+a repository carries; the console shows it as a layer but never writes to
+it. If one is sitting in the home itself the loader applies it **over** the
+operator config — the screen names it so the split is visible, and per-key
+edits say when that file still wins.
+
+- **Resolved** — every setting as one addressable key with its value and
+  the layer that set it (home config, `pyproject.toml`, `sbxloop.toml`,
+  env, default); `/` filters keys, values and sources, matching what is on
+  screen. Values read the way they are written rather than the way Python
+  prints them: `60` not `60.0`, `claude` not `'claude'`, `true` not `True`,
+  `—` for unset, `""` for an empty string, and a list as its items. A
+  string that would be mistaken for another type keeps its quotes, so
+  `"60"` and `"true"` are never read as the number or the bool. It is resolved **from the home**, not from the directory the
+  console was started in: that is where the daemon runs, so this is the
+  configuration the loop actually gets, and it is the same root an edit is
+  validated against — a save shows up here at once. Arrays of tables are
+  walked, so the second repository is `github.repos[1].deliver_base` rather
+  than one blob you have to find in a file, and a leaf inherits the layer
+  that supplied the array it lives in. Lists of scalars (`policy.allow`)
+  stay one key: the useful edit there is the whole list.
+
+- **Editing one key.** `Enter` on a row — or `e` — opens that setting on
+  its own: what it accepts (a type, the set a `Literal` allows, the bounds
+  the model carries), what it holds now and which layer is answering, and
+  the file the answer is written to. The widget follows the type — a
+  picker for a bool or a fixed set, one item per line for a list, a line of
+  text otherwise — so a string needs no quotes and a bad value is named
+  before the loader sees it. `^U` unsets the key instead, so the file stops
+  saying anything about it and the layer beneath answers.
+
+  `Enter` (a picker: `^S`) applies. The edit starts from the file as it is
+  on disk — there is no buffered draft to go stale — and the value is
+  written at that path and nowhere else, **every comment in the file
+  kept**. The whole result then goes through the real loader, and only a
+  file it accepts is saved: the write is atomic, the previous file is kept
+  beside it as `sbxloop.toml.bak-<stamp>`, and a restart of the unit is
+  offered, since the daemon reads its configuration only at start. A file
+  the loader refuses is never written. The dialog is the confirmation, so
+  nothing else is asked. A key the environment or a `sbxloop.toml` in the
+  home also sets is still written and the verdict says so, naming the layer
+  that wins and the value the loop actually sees. `--read-only` refuses
+  every edit.
+
+- **Adding a key.** `a` takes a dotted path the resolved view has no row
+  for — `sandbox.env.RAILS_ENV`, `github.repos[2].repo` — and opens the
+  same dialog. An index one past the end appends an entry; an index beyond
+  that is refused by name.
+
 - **Policy** — the effective per-phase egress policy `sbxloop config policy`
   prints, from the same fold (`sbxloop.cli.policyview.policy_view`).
+
 - **Repos** — the configured repositories as `sbxloop config repos` lists
-  them.
-- **Edit** — the `sbxloop.toml` the daemon reads: the daemon says where it
-  loaded its configuration from (`status` carries its directory), and the
-  editor follows that, not the directory the console was started in (the
-  commented example when there is no file yet). `i` focuses it, `Esc`
-  hands focus back. `V` validates the draft with the real loader, in
-  place of that file at the same discovered root — the user,
-  `pyproject.toml` and environment layers still applied, and the project
-  cut-down too: a `sbxloop.toml` the repository carries (tracked by git)
-  may only set project keys, and the verdict names the keys the daemon
-  would ignore rather than saying "loads". It names what it refuses (an
-  unknown key, a bad value). `W` (or `ctrl+s`) validates and then saves,
-  typed `save`: the write is atomic, the previous file is kept beside it
-  as `sbxloop.toml.bak-<stamp>`, and a restart of the unit is offered
-  (typed, as on the Daemon screen), since the daemon reads the file only
-  at start. A draft the loader refuses is never written. `E` opens
-  `$EDITOR` on the file with the terminal handed over; `L` reloads from
-  disk. `--read-only` makes the editor read-only.
+  them. `Enter` on a repository narrows the Resolved view to that entry's
+  keys.
 
 ### Doctor (`8`) and secrets
 

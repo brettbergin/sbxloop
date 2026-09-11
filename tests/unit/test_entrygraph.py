@@ -188,5 +188,5 @@ def test_default_runner_stages_scanner_and_seeds_workload(tmp_path: Path) -> Non
     assert engine.config.workload_profile().name == "entrygraph"
     assert (cfg.paths.run_workspace("rscan") / ".entrygraph/scan.py").is_file()
     h.loop._default_runner(item, cfg, "rscan", bus, True)
-    engine.resume.assert_called_once_with("rscan")
+    engine.resume.assert_called_once_with("rscan", release_provider_hold=False)
     assert engine.start.call_count == 1

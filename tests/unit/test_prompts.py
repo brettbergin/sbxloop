@@ -157,6 +157,19 @@ def test_build_carries_environment_notes() -> None:
     assert "cannot edit" in build
 
 
+def test_prompts_name_yq_for_yaml() -> None:
+    """Field regression (#751, run r72m8rass): the builder spent four turns
+    hunting for a YAML parser (ruby, PyYAML, a venv without pip) on a
+    workflow-editing task. Both prompts say yq/jq are there and that yq
+    takes jq syntax, so the agent neither installs a parser nor reaches
+    for mikefarah flags."""
+    for name, context in (("build", build_context()), ("review", RENDER_CONTEXTS["review"])):
+        text = " ".join(render(name, **context).split())
+        assert "`yq` and `jq` are on every sandbox" in text, name
+        assert "jq syntax" in text or "jq-syntax" in text, name
+        assert "Do not install PyYAML" in text or "do not install PyYAML" in text, name
+
+
 def test_build_is_framed_as_a_branch_not_an_artifact() -> None:
     """#689: the builder edits an existing repository on a feature branch
     that a human reviews as a pull request — not a workspace it fills
@@ -250,6 +263,13 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "project_gate": "- gate rule",
         **EXAMPLE,
     },
+    "review_repair": {
+        "prior_response": '{"verdict":"approve","summary":"checked"}',
+        "original_response": "",
+        "validation_error": "unexpected field",
+        "schema": '{"type":"object"}',
+        "prior_rounds": "(no earlier review rounds)",
+    },
     "concierge": {
         "chat_name": "Discord",
         "command_prefix": "!sbx",
@@ -261,6 +281,17 @@ RENDER_CONTEXTS: dict[str, dict[str, str]] = {
         "trigger_label": "sbxloop:run",
         "workload_label": "sbxloop:workload",
         "workloads": "- `research`: sinks chat, issue",
+    },
+    # The one phase that edits the exam rather than the work.
+    "reauthor_verify": {
+        "task_title": "t1: T",
+        "task_description": "d",
+        "acceptance_criteria": "- a",
+        "suspect_command": "check --thing",
+        "suspect_output": "(no output at all)",
+        "other_commands": "- other --check",
+        "builder_report": "r",
+        "gate_rule": "",
     },
     # The workload's actors (#756): the operator plans and executes, the
     # judge decides.
@@ -306,6 +337,17 @@ def test_concierge_prompt_carries_contract() -> None:
     text = render("concierge", **RENDER_CONTEXTS["concierge"])
     assert text.startswith("# You are the sbxloop concierge")
     assert "`sbx_control`" in text and "`create_issue`" in text
+    assert "`agent_rate_limits` with no arguments" in text
+    for evidence in (
+        "observation time",
+        "source",
+        "freshness",
+        "provider scope",
+        "used or remaining",
+        "Null means unknown",
+        "cannot establish provider capacity",
+    ):
+        assert evidence in text
     # "backlog" is allowed only as the `list_issues` state value, never as a
     # separate queue concept the concierge could file onto
     assert "`enqueue_work`" not in text and "inbox" not in text

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import stat
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -11,6 +12,41 @@ from typing import Any
 import pytest
 
 FAKE_SBX_SOURCE = Path(__file__).parent / "fakes" / "fake_sbx.py"
+
+
+@pytest.fixture(scope="session")
+def git_server_certificate(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    """A short-lived localhost certificate for the real Git HTTPS tests."""
+    directory = tmp_path_factory.mktemp("git-tls")
+    cert = directory / "localhost.pem"
+    subprocess.run(
+        [
+            "openssl",
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-nodes",
+            "-days",
+            "2",
+            "-subj",
+            "/CN=localhost",
+            "-addext",
+            "subjectAltName=DNS:localhost,IP:127.0.0.1",
+            "-keyout",
+            str(cert.with_suffix(".key")),
+            "-out",
+            str(cert),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return cert
+
+
+@pytest.fixture(autouse=True)
+def trust_git_test_server(git_server_certificate: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("GIT_SSL_CAINFO", str(git_server_certificate))
 
 
 class FakeSbx:
@@ -119,6 +155,10 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 @pytest.fixture
 def fake_sbx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeSbx:
+    # A fake successful provision must not contact a real model catalogue.
+    # Lifecycle tests replace this hook with a recorder; catalogue tests
+    # inject the discovery response and exercise the cache itself.
+    monkeypatch.setattr("sbxloop.modelcatalog.refresh_after_provision", lambda config: None)
     state = tmp_path / "sbx-state"
     state.mkdir()
     bin_dir = tmp_path / "bin"

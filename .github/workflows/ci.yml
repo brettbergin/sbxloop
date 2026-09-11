@@ -73,6 +73,44 @@ jobs:
       - run: uv sync --all-packages
       - run: uv run bandit -c pyproject.toml -r packages/sbxloop/src packages/sbxloop-worker/src
 
+  # Exercise the published optional SDK against a fake stdio process. No
+  # inference credentials, model calls or real Codex runtime are involved.
+  codex-sdk:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-packages --extra codex --python ${{ matrix.python-version }}
+      - run: uv run --no-sync pytest -n0 tests/unit/test_codex_sdk_contract.py
+
+  # Use the shipped preset to install and drive Chromium, without an agent
+  # credential. Browser software is installed only in this dedicated runner.
+  playwright-preset:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: uv sync --all-packages
+      - run: uv run pytest -n0 tests/unit/test_playwright_preset_runtime.py
+        env:
+          SBXLOOP_TEST_PLAYWRIGHT: "1"
+
   # The suite in three slices per interpreter: the ~3900 in-process tests,
   # and the ~770 process-bound `slow` tests (fake sbx, real workers, real
   # git) spread over two runners with the deterministic `--shard` from the

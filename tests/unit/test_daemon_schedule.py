@@ -15,7 +15,7 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
-from sbxloop.config import Config
+from sbxloop.config import Config, ScheduleConfig
 from sbxloop.daemon.control import dispatch
 from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.schedule import (
@@ -411,7 +411,7 @@ class TestControl:
 
     def test_no_schedules(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
-        assert dispatch(h.loop, "schedules").text.startswith("no schedules configured")
+        assert dispatch(h.loop, "schedules").text.startswith("no schedules — create one")
 
     def test_pause_and_resume_one_schedule(self, tmp_path: Path) -> None:
         h = harness(tmp_path)
@@ -439,7 +439,180 @@ class TestControl:
     def test_unknown_schedule_and_usage(self, tmp_path: Path) -> None:
         h = harness(tmp_path)
         reply = dispatch(h.loop, "schedules pause nope")
-        assert not reply.ok and "no schedule called 'nope' (configured: hourly)" in reply.text
+        assert not reply.ok and "no schedule called 'nope' (stored: hourly)" in reply.text
         assert not dispatch(h.loop, "schedules stop hourly").ok
         assert not dispatch(h.loop, "schedules pause").ok
-        assert "schedules [pause <name>|resume <name>]" in dispatch(h.loop, "bogus").text
+        assert "schedules [add <name> --profile P" in dispatch(h.loop, "bogus").text
+
+
+# -- the store is home (#818) --------------------------------------------------------
+
+
+def stored(h: Harness) -> list[dict[str, Any]]:
+    return h.loop.schedules()
+
+
+class TestStoredSchedules:
+    """#818: schedules live in the daemon's database. A `[[schedules]]`
+    entry still in the file is imported once, at first sight, and the
+    operator is told; a schedule created at runtime is live from the next
+    tick; removing one ends its ticks."""
+
+    def test_config_entries_are_imported_once_and_announced(self, tmp_path: Path) -> None:
+        h = harness(tmp_path)
+        assert tick_at(h, T0).idle_kind == "no_work"
+        (row,) = stored(h)
+        assert row["source"] == "config" and row["created_by"] is None
+        assert row["ask"] == "Summarise the hour" and row["next_due"] == T0 + HOUR
+        (note,) = kinds(h, "daemon.schedules_imported")
+        assert note.startswith("📅 schedules: imported hourly from sbxloop.toml")
+        assert "remove the `[[schedules]]` entries" in note
+        # A restart with the entry still in the file: the stored one wins,
+        # the note says so, nothing is duplicated and the grid is kept.
+        h2 = harness(tmp_path)
+        tick_at(h2, T0 + 60)
+        (row,) = stored(h2)
+        assert row["next_due"] == T0 + HOUR
+        (note,) = kinds(h2, "daemon.schedules_imported")
+        assert "already live in the daemon's database" in note
+        # The file's copy is ignored from here on: an edited ask does not
+        # reach the store.
+        h3 = harness(tmp_path, {**EVERY_HOUR, "ask": "Changed in the file"})
+        tick_at(h3, T0 + 120)
+        assert stored(h3)[0]["ask"] == "Summarise the hour"
+        assert h3.dstore.schedule("hourly") is not None
+
+    def test_no_config_entries_means_no_note(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path, config_with(tmp_path))
+        h.loop.frontend = RecordingFrontend()
+        tick_at(h, T0)
+        assert kinds(h, "daemon.schedules_imported") == []
+        assert stored(h) == []
+
+    def test_a_schedule_created_at_runtime_is_live_from_the_next_tick(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path, config_with(tmp_path))
+        h.loop.frontend = RecordingFrontend()
+        tick_at(h, T0)
+        spec = ScheduleConfig(name="digest", profile="brief", ask="Digest\n\nDetails", every="2h")
+        text = h.loop.add_schedule(spec, "brett", source="chat")
+        assert text.startswith("schedule digest created: every 2h (UTC), profile `brief`")
+        assert f"first tick due {format_due(T0 + 2 * HOUR)}" in text and "without a restart" in text
+        (note,) = kinds(h, "daemon.schedule_added")
+        assert note.startswith("📅 schedule digest created by brett: every 2h (UTC)")
+        (row,) = stored(h)
+        assert row["source"] == "chat" and row["created_by"] == "brett"
+        assert row["created_at"] == T0 and row["next_due"] == T0 + 2 * HOUR
+        assert tick_at(h, T0 + 2 * HOUR - 1).discovered == 0
+        assert tick_at(h, T0 + 2 * HOUR).discovered == 1
+        (item,) = h.dstore.items()
+        assert item.item_id == f"sched:digest:{format_due(T0 + 2 * HOUR)}"
+        assert item.title == "Digest" and item.body == "Digest\n\nDetails"
+        # A restart reads it from the store: no config involved.
+        h2 = Harness(tmp_path, config_with(tmp_path))
+        assert [r["name"] for r in stored(h2)] == ["digest"]
+        assert stored(h2)[0]["next_due"] == T0 + 4 * HOUR
+
+    def test_creation_refuses_a_taken_name_or_an_undeclared_profile(self, tmp_path: Path) -> None:
+        h = harness(tmp_path)
+        tick_at(h, T0)
+        with pytest.raises(ValueError, match="already exists"):
+            h.loop.add_schedule(ScheduleConfig(**EVERY_HOUR), "brett", source="chat")
+        with pytest.raises(ValueError, match=r"profile 'nope' is not declared.*declared: brief"):
+            h.loop.add_schedule(
+                ScheduleConfig(name="x", profile="nope", ask="y", every="1h"),
+                "brett",
+                source="chat",
+            )
+        assert [r["name"] for r in stored(h)] == ["hourly"]
+
+    def test_removal_ends_the_ticks(self, tmp_path: Path) -> None:
+        h = harness(tmp_path)
+        tick_at(h, T0)
+        text = h.loop.remove_schedule("hourly", "brett")
+        assert text.startswith("schedule hourly removed; no further ticks")
+        assert kinds(h, "daemon.schedule_removed") == [
+            "🗑 schedule hourly removed by brett; no further ticks"
+        ]
+        assert stored(h) == []
+        assert tick_at(h, T0 + 2 * HOUR).discovered == 0
+        with pytest.raises(ValueError, match="no schedule called 'hourly'"):
+            h.loop.remove_schedule("hourly", "brett")
+        # Re-created under the same name: a fresh grid from now.
+        h.loop.add_schedule(ScheduleConfig(**EVERY_HOUR), "ana", source="chat")
+        assert stored(h)[0]["next_due"] == T0 + 3 * HOUR
+
+    def test_a_schedule_whose_profile_is_gone_skips_its_tick_named(self, tmp_path: Path) -> None:
+        h = harness(tmp_path)
+        tick_at(h, T0)
+        # The operator removed the profile from the config; the stored
+        # schedule outlives it and must not run with every need refused.
+        config = Config.model_validate({"home": str(tmp_path / "state"), "github": {"repo": "o/r"}})
+        h2 = Harness(tmp_path, config)
+        h2.loop.frontend = RecordingFrontend()
+        assert tick_at(h2, T0 + HOUR).discovered == 0
+        (note,) = kinds(h2, "daemon.schedule_skipped")
+        assert "profile `brief` is no longer declared" in note
+        assert "schedules remove hourly" in note
+        assert h2.dstore.items() == []
+        assert stored(h2)[0]["next_due"] == T0 + 2 * HOUR  # the tick was handled
+
+
+class TestControlAddRemove:
+    def test_add_creates_a_schedule_from_flags(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path, config_with(tmp_path))
+        h.loop.frontend = RecordingFrontend()
+        tick_at(h, T0)
+        reply = dispatch(
+            h.loop,
+            "schedules add morning-brief --profile brief --cron 0 7 * * mon-fri "
+            "--tz Europe/London --ask Summarise what changed overnight",
+            by="brett",
+        )
+        assert reply.ok, reply.text
+        assert reply.text.startswith(
+            "schedule morning-brief created: cron 0 7 * * mon-fri (Europe/London), profile `brief`"
+        )
+        (row,) = stored(h)
+        assert row["ask"] == "Summarise what changed overnight"
+        assert row["source"] == "ctl" and row["created_by"] == "brett"
+        line = dispatch(h.loop, "schedules").text
+        assert "**morning-brief** · cron 0 7 * * mon-fri (Europe/London) · profile `brief`" in line
+        assert "“Summarise what changed overnight”" in line and "by brett" in line
+        # every, with the ask carrying the rest of the line
+        reply = dispatch(h.loop, "schedules add hourly --profile brief --every 1h --ask Check it")
+        assert reply.ok and "every 1h (UTC)" in reply.text
+        assert {r["name"]: r["ask"] for r in stored(h)}["hourly"] == "Check it"
+
+    def test_add_usage_and_validation(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path, config_with(tmp_path))
+        usage = "usage: schedules [add <name> --profile P"
+        for cmd in (
+            "schedules add",
+            "schedules add --profile brief",
+            "schedules add x --profile brief --every 1h",  # no ask
+            "schedules add x --every 1h --ask y",  # no profile
+            "schedules add x --profile brief --cron 0 7 * --ask y",  # short cron
+            "schedules add x --profile brief --every 1h --ask",  # empty ask
+            "schedules add x --profile brief --bogus 1 --ask y",
+        ):
+            reply = dispatch(h.loop, cmd)
+            assert not reply.ok and reply.text.startswith(usage), cmd
+        reply = dispatch(h.loop, "schedules add x --profile brief --every soon --ask y")
+        assert not reply.ok and reply.text.startswith("schedules add failed: schedules.x: every")
+        reply = dispatch(h.loop, "schedules add x --profile brief --ask y")
+        assert not reply.ok and "set exactly one of every / cron" in reply.text
+        reply = dispatch(h.loop, "schedules add x --profile nope --every 1h --ask y")
+        assert not reply.ok and "profile 'nope' is not declared" in reply.text
+        reply = dispatch(h.loop, "schedules add no.spaces! --profile brief --every 1h --ask y")
+        assert not reply.ok and "name must be" in reply.text
+        assert stored(h) == []
+        assert not dispatch(h.loop, "schedules bogus x").ok
+
+    def test_remove(self, tmp_path: Path) -> None:
+        h = harness(tmp_path)
+        tick_at(h, T0)
+        reply = dispatch(h.loop, "schedules remove hourly", by="brett")
+        assert reply.ok and reply.text.startswith("schedule hourly removed")
+        assert stored(h) == []
+        reply = dispatch(h.loop, "schedules remove hourly")
+        assert not reply.ok and "no schedule called 'hourly' (stored: none)" in reply.text

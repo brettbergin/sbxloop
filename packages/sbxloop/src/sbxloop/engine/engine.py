@@ -44,10 +44,10 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import queue
 import shlex
 import shutil
-import sqlite3
 import tarfile
 import tempfile
 import threading
@@ -62,7 +62,8 @@ from urllib.parse import quote
 
 from pydantic import ValidationError
 
-from sbxloop import hostgit
+from sbxloop import hostgit, repofiles
+from sbxloop.agentmodels import model_for_phase, refreshed_models, run_model_repo
 from sbxloop.config import (
     DEFAULT_PR_TITLE_TEMPLATE,
     GITHUB_SINKS,
@@ -89,6 +90,7 @@ from sbxloop.engine.followups import (
     issue_body,
     marker_key,
 )
+from sbxloop.engine.issue_lookup import IssueLookup, LookupUnavailable
 from sbxloop.engine.landing import (
     AwaitingReview,
     Blocked,
@@ -164,11 +166,13 @@ from sbxloop.engine.review import (
     unanswered_findings,
 )
 from sbxloop.engine.service import ServiceOps
-from sbxloop.engine.store import PostedRecord, StateStore
+from sbxloop.engine.store import PhaseAttemptRecord, PostedRecord, StateStore
 from sbxloop.errors import (
     BudgetExceededError,
     ConfigError,
     DeliveryError,
+    DeliveryPermissionError,
+    EmptyDeliveryError,
     GithubOpsError,
     InvalidOutputTwice,
     ProvisionError,
@@ -189,19 +193,23 @@ from sbxloop.gh.ops import (
     ReviewComment,
     SubmittedReview,
     identities_match,
+    raw_lookup,
     raw_pages,
     user_identity,
 )
-from sbxloop.ids import branch_name, new_message_id, new_run_id
+from sbxloop.gh.permissions import workflows_write_granted
+from sbxloop.ids import branch_name, new_job_id, new_message_id, new_run_id
 from sbxloop.log import get_logger
 from sbxloop.policy import EgressGranter, egress_rejection
+from sbxloop.provider import ProviderHeldError, ProviderRecovery
 from sbxloop.sbx import registries
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
-from sbxloop.sbx.provision import Provisioner
+from sbxloop.sbx.provision import ContinueBranch, Provisioner
 from sbxloop.sbx.sandbox import SBXLOOP_DIR
 from sbxloop.verifylint import services_evidence
 from sbxloop.worker.client import WorkerClient
+from sbxloop_worker.protocol import JobRequest
 
 log = get_logger(__name__)
 
@@ -475,6 +483,7 @@ class LoopEngine:
         self._select_repo(repo)
         if kind == "workload":
             self.config = self.config.for_workload_profile(profile)
+            self.config = self.config.model_copy(update={"run_model_repo": repo or ""})
         granted = [c.name for c in self.config.credentials_named(credentials)]
         self.store.create_run(
             run_id, outcome, self.config.model_dump_json(), credentials=granted, kind=kind
@@ -524,7 +533,7 @@ class LoopEngine:
         github = self.config.github.for_repo(repo, workspace=self.config.workspace_for_repo(repo))
         self.config = self.config.model_copy(update={"github": github})
 
-    def resume(self, run_id: str) -> RunResult:
+    def resume(self, run_id: str, *, release_provider_hold: bool = True) -> RunResult:
         """Continue a run from the last stage it committed.
 
         A run interrupted before it delivered anything re-enters its task
@@ -563,6 +572,19 @@ class LoopEngine:
             # earns its own or ends merged.
             self.store.set_run_reason(run_id, None)
         self._rehydrate_config(run_id)
+        recovery = ProviderRecovery(self.store, self.config.agent.backend)
+        if release_provider_hold and recovery.pending(run_id):
+            recovery.release()
+        recovery.check()
+        pending_chat: dict[str, str] = {}
+        for _, event in self.store.events(run_id, type_prefix="chat."):
+            message_id = event.data.get("message_id")
+            if event.type == "chat.provider_pending":
+                pending_chat[str(message_id)] = str(event.data["text"])
+            elif event.type == HostEventTypes.CHAT_REPLY:
+                pending_chat.pop(str(message_id), None)
+        for message_id, text in pending_chat.items():
+            self._chat_queue.put(ChatMessage(message_id, text))
         self.bus.emit(
             HostEventTypes.RUN_START,
             run_id,
@@ -623,7 +645,7 @@ class LoopEngine:
 
     def _rehydrate_config(self, run_id: str) -> None:
         """Adopt the config persisted when the run was created, so a resumed
-        run keeps its original rules (budgets, model, github toggles,
+        run keeps its original rules (budgets, backend, github toggles,
         workspace) even if the on-disk config changed — or the resume happens
         from a different directory — in between.
 
@@ -633,6 +655,8 @@ class LoopEngine:
         (``keep_sandboxes``, ``keep_on_failure``) also stay resume-time
         choices — they are operator intent about THIS attempt, not run
         identity, and flipping keep on to debug a crashing run must work.
+        Model settings refresh separately at each new phase from the original
+        config location; the run's explicit --model override remains pinned.
         Drift from the config this engine was built with is reported via a
         ``run.config_drift`` event, never applied silently.
         """
@@ -663,6 +687,9 @@ class LoopEngine:
             }
         )
         current = self.config
+        stored._model_env = current._model_env
+        if stored.model_source_dir is None:
+            stored.model_source_dir = current.model_source_dir
         if stored.workload.default is not None:
             # The run was pinned to a profile (#758): the live config under
             # that same profile is the fair comparison; a profile that is
@@ -673,7 +700,7 @@ class LoopEngine:
         if drift:
             message = (
                 "resuming with the run's original config; the current config "
-                "differs: " + "; ".join(drift)
+                "differs (model settings refresh before each new phase): " + "; ".join(drift)
             )
             log.warning("run.config_drift", run=run_id, drift=drift)
             self.bus.emit(HostEventTypes.RUN_CONFIG_DRIFT, run_id, message=message)
@@ -695,7 +722,12 @@ class LoopEngine:
         # config was narrowed to its repository, not an operator setting: it
         # differs from the live config by construction and says nothing about
         # drift.
-        ignore = {"github.enabled_repo_count"}
+        ignore = {
+            "github.enabled_repo_count",
+            "run_model_override",
+            "run_model_repo",
+            "model_source_dir",
+        }
         return [
             f"{key} (run: {stored_flat.get(key)!r}, current: {current_flat.get(key)!r})"
             for key in sorted(stored_flat.keys() | current_flat.keys())
@@ -715,13 +747,14 @@ class LoopEngine:
     ) -> RunResult:
         self._waited_s = 0.0
         deadline = self.clock() + self.config.budgets.max_wall_clock_s
+        ProviderRecovery(self.store, self.config.agent.backend).check()
         self._set_run_state(run_id, "provisioning")
         # A restart pins its clone to the branch the previous attempt pushed
         # BEFORE the workspace is cut (#600), so the agent starts from that
         # work, the review diff describes it, and the delivered tree is the
         # one the agent actually built. Pinning after provisioning would
         # only change where the result lands.
-        provisioner = Provisioner(self.sbx, self._provision_config(), self.bus)
+        provisioner = Provisioner(self.sbx, self.config, self.bus)
         # A resumed run's workspace is pinned from the runs table — never
         # recomputed from config, which would silently relocate it (#60).
         # The run's repository (its config was narrowed to it in
@@ -730,6 +763,8 @@ class LoopEngine:
         # run row so a resume re-provisions the same service sandbox — and
         # so is its kind (#755), which decides the sandboxes it gets.
         run_row = self.store.get_run(run_id)
+        provider_recovery = ProviderRecovery(self.store, self.config.agent.backend)
+        recovering_provider = provider_recovery.pending(run_id)
         credentials, kind = run_row.credentials, run_row.kind
         pair = provisioner.ensure_pair(
             run_id,
@@ -738,6 +773,8 @@ class LoopEngine:
             expects_mount=expects_mount,
             credentials=credentials,
             kind=kind,
+            continue_branch=self._continue_branch(),
+            **({"reuse_sandboxes": True} if recovering_provider else {}),
         )
         assert pair.workspace is not None
         self._confirm_prior_checkout(run_id, pair)
@@ -771,6 +808,7 @@ class LoopEngine:
                             "agent", self.config.github.repo, sandbox=pair.agent
                         ),
                     )
+                    agent.provider_recovery = provider_recovery
                     github = (
                         WorkerClient(
                             pair.github,
@@ -814,6 +852,10 @@ class LoopEngine:
                         if pair.service is not None
                         else None
                     )
+                    if service_client is not None:
+                        from sbxloop.worker.mcp import McpBroker
+
+                        agent.mcp_prepare = McpBroker(lambda: service_client).prepare
                     service = (
                         self._service_ops(
                             service_client,
@@ -821,17 +863,27 @@ class LoopEngine:
                             self.bus,
                             self.config.credentials_named(credentials),
                             self.config.credentialed_registries_for(self.config.github.repo),
-                            workdir=pair.service_workdir,
+                            workdir=pair.agent_workdir,
                             workspace=pair.workspace,
+                            agent=agent,
                         )
                         if service_client is not None
                         else None
                     )
                     if self.install_workers:
                         self._install_workers(run_id, pair, agent, github, service_client)
-                    if service is not None:
+                    dependencies_ready = recovering_provider and any(
+                        row.phase == "dependencies" and row.status == "ok"
+                        for row in self.store.phase_attempts(run_id)
+                    )
+                    if service is not None and not dependencies_ready:
                         self._fetch_dependencies(run_id, service)
-                    if kind == "code":
+                    setup_complete = recovering_provider and stage not in (
+                        None,
+                        "created",
+                        "provisioning",
+                    )
+                    if kind == "code" and not setup_complete:
                         # `setup_commands` prepare a cloned checkout; a
                         # workload has none to prepare (#755).
                         self._run_setup_commands(run_id, pair, agent)
@@ -856,11 +908,13 @@ class LoopEngine:
                         # host through the service sandbox.
                         host_tools=service.tool_specs() if service is not None else (),
                         tool_handler=service.handler(phase="build" if kind == "code" else "execute")
-                        if service is not None
+                        if service is not None and service.tool_specs()
                         else None,
                         # The judge's tool digest is read off the bus (#756);
                         # a code run's phases never ask for one.
                         bus=self.bus if kind == "workload" else None,
+                        session_models=self.store.session_models(run_id),
+                        store=self.store,
                     )
                     # Replay persisted chat guidance (steer_run verdicts)
                     # so a resumed run keeps the direction the user set.
@@ -905,6 +959,15 @@ class LoopEngine:
                         # still alive here, and partial artifacts beat none.
                         self._harvest(run_id, pair, kind)
                         self._report_artifacts(run_id, pair, kind)
+                except ProviderHeldError as exc:
+                    # Covers dependency preparation as well as code,
+                    # workload and steering phases. Preserve the live VM.
+                    state, reason = "provider_held", str(exc)
+                    pair.keep = True
+                    self.store.set_run_kept(run_id, "provider")
+                    self._harvest(run_id, pair, kind)
+                    if self._cancel_event.is_set():
+                        self._check_cancelled_and_clock(run_id, deadline)
                 except SbxloopError:
                     # Infra failures (install, worker, sbx) are exactly what
                     # gets diagnosed in-sandbox; decide keep before pair exit.
@@ -936,6 +999,8 @@ class LoopEngine:
             )
         if reason:
             self.store.set_run_reason(run_id, reason)
+        if recovering_provider and state != "provider_held" and not pair.keep:
+            self.store.set_run_kept(run_id, None)
         self._set_run_state(run_id, state)
         run = self.store.get_run(run_id)
         tasks = self.store.get_tasks(run_id)
@@ -1017,18 +1082,14 @@ class LoopEngine:
             installs.append(partial(github.install, extras="", expect_prebaked=prebaked_expected))
         if service is not None:
             roles.append("service")
-            fetch_languages = registries.languages(
-                self.config.credentialed_registries_for(self.config.github.repo)
-            )
             installs.append(
                 partial(
                     service.install,
                     extras="",
-                    ensure_dev_tools=bool(fetch_languages),
-                    languages=fetch_languages,
-                    versions={
-                        k: v for k, v in pair.languages.versions.items() if k in fetch_languages
-                    },
+                    ensure_dev_tools=False,
+                    apt_packages=["git"]
+                    if self.config.credentialed_registries_for(self.config.github.repo)
+                    else [],
                     expect_prebaked=prebaked_expected,
                 )
             )
@@ -1074,23 +1135,121 @@ class LoopEngine:
                 ),
             )
 
+        from sbxloop.modelcatalog import refresh_after_provision
+
+        refresh_after_provision(self.config)
+
     def _fetch_dependencies(self, run_id: str, service: ServiceOps) -> None:
-        """The setup-time fetch (#766): one ``service.fetch`` per credentialed
-        ecosystem the workspace has a manifest for, so the agent's first
-        offline install finds its dependencies in the shared cache. A
-        non-zero exit fails provisioning the way a failed setup command
-        does — the run cannot build without its dependencies, and the
-        event carries the package manager's output."""
-        for kind in service.kinds:
-            manifests = service.manifests(kind)
-            if not manifests:
-                continue
-            result = service.fetch(kind, manifests=manifests, phase="setup")
-            if result["exit_code"] != 0:
-                tail = result["output"][-2000:]
+        """Prepare dependencies in the agent, then verify its offline cache.
+
+        The service only downloads data. Resolution and metadata hooks use
+        the agent's existing toolchains, with no registry credentials.
+        """
+        plans = {
+            kind: registries.fetch_plan(kind, "fetch", manifests=service.manifests(kind))
+            for kind in service.kinds
+            if service.manifests(kind)
+        }
+        if not plans:
+            return
+        agent = service.agent
+        if agent is None or service.workdir is None:
+            raise ProvisionError("dependency preparation requires the agent workspace")
+        commands = {kind: list(plan.argv) for kind, plan in plans.items()}
+        selection = model_for_phase(
+            refreshed_models(self.config), "build", repo=run_model_repo(self.config)
+        )
+        job = JobRequest(
+            job_id=new_job_id(),
+            run_id=run_id,
+            kind="agent.session",
+            prompt=(
+                "Prepare this workspace's private dependencies before setup commands run. "
+                "Follow the target repository's conventions. You have no registry secrets. "
+                "Use fetch_dependencies to discover registry indexes, read metadata and "
+                "download artifacts or Git bundles through the host. Resolve transitive "
+                "and build dependencies here, and populate the documented offline caches. "
+                "Package managers, metadata hooks, extraction and builds run only here. "
+                "Keep the dependency declarations and lockfile versions unchanged. "
+                "Do not create listeners, proxies, sockets or cross-sandbox channels. "
+                "After preparation, the host will run these commands in this sandbox's "
+                "offline environment: " + json.dumps(commands) + ". "
+                'Return JSON {"ready": true, "reason": "evidence"} only after verifying '
+                'those commands succeed; otherwise return {"ready": false, "reason": "blocker"}.'
+                + "\nUser guidance:\n"
+                + "\n".join(self.store.get_run_guidance(run_id))
+            ),
+            system_message="You prepare dependency data inside the agent sandbox.",
+            model=selection.model,
+            expect="json",
+            cwd=service.workdir,
+            timeout_s=self.config.budgets.per_job_timeout_s,
+            max_tool_calls=self.config.budgets.max_tool_calls_per_phase or None,
+            host_tools=[service.fetch_tool_spec()],
+            host_tool_timeout_s=service.fetch_timeout_s + 30,
+        )
+        self.bus.emit(
+            HostEventTypes.SANDBOX_FETCH,
+            run_id,
+            job_id=job.job_id,
+            verb="prepare",
+            phase="setup",
+            ecosystems=list(plans),
+        )
+        started = time.time()
+        result = agent.submit(
+            job,
+            tool_handler=service.handler(phase="dependencies"),
+            agent="dependency-resolver",
+            agent_phase="build",
+            model_source=selection.source,
+        )
+        output = result.output_json
+        ready = result.status == "ok" and isinstance(output, dict) and output.get("ready") is True
+        attempt = 1 + sum(
+            1 for row in self.store.phase_attempts(run_id) if row.phase == "dependencies"
+        )
+        self.store.record_phase(
+            run_id,
+            "dependencies",
+            task_id=None,
+            attempt=attempt,
+            status="ok" if ready else "error",
+            output_json=json.dumps(output),
+            started_at=started,
+            usage=result.usage,
+            turns=result.turns,
+        )
+        if result.status != "ok" or not isinstance(output, dict) or output.get("ready") is not True:
+            reason = (
+                output.get("reason", "no verified preparation result")
+                if isinstance(output, dict)
+                else "no verified preparation result"
+            )
+            raise ProvisionError(f"dependency preparation failed in the agent sandbox: {reason}")
+        for kind, plan in plans.items():
+            check = agent.submit(
+                JobRequest(
+                    job_id=new_job_id(),
+                    run_id=run_id,
+                    kind="shell.check",
+                    argv=list(plan.argv),
+                    cwd=service.workdir,
+                    timeout_s=service.fetch_timeout_s,
+                )
+            )
+            exit_code = check.exit_code if check.exit_code is not None else -1
+            self.bus.emit(
+                HostEventTypes.SANDBOX_FETCH,
+                run_id,
+                ecosystem=kind,
+                verb="verify-offline",
+                phase="setup",
+                exit_code=exit_code,
+            )
+            if check.status != "ok" or exit_code != 0:
                 raise ProvisionError(
-                    f"dependency fetch for {kind} failed in the service sandbox "
-                    f"(exit {result['exit_code']}): {' '.join(result['argv'])}\n{tail}"
+                    f"offline dependency verification for {kind} failed in the agent sandbox"
                 )
 
     def _run_setup_commands(self, run_id: str, pair: SandboxPair, agent: WorkerClient) -> None:
@@ -1296,22 +1455,18 @@ class LoopEngine:
             log.info("run.issues_disabled", run=run_id, repo=entry.repo)
         return probe.has_issues
 
-    def _provision_config(self) -> Config:
-        """The config provisioning sees: a restart's offered branch pinned
-        as ``sandbox.continue_branch`` so the run's clone is cut from the
-        previous attempt's work rather than from the base branch (#600).
+    def _continue_branch(self) -> ContinueBranch | None:
+        """A restart's offered branch, for provisioning to cut the run's
+        clone from the previous attempt's work rather than from the base
+        branch (#600) — passed as the provisioner's own parameter (#646),
+        not smuggled through the config.
 
-        The pin is *optional* — unlike a resume, a restart has published
+        The offer is *optional* — unlike a resume, a restart has published
         nothing of its own, so a branch that is gone from origin is a fresh
         start with a logged reason, not a failed provision.
         """
         branch = self._prior.branch
-        if not branch:
-            return self.config
-        sandbox = self.config.sandbox.model_copy(
-            update={"continue_branch": branch, "continue_branch_optional": True}
-        )
-        return self.config.model_copy(update={"sandbox": sandbox})
+        return ContinueBranch(branch, optional=True) if branch else None
 
     def _confirm_prior_checkout(self, run_id: str, pair: SandboxPair) -> None:
         """Keep the branch offer only if the workspace really landed on it.
@@ -1379,10 +1534,9 @@ class LoopEngine:
             if head_sha is None:
                 self._prior_unusable(p, branch, "the branch is no longer on origin")
                 return
-            if not self._shares_merge_base(ops, repo, base, branch):
-                self._prior_unusable(
-                    p, branch, f"the branch has no merge base with {base} (unrelated history)"
-                )
+            problem = self._merge_base_problem(ops, repo, base, branch)
+            if problem is not None:
+                self._prior_unusable(p, branch, problem)
                 return
             pr_number = self._prior_open_pr(ops, repo, branch, prior.pr_number)
         except (GithubOpsError, SbxloopError) as exc:
@@ -1420,21 +1574,31 @@ class LoopEngine:
         )
 
     @staticmethod
-    def _shares_merge_base(ops: GithubOps, repo: str, base: str, branch: str) -> bool:
-        """Whether ``branch`` and ``base`` have a common ancestor — the test
-        for "this branch is still about this repository's current line of
-        work". A comparison GitHub cannot make (404 on unrelated histories)
-        answers no rather than raising."""
-        try:
-            data = ops.raw("GET", f"/repos/{repo}/compare/{base}...{branch}")
-        except GithubOpsError as exc:
-            if exc.http_status == 404:
-                return False
-            raise
+    def _merge_base_problem(ops: GithubOps, repo: str, base: str, branch: str) -> str | None:
+        """Why ``branch`` cannot be continued on ``base`` — None when the
+        two share history, the test for "this branch is still about this
+        repository's current line of work".
+
+        GitHub's compare answers 404 both for unrelated histories and for
+        a base the token cannot see (#647), and the two mean different
+        things to an operator: one is a branch to abandon, the other a
+        permissions problem that would report as "unrelated history".
+        A miss is told apart by asking for the base ref itself.
+        """
+        data = raw_lookup(ops, "GET", f"/repos/{repo}/compare/{base}...{branch}")
+        if data is None:
+            if ops.ref_lookup(repo, f"heads/{base}") is None:
+                return (
+                    f"GitHub could not compare it with {base}: the base branch is not on "
+                    "origin, or the token cannot see it"
+                )
+            return f"the branch has no merge base with {base} (unrelated history)"
         if not isinstance(data, dict):
-            return False
+            return f"GitHub's comparison with {base} had no usable shape"
         merge_base = data.get("merge_base_commit")
-        return bool(isinstance(merge_base, dict) and merge_base.get("sha"))
+        if isinstance(merge_base, dict) and merge_base.get("sha"):
+            return None
+        return f"GitHub's comparison with {base} named no merge base"
 
     @staticmethod
     def _prior_open_pr(ops: GithubOps, repo: str, branch: str, recorded: int | None) -> int | None:
@@ -1525,7 +1689,21 @@ class LoopEngine:
                     return "completed", None
                 stage = "delivering"
             elif stage == "delivering":
-                self._stage_deliver(p)
+                try:
+                    self._stage_deliver(p)
+                except EmptyDeliveryError as exc:
+                    # Empty output cannot prove the request was satisfied.
+                    # Hand it over without automatically buying another run.
+                    return "blocked", (
+                        f"{exc}; automatic retries stopped. Check whether the request "
+                        "is already satisfied or intended changes were omitted or excluded."
+                    )
+                except DeliveryPermissionError as exc:
+                    # The credential cannot make this delivery and no
+                    # attempt would change that (#752): hand over with the
+                    # remedy named, the way a base rule the loop cannot
+                    # satisfy does — never a failed attempt to retry.
+                    return "blocked", str(exc)
                 self._stage_reconcile(p)
                 self._stage_reconcile_human(p)
                 stage = "reviewing"
@@ -1985,16 +2163,16 @@ class LoopEngine:
             )
         if mode != "advisory":
             return ""
-        latest: dict[tuple[str, str | None], sqlite3.Row] = {}
+        latest: dict[tuple[str, str | None], PhaseAttemptRecord] = {}
         for row in self.store.phase_attempts(run_id):
-            if row["phase"] in ("verify", "gate"):
-                latest[(str(row["phase"]), row["task_id"])] = row
+            if row.phase in ("verify", "gate"):
+                latest[(row.phase, row.task_id)] = row
         lines: list[str] = []
         for (phase, task_id), row in latest.items():
-            if row["status"] != "advisory":
+            if row.status != "advisory":
                 continue
             try:
-                data = json.loads(row["output_json"] or "{}")
+                data = json.loads(row.output_json or "{}")
             except ValueError:
                 continue
             if phase == "gate":
@@ -2159,7 +2337,7 @@ class LoopEngine:
         attempt = 1 + sum(
             1
             for row in self.store.phase_attempts(run_id)
-            if row["phase"] == "judge" and row["task_id"] is None
+            if row.phase == "judge" and row.task_id is None
         )
         started = time.time()
         results = phases.shell_batch(commands) if commands else []
@@ -2296,7 +2474,12 @@ class LoopEngine:
                 for rel in files:
                     dest = target / rel
                     dest.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(p.pair.workspace / rel, dest)
+                    with (
+                        repofiles.open_file(p.pair.workspace, rel) as source,
+                        dest.open("wb") as out,
+                    ):
+                        shutil.copyfileobj(source, out)
+                        os.fchmod(out.fileno(), os.fstat(source.fileno()).st_mode & 0o777)
             else:
                 self._copy_out(p.pair, target, files)
         return target, [str(target / rel) for rel in files]
@@ -2354,6 +2537,7 @@ class LoopEngine:
             title=pr_title,
             commit_message=commit_message,
             authored_body=sinks.pr_body(tasks, run.pr_title, carried),
+            workflows_write_granted=self._workflows_write_granted(p),
         )
         label = sinks.result_label(self.config.workload.result_label)
         try:
@@ -2441,7 +2625,7 @@ class LoopEngine:
         self._set_run_state(run_id, "gating")
         gate = phases.project_gate()
         mode = self._verify_mode
-        attempt = 1 + sum(1 for row in self.store.phase_attempts(run_id) if row["phase"] == "gate")
+        attempt = 1 + sum(1 for row in self.store.phase_attempts(run_id) if row.phase == "gate")
         started = time.time()
         if not gate or mode == "ci-only":
             # Under `ci-only` (#682) the gate is the pull request's checks:
@@ -2520,6 +2704,27 @@ class LoopEngine:
         # (bounded: every round spends the CI budget).
         return self._stage_gate(p)
 
+    def _workflows_write_granted(self, p: Pipeline) -> Callable[[], bool | None]:
+        """Whether the run's credential may deliver a workflow file (#752),
+        answered lazily — the delivery asks only when its plan carries one.
+        An App's grant map (from the mint, cached on the token source) or
+        a classic PAT's scopes say; a fine-grained PAT says nothing
+        (``None``) and GitHub's 403 decides at the tree."""
+
+        def check() -> bool | None:
+            permissions = (
+                p.provisioner.gh_app_permissions(p.repo) if p.provisioner is not None else None
+            )
+            scopes = None
+            if permissions is None and p.ops is not None:
+                try:
+                    scopes = p.ops.token_scopes()
+                except GithubOpsError:
+                    scopes = None
+            return workflows_write_granted(app_permissions=permissions, scopes=scopes)
+
+        return check
+
     def _stage_deliver(self, p: Pipeline) -> None:
         """Open the pull request, or refresh it: the same branch every round.
 
@@ -2576,6 +2781,7 @@ class LoopEngine:
             commit_message=commit_message,
             authored_body=authored_body,
             verification=self._verification_note(run_id),
+            workflows_write_granted=self._workflows_write_granted(p),
         )
         data = ops.pr_get(repo, pr.number)
         head = data.get("head")
@@ -2719,6 +2925,11 @@ class LoopEngine:
         round_no = len(rounds) + 1
         diff = self._diff_for_review(p, run.head_sha)
         started = time.time()
+        phases.issue_lookup = (
+            IssueLookup(ops, repo, run_id, self.store)
+            if self.config.landing.followups == "issues" and p.issues_enabled is not False
+            else None
+        )
         verdict = phases.review(
             diff=diff,
             pr_number=run.pr_number,
@@ -2727,6 +2938,7 @@ class LoopEngine:
             history=render_review_history(rounds),
             refuted=closed_anchors(rounds),
             verification=self._verification_note(run_id),
+            head_sha=run.head_sha,
         )
         # Round n+1's word on a finding an earlier round raised belongs in
         # that finding's own thread, not restated in a fresh review body
@@ -2746,6 +2958,23 @@ class LoopEngine:
         posted_findings: tuple[PostedFinding, ...] = ()
         posted_review_id: int | None = None
         comments = posting.comments()
+        if comments:
+            try:
+                locations = ops.pr_review_locations(repo, run.pr_number, commit_id=run.head_sha)
+            except GithubOpsError as exc:
+                log.warning(
+                    "review.locations_unavailable",
+                    run=run_id,
+                    pr=run.pr_number,
+                    error=str(exc),
+                    hint="posting findings in the review body",
+                )
+                locations = {}
+            comments = [c for c in comments if any(c.line in h for h in locations.get(c.path, ()))]
+        inline_anchors = {f"{c.path}:{c.line}" for c in comments}
+        in_body = [f for f in posting.findings if f.anchor not in inline_anchors]
+        if in_body:
+            log.info("review.findings_in_body", run=run_id, pr=run.pr_number, findings=len(in_body))
         try:
             try:
                 if self._self_review(p, run.pr_number):
@@ -2757,7 +2986,7 @@ class LoopEngine:
                         repo,
                         run.pr_number,
                         verdict.event,
-                        review_body(posting, run_id=run_id, round=round_no),
+                        review_body(posting, run_id=run_id, round=round_no, in_body=in_body),
                         comments,
                     )
             except GithubOpsError:
@@ -3211,15 +3440,15 @@ class LoopEngine:
         """The most recent fix task's build report and its round number."""
         report, seen = "", []
         for row in self.store.phase_attempts(run_id):
-            if row["phase"] != "build" or not row["task_id"]:
+            if row.phase != "build" or not row.task_id:
                 continue
-            task_id = str(row["task_id"])
+            task_id = str(row.task_id)
             if not is_fix_task(task_id):
                 continue
             if task_id not in seen:
                 seen.append(task_id)
             try:
-                report = str(json.loads(row["output_json"] or "{}").get("report") or "")
+                report = str(json.loads(row.output_json or "{}").get("report") or "")
             except ValueError:
                 report = ""
         return report, len(seen)
@@ -3260,21 +3489,16 @@ class LoopEngine:
         """
         rounds: list[ReviewRound] = []
         for row in self.store.phase_attempts(run_id):
-            if row["phase"] == "review":
+            if row.phase == "review":
                 try:
-                    data = json.loads(row["output_json"] or "{}")
+                    data = json.loads(row.output_json or "{}")
                     verdict = ReviewVerdict.model_validate(data.get("verdict") or data)
                 except (ValueError, ValidationError):
                     continue
                 rounds.append(ReviewRound(len(rounds) + 1, verdict, ""))
-            elif (
-                row["phase"] == "build"
-                and rounds
-                and row["task_id"]
-                and is_fix_task(str(row["task_id"]))
-            ):
+            elif row.phase == "build" and rounds and row.task_id and is_fix_task(str(row.task_id)):
                 try:
-                    report = json.loads(row["output_json"] or "{}").get("report") or ""
+                    report = json.loads(row.output_json or "{}").get("report") or ""
                 except ValueError:
                     report = ""
                 last = rounds[-1]
@@ -3295,10 +3519,10 @@ class LoopEngine:
         with no review round at all has nothing to have failed, so True.
         """
         for row in reversed(self.store.phase_attempts(run_id)):
-            if row["phase"] != "review":
+            if row.phase != "review":
                 continue
             try:
-                data = json.loads(row["output_json"] or "{}")
+                data = json.loads(row.output_json or "{}")
             except ValueError:
                 return False
             review = data.get("review") if isinstance(data, dict) else None
@@ -3527,7 +3751,7 @@ class LoopEngine:
     def _merge_base_into_clone(self, p: Pipeline) -> hostgit.MergeResult | None:
         """Before a fix round: bring the current base into the run's clone,
         so the fixer works on what CI actually judges and a conflict is
-        real in its working tree (see :func:`hostgit.merge_from_base`).
+        real in its working tree. Git mutations run inside the agent VM.
         None when the run has no mounted clone to merge into; a fetch/merge
         failure is logged and the round proceeds on the tree as it is."""
         workspace = p.pair.workspace
@@ -3535,7 +3759,12 @@ class LoopEngine:
             return None
         base = self._base_branch(p)
         try:
-            result = hostgit.merge_from_base(workspace, base)
+            assert p.provisioner is not None
+            url = f"{self.config.github.web_url}/{p.repo}.git"
+            with hostgit.base_bundle(
+                workspace, url, base, token=p.provisioner.clone_token(p.repo)
+            ) as (sha, bundle):
+                result = p.phases.merge_from_base(base, base_sha=sha, bundle=bundle)
         except SbxloopError:
             log.warning("fix.merge_base_failed", run=p.run_id, base=base, exc_info=True)
             return None
@@ -3773,6 +4002,7 @@ class LoopEngine:
         already = self._recorded_followups(run_id)
         filed: list[tuple[str, str]] = []
         listed: list[str] = []
+        reused: list[tuple[str, str]] = []
         started = time.time()
         mode: str = cfg.followups
         downgraded = False
@@ -3781,7 +4011,9 @@ class LoopEngine:
         try:
             if mode == "issues":
                 try:
-                    self._file_followup_issues(p, run, candidates, already, filed, started)
+                    self._file_followup_issues(
+                        p, run, candidates, already, filed, listed, reused, started
+                    )
                 except GithubOpsError as exc:
                     if exc.http_status != 410:
                         raise
@@ -3811,8 +4043,10 @@ class LoopEngine:
         if not filed and not listed:
             return
         extra: dict[str, Any] = {}
+        if reused:
+            extra["reused"] = [{"title": t, "url": u} for t, u in reused]
         if downgraded:
-            extra = {"downgraded_from": "issues", "reason": "issues_disabled"}
+            extra.update(downgraded_from="issues", reason="issues_disabled")
         log.info(
             "run.followups",
             run=run_id,
@@ -3839,6 +4073,8 @@ class LoopEngine:
         candidates: Sequence[Candidate],
         already: dict[str, str],
         filed: list[tuple[str, str]],
+        listed: list[str],
+        reused: list[tuple[str, str]],
         started: float,
     ) -> None:
         """The ``issues`` mode of :meth:`_file_followups`: one issue per
@@ -3848,47 +4084,78 @@ class LoopEngine:
         ops, repo, run_id = p.ops, p.repo, p.run_id
         assert ops is not None and repo is not None and run.pr_number is not None
         cfg = self.config.landing
-        on_repo = self._filed_on_repo(ops, repo, cfg.followup_label, run_id)
-        self._ensure_label(ops, repo, cfg.followup_label)
+        try:
+            on_repo = self._filed_on_repo(ops, repo, cfg.followup_label, run_id)
+            lookup_error = ""
+        except (GithubOpsError, LookupUnavailable):
+            on_repo = {}
+            lookup_error = "existing follow-up issues could not be read"
+        lookup = IssueLookup(ops, repo, run_id, self.store)
+        held: list[tuple[Candidate, str]] = []
+        label_ready = False
+        url: str | None
         for cand in candidates:
             title = cand.followup.title.strip()
             if cand.key in already:
                 filed.append((title, already[cand.key]))
+                reused.append((title, already[cand.key]))
                 continue
-            if cand.key in on_repo:
+            existing = True
+            regression_of_match = cand.followup.decision == "regression" and on_repo.get(
+                cand.key, ""
+            ).endswith(f"/issues/{cand.followup.existing_issue}")
+            if cand.key in on_repo and not regression_of_match:
                 url = on_repo[cand.key]
             else:
-                ref = ops.issue_create(
-                    repo,
-                    title,
-                    issue_body(
-                        cand,
-                        run_id=run_id,
-                        repo=repo,
-                        pr_number=run.pr_number,
-                        pr_url=run.pr_url or "",
-                        closes=self.config.github.deliver_closes,
-                        trigger_label=self.trigger_label,
-                    ),
-                    labels=[cfg.followup_label],
-                )
-                url = ref.url
+                try:
+                    if lookup_error:
+                        raise LookupUnavailable(lookup_error)
+                    url = lookup.check(cand.followup)
+                except (GithubOpsError, LookupUnavailable) as exc:
+                    held.append((cand, str(exc)))
+                    listed.append(title)
+                    continue
+                if url is None:
+                    if not label_ready:
+                        self._ensure_label(ops, repo, cfg.followup_label)
+                        label_ready = True
+                    ref = ops.issue_create(
+                        repo,
+                        title,
+                        issue_body(
+                            cand,
+                            run_id=run_id,
+                            repo=repo,
+                            pr_number=run.pr_number,
+                            pr_url=run.pr_url or "",
+                            closes=self.config.github.deliver_closes,
+                            trigger_label=self.trigger_label,
+                        ),
+                        labels=[cfg.followup_label],
+                    )
+                    url = ref.url
+                    on_repo[cand.key] = url
+                    existing = False
             filed.append((title, url))
+            if existing:
+                reused.append((title, url))
             self.store.record_phase(
                 run_id,
                 "followup",
                 task_id=None,
                 attempt=len(already) + len(filed),
-                status="filed",
+                status="reused" if existing else "filed",
                 output_json=json.dumps({"key": cand.key, "title": title, "url": url}),
                 started_at=started,
             )
             already[cand.key] = url
-        if filed and "(comment)" not in already:
+        if (filed or held) and "(comment)" not in already:
             # One pointer on the PR, so the human sees them without opening
             # the tracker.
             ops.pr_issue_comment(
-                repo, run.pr_number, checklist_comment(candidates, run_id=run_id, filed=filed)
+                repo,
+                run.pr_number,
+                checklist_comment(candidates, run_id=run_id, filed=filed, held=held),
             )
             self._record_followup_comment(run_id, len(already) + 1, len(filed), started)
 
@@ -3910,10 +4177,10 @@ class LoopEngine:
         ``"(comment)"`` when the checklist comment was posted)."""
         out: dict[str, str] = {}
         for row in self.store.phase_attempts(run_id):
-            if row["phase"] != "followup":
+            if row.phase != "followup":
                 continue
             try:
-                data = json.loads(row["output_json"] or "{}")
+                data = json.loads(row.output_json or "{}")
             except ValueError:
                 continue
             key = str(data.get("key") or "")
@@ -3923,24 +4190,41 @@ class LoopEngine:
 
     @staticmethod
     def _filed_on_repo(ops: GithubOps, repo: str, label: str, run_id: str) -> dict[str, str]:
-        """Follow-ups already on the repository for this run, by key — the
-        crash-window dedup (filed, died before recording). Read from the
+        """Follow-ups across runs, by key; this run wins for crash recovery.
+        Read from the
         label's issue list, which unlike search is not eventually consistent."""
         out: dict[str, str] = {}
-        try:
-            data = raw_pages(ops, f"/repos/{repo}/issues?labels={quote(label, safe='')}&state=all")
-        except GithubOpsError:
-            log.warning("run.followups_list_failed", repo=repo, exc_info=True)
-            return out
+        data: list[Any] = []
+        for page in range(1, 101):
+            chunk = ops.raw(
+                "GET",
+                f"/repos/{repo}/issues?labels={quote(label, safe='')}&state=all"
+                f"&per_page=100&page={page}",
+            )
+            if not isinstance(chunk, list):
+                raise LookupUnavailable("follow-up listing was malformed")
+            data.extend(chunk)
+            if len(chunk) < 100:
+                break
+        else:
+            raise LookupUnavailable("follow-up listing was incomplete")
         for issue in data:
             # The issues endpoint lists pull requests too (#631): a labelled
             # PR carrying an old marker in its body must not read as "this
             # follow-up was filed" and suppress the issue.
-            if not isinstance(issue, dict) or issue.get("pull_request"):
+            if not isinstance(issue, dict):
+                raise LookupUnavailable("follow-up listing contained a malformed issue")
+            if "pull_request" in issue:
                 continue
             found = marker_key(str(issue.get("body") or ""))
-            if found and found[0] == run_id:
-                out[found[1]] = str(issue.get("html_url") or "")
+            if found:
+                url = str(issue.get("html_url") or "")
+                if not url:
+                    raise LookupUnavailable("existing follow-up has no issue URL")
+                if found[0] == run_id:
+                    out[found[1]] = url
+                else:
+                    out.setdefault(found[1], url)
         return out
 
     @staticmethod
@@ -4101,18 +4385,16 @@ class LoopEngine:
             resume_session_id=resume,
         )
         if resume and result.session_id != resume:
-            # The backend falls back to a fresh session when a resume fails
-            # rather than failing the job. It cannot say so (no logger in
-            # the worker), but a different id coming back is the tell — and
-            # without this line a silently-never-resuming pipeline would
-            # look identical to a working one.
+            # A model change or an SDK resume miss can start a fresh session.
+            # The model-change reason is logged at dispatch; either way the
+            # prior report carried the context into the new session.
             log.info(
                 "phase.resume_missed",
                 run=run_id,
                 task=task.spec.id,
                 requested=resume,
                 got=result.session_id,
-                hint="the SDK could not resume; the prior report still carried the context",
+                hint="continuing in a fresh session; the prior report carried the context",
             )
         task.session_id = result.session_id
         if result.session_id:
@@ -4120,6 +4402,7 @@ class LoopEngine:
         builder_report = clip(result.output_text)
         spend = phases.drain_spend()
         payload: dict[str, Any] = {"report": builder_report, "session_id": result.session_id}
+        payload["requested_model"] = phases.session_models.get(result.session_id or "")
         # A fix round's report is the per-finding answer to the review that
         # seeded it. Parse it once, here, and persist it with the build row:
         # the reconciliation that gets replied onto the PR threads must
@@ -4218,7 +4501,7 @@ class LoopEngine:
                 task=task.spec.id,
                 requested=resume,
                 got=result.session_id,
-                hint="the SDK could not resume; the prior report still carried the context",
+                hint="continuing in a fresh session; the prior report carried the context",
             )
         task.session_id = result.session_id
         if result.session_id:
@@ -4236,6 +4519,7 @@ class LoopEngine:
                     "report": report,
                     "session_id": result.session_id,
                     "tools": digest.render(),
+                    "requested_model": phases.session_models.get(result.session_id or ""),
                     "tool_calls": digest.total,
                 }
             ),
@@ -4556,7 +4840,7 @@ class LoopEngine:
                     f"verify command suspect: `{repeated[0].command}` failed identically again"
                 ),
             )
-            self._register_verify_suspect(run_id, task, repeated)
+            self._register_verify_suspect(run_id, phases, task, repeated)
             return
         self._register_revision(run_id, task, feedback, verify_failure=True)
 
@@ -4578,19 +4862,29 @@ class LoopEngine:
         return repeated
 
     def _register_verify_suspect(
-        self, run_id: str, task: TaskRecord, repeated: Sequence[VerifyFailure]
+        self,
+        run_id: str,
+        phases: PhaseRunner,
+        task: TaskRecord,
+        repeated: Sequence[VerifyFailure],
     ) -> None:
-        """Spend one fresh-session attempt on the only thing the loop can do.
+        """Escalate a check that cannot pass, then fall back to a fresh session.
 
         The verify commands are decomposer-authored and the builder is told
-        it cannot edit them, so this does NOT order a re-author (the review
-        of #509 was right that nothing in the loop re-runs decompose). What
-        it does is give the one remaining lever a fresh session: an approach
-        whose layout and setup satisfy the command exactly as written. The
-        feedback also tells the builder to report the command as unpassable
-        if it cannot be satisfied, and ``verify_suspect`` is carried into the
-        run's failure reason (``_failure_reason``) so the diagnosis reaches a
-        human rather than dying in the task row.
+        it cannot edit them. That used to be the end of the story: nothing in
+        the loop re-ran decompose, so the only lever was to give the builder
+        a fresh session and hope an approach existed that satisfied the
+        command as written. When none did — because the command was asking
+        for something no arrangement of the workspace could give — the run
+        was abandoned with the work finished and every other check green
+        (field failure rkbgkf32a).
+
+        So the check is now escalated first: one bounded re-author that sees
+        that command and no other, and may replace it, drop it, or let it
+        stand. Only when it stands (or the budget is spent, or it declines)
+        does the old fresh-session replan run, and after that the task fails
+        with ``verify_suspect`` carried into the run's failure reason
+        (``_failure_reason``) so the diagnosis reaches a human.
 
         Deliberately does NOT increment ``revisions``: the whole point of
         the signal is that identical revisions are wasted (field run
@@ -4598,12 +4892,77 @@ class LoopEngine:
         ``uv run mypy packages``).
         """
         task.last_feedback = verify_suspect_feedback(list(repeated))
+        if self._reauthor_verify(run_id, phases, task, repeated[0]):
+            return
         if task.replans >= self.config.budgets.max_replans_per_task:
             self._set_task_state(run_id, task, "failed")
             return
         task.replans += 1
         self._discard_session(task)
         self._set_task_state(run_id, task, "executing")
+
+    def _reauthor_verify(
+        self,
+        run_id: str,
+        phases: PhaseRunner,
+        task: TaskRecord,
+        failure: VerifyFailure,
+    ) -> bool:
+        """Try to change the check instead of the work; True if it changed.
+
+        The task stays in ``verifying`` on success rather than going back
+        through BUILD. The build already passed — only the exam changed — and
+        a run's cost scales with turns, so a build turn that would find
+        nothing to do is a turn not worth spending.
+
+        ``verify_suspect`` is cleared with the command that earned it. The
+        fingerprints are left alone: they are keyed by command text, so the
+        replacement starts clean anyway, and a *different* command that
+        starts repeating is a new suspect that deserves its own escalation.
+        """
+        budget = self.config.budgets.max_verify_reauthors_per_task
+        if task.verify_reauthors >= budget:
+            return False
+        try:
+            answer = phases.reauthor_verify(
+                task,
+                suspect_command=failure.command,
+                suspect_output=failure.output,
+                builder_report=self._prior_attempt_report(run_id, task),
+            )
+        except (InvalidOutputTwice, WorkerError) as exc:
+            # A re-author that cannot answer must not take the run with it:
+            # the fallback below is exactly the behaviour that existed before
+            # this phase did.
+            log.warning(
+                "verify.reauthor_failed", run=run_id, task=task.spec.id, error=str(exc)[:300]
+            )
+            return False
+        if answer.verdict == "keep":
+            return False
+        task.verify_reauthors += 1
+        replacement = answer.command.strip() if answer.verdict == "replace" else ""
+        task.spec.verify_commands = [
+            replacement if command == failure.command else command
+            for command in task.spec.verify_commands
+            if replacement or command != failure.command
+        ]
+        task.verify_suspect = False
+        self.bus.emit(
+            HostEventTypes.VERIFY_REAUTHORED,
+            run_id,
+            task_id=task.spec.id,
+            verdict=answer.verdict,
+            command=failure.command,
+            replacement=replacement,
+            reason=answer.reason,
+            text=(
+                f"verify check {answer.verdict}d on task {task.spec.id}: "
+                f"`{failure.command}` — {answer.reason}"
+            ),
+        )
+        self.store.update_task(run_id, task)
+        return True
 
     @staticmethod
     def _discard_session(task: TaskRecord) -> None:
@@ -4715,6 +5074,15 @@ class LoopEngine:
                 verdict = phases.steer(
                     message.text, tasks=self.store.get_tasks(run_id), task=task, stage=stage
                 )
+            except ProviderHeldError:
+                self._steer_attempts -= 1
+                self.bus.emit(
+                    "chat.provider_pending",
+                    run_id,
+                    message_id=message.message_id,
+                    text=message.text,
+                )
+                raise
             except WorkerError as exc:
                 log.warning(
                     "run.steer_failed",

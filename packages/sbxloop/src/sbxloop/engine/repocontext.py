@@ -17,6 +17,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from sbxloop import repofiles
+
 __all__ = [
     "CONVENTION_FILES",
     "RepoContext",
@@ -55,11 +57,9 @@ class RepoContext:
     clipped: bool  # the block was cut at the budget and says so
 
 
-def _read(path: Path) -> str | None:
+def _read(root: Path, name: str) -> str | None:
     try:
-        if not path.is_file():
-            return None
-        return path.read_text(encoding="utf-8", errors="replace")
+        return repofiles.read_text(root, name)
     except OSError:
         return None
 
@@ -86,7 +86,7 @@ def read_repo_context(workspace: Path | None, *, max_chars: int) -> RepoContext:
     seen: dict[tuple[object, str], int] = {}
     for name in CONVENTION_FILES:
         path = workspace / name
-        text = _read(path)
+        text = _read(workspace, name)
         if text is None or not text.strip():
             continue
         try:

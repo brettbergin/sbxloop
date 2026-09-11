@@ -39,18 +39,20 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    PrivateAttr,
     ValidationError,
     ValidationInfo,
     field_validator,
     model_validator,
 )
 
-from sbxloop.backends import ANTHROPIC_TOKEN_ENV, COPILOT_TOKEN_ENV
+from sbxloop.backends import ANTHROPIC_TOKEN_ENV, COPILOT_TOKEN_ENV, OPENAI_TOKEN_ENV
 from sbxloop.errors import ConfigError
 from sbxloop.ids import DEFAULT_BRANCH_PREFIX
 from sbxloop.log import LogFormat, LogLevel, get_logger
 from sbxloop.paths import SbxloopHome, home_root_from_env, resolve_home_root
 from sbxloop.toolchains import DEFAULT_LANGUAGES, normalize_language, supported_languages
+from sbxloop_worker.protocol import McpServerSpec, McpTransport
 
 log = get_logger(__name__)
 
@@ -67,7 +69,14 @@ RESERVED_ENV_KEYS = frozenset({"worker_backend", "echo_script", "home"})
 # clobber the run's credential or be clobbered silently, and neither is a
 # setting.
 LOOP_MANAGED_ENV = frozenset(
-    {"GH_TOKEN", "GITHUB_TOKEN", "GH_REPO", COPILOT_TOKEN_ENV, ANTHROPIC_TOKEN_ENV}
+    {
+        "GH_TOKEN",
+        "GITHUB_TOKEN",
+        "GH_REPO",
+        COPILOT_TOKEN_ENV,
+        ANTHROPIC_TOKEN_ENV,
+        OPENAI_TOKEN_ENV,
+    }
 )
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
@@ -150,6 +159,26 @@ _UNSET = _Unset()
 
 class _ConfigModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
+
+
+class AgentModels(_ConfigModel):
+    """Sparse model overrides, keyed by agent phase rather than tool role."""
+
+    decompose: str | None = None
+    build: str | None = None
+    review: str | None = None
+    steer: str | None = None
+    reauthor_verify: str | None = None
+    operator_plan: str | None = None
+    operator_execute: str | None = None
+    operator_judge: str | None = None
+
+    @field_validator("*")
+    @classmethod
+    def _nonblank(cls, value: str | None) -> str | None:
+        if value is not None and not value.strip():
+            raise ValueError("a model override must not be blank; omit it to inherit")
+        return value
 
 
 class SandboxConfig(_ConfigModel):
@@ -378,10 +407,10 @@ class RegistryConfig(_ConfigModel):
     `auth_env` the registry is the agent sandbox's own: `host` joins its
     allowlist and the client file lands in its `$HOME`. With `auth_env`
     (the daemon-environment variable holding the credential) the registry
-    belongs to the SERVICE sandbox (#766): host, credential and client file
-    go there, the dependencies are fetched there into a cache in the shared
-    workspace, and the agent sandbox — which never sees the credential —
-    builds offline from that cache.
+    belongs to the SERVICE sandbox: it downloads metadata and artifacts
+    using fixed operations. The host copies the data to the agent, where
+    native resolution and offline cache preparation run without registry
+    credentials. The service does not use package-manager client files.
     """
 
     kind: RegistryKind
@@ -488,6 +517,16 @@ class RegistryConfig(_ConfigModel):
 
 _CREDENTIAL_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _HEADER_NAME_RE = re.compile(r"^[A-Za-z0-9!#$%&'*+.^_`|~-]+$")
+# An MCP server's name reaches the model as part of every tool it exposes
+# (`mcp__<server>__<tool>`), so it is held to the protocol's tool alphabet.
+_MCP_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+# Credential shapes an operator might paste into an MCP command line. Not a
+# secret scanner — a guard rail against the one mistake that would put a
+# real token into events, logs and `sbx` argv.
+_SECRET_SHAPED_RE = re.compile(
+    r"(?:^|[^A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{16,}|github_pat_[A-Za-z0-9_]{20,}"
+    r"|sk-ant-[A-Za-z0-9_-]{16,}|sk-[A-Za-z0-9]{32,}|xox[baprs]-[A-Za-z0-9-]{10,})"
+)
 
 
 class CredentialConfig(_ConfigModel):
@@ -723,6 +762,7 @@ class RepoConfig(_ConfigModel):
     """
 
     repo: str
+    agent_models: AgentModels = Field(default_factory=AgentModels)
     # The host checkout of *this* repository that runs clone and refresh.
     # None falls back to the legacy ``[sandbox] workspace``, but only when
     # that checkout demonstrably belongs to this repo (see
@@ -1288,6 +1328,13 @@ class Limits(_ConfigModel):
 class Budgets(_ConfigModel):
     max_revisions_per_task: int = 2
     max_replans_per_task: int = 1
+    # How many of a task's verify commands may be re-authored after proving
+    # unpassable — the same check failing identically across attempts and
+    # approaches, so no further work on the code can change it. The
+    # re-author sees only that one command and may replace it, drop it, or
+    # let it stand; the rest of the task's exam is untouchable. 0 turns the
+    # escalation off, and a suspect check fails the task as it did before.
+    max_verify_reauthors_per_task: int = Field(default=1, ge=0)
     max_tasks: int = 20
     max_wall_clock_s: float = 7200.0
     per_job_timeout_s: float = 1800.0
@@ -1843,6 +1890,93 @@ RETIRED_PATH_KEYS: dict[str, str] = {
 }
 
 
+#: Which session roles an MCP server may be given to. A critic is
+#: deliberately absent from the default: a read-only review session reaching
+#: a third-party service is a capability nobody asked for, and both backends
+#: already fail closed on an unknown MCP tool in read-only mode.
+McpRole = Literal["planner", "builder", "critic", "operator", "concierge"]
+DEFAULT_MCP_ROLES: tuple[McpRole, ...] = ("builder", "operator")
+
+
+class McpConfig(_ConfigModel):
+    """One external MCP server the agent sandbox may be given.
+
+    The extensibility point: an operator names a server here and every
+    session whose role is listed gets it, on whichever ``[agent] backend``
+    is configured. The host resolves this into the neutral
+    ``McpServerSpec`` the worker protocol carries, and each backend
+    materialises that into its own SDK's dialect.
+
+    ``hosts`` are the domains the server needs to reach. They join the agent
+    sandbox's allowlist, which is otherwise least-privilege and would refuse
+    them: a server whose host is not declared here fails closed at its first
+    request, which reads as a hang rather than a misconfiguration, so this
+    is not optional bookkeeping.
+
+    `credential` names a service-only credential. Such servers require
+    HTTPS Streamable HTTP and are exposed through fixed host-mediated tool
+    calls. Native credential-free servers retain the SDK transports.
+    """
+
+    name: str
+    transport: McpTransport = "stdio"
+    command: list[str] = Field(default_factory=list)
+    url: str = ""
+    hosts: list[str] = Field(default_factory=list)
+    credential: str | None = None
+    roles: list[McpRole] = Field(default_factory=lambda: list(DEFAULT_MCP_ROLES))
+    description: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, value: str) -> str:
+        if not _MCP_NAME_RE.match(value):
+            raise ValueError(
+                "mcp[].name must be letters, digits, '-' or '_' (it becomes the MCP "
+                f"server name the model sees), got {value!r}"
+            )
+        return value
+
+    @field_validator("hosts")
+    @classmethod
+    def _check_hosts(cls, value: list[str]) -> list[str]:
+        hosts = [host.strip().lower() for host in value]
+        bad = [host for host in hosts if not _HOST_RE.match(host)]
+        if bad:
+            raise ValueError(f"mcp[].hosts must be bare hostnames, got {bad!r}")
+        return list(dict.fromkeys(hosts))
+
+    @field_validator("roles")
+    @classmethod
+    def _dedupe_roles(cls, value: list[McpRole]) -> list[McpRole]:
+        return list(dict.fromkeys(value))
+
+    @model_validator(mode="after")
+    def _check_transport(self) -> McpConfig:
+        if self.transport == "stdio":
+            if not self.command:
+                raise ValueError(f"mcp {self.name!r}: a stdio server needs a command")
+            if self.url:
+                raise ValueError(f"mcp {self.name!r}: a stdio server takes no url")
+        else:
+            if not self.url:
+                raise ValueError(f"mcp {self.name!r}: a {self.transport} server needs a url")
+            if self.command:
+                raise ValueError(f"mcp {self.name!r}: a {self.transport} server takes no command")
+        if not self.roles:
+            raise ValueError(f"mcp {self.name!r}: names no roles, so no session would get it")
+        # A credential in argv would reach events, logs and `sbx` arguments,
+        # which is the one thing secrets never do here.
+        for word in self.command:
+            if _SECRET_SHAPED_RE.search(word):
+                raise ValueError(
+                    f"mcp {self.name!r}: command carries what looks like a secret "
+                    f"({word!r}); declare a [[credentials]] entry and reference it with "
+                    "`credential`, which is delivered as environment instead"
+                )
+        return self
+
+
 class AgentConfig(_ConfigModel):
     """Which SDK runs the agent personas inside the agent sandbox (#533).
 
@@ -1851,13 +1985,16 @@ class AgentConfig(_ConfigModel):
     Claude Agent SDK — the Claude Code harness — and needs
     ``ANTHROPIC_API_KEY`` on the host; provisioning installs Node and the
     Claude Code CLI into the agent sandbox and allows ``api.anthropic.com``
-    egress. Either way the credential is injected into the agent sandbox
-    alone, and the top-level ``model`` key names the model the chosen
-    backend runs (``"auto"`` lets the backend pick its default).
+    egress. ``codex`` runs the Codex Python SDK and its bundled runtime with
+    ``OPENAI_API_KEY``, reaching ``api.openai.com``. The credential is
+    injected into the agent sandbox alone, and the top-level ``model`` key
+    names the model the chosen backend runs (``"auto"`` lets the backend
+    pick its default).
     An unknown value fails config loading with the accepted choices named.
     """
 
-    backend: Literal["copilot", "claude"] = "copilot"
+    backend: Literal["copilot", "claude", "codex"] = "copilot"
+    models: AgentModels = Field(default_factory=AgentModels)
 
 
 # Where a workload's result may go when the run publishes (#759 delivers
@@ -1930,6 +2067,30 @@ class WorkloadProfile(_ConfigModel):
     publish: WorkloadPublish = "auto"
     budgets: BudgetOverrides = Field(default_factory=BudgetOverrides)
     description: str = ""
+    # The language toolchains a workload's agent box is provisioned with
+    # (#801): empty by default — the operator persona needs its backend's
+    # runtime and nothing else, and `[sandbox] languages` (a code run's
+    # set) is not applied to a workload. Name entries here when the asks
+    # under this profile run code.
+    languages: list[str] = Field(default_factory=list)
+
+    @field_validator("languages")
+    @classmethod
+    def _check_languages(cls, value: list[str]) -> list[str]:
+        normalized: list[str] = []
+        bad: list[str] = []
+        for entry in value:
+            key = normalize_language(entry)
+            if key is None:
+                bad.append(entry)
+            elif key not in normalized:
+                normalized.append(key)
+        if bad:
+            raise ValueError(
+                f"unsupported workloads[].languages entries {bad}: "
+                f"choose from {list(supported_languages())}"
+            )
+        return normalized
 
     @field_validator("name")
     @classmethod
@@ -2008,6 +2169,13 @@ class ScheduleConfig(_ConfigModel):
     tick is still live, in which case the tick is skipped and said so. A
     tick is recorded at its due time: a late daemon does not shift the
     grid, and one down for several ticks catches up with one.
+
+    Schedules live in the daemon's database (#818): the concierge's
+    ``create_schedule`` and ``schedules add`` store one there, live from
+    the next tick. This model is that row's shape, and — as
+    ``[[schedules]]`` in sbxloop.toml — the legacy way to declare one: the
+    daemon imports a file entry into its database once and ignores the
+    file's copy after that (doctor says so).
     """
 
     name: str
@@ -2070,8 +2238,29 @@ class ScheduleConfig(_ConfigModel):
         return Cadence.parse(self.every, self.cron).describe()
 
 
+class TelemetryConfig(_ConfigModel):
+    """Host error reporting; the DSN value lives only in the environment."""
+
+    dsn_env: str = "GLITCHTIP_DSN"
+    environment: str = "production"
+
+    @field_validator("dsn_env")
+    @classmethod
+    def _dsn_env_name(cls, value: str) -> str:
+        _check_env_names([value], "telemetry.dsn_env")
+        return value
+
+
 class Config(_ConfigModel):
     model: str = "auto"
+    # Runtime provenance, not operator knobs. Persisted so CLI precedence
+    # and the original config location survive a resume from another cwd.
+    run_model_override: str | None = None
+    # None uses the selected GitHub repo; "" explicitly selects no repo.
+    run_model_repo: str | None = None
+    model_source_dir: Path | None = None
+    # Environment values (including secrets) never enter the snapshot.
+    _model_env: dict[str, str] | None = PrivateAttr(default=None)
     agent: AgentConfig = Field(default_factory=AgentConfig)
     # sbx --app-name. Empty (the default) shares the user's normal sbx
     # application state, so their `sbx login` and `sbx policy init balanced`
@@ -2102,13 +2291,17 @@ class Config(_ConfigModel):
     registries: list[RegistryConfig] = Field(default_factory=list)
     # The credentials a run may be granted (#765): held by a per-run service
     # sandbox and used through host-driven ops; never in the agent sandbox.
+    # MCP entries grant scoped tool access through that same service boundary.
     credentials: list[CredentialConfig] = Field(default_factory=list)
+    # External MCP servers the agent sessions may be given, by role.
+    mcp: list[McpConfig] = Field(default_factory=list)
     github: GithubConfig = Field(default_factory=GithubConfig)
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     budgets: Budgets = Field(default_factory=Budgets)
     limits: Limits = Field(default_factory=Limits)
     landing: LandingConfig = Field(default_factory=LandingConfig)
     daemon: DaemonConfig = Field(default_factory=DaemonConfig)
+    telemetry: TelemetryConfig = Field(default_factory=TelemetryConfig)
     chat: ChatConfig = Field(default_factory=ChatConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
@@ -2118,13 +2311,150 @@ class Config(_ConfigModel):
     # default; a code run ignores both.
     workloads: list[WorkloadProfile] = Field(default_factory=list)
     workload: WorkloadConfig = Field(default_factory=WorkloadConfig)
-    # Workloads the daemon asks for by itself, on a cadence (#761).
+    # Legacy (#818): schedules live in the daemon's database; an entry here
+    # is imported into it once on daemon start and then ignored.
     schedules: list[ScheduleConfig] = Field(default_factory=list)
 
     @field_validator("home", mode="after")
     @classmethod
     def _expand_home(cls, value: Path) -> Path:
         return value.expanduser()
+
+    @model_validator(mode="after")
+    def _check_mcp(self) -> Config:
+        """Everything about ``[[mcp]]`` that needs the whole config.
+
+        Fails closed at load rather than at provisioning: an MCP server that
+        names a credential nobody declared, or two servers fighting over one
+        env var, would otherwise surface inside a sandbox as a server that
+        silently did not start.
+        """
+        seen: set[str] = set()
+        for server in self.mcp:
+            if server.name in seen:
+                raise ValueError(f"two [[mcp]] entries are both named {server.name!r}")
+            seen.add(server.name)
+        by_env: dict[str, str] = {}
+        for server in self.mcp:
+            if server.credential is None:
+                continue
+            entry = self.credential(server.credential)
+            if entry is None:
+                known = ", ".join(c.name for c in self.credentials) or "none"
+                raise ValueError(
+                    f"mcp {server.name!r} references credential {server.credential!r}, "
+                    f"which is not declared under [[credentials]] (declared: {known})"
+                )
+            if server.transport != "http":
+                raise ValueError(
+                    "credentialed MCP requires transport='http'; "
+                    "stdio and legacy SSE cannot safely carry service credentials"
+                )
+            parts = urlsplit(server.url)
+            if (
+                parts.scheme != "https"
+                or parts.hostname != entry.host
+                or parts.username
+                or parts.password
+                or parts.fragment
+            ):
+                raise ValueError(
+                    "credentialed MCP URL must use HTTPS on the credential's host, "
+                    "without userinfo or fragment"
+                )
+            # sbx keys custom secrets by env var name, so one env cannot be
+            # registered twice in a sandbox. A collision with the agent
+            # backend's own credential is already impossible — those names
+            # are reserved for every `[[credentials]]` entry — so only the
+            # server-to-server case needs saying here.
+            other = by_env.get(entry.env)
+            if other is not None:
+                raise ValueError(
+                    f"mcp {server.name!r} and {other!r} both bind env {entry.env}; a sandbox "
+                    "registers one secret per env var, so give them separate credentials"
+                )
+            by_env[entry.env] = server.name
+        return self
+
+    def mcp_for(self, role: str) -> list[McpConfig]:
+        """The configured servers a session running as ``role`` gets."""
+        return [server for server in self.mcp if role in server.roles]
+
+    def mcp_specs_for(self, role: str) -> list[McpServerSpec]:
+        """``mcp_for`` as the worker protocol's neutral specs.
+
+        Credentialed HTTP servers are host-mediated descriptors. Only anonymous
+        servers become native SDK configs; credentials stay in the service VM.
+        """
+        specs: list[McpServerSpec] = []
+        for server in self.mcp_for(role):
+            entry = None if server.credential is None else self.credential(server.credential)
+            if entry is not None:
+                specs.append(
+                    McpServerSpec(name=server.name, transport="http", url=server.url, mediated=True)
+                )
+                continue
+            if server.transport == "stdio":
+                specs.append(
+                    McpServerSpec(
+                        name=server.name,
+                        transport="stdio",
+                        command=server.command[0],
+                        args=list(server.command[1:]),
+                    )
+                )
+            else:
+                specs.append(
+                    McpServerSpec(
+                        name=server.name,
+                        transport=server.transport,
+                        url=server.url,
+                    )
+                )
+        return specs
+
+    def mcp_servers_for_roles(self, roles: Sequence[str] | None) -> list[McpConfig]:
+        """The servers reachable by any of ``roles``; ``None`` means every
+        role, which is what a run's agent sandbox needs (it runs the
+        planner, the builder and the critic in the same box)."""
+        if roles is None:
+            return list(self.mcp)
+        wanted = set(roles)
+        return [server for server in self.mcp if wanted & set(server.roles)]
+
+    def mcp_hosts_for(self, roles: Sequence[str] | None = None) -> list[str]:
+        """The hosts ``roles``' MCP servers need, deduped — what
+        ``agent_policy_allows`` adds to that sandbox's allowlist. A box that
+        runs no session able to use a server does not get its host."""
+        return list(
+            dict.fromkeys(
+                host
+                for server in self.mcp_servers_for_roles(roles)
+                for host in server.hosts
+                if server.credential is None
+            )
+        )
+
+    def mcp_secrets_for(self, roles: Sequence[str] | None = None) -> list[tuple[str, str]]:
+        """``(env, host)`` per credentialed MCP server reachable by
+        ``roles``. This is metadata only; no MCP secret is registered in an agent."""
+        pairs: dict[str, str] = {}
+        for server in self.mcp_servers_for_roles(roles):
+            if server.credential is None:
+                continue
+            entry = self.credential(server.credential)
+            assert entry is not None  # _check_mcp ran at load
+            pairs.setdefault(entry.env, entry.host)
+        return list(pairs.items())
+
+    def mcp_credentials(self) -> list[CredentialConfig]:
+        return self.credentials_named(
+            list(
+                dict.fromkeys(
+                    server.credential for server in self.mcp if server.credential is not None
+                )
+            )
+        )
 
     @property
     def paths(self) -> SbxloopHome:
@@ -2559,34 +2889,18 @@ def _project_layer(raw: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     return kept, dropped
 
 
-def _file_layers(
-    discovery: ConfigDiscovery,
-    *,
-    sbxloop_toml_text: str | None = None,
-    dropped_keys: list[str] | None = None,
-) -> list[tuple[str, dict[str, Any]]]:
+def _file_layers(discovery: ConfigDiscovery) -> list[tuple[str, dict[str, Any]]]:
     """The two file layers at the discovered root, each cut down to project
-    config when the repository carries it (see ``PROJECT_LAYER_KEYS``).
-    ``sbxloop_toml_text`` stands in for the root's ``sbxloop.toml`` — a
-    draft validated exactly as the file would load, the cut-down included;
-    ``dropped_keys`` collects what the cut-down ignored."""
+    config when the repository carries it (see ``PROJECT_LAYER_KEYS``)."""
     layers: list[tuple[str, dict[str, Any]]] = []
     for name, read in (
         ("pyproject.toml", _pyproject_layer),
         ("sbxloop.toml", _sbxloop_toml_layer),
     ):
         path = discovery.root / name
-        if name == "sbxloop.toml" and sbxloop_toml_text is not None:
-            try:
-                raw = tomllib.loads(sbxloop_toml_text)
-            except tomllib.TOMLDecodeError as exc:
-                raise ConfigError(f"invalid TOML in the draft of {path}: {exc}") from exc
-        else:
-            raw = read(discovery.root)
+        raw = read(discovery.root)
         if raw and discovery.is_project_file(path):
             raw, dropped = _project_layer(raw)
-            if dropped_keys is not None:
-                dropped_keys.extend(dropped)
             if dropped:
                 log.warning(
                     "config.project_layer.ignored",
@@ -2608,8 +2922,16 @@ def home_config_path(env: Mapping[str, str]) -> Path | None:
     return SbxloopHome(root).config_toml if root is not None else None
 
 
-def _home_config_layer(env: Mapping[str, str]) -> dict[str, Any]:
+def _home_config_layer(env: Mapping[str, str], text: str | None = None) -> dict[str, Any]:
+    """The operator's own ``$SBXLOOP_HOME/config/sbxloop.toml``. ``text``
+    stands in for it unread — the console validating a draft of that file
+    before it is written."""
     path = home_config_path(env)
+    if text is not None:
+        try:
+            return tomllib.loads(text)
+        except tomllib.TOMLDecodeError as exc:
+            raise ConfigError(f"invalid TOML in the draft of {path}: {exc}") from exc
     if path is None or not path.is_file():
         return {}
     return _read_toml(path)
@@ -2687,13 +3009,11 @@ def load_config_with_sources(
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
     *,
-    sbxloop_toml_text: str | None = None,
-    dropped_keys: list[str] | None = None,
+    home_config_text: str | None = None,
 ) -> tuple[Config, dict[str, str]]:
     """Load config and report, per dotted key, which layer supplied it.
-    ``sbxloop_toml_text`` replaces the discovered root's ``sbxloop.toml``
-    (the console validating a draft); ``dropped_keys`` receives the keys a
-    repository-carried layer may not set."""
+    ``home_config_text`` replaces the home's ``config/sbxloop.toml`` — the
+    console validating a draft of the operator's file before writing it."""
     cwd = cwd or Path.cwd()
     if env is None:
         # Only consult secrets.env when reading the real environment;
@@ -2703,8 +3023,8 @@ def load_config_with_sources(
 
     discovery = discover_config(cwd)
     layers: list[tuple[str, dict[str, Any]]] = [
-        ("home config", _home_config_layer(env)),
-        *_file_layers(discovery, sbxloop_toml_text=sbxloop_toml_text, dropped_keys=dropped_keys),
+        ("home config", _home_config_layer(env, home_config_text)),
+        *_file_layers(discovery),
         ("env", _env_layer(env)),
     ]
 
@@ -2718,15 +3038,21 @@ def load_config_with_sources(
         if dotted in sources:
             raise ConfigError(f"{dotted!r} (from {sources[dotted]}) is no longer a setting: {why}")
 
+    for internal in ("run_model_override", "run_model_repo", "model_source_dir"):
+        if internal in merged:
+            raise ConfigError(f"{internal!r} is run bookkeeping, not a configuration setting")
+
     # The home is the env's business, never a file's: SBXLOOP_HOME, else
     # HOME/.sbxloop, else the process home — resolved from the mapping the
     # loader was handed so a hermetic caller decides where state lands.
     merged["home"] = str(resolve_home_root(env))
+    merged["model_source_dir"] = discovery.root.resolve()
 
     try:
         config = Config.model_validate(merged)
     except ValidationError as exc:
         raise ConfigError(f"invalid sbxloop configuration: {exc}") from exc
+    config._model_env = dict(env)
 
     gh_host = (env.get("GH_HOST") or "").strip()
     if gh_host and gh_host.casefold() != config.github.web_host.casefold():

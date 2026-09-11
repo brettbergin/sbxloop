@@ -1,7 +1,21 @@
 """Config: the resolved configuration with the layer each key came from,
-the effective egress policy, the repositories, and an editor for
-``sbxloop.toml`` that validates a draft with the real loader before it
-is saved (atomically, with a backup) and offers the restart."""
+the effective egress policy, the repositories — and the place any of it is
+changed.
+
+Changes are made **per key**, never by handing over a file. Every setting
+is one row — arrays of tables walked down to
+``github.repos[1].deliver_base``, so nothing is a blob to hunt for —
+and ``Enter`` on a row opens that key alone: what it holds, what it
+accepts, which layer is currently answering, and a widget shaped by its
+type. What comes back is written into the home's operator config at that
+path and nowhere else, every comment in the file kept, after the real
+loader has accepted the whole result. The write is atomic, the previous
+file is kept as a timestamped backup, and the restart is offered.
+
+There is deliberately no text editor here. A console that pops a file and
+leaves the operator to find a line is the thing this screen replaced; for
+edits no key describes, edit the file on the host.
+"""
 
 from __future__ import annotations
 
@@ -15,62 +29,54 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Vertical, VerticalScroll
-from textual.widgets import Input, TabbedContent, TabPane, TextArea
+from textual.notifications import SeverityLevel
+from textual.widgets import Input, TabbedContent, TabPane
 from textual.worker import get_current_worker
 
+from sbxloop.backends import backend_for
+from sbxloop.cli.doctor import stored_schedules
 from sbxloop.cli.policyview import PolicyView, policy_view
+from sbxloop.cli.workloadview import NO_PROFILE_NOTE, ProfileView, profile_views
 from sbxloop.config import Config, load_config_with_sources
-from sbxloop.tui import actions
-from sbxloop.tui.configedit import Verdict, config_path, read_text, validate_text
-from sbxloop.tui.data import ConsoleState
+from sbxloop.tui import actions, configkeys, configtoml
+from sbxloop.tui.configedit import (
+    FILE_LAYER,
+    Verdict,
+    config_path,
+    home_env,
+    read_text,
+    validate_text,
+)
 from sbxloop.tui.screens.base import ConsoleScreen
-from sbxloop.tui.screens.modals import ConfirmScreen
+from sbxloop.tui.screens.configvalue import ValueEdit, ValueScreen
+from sbxloop.tui.screens.modals import ConfirmScreen, TextPromptScreen
+from sbxloop.tui.screens.modelvalue import ModelScreen
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop.tui.widgets.tables import ConsoleTable
 
+#: How much of a value the table shows. The key column is as wide as the
+#: longest dotted path, and the source column must survive beside them
+#: both on a 120-column terminal once the console's rail has its 15.
+VALUE_WIDTH = 44
+
 
 def flatten_config(config: Config) -> dict[str, Any]:
-    flat: dict[str, Any] = {}
-
-    def walk(prefix: str, data: dict[str, Any]) -> None:
-        for key, value in data.items():
-            dotted = f"{prefix}{key}"
-            if isinstance(value, dict):
-                walk(f"{dotted}.", value)
-            else:
-                flat[dotted] = value
-
-    walk("", config.model_dump(mode="json"))
-    return flat
-
-
-class ConfigEditor(TextArea):
-    """The draft; ``Esc`` hands focus back so the screen's keys act."""
-
-    BINDINGS: ClassVar[list[BindingType]] = [
-        Binding("escape", "leave", "Leave the editor", show=False),
-    ]
-
-    def action_leave(self) -> None:
-        self.screen.set_focus(None)
+    """Every setting as one addressable leaf: ``daemon.poll_interval_s``,
+    ``github.repos[1].deliver_base``, ``sandbox.env.RAILS_ENV``."""
+    return configkeys.flatten(config.model_dump(mode="json"))
 
 
 class ConfigScreen(ConsoleScreen):
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("slash", "filter", "Filter"),
         Binding("escape", "clear_filter", "Clear filter", show=False),
-        Binding("i", "edit", "Edit"),
-        Binding("V", "validate", "Validate draft"),
-        Binding("W", "save", "Save draft"),
-        Binding("ctrl+s", "save", "Save", show=False, priority=True),
-        Binding("E", "editor", "$EDITOR", show=False),
-        Binding("L", "reload", "Reload from disk", show=False),
+        Binding("e", "edit_value", "Edit value"),
+        Binding("a", "add_key", "Add key"),
     ]
     DEFAULT_CSS = """
     ConfigScreen TabbedContent { height: 1fr; }
     ConfigScreen #resolved { height: 1fr; }
-    ConfigScreen #editor { height: 1fr; }
-    ConfigScreen #edit-status { height: auto; max-height: 6; padding: 0 1; }
+    ConfigScreen #file-status { height: auto; max-height: 5; padding: 0 1; }
     ConfigScreen #filter { display: none; }
     """
 
@@ -82,37 +88,31 @@ class ConfigScreen(ConsoleScreen):
         self.config: Config | None = None
         self.error: str | None = None
         self.path: Path | None = None
-        self.last_verdict: str = "not validated yet"
-        # What the editor was loaded with: a re-anchor or reload replaces
-        # the draft only while it is untouched.
-        self._loaded_text = ""
-        self._anchor_note = ""
+        self.last_verdict: str = "no change yet"
 
     def compose(self) -> ComposeResult:
         yield from self.compose_frame()
         with Vertical(id="body"), TabbedContent(id="tabs"):
             with TabPane("Resolved", id="resolved-pane"):
+                yield TextPanel(Text("loading…", style="dim"), id="file-status")
                 yield Input(placeholder="filter keys, values, sources", id="filter")
                 yield ConsoleTable("key", "value", "source", id="resolved")
             with TabPane("Policy", id="policy-pane"), VerticalScroll():
                 yield TextPanel(Text("loading…", style="dim"), id="policy")
+            with TabPane("Workloads", id="workloads-pane"), VerticalScroll():
+                yield TextPanel(Text("loading…", style="dim"), id="workloads")
             with TabPane("Repos", id="repos-pane"):
                 yield ConsoleTable(
                     "repo", "enabled", "base", "token env", "trigger label", id="repos"
                 )
-            with TabPane("Edit", id="edit-pane"):
-                yield TextPanel(Text("loading…", style="dim"), id="edit-status")
-                yield ConfigEditor(show_line_numbers=True, soft_wrap=False, id="editor")
         yield from self.compose_footer()
 
     def on_mount(self) -> None:
         super().on_mount()
         self.query_one("#filter", Input).display = False
         self.query_one("#resolved", ConsoleTable).focus()
-        deps = self.console_app.deps
-        self._anchor(deps.cwd, "the console's directory")
-        if deps.read_only:
-            self.query_one("#editor", ConfigEditor).read_only = True
+        self.path = config_path(self.console_app.deps.home)
+        self._file_status()
         self.load()
 
     def on_screen_resume(self) -> None:
@@ -123,18 +123,27 @@ class ConfigScreen(ConsoleScreen):
 
     @work(thread=True, exclusive=True, group="config")
     def load(self) -> None:
+        # Resolved from the home, not from wherever the console happened to
+        # be started: that is where the daemon runs, so this is the
+        # configuration the loop actually gets — and it is the same root a
+        # draft is validated against, so a save is visible here at once.
         deps = self.console_app.deps
         try:
-            config, sources = load_config_with_sources(cwd=deps.cwd, env=dict(os.environ))
+            config, sources = load_config_with_sources(
+                cwd=deps.home.root, env=home_env(deps.home, os.environ)
+            )
         except Exception as exc:
             if not get_current_worker().is_cancelled:
-                self.app.call_from_thread(self._apply, None, {}, {}, None, str(exc))
+                self.app.call_from_thread(self._apply, None, {}, {}, None, str(exc), [])
             return
         flat = flatten_config(config)
         view = policy_view(config)
+        # The stored schedules hang under the profile they name (#804); the
+        # read-only handle, off the UI thread like every other read here.
+        profiles = profile_views(config, [s.spec for s in stored_schedules(config)])
         if get_current_worker().is_cancelled:
             return
-        self.app.call_from_thread(self._apply, config, flat, sources, view, None)
+        self.app.call_from_thread(self._apply, config, flat, sources, view, None, profiles)
 
     def _apply(
         self,
@@ -143,6 +152,7 @@ class ConfigScreen(ConsoleScreen):
         sources: dict[str, str],
         view: PolicyView | None,
         error: str | None,
+        profiles: list[ProfileView] | None = None,
     ) -> None:
         self.config, self.flat, self.sources, self.error = config, flat, sources, error
         self.render_resolved()
@@ -150,34 +160,19 @@ class ConfigScreen(ConsoleScreen):
             self.query_one("#policy", TextPanel).update(self._policy(view))
         elif error:
             self.query_one("#policy", TextPanel).update(Text(error, style="red"))
+        if config is not None:
+            self.query_one("#workloads", TextPanel).update(self._workloads(profiles or []))
+        elif error:
+            self.query_one("#workloads", TextPanel).update(Text(error, style="red"))
         self._repos()
 
-    def refresh_data(self, state: ConsoleState) -> None:
-        super().refresh_data(state)
-        # The daemon says where it loaded its config from: that is the
-        # file to edit, whatever directory the console was started in.
-        status = (state.daemon.status if state.daemon and state.daemon.live else None) or {}
-        cwd = status.get("cwd")
-        if cwd and self.path is not None and config_path(Path(cwd)) != self.path:
-            self._anchor(Path(cwd), "the daemon's directory")
-
-    def _anchor(self, root: Path, origin: str) -> None:
-        """Point the editor at ``root``'s sbxloop.toml, loading it when the
-        draft is untouched (else the operator's edit stays)."""
-        path = config_path(root)
-        editor = self.query_one("#editor", ConfigEditor)
-        untouched = editor.text == self._loaded_text
-        self.path = path
-        self._anchor_note = f"({origin})"
-        if untouched:
-            text, note = read_text(path)
-            editor.load_text(text)
-            self._loaded_text = text
-            if note:
-                self.last_verdict = note
-        else:
-            self.last_verdict = f"the file moved to {path}; the draft is yours — L reloads"
-        self._edit_status()
+    def _shadowing_files(self) -> list[Path]:
+        """Files the daemon *also* reads that this console does not edit: a
+        ``sbxloop.toml`` or a ``[tool.sbxloop]`` sitting in the home, which
+        the loader applies over the operator config. Console versions before
+        this one wrote edits into the first of those, so say it is there."""
+        root = self.console_app.deps.home.root
+        return [path for path in (root / "sbxloop.toml", root / "pyproject.toml") if path.is_file()]
 
     def render_resolved(self) -> None:
         needle = self.filter_text.lower()
@@ -185,12 +180,22 @@ class ConfigScreen(ConsoleScreen):
         if self.error:
             rows.append(("error", ("configuration", Text(self.error, style="red"), "")))
         for dotted in sorted(self.flat):
-            value = repr(self.flat[dotted])
-            source = self.sources.get(dotted, "default")
+            raw = self.flat[dotted]
+            value = configkeys.display(raw)
+            source = configkeys.source_for(dotted, self.sources)
+            # Filter on what is on screen, not on the repr behind it: a
+            # search for `main` should find `deliver_base`.
             if needle and needle not in f"{dotted} {value} {source}".lower():
                 continue
             style = "" if source == "default" else "bold"
-            rows.append((dotted, (dotted, value[:120], Text(source, style=style))))
+            # Short enough that the source column still fits beside the
+            # console's rail on a 120-column terminal — knowing which layer
+            # answered is the point of the row, and the whole value is one
+            # Enter away.
+            shown = Text(value if len(value) <= VALUE_WIDTH else value[: VALUE_WIDTH - 1] + "…")
+            if raw is None:
+                shown.stylize("dim")
+            rows.append((dotted, (dotted, shown, Text(source, style=style))))
         self.query_one("#resolved", ConsoleTable).replace_rows(rows)
 
     @staticmethod
@@ -214,16 +219,41 @@ class ConfigScreen(ConsoleScreen):
         table.add_row("audit trail", view.audit)
         return table
 
+    @staticmethod
+    def _workloads(profiles: list[ProfileView]) -> Any:
+        """One card per `[[workloads]]` profile (#804): its bounds spelled
+        out the way the operator persona is told them, the schedules that
+        run under it; with none declared, what that means for a run."""
+        if not profiles:
+            return Text(NO_PROFILE_NOTE, style="yellow")
+        table = Table.grid(padding=(0, 1))
+        table.add_column(style="bold", no_wrap=True)
+        table.add_column()
+        for index, view in enumerate(profiles):
+            if index:
+                table.add_row("", "")
+            title = Text(view.title, style="bold cyan")
+            if view.description:
+                title.append(f" — {view.description}", style="dim")
+            table.add_row(Text("[[workloads]]"), title)
+            for label, value in view.rows:
+                table.add_row(f"  {label}", Text(value))
+            table.add_row(
+                "  schedules",
+                Text("; ".join(view.schedules) if view.schedules else "none", style="dim"),
+            )
+        return table
+
     def _repos(self) -> None:
         config = self.config
         if config is None:
             return
         rows = []
-        for entry in config.github.repo_list():
+        for index, entry in enumerate(config.github.repo_list()):
             effective = config.github.effective_repo(entry.repo) or entry
             rows.append(
                 (
-                    entry.repo,
+                    f"github.repos[{index}]",
                     (
                         entry.repo,
                         "yes" if entry.enabled else "no",
@@ -235,20 +265,24 @@ class ConfigScreen(ConsoleScreen):
             )
         self.query_one("#repos", ConsoleTable).replace_rows(rows)
 
-    def _edit_status(self) -> None:
+    def _file_status(self) -> None:
+        """Where an edit lands, anything the loader stacks on top of it, and
+        what the last one did."""
         text = Text()
         path = self.path
         if path is not None:
+            text.append("writes to ", style="dim")
             text.append(str(path), style="bold")
-            text.append(f"  {self._anchor_note}", style="dim")
             text.append("  (new file)" if not path.is_file() else "", style="dim")
+        for shadow in self._shadowing_files():
+            text.append(
+                f"\n{shadow.name} sits in the home and the loader applies it over this file: "
+                "move what it says here and delete it",
+                style="yellow",
+            )
         text.append(f"\n{self.last_verdict}")
-        text.append(
-            "\ni edits · Esc leaves the editor · V validates · W saves (typed) · "
-            "E opens $EDITOR · L reloads",
-            style="dim",
-        )
-        self.query_one("#edit-status", TextPanel).update(text)
+        text.append("\nEnter or e edits the selected key · a adds one · / filters", style="dim")
+        self.query_one("#file-status", TextPanel).update(text)
 
     # -- actions -----------------------------------------------------------------
 
@@ -276,53 +310,180 @@ class ConfigScreen(ConsoleScreen):
         if event.input.id == "filter":
             self.query_one("#resolved", ConsoleTable).focus()
 
-    def action_edit(self) -> None:
-        self.query_one("#tabs", TabbedContent).active = "edit-pane"
-        self.query_one("#editor", ConfigEditor).focus()
+    # -- one key at a time -------------------------------------------------------
 
-    def draft(self) -> str:
-        return self.query_one("#editor", ConfigEditor).text
+    def on_data_table_row_selected(self, event: ConsoleTable.RowSelected) -> None:
+        """Enter on a resolved key edits it; Enter on a repository narrows
+        the resolved view to that entry's keys."""
+        key = str(event.row_key.value or "")
+        if event.data_table.id == "resolved" and key != "error":
+            self.edit_key(key)
+        elif event.data_table.id == "repos" and key:
+            self._filter_to(key)
 
-    def action_validate(self) -> None:
-        self.validate_draft(self.draft())
+    def _filter_to(self, prefix: str) -> None:
+        box = self.query_one("#filter", Input)
+        box.display = True
+        box.value = prefix
+        self.query_one("#tabs", TabbedContent).active = "resolved-pane"
+        self.query_one("#resolved", ConsoleTable).focus()
+
+    def action_edit_value(self) -> None:
+        self.query_one("#tabs", TabbedContent).active = "resolved-pane"
+        key = self.query_one("#resolved", ConsoleTable).selected_key()
+        if key is None or key == "error":
+            self.app.notify("no key selected", title="config", severity="warning")
+            return
+        self.edit_key(key)
+
+    def action_add_key(self) -> None:
+        """A key the resolved view has no row for: a new ``[[github.repos]]``
+        entry, an environment variable, a registry."""
+        if self._refuse_read_only():
+            return
+
+        def typed(dotted: str | None) -> None:
+            if dotted:
+                self.edit_key(dotted.strip())
+
+        self.app.push_screen(
+            TextPromptScreen(
+                "add a key",
+                "The dotted path to set — github.repos[2].repo, sandbox.env.RAILS_ENV. "
+                "An index one past the end appends an entry.",
+                placeholder="section.key",
+            ),
+            typed,
+        )
+
+    def _refuse_read_only(self) -> bool:
+        if self.console_app.read_only:
+            self.app.notify("read-only console: editing refused", severity="warning")
+            return True
+        return False
+
+    def edit_key(self, dotted: str) -> None:
+        """Open one setting on its own; what comes back goes through the
+        loader before the file is touched."""
+        if self._refuse_read_only():
+            return
+        if self.path is None:  # pragma: no cover - anchored on mount
+            return
+        try:
+            parts = configkeys.parse_path(dotted)
+        except configkeys.PathError as exc:
+            self.app.notify(str(exc)[:300], title="config", severity="error")
+            return
+        dotted = configkeys.format_path(parts)
+        why = configkeys.ENV_ONLY_KEYS.get(dotted)
+        if why is not None:
+            self.app.notify(
+                f"{dotted} is not a file setting: {why}", title=dotted, severity="warning"
+            )
+            return
+        _, in_file = configtoml.file_value(self.file_text(), parts)
+        spec = configkeys.describe(dotted)
+        value = self.flat.get(dotted)
+        source = configkeys.source_for(dotted, self.sources) if dotted in self.flat else "unset"
+        args: dict[str, Any] = {"source": source, "target": str(self.path), "in_file": in_file}
+        screen = (
+            ModelScreen(
+                spec,
+                value,
+                **args,
+                home=self.console_app.deps.home,
+                backend=backend_for(self.config),
+            )
+            if self.config is not None and configkeys.is_model_key(dotted)
+            else ValueScreen(spec, value, **args)
+        )
+        self.app.push_screen(screen, self._key_edited)
+
+    def file_text(self) -> str:
+        """The operator config as it is on disk right now. There is no
+        buffered draft to go stale: every edit starts from the file, so a
+        change made outside the console is never silently overwritten."""
+        if self.path is None:  # pragma: no cover - set on mount
+            return ""
+        return read_text(self.path)[0]
+
+    def _key_edited(self, edit: ValueEdit | None) -> None:
+        if edit is None:
+            return
+        current = self.file_text()
+        parts = configkeys.parse_path(edit.path)
+        try:
+            text = (
+                configtoml.unset_value(current, parts)
+                if edit.unset
+                else configtoml.set_value(current, parts, edit.value)
+            )
+        except ValueError as exc:
+            self.last_verdict = f"{edit.path}: {exc}"
+            self._file_status()
+            self.app.notify(str(exc)[:300], title=edit.path, severity="error", timeout=15)
+            return
+        if text == current:
+            self.app.notify(f"{edit.path} already says that", title="config")
+            return
+        self.validate_draft(text, edit)
 
     @work(thread=True, exclusive=True, group="validate")
-    def validate_draft(self, text: str, then_save: bool = False) -> None:
-        deps = self.console_app.deps
-        root = self.path.parent if self.path is not None else deps.cwd
-        verdict = validate_text(text, cwd=root, env=os.environ)
+    def validate_draft(self, text: str, edit: ValueEdit) -> None:
+        """The loader's verdict on the whole file with the edit applied.
+        Nothing is written until it comes back clean: a refused file would
+        stop the daemon at its next start."""
+        verdict = validate_text(text, home=self.console_app.deps.home, env=os.environ)
         if get_current_worker().is_cancelled:
             return
-        self.app.call_from_thread(self._validated, verdict, text, then_save)
+        self.app.call_from_thread(self._validated, verdict, text, edit)
 
-    def _validated(self, verdict: Verdict, text: str, then_save: bool) -> None:
-        self.last_verdict = verdict.text
-        self._edit_status()
+    def _validated(self, verdict: Verdict, text: str, edit: ValueEdit) -> None:
+        self.last_verdict = f"{edit.path}: {verdict.text}"
         if not verdict.ok:
-            self.app.notify(verdict.text[:300], title="validate", severity="error", timeout=15)
+            self._file_status()
+            self.app.notify(verdict.text[:300], title=edit.path, severity="error", timeout=15)
             return
-        if verdict.dropped:
-            self.app.notify(verdict.text[:300], title="validate", severity="warning", timeout=15)
-        if then_save and self.path is not None:
+        note, severity = self._answered_by(edit, verdict)
+        if note is not None:
+            self.last_verdict = note
+            self.app.notify(note[:300], title=edit.path, severity=severity, timeout=15)
+        self._file_status()
+        if self.path is not None:
             self.console_app.perform(
-                actions.save_config(self.console_app.deps, self.path, text),
-                on_success=lambda: self._saved(text),
+                actions.save_config(self.console_app.deps, self.path, text, key=edit.path),
+                on_success=lambda: self._saved(edit.path),
             )
-        elif not verdict.dropped:
-            self.app.notify("the draft loads", title="validate")
 
-    def action_save(self) -> None:
-        if self.console_app.read_only:
-            self.app.notify("read-only console: save refused", severity="warning")
-            return
-        # Never write a draft the loader would refuse: the daemon's next
-        # start would fail on it.
-        self.validate_draft(self.draft(), then_save=True)
+    def _answered_by(self, edit: ValueEdit, verdict: Verdict) -> tuple[str | None, SeverityLevel]:
+        """Which layer answers for the edited key once the draft applies.
+        This file is written either way — the operator asked for it — but a
+        key the environment or a `sbxloop.toml` in the home also sets would
+        otherwise look applied when it is not, and an unset key should say
+        what it fell back to."""
+        if verdict.config is None:  # pragma: no cover - guarded by verdict.ok
+            return None, "information"
+        source = configkeys.source_for(edit.path, verdict.sources)
+        if source == FILE_LAYER:
+            return None, "information"
+        value = configkeys.flatten(verdict.config.model_dump(mode="json")).get(edit.path)
+        if edit.unset:
+            where = "its default" if source == "default" else source
+            return f"{edit.path} unset here; it now comes from {where}: {value!r}", "information"
+        return (
+            f"{edit.path} is written, but {source} sets it too and wins: "
+            f"the loop still sees {value!r}",
+            "warning",
+        )
 
-    def _saved(self, text: str) -> None:
-        self._loaded_text = text
-        self._edit_status()
+    def _saved(self, key: str = "") -> None:
+        self._file_status()
         self.load()
+        if configkeys.is_model_key(key):
+            self.app.notify(
+                "Model settings refresh before the next phase or concierge turn.", title="config"
+            )
+            return
 
         def decided(restart: bool | None) -> None:
             if restart:
@@ -331,26 +492,11 @@ class ConfigScreen(ConsoleScreen):
         self.app.push_screen(
             ConfirmScreen(
                 "restart the daemon?",
-                "The daemon reads sbxloop.toml at start. Restart the unit now to apply "
-                "the saved file? (The Daemon screen's B does the same later.)",
+                "The daemon reads its configuration at start. Restart the unit now to "
+                "apply the change? (The Daemon screen's B does the same later.)",
             ),
             decided,
         )
 
-    def action_editor(self) -> None:
-        if self.path is None:
-            return
-        self.console_app.perform(actions.open_editor(self.path), then=self.action_reload)
 
-    def action_reload(self) -> None:
-        if self.path is None:
-            return
-        text, note = read_text(self.path)
-        self.query_one("#editor", ConfigEditor).load_text(text)
-        self._loaded_text = text
-        self.last_verdict = note or "reloaded from disk"
-        self._edit_status()
-        self.load()
-
-
-__all__ = ["ConfigEditor", "ConfigScreen", "flatten_config"]
+__all__ = ["ConfigScreen", "flatten_config"]

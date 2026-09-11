@@ -36,6 +36,8 @@ come from ``SLACK_BOT_TOKEN`` (``xoxb-…``) and ``SLACK_APP_TOKEN``
 
 from __future__ import annotations
 
+import asyncio
+import functools
 import os
 import re
 from collections.abc import Sequence
@@ -44,12 +46,14 @@ from typing import Any, ClassVar
 
 from sbxloop.config import ChatBackend, Config, SlackConfig
 from sbxloop.daemon.chat import ChatBridge, Inbound
+from sbxloop.daemon.chat_choices import ChoiceQuestion, render_prose
 from sbxloop.daemon.chat_routing import SLACK_MENTION_RE
 from sbxloop.daemon.concierge import Concierge
 from sbxloop.daemon.discord_format import EmbedSpec, _clip
 from sbxloop.daemon.slack_format import (
     EMOJI_NAMES,
     embed_attachment,
+    escape,
     thread_permalink,
     to_mrkdwn,
 )
@@ -136,10 +140,17 @@ class SlackClient:
         # Ack first: Slack retries an envelope it does not hear back on
         # within 3 s, and a retried message would be routed twice.
         await client.send_socket_mode_response(SocketModeResponse(envelope_id=req.envelope_id))
-        if req.type != "events_api":
-            return
-        event = (req.payload or {}).get("event") or {}
-        self.bridge._handle_event(event)
+        dispatch_envelope(self.bridge, str(req.type or ""), req.payload or {})
+
+
+def dispatch_envelope(bridge: Any, kind: str, payload: dict[str, Any]) -> None:
+    """Route one Socket Mode envelope: an Events API event to the message
+    handler, a block-kit click (``interactive`` / ``block_actions``, #571)
+    to the interaction handler; anything else is dropped."""
+    if kind == "events_api":
+        bridge._handle_event(payload.get("event") or {})
+    elif kind == "interactive" and payload.get("type") == "block_actions":
+        bridge._handle_interaction(payload)
 
 
 class SlackBridge(ChatBridge):
@@ -402,6 +413,230 @@ class SlackBridge(ChatBridge):
         # *is* the reply stream under the headline.
         return SlackTarget(headline.channel, thread_ts=headline.ts)
 
+    # -- block-kit buttons (#571) ------------------------------------------------
+
+    async def _send_choices(
+        self,
+        target: Any,
+        text: str,
+        question: ChoiceQuestion,
+        *,
+        reply_to: Any = None,
+        pending_key: str | None = None,
+        mention_users: bool = False,
+    ) -> Any:
+        """A clarifying question with one block-kit button per choice.
+
+        The message text is the same numbered prose the base seam posts,
+        so a click is an extra way in and typing still answers; a post
+        Slack refuses with the blocks falls back to that prose. The
+        buttons carry the choice value, and the actions block carries the
+        provisional key the question was registered under, so a click
+        that lands before the post's ``ts`` is known still resolves.
+        """
+        body = render_prose(question)
+        if text and text.strip() and text.strip() != question.prompt.strip():
+            body = f"{text.strip()}\n\n{body}"
+        limit = self.slack.max_message_chars
+        mrkdwn = to_mrkdwn(_clip(body, limit), mentions=mention_users)
+        kwargs: dict[str, Any] = {
+            "channel": target.channel,
+            "text": mrkdwn,
+            "blocks": [
+                _section(mrkdwn),
+                _actions_block(
+                    [
+                        (f"{CHOICE_ACTION_PREFIX}{index}", choice.label, choice.value, None)
+                        for index, choice in enumerate(question.choices)
+                    ],
+                    block_id=pending_key or CHOICE_BLOCK_ID,
+                ),
+            ],
+            "unfurl_links": False,
+            "unfurl_media": False,
+        }
+        if target.thread_ts:
+            kwargs["thread_ts"] = target.thread_ts
+        try:
+            resp = await self.client.web.chat_postMessage(**kwargs)
+        except Exception:
+            if self._report_channel_error_quietly():
+                return None
+            log.warning("slack.choices_send_failed", target=target.id, exc_info=True)
+            return await super()._send_choices(
+                target, text, question, reply_to=reply_to, mention_users=mention_users
+            )
+        return SlackMessage(
+            str(resp.get("channel") or target.channel), str(resp["ts"]), target.thread_ts
+        )
+
+    async def _send_gate(self, target: Any, text: str, gate: Any) -> Any:
+        """The approval prompt with one persistent button on top of the base
+        prose — the typed command stays in the body, so a post Slack
+        refuses with the block leaves a prompt that works by typing."""
+        held = getattr(gate, "kind", "merge") == "publish"
+        limit = self.slack.max_message_chars
+        mrkdwn = to_mrkdwn(_clip(text, limit), mentions=True)
+        kwargs: dict[str, Any] = {
+            "channel": target.channel,
+            "text": mrkdwn,
+            "blocks": [
+                _section(mrkdwn),
+                _actions_block(
+                    [
+                        (
+                            GATE_ACTION_ID,
+                            "Release result" if held else "Approve merge",
+                            str(gate.run_id),
+                            "primary",
+                        )
+                    ],
+                    block_id=f"{GATE_BLOCK_PREFIX}{gate.run_id}",
+                ),
+            ],
+            "unfurl_links": False,
+            "unfurl_media": False,
+        }
+        if target.thread_ts:
+            kwargs["thread_ts"] = target.thread_ts
+        try:
+            resp = await self.client.web.chat_postMessage(**kwargs)
+        except Exception:
+            if self._report_channel_error_quietly():
+                return None
+            log.warning("slack.gate_send_failed", run=gate.run_id, exc_info=True)
+            return await super()._send_gate(target, text, gate)
+        return SlackMessage(
+            str(resp.get("channel") or target.channel), str(resp["ts"]), target.thread_ts
+        )
+
+    async def _finalize_gate_message(self, message: Any, text: str) -> None:
+        """Rewrite the prompt once the gate is resolved and drop its button."""
+        await self.client.web.chat_update(
+            channel=message.channel,
+            ts=message.ts,
+            text=to_mrkdwn(_clip(text, self.slack.max_message_chars)),
+            blocks=[],
+        )
+
+    def _report_channel_error_quietly(self) -> bool:
+        """Whether the last send failure was the unreachable-channel case
+        (already reported once); False when it was something else."""
+        return self._channel_error_logged
+
+    def _handle_interaction(self, payload: dict[str, Any]) -> None:
+        """A block-kit click (client thread): schedule it on the loop."""
+        self._schedule(self._route_interaction(payload))
+
+    async def _route_interaction(self, payload: dict[str, Any]) -> None:
+        user = payload.get("user") or {}
+        user_id = str(user.get("id") or "")
+        name = str(user.get("username") or user.get("name") or "").strip()
+        if not name and user_id:
+            if user_id not in self._names:
+                await self._lookup_name(user_id)
+            name = self._names.get(user_id, user_id)
+        author = f"Slack user `{name}`" if name else "a Slack user"
+        container = payload.get("container") or {}
+        message = payload.get("message") or {}
+        channel = str(container.get("channel_id") or (payload.get("channel") or {}).get("id") or "")
+        ts = str(container.get("message_ts") or message.get("ts") or "")
+        thread_ts = container.get("thread_ts") or message.get("thread_ts")
+        for action in payload.get("actions") or []:
+            if not isinstance(action, dict):
+                continue
+            action_id = str(action.get("action_id") or "")
+            value = str(action.get("value") or "")
+            block_id = str(action.get("block_id") or "")
+            if action_id.startswith(CHOICE_ACTION_PREFIX):
+                await self._choice_clicked(
+                    channel, ts, thread_ts, block_id, value, author, user_id, name
+                )
+            elif action_id == GATE_ACTION_ID:
+                await self._gate_clicked(channel, ts, thread_ts, value, author)
+
+    async def _choice_clicked(
+        self,
+        channel: str,
+        ts: str,
+        thread_ts: Any,
+        block_id: str,
+        value: str,
+        author: str,
+        user_id: str,
+        name: str,
+    ) -> None:
+        """Anyone may click; who clicked is recorded. The question is found
+        by the post's ``ts``, else by the provisional key in the block —
+        a click that beat the rekey — and a click on a question the bridge
+        no longer holds gets the typed route, ephemerally, not a dead
+        button."""
+        accepted = False
+        for key in (ts, block_id):
+            if not key or key == CHOICE_BLOCK_ID:
+                continue
+            try:
+                accepted = bool(
+                    self._answer_choice(
+                        key, value, author, author_id=user_id or None, author_name=name or None
+                    )
+                )
+            except Exception:
+                log.warning("slack.choice_answer_failed", value=value, exc_info=True)
+                accepted = False
+            if accepted:
+                break
+        if not accepted:
+            log.info("slack.choice_click_expired", value=value, by=author)
+            await self._ephemeral(channel, user_id, thread_ts, EXPIRED_CLICK_NOTE)
+            return
+        try:
+            await self.client.web.chat_update(
+                channel=channel,
+                ts=ts,
+                text=f"_Answered: *{escape(value)}* (by {escape(author)})._",
+                blocks=[],
+            )
+        except Exception:
+            log.debug("slack.choice_edit_failed", ts=ts, exc_info=True)
+
+    async def _gate_clicked(
+        self, channel: str, ts: str, thread_ts: Any, run_id: str, author: str
+    ) -> None:
+        """The approve / release button: the same call the typed command
+        makes, answered in the thread. The click never disables the button:
+        a failed landing re-opens the gate and the same button works
+        again; resolution clears it through ``_finalize_gate_message``."""
+        loop_ref = self.loop_ref
+        if loop_ref is None:
+            await self._ephemeral(channel, "", thread_ts, "daemon loop not attached")
+            return
+        try:
+            reply = await asyncio.get_event_loop().run_in_executor(
+                None, functools.partial(loop_ref.approve_merge, run_id, by=author)
+            )
+        except (KeyError, ValueError) as exc:
+            reply = f"failed: {exc.args[0] if exc.args else exc}"
+        except Exception:
+            log.warning("slack.gate_click_failed", run=run_id, exc_info=True)
+            reply = (
+                f"something went wrong — `{self.chat.command_prefix} merge` / `release` still work"
+            )
+        await self._send(SlackTarget(channel, thread_ts=thread_ts or ts), str(reply))
+
+    async def _ephemeral(self, channel: str, user_id: str, thread_ts: Any, text: str) -> None:
+        """A note only the clicker sees, when the workspace allows it."""
+        post = getattr(self.client.web, "chat_postEphemeral", None)
+        if post is None or not user_id:
+            return
+        kwargs: dict[str, Any] = {"channel": channel, "user": user_id, "text": to_mrkdwn(text)}
+        if thread_ts:
+            kwargs["thread_ts"] = thread_ts
+        try:
+            await post(**kwargs)
+        except Exception:
+            log.debug("slack.ephemeral_failed", exc_info=True)
+
     def _message_id(self, message: Any) -> str:
         return str(getattr(message, "ts", "") or "")
 
@@ -416,6 +651,41 @@ class SlackBridge(ChatBridge):
         if thread.thread_id == thread.channel_id:
             return f"<#{thread.channel_id}>"
         return f"<{thread_permalink(thread.channel_id, thread.thread_id)}|thread>"
+
+
+#: Block-kit ids (#571): one action per choice, the provisional question
+#: key on the actions block; one persistent action for a gate's button.
+CHOICE_ACTION_PREFIX = "sbx-choice:"
+CHOICE_BLOCK_ID = "sbx-choices"
+GATE_ACTION_ID = "sbx-gate"
+GATE_BLOCK_PREFIX = "sbx-gate:"
+EXPIRED_CLICK_NOTE = (
+    "That question has expired (or was already answered) — just type your answer "
+    "in the channel and I'll pick it up."
+)
+
+
+def _section(mrkdwn: str) -> dict[str, Any]:
+    return {"type": "section", "text": {"type": "mrkdwn", "text": mrkdwn}}
+
+
+def _actions_block(
+    buttons: list[tuple[str, str, str, str | None]], *, block_id: str
+) -> dict[str, Any]:
+    """An actions block of ``(action_id, label, value, style)`` buttons —
+    at most five, Slack's cap, which is also the choice model's."""
+    elements = []
+    for action_id, label, value, style in buttons[:5]:
+        button: dict[str, Any] = {
+            "type": "button",
+            "action_id": action_id,
+            "text": {"type": "plain_text", "text": label[:75] or value[:75] or "?"},
+            "value": value[:2000],
+        }
+        if style:
+            button["style"] = style
+        elements.append(button)
+    return {"type": "actions", "block_id": block_id[:255], "elements": elements}
 
 
 def _api_error(exc: Exception) -> str:

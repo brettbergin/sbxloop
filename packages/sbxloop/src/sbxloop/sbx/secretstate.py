@@ -35,6 +35,8 @@ from sbxloop.backends import (
     ANTHROPIC_TOKEN_HOST,
     COPILOT_TOKEN_ENV,
     COPILOT_TOKEN_HOST,
+    OPENAI_TOKEN_ENV,
+    OPENAI_TOKEN_HOST,
     backend_for,
 )
 from sbxloop.config import Config
@@ -53,6 +55,8 @@ __all__ = [
     "ANTHROPIC_TOKEN_HOST",
     "COPILOT_TOKEN_ENV",
     "COPILOT_TOKEN_HOST",
+    "OPENAI_TOKEN_ENV",
+    "OPENAI_TOKEN_HOST",
 ]
 
 # Every sbxloop sandbox (and therefore every sandbox-scoped registration

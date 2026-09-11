@@ -13,6 +13,8 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
     "Typing :: Typed",
 ]
 dependencies = [
@@ -26,18 +28,35 @@ dependencies = [
     "sbxloop-worker",
     "gitpython>=3.1.59",
     "structlog>=24.1",
+    # Optional host error reporting is dormant until the operator supplies a DSN.
+    "sentry-sdk>=2.68.0,<3",
     # `.rubocop.yml` / other YAML project files the verify lint reads (#628).
     "pyyaml>=6.0",
     # `requires-python` is a PEP 440 specifier; the toolchain series a run
     # provisions is chosen against it (#627).
     "packaging>=24",
     "textual>=8.2",
+    # The overview's distributions and trends (`tui/widgets/chart.py`).
+    # Bands cover every "what share" question and cover it better; these
+    # are the plots that need a scale. Pure Python, no transitive deps.
+    "textual-plotext>=1.0.1",
+    # Round-trip TOML for the console's config editor: setting one key must
+    # keep every comment and every other line of the operator's file
+    # (`tui/configtoml.py`); `tomllib` reads but cannot write.
+    "tomlkit>=0.13",
+    # The data layer. One WAL-mode SQLite file holds every table; SQLAlchemy
+    # owns the mapping and Alembic owns the upgrade path, applied on open so
+    # an unattended daemon still migrates itself (#539).
+    "sqlalchemy>=2.0",
+    "alembic>=1.13",
 ]
 
 [project.optional-dependencies]
 # Host-side SDK access for `sbxloop list-models` (agent sessions get the SDK
 # inside the sandbox via sbxloop-worker[copilot]; runs never need this extra).
 copilot = ["github-copilot-sdk>=1.0.8"]
+# Host-side model listing; agent sessions install the worker's matching extra.
+codex = ["openai-codex==0.147.0"]
 # `sbxloop daemon`'s chat bridge (chronology + steering), one extra per
 # backend; the daemon runs without either when no [chat] backend is set.
 discord = ["discord.py>=2.3"]
@@ -78,6 +97,9 @@ artifacts = [
   "src/sbxloop/data/*.example",
   "src/sbxloop/data/presets/*.toml",
   "src/sbxloop/data/home/*",
+  # Alembic reads this template off disk when a developer writes a revision;
+  # hatch ships the .py files on its own but not a .mako.
+  "src/sbxloop/db/migrations/script.py.mako",
 ]
 
 [tool.hatch.build.targets.sdist]
@@ -86,6 +108,9 @@ artifacts = [
   "src/sbxloop/data/*.example",
   "src/sbxloop/data/presets/*.toml",
   "src/sbxloop/data/home/*",
+  # Alembic reads this template off disk when a developer writes a revision;
+  # hatch ships the .py files on its own but not a .mako.
+  "src/sbxloop/db/migrations/script.py.mako",
 ]
 
 [tool.hatch.build.hooks.custom]

@@ -26,6 +26,8 @@ from rich.table import Table
 from rich.tree import Tree
 
 import sbxloop
+from sbxloop import telemetry
+from sbxloop.agentmodels import model_plan, refreshed_models, run_model_repo
 from sbxloop.backends import backend_for
 from sbxloop.cli.doctor import run_doctor
 from sbxloop.cli.tui import ChatInput, Dashboard, format_event, plain_printer, render_event
@@ -56,7 +58,7 @@ from sbxloop.engine.model import (
 )
 from sbxloop.engine.sinks import published_line
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import SbxloopError
+from sbxloop.errors import ConfigError, SbxloopError
 from sbxloop.events import Event, EventBus, HostEventTypes
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
 from sbxloop.ghids import normalize_item_id, try_parse_gh_id
@@ -127,6 +129,14 @@ def _main_callback(
     # Every command sees the home's secrets.env (tokens + SBXLOOP_* settings);
     # real environment variables always take precedence.
     load_secrets_env()
+    # Repair commands (init/config/doctor) must remain usable when config is
+    # invalid. Each command still owns its normal config error handling.
+    try:
+        telemetry_config = load_config().telemetry
+    except ConfigError:
+        pass
+    else:
+        telemetry.configure_telemetry(telemetry_config)
     # Temporary files land in the home too, once there is one (`sbxloop
     # init`); before that the platform default stands.
     tmp = resolve_home_root() / "tmp"
@@ -134,9 +144,25 @@ def _main_callback(
         tempfile.tempdir = str(tmp)
 
 
+def _require_supported_host() -> None:
+    """Refuse, by name, a host that cannot boot a sandbox (#596) — before
+    any state is written or a microVM is attempted. Read-only commands
+    are not gated: `sbxloop doctor` on the same host says the same thing
+    as a row."""
+    from sbxloop.hostos import host_support
+
+    support = host_support()
+    if support.supported:
+        return
+    console.print(f"[bold red]{support.refusal}[/]")
+    raise typer.Exit(2)
+
+
 def _config_with_overrides(**overrides: Any) -> Config:
     config = _run_config()
     updates = {k: v for k, v in overrides.items() if v is not None}
+    if "model" in updates:
+        updates["run_model_override"] = updates.pop("model")
     return config.model_copy(update=updates) if updates else config
 
 
@@ -661,7 +687,8 @@ def run(
         str | None,
         typer.Option(
             "--model",
-            help="Model id for the configured [agent] backend (`sbxloop list-models`).",
+            help="Force every run agent to use this model for the configured [agent] backend "
+            "(`sbxloop list-models`); concierge is unchanged. Persists across resume.",
         ),
     ] = None,
     keep_sandboxes: Annotated[
@@ -693,6 +720,7 @@ def run(
     With a GitHub repository configured the run carries its work all the
     way: a draft pull request, its own review, fix rounds, CI, and the merge.
     """
+    _require_supported_host()
     config = _config_with_overrides(
         model=model,
         keep_sandboxes=keep_sandboxes,
@@ -852,6 +880,7 @@ def resume(
     ] = 0,
 ) -> None:
     """Resume an unfinished run (fresh sandboxes, persisted state and config)."""
+    _require_supported_host()
     config = _run_config()
     engine = LoopEngine(config)
     try:
@@ -938,6 +967,31 @@ def status(
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
     tasks = store.get_tasks(run_id)
+    model_policy: dict[str, Any] = {}
+    try:
+        raw_config = store.get_run_config(run_id)
+        if json.loads(raw_config):
+            saved = Config.model_validate_json(raw_config)
+            saved._model_env = config._model_env
+            if record.state not in TERMINAL_RUN_STATES:
+                saved = saved.model_copy(
+                    update={
+                        "home": config.home,
+                        "model_source_dir": saved.model_source_dir or config.model_source_dir,
+                    }
+                )
+                saved = refreshed_models(saved)
+            model_policy = {
+                "backend": saved.agent.backend,
+                "scope": "initial policy" if record.state in TERMINAL_RUN_STATES else "next phase",
+                "roles": {
+                    phase: {"model": choice.model, "source": choice.source}
+                    for phase, choice in model_plan(saved, repo=run_model_repo(saved)).items()
+                    if phase != "concierge"
+                },
+            }
+    except (ValueError, SbxloopError) as exc:
+        model_policy = {"error": str(exc)}
     if json_output:
         # Bare JSON on stdout, nothing else — `sbxloop status <run> --json | jq`.
         # A workload's tasks carry their outputs (#757); a code run's are null.
@@ -951,6 +1005,7 @@ def status(
                         else None
                     ),
                     "tasks": [task.model_dump(mode="json") for task in tasks],
+                    "model_policy": model_policy,
                 }
             )
         )
@@ -963,6 +1018,20 @@ def status(
     if record.reason:
         console.print(f"reason: {record.reason}")
     console.print(f"outcome: {record.outcome}")
+    if model_policy.get("error"):
+        console.print(f"model policy unavailable: {rich_escape(model_policy['error'])}")
+    elif model_policy:
+        model_table = Table(title=f"Agent models ({model_policy['scope']}; requests, not usage)")
+        for column in ("phase", "backend", "model", "source"):
+            model_table.add_column(column)
+        for phase, choice in model_policy["roles"].items():
+            model_table.add_row(
+                phase,
+                model_policy["backend"],
+                rich_escape(choice["model"]),
+                rich_escape(choice["source"]),
+            )
+        console.print(model_table)
     for entry in record.published:
         console.print(f"published: {rich_escape(published_line(entry))}")
     table = Table(title="tasks")
@@ -1081,6 +1150,7 @@ def shell(
     Attaching to an in-flight run is meant as observation: the worker owns
     its env files and workspace, so avoid mutating them mid-phase.
     """
+    _require_supported_host()
     if role not in ("agent", "github", "service"):
         console.print(f"[bold red]invalid --role {role!r}:[/] must be agent, github or service")
         raise typer.Exit(2)
@@ -1308,7 +1378,8 @@ def secrets_rotate(
             "--prompt",
             help="Read the new token from a hidden interactive prompt instead of "
             "the configured agent backend's environment variable "
-            "(COPILOT_GITHUB_TOKEN, or ANTHROPIC_API_KEY under the claude backend) / ./.env.",
+            "(COPILOT_GITHUB_TOKEN, ANTHROPIC_API_KEY, or OPENAI_API_KEY, "
+            "according to [agent] backend) / ./.env.",
         ),
     ] = False,
     verify: Annotated[
@@ -1323,7 +1394,7 @@ def secrets_rotate(
     """Rotate the agent credential's sbx registration in one step.
 
     Which credential follows `[agent] backend` (the Copilot token by
-    default, the Anthropic key under the claude backend). Replaces the
+    default, the Anthropic key for claude, the OpenAI key for codex). Replaces the
     existing registration (wherever its scope) with a global one carrying
     the canonical host binding — the rm + set-custom dance provisioning
     would otherwise perform mid-run. The token is read from the
@@ -1902,6 +1973,33 @@ def _migrate_home(
     say("next: `sbxloop doctor`")
 
 
+@app.command("update")
+def update_command(
+    check: Annotated[
+        bool, typer.Option("--check", help="Compare versions without installing anything.")
+    ] = False,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Check versions and show the installation command.")
+    ] = False,
+) -> None:
+    """Check PyPI and update this home's sbxloop and worker to the latest release."""
+    from sbxloop.update import UpdateError, update_home
+
+    if check and dry_run:
+        console.print("choose either --check or --dry-run", markup=False)
+        raise typer.Exit(2)
+    try:
+        update_home(
+            SbxloopHome(resolve_home_root()),
+            check=check,
+            dry_run=dry_run,
+            say=lambda line: console.print(line, markup=False, soft_wrap=True),
+        )
+    except UpdateError as exc:
+        console.print(f"update failed: {exc}", markup=False, soft_wrap=True)
+        raise typer.Exit(1) from exc
+
+
 backup_app = typer.Typer(
     help="Snapshots of the home's config, secrets, units and state.db.",
     invoke_without_command=True,
@@ -2074,6 +2172,7 @@ def daemon(
     Subcommands inspect and steer
     individual work items; `sbxloop daemon ctl CMD` talks to the running
     daemon instead."""
+    _require_supported_host()
     if ctx.invoked_subcommand is not None:
         return
     from sbxloop.daemon.agentbox import DaemonAgent
@@ -2167,15 +2266,6 @@ def daemon(
     # backend and no `[github]` runs on those alone.
     # (`--once` skips the concierge but still runs what one already queued.)
     chat_intake = config.chat_backend is not None and bool(config.concierge.enabled)
-    if not config.github.enabled and not chat_intake and not config.schedules:
-        log.error(
-            "daemon.no_repository",
-            hint="set --repo owner/name (or [github] repo / [[github.repos]]): the "
-            "daemon's work is the labeled issues of the configured repositories — or "
-            "configure a chat backend with the concierge on, and workloads asked for "
-            "in chat are its work — or declare [[schedules]], and their ticks are",
-        )
-        raise typer.Exit(2)
     if config.github.enabled and not config.github.enabled_repos():
         log.error(
             "daemon.no_enabled_repository",
@@ -2207,6 +2297,23 @@ def daemon(
     archived = DaemonStore.archive_legacy(db_path)
     store = _store(config)
     dstore = DaemonStore(db_path)
+    # Schedules live in the store (#818): a daemon with stored schedules
+    # and nothing else is a valid daemon, as one with `[[schedules]]` was.
+    if (
+        not config.github.enabled
+        and not chat_intake
+        and not config.schedules
+        and not dstore.schedules()
+    ):
+        log.error(
+            "daemon.no_repository",
+            hint="set --repo owner/name (or [github] repo / [[github.repos]]): the "
+            "daemon's work is the labeled issues of the configured repositories — or "
+            "configure a chat backend with the concierge on, and workloads asked for "
+            "in chat are its work — or create a schedule (`sbxloop daemon ctl schedules "
+            "add …`), and its ticks are",
+        )
+        raise typer.Exit(2)
     # Rows a single-repo daemon wrote carry no repository. Name it now, from
     # the config, rather than letting whichever repository is polled first
     # adopt them. With several repos configured there is no sole owner to
@@ -2267,7 +2374,6 @@ def daemon(
     source: WorkSource
     if config.github.enabled:
         github = DaemonGithub(config, sbx, bus, worker_python=config.worker_python)
-        github.remove_stale()
         labels = GitHubLabels(
             config.daemon.trigger_label,
             config.daemon.in_progress_label,
@@ -2294,21 +2400,13 @@ def daemon(
             suspend_after=config.daemon.repo_suspend_after,
             persist=persist_repo_health,
         )
-        if chat_intake or config.schedules:
-            # Chat-started (#760) and scheduled (#761) workloads ride the
-            # same queue; the composite routes each item back to where it
-            # came from.
-            source = CompositeSource(
-                source,
-                ChatSource() if chat_intake else None,
-                ScheduleSource() if config.schedules else None,
-            )
+        # Chat-started (#760) and scheduled (#761) workloads ride the same
+        # queue; the composite routes each item back to where it came
+        # from. The schedule source always rides: a schedule may be
+        # created from chat while the daemon runs (#818).
+        source = CompositeSource(source, ChatSource() if chat_intake else None, ScheduleSource())
     else:
-        source = CompositeSource(
-            None,
-            ChatSource() if chat_intake else None,
-            ScheduleSource() if config.schedules else None,
-        )
+        source = CompositeSource(None, ChatSource() if chat_intake else None, ScheduleSource())
 
     # One line an operator can read back from the journal to know exactly
     # what this daemon is: its home, what it polls, and every guardrail.
@@ -2374,7 +2472,7 @@ def daemon(
         raise typer.Exit(code)
 
     loop = DaemonLoop(config, store=store, dstore=dstore, source=source, sbx=sbx, github=github)
-    polled = source.github if isinstance(source, CompositeSource) else source
+    polled = source.github
     if isinstance(polled, MultiRepoIssueSource):
         polled.notify = loop.source_notice
     # One probe, shared: the startup drift check below warms its PyPI memo, so
@@ -2831,6 +2929,7 @@ def bake(
     reinstalling it on every provision (and fall back to the normal
     install if the template goes stale).
     """
+    _require_supported_host()
     config = load_config()
     cli = SbxCLI(app_name=config.app_name or None)
     try:
@@ -2868,12 +2967,15 @@ def list_models(
         float,
         typer.Option("--timeout", help="Seconds to wait for the backend's runtime and API."),
     ] = 60.0,
+    repo: Annotated[
+        str | None, typer.Option("--repo", help="Show this repository's model overrides.")
+    ] = None,
 ) -> None:
     """List the models the configured [agent] backend gives this host access to.
 
     Queries the backend directly on the host (no sandbox) with the same
     credential agent sessions use — the Copilot SDK by default, the
-    Anthropic Models API under `[agent] backend = "claude"` — so the ids
+    Anthropic Models API for claude, the Codex SDK for codex — so the ids
     shown here are valid values for `model` in sbxloop.toml and
     `sbxloop run --model`.
     """
@@ -2886,6 +2988,8 @@ def list_models(
 
     config = load_config()
     backend = backend_for(config)
+    selected_repo = _resolve_repo(config, repo).repo if repo is not None else None
+    choices = model_plan(config, repo=selected_repo)
     try:
         rows = fetch_backend_rows(backend, timeout_s=timeout_s)
     except SbxloopError as exc:
@@ -2893,6 +2997,13 @@ def list_models(
         # error text must not be parsed as rich markup.
         console.print(f"[bold red]list-models failed:[/] {rich_escape(str(exc))}")
         raise typer.Exit(2) from exc
+    if rows:
+        from sbxloop.modelcatalog import save_catalog
+
+        try:
+            save_catalog(config.paths, backend, rows)
+        except (OSError, ValueError):
+            typer.echo("Models listed, but the TUI model cache could not be updated.", err=True)
     if json_output:
         # bare JSON on stdout, nothing else — `sbxloop list-models --json | jq`
         typer.echo(json.dumps([row.raw or {"id": row.id, "name": row.name} for row in rows]))
@@ -2902,7 +3013,9 @@ def list_models(
     for column in columns:
         table.add_column(column)
     for row in rows:
-        configured = row.id == config.model
+        configured = row.id == config.model or any(
+            choice.model == row.id for choice in choices.values()
+        )
         # SDK-provided text is escaped: a model name with brackets must not
         # be parsed as rich markup.
         cells = {
@@ -2932,6 +3045,14 @@ def list_models(
     )
     footnote = "; * = default reasoning effort" if "reasoning" in columns else ""
     console.print(f"[dim]{marker}{footnote}[/]")
+    for phase, choice in choices.items():
+        if choice.source != "model":
+            availability = (
+                ""
+                if choice.model == "auto" or any(row.id == choice.model for row in rows)
+                else " (not in this list)"
+            )
+            console.print(rich_escape(f"{phase}: {choice.model} — {choice.source}{availability}"))
 
 
 @app.command()
@@ -2974,7 +3095,13 @@ def doctor(
 
 
 def main() -> None:
-    app()
+    try:
+        app()
+    except Exception as exc:
+        telemetry.capture_exception(exc)
+        raise
+    finally:
+        telemetry.shutdown_telemetry()
 
 
 if __name__ == "__main__":

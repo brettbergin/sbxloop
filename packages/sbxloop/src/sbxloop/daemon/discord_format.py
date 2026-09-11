@@ -218,7 +218,7 @@ UNKNOWN_BACKEND = "unknown"
 UNKNOWN_MODEL = "unknown"
 #: The agent backends the config accepts (config.AgentConfig.backend). Kept
 #: literal here so this module stays importable without the config package.
-KNOWN_BACKENDS = ("copilot", "claude")
+KNOWN_BACKENDS = ("copilot", "claude", "codex")
 
 
 def agent_model_label(backend: object, model: object) -> str:
@@ -261,9 +261,28 @@ def agent_ident_from_config_json(raw: object) -> dict[str, str]:
         data = {}
     agent = data.get("agent")
     backend = agent.get("backend") if isinstance(agent, dict) else None
+    model = str(data.get("model") or "") or UNKNOWN_MODEL
+    if data.get("run_model_override"):
+        model = f"{data['run_model_override']} (run override)"
+    else:
+        role_models = agent.get("models") if isinstance(agent, dict) else None
+        github = data.get("github")
+        repos = github.get("repos") if isinstance(github, dict) else None
+        per_repo = isinstance(repos, list) and any(
+            isinstance(entry, dict)
+            and isinstance(entry.get("agent_models"), dict)
+            and any(entry["agent_models"].values())
+            for entry in repos
+        )
+        if (
+            data.get("model_source_dir")
+            or per_repo
+            or (isinstance(role_models, dict) and any(role_models.values()))
+        ):
+            model = f"per-agent; initial fallback {model}"
     return {
         "backend": str(backend or "") or UNKNOWN_BACKEND,
-        "model": str(data.get("model") or "") or UNKNOWN_MODEL,
+        "model": model,
     }
 
 
@@ -1563,6 +1582,12 @@ def format_for_discord(
                 flush=True,
             )
         ]
+    if t == "provider.held":
+        return [line(f"⏸ **provider held** — {data.get('message')}", flush=True)]
+    if t == "provider.recovered":
+        return [
+            line(f"▶ **{data.get('backend')} recovered** — continuing the checkpoint", flush=True)
+        ]
     if t == HostEventTypes.RUN_HELD:
         declared = ", ".join(str(name) for name in _list(data, "sinks"))
         where = f" — sinks: {declared}" if declared else ""
@@ -1599,14 +1624,26 @@ def format_for_discord(
         who = " (by a human)" if data.get("by_human") else ""
         return [line(f"🎉 **merged** PR {link(label, data.get('url'))}{who}", flush=True)]
     if t == HostEventTypes.RUN_FOLLOWUPS:
-        filed = [f for f in _list(data, "filed") if isinstance(f, dict)]
+        reused = [f for f in _list(data, "reused") if isinstance(f, dict)]
+        reused_urls = {str(f.get("url")) for f in reused}
+        filed = [
+            f
+            for f in _list(data, "filed")
+            if isinstance(f, dict) and str(f.get("url")) not in reused_urls
+        ]
+        messages: list[Chunk] = []
         if filed:
             refs = ", ".join(
                 link(_one_line(str(f.get("title") or ""), 60), f.get("url")) for f in filed
             )
-            return [
-                line(f"📌 filed {len(filed)} follow-up issue(s) (not queued): {refs}", flush=True)
-            ]
+            messages.extend(
+                [line(f"📌 filed {len(filed)} follow-up issue(s) (not queued): {refs}", flush=True)]
+            )
+        if reused:
+            refs = ", ".join(
+                link(_one_line(str(f.get("title") or ""), 60), f.get("url")) for f in reused
+            )
+            messages.append(line(f"📌 already tracked in existing issues: {refs}", flush=True))
         listed = _list(data, "listed")
         if listed:
             why = (
@@ -1614,14 +1651,16 @@ def format_for_discord(
                 if data.get("reason") == "issues_disabled"
                 else ""
             )
-            return [
-                line(
-                    f"📌 {len(listed)} follow-up(s) listed on the PR, not filed{why}: "
-                    + "; ".join(_one_line(str(t), 60) for t in listed),
-                    flush=True,
-                )
-            ]
-        return []
+            messages.extend(
+                [
+                    line(
+                        f"📌 {len(listed)} follow-up(s) listed on the PR, not filed{why}: "
+                        + "; ".join(_one_line(str(t), 60) for t in listed),
+                        flush=True,
+                    )
+                ]
+            )
+        return messages
     if t == HostEventTypes.RUN_BLOCKED:
         why = _one_line(data.get("why") or "", 300)
         label = f"#{data.get('pr')}"
@@ -2221,7 +2260,7 @@ def status_embed(status: dict[str, Any]) -> EmbedSpec:
     )
     resumes = status.get("resumes_today", 0)
     tz = status.get("run_cap_timezone", "UTC")
-    fields = (
+    fields: tuple[tuple[str, str, bool], ...] = (
         ("Current", current, False),
         ("Queued", str(status.get("queued", 0)), True),
         (
@@ -2233,10 +2272,19 @@ def status_embed(status: dict[str, Any]) -> EmbedSpec:
         ("Breaker", breaker, True),
         ("Paused", paused, True),
     )
+    if status.get("source_failures"):
+        fields += (
+            (
+                "Source",
+                f"polling failed {status['source_failures']} time(s); "
+                f"retry in {status.get('source_retry_in_s', 0):.0f}s — check the daemon logs",
+                False,
+            ),
+        )
     color = (
         COLOR_FAIL
         if status.get("breaker_open")
-        else (COLOR_WARN if status.get("paused") else COLOR_OK)
+        else (COLOR_WARN if status.get("paused") or status.get("source_failures") else COLOR_OK)
     )
     return EmbedSpec(title="sbxloop daemon", color=color, fields=fields).clamped()
 
