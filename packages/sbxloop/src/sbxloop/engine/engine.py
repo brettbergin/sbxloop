@@ -1800,10 +1800,16 @@ class LoopEngine:
             started_at=started,
         )
         if failed is not None:
-            what = "command" if failed["command"] == spec.command else "check"
+            # One line on the wire: the reason is what the finish card
+            # posts, and the full transcript is already on the phase row.
+            # The recipe's command is named by the task, not repeated — it
+            # is the recipe's, and long; a check is short and is quoted.
+            named = (
+                "command" if failed["command"] == spec.command else f"check `{failed['command']}`"
+            )
             message = (
-                f"task {spec.id}: {what} `{failed['command']}` exited "
-                f"{failed['exit_code']}: {clip(str(failed['output']))}"
+                f"task {spec.id}: {named} exited {failed['exit_code']}"
+                f"{_last_line(str(failed['output']))}"
             )
             self.bus.emit(
                 HostEventTypes.PHASE_END,
@@ -5520,6 +5526,19 @@ class LoopEngine:
             title=task.spec.title,
             state=task.state,
         )
+
+
+def _last_line(output: str, limit: int = 300) -> str:
+    """The last non-empty line of a command's output, as a ` — …` suffix;
+    empty when there is none. A traceback ends with the exception, a tool
+    with its error line: the one line a person needs, never the wall."""
+    lines = [line.strip() for line in output.splitlines() if line.strip()]
+    if not lines:
+        return ""
+    line = lines[-1]
+    if len(line) > limit:
+        line = line[: limit - 1] + "…"
+    return f" — {line}"
 
 
 def run_outcome(outcome: str, config: Config | None = None) -> RunResult:

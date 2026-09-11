@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib
+import io
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import dataclass
@@ -15,6 +18,19 @@ from typing import Any
 import pytest
 
 from sbxloop.data import entrygraph_scan as scan
+
+
+def fails(argv: list[str], *, match: str) -> None:
+    """``main`` reports a failure as exit 1 and ONE ``error:`` line on
+    stderr — never a traceback: the line is read in a chat thread as the
+    run's reason, and the frames of this script are nobody's business."""
+    captured = io.StringIO()
+    with contextlib.redirect_stderr(captured):
+        assert scan.main(argv) == 1
+    lines = [line for line in captured.getvalue().splitlines() if line.strip()]
+    assert len(lines) == 1, lines
+    assert lines[0].startswith("error: ") and re.search(match, lines[0]), lines[0]
+    assert "Traceback" not in captured.getvalue()
 
 
 @dataclass
@@ -188,15 +204,13 @@ def test_empty_result_keeps_no_safety_inference(sandbox_apis: SimpleNamespace) -
 def test_index_error_cannot_leave_a_success_report(sandbox_apis: SimpleNamespace) -> None:
     s = sandbox_apis
     s.failure = RuntimeError("parser unavailable")
-    with pytest.raises(RuntimeError, match="parser unavailable"):
-        scan.main(["--repo", str(s.root), "--output", str(s.output)])
+    fails(["--repo", str(s.root), "--output", str(s.output)], match="parser unavailable")
     assert not (s.output / "report.json").exists()
 
 
 def test_missing_checkout_fails_before_indexing(sandbox_apis: SimpleNamespace) -> None:
     s = sandbox_apis
-    with pytest.raises(ValueError, match="checkout"):
-        scan.main(["--repo", str(s.root / "missing"), "--output", str(s.output)])
+    fails(["--repo", str(s.root / "missing"), "--output", str(s.output)], match="checkout")
     assert not s.indexes
 
 
@@ -213,8 +227,7 @@ def test_missing_checkout_fails_before_indexing(sandbox_apis: SimpleNamespace) -
 )
 def test_url_rejection_precedes_clone(sandbox_apis: SimpleNamespace, url: str) -> None:
     s = sandbox_apis
-    with pytest.raises(ValueError, match="HTTPS"):
-        scan.main(["--repo", str(s.root / "new"), "--url", url, "--output", str(s.output)])
+    fails(["--repo", str(s.root / "new"), "--url", url, "--output", str(s.output)], match="HTTPS")
     assert not s.clones
     assert not s.indexes
 
@@ -250,17 +263,17 @@ def test_existing_url_clone_is_reused_without_fetch(sandbox_apis: SimpleNamespac
 
 def test_wrong_origin_is_never_overwritten(sandbox_apis: SimpleNamespace) -> None:
     s = sandbox_apis
-    with pytest.raises(ValueError, match="origin"):
-        scan.main(
-            [
-                "--repo",
-                str(s.root),
-                "--url",
-                "https://example.com/other/repo",
-                "--output",
-                str(s.output),
-            ]
-        )
+    fails(
+        [
+            "--repo",
+            str(s.root),
+            "--url",
+            "https://example.com/other/repo",
+            "--output",
+            str(s.output),
+        ],
+        match="origin",
+    )
     assert not s.clones
     assert not s.indexes
 
@@ -269,8 +282,7 @@ def test_retry_cannot_change_completed_source_revision(sandbox_apis: SimpleNames
     s = sandbox_apis
     scan.main(["--repo", str(s.root), "--output", str(s.output)])
     s.sha = "b" * 40
-    with pytest.raises(ValueError, match="revision"):
-        scan.main(["--repo", str(s.root), "--output", str(s.output)])
+    fails(["--repo", str(s.root), "--output", str(s.output)], match="revision")
     assert json.loads((s.output / "report.json").read_text())["source"]["revision"] == "a" * 40
 
 
@@ -278,15 +290,13 @@ def test_verify_rejects_changed_markdown(sandbox_apis: SimpleNamespace) -> None:
     s = sandbox_apis
     scan.main(["--repo", str(s.root), "--output", str(s.output)])
     (s.output / "report.md").write_text("Everything is safe.")
-    with pytest.raises(ValueError, match="report"):
-        scan.main(["--check", "--output", str(s.output)])
+    fails(["--check", "--output", str(s.output)], match="report")
 
 
 def test_verify_requires_complete_schema(tmp_path: Path) -> None:
     (tmp_path / "report.json").write_text('{"source": {"revision": "abc"}}')
     (tmp_path / "report.md").write_text("incomplete")
-    with pytest.raises(ValueError, match="report"):
-        scan.main(["--check", "--output", str(tmp_path)])
+    fails(["--check", "--output", str(tmp_path)], match="report")
 
 
 def test_configured_source_preserves_owner(sandbox_apis: SimpleNamespace) -> None:
@@ -338,5 +348,4 @@ def test_real_gitpython_reports_sha_and_refuses_untracked_analysis_input(
         expected = repository.head.commit.hexsha
     assert json.loads((s.output / "report.json").read_text())["source"]["revision"] == expected
     (s.root / "untracked.txt").write_text("Uncommitted analysis input")
-    with pytest.raises(ValueError, match="checkout"):
-        scan.main(["--repo", str(s.root), "--output", str(s.output)])
+    fails(["--repo", str(s.root), "--output", str(s.output)], match="checkout")
