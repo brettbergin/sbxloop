@@ -63,6 +63,15 @@ def _slack(tmp_path: Path) -> Config:
     )
 
 
+def _mattermost(tmp_path: Path) -> Config:
+    return Config.model_validate(
+        {
+            "home": str(tmp_path / "state"),
+            "mattermost": {"url": "https://mm.example.test", "channel_id": "c" * 26},
+        }
+    )
+
+
 def _http_error(code: int) -> urllib.error.HTTPError:
     return urllib.error.HTTPError("https://x", code, "nope", {}, io.BytesIO(b""))  # type: ignore[arg-type]
 
@@ -251,3 +260,45 @@ class TestCli:
         assert result.exit_code == 2, result.output
         assert "DISCORD_BOT_TOKEN is not set" in result.output
         assert opener.requests == []
+
+
+class TestMattermost:
+    def test_posts_to_the_configured_instance_with_the_bot_token(self, tmp_path: Path) -> None:
+        """The endpoint is the operator's instance, not a constant — and the
+        credential is Mattermost's, not the Slack token the two-way branch
+        would have reached for."""
+        opener = Recorder()
+        posted = post_notice(
+            _mattermost(tmp_path),
+            "**deploy** starting",
+            env={"MATTERMOST_BOT_TOKEN": "tok"},
+            timeout_s=7.0,
+            open_url=opener,
+        )
+        assert posted == Posted("mattermost", "c" * 26)
+        request = opener.only
+        assert request.full_url == "https://mm.example.test/api/v4/posts"
+        assert request.get_method() == "POST"
+        assert request.get_header("Authorization") == "Bearer tok"
+        payload = opener.payload
+        assert payload["channel_id"] == "c" * 26
+        # House dialect goes through untouched: Mattermost reads it as is.
+        assert payload["message"] == "**deploy** starting"
+
+    def test_a_notice_can_never_ping(self, tmp_path: Path) -> None:
+        """Mattermost has no allowed-mentions control, so the guard is the
+        only thing between a deploy notice and waking a channel."""
+        opener = Recorder()
+        post_notice(
+            _mattermost(tmp_path),
+            "rollback failed, @channel",
+            env={"MATTERMOST_BOT_TOKEN": "tok"},
+            open_url=opener,
+        )
+        message = opener.payload["message"]
+        assert "@channel" not in message  # the bare form, which would wake everyone
+        assert "@\u200bchannel" in message  # parked: still readable, now inert
+
+    def test_a_missing_token_names_the_right_variable(self, tmp_path: Path) -> None:
+        with pytest.raises(SbxloopError, match="MATTERMOST_BOT_TOKEN is not set"):
+            post_notice(_mattermost(tmp_path), "x", env={}, open_url=Recorder())
