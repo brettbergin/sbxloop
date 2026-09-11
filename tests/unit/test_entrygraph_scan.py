@@ -349,3 +349,20 @@ def test_real_gitpython_reports_sha_and_refuses_untracked_analysis_input(
     assert json.loads((s.output / "report.json").read_text())["source"]["revision"] == expected
     (s.root / "untracked.txt").write_text("Uncommitted analysis input")
     fails(["--repo", str(s.root), "--output", str(s.output)], match="checkout")
+
+
+def test_clone_follows_a_code_hosts_initial_redirect(sandbox_apis: SimpleNamespace) -> None:
+    """A URL without its `.git` suffix is answered with a 301 by some code
+    hosts; `http.followRedirects=false` refused it and every scan of such
+    a URL failed at the clone (seen in the field). Git's own default,
+    `initial`, follows that one redirect and still refuses any mid-transfer."""
+    s = sandbox_apis
+    scan.main(["--repo", str(s.root / "new"), "--url", s.origin, "--output", str(s.output)])
+    (_, _, kwargs) = s.clones[0]
+    env = kwargs["env"]
+    settings = {
+        env[f"GIT_CONFIG_KEY_{i}"]: env[f"GIT_CONFIG_VALUE_{i}"]
+        for i in range(int(env["GIT_CONFIG_COUNT"]))
+    }
+    assert settings["http.followRedirects"] == "initial"
+    assert settings["protocol.allow"] == "never" and settings["protocol.https.allow"] == "always"
