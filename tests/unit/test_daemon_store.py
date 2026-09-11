@@ -1532,6 +1532,65 @@ class TestWorkloadItems:
     """#760: an item carries the run it becomes and its profile; a chat ask
     has no repository by design and survives the repo-attribution passes."""
 
+    def test_a_recipe_requires_tool_kind(self) -> None:
+        with pytest.raises(ValueError, match="recipe requires a tool"):
+            item("scan", item_id="chat:scan", recipe="entrygraph", recipe_target="acme/one")
+        with pytest.raises(ValueError, match="recipe requires a tool"):
+            item(
+                "scan",
+                item_id="chat:scan",
+                kind="workload",
+                recipe="entrygraph",
+                recipe_target="acme/one",
+            )
+
+    def test_a_recipe_and_its_target_are_set_together(self) -> None:
+        with pytest.raises(ValueError, match="set together"):
+            item("scan", item_id="chat:scan", kind="tool", recipe="entrygraph")
+        with pytest.raises(ValueError, match="set together"):
+            item("scan", item_id="chat:scan", kind="tool", recipe_target="acme/one")
+
+    def test_a_recipe_survives_store_reopen(self, tmp_path: Path) -> None:
+        path = tmp_path / "state.db"
+        store = DaemonStore(path)
+        store.upsert_new(
+            item(
+                "scan",
+                item_id="chat:scan",
+                kind="tool",
+                recipe="entrygraph",
+                recipe_target="acme/one",
+            ),
+            now=1.0,
+        )
+        store.close()
+        reopened = DaemonStore(path)
+        got = reopened.get("chat:scan")
+        assert got is not None and got.recipe == "entrygraph"
+        assert got.recipe_target == "acme/one"
+
+    def test_pre_recipe_database_gains_nullable_recipe_columns(self, tmp_path: Path) -> None:
+        path = daemon_db(tmp_path, "pre_local_bridge")
+        insert_daemon_row(
+            path,
+            item_id="gh:o/r:issue:3",
+            source_key="3",
+            title="Three",
+            state="queued",
+            attempts=0,
+            claimed=0,
+            created_at=1.0,
+            updated_at=2.0,
+            repo="o/r",
+        )
+        store = DaemonStore(path)
+        got = store.get("gh:o/r:issue:3")
+        assert got is not None and got.recipe is None and got.recipe_target is None
+        columns = {
+            row[1] for row in sqlite3.connect(path).execute("PRAGMA table_info(daemon_work_items)")
+        }
+        assert {"recipe", "recipe_target"} <= columns
+
     def test_kind_and_profile_round_trip(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")
         store.upsert_new(item("6", item_id="gh:issue:6", kind="workload", profile="research"), 1.0)
@@ -1677,3 +1736,41 @@ class TestWorkloadItems:
         assert live is not None and live.item_id == "sched:daily:t1"
         store.mark_done("sched:daily:t1", now=2.0)
         assert store.live_schedule_item("daily") is None
+
+
+class TestRecipeItemsAreToolRuns:
+    """Recipe items were first queued as `workload` runs; they are `tool`
+    runs now, and a row persisted under the earlier kind must load."""
+
+    def test_a_recipe_item_persisted_as_a_workload_loads_as_a_tool_run(
+        self, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "state.db"
+        store = DaemonStore(path)
+        store.upsert_new(
+            item(
+                "scan",
+                item_id="chat:scan",
+                kind="tool",
+                recipe="entrygraph",
+                recipe_target="acme/one",
+            ),
+            now=1.0,
+        )
+        store.close()
+        # The row as the earlier release wrote it, and the schema stamp it
+        # left, so the migration runs on reopen.
+        with sqlite3.connect(path) as conn:
+            conn.execute("UPDATE daemon_work_items SET run_kind = 'workload'")
+            conn.execute("UPDATE alembic_version SET version_num = '0007'")
+        reopened = DaemonStore(path)
+        got = reopened.get("chat:scan")
+        assert got is not None and got.kind == "tool" and got.recipe == "entrygraph"
+        # An ordinary workload item is not touched.
+        reopened.upsert_new(item("ask", item_id="chat:ask", kind="workload"), now=2.0)
+        reopened.close()
+        with sqlite3.connect(path) as conn:
+            conn.execute("UPDATE alembic_version SET version_num = '0007'")
+        again = DaemonStore(path)
+        plain = again.get("chat:ask")
+        assert plain is not None and plain.kind == "workload" and plain.recipe is None

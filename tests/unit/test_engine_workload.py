@@ -71,6 +71,37 @@ def harness(fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 
 class TestWorkloadRun:
+    def test_a_caller_that_seeded_inputs_requires_a_visible_mount(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A recipe stages the code the run executes, then says so: without
+        the mount the task is gone, not merely its artifacts."""
+        from sbxloop.errors import ProvisionError
+
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        workspace = harness.home.run_workspace("rinput")
+        workspace.mkdir(parents=True)
+        (workspace / "input.txt").write_text("an input the task must read")
+        harness.script([taskgraph(task("t1")), BUILD, PASS])
+        with pytest.raises(ProvisionError, match="mount"):
+            harness.engine().start(
+                "read input.txt", run_id="rinput", kind="workload", expects_mount=True
+            )
+
+    def test_an_ordinary_workload_is_not_held_to_a_mount_by_leftover_files(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Whether the mount is required is the caller's to state. Files that
+        happen to be in the data directory — a previous attempt's scratch, a
+        harvest left behind — must not decide it for them."""
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        workspace = harness.home.run_workspace("rleft")
+        workspace.mkdir(parents=True)
+        (workspace / "leftover.txt").write_text("not an input anybody declared")
+        harness.script([taskgraph(task("t1")), BUILD, PASS])
+        result = harness.engine().start("do the work", run_id="rleft", kind="workload")
+        assert result.state == "completed", result.reason
+
     def test_one_sandbox_and_the_operator_stages(self, harness: Harness) -> None:
         """No `[github]`: the agent box alone, the four stages in order,
         `completed` at the end — and the run says what it is."""
@@ -757,6 +788,38 @@ def profiled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
 
 
 class TestNeeds:
+    def test_a_re_authorized_graph_announces_its_grant_once(
+        self, harness: Harness, profiled: dict[str, Any]
+    ) -> None:
+        """Every pass re-authorizes the graph — but the grant is one
+        decision. A run that re-provisions for its credentials passes the
+        needs step twice; a second `run.needs_granted` would read in the
+        chronology as a second, different grant of the same thing.
+        """
+        harness.script(
+            [
+                plan(needing("t1", credentials=["weather"])),
+                {"text": "checked the forecast", "host_tool_calls": [CALL]},
+                PASS,
+            ]
+        )
+        result = harness.engine(**profiled).start("what is the weather", kind="workload")
+        assert result.state == "completed", result.reason
+        (grant,) = self.granted(harness)
+        assert grant["credentials"] == ["weather"]
+
+    def test_seeded_workload_does_not_skip_need_validation(self, harness: Harness) -> None:
+        from sbxloop.engine.model import TaskSpec
+
+        harness.script([BUILD, PASS])
+        result = harness.engine().start(
+            "read the repository",
+            kind="workload",
+            tasks=[TaskSpec.model_validate(needing("t1", repo="org/private"))],
+        )
+        assert result.state == "failed"
+        assert self.refused(harness)[0]["need"] == "repo"
+
     def refused(self, harness: Harness) -> list[dict[str, Any]]:
         return [e.data for e in harness.events if e.type == HostEventTypes.RUN_NEEDS_REFUSED]
 

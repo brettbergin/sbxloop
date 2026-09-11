@@ -175,8 +175,31 @@ These keys follow normal operator config layering: the home config, untracked
 `pyproject.toml` (`[tool.sbxloop]`), untracked `sbxloop.toml`, then environment overrides such as
 `SBXLOOP_AGENT__MODELS__BUILD`. Tracked project config cannot change model
 policy. Put operator choices in the home config or an untracked file. The TUI
-config editor supports the nested keys; unset a key
-to restore inheritance. Use `sbxloop doctor` for local model resolution and
+config editor opens a searchable model picker for top-level `model`, each
+agent model, repository overrides, and `concierge.model`. Search by model name
+or slug, use the arrow keys to select, and press Enter to apply. Choose
+**Inherit** or press Ctrl+U to remove an override; **auto** explicitly delegates
+selection to the backend. Ctrl+T opens custom entry for aliases or models the
+catalog does not yet list. Search text alone never becomes a model value.
+
+The picker reads the last successful catalog from the home's
+`cache/models/<backend>.json`, showing its timestamp and whether it is stale.
+Successful agent provisioning (including concierge reuse after restart)
+refreshes missing or day-old catalogs in the background. Opening the picker
+also refreshes a missing or stale catalog; Ctrl+R refreshes on demand.
+`sbxloop list-models` refreshes the same cache after a successful nonempty
+listing, including with `--json`. Failed discovery keeps the last successful
+catalog and does not interrupt provisioning or discard configured model ids.
+Catalogs are separate per backend and contain only model ids, display names,
+policy state, and the fetch timestamp. The cache is advisory, not proof of
+current account access; refresh it after changing credentials.
+
+Discovery has the same host credential and optional SDK requirements as
+[`list-models`](#which-models-can-i-use). Claude needs no host SDK extra;
+Copilot and Codex require their respective extras. The picker reports lookup
+failures and still offers the cached models, current value, auto, and custom entry.
+
+Use `sbxloop doctor` for local model resolution and
 `sbxloop list-models --repo your-org/your-project` to compare those choices
 against the backend's catalogue. A model absent from that catalogue is
 reported, not rejected: aliases and account-specific availability vary.
@@ -283,6 +306,8 @@ landed; a run whose languages the template lacks — a Go repo on a Python bake,
 say — keeps the baked worker and provisions the missing toolchain on top, and
 the `sandbox.prebaked` event and `sbxloop doctor` both say so, so you know
 when a re-bake would stop paying for that per provision.
+
+#### Which models can I use?
 
 Wondering what to put in `model = "..."` (or `--model`)? Ask the configured
 backend which models your credential can actually use:
@@ -622,6 +647,48 @@ valid daemon: chat-asked workloads are its whole queue. A profile's
 `publish = "hold"` parks the finished run instead of publishing (see above):
 the release re-queues the item with its run pinned and the next tick
 resumes it at the publishing stage.
+
+**Entrygraph reports from chat.** Ask the concierge:
+
+- `Run entrygraph against the configured repos.`
+- `Run entrygraph against owner/repo.`
+- `Run entrygraph against https://github.com/owner/repo.git.`
+
+or, from a terminal, `sbxloop run --kind tool --recipe entrygraph --target owner/repo "scan owner/repo"` — the same recipe path the daemon takes, with
+the run's chronology in the TUI and the reports under
+`runs/<run>/artifacts`.
+
+The `start_entrygraph` tool queues one **tool run** per repository — a fixed
+recipe with no agent in it: the pinned analyzer runs as one command in the
+sandbox, its own consistency check runs behind it, and the two reports it
+wrote go to chat as they are. No planning turn, no judge, no model-written
+summary; the same input gives the same chronology every time. Discord
+receives the report and the `report.md` / `report.json` attachments through
+its existing run thread and upload limits. The report records the scanned commit, repository
+statistics, languages/frameworks, entrypoints, and source-to-sink paths with
+locations and confidence. Searches cover all source/sink categories, up to
+100 paths and depth 25, and report widening, truncation and coverage limits;
+an empty result does not establish that a repository is safe.
+
+With no selector, scans cover all enabled configured repositories. A matching
+configured repository URL uses that repository's existing credential; other
+HTTPS clone URLs must be public. Credentials embedded in URLs are refused.
+Configured checkouts are fetched through the existing host GitPython path;
+public URL checkouts are cloned with GitPython inside the sandbox. Both are
+isolated scan inputs, and target code and build setup are not executed.
+Repositories with unavailable submodule or LFS contents retain that coverage
+limitation in the report.
+
+The recipe runs entrygraph 0.1.134 and installs its analysis runtime inside
+the sandbox from published wheels, so the only egress it is granted is the
+package index; `[policy] deny` still wins, and `[entrygraph] extra_hosts`
+covers a sandbox where no wheel applies. `[entrygraph] enabled = false`
+removes the tool; `allow_public_urls = false` narrows it to the configured
+repositories. The usual queue limits, chronology, cancellation and resume
+apply; steering does not — there is no agent to steer — and chat is the only
+result sink. A tool run has no workload profile: its declared hosts are its
+whole egress grant. Replaying the same chat message does not duplicate scans;
+a new message queues a fresh scan.
 
 **Workloads on a cadence** (#761) are the third way in: **schedules**,
 which live in the daemon's database (#818), not in the config file. Create
@@ -972,6 +1039,53 @@ command in the error, and `keep_on_failure` keeps the sandbox for `sbxloop shell
 is paid at that repository's provision, since the bake reads the global list
 only.
 
+### Playwright MCP for browser verification
+
+Give Copilot or Claude builders a headless browser with the packaged preset:
+
+```bash
+sbxloop init --preset playwright
+# Inspect the generated config without writing files:
+sbxloop init --stdout --preset playwright
+```
+
+For an existing installation, merge the generated `[sandbox]` settings and
+`[[mcp]]` entry into the home's `config/sbxloop.toml`. Keep any existing
+languages and append the setup commands to the existing list; a repository's
+`setup_commands` override replaces that list and must include the browser
+installation too. The preset selects `[agent] backend = "copilot"`; change
+it to `"claude"` to use the Claude Agent SDK and configure that backend's
+inference credential as usual. Native MCP is not supported by the Codex
+backend.
+
+The preset installs `@playwright/mcp@0.0.80` into
+`$HOME/.sbxloop/playwright-mcp` inside the **agent sandbox**, then invokes
+that package's Playwright CLI to install the matching Chromium binary and
+Linux dependencies. This avoids changing the target's package manifest or
+lockfile. The public package installation uses its own cache with lifecycle
+scripts disabled, including when the target's dependency cache is offline.
+The MCP command uses that installed copy, with `--browser chromium`,
+`--headless` and `--isolated`. Each MCP browser session starts with a fresh
+profile. See the [Playwright MCP options](https://github.com/microsoft/playwright-mcp#configuration)
+and [browser installation guide](https://playwright.dev/docs/browsers#install-browsers).
+
+Only the builder receives the server. It can start the target's development
+server in the sandbox, navigate to its loopback address, inspect pages and
+console errors, and exercise the UI. Ask it to save screenshots and other
+evidence inside the workspace so they survive harvest. The declared hosts
+cover npm and the browser downloads; add the application's external API,
+asset and website domains to the MCP entry's `hosts` as needed. The existing
+network policy and setup failure reporting still apply. Browser tools do
+not replace the target repository's verification gate.
+
+Setup commands run before the first phase of each **code run**; `sbxloop bake`
+does not execute them. Workloads skip these commands, so the preset excludes
+`operator`: to use it for workloads, first prepare a custom sandbox template
+with the same package, browser and OS dependencies installed for the agent
+user, select it under `[sandbox] template`, and add `"operator"` to `roles`.
+Keep planners, critics and the concierge excluded. Update the pinned MCP
+package and reinstall its browser together when upgrading.
+
 ### Suites that need services
 
 Most backend suites want a database, a broker or a browser the sandbox
@@ -1238,13 +1352,14 @@ warning and a `sbxloop doctor` row to make that edit unhurried
 migrated, and the old lanes' issues and labels are closed by hand;
 [CHANGELOG → 1.0 cutover](../CHANGELOG.md#10-cutover) has the steps.
 
-### Chat: chronology out, steering in — Discord or Slack
+### Chat: chronology out, steering in — Discord, Slack or Mattermost
 
-The daemon's human channel is one chat service, chosen by `[chat] backend = "discord" | "slack"` — or inferred from whichever of `[discord]` / `[slack]`
-carries a `channel_id`; configuring both without choosing is a config error,
-and neither means the daemon runs headless (`sbxloop daemon ctl` only).
-Everything in this section works the same on both: Discord is described
-first, the Slack differences follow. With `pip install 'sbxloop[discord]'`,
+The daemon's human channel is one chat service, chosen by `[chat] backend = "discord" | "slack" | "mattermost"` — or inferred from whichever of
+`[discord]` / `[slack]` / `[mattermost]` carries a `channel_id`; configuring
+more than one without choosing is a config error, and none means the daemon
+runs headless (`sbxloop daemon ctl` only).
+Everything in this section works the same on each: Discord is described
+first, the Slack and Mattermost differences follow. With `pip install 'sbxloop[discord]'`,
 `DISCORD_BOT_TOKEN` in the environment, and `[discord] channel_id` set, a
 gateway bot posts a headline card per run in the control channel (source issue, run id, branch, PR,
 task tally — colour follows the state) and streams that run's
@@ -1403,9 +1518,13 @@ that typing still works, and a click that arrives late (or on a question
 already answered, or after a daemon restart, which forgets them — nothing
 is persisted) gets a private nudge to answer in the channel instead. The
 bot never waits on a click: a Discord that rejects the components, or a
-host without them, simply gets the plain numbered question. Backends
-without interactive components — Slack today — always get that prose
-rendering, so nothing about them changes.
+host without them, simply gets the plain numbered question. Every backend
+posts that same numbered prose and stays answerable by typing; what differs
+is the affordance laid on top. Slack adds Block Kit buttons. Mattermost
+seeds the question with one emoji per choice — reacting 1️⃣/2️⃣ answers it —
+because Mattermost's own interactive buttons post to a callback URL, which
+would cost the daemon the dial-out property its bridge is built on, while a
+reaction arrives on the websocket already open.
 "What's open?" lists the repository's open issues and which are queued or
 running; `queued: false` shows everything the daemon is not currently
 queued or running — the backlog plus issues that failed or are blocked and
@@ -1502,6 +1621,36 @@ no "reply to a message" outside threads, so the concierge and steering are
 tokens present. Switching backends is a config change plus a daemon
 restart; runs recorded under the other backend keep their thread rows but
 are not re-posted.
+
+**Mattermost instead.** For an instance you host. `pip install 'sbxloop[mattermost]'`, set `[mattermost] url` to the instance (scheme
+included — a private hostname and a port are ordinary here) and
+`[mattermost] channel_id` to the channel's 26-character id (channel name →
+*View Info*, not a `~name`), and put `MATTERMOST_BOT_TOKEN` in the
+environment / `.env` — never in `sbxloop.toml`. Create a bot account in the
+*System Console* → *Integrations* → *Bot Accounts*, then add it to the
+control channel. The bridge connects over a **websocket**, so like Slack's
+Socket Mode it dials out: no public URL, no inbound hole, and a daemon
+behind NAT works.
+On Mattermost's shapes: the run thread is the reply stream under the
+headline post (its post id is the thread id; `thread_per_run = false` posts
+everything top-level), and Mattermost does not nest, so the one-level
+chronology is the shape it already wants. Reactions use the standard emoji
+names. Mattermost has no allowed-mentions control, so agent prose is passed
+through a mention guard — a zero-width space parks every `@name` that would
+resolve, leaving it readable and inert — which is why a run's prose can
+never ping `@channel`. Replying on Mattermost means posting in a thread
+rather than answering one message, so — as on Slack — the concierge and
+steering are @mention-only (`@your-bot` in the control channel or in a
+run's thread), and people can talk to each other in a run's thread without
+the bot answering. `sbxloop doctor` shows one
+`chat bridge (mattermost)` row: extra installed, token present.
+Cards are coloured message attachments (`[mattermost] embeds`) — a post the
+server rejects is retried text-only, so a run's chronology never goes
+missing over presentation — a workload result's files are uploaded up to
+`max_attachment_bytes` and named by host path beyond it (or if an upload
+fails; a named file is never silently dropped), and the merge gate's
+approve button is a seeded ✅: reacting with it approves, exactly as
+`!sbx merge` does.
 
 ## Artifacts
 
@@ -2379,6 +2528,9 @@ The notable knobs:
 | `[workload] default`                                                           | unset                                           | The profile a workload run gets when `--profile` does not name one. Unset: the run has no profile and every declared need is refused. Must name a `[[workloads]]` entry.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `[[schedules]]`                                                                | none                                            | **Legacy** (#818): schedules live in the daemon's database — create them from chat (`create_schedule`) or `sbxloop daemon ctl schedules add …`. An entry here (`name`, `profile`, `ask`, one of `every` / `cron`, `timezone`) is imported into the database once on daemon start and ignored after that; doctor asks for it to be removed.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `[workload] result_label`                                                      | `sbxloop:result`                                | The label a workload's result issue carries (the `issue` sink, #759); ensured on the repository before filing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `[entrygraph] enabled`                                                         | `true`                                          | Whether the concierge offers `start_entrygraph`, the fixed repository-analysis tool run. False removes the tool from its roster entirely.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `[entrygraph] allow_public_urls`                                               | `true`                                          | Whether an ask may name an arbitrary public HTTPS repository. False narrows the recipe to the configured repositories; any other target is refused.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `[entrygraph] extra_hosts`                                                     | `[]`                                            | Extra egress patterns for the scan runtime, on top of the package index. The runtime installs wheels only, so it reaches no code host by default; name what a source build needs where no wheel applies. `[policy] deny` still wins.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | `[policy] allow` / `deny`                                                      | `[]`                                            | Bounds for task-declared egress.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `[github] repo`                                                                | unset                                           | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public`, `pr_title_template`, `commit_message_template`, `branch_prefix`, `bot_login` beside it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `[github] api_url`                                                             | api.github.com                                  | The GitHub REST root — GitHub Enterprise Server: `https://ghe.example.com/api/v3`. One source of truth for the REST transport, App auth, `gh` (`GH_HOST`) and both sandboxes' network allows; a `GH_HOST` in the daemon's environment that names another host is refused at config load. FIELD-UNVERIFIED on GHES.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
@@ -2395,7 +2547,7 @@ The notable knobs:
 | `[daemon] backups_keep`                                                        | `10`                                            | Snapshots kept under `~/.sbxloop/backups/` by the daily sweep (`0` keeps all).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `[daemon] workspace_isolation`                                                 | `clone`                                         | Isolation for daemon runs against a git-checkout workspace (dirty tree proceeds with a warning).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `[daemon] refresh_workspace`                                                   | `true`                                          | `git fetch` + fast-forward the workspace checkout before each fresh daemon run.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| `[tui] operator_id` / `emoji` / `daemon_unit` / `refresh_s` / `retention_days` | `""` / `true` / `sbxloop-daemon` / `0.5` / `14` | The operator console (`sbxloop tui`), always on: who it speaks as (empty = the login name), glyph markers, the systemd user unit it tails and restarts, its live refresh interval, and how long the daemon keeps the console's mailbox rows (`0` keeps them). The rendering knobs are the `[discord]` / `[slack]` ones.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `[tui] operator_id` / `emoji` / `daemon_unit` / `refresh_s` / `retention_days` | `""` / `true` / `sbxloop-daemon` / `0.5` / `14` | The operator console (`sbxloop tui`), always on: who it speaks as (empty = the login name), glyph markers, the systemd user unit it tails and restarts, its live refresh interval, and how long the daemon keeps the console's mailbox rows (`0` keeps them). The rendering knobs are the `[discord]` / `[slack]` / `[mattermost]` ones.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
 sbxloop does not size the sandbox: `sbx create` is called without CPU or
 memory flags, so the microVM is whatever size sbx gives every sandbox.

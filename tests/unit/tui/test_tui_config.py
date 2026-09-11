@@ -9,10 +9,12 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from textual.widgets import Input, Select, TabbedContent, TabPane, TextArea
+from textual.widgets import Input, OptionList, Select, TabbedContent, TabPane, TextArea
 
+from sbxloop.backends import backend_named
 from sbxloop.cli.policyview import policy_view
 from sbxloop.config import Config
+from sbxloop.modelcatalog import save_catalog
 from sbxloop.paths import SbxloopHome
 from sbxloop.tui import configkeys, configtoml
 from sbxloop.tui.configedit import (
@@ -27,6 +29,7 @@ from sbxloop.tui.screens.configvalue import ValueScreen
 from sbxloop.tui.screens.modals import ConfirmScreen, TextPromptScreen
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop.tui.widgets.tables import ConsoleTable
+from tests.unit.test_modelcatalog import row
 from tests.unit.tui.conftest import FakeCtl, FakeRunner, drive, live_status, make_app
 
 REFRESH: dict[str, Any] = {"refresh_s": 3.0}
@@ -41,6 +44,24 @@ def _seed_config(home: SbxloopHome, text: str) -> None:
 
 def _config_text(home: SbxloopHome) -> str:
     return home.config_toml.read_text()
+
+
+def test_model_setting_opens_a_picker(seeded: SbxloopHome, hermetic: None) -> None:
+    _seed_config(seeded, '[agent.models]\nbuild = "first"\n')
+
+    async def scenario() -> None:
+        app = make_app(seeded, **REFRESH)
+        async with app.run_test(size=(160, 50)) as pilot:
+            await pilot.press("7")
+            await pilot.pause(0.5)
+            screen = app.screen
+            assert isinstance(screen, ConfigScreen)
+            screen.edit_key("agent.models.build")
+            await pilot.pause(0.2)
+            assert app.screen.query_one("#model-options", OptionList).option_count >= 2
+            await pilot.press("escape")
+
+    drive(scenario)
 
 
 @pytest.fixture
@@ -469,6 +490,7 @@ def _open_key(screen: ConfigScreen, key: str) -> None:
 
 def test_model_edit_applies_without_offering_restart(seeded: SbxloopHome, hermetic: None) -> None:
     _seed_config(seeded, '[agent.models]\nbuild = "first"\n')
+    save_catalog(seeded, backend_named("copilot"), [row("first"), row("second")])
 
     async def scenario() -> None:
         app = make_app(seeded, **REFRESH)
@@ -481,7 +503,7 @@ def test_model_edit_applies_without_offering_restart(seeded: SbxloopHome, hermet
             await pilot.press("enter")
             await pilot.pause(0.5)
             assert isinstance(app.screen, ValueScreen)
-            app.screen.query_one("#value-text", Input).value = "second"
+            app.screen.query_one("#model-filter", Input).value = "second"
             await pilot.press("enter")
             await pilot.pause(2.0)
             assert 'build = "second"' in _config_text(seeded)
@@ -738,6 +760,7 @@ def test_an_edit_shows_up_in_the_resolved_view_at_once(
     key again answered "already says that" because the *draft* had changed
     and nothing else had."""
     _seed_config(seeded, 'model = "claude-sonnet-5"\n')
+    save_catalog(seeded, backend_named("copilot"), [row("claude-haiku-4-5-20251001")])
     launched_from = tmp_path / "somewhere-else"
     launched_from.mkdir()
 
@@ -759,7 +782,7 @@ def test_an_edit_shows_up_in_the_resolved_view_at_once(
             await pilot.press("enter")
             await pilot.pause(0.5)
             assert isinstance(app.screen, ValueScreen)
-            app.screen.query_one("#value-text", Input).value = "claude-haiku-4-5-20251001"
+            app.screen.query_one("#model-filter", Input).value = "claude-haiku-4-5-20251001"
             await pilot.press("enter")
             await pilot.pause(2.0)
             assert isinstance(app.screen, ConfigScreen), "model edits apply without a restart"

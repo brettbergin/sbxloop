@@ -62,6 +62,9 @@ codex = ["openai-codex==0.147.0"]
 discord = ["discord.py>=2.3"]
 # Socket Mode needs aiohttp, which slack_sdk leaves optional.
 slack = ["slack-sdk>=3.33", "aiohttp>=3.9"]
+# Mattermost's API is plain REST plus a websocket, so the bridge speaks it
+# directly (see daemon/mattermost.py) rather than through a driver.
+mattermost = ["aiohttp>=3.9"]
 
 [project.scripts]
 sbxloop = "sbxloop.cli.app:main"

@@ -31,7 +31,7 @@ import string
 import tomllib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, cast
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -47,6 +47,7 @@ from pydantic import (
 )
 
 from sbxloop.backends import ANTHROPIC_TOKEN_ENV, COPILOT_TOKEN_ENV, OPENAI_TOKEN_ENV
+from sbxloop.chatservices import CHAT_SERVICES, service_named
 from sbxloop.errors import ConfigError
 from sbxloop.ids import DEFAULT_BRANCH_PREFIX
 from sbxloop.log import LogFormat, LogLevel, get_logger
@@ -1676,11 +1677,17 @@ class DaemonConfig(_ConfigModel):
 ChronologyLevel = Literal["quiet", "normal", "verbose"]
 
 
-ChatBackend = Literal["discord", "slack"]
-CHAT_BACKENDS: tuple[ChatBackend, ...] = ("discord", "slack")
+ChatBackend = Literal["discord", "slack", "mattermost"]
+#: The same set as the Literal above, as data: every external service has a
+#: row in ``sbxloop.chatservices``, and the two are pinned together by
+#: ``test_config_chat``. Ordered as the descriptors are, so the implicit
+#: "the one section with a channel_id" search is stable.
+CHAT_BACKENDS: tuple[ChatBackend, ...] = tuple(
+    cast("ChatBackend", service.name) for service in CHAT_SERVICES
+)
 #: Every bridge the daemon can run: the external ``[chat] backend`` choices
 #: plus ``local``, the operator console's bridge, which is always on.
-BridgeBackend = Literal["discord", "slack", "local"]
+BridgeBackend = Literal["discord", "slack", "mattermost", "local"]
 #: The local bridge's control channel id (its threads are ``thread:<id>``).
 TUI_CONTROL_CHANNEL = "control"
 
@@ -1795,6 +1802,78 @@ class SlackConfig(ChatBridgeConfig):
         return self.channel_id or ""
 
 
+# A Mattermost id — channel, user, team, post — is 26 lowercase
+# alphanumerics. Not a ``~channel-name``, which is renamed while the id is
+# not, and which the store could not key threads by.
+_MATTERMOST_ID_RE = re.compile(r"^[a-z0-9]{26}$")
+
+
+class MattermostConfig(ChatBridgeConfig):
+    """The same human channel on a Mattermost instance the operator hosts:
+    a websocket bot posting each run's headline in a control channel and its
+    chronology in the thread under it; @mentioning the bot in that thread
+    steers the run. Unset ``channel_id`` disables it. The bot's access token
+    comes from ``MATTERMOST_BOT_TOKEN`` in the environment / .env, never
+    from this file. Anyone who can post in the channel can steer — restrict
+    the channel accordingly."""
+
+    # The instance's base URL, scheme included. Self-hosted is the norm, so
+    # a port and a private hostname both have to work; the path (if any) is
+    # kept, for an instance served under a prefix.
+    url: str | None = None
+    # The channel *id* (channel name → View Info → the ID), not its
+    # ``~name``: names are renamed, ids are not, and the store keys threads
+    # by it.
+    channel_id: str | None = None
+
+    @field_validator("url", mode="before")
+    @classmethod
+    def _url_is_absolute_http(cls, value: object) -> object:
+        if value is None:
+            return None
+        text = str(value).strip().rstrip("/")
+        if not text:
+            return None
+        parsed = urlsplit(text)
+        if parsed.scheme not in ("http", "https") or not parsed.netloc:
+            raise ValueError(
+                "[mattermost] url must be the instance's base URL including the scheme — "
+                f'e.g. "https://mattermost.example.com" or "http://10.0.0.12:8065": got {text!r}'
+            )
+        return text
+
+    @field_validator("channel_id", mode="before")
+    @classmethod
+    def _channel_id_is_an_id(cls, value: object) -> object:
+        if value is None:
+            return None
+        text = str(value).strip()
+        if not text:
+            return None
+        if not _MATTERMOST_ID_RE.match(text):
+            raise ValueError(
+                "[mattermost] channel_id must be the channel's 26-character id, as shown by "
+                f"the channel name → View Info, not a ~name or a URL: got {text!r}"
+            )
+        return text
+
+    @model_validator(mode="after")
+    def _a_channel_needs_an_instance(self) -> MattermostConfig:
+        """A channel id with nowhere to send it is the operator's mistake,
+        caught before the daemon starts rather than at the first post."""
+        if self.channel_id is not None and self.url is None:
+            raise ValueError("[mattermost] channel_id is set but url is not")
+        return self
+
+    @property
+    def enabled(self) -> bool:
+        return self.channel_id is not None and self.url is not None
+
+    @property
+    def channel_ref(self) -> str:
+        return self.channel_id or ""
+
+
 class TuiConfig(ChatBridgeConfig):
     """The operator console, ``sbxloop tui`` — always on. The daemon keeps a
     local chat mailbox in ``state.db`` with the same headline, thread,
@@ -1827,10 +1906,11 @@ class TuiConfig(ChatBridgeConfig):
 
 class ChatConfig(_ConfigModel):
     """Which service carries the daemon's human channel. ``backend`` names
-    the ``[discord]`` or ``[slack]`` section to use; when it is unset the
-    one section with a ``channel_id`` is used, and configuring both without
-    choosing is an error. Neither configured means the daemon runs headless
-    (no chronology, no steering, ``sbxloop daemon ctl`` only)."""
+    the ``[discord]``, ``[slack]`` or ``[mattermost]`` section to use; when
+    it is unset the one section with a ``channel_id`` is used, and
+    configuring more than one without choosing is an error. None configured
+    means the daemon runs headless (no chronology, no steering, ``sbxloop
+    daemon ctl`` only)."""
 
     backend: ChatBackend | None = None
 
@@ -1873,6 +1953,46 @@ class ConciergeConfig(_ConfigModel):
     # its stated assumption — no goal is ever silently dropped. Also the
     # clickable-choice TTL, so buttons and the auto-file expire in step.
     clarify_ttl_s: float = Field(default=900.0, ge=60, le=86400)
+
+
+class EntrygraphConfig(_ConfigModel):
+    """`[entrygraph]`: the operator's bounds on the entrygraph recipe — the
+    fixed repository-analysis workload the concierge can queue.
+
+    The recipe's pinned versions are not knobs (they are what the report
+    means); what an operator decides is whether the tool exists at all,
+    whether an ask may name a repository nobody configured, and which extra
+    hosts its runtime may reach. ``[policy] deny`` still wins over
+    ``extra_hosts``, as it does over every profile's egress.
+    """
+
+    # The concierge offers `start_entrygraph` only when this is on. Off
+    # takes the tool out of the roster entirely, rather than leaving a tool
+    # that always answers with a refusal.
+    enabled: bool = True
+    # Whether an ask may name an arbitrary public HTTPS repository. Off
+    # narrows the recipe to the repositories the operator configured — the
+    # scan still runs an agent over code that repository's authors wrote,
+    # but not over code chosen by whoever is in the chat channel.
+    allow_public_urls: bool = True
+    # Extra egress patterns for the scan runtime, granted on top of the
+    # package index. The pinned analyzer resolves from wheels; an operator
+    # whose sandbox has no matching wheel (an old glibc, an unusual
+    # architecture) names the hosts a source build needs here.
+    extra_hosts: list[str] = Field(default_factory=list)
+
+    @field_validator("extra_hosts")
+    @classmethod
+    def _check_extra_hosts(cls, value: list[str]) -> list[str]:
+        from sbxloop.policy import valid_pattern
+
+        patterns = [p.strip().lower() for p in value]
+        bad = [p for p in patterns if not valid_pattern(p, operator=True)]
+        if bad:
+            raise ValueError(
+                f"entrygraph.extra_hosts must be domains, *.domain wildcards or '*', got {bad!r}"
+            )
+        return list(dict.fromkeys(patterns))
 
 
 #: Settings that used to say where state lives. Rejected by name (not just
@@ -2305,8 +2425,10 @@ class Config(_ConfigModel):
     chat: ChatConfig = Field(default_factory=ChatConfig)
     discord: DiscordConfig = Field(default_factory=DiscordConfig)
     slack: SlackConfig = Field(default_factory=SlackConfig)
+    mattermost: MattermostConfig = Field(default_factory=MattermostConfig)
     tui: TuiConfig = Field(default_factory=TuiConfig)
     concierge: ConciergeConfig = Field(default_factory=ConciergeConfig)
+    entrygraph: EntrygraphConfig = Field(default_factory=EntrygraphConfig)
     # Named bounds for workload runs (#758) and the one a run gets by
     # default; a code run ignores both.
     workloads: list[WorkloadProfile] = Field(default_factory=list)
@@ -2683,17 +2805,26 @@ class Config(_ConfigModel):
                 raise ValueError(
                     f'[chat] backend = "{explicit}" but [{explicit}] channel_id is not set'
                 )
-        elif self.discord.enabled and self.slack.enabled:
+            return self
+        configured = [name for name in CHAT_BACKENDS if self.chat_section(name).enabled]
+        if len(configured) > 1:
+            # "both [discord] and [slack]" while two services exist; "[a], [b]
+            # and [c]" once there are more, so the sentence stays grammatical
+            # however many rows chatservices grows.
+            sections = [f"[{name}]" for name in configured]
+            listed = " and ".join((", ".join(sections[:-1]), sections[-1]))
+            quantifier = "both " if len(configured) == 2 else ""
+            choices = " | ".join(f'"{name}"' for name in configured)
             raise ValueError(
-                "both [discord] and [slack] have a channel_id; pick one with "
-                '[chat] backend = "discord" | "slack"'
+                f"{quantifier}{listed} have a channel_id; pick one with [chat] backend = {choices}"
             )
         return self
 
-    def chat_section(self, backend: BridgeBackend) -> DiscordConfig | SlackConfig | TuiConfig:
+    def chat_section(self, backend: BridgeBackend) -> ChatBridgeConfig:
         if backend == "local":
             return self.tui
-        return self.discord if backend == "discord" else self.slack
+        section: ChatBridgeConfig = getattr(self, service_named(backend).section)
+        return section
 
     @property
     def chat_backend(self) -> ChatBackend | None:
@@ -2710,12 +2841,13 @@ class Config(_ConfigModel):
         return None
 
     @property
-    def chat_settings(self) -> DiscordConfig | SlackConfig | None:
+    def chat_settings(self) -> ChatBridgeConfig | None:
         """The active backend's section, or None when the daemon is headless."""
         backend = self.chat_backend
         if backend is None:
             return None
-        return self.discord if backend == "discord" else self.slack
+        settings: ChatBridgeConfig = getattr(self, service_named(backend).section)
+        return settings
 
     def workspace_for_repo(self, repo: str | None) -> Path | None:
         """The host checkout runs for ``repo`` clone and refresh from.

@@ -1745,6 +1745,9 @@ copilot = [
 discord = [
     { name = "discord-py" },
 ]
+mattermost = [
+    { name = "aiohttp" },
+]
 slack = [
     { name = "aiohttp" },
     { name = "slack-sdk" },
@@ -1752,6 +1755,7 @@ slack = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", marker = "extra == 'mattermost'", specifier = ">=3.9" },
     { name = "aiohttp", marker = "extra == 'slack'", specifier = ">=3.9" },
     { name = "alembic", specifier = ">=1.13" },
     { name = "discord-py", marker = "extra == 'discord'", specifier = ">=2.3" },
@@ -1773,7 +1777,7 @@ requires-dist = [
     { name = "tomlkit", specifier = ">=0.13" },
     { name = "typer", specifier = ">=0.12" },
 ]
-provides-extras = ["codex", "copilot", "discord", "slack"]
+provides-extras = ["codex", "copilot", "discord", "mattermost", "slack"]
 
 [[package]]
 name = "sbxloop-worker"

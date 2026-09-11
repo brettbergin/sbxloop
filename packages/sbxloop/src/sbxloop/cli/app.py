@@ -53,8 +53,8 @@ from sbxloop.engine.model import (
     RunResult,
     TaskRecord,
     artifacts_dir,
+    run_summary,
     scan_artifacts,
-    workload_summary,
 )
 from sbxloop.engine.sinks import published_line
 from sbxloop.engine.store import StateStore
@@ -593,6 +593,59 @@ def _print_retention_note(config: Config) -> None:
     )
 
 
+def _run_tool(
+    config: Config,
+    outcome: str,
+    *,
+    recipe: str | None,
+    target: str | None,
+    tui: bool,
+    chat: bool,
+) -> None:
+    """A `--kind tool` run from the terminal: the same recipe path the
+    daemon takes for a chat ask — config narrowed by the recipe, its inputs
+    staged, one mechanical task seeded — with no agent in it. Exits."""
+    from sbxloop.ids import new_run_id
+    from sbxloop.recipes import get_recipe
+
+    if recipe is None or target is None:
+        console.print("[bold red]--kind tool needs --recipe and --target[/]")
+        raise typer.Exit(2)
+    try:
+        chosen = get_recipe(recipe)
+        run_config = chosen.config(config, target)
+    except SbxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    except ValueError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    run_id = new_run_id()
+    console.print(f"recipe: {chosen.name} on {target}")
+    console.print(
+        "workspace: a per-run data directory — the recipe's inputs are staged there "
+        "and its result files are published to chat"
+    )
+    engine = LoopEngine(run_config)
+    task = chosen.task(run_config, target)
+    repo = task.needs.repo
+    try:
+        chosen.stage(run_config, run_id, target)
+        result = _drive_with_ui(
+            engine,
+            tui=tui,
+            # No agent to talk to: the chat pane has nothing to steer.
+            chat=False,
+            action=lambda: engine.start(
+                outcome, run_id=run_id, tasks=[task], repo=repo, kind="tool"
+            ),
+        )
+    except SbxloopError as exc:
+        console.print(f"[bold red]run failed:[/] {exc}")
+        raise typer.Exit(2) from exc
+    _finish(result, run_config)
+
+
 def _finish(result: RunResult, config: Config) -> None:
     style = "green" if result.succeeded else ("yellow" if result.state == "blocked" else "red")
     console.print(f"\nrun [bold cyan]{result.run_id}[/] finished: [bold {style}]{result.state}[/]")
@@ -630,10 +683,27 @@ def run(
         typer.Option(
             "--kind",
             help="What the run is for: `code` (the developer loop: a task graph that "
-            "ends in a pull request) or `workload` (the operator persona: plan, "
-            "execute, judge, publish — in its own data directory, no repository).",
+            "ends in a pull request), `workload` (the operator persona: plan, "
+            "execute, judge, publish — in its own data directory, no repository) or "
+            "`tool` (a fixed recipe named by --recipe: one command, its checks, its "
+            "files to chat — no agent anywhere in it).",
         ),
     ] = "code",
+    recipe: Annotated[
+        str | None,
+        typer.Option(
+            "--recipe",
+            help="The recipe a `--kind tool` run executes (`entrygraph`); its target is --target.",
+        ),
+    ] = None,
+    target: Annotated[
+        str | None,
+        typer.Option(
+            "--target",
+            help="What the recipe runs on: a configured `owner/name`, or an HTTPS "
+            "repository URL where the recipe accepts one.",
+        ),
+    ] = None,
     profile: Annotated[
         str | None,
         typer.Option(
@@ -726,9 +796,16 @@ def run(
         keep_sandboxes=keep_sandboxes,
         keep_on_failure=keep_on_failure,
     )
-    if kind not in ("code", "workload"):
-        console.print(f"[bold red]invalid --kind:[/] {kind!r} (expected `code` or `workload`)")
+    if kind not in ("code", "workload", "tool"):
+        console.print(
+            f"[bold red]invalid --kind:[/] {kind!r} (expected `code`, `workload` or `tool`)"
+        )
         raise typer.Exit(2)
+    if (recipe is not None or target is not None) and kind != "tool":
+        console.print("[bold red]--recipe and --target apply to --kind tool only[/]")
+        raise typer.Exit(2)
+    if kind == "tool":
+        _run_tool(config, outcome, recipe=recipe, target=target, tui=tui, chat=chat)
     if profile is not None and kind != "workload":
         console.print(
             "[bold red]--profile cannot be combined with --kind code:[/] a workload "
@@ -999,11 +1076,7 @@ def status(
             json.dumps(
                 {
                     "run": record.model_dump(mode="json"),
-                    "summary": (
-                        workload_summary(tasks, record.pr_title)
-                        if record.kind == "workload"
-                        else None
-                    ),
+                    "summary": run_summary(record.kind, tasks, record.pr_title),
                     "tasks": [task.model_dump(mode="json") for task in tasks],
                     "model_policy": model_policy,
                 }
@@ -1036,7 +1109,7 @@ def status(
         console.print(f"published: {rich_escape(published_line(entry))}")
     table = Table(title="tasks")
     columns: tuple[str, ...] = ("task", "title", "state", "revisions", "replans")
-    if record.kind == "workload":
+    if record.kind != "code":
         columns += ("output",)
     for column in columns:
         table.add_column(column)
@@ -1048,7 +1121,7 @@ def status(
             str(task.revisions),
             str(task.replans),
         ]
-        if record.kind == "workload":
+        if record.kind != "code":
             row.append(_output_cell(task))
         table.add_row(*row)
     console.print(table)
@@ -1058,10 +1131,8 @@ def status(
     # `sbxloop-<run>-agent` reconstruction.
     console.print("sandboxes:")
     # The service sandbox (#765) exists only for a run granted credentials;
-    # the github sandbox never for a workload (#755).
-    roles: tuple[SandboxRole, ...] = (
-        ("agent",) if record.kind == "workload" else ("agent", "github")
-    )
+    # the github sandbox never for a workload (#755) or a tool run.
+    roles: tuple[SandboxRole, ...] = ("agent",) if record.kind != "code" else ("agent", "github")
     if record.credentials:
         roles += ("service",)
     try:
@@ -2997,6 +3068,13 @@ def list_models(
         # error text must not be parsed as rich markup.
         console.print(f"[bold red]list-models failed:[/] {rich_escape(str(exc))}")
         raise typer.Exit(2) from exc
+    if rows:
+        from sbxloop.modelcatalog import save_catalog
+
+        try:
+            save_catalog(config.paths, backend, rows)
+        except (OSError, ValueError):
+            typer.echo("Models listed, but the TUI model cache could not be updated.", err=True)
     if json_output:
         # bare JSON on stdout, nothing else — `sbxloop list-models --json | jq`
         typer.echo(json.dumps([row.raw or {"id": row.id, "name": row.name} for row in rows]))

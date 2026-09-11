@@ -81,7 +81,7 @@ from sbxloop.engine.model import (
     RunResult,
     RunState,
     TaskRecord,
-    workload_summary,
+    run_summary,
 )
 from sbxloop.engine.reconcile import acknowledge_human_threads
 from sbxloop.engine.sinks import published_line
@@ -106,6 +106,7 @@ from sbxloop.ghids import (
 from sbxloop.ids import new_run_id
 from sbxloop.log import bind_run, clear_run, get_logger
 from sbxloop.provider import ProviderHeldError, ProviderRecovery
+from sbxloop.recipes import get_recipe
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.provision import sandbox_name
@@ -1545,7 +1546,8 @@ class DaemonLoop:
             self.source.report_started(item, run_id)
             # Fresh runs only: a resumed run is pinned to the clone it
             # already has, so moving the source would change nothing.
-            self._refresh_workspace(self._item_repo(item))
+            if item.recipe is None:
+                self._refresh_workspace(self._item_repo(item))
         else:
             self.dstore.mark_resuming(
                 item.item_id,
@@ -1834,7 +1836,7 @@ class DaemonLoop:
         # `completed` after its gate, and that is the whole job. A workload
         # (#760) ends `completed` once its result is published, whatever
         # `[github]` says — there is no pull request to merge.
-        workload = item.kind == "workload"
+        workload = item.kind != "code"
         landed = state == "merged" or (
             state == "completed" and (workload or not self.config.github.enabled)
         )
@@ -2912,6 +2914,12 @@ class DaemonLoop:
         return repo
 
     def _item_config(self, item: WorkItem) -> Config:
+        if item.recipe is not None:
+            # A recipe narrows the config itself, at start, inside the
+            # runner's exception boundary — so a target removed while the
+            # item was queued is reported and settled normally. A resume
+            # must first rehydrate the run's persisted profile.
+            return self.config.model_copy(update={"keep_on_failure": False})
         # Narrow the section to the item's repository first, so the run's
         # per-repo deliver_base / token_env win over the global defaults.
         item_repo = self._item_repo(item)
@@ -3177,6 +3185,22 @@ class DaemonLoop:
         engine = handle.engine
         if resume:
             return engine.resume(run_id, release_provider_hold=False)
+        if item.recipe is not None:
+            recipe = get_recipe(item.recipe)
+            target = item.recipe_target or ""
+            item_config = recipe.config(item_config, target)
+            engine.config = item_config
+            recipe.stage(item_config, run_id, target)
+            # A `tool` run: the recipe's command and checks, no agent, the
+            # result files to chat. The recipe just wrote the run's inputs,
+            # and a tool run requires its mount by default.
+            return engine.start(
+                self.outcome_text(item),
+                run_id=run_id,
+                tasks=[recipe.task(item_config, target)],
+                repo=item.repo,
+                kind="tool",
+            )
         # A restart by re-applied label continues the previous attempt's
         # pushed branch and PR where they are still usable (#600); the
         # engine confirms that with GitHub and falls back to a fresh start.
@@ -3331,9 +3355,9 @@ class DaemonLoop:
         kind: RunKind = record.kind if record is not None else (result.kind if result else "code")
         outputs: tuple[TaskOutcome, ...] = ()
         closing: str | None = None
-        if kind == "workload":
+        if kind != "code":
             outputs = tuple(self._task_outcome(run_id, t) for t in tasks)
-            closing = workload_summary(tasks, record.pr_title if record is not None else None)
+            closing = run_summary(kind, tasks, record.pr_title if record is not None else None)
         return RunReport(
             run_id,
             state,
@@ -3689,11 +3713,7 @@ class DaemonLoop:
             pr_url=record.pr_url,
             reason=record.reason,
             kind=record.kind,
-            summary=(
-                workload_summary(self.store.get_tasks(run_id), record.pr_title)
-                if record.kind == "workload"
-                else None
-            ),
+            summary=run_summary(record.kind, self.store.get_tasks(run_id), record.pr_title),
             published=list(record.published),
         )
 

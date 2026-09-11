@@ -73,6 +73,10 @@ to get the job done, without putting every key on the workbench.
 The [security architecture](docs/architecture.md#the-credential-split-in-one-picture)
 explains the boundaries and how credentials are handled.
 
+For browser verification with Copilot or Claude, use the
+[Playwright MCP preset](docs/user-guide.md#playwright-mcp-for-browser-verification):
+`sbxloop init --preset playwright` provisions the browser and exposes it to builders.
+
 Need a report or a set of files instead? [Workload runs](docs/architecture.md#workloads)
 use the same supervised loop and publish the result without a code merge.
 
@@ -148,7 +152,9 @@ for the concierge, Opus for the builder, and Sonnet for review. Configure
 `[agent.models]`, optional per-repository `agent_models`, and `[concierge] model`.
 Unset roles inherit top-level `model`; `--model` forces all run agents for that
 run. Edits take effect before the next phase, with a fresh session when the
-model changes. See [Agent models](docs/user-guide.md#agent-models).
+model changes. The TUI offers a searchable model picker backed by a cached
+backend catalog; successful provisioning and `list-models` refresh that cache.
+See [Agent models](docs/user-guide.md#agent-models).
 
 The home config holds your operator settings. For a project's build and
 check settings, `sbxloop init --project` creates a `sbxloop.toml` in the

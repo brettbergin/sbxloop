@@ -22,6 +22,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any, ClassVar
 
+from sbxloop.chatservices import DISCORD_TOKEN_ENV
 from sbxloop.config import ChatBackend, Config, DiscordConfig
 from sbxloop.daemon.chat import (
     CHOICE_QUESTION_TTL_S,
@@ -48,7 +49,9 @@ from sbxloop.log import get_logger
 
 log = get_logger(__name__)
 
-TOKEN_ENV = "DISCORD_BOT_TOKEN"  # nosec B105 - env var name, not a secret
+#: Re-exported from the service descriptor, which is what doctor and
+#: ``build_bridge`` read; the spelling lives in one place.
+TOKEN_ENV = DISCORD_TOKEN_ENV
 INSTALL_HINT = (
     "discord.py is not installed on this host — install it with "
     "`pip install 'sbxloop[discord]'` to enable the daemon's Discord bridge"

@@ -1238,6 +1238,63 @@ ask ─▶ PLAN (task DAG, needs declared) ─▶ grant needs against the profil
   the daemon would get its work. See [The daemon](#the-daemon) for the
   label, chat and schedule paths.
 
+## Tools
+
+The third run kind, `tool`, is a fixed recipe on the run shape with no agent
+in it. Where a `code` run decomposes an outcome and a `workload` plans an
+ask, a tool run is seeded by trusted host code — a *recipe* — with a task
+graph that is already mechanical: each task is one command the host chose
+(`TaskSpec.command`), the checks that are its exit criterion
+(`verify_commands`), and the files it must leave (`result_files`). The
+engine runs the command and its checks as one shell job in the run's data
+directory, records the transcript as the task's execute phase, reads the
+first declared Markdown file as the task's result text, and hands the
+declared files to the sinks exactly as a workload's publish stage does.
+Two stages — `executing`, `publishing` — and no planning, judging, revision,
+steering or chat, because there is no one to plan, judge, revise, steer or
+answer. A failed command, a failed check, a declared file that is not there
+or a host `[policy] deny` refuses all end the run named, before or instead
+of a result; a resume at `executing` runs the command again (a recipe's
+command is idempotent by contract) and one at `publishing` re-enters there.
+`tests/unit/test_tool_run_trail.py` holds a tool run's chronology
+byte-identical the way the code trail holds a code run's, and asserts no
+model turn ever appears in it.
+
+A tool run provisions like a workload — its own data directory, the agent
+sandbox alone, never a github or service box — with `[sandbox] languages`
+as the recipe pinned them, nothing detected and nothing defaulted. Its
+declared hosts are its whole egress bound: granted at execute the way an
+agent's declared egress is, with `[policy] deny` winning as it does
+everywhere. The recipe stages the run's inputs before the sandbox is cut
+and the run requires its mount, so a sandbox that came up without them
+fails provisioning rather than starting on an empty directory.
+
+A chat work item persists the recipe it names and the one target it was
+queued for (`recipe`, `recipe_target`, both `tool` items);
+`sbxloop/recipes.py` is the registry that turns that pair into config,
+inputs and tasks, so the daemon has one branch for recipes rather than one
+per recipe. The concierge's `start_entrygraph` tool is the first recipe,
+queueing one item per enabled configured repository or explicit public
+HTTPS URL. `[entrygraph] enabled` decides whether the tool exists at all and
+`allow_public_urls` whether an ask may name a repository nobody configured.
+The analyzer version is the scanner's own constant, imported by the host
+that builds the runtime command, so the pin cannot disagree with itself.
+That runtime installs published wheels only (`uv run --no-build`), which
+keeps its egress to the package index; `[entrygraph] extra_hosts` covers a
+sandbox where no wheel applies.
+
+The recipe narrows the run's config to the target's repository entry (its
+token, for a configured repository; nothing, for a public one), a Python
+toolchain and none of the operator's setup, and excludes the scanner and
+the checkout from the harvest. Configured repositories use the existing
+host-mediated GitPython clone into the data directory; arbitrary public
+URLs are cloned by GitPython inside the sandbox, by the command itself,
+without host credentials. The scanner records the source revision and
+analysis limits, checks consistency between both reports, and reuses an
+already completed report only for the same source revision. Only its
+Markdown and JSON reports are result files; the Markdown report is the
+message the chat bridge posts, unchanged.
+
 The two [design principles](#design-principles) hold for a workload exactly
 as for a code run, and the workload cases are the ones that test them:
 
@@ -1371,6 +1428,23 @@ reported model separately from persona totals, so `operator_plan` and
 active runs; historical headlines label a snapshot as the initial fallback.
 Model ids are provider-owned strings; catalogue misses are diagnostic rather
 than a closed validation list.
+
+`modelcatalog.py` caches successful host-side `list-models` discovery under
+`SbxloopHome.model_catalogs`, one JSON file per backend. The bounded schema
+stores only picker metadata and a timestamp; atomic replacement keeps a failed
+or empty refresh from destroying the last successful result. Agent worker
+installation and concierge readiness trigger a background refresh when the
+catalog is missing or at least one day old. An in-process lock deduplicates
+automatic discovery, with a five-minute retry floor. No catalog lookup adds
+model turns or changes the run trail, and provisioning does not wait for it.
+The same optional host SDKs and credentials as `list-models` are required.
+
+The TUI's `ModelScreen` loads the current backend's cache, filters names and
+slugs locally, and returns the existing `ValueEdit` to the validated config
+save path. Refresh runs in a Textual worker, keeping the cached choices usable
+while discovery is pending or unavailable. Inheritance and `auto` are separate
+choices; custom input is an explicit action. Provider-disabled entries cannot
+be picked, and a configured alias absent from the catalog remains visible.
 
 ### Run reconciliation
 

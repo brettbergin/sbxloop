@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Literal, NamedTuple
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, ValidationInfo, field_validator, model_validator
 
 from sbxloop.engine.model import Published, RunKind, RunState
 from sbxloop.ghids import normalize_item_id
@@ -109,6 +109,30 @@ class WorkItem(BaseModel):
     prior_pr_number: int | None = None
     kind: RunKind = "code"
     profile: str | None = None
+    # A recipe (:mod:`sbxloop.recipes`) — the fixed `tool` run this item
+    # becomes — and the one target it was queued for: for the entrygraph
+    # recipe, `owner/name` for a configured repository or a validated HTTPS
+    # clone URL for a public one. The name is not resolved here: a recipe
+    # that no longer exists is a run-time failure the runner reports, not
+    # a row that will not load.
+    recipe: str | None = None
+    recipe_target: str | None = None
+
+    @field_validator("recipe")
+    @classmethod
+    def _recipe_is_a_tool_run(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is not None and info.data.get("kind") != "tool":
+            raise ValueError("recipe requires a tool item")
+        return value
+
+    @model_validator(mode="after")
+    def _recipe_pairs_with_its_target(self) -> WorkItem:
+        # Either both or neither — checked on the whole item, so an omitted
+        # field is caught too: a target with no recipe names nothing that can
+        # run it, and a recipe with no target has nothing to run on.
+        if (self.recipe is None) != (self.recipe_target is None):
+            raise ValueError("recipe and recipe_target are set together")
+        return self
 
     @property
     def restarted(self) -> bool:

@@ -143,6 +143,10 @@ class SbxloopHome:
         return self.root / "cache"
 
     @property
+    def model_catalogs(self) -> Path:
+        return self.cache / "models"
+
+    @property
     def tmp(self) -> Path:
         return self.root / "tmp"
 

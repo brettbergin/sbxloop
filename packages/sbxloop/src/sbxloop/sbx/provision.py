@@ -553,6 +553,16 @@ class Provisioner:
         separately) and no compiler, and the field showed every chat
         workload spending a minute installing toolchains it never used.
         """
+        if kind == "tool":
+            # A tool run's recipe pinned `[sandbox] languages` to what its
+            # command needs; nothing is detected, and nothing defaults.
+            languages = tuple(self.config.sandbox.languages)
+            return toolchains.LanguageResolution(
+                languages,
+                "config" if languages else "none",
+                {},
+                toolchains.toolchain_versions(languages, None),
+            )
         if kind == "workload":
             try:
                 profile = self.config.workload_profile()
@@ -850,9 +860,13 @@ class Provisioner:
             workspace = workspace.resolve()
             if expects_mount is None:
                 expects_mount = True
-        elif kind == "workload":
+        elif kind in ("workload", "tool"):
             workspace = self._data_dir(run_id)
             if expects_mount is None:
+                # A workload's data directory starts empty and the run fills
+                # it, so a lost mount costs artifacts, not the task. A caller
+                # that seeded inputs into it says so — it knows; a guess from
+                # whatever happens to be on disk does not.
                 expects_mount = False
         else:
             workspace, resolved_expects = self._resolve_workspace_source(run_id, repo)
@@ -1420,8 +1434,10 @@ class Provisioner:
         # a profile whose sinks write to GitHub (#759) — an issue is filed
         # through that box like every other GitHub write — and never
         # otherwise, configured or not.
+        # A tool run never gets one: its sinks are chat and the artifact
+        # directory, and it has no agent to hand a GitHub token to.
         github_enabled = self.config.github.enabled and (
-            kind == "code" or self._workload_needs_github()
+            kind == "code" or (kind == "workload" and self._workload_needs_github())
         )
         creds = self.config.credentials_named(
             list(

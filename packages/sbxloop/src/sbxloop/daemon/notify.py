@@ -14,12 +14,15 @@ the notice that matters most ("rollback also failed") is sent when
 nothing else is running.
 
 Text is written in the house dialect (Discord-flavoured Markdown, the
-same one every bridge message is shaped in) and re-dialected for Slack
-by :func:`~sbxloop.daemon.slack_format.to_mrkdwn`, so a caller never
+same one every bridge message is shaped in) and re-dialected per service
+— :func:`~sbxloop.daemon.slack_format.to_mrkdwn` for Slack, nothing for
+Mattermost, which reads the house dialect as it is — so a caller never
 knows which service is behind the channel. Links never unfurl and
 mentions never ping: Discord gets ``SUPPRESS_EMBEDS`` and
 ``allowed_mentions: {parse: []}``, Slack ``unfurl_links: false`` with user
-mentions escaped — the same rules the bridges apply to agent prose.
+mentions escaped, Mattermost the same mention guard its bridge applies
+(it has no allowed-mentions control) — the rules the bridges apply to
+agent prose.
 """
 
 from __future__ import annotations
@@ -34,6 +37,7 @@ from urllib.request import Request
 
 from sbxloop import __version__
 from sbxloop.config import Config
+from sbxloop.daemon.mattermost_format import neutralize_mentions
 from sbxloop.daemon.slack_format import to_mrkdwn
 from sbxloop.errors import SbxloopError
 
@@ -41,9 +45,21 @@ from sbxloop.errors import SbxloopError
 # bridge module (each pulls its SDK in).
 DISCORD_TOKEN_ENV = "DISCORD_BOT_TOKEN"  # nosec B105 - env var name, not a secret
 SLACK_TOKEN_ENV = "SLACK_BOT_TOKEN"  # nosec B105 - env var name, not a secret
+MATTERMOST_TOKEN_ENV = "MATTERMOST_BOT_TOKEN"  # nosec B105 - env var name, not a secret
+#: Which credential each backend posts with. The bridges read the same
+#: names from ``sbxloop.chatservices``; restated here so this module never
+#: imports a bridge module (each pulls its SDK in).
+NOTICE_TOKEN_ENVS = {
+    "discord": DISCORD_TOKEN_ENV,
+    "slack": SLACK_TOKEN_ENV,
+    "mattermost": MATTERMOST_TOKEN_ENV,
+}
 
 DISCORD_MESSAGES_URL = "https://discord.com/api/v10/channels/{channel_id}/messages"
 SLACK_POST_MESSAGE_URL = "https://slack.com/api/chat.postMessage"
+# Mattermost is self-hosted, so its endpoint comes from the configured
+# instance rather than a constant.
+MATTERMOST_POSTS_PATH = "/api/v4/posts"
 # Discord's edge refuses ``urllib``'s default ``Python-urllib/3.x`` agent
 # outright (Cloudflare error 1010: a 403 with no Discord error body)
 # whatever the token — field failure, db 2026-09-04: every deploy notice
@@ -88,8 +104,8 @@ def post_notice(
     backend = config.chat_backend
     if backend is None:
         raise SbxloopError(
-            "no chat backend is configured — set [chat] backend (or a [discord] / [slack] "
-            "channel_id) to post notices"
+            "no chat backend is configured — set [chat] backend (or a [discord] / "
+            "[slack] / [mattermost] channel_id) to post notices"
         )
     text = text.strip()
     if not text:
@@ -98,7 +114,7 @@ def post_notice(
         raise SbxloopError(f"notice is {len(text)} characters; the limit is {MAX_CHARS}")
     section = config.chat_section(backend)
     channel_id = section.channel_ref
-    token_env = DISCORD_TOKEN_ENV if backend == "discord" else SLACK_TOKEN_ENV
+    token_env = NOTICE_TOKEN_ENVS[backend]
     token = env.get(token_env, "")
     if not token:
         raise SbxloopError(
@@ -115,6 +131,23 @@ def post_notice(
             headers={
                 "Authorization": f"Bot {token}",
                 "Content-Type": "application/json",
+                "User-Agent": USER_AGENT,
+            },
+            method="POST",
+        )
+        _send(opener, request, timeout_s, backend)
+    elif backend == "mattermost":
+        # The instance is the operator's, so the URL is config, not a
+        # constant; the mention guard is the bridge's, since Mattermost has
+        # no allowed-mentions control to ask for.
+        request = Request(
+            f"{(config.mattermost.url or '').rstrip('/')}{MATTERMOST_POSTS_PATH}",
+            data=json.dumps(
+                {"channel_id": channel_id, "message": neutralize_mentions(text)}
+            ).encode(),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json; charset=utf-8",
                 "User-Agent": USER_AGENT,
             },
             method="POST",

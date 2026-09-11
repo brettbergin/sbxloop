@@ -74,6 +74,8 @@ secret_strategy = "proxy"
 # Omit a key to inherit top-level model. Explicit "auto" asks the backend
 # to choose, even when the inherited model is pinned. IDs are backend-specific;
 # use `sbxloop list-models`. Model settings are reread before each agent phase.
+# The TUI offers a searchable backend-model picker. Successful provisioning
+# and list-models populate its cache; Ctrl+R refreshes, Ctrl+U restores inheritance.
 # `run --model ID` forces every run agent for that run, never the concierge.
 # SBXLOOP_AGENT__MODELS__BUILD overrides the build key through the environment.
 # decompose = "auto"
@@ -262,6 +264,11 @@ secret_strategy = "proxy"
 # scheme = ""
 # description = "read-only weather forecasts"
 
+# For headless browser tools on Copilot/Claude code runs, generate a complete
+# setup with `sbxloop init --stdout --preset playwright`. It includes Node,
+# a pinned Playwright MCP package, Chromium installation and the host allows.
+# Merge its sections into an existing config rather than adding duplicate tables.
+#
 # External MCP servers the agent sessions may use — the extensibility
 # point. Each entry is given to every session whose role is listed, on
 # whichever `[agent] backend` runs (the two SDKs spell the transports
@@ -661,10 +668,11 @@ secret_strategy = "proxy"
 # Which service carries the daemon's human channel — the run headline cards,
 # the per-run thread streaming each run's chronology, `!sbx` operator commands,
 # @mention steering of a live run and the concierge. Exactly one of [discord]
-# / [slack] is active: name it here, or leave `backend` unset and the one
-# section with a channel_id is used (both set without a choice is an error).
+# / [slack] / [mattermost] is active: name it here, or leave `backend` unset
+# and the one section with a channel_id is used (more than one set without a
+# choice is an error).
 # No channel_id anywhere = headless: no chronology, `sbxloop daemon ctl` only.
-# backend = "discord"              # "discord" | "slack"
+# backend = "discord"              # "discord" | "slack" | "mattermost"
 
 # [discord]
 # The Discord backend: a gateway bot posts each run's chronology (agent
@@ -713,12 +721,39 @@ secret_strategy = "proxy"
 # tool_output_lines = 0
 # tool_fail_output_lines = 20
 
+# [mattermost]
+# The Mattermost backend: the same channel, threads, commands and steering on
+# an instance you host. The bot dials out over a websocket, so the daemon
+# needs no public URL and no inbound hole — a box behind NAT works. Needs
+# `pip install 'sbxloop[mattermost]'` plus MATTERMOST_BOT_TOKEN in the
+# environment / .env (never here); create a bot account in the System Console
+# and add it to the channel. Same knobs as [discord]. Unset channel_id =
+# Mattermost off.
+# url = "https://mattermost.example.com"   # the instance, scheme included; a
+#                                  # private host and a port are fine
+# channel_id = "abcdefghijklmnopqrstuvwxyz"  # the channel's 26-character id
+#                                  # (channel name → View Info), not a ~name
+# command_prefix = "!sbx"
+# thread_per_run = true
+# chronology_level = "normal"
+# max_message_chars = 1900
+# embeds = true                    # cards as coloured message attachments; a post
+#                                  # the server rejects is retried text-only
+# status_line = true
+# tool_batch_lines = 8
+# tool_output_lines = 0
+# tool_fail_output_lines = 20
+# max_attachment_bytes = 10000000  # a workload result's files ride the thread as
+#                                  # uploads up to this size; larger ones (and any
+#                                  # upload that fails) are named by host path.
+#                                  # 0 = name all
+
 # [tui]
 # The operator console, `sbxloop tui`, run on the daemon host — always on,
 # no channel or token to configure. The daemon keeps a local chat mailbox
 # in state.db with the same headline, thread, steering, concierge and
-# merge-gate experience [discord] / [slack] give, and the console attaches
-# to it. The rendering knobs are the ones [discord] / [slack] share
+# merge-gate experience [discord] / [slack] / [mattermost] give, and the
+# console attaches to it. The rendering knobs are the ones those share
 # (command_prefix, thread_per_run, chronology_level, max_message_chars,
 # embeds, status_line, tool_batch_lines, tool_output_lines,
 # tool_fail_output_lines, max_attachment_bytes); these are the terminal's own.
@@ -748,3 +783,19 @@ secret_strategy = "proxy"
 # clarify_ttl_s = 900              # a filing-blocking clarifying question waits this
 #                                  # long (also the clickable-choice TTL); then the
 #                                  # issue files on the concierge's stated assumption
+
+# [entrygraph]
+# The fixed repository-analysis workload the concierge can queue
+# ("run entrygraph against owner/repo"): a pinned analyzer reports a
+# repository's overview, entrypoints and source-to-sink findings to chat.
+# The pinned versions are the recipe, not settings — what you decide here
+# is whether the tool exists, what it may be pointed at, and what its
+# runtime may reach. [policy] deny still wins over extra_hosts.
+# enabled = true                   # false: the concierge has no entrygraph tool at all
+# allow_public_urls = true         # false: only the repositories configured above —
+#                                  # an ask naming any other repository is refused
+# extra_hosts = []                 # extra egress for the scan runtime, on top of the
+#                                  # package index. Only needed where the pinned
+#                                  # analyzer and grammar wheels do not apply (an old
+#                                  # glibc, an unusual architecture): the runtime is
+#                                  # wheel-only, so it never reaches a code host itself

@@ -155,6 +155,10 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 
 @pytest.fixture
 def fake_sbx(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeSbx:
+    # A fake successful provision must not contact a real model catalogue.
+    # Lifecycle tests replace this hook with a recorder; catalogue tests
+    # inject the discovery response and exercise the cache itself.
+    monkeypatch.setattr("sbxloop.modelcatalog.refresh_after_provision", lambda config: None)
     state = tmp_path / "sbx-state"
     state.mkdir()
     bin_dir = tmp_path / "bin"
