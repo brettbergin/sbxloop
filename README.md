@@ -439,6 +439,38 @@ valid daemon: chat-asked workloads are its whole queue. A profile's
 the release re-queues the item with its run pinned and the next tick
 resumes it at the publishing stage.
 
+**Entrygraph reports from chat.** Ask the concierge:
+
+- `Run entrygraph against the configured repos.`
+- `Run entrygraph against owner/repo.`
+- `Run entrygraph against https://github.com/owner/repo.git.`
+
+The `start_entrygraph` tool queues one workload per repository and returns
+the results through the configured chat backend. Discord receives a summary
+and `report.md` / `report.json` attachments through its existing run thread
+and upload limits. The report records the scanned commit, repository
+statistics, languages/frameworks, entrypoints, and source-to-sink paths with
+locations and confidence. Searches cover all source/sink categories, up to
+100 paths and depth 25, and report widening, truncation and coverage limits;
+an empty result does not establish that a repository is safe.
+
+With no selector, scans cover all enabled configured repositories. A matching
+configured repository URL uses that repository's existing credential; other
+HTTPS clone URLs must be public. Credentials embedded in URLs are refused.
+Configured checkouts are fetched through the existing host GitPython path;
+public URL checkouts are cloned with GitPython inside the sandbox. Both are
+isolated scan inputs, and target code and build setup are not executed.
+Repositories with unavailable submodule or LFS contents retain that coverage
+limitation in the report.
+
+No new configuration is required. The recipe runs entrygraph 0.1.134 and
+installs its analysis runtime inside the sandbox. Package and grammar downloads
+need network access; `[policy] deny` still wins. The usual queue limits,
+chronology, cancellation and resume apply. The default workload profile's
+budget overrides and `publish = "hold"` preference are retained, with chat as
+the only result sink. Replaying the same chat message does not duplicate scans;
+a new message queues a fresh scan.
+
 **Workloads on a cadence** (#761) are the third way in. `[[schedules]]`
 declares each: a `name`, the `profile` to run under, the `ask`, and either
 `every = "24h"` (a period on a grid from the moment the daemon first saw

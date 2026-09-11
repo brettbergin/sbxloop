@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, Protocol, cast
 from zoneinfo import ZoneInfo
 
-from sbxloop import __version__, hostgit
+from sbxloop import __version__, entrygraph, hostgit
 from sbxloop.config import Config, GithubConfig, SandboxConfig
 from sbxloop.daemon.github import DaemonGithub
 from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
@@ -1350,7 +1350,8 @@ class DaemonLoop:
             self.source.report_started(item, run_id)
             # Fresh runs only: a resumed run is pinned to the clone it
             # already has, so moving the source would change nothing.
-            self._refresh_workspace(self._item_repo(item))
+            if item.entrygraph_target is None:
+                self._refresh_workspace(self._item_repo(item))
         else:
             self.dstore.mark_resuming(item.item_id, run_id, now)
             item = self.dstore.get(item.item_id) or item
@@ -2686,6 +2687,11 @@ class DaemonLoop:
         return repo
 
     def _item_config(self, item: WorkItem) -> Config:
+        if item.entrygraph_target is not None:
+            # Validate the recipe inside the runner's exception boundary, so
+            # a target removed while queued is reported and settled normally.
+            # A resume must first rehydrate the run's persisted profile.
+            return self.config.model_copy(update={"keep_on_failure": False})
         # Narrow the section to the item's repository first, so the run's
         # per-repo deliver_base / token_env win over the global defaults.
         item_repo = self._item_repo(item)
@@ -2951,6 +2957,17 @@ class DaemonLoop:
         engine = handle.engine
         if resume:
             return engine.resume(run_id)
+        if item.entrygraph_target is not None:
+            item_config = entrygraph.scan_config(item_config, item.entrygraph_target)
+            engine.config = item_config
+            entrygraph.stage_scanner(item_config, run_id)
+            return engine.start(
+                self.outcome_text(item),
+                run_id=run_id,
+                tasks=[entrygraph.scan_task(item.entrygraph_target)],
+                repo=item.repo,
+                kind="workload",
+            )
         # A restart by re-applied label continues the previous attempt's
         # pushed branch and PR where they are still usable (#600); the
         # engine confirms that with GitHub and falls back to a fresh start.

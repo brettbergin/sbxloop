@@ -90,6 +90,7 @@ _WORK_ITEMS_BODY = """(
     -- pre-1.0 lanes' marker the archive check looks for.
     run_kind        TEXT NOT NULL DEFAULT 'code',
     profile         TEXT,
+    entrygraph_target TEXT,
     UNIQUE(source_key, repo)
 )"""
 
@@ -677,6 +678,7 @@ def _row_to_item(row: sqlite3.Row) -> WorkItem:
         prior_pr_number=_col(row, "prior_pr_number"),
         kind=_col(row, "run_kind") or "code",
         profile=_col(row, "profile"),
+        entrygraph_target=_col(row, "entrygraph_target"),
     )
 
 
@@ -939,6 +941,11 @@ class DaemonStore:
             "daemon_work_items",
             "profile",
             "ALTER TABLE daemon_work_items ADD COLUMN profile TEXT",
+        ),
+        (
+            "daemon_work_items",
+            "entrygraph_target",
+            "ALTER TABLE daemon_work_items ADD COLUMN entrygraph_target TEXT",
         ),
         (
             "daemon_merge_gates",
@@ -1337,8 +1344,9 @@ class DaemonStore:
             self._conn.execute(
                 "INSERT INTO daemon_work_items (item_id, source_key, title, body, url, state, "
                 "attempts, claimed, run_id, last_error, created_at, updated_at, requested_by, "
-                "repo, prior_run_id, prior_branch, prior_pr_number, run_kind, profile) "
-                "VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "repo, prior_run_id, prior_branch, prior_pr_number, run_kind, profile, "
+                "entrygraph_target) "
+                "VALUES (?, ?, ?, ?, ?, 'queued', 0, 0, NULL, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     item_id,
                     item.source_key,
@@ -1354,6 +1362,7 @@ class DaemonStore:
                     prior.pr_number if prior else None,
                     item.kind,
                     item.profile,
+                    item.entrygraph_target,
                 ),
             )
             self._conn.commit()

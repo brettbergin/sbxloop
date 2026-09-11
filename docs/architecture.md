@@ -965,6 +965,26 @@ ask ─▶ PLAN (task DAG, needs declared) ─▶ grant needs against the profil
   the daemon would get its work. See [The daemon](#the-daemon) for the
   label, chat and schedule paths.
 
+The concierge's `start_entrygraph` tool is a predefined workload recipe. It
+persists a nullable `entrygraph_target` on each chat work item and queues one
+item per enabled configured repository or explicit public HTTPS URL. The
+daemon stages a packaged scanner and seeds one task, avoiding a planning
+turn. Seeded and resumed workload graphs pass the same needs validation as
+newly planned graphs. A data directory that already contains inputs must be
+mounted visibly; it cannot fall back to an empty directory inside the VM.
+
+The recipe's per-run profile grants the analysis download hosts, one configured
+repository checkout when applicable, and the chat sink. It preserves the
+default profile's budget overrides and publication hold, while granting no
+operator credentials or GitHub write sink. Configured repositories use the
+existing host-mediated GitPython clone; arbitrary public URLs are cloned by
+GitPython inside the sandbox without host credentials. Only the scanner's
+Markdown and JSON reports are result artifacts; the public clone and scanner
+scratch are excluded. The scanner records the source revision and analysis
+limits, checks consistency between both reports, and reuses an already
+completed report only for the same source revision. The usual judgment and
+publication stages deliver the result through the configured chat bridge.
+
 The two [design principles](#design-principles) hold for a workload exactly
 as for a code run, and the workload cases are the ones that test them:
 

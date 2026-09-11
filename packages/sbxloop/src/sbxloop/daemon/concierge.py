@@ -31,6 +31,7 @@ engine thread's.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import time
@@ -64,6 +65,7 @@ from sbxloop.daemon.versions import VersionProbe
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunState
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.store import StateStore
+from sbxloop.entrygraph import resolve_targets
 from sbxloop.errors import (
     ConfigError,
     DaemonError,
@@ -102,6 +104,7 @@ CONCIERGE_RUN_ID = "concierge"
 # daemon_state keys
 STATE_SESSION_ID = "concierge_session_id"
 STATE_SESSION_TURNS = "concierge_session_turns"
+
 
 _RUN_STATES = list(get_args(RunState))
 #: Run states that mean the run is over — nothing more will happen to it, so a
@@ -458,7 +461,7 @@ class Concierge:
             response = self._tool_handler(call, author=author)
             if on_tool is not None:
                 try:
-                    on_tool(call.name, call.arguments, response)
+                    on_tool(call.name, _visible_tool_arguments(call), response)
                 except Exception:
                     log.debug("concierge.on_tool_failed", exc_info=True)
             return response
@@ -641,7 +644,7 @@ class Concierge:
             "concierge.tool",
             tool=call.name,
             by=author,
-            args=_one_line(json.dumps(call.arguments, default=str), 200),
+            args=_one_line(json.dumps(_visible_tool_arguments(call), default=str), 200),
             duration_s=round(time.monotonic() - started, 2),
         )
         return HostToolResponse(
@@ -848,6 +851,30 @@ class Concierge:
                     ),
                 ),
                 self._tool_start_workload,
+            ),
+            HostTool(
+                HostToolSpec(
+                    name="start_entrygraph",
+                    description=(
+                        "Queue entrygraph repository analysis and return its overview, "
+                        "entrypoints, source-to-sink paths and report files through the "
+                        "configured chat backend. Use this tool when the person asks to "
+                        "run entrygraph. With no selector, scan every enabled configured "
+                        "repository; `all_repos: true` selects those explicitly. `repo` "
+                        "selects one configured repository; `url` selects an arbitrary "
+                        "public HTTPS repository URL. Choose only one selector. One "
+                        "workload is queued per target, with its own run thread and "
+                        "requester notification. Queue directly, without confirmation."
+                    ),
+                    parameters=_schema(
+                        {
+                            "repo": {"type": "string"},
+                            "url": {"type": "string"},
+                            "all_repos": {"type": "boolean"},
+                        }
+                    ),
+                ),
+                self._tool_start_entrygraph,
             ),
         ]
         if self.config.github.repo_list():
@@ -1451,6 +1478,76 @@ class Concierge:
             f"is published.{note}"
         )
 
+    def _tool_start_entrygraph(self, args: dict[str, Any], by: str) -> str:
+        for name in ("repo", "url"):
+            if args.get(name) is not None and not isinstance(args[name], str):
+                return f"{name} must be a string"
+        all_repos = args.get("all_repos", False)
+        if not isinstance(all_repos, bool):
+            return "all_repos must be a boolean"
+        try:
+            targets = resolve_targets(
+                self.config,
+                repo=args.get("repo"),
+                url=args.get("url"),
+                all_repos=all_repos,
+            )
+        except (ConfigError, ValueError) as exc:
+            return str(exc)
+
+        key = self._turn_message_id or new_run_id()
+        lines = []
+        for target in targets:
+            suffix = hashlib.sha256(target.encode()).hexdigest()[:12]
+            source_key = f"{key}:entrygraph:{suffix}"
+            item_id = chat_item_id(source_key)
+            # A replay of the same chat message must not requeue a completed
+            # result: upsert_new intentionally does that for relabelled issues.
+            existing = self.dstore.get(item_id)
+            if existing is not None:
+                lines.append(f"`{item_id}` already exists ({existing.state}) for {target}.")
+                continue
+            entry = self.config.github.find_repo(target)
+            title = f"Run entrygraph against {target}"
+            item = WorkItem(
+                item_id=item_id,
+                source_key=source_key,
+                title=title if len(title) <= 120 else title[:119] + "…",
+                body=(
+                    f"Run entrygraph against {target}. Return a repository overview, "
+                    "entrypoints, and source-to-sink paths. Deliver the report and "
+                    "supporting result files through the chat sink."
+                ),
+                kind="workload",
+                entrygraph_target=target,
+                repo=entry.repo if entry is not None else None,
+                requested_by=self._turn_author_id,
+            )
+            try:
+                queued = self.dstore.upsert_new(item, self.clock())
+            except DaemonError as exc:
+                lines.append(f"queueing {target} failed: {_one_line(str(exc), 300)}")
+                continue
+            log.info(
+                "concierge.entrygraph_queued",
+                item=item_id,
+                target=target,
+                by=by,
+                fresh=queued,
+            )
+            state = "queued" if queued else "already queued or running"
+            lines.append(f"{state} entrygraph workload `{item_id}` for {target}.")
+        lines.append(
+            "Each new workload gets a run thread here; the requester is notified "
+            "when its result is published."
+        )
+        status = self.loop.status()
+        if status.get("paused"):
+            lines.append("The daemon is PAUSED — nothing runs until `resume`.")
+        elif status.get("breaker_open"):
+            lines.append("The breaker is OPEN — nothing runs until it resets.")
+        return "\n".join(lines)
+
     def _tool_list_repos(self, args: dict[str, Any], by: str) -> str:
         entries = self.config.github.repo_list()
         if not entries:
@@ -1879,6 +1976,15 @@ class Concierge:
 
 
 # -- module helpers ---------------------------------------------------------------
+
+
+def _visible_tool_arguments(call: HostToolCall) -> dict[str, Any]:
+    """Only resolved scan targets may reach logs or chat tool notes.
+
+    An invalid URL can contain credentials; the queue response names a
+    validated target, while raw selectors never leave the handler.
+    """
+    return {} if call.name == "start_entrygraph" else dict(call.arguments)
 
 
 def _schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:

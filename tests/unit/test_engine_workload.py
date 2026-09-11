@@ -67,6 +67,46 @@ def harness(fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 
 class TestWorkloadRun:
+    def test_entrygraph_publishes_reports_without_the_public_clone(self, harness: Harness) -> None:
+        from sbxloop.entrygraph import scan_config
+
+        engine = harness.engine()
+        engine.config = scan_config(engine.config, "https://git.example.org/team/repo.git")
+        harness.script(
+            [
+                plan(needing("t1", sink="chat")),
+                {
+                    "text": "## Result\nProduced entrygraph-report/report.md and report.json.",
+                    "files": {
+                        "repository/source.txt": "customer source",
+                        ".entrygraph/scan.py": "scanner scratch",
+                        "entrygraph-report/report.md": "findings",
+                        "entrygraph-report/report.json": "{}",
+                    },
+                },
+                PASS,
+            ]
+        )
+        result = engine.start("scan the repository", kind="workload")
+        assert result.state == "completed", result.reason
+        published = [e.data for e in harness.events if e.type == HostEventTypes.RUN_PUBLISHED]
+        assert len(published) == 1 and published[0]["sink"] == "chat"
+        assert {Path(path).name for path in published[0]["paths"]} == {"report.md", "report.json"}
+        assert result.tasks[0].output.file_count == 2
+
+    def test_preseeded_input_files_require_a_visible_mount(
+        self, harness: Harness, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.errors import ProvisionError
+
+        monkeypatch.setenv("SBX_FAKE_NO_MOUNT", "1")
+        workspace = harness.home.run_workspace("rinput")
+        workspace.mkdir(parents=True)
+        (workspace / "input.txt").write_text("an input the task must read")
+        harness.script([taskgraph(task("t1")), BUILD, PASS])
+        with pytest.raises(ProvisionError, match="mount"):
+            harness.engine().start("read input.txt", run_id="rinput", kind="workload")
+
     def test_one_sandbox_and_the_operator_stages(self, harness: Harness) -> None:
         """No `[github]`: the agent box alone, the four stages in order,
         `completed` at the end — and the run says what it is."""
@@ -752,6 +792,18 @@ def profiled(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict[str, Any]:
 
 
 class TestNeeds:
+    def test_seeded_workload_does_not_skip_need_validation(self, harness: Harness) -> None:
+        from sbxloop.engine.model import TaskSpec
+
+        harness.script([BUILD, PASS])
+        result = harness.engine().start(
+            "read the repository",
+            kind="workload",
+            tasks=[TaskSpec.model_validate(needing("t1", repo="org/private"))],
+        )
+        assert result.state == "failed"
+        assert self.refused(harness)[0]["need"] == "repo"
+
     def refused(self, harness: Harness) -> list[dict[str, Any]]:
         return [e.data for e in harness.events if e.type == HostEventTypes.RUN_NEEDS_REFUSED]
 

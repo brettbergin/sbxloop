@@ -795,7 +795,10 @@ class Provisioner:
         elif kind == "workload":
             workspace = self._data_dir(run_id)
             if expects_mount is None:
-                expects_mount = False
+                # A seeded workload may already carry inputs (for example a
+                # fixed report generator). Starting in an empty VM directory
+                # when those inputs cannot be mounted would lose the task.
+                expects_mount = workspace.exists() and any(workspace.iterdir())
         else:
             workspace, resolved_expects = self._resolve_workspace_source(run_id, repo)
             if expects_mount is None:

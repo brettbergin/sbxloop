@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Literal, NamedTuple
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, ValidationInfo, field_validator
 
 from sbxloop.engine.model import Published, RunKind, RunState
 from sbxloop.ghids import normalize_item_id
@@ -109,6 +109,16 @@ class WorkItem(BaseModel):
     prior_pr_number: int | None = None
     kind: RunKind = "code"
     profile: str | None = None
+    # A dedicated repository-analysis workload. Configured targets use
+    # owner/name; public targets use a validated HTTPS clone URL.
+    entrygraph_target: str | None = None
+
+    @field_validator("entrygraph_target")
+    @classmethod
+    def _entrygraph_workload(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is not None and info.data.get("kind") != "workload":
+            raise ValueError("entrygraph_target requires a workload item")
+        return value
 
     @property
     def restarted(self) -> bool:

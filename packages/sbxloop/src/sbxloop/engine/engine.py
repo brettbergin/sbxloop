@@ -1707,8 +1707,12 @@ class LoopEngine:
                 turns=spend.turns,
             )
             tasks = self.store.get_tasks(run_id)
-            if p.kind == "workload" and self._grant_needs(p, tasks) is not None:
-                return True
+
+        # Seeded recipes and resumed tasks require the same authorization as
+        # a freshly planned workload. Checkout grants are idempotent, and a
+        # fresh sandbox on resume needs its inputs checked again.
+        if p.kind == "workload" and self._grant_needs(p, tasks) is not None:
+            return True
 
         self._set_run_state(run_id, executing)
         self._announce_roster(run_id, tasks)
