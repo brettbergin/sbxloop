@@ -1249,6 +1249,12 @@ _WORKLOAD_STATE_PHASE = {
     "executing": "execute",
     "verifying": "judge",
 }
+# A tool's task has one phase: the command, with its checks inside it.
+_TOOL_STATE_PHASE = {
+    "executing": "execute",
+    "verifying": "execute",
+}
+_KIND_STATE_PHASE = {"workload": _WORKLOAD_STATE_PHASE, "tool": _TOOL_STATE_PHASE}
 _PHASE_STATES = frozenset(_STATE_PHASE)
 # What the run is doing in each post-build stage, for the steer note.
 _STAGE_DOING = {
@@ -1311,7 +1317,7 @@ class SteerProgress:
             # Every state change is a checkpoint: the per-phase job (and its
             # tool-call ceiling) restarts, so the count restarts with it.
             self.task_id = tid
-            names = _WORKLOAD_STATE_PHASE if self.kind == "workload" else _STATE_PHASE
+            names = _KIND_STATE_PHASE.get(self.kind, _STATE_PHASE)
             self.phase = names[str(d["state"])]
             self.tool_calls, self.capped = 0, False
             self._dirty = True
@@ -2168,7 +2174,9 @@ def _went_well(stats: RunStats, report: RunReport) -> list[str]:
         1 for tid, s in stats.states.items() if s == "done" and not stats.revisions.get(tid)
     )
     if clean:
-        how = "passed the judge" if stats.kind == "workload" else "verified"
+        how = {"workload": "passed the judge", "tool": "passed their checks"}.get(
+            stats.kind, "verified"
+        )
         out.append(f"{clean} task(s) {how} without revision")
     if stats.steers and stats.steers_answered == stats.steers:
         out.append(f"answered all {stats.steers} steering message(s)")

@@ -109,19 +109,20 @@ class WorkItem(BaseModel):
     prior_pr_number: int | None = None
     kind: RunKind = "code"
     profile: str | None = None
-    # A seeded workload recipe (:mod:`sbxloop.recipes`) and the one target
-    # it was queued for — for the entrygraph recipe, `owner/name` for a
-    # configured repository or a validated HTTPS clone URL for a public one.
-    # The name is not resolved here: a recipe that no longer exists is a
-    # run-time failure the runner reports, not a row that will not load.
+    # A recipe (:mod:`sbxloop.recipes`) — the fixed `tool` run this item
+    # becomes — and the one target it was queued for: for the entrygraph
+    # recipe, `owner/name` for a configured repository or a validated HTTPS
+    # clone URL for a public one. The name is not resolved here: a recipe
+    # that no longer exists is a run-time failure the runner reports, not
+    # a row that will not load.
     recipe: str | None = None
     recipe_target: str | None = None
 
     @field_validator("recipe")
     @classmethod
-    def _recipe_workload(cls, value: str | None, info: ValidationInfo) -> str | None:
-        if value is not None and info.data.get("kind") != "workload":
-            raise ValueError("recipe requires a workload item")
+    def _recipe_is_a_tool_run(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is not None and info.data.get("kind") != "tool":
+            raise ValueError("recipe requires a tool item")
         return value
 
     @model_validator(mode="after")

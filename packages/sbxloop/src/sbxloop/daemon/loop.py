@@ -81,7 +81,7 @@ from sbxloop.engine.model import (
     RunResult,
     RunState,
     TaskRecord,
-    workload_summary,
+    run_summary,
 )
 from sbxloop.engine.reconcile import acknowledge_human_threads
 from sbxloop.engine.sinks import published_line
@@ -1836,7 +1836,7 @@ class DaemonLoop:
         # `completed` after its gate, and that is the whole job. A workload
         # (#760) ends `completed` once its result is published, whatever
         # `[github]` says — there is no pull request to merge.
-        workload = item.kind == "workload"
+        workload = item.kind != "code"
         landed = state == "merged" or (
             state == "completed" and (workload or not self.config.github.enabled)
         )
@@ -3191,16 +3191,15 @@ class DaemonLoop:
             item_config = recipe.config(item_config, target)
             engine.config = item_config
             recipe.stage(item_config, run_id, target)
+            # A `tool` run: the recipe's command and checks, no agent, the
+            # result files to chat. The recipe just wrote the run's inputs,
+            # and a tool run requires its mount by default.
             return engine.start(
                 self.outcome_text(item),
                 run_id=run_id,
                 tasks=[recipe.task(item_config, target)],
                 repo=item.repo,
-                kind="workload",
-                # The recipe just wrote the run's inputs: the agent box must
-                # see them, and a run that starts without them has lost its
-                # task, not merely its workspace.
-                expects_mount=True,
+                kind="tool",
             )
         # A restart by re-applied label continues the previous attempt's
         # pushed branch and PR where they are still usable (#600); the
@@ -3356,9 +3355,9 @@ class DaemonLoop:
         kind: RunKind = record.kind if record is not None else (result.kind if result else "code")
         outputs: tuple[TaskOutcome, ...] = ()
         closing: str | None = None
-        if kind == "workload":
+        if kind != "code":
             outputs = tuple(self._task_outcome(run_id, t) for t in tasks)
-            closing = workload_summary(tasks, record.pr_title if record is not None else None)
+            closing = run_summary(kind, tasks, record.pr_title if record is not None else None)
         return RunReport(
             run_id,
             state,
@@ -3714,11 +3713,7 @@ class DaemonLoop:
             pr_url=record.pr_url,
             reason=record.reason,
             kind=record.kind,
-            summary=(
-                workload_summary(self.store.get_tasks(run_id), record.pr_title)
-                if record.kind == "workload"
-                else None
-            ),
+            summary=run_summary(record.kind, self.store.get_tasks(run_id), record.pr_title),
             published=list(record.published),
         )
 

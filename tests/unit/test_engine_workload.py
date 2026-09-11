@@ -71,33 +71,6 @@ def harness(fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
 
 
 class TestWorkloadRun:
-    def test_entrygraph_publishes_reports_without_the_public_clone(self, harness: Harness) -> None:
-        from sbxloop.entrygraph import scan_config
-
-        engine = harness.engine()
-        engine.config = scan_config(engine.config, "https://git.example.org/team/repo.git")
-        harness.script(
-            [
-                plan(needing("t1", sink="chat")),
-                {
-                    "text": "## Result\nProduced entrygraph-report/report.md and report.json.",
-                    "files": {
-                        "repository/source.txt": "customer source",
-                        ".entrygraph/scan.py": "scanner scratch",
-                        "entrygraph-report/report.md": "findings",
-                        "entrygraph-report/report.json": "{}",
-                    },
-                },
-                PASS,
-            ]
-        )
-        result = engine.start("scan the repository", kind="workload")
-        assert result.state == "completed", result.reason
-        published = [e.data for e in harness.events if e.type == HostEventTypes.RUN_PUBLISHED]
-        assert len(published) == 1 and published[0]["sink"] == "chat"
-        assert {Path(path).name for path in published[0]["paths"]} == {"report.md", "report.json"}
-        assert result.tasks[0].output.file_count == 2
-
     def test_a_caller_that_seeded_inputs_requires_a_visible_mount(
         self, harness: Harness, monkeypatch: pytest.MonkeyPatch
     ) -> None:

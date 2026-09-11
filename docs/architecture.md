@@ -1238,22 +1238,44 @@ ask ─▶ PLAN (task DAG, needs declared) ─▶ grant needs against the profil
   the daemon would get its work. See [The daemon](#the-daemon) for the
   label, chat and schedule paths.
 
-**Recipes.** A *recipe* is trusted host code that stands in for a workload's
-planning turn: it narrows the run's config to the capabilities the work
-needs, stages the code the run executes, and seeds the task graph. A chat
-work item persists the recipe it names and the one target it was queued for
-(`recipe`, `recipe_target`); `sbxloop/recipes.py` is the registry that turns
-that pair into config, inputs and tasks, so the daemon has one branch for
-recipes rather than one per recipe. Seeded and resumed workload graphs pass
-the same needs validation as newly planned graphs. A run whose inputs were
-staged declares that its data directory must be mounted visibly, so a
-sandbox that came up without them fails provisioning rather than starting on
-an empty directory — the caller that seeded the inputs says so, and
-provisioning never infers it from what happens to be on disk.
+## Tools
 
-The concierge's `start_entrygraph` tool is the first recipe, queueing one
-item per enabled configured repository or explicit public HTTPS URL.
-`[entrygraph] enabled` decides whether the tool exists at all and
+The third run kind, `tool`, is a fixed recipe on the run shape with no agent
+in it. Where a `code` run decomposes an outcome and a `workload` plans an
+ask, a tool run is seeded by trusted host code — a *recipe* — with a task
+graph that is already mechanical: each task is one command the host chose
+(`TaskSpec.command`), the checks that are its exit criterion
+(`verify_commands`), and the files it must leave (`result_files`). The
+engine runs the command and its checks as one shell job in the run's data
+directory, records the transcript as the task's execute phase, reads the
+first declared Markdown file as the task's result text, and hands the
+declared files to the sinks exactly as a workload's publish stage does.
+Two stages — `executing`, `publishing` — and no planning, judging, revision,
+steering or chat, because there is no one to plan, judge, revise, steer or
+answer. A failed command, a failed check, a declared file that is not there
+or a host `[policy] deny` refuses all end the run named, before or instead
+of a result; a resume at `executing` runs the command again (a recipe's
+command is idempotent by contract) and one at `publishing` re-enters there.
+`tests/unit/test_tool_run_trail.py` holds a tool run's chronology
+byte-identical the way the code trail holds a code run's, and asserts no
+model turn ever appears in it.
+
+A tool run provisions like a workload — its own data directory, the agent
+sandbox alone, never a github or service box — with `[sandbox] languages`
+as the recipe pinned them, nothing detected and nothing defaulted. Its
+declared hosts are its whole egress bound: granted at execute the way an
+agent's declared egress is, with `[policy] deny` winning as it does
+everywhere. The recipe stages the run's inputs before the sandbox is cut
+and the run requires its mount, so a sandbox that came up without them
+fails provisioning rather than starting on an empty directory.
+
+A chat work item persists the recipe it names and the one target it was
+queued for (`recipe`, `recipe_target`, both `tool` items);
+`sbxloop/recipes.py` is the registry that turns that pair into config,
+inputs and tasks, so the daemon has one branch for recipes rather than one
+per recipe. The concierge's `start_entrygraph` tool is the first recipe,
+queueing one item per enabled configured repository or explicit public
+HTTPS URL. `[entrygraph] enabled` decides whether the tool exists at all and
 `allow_public_urls` whether an ask may name a repository nobody configured.
 The analyzer version is the scanner's own constant, imported by the host
 that builds the runtime command, so the pin cannot disagree with itself.
@@ -1261,17 +1283,17 @@ That runtime installs published wheels only (`uv run --no-build`), which
 keeps its egress to the package index; `[entrygraph] extra_hosts` covers a
 sandbox where no wheel applies.
 
-The recipe's per-run profile grants the analysis download hosts, one configured
-repository checkout when applicable, and the chat sink. It preserves the
-default profile's budget overrides and publication hold, while granting no
-operator credentials or GitHub write sink. Configured repositories use the
-existing host-mediated GitPython clone; arbitrary public URLs are cloned by
-GitPython inside the sandbox without host credentials. Only the scanner's
-Markdown and JSON reports are result artifacts; the public clone and scanner
-scratch are excluded. The scanner records the source revision and analysis
-limits, checks consistency between both reports, and reuses an already
-completed report only for the same source revision. The usual judgment and
-publication stages deliver the result through the configured chat bridge.
+The recipe narrows the run's config to the target's repository entry (its
+token, for a configured repository; nothing, for a public one), a Python
+toolchain and none of the operator's setup, and excludes the scanner and
+the checkout from the harvest. Configured repositories use the existing
+host-mediated GitPython clone into the data directory; arbitrary public
+URLs are cloned by GitPython inside the sandbox, by the command itself,
+without host credentials. The scanner records the source revision and
+analysis limits, checks consistency between both reports, and reuses an
+already completed report only for the same source revision. Only its
+Markdown and JSON reports are result files; the Markdown report is the
+message the chat bridge posts, unchanged.
 
 The two [design principles](#design-principles) hold for a workload exactly
 as for a code run, and the workload cases are the ones that test them:

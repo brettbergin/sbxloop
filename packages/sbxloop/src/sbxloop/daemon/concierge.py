@@ -1678,7 +1678,7 @@ class Concierge:
                     "entrypoints, and source-to-sink paths. Deliver the report and "
                     "supporting result files through the chat sink."
                 ),
-                kind="workload",
+                kind="tool",
                 recipe="entrygraph",
                 recipe_target=target,
                 repo=entry.repo if entry is not None else None,

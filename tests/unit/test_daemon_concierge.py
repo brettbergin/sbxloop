@@ -2620,7 +2620,8 @@ class TestStartEntrygraph:
     def test_configured_target_queues_a_report_with_requester(self, tmp_path: Path) -> None:
         text, dstore = self._call(tmp_path, {"repo": "acme/one"})
         (item,) = dstore.items()
-        assert item.kind == "workload" and item.profile is None
+        assert item.kind == "tool" and item.profile is None
+        assert item.recipe == "entrygraph"
         assert item.recipe_target == "acme/one" and item.repo == "acme/one"
         assert item.requested_by == "777"
         assert item.item_id == f"chat:{item.source_key}"
@@ -2645,7 +2646,7 @@ class TestStartEntrygraph:
         text, dstore = self._call(tmp_path, {"url": url}, config={})
         (item,) = dstore.items()
         assert item.recipe_target == url and item.repo is None
-        assert item.url == "" and item.kind == "workload"
+        assert item.url == "" and item.kind == "tool"
         assert "queued" in text
 
     @pytest.mark.parametrize(
