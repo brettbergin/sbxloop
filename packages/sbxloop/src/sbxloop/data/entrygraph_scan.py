@@ -88,7 +88,11 @@ def _git_environment() -> dict[str, str | None]:
         "core.hooksPath": os.devnull,
         "protocol.allow": "never",
         "protocol.https.allow": "always",
-        "http.followRedirects": "false",
+        # `initial`, git's own default, not `false`: a redirect on the first
+        # request is how a code host answers a URL without its `.git` suffix
+        # (a 301 the clone must follow), while a redirect mid-transfer — the
+        # case the tighter setting guards against — is still refused.
+        "http.followRedirects": "initial",
     }
     environment["GIT_CONFIG_COUNT"] = str(len(settings))
     for index, (key, value) in enumerate(settings.items()):
