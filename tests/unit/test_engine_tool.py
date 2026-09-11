@@ -90,6 +90,11 @@ class TestToolRun:
         assert "One entrypoint, one path." in entry["message"]
         assert result.summary is not None
         assert result.summary.startswith("1/1 command(s) passed their checks")
+        # Nothing on the wire echoes the command: it is the recipe's, long,
+        # and reads to a person like an install log.
+        for event in harness.events:
+            for value in event.data.values():
+                assert not (isinstance(value, str) and "printf" in value), (event.type, value)
 
     def test_stages_are_the_two_and_the_states_record_no_judgment(self, harness: Harness) -> None:
         assert TOOL_STAGES == ("executing", "publishing")
@@ -103,9 +108,9 @@ class TestToolRun:
         harness.script([])
         result = harness.engine().start("scan", kind="tool", tasks=[tool("echo boom >&2; exit 3")])
         assert result.state == "failed"
-        assert result.reason is not None
-        assert "command `echo boom >&2; exit 3` exited 3" in result.reason
-        assert "boom" in result.reason
+        # One line, the task named, the command not repeated (it is the
+        # recipe's and long), the output's last line as the detail.
+        assert result.reason == "task scan: command exited 3 — boom"
         (task,) = result.tasks
         assert task.state == "failed" and task.output is None
         assert published(harness) == []
@@ -119,9 +124,34 @@ class TestToolRun:
             tasks=[tool(WRITE_REPORTS, checks=["grep -q nothing-here out/report.md"])],
         )
         assert result.state == "failed"
-        assert result.reason is not None
-        assert "check `grep -q nothing-here out/report.md` exited 1" in result.reason
+        assert result.reason == "task scan: check `grep -q nothing-here out/report.md` exited 1"
         assert published(harness) == []
+
+    def test_a_failure_reason_is_one_line_never_the_transcript(self, harness: Harness) -> None:
+        """The reason is what the finish card posts in a chat thread. A
+        traceback ends with the exception and a tool with its error line;
+        that line is the reason, and the rest stays on the phase row."""
+        harness.script([])
+        command = (
+            'printf \'Traceback (most recent call last):\\n  File "scan.py", line 1\\n'
+            "    boom()\\nRuntimeError: the clone was refused\\n' >&2; exit 1"
+        )
+        engine = harness.engine()
+        result = engine.start("scan", kind="tool", tasks=[tool(command)])
+        assert result.state == "failed"
+        assert result.reason == "task scan: command exited 1 — RuntimeError: the clone was refused"
+        assert "Traceback" not in result.reason and "printf" not in result.reason
+        # The whole transcript is on the phase row for whoever needs it.
+        (row,) = engine.store.phase_attempts(result.run_id)
+        assert row.phase == "execute" and row.status == "failed"
+        assert row.output_json is not None and "Traceback" in row.output_json
+        # The chronology's phase line is the same one line.
+        (ended,) = [
+            e
+            for e in harness.events
+            if e.type == HostEventTypes.PHASE_END and e.data.get("phase") == "execute"
+        ]
+        assert ended.data["message"] == result.reason
 
     def test_a_missing_declared_file_fails_closed(self, harness: Harness) -> None:
         """A check that passed while a file the sink carries is missing is

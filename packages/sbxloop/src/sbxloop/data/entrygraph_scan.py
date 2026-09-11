@@ -13,6 +13,7 @@ import importlib
 import json
 import os
 import re
+import sys
 import tempfile
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
@@ -380,14 +381,22 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args(argv)
-    if args.check:
-        if args.repo is not None or args.url is not None or args.source is not None:
-            parser.error("--check accepts only --output")
-        check_report(args.output)
-    else:
-        if args.repo is None:
-            parser.error("--repo is required for a scan")
-        run_scan(args.repo, args.output, url=args.url, source=args.source)
+    # One error line, never a traceback: the run's reason is read in a chat
+    # thread, and the failure is the tool's (a clone refused, a report that
+    # does not match), not a defect in this script to debug from the frames.
+    try:
+        if args.check:
+            if args.repo is not None or args.url is not None or args.source is not None:
+                parser.error("--check accepts only --output")
+            check_report(args.output)
+        else:
+            if args.repo is None:
+                parser.error("--repo is required for a scan")
+            run_scan(args.repo, args.output, url=args.url, source=args.source)
+    except Exception as exc:
+        message = " ".join(str(exc).split()) or type(exc).__name__
+        sys.stderr.write(f"error: {type(exc).__name__}: {message}\n")
+        return 1
     return 0
 
 
