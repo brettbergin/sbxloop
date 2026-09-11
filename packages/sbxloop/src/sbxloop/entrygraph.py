@@ -16,27 +16,35 @@ from pathlib import Path
 from urllib.parse import unquote, urlsplit, urlunsplit
 
 from sbxloop.config import BudgetOverrides, Config, WorkloadProfile
+from sbxloop.data.entrygraph_scan import ENTRYGRAPH_VERSION
 from sbxloop.engine.model import TaskNeeds, TaskSpec
 from sbxloop.errors import ProvisionError
 from sbxloop.policy import valid_pattern
 
 # Runtime versions are part of the recipe, not customer toolchain settings.
+# The analyzer version is the scanner's own constant: the scanner refuses a
+# runtime that does not match it, so one pin here and a second one there
+# could only ever disagree at run time, on a run that then fails.
+GITPYTHON_VERSION = "3.1.59"
+LANGUAGE_PACK_VERSION = "1.12.2"
+# `--no-build` keeps the runtime to published wheels. The analyzer and the
+# grammar pack both ship them; a source build would instead reach hosts this
+# recipe does not grant, and fail deep inside a compile rather than here.
 RUNTIME = (
-    "uv run --no-project --no-config --python 3.13 "
-    "--with entrygraph==0.1.134 --with gitpython==3.1.59 "
-    "--with tree-sitter-language-pack==1.12.2 python"
+    "uv run --no-project --no-config --no-build --python 3.13 "
+    f"--with entrygraph=={ENTRYGRAPH_VERSION} "
+    f"--with gitpython=={GITPYTHON_VERSION} "
+    f"--with tree-sitter-language-pack=={LANGUAGE_PACK_VERSION} python"
 )
 SCANNER = ".entrygraph/scan.py"
 OUTPUT = "entrygraph-report"
-# tree-sitter-language-pack fetches its grammars from GitHub releases.
-# These are late grants; the operator's policy.deny always wins.
+# The package index, and nothing else: the grammar pack's wheels carry their
+# grammars, so the scan runtime never fetches from a code host. An operator
+# whose sandbox needs more names it in `[entrygraph] extra_hosts`. These are
+# late grants; the operator's policy.deny always wins.
 RUNTIME_HOSTS = (
     "pypi.org",
     "files.pythonhosted.org",
-    "github.com",
-    "api.github.com",
-    "release-assets.githubusercontent.com",
-    "objects.githubusercontent.com",
 )
 
 
@@ -100,15 +108,25 @@ def resolve_targets(
                 if not entry.enabled:
                     raise ValueError("entrygraph target is not an enabled configured repository")
                 return [entry.repo]
+        if not config.entrygraph.allow_public_urls:
+            # The scan runs an agent over whatever that repository contains;
+            # an operator may keep the choice of repository to themselves.
+            raise ValueError(
+                "entrygraph is configured for its configured repositories only "
+                "(`[entrygraph] allow_public_urls = false`); name one of those instead"
+            )
         return [canonical]
     if not entries:
         raise ValueError("no enabled repositories are configured; supply an HTTPS repository url")
     return [entry.repo for entry in entries]
 
 
-def _hosts(target: str) -> list[str]:
+def _hosts(config: Config, target: str) -> list[str]:
+    """The hosts the scan runtime may reach: the index, the operator's extra
+    grants, and — for a public target — the code host it is cloned from."""
     host = urlsplit(target).hostname if target.startswith("https://") else None
-    return list(dict.fromkeys([*RUNTIME_HOSTS, *([host] if host else [])]))
+    extra = config.entrygraph.extra_hosts
+    return list(dict.fromkeys([*RUNTIME_HOSTS, *extra, *([host] if host else [])]))
 
 
 def _layout(target: str | None) -> tuple[str, str, str]:
@@ -131,7 +149,7 @@ def scan_config(config: Config, target: str) -> Config:
     previous = config.workload_profile()
     profile = WorkloadProfile(
         name="entrygraph",
-        egress=_hosts(target),
+        egress=_hosts(config, target),
         sinks=["chat"],
         repo=not public,
         publish=previous.publish if previous is not None else "auto",
@@ -188,8 +206,13 @@ def scan_config(config: Config, target: str) -> Config:
     )
 
 
-def scan_task(target: str) -> TaskSpec:
-    """One predefined task: execute a scanner, judge its report, publish to chat."""
+def scan_task(config: Config, target: str) -> TaskSpec:
+    """One predefined task: execute a scanner, judge its report, publish to chat.
+
+    The task's declared hosts are the profile's egress, computed the same
+    way from the same config: a need the profile does not cover fails the
+    run closed, and these two must never be able to disagree.
+    """
     public = target.startswith("https://")
     checkout, scanner, output = _layout(target)
     command = f"{RUNTIME} {scanner} --repo {shlex.quote(checkout)} --output {output}"
@@ -222,14 +245,19 @@ def scan_task(target: str) -> TaskSpec:
             "Both the readable report and machine-readable JSON are declared as chat result files.",
         ],
         verify_commands=[f"python {scanner} --check --output {output}"],
-        needs=TaskNeeds(hosts=_hosts(target), repo=None if public else target, sink="chat"),
+        needs=TaskNeeds(hosts=_hosts(config, target), repo=None if public else target, sink="chat"),
     )
 
 
-def stage_scanner(config: Config, run_id: str) -> Path:
-    """Stage trusted recipe code before mounting the workload's input directory."""
+def stage_scanner(config: Config, run_id: str, target: str) -> Path:
+    """Stage trusted recipe code before mounting the workload's input directory.
+
+    The target is named, never re-derived from the config: the scanner's
+    path has to be the one ``scan_task`` told the agent to run, and a config
+    that narrowed differently would stage it somewhere else in silence.
+    """
     workspace = config.paths.run_workspace(run_id).resolve()
-    _, scanner, _ = _layout(config.github.repo)
+    _, scanner, _ = _layout(target)
     destination = workspace / scanner
     source = files("sbxloop.data").joinpath("entrygraph_scan.py").read_bytes()
     if destination.parent.is_symlink() or destination.is_symlink():

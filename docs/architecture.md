@@ -1238,13 +1238,28 @@ ask ─▶ PLAN (task DAG, needs declared) ─▶ grant needs against the profil
   the daemon would get its work. See [The daemon](#the-daemon) for the
   label, chat and schedule paths.
 
-The concierge's `start_entrygraph` tool is a predefined workload recipe. It
-persists a nullable `entrygraph_target` on each chat work item and queues one
-item per enabled configured repository or explicit public HTTPS URL. The
-daemon stages a packaged scanner and seeds one task, avoiding a planning
-turn. Seeded and resumed workload graphs pass the same needs validation as
-newly planned graphs. A data directory that already contains inputs must be
-mounted visibly; it cannot fall back to an empty directory inside the VM.
+**Recipes.** A *recipe* is trusted host code that stands in for a workload's
+planning turn: it narrows the run's config to the capabilities the work
+needs, stages the code the run executes, and seeds the task graph. A chat
+work item persists the recipe it names and the one target it was queued for
+(`recipe`, `recipe_target`); `sbxloop/recipes.py` is the registry that turns
+that pair into config, inputs and tasks, so the daemon has one branch for
+recipes rather than one per recipe. Seeded and resumed workload graphs pass
+the same needs validation as newly planned graphs. A run whose inputs were
+staged declares that its data directory must be mounted visibly, so a
+sandbox that came up without them fails provisioning rather than starting on
+an empty directory — the caller that seeded the inputs says so, and
+provisioning never infers it from what happens to be on disk.
+
+The concierge's `start_entrygraph` tool is the first recipe, queueing one
+item per enabled configured repository or explicit public HTTPS URL.
+`[entrygraph] enabled` decides whether the tool exists at all and
+`allow_public_urls` whether an ask may name a repository nobody configured.
+The analyzer version is the scanner's own constant, imported by the host
+that builds the runtime command, so the pin cannot disagree with itself.
+That runtime installs published wheels only (`uv run --no-build`), which
+keeps its egress to the package index; `[entrygraph] extra_hosts` covers a
+sandbox where no wheel applies.
 
 The recipe's per-run profile grants the analysis download hosts, one configured
 repository checkout when applicable, and the chat sink. It preserves the

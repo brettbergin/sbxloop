@@ -82,11 +82,11 @@ def test_recipe_limits_run_to_scan_inputs_and_chat(tmp_path: Path) -> None:
     assert scan.github.find_repo("org/one").token_env == "ONE_TOKEN"
     assert scan.sandbox.languages == ["python"] and scan.sandbox.setup_commands == []
     assert scan.sandbox.env == {} and scan.registries == []
-    task = scan_task("org/one")
+    task = scan_task(scan, "org/one")
     assert task.needs.repo == "org/one" and task.needs.sink == "chat"
     assert "--no-project" in task.description and "--url" not in task.description
     assert "--check" in task.verify_commands[0]
-    staged = stage_scanner(scan, "rscan")
+    staged = stage_scanner(scan, "rscan", "org/one")
     assert staged.is_file() and staged.is_relative_to(scan.paths.run_workspace("rscan"))
     assert cfg.sandbox.languages == ["javascript"]
 
@@ -99,7 +99,7 @@ def test_public_url_recipe_has_no_github_capability(tmp_path: Path) -> None:
     )
     scan = scan_config(cfg, "https://git.example.org/team/repo.git")
     assert scan.github.repo is None and scan.github.repos == []
-    task = scan_task("https://git.example.org/team/repo.git")
+    task = scan_task(scan, "https://git.example.org/team/repo.git")
     assert task.needs.repo is None
     assert "git.example.org" in task.needs.hosts
     assert "--url https://git.example.org/team/repo.git" in task.description
@@ -119,10 +119,10 @@ def test_recipe_files_are_outside_the_configured_checkout(tmp_path: Path, name: 
 
     target = f"org/{name}"
     cfg = scan_config(config(home=tmp_path, github={"repo": target}), target)
-    script = stage_scanner(cfg, "rlayout")
+    script = stage_scanner(cfg, "rlayout", target)
     checkout = cfg.paths.run_workspace("rlayout") / name
     assert not script.is_relative_to(checkout)
-    task = scan_task(target)
+    task = scan_task(cfg, target)
     import shlex
 
     check = shlex.split(task.verify_commands[0])
@@ -150,7 +150,8 @@ def test_daemon_scan_does_not_refresh_an_unrelated_host_workspace(
         source_key="scan",
         title="Scan repository",
         kind="workload",
-        entrygraph_target="https://git.example.org/team/repo.git",
+        recipe="entrygraph",
+        recipe_target="https://git.example.org/team/repo.git",
     )
     h.dstore.upsert_new(item, h.clock())
     h.outcomes = ["completed"]
@@ -174,7 +175,8 @@ def test_default_runner_stages_scanner_and_seeds_workload(tmp_path: Path) -> Non
         source_key="scan",
         title="Scan repository",
         kind="workload",
-        entrygraph_target="o/r",
+        recipe="entrygraph",
+        recipe_target="o/r",
         repo="o/r",
     )
     cfg = h.loop._item_config(item)
@@ -190,3 +192,65 @@ def test_default_runner_stages_scanner_and_seeds_workload(tmp_path: Path) -> Non
     h.loop._default_runner(item, cfg, "rscan", bus, True)
     engine.resume.assert_called_once_with("rscan", release_provider_hold=False)
     assert engine.start.call_count == 1
+
+
+def test_the_analyzer_is_pinned_in_one_place() -> None:
+    """The scanner refuses a runtime that is not its own version, so two
+    pins could only ever disagree at run time, on a run that then fails."""
+    from sbxloop.data.entrygraph_scan import ENTRYGRAPH_VERSION
+    from sbxloop.entrygraph import RUNTIME
+
+    assert f"--with entrygraph=={ENTRYGRAPH_VERSION} " in RUNTIME
+
+
+def test_the_scan_runtime_installs_wheels_and_reaches_no_code_host() -> None:
+    """The pinned analyzer and grammar pack both publish wheels. Building
+    from source would reach hosts this recipe does not grant, and fail deep
+    inside a compile rather than at resolution."""
+    from sbxloop.entrygraph import RUNTIME, RUNTIME_HOSTS, scan_task
+
+    assert "--no-build" in RUNTIME
+    assert set(RUNTIME_HOSTS) == {"pypi.org", "files.pythonhosted.org"}
+    task = scan_task(config(github={"repo": "org/one"}), "org/one")
+    assert task.needs.hosts == ["pypi.org", "files.pythonhosted.org"]
+
+
+def test_extra_hosts_widen_the_profile_and_the_task_together() -> None:
+    """A need the profile does not cover fails the run closed, so the two
+    lists are computed the same way from the same config."""
+    from sbxloop.entrygraph import scan_config, scan_task
+
+    cfg = config(
+        github={"repo": "org/one"},
+        entrygraph={"extra_hosts": ["Mirror.Example.Org"]},
+    )
+    scan = scan_config(cfg, "org/one")
+    profile = scan.workload_profile()
+    assert profile is not None and "mirror.example.org" in profile.egress
+    assert scan_task(cfg, "org/one").needs.hosts == profile.egress
+
+
+def test_public_urls_can_be_narrowed_to_configured_repositories() -> None:
+    from sbxloop.entrygraph import resolve_targets
+
+    cfg = config(
+        github={"repo": "org/one"},
+        entrygraph={"allow_public_urls": False},
+    )
+    # the configured repository is still reachable by its own URL
+    assert resolve_targets(cfg, url="https://github.com/org/one.git") == ["org/one"]
+    with pytest.raises(ValueError, match="allow_public_urls"):
+        resolve_targets(cfg, url="https://git.example.org/team/repo.git")
+
+
+def test_the_registry_is_how_the_daemon_reaches_a_recipe() -> None:
+    from sbxloop import entrygraph
+    from sbxloop.errors import ConfigError
+    from sbxloop.recipes import get_recipe
+
+    recipe = get_recipe("entrygraph")
+    assert recipe.config is entrygraph.scan_config
+    assert recipe.stage is entrygraph.stage_scanner
+    assert recipe.task is entrygraph.scan_task
+    with pytest.raises(ConfigError, match="entrygraph"):
+        get_recipe("no-such-recipe")

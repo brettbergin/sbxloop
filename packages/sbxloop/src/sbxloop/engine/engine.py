@@ -434,6 +434,7 @@ class LoopEngine:
         credentials: Sequence[str] = (),
         kind: RunKind = "code",
         profile: str | None = None,
+        expects_mount: bool | None = None,
     ) -> RunResult:
         """Drive a fresh run all the way through.
 
@@ -471,6 +472,13 @@ class LoopEngine:
         persisted with the run, so a resume re-enters the same stages
         whatever the on-disk config says by then.
 
+        ``expects_mount`` says whether the agent sandbox must see the
+        run's directory. A caller that seeded inputs into it — a workload
+        recipe staging the code the run executes — says ``True``, so a
+        sandbox that came up without them fails provisioning instead of
+        starting on an empty directory. ``None`` leaves the decision to
+        provisioning, which is what every ordinary run passes.
+
         ``profile`` names the ``[[workloads]]`` profile a workload runs
         under (#758) — the `[workload] default` when None; a run with no
         profile at all may declare no needs. It is pinned into the run's
@@ -505,7 +513,7 @@ class LoopEngine:
                 workspace_source="data-dir",
             )
             self._prior = PriorArtifacts(branch=None, pr_number=None)
-            return self._drive(run_id, outcome)
+            return self._drive(run_id, outcome, expects_mount=expects_mount)
         workspace = self.config.workspace_for_repo(self.config.github.repo)
         self.bus.emit(
             HostEventTypes.RUN_START,
@@ -517,7 +525,7 @@ class LoopEngine:
             or self.config.workspace_source(self.config.github.repo),
         )
         self._prior = PriorArtifacts(branch=prior_branch, pr_number=prior_pr)
-        return self._drive(run_id, outcome)
+        return self._drive(run_id, outcome, expects_mount=expects_mount)
 
     def _select_repo(self, repo: str | None) -> None:
         """Pin this engine's GitHub config to the run's repository.
@@ -2090,17 +2098,26 @@ class LoopEngine:
         message = f"granted under profile {pname!r}: " + "; ".join(parts)
         if new_creds:
             message += " — re-provisioning with the service sandbox that holds the credentials"
-        self.bus.emit(
-            HostEventTypes.RUN_NEEDS_GRANTED,
-            run_id,
-            profile=pname,
-            hosts=granted_hosts,
-            credentials=granted_creds,
-            sinks=granted_sinks,
-            repos=granted_repos,
-            message=message,
-        )
-        log.info("run.needs_granted", run=run_id, profile=pname, message=message)
+        # Announced once per run. The checks above run on every pass — a
+        # re-provision and a resume must re-authorize what the graph asks
+        # for, and a need that stopped being allowed still fails the run
+        # closed — but the grant itself is one decision, and repeating it
+        # in the chronology would read as a second, different grant.
+        if not any(
+            True
+            for _, event in self.store.events(run_id, type_prefix=HostEventTypes.RUN_NEEDS_GRANTED)
+        ):
+            self.bus.emit(
+                HostEventTypes.RUN_NEEDS_GRANTED,
+                run_id,
+                profile=pname,
+                hosts=granted_hosts,
+                credentials=granted_creds,
+                sinks=granted_sinks,
+                repos=granted_repos,
+                message=message,
+            )
+            log.info("run.needs_granted", run=run_id, profile=pname, message=message)
         assert p.pair.workspace is not None
         for repo in granted_repos:
             assert p.provisioner is not None

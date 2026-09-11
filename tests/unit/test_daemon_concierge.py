@@ -2621,7 +2621,7 @@ class TestStartEntrygraph:
         text, dstore = self._call(tmp_path, {"repo": "acme/one"})
         (item,) = dstore.items()
         assert item.kind == "workload" and item.profile is None
-        assert item.entrygraph_target == "acme/one" and item.repo == "acme/one"
+        assert item.recipe_target == "acme/one" and item.repo == "acme/one"
         assert item.requested_by == "777"
         assert item.item_id == f"chat:{item.source_key}"
         assert item.source_key.startswith("9001:entrygraph:")
@@ -2636,17 +2636,15 @@ class TestStartEntrygraph:
     ) -> None:
         _, dstore = self._call(tmp_path, args)
         items = dstore.items()
-        assert {item.entrygraph_target for item in items} == {"acme/one", "acme/two"}
+        assert {item.recipe_target for item in items} == {"acme/one", "acme/two"}
         assert len({item.source_key for item in items}) == 2
-        assert all(
-            item.requested_by == "777" and item.repo == item.entrygraph_target for item in items
-        )
+        assert all(item.requested_by == "777" and item.repo == item.recipe_target for item in items)
 
     def test_an_arbitrary_url_needs_no_configured_repository(self, tmp_path: Path) -> None:
         url = "https://git.example.org/team/project.git"
         text, dstore = self._call(tmp_path, {"url": url}, config={})
         (item,) = dstore.items()
-        assert item.entrygraph_target == url and item.repo is None
+        assert item.recipe_target == url and item.repo is None
         assert item.url == "" and item.kind == "workload"
         assert "queued" in text
 
@@ -2703,6 +2701,29 @@ class TestStartEntrygraph:
         (tool,) = [tool for tool in job.host_tools if tool.name == "start_entrygraph"]
         assert set(tool.parameters["properties"]) == {"repo", "url", "all_repos"}
 
+    def test_a_disabled_recipe_has_no_tool_at_all(self, tmp_path: Path) -> None:
+        """Gated by removal, not refusal: a tool the model can see but never
+        use costs a turn and reads, to the person, as a capability."""
+        concierge, client, _, _, _ = make(
+            tmp_path, [{"text": "hi"}], config={"entrygraph": {"enabled": False}}
+        )
+        turn(concierge)
+        (job,) = client.jobs
+        assert [tool for tool in job.host_tools if tool.name == "start_entrygraph"] == []
+
+    def test_narrowing_to_configured_repositories_removes_the_url_selector(
+        self, tmp_path: Path
+    ) -> None:
+        """An ask cannot name a target the config would refuse."""
+        concierge, client, _, _, _ = make(
+            tmp_path, [{"text": "hi"}], config={"entrygraph": {"allow_public_urls": False}}
+        )
+        turn(concierge)
+        (job,) = client.jobs
+        (tool,) = [tool for tool in job.host_tools if tool.name == "start_entrygraph"]
+        assert set(tool.parameters["properties"]) == {"repo", "all_repos"}
+        assert "Only configured repositories" in tool.description
+
     def test_rejected_url_credentials_are_absent_from_tool_notes(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2734,6 +2755,23 @@ class TestStartEntrygraph:
         assert dstore.items() == []
         assert notes and logged
         assert secret not in repr((notes, logged, client.responses))
+
+    def test_selectors_that_cannot_carry_a_credential_stay_visible(self, tmp_path: Path) -> None:
+        """A tool call that shows up with no arguments cannot be followed or
+        steered; only the selector that can embed a password is hidden."""
+        notes: list[dict[str, Any]] = []
+        concierge, _, _, _, _ = make(
+            tmp_path,
+            [{"calls": [("start_entrygraph", {"repo": "acme/one", "all_repos": False})]}],
+            config=self.REPOS,
+        )
+        concierge.submit_turn(
+            "scan",
+            author="ana",
+            message_id="9002",
+            on_tool=lambda name, args, response: notes.append(args),
+        ).result(timeout=10)
+        assert notes == [{"repo": "acme/one", "all_repos": False}]
 
 
 class TestStartWorkload:

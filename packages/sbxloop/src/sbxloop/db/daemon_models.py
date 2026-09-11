@@ -85,7 +85,8 @@ class WorkItemRow(Base):
     prior_pr_number: Mapped[int | None] = mapped_column(Integer)
     run_kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="'code'")
     profile: Mapped[str | None] = mapped_column(Text)
-    entrygraph_target: Mapped[str | None] = mapped_column(Text)
+    recipe: Mapped[str | None] = mapped_column(Text)
+    recipe_target: Mapped[str | None] = mapped_column(Text)
 
 
 class DaemonRunRow(Base):

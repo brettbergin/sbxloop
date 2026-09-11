@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, NamedTuple, Protocol, cast
 from zoneinfo import ZoneInfo
 
-from sbxloop import __version__, entrygraph, hostgit
+from sbxloop import __version__, hostgit
 from sbxloop.config import Config, GithubConfig, SandboxConfig, ScheduleConfig
 from sbxloop.daemon.github import DaemonGithub
 from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
@@ -106,6 +106,7 @@ from sbxloop.ghids import (
 from sbxloop.ids import new_run_id
 from sbxloop.log import bind_run, clear_run, get_logger
 from sbxloop.provider import ProviderHeldError, ProviderRecovery
+from sbxloop.recipes import get_recipe
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.provision import sandbox_name
@@ -1545,7 +1546,7 @@ class DaemonLoop:
             self.source.report_started(item, run_id)
             # Fresh runs only: a resumed run is pinned to the clone it
             # already has, so moving the source would change nothing.
-            if item.entrygraph_target is None:
+            if item.recipe is None:
                 self._refresh_workspace(self._item_repo(item))
         else:
             self.dstore.mark_resuming(
@@ -2913,10 +2914,11 @@ class DaemonLoop:
         return repo
 
     def _item_config(self, item: WorkItem) -> Config:
-        if item.entrygraph_target is not None:
-            # Validate the recipe inside the runner's exception boundary, so
-            # a target removed while queued is reported and settled normally.
-            # A resume must first rehydrate the run's persisted profile.
+        if item.recipe is not None:
+            # A recipe narrows the config itself, at start, inside the
+            # runner's exception boundary — so a target removed while the
+            # item was queued is reported and settled normally. A resume
+            # must first rehydrate the run's persisted profile.
             return self.config.model_copy(update={"keep_on_failure": False})
         # Narrow the section to the item's repository first, so the run's
         # per-repo deliver_base / token_env win over the global defaults.
@@ -3183,16 +3185,22 @@ class DaemonLoop:
         engine = handle.engine
         if resume:
             return engine.resume(run_id, release_provider_hold=False)
-        if item.entrygraph_target is not None:
-            item_config = entrygraph.scan_config(item_config, item.entrygraph_target)
+        if item.recipe is not None:
+            recipe = get_recipe(item.recipe)
+            target = item.recipe_target or ""
+            item_config = recipe.config(item_config, target)
             engine.config = item_config
-            entrygraph.stage_scanner(item_config, run_id)
+            recipe.stage(item_config, run_id, target)
             return engine.start(
                 self.outcome_text(item),
                 run_id=run_id,
-                tasks=[entrygraph.scan_task(item.entrygraph_target)],
+                tasks=[recipe.task(item_config, target)],
                 repo=item.repo,
                 kind="workload",
+                # The recipe just wrote the run's inputs: the agent box must
+                # see them, and a run that starts without them has lost its
+                # task, not merely its workspace.
+                expects_mount=True,
             )
         # A restart by re-applied label continues the previous attempt's
         # pushed branch and PR where they are still usable (#600); the

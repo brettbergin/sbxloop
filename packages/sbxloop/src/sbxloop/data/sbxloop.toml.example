@@ -755,3 +755,19 @@ secret_strategy = "proxy"
 # clarify_ttl_s = 900              # a filing-blocking clarifying question waits this
 #                                  # long (also the clickable-choice TTL); then the
 #                                  # issue files on the concierge's stated assumption
+
+# [entrygraph]
+# The fixed repository-analysis workload the concierge can queue
+# ("run entrygraph against owner/repo"): a pinned analyzer reports a
+# repository's overview, entrypoints and source-to-sink findings to chat.
+# The pinned versions are the recipe, not settings — what you decide here
+# is whether the tool exists, what it may be pointed at, and what its
+# runtime may reach. [policy] deny still wins over extra_hosts.
+# enabled = true                   # false: the concierge has no entrygraph tool at all
+# allow_public_urls = true         # false: only the repositories configured above —
+#                                  # an ask naming any other repository is refused
+# extra_hosts = []                 # extra egress for the scan runtime, on top of the
+#                                  # package index. Only needed where the pinned
+#                                  # analyzer and grammar wheels do not apply (an old
+#                                  # glibc, an unusual architecture): the runtime is
+#                                  # wheel-only, so it never reaches a code host itself

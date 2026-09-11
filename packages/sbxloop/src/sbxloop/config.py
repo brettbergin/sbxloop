@@ -1875,6 +1875,46 @@ class ConciergeConfig(_ConfigModel):
     clarify_ttl_s: float = Field(default=900.0, ge=60, le=86400)
 
 
+class EntrygraphConfig(_ConfigModel):
+    """`[entrygraph]`: the operator's bounds on the entrygraph recipe — the
+    fixed repository-analysis workload the concierge can queue.
+
+    The recipe's pinned versions are not knobs (they are what the report
+    means); what an operator decides is whether the tool exists at all,
+    whether an ask may name a repository nobody configured, and which extra
+    hosts its runtime may reach. ``[policy] deny`` still wins over
+    ``extra_hosts``, as it does over every profile's egress.
+    """
+
+    # The concierge offers `start_entrygraph` only when this is on. Off
+    # takes the tool out of the roster entirely, rather than leaving a tool
+    # that always answers with a refusal.
+    enabled: bool = True
+    # Whether an ask may name an arbitrary public HTTPS repository. Off
+    # narrows the recipe to the repositories the operator configured — the
+    # scan still runs an agent over code that repository's authors wrote,
+    # but not over code chosen by whoever is in the chat channel.
+    allow_public_urls: bool = True
+    # Extra egress patterns for the scan runtime, granted on top of the
+    # package index. The pinned analyzer resolves from wheels; an operator
+    # whose sandbox has no matching wheel (an old glibc, an unusual
+    # architecture) names the hosts a source build needs here.
+    extra_hosts: list[str] = Field(default_factory=list)
+
+    @field_validator("extra_hosts")
+    @classmethod
+    def _check_extra_hosts(cls, value: list[str]) -> list[str]:
+        from sbxloop.policy import valid_pattern
+
+        patterns = [p.strip().lower() for p in value]
+        bad = [p for p in patterns if not valid_pattern(p, operator=True)]
+        if bad:
+            raise ValueError(
+                f"entrygraph.extra_hosts must be domains, *.domain wildcards or '*', got {bad!r}"
+            )
+        return list(dict.fromkeys(patterns))
+
+
 #: Settings that used to say where state lives. Rejected by name (not just
 #: "unknown key") so the error says what replaced them.
 RETIRED_PATH_KEYS: dict[str, str] = {
@@ -2307,6 +2347,7 @@ class Config(_ConfigModel):
     slack: SlackConfig = Field(default_factory=SlackConfig)
     tui: TuiConfig = Field(default_factory=TuiConfig)
     concierge: ConciergeConfig = Field(default_factory=ConciergeConfig)
+    entrygraph: EntrygraphConfig = Field(default_factory=EntrygraphConfig)
     # Named bounds for workload runs (#758) and the one a run gets by
     # default; a code run ignores both.
     workloads: list[WorkloadProfile] = Field(default_factory=list)

@@ -853,10 +853,11 @@ class Provisioner:
         elif kind == "workload":
             workspace = self._data_dir(run_id)
             if expects_mount is None:
-                # A seeded workload may already carry inputs (for example a
-                # fixed report generator). Starting in an empty VM directory
-                # when those inputs cannot be mounted would lose the task.
-                expects_mount = workspace.exists() and any(workspace.iterdir())
+                # A workload's data directory starts empty and the run fills
+                # it, so a lost mount costs artifacts, not the task. A caller
+                # that seeded inputs into it says so — it knows; a guess from
+                # whatever happens to be on disk does not.
+                expects_mount = False
         else:
             workspace, resolved_expects = self._resolve_workspace_source(run_id, repo)
             if expects_mount is None:

@@ -815,7 +815,8 @@ def _row_to_item(row: WorkItemRow) -> WorkItem:
         prior_pr_number=row.prior_pr_number,
         kind=cast("RunKind", row.run_kind or "code"),
         profile=row.profile,
-        entrygraph_target=row.entrygraph_target,
+        recipe=row.recipe,
+        recipe_target=row.recipe_target,
     )
 
 
@@ -1653,7 +1654,8 @@ class DaemonStore:
                     prior_pr_number=prior.pr_number if prior else None,
                     run_kind=item.kind,
                     profile=item.profile,
-                    entrygraph_target=item.entrygraph_target,
+                    recipe=item.recipe,
+                    recipe_target=item.recipe_target,
                 )
             )
             if prior is not None:

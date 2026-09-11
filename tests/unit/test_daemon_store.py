@@ -1532,23 +1532,36 @@ class TestWorkloadItems:
     """#760: an item carries the run it becomes and its profile; a chat ask
     has no repository by design and survives the repo-attribution passes."""
 
-    def test_entrygraph_target_requires_workload_kind(self) -> None:
-        with pytest.raises(ValueError, match="entrygraph_target requires a workload"):
-            item("scan", item_id="chat:scan", entrygraph_target="acme/one")
+    def test_a_recipe_requires_workload_kind(self) -> None:
+        with pytest.raises(ValueError, match="recipe requires a workload"):
+            item("scan", item_id="chat:scan", recipe="entrygraph", recipe_target="acme/one")
 
-    def test_entrygraph_target_survives_store_reopen(self, tmp_path: Path) -> None:
+    def test_a_recipe_and_its_target_are_set_together(self) -> None:
+        with pytest.raises(ValueError, match="set together"):
+            item("scan", item_id="chat:scan", kind="workload", recipe="entrygraph")
+        with pytest.raises(ValueError, match="set together"):
+            item("scan", item_id="chat:scan", kind="workload", recipe_target="acme/one")
+
+    def test_a_recipe_survives_store_reopen(self, tmp_path: Path) -> None:
         path = tmp_path / "state.db"
         store = DaemonStore(path)
         store.upsert_new(
-            item("scan", item_id="chat:scan", kind="workload", entrygraph_target="acme/one"),
+            item(
+                "scan",
+                item_id="chat:scan",
+                kind="workload",
+                recipe="entrygraph",
+                recipe_target="acme/one",
+            ),
             now=1.0,
         )
         store.close()
         reopened = DaemonStore(path)
         got = reopened.get("chat:scan")
-        assert got is not None and got.entrygraph_target == "acme/one"
+        assert got is not None and got.recipe == "entrygraph"
+        assert got.recipe_target == "acme/one"
 
-    def test_pre_entrygraph_database_gains_a_nullable_target(self, tmp_path: Path) -> None:
+    def test_pre_recipe_database_gains_nullable_recipe_columns(self, tmp_path: Path) -> None:
         path = daemon_db(tmp_path, "pre_local_bridge")
         insert_daemon_row(
             path,
@@ -1564,11 +1577,11 @@ class TestWorkloadItems:
         )
         store = DaemonStore(path)
         got = store.get("gh:o/r:issue:3")
-        assert got is not None and got.entrygraph_target is None
+        assert got is not None and got.recipe is None and got.recipe_target is None
         columns = {
             row[1] for row in sqlite3.connect(path).execute("PRAGMA table_info(daemon_work_items)")
         }
-        assert "entrygraph_target" in columns
+        assert {"recipe", "recipe_target"} <= columns
 
     def test_kind_and_profile_round_trip(self, tmp_path: Path) -> None:
         store = DaemonStore(tmp_path / "state.db")

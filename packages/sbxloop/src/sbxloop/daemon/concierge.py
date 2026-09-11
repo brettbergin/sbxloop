@@ -922,30 +922,7 @@ class Concierge:
                 ),
                 self._tool_start_workload,
             ),
-            HostTool(
-                HostToolSpec(
-                    name="start_entrygraph",
-                    description=(
-                        "Queue entrygraph repository analysis and return its overview, "
-                        "entrypoints, source-to-sink paths and report files through the "
-                        "configured chat backend. Use this tool when the person asks to "
-                        "run entrygraph. With no selector, scan every enabled configured "
-                        "repository; `all_repos: true` selects those explicitly. `repo` "
-                        "selects one configured repository; `url` selects an arbitrary "
-                        "public HTTPS repository URL. Choose only one selector. One "
-                        "workload is queued per target, with its own run thread and "
-                        "requester notification. Queue directly, without confirmation."
-                    ),
-                    parameters=_schema(
-                        {
-                            "repo": {"type": "string"},
-                            "url": {"type": "string"},
-                            "all_repos": {"type": "boolean"},
-                        }
-                    ),
-                ),
-                self._tool_start_entrygraph,
-            ),
+            *self._entrygraph_tools(),
             HostTool(
                 HostToolSpec(
                     name="create_schedule",
@@ -1616,6 +1593,51 @@ class Concierge:
             f"is published.{note}"
         )
 
+    def _entrygraph_tools(self) -> list[HostTool]:
+        """The entrygraph recipe's tool, when the operator left it on.
+
+        Gated by removal rather than refusal: a tool the model can see but
+        never use costs a turn and reads, to the person, as a capability.
+        The selector schema follows the same knob — an ask cannot name a
+        public URL the config would reject.
+        """
+        if not self.config.entrygraph.enabled:
+            return []
+        public_urls = self.config.entrygraph.allow_public_urls
+        selectors: dict[str, Any] = {
+            "repo": {"type": "string"},
+            "all_repos": {"type": "boolean"},
+        }
+        if public_urls:
+            selectors["url"] = {"type": "string"}
+        return [
+            HostTool(
+                HostToolSpec(
+                    name="start_entrygraph",
+                    description=(
+                        "Queue entrygraph repository analysis and return its overview, "
+                        "entrypoints, source-to-sink paths and report files through the "
+                        "configured chat backend. Use this tool when the person asks to "
+                        "run entrygraph. With no selector, scan every enabled configured "
+                        "repository; `all_repos: true` selects those explicitly. `repo` "
+                        "selects one configured repository. "
+                        + (
+                            "`url` selects an arbitrary public HTTPS repository URL. "
+                            if public_urls
+                            else "Only configured repositories can be scanned here: an "
+                            "ask naming any other repository is refused, and saying so "
+                            "is the answer. "
+                        )
+                        + "Choose only one selector. One "
+                        "workload is queued per target, with its own run thread and "
+                        "requester notification. Queue directly, without confirmation."
+                    ),
+                    parameters=_schema(selectors),
+                ),
+                self._tool_start_entrygraph,
+            )
+        ]
+
     def _tool_start_entrygraph(self, args: dict[str, Any], by: str) -> str:
         for name in ("repo", "url"):
             if args.get(name) is not None and not isinstance(args[name], str):
@@ -1657,7 +1679,8 @@ class Concierge:
                     "supporting result files through the chat sink."
                 ),
                 kind="workload",
-                entrygraph_target=target,
+                recipe="entrygraph",
+                recipe_target=target,
                 repo=entry.repo if entry is not None else None,
                 requested_by=self._turn_author_id,
             )
@@ -2185,12 +2208,18 @@ class Concierge:
 
 
 def _visible_tool_arguments(call: HostToolCall) -> dict[str, Any]:
-    """Only resolved scan targets may reach logs or chat tool notes.
+    """The call's arguments, with the ones that can carry a credential hidden.
 
-    An invalid URL can contain credentials; the queue response names a
-    validated target, while raw selectors never leave the handler.
+    A URL a person types can embed a username and password, and a rejected
+    one is never canonicalised — so the raw value never reaches the logs or
+    the chat chronology. Every other selector stays visible: a tool call
+    that shows up with no arguments cannot be followed or steered, and the
+    resolved targets are named in the reply either way.
     """
-    return {} if call.name == "start_entrygraph" else dict(call.arguments)
+    arguments = dict(call.arguments)
+    if call.name == "start_entrygraph" and arguments.get("url") is not None:
+        arguments["url"] = "<redacted url>"
+    return arguments
 
 
 def _schema(properties: dict[str, Any], required: list[str] | None = None) -> dict[str, Any]:
