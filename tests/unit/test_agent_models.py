@@ -491,7 +491,7 @@ def test_run_creation_pins_explicit_workload_repo_for_models(tmp_path, monkeypat
 
     cfg = config(home=tmp_path)
     engine = LoopEngine(cfg)
-    monkeypatch.setattr(engine, "_drive", lambda *args: None)
+    monkeypatch.setattr(engine, "_drive", lambda *args, **kwargs: None)
     try:
         engine.start("task", run_id="r1", kind=kind, repo=repo)
         saved = Config.model_validate_json(engine.store.get_run_config("r1"))

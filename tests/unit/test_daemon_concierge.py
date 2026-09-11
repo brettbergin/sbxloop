@@ -268,6 +268,7 @@ class TestJobShape:
             "agent_rate_limits",
             "daemon_log",
             "start_workload",
+            "start_entrygraph",
             "create_schedule",
             "delete_schedule",
             # Last, and never gated: it reaches nothing outside the host, and
@@ -2590,6 +2591,187 @@ class TestSurface:
         assert concierge.config.chat_backend is None
         assert concierge._chat is concierge.config.tui
         assert concierge._chat_name == "the operator console"
+
+
+class TestStartEntrygraph:
+    REPOS: ClassVar[dict[str, Any]] = {
+        "github": {"repos": [{"repo": "acme/one"}, {"repo": "acme/two"}]}
+    }
+
+    def _call(
+        self,
+        tmp_path: Path,
+        args: dict[str, Any],
+        *,
+        config: dict[str, Any] | None = None,
+    ) -> tuple[str, DaemonStore]:
+        concierge, client, _, _, dstore = make(
+            tmp_path,
+            [{"calls": [("start_entrygraph", args)]}],
+            config=self.REPOS if config is None else config,
+        )
+        concierge.submit_turn(
+            "run entrygraph", author="ana", author_id="777", message_id="9001"
+        ).result(timeout=10)
+        (response,) = client.responses
+        assert response.ok
+        return response.text or "", dstore
+
+    def test_configured_target_queues_a_report_with_requester(self, tmp_path: Path) -> None:
+        text, dstore = self._call(tmp_path, {"repo": "acme/one"})
+        (item,) = dstore.items()
+        assert item.kind == "workload" and item.profile is None
+        assert item.recipe_target == "acme/one" and item.repo == "acme/one"
+        assert item.requested_by == "777"
+        assert item.item_id == f"chat:{item.source_key}"
+        assert item.source_key.startswith("9001:entrygraph:")
+        assert all(
+            word in item.body.lower() for word in ("overview", "entrypoints", "source", "sink")
+        )
+        assert item.item_id in text and "queued" in text and "run thread" in text
+
+    @pytest.mark.parametrize("args", [{}, {"all_repos": True}])
+    def test_all_configured_targets_queue_separate_items(
+        self, tmp_path: Path, args: dict[str, Any]
+    ) -> None:
+        _, dstore = self._call(tmp_path, args)
+        items = dstore.items()
+        assert {item.recipe_target for item in items} == {"acme/one", "acme/two"}
+        assert len({item.source_key for item in items}) == 2
+        assert all(item.requested_by == "777" and item.repo == item.recipe_target for item in items)
+
+    def test_an_arbitrary_url_needs_no_configured_repository(self, tmp_path: Path) -> None:
+        url = "https://git.example.org/team/project.git"
+        text, dstore = self._call(tmp_path, {"url": url}, config={})
+        (item,) = dstore.items()
+        assert item.recipe_target == url and item.repo is None
+        assert item.url == "" and item.kind == "workload"
+        assert "queued" in text
+
+    @pytest.mark.parametrize(
+        "args",
+        [
+            {"repo": "acme/one", "url": "https://git.example.org/team/project.git"},
+            {"repo": "acme/one", "all_repos": True},
+            {"url": "file:///private/repository"},
+            {"repo": "unknown/repository"},
+            {"all_repos": "false"},
+        ],
+    )
+    def test_invalid_or_ambiguous_selection_queues_nothing(
+        self, tmp_path: Path, args: dict[str, Any]
+    ) -> None:
+        text, dstore = self._call(tmp_path, args)
+        assert text and "queued" not in text
+        assert dstore.items() == []
+
+    def test_replayed_message_never_requeues_even_after_completion(self, tmp_path: Path) -> None:
+        concierge, client, _, _, dstore = make(
+            tmp_path,
+            [{"calls": [("start_entrygraph", {"repo": "acme/one"})]}] * 3,
+            config=self.REPOS,
+        )
+        for attempt in range(3):
+            concierge.submit_turn("scan", author="ana", message_id="9").result(timeout=10)
+            if attempt == 1:
+                (item,) = dstore.items()
+                dstore.mark_running(item.item_id, "r1", now=2.0)
+                dstore.mark_done(item.item_id, now=3.0)
+        (item,) = dstore.items()
+        assert item.state == "done"
+        assert all("already" in (response.text or "") for response in client.responses[1:])
+
+    def test_paused_daemon_is_named_without_starting_a_scan(self, tmp_path: Path) -> None:
+        concierge, client, _, loop, dstore = make(
+            tmp_path,
+            [{"calls": [("start_entrygraph", {"repo": "acme/one"})]}],
+            config=self.REPOS,
+        )
+        loop.paused = True
+        turn(concierge)
+        assert "PAUSED" in (client.responses[0].text or "")
+        (item,) = dstore.items()
+        assert item.state == "queued" and item.run_id is None
+
+    def test_prompt_routes_entrygraph_to_its_tool(self, tmp_path: Path) -> None:
+        concierge, client, _, _, _ = make(tmp_path, [{"text": "hi"}])
+        turn(concierge)
+        (job,) = client.jobs
+        assert job.system_message and "`start_entrygraph`" in job.system_message
+        (tool,) = [tool for tool in job.host_tools if tool.name == "start_entrygraph"]
+        assert set(tool.parameters["properties"]) == {"repo", "url", "all_repos"}
+
+    def test_a_disabled_recipe_has_no_tool_at_all(self, tmp_path: Path) -> None:
+        """Gated by removal, not refusal: a tool the model can see but never
+        use costs a turn and reads, to the person, as a capability."""
+        concierge, client, _, _, _ = make(
+            tmp_path, [{"text": "hi"}], config={"entrygraph": {"enabled": False}}
+        )
+        turn(concierge)
+        (job,) = client.jobs
+        assert [tool for tool in job.host_tools if tool.name == "start_entrygraph"] == []
+
+    def test_narrowing_to_configured_repositories_removes_the_url_selector(
+        self, tmp_path: Path
+    ) -> None:
+        """An ask cannot name a target the config would refuse."""
+        concierge, client, _, _, _ = make(
+            tmp_path, [{"text": "hi"}], config={"entrygraph": {"allow_public_urls": False}}
+        )
+        turn(concierge)
+        (job,) = client.jobs
+        (tool,) = [tool for tool in job.host_tools if tool.name == "start_entrygraph"]
+        assert set(tool.parameters["properties"]) == {"repo", "all_repos"}
+        assert "Only configured repositories" in tool.description
+
+    def test_rejected_url_credentials_are_absent_from_tool_notes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.daemon import concierge as concierge_module
+
+        notes: list[dict[str, Any]] = []
+        logged: list[dict[str, Any]] = []
+        secret = "a-private-password"
+        concierge, client, _, _, dstore = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("start_entrygraph", {"url": f"https://user:{secret}@git.example.org/r"})
+                    ]
+                }
+            ],
+        )
+
+        def capture_log(event: str, **fields: Any) -> None:
+            logged.append(fields)
+
+        monkeypatch.setattr(concierge_module.log, "info", capture_log)
+        concierge.submit_turn(
+            "scan",
+            author="ana",
+            on_tool=lambda name, args, response: notes.append(args),
+        ).result(timeout=10)
+        assert dstore.items() == []
+        assert notes and logged
+        assert secret not in repr((notes, logged, client.responses))
+
+    def test_selectors_that_cannot_carry_a_credential_stay_visible(self, tmp_path: Path) -> None:
+        """A tool call that shows up with no arguments cannot be followed or
+        steered; only the selector that can embed a password is hidden."""
+        notes: list[dict[str, Any]] = []
+        concierge, _, _, _, _ = make(
+            tmp_path,
+            [{"calls": [("start_entrygraph", {"repo": "acme/one", "all_repos": False})]}],
+            config=self.REPOS,
+        )
+        concierge.submit_turn(
+            "scan",
+            author="ana",
+            message_id="9002",
+            on_tool=lambda name, args, response: notes.append(args),
+        ).result(timeout=10)
+        assert notes == [{"repo": "acme/one", "all_repos": False}]
 
 
 class TestStartWorkload:

@@ -1238,6 +1238,41 @@ ask ─▶ PLAN (task DAG, needs declared) ─▶ grant needs against the profil
   the daemon would get its work. See [The daemon](#the-daemon) for the
   label, chat and schedule paths.
 
+**Recipes.** A *recipe* is trusted host code that stands in for a workload's
+planning turn: it narrows the run's config to the capabilities the work
+needs, stages the code the run executes, and seeds the task graph. A chat
+work item persists the recipe it names and the one target it was queued for
+(`recipe`, `recipe_target`); `sbxloop/recipes.py` is the registry that turns
+that pair into config, inputs and tasks, so the daemon has one branch for
+recipes rather than one per recipe. Seeded and resumed workload graphs pass
+the same needs validation as newly planned graphs. A run whose inputs were
+staged declares that its data directory must be mounted visibly, so a
+sandbox that came up without them fails provisioning rather than starting on
+an empty directory — the caller that seeded the inputs says so, and
+provisioning never infers it from what happens to be on disk.
+
+The concierge's `start_entrygraph` tool is the first recipe, queueing one
+item per enabled configured repository or explicit public HTTPS URL.
+`[entrygraph] enabled` decides whether the tool exists at all and
+`allow_public_urls` whether an ask may name a repository nobody configured.
+The analyzer version is the scanner's own constant, imported by the host
+that builds the runtime command, so the pin cannot disagree with itself.
+That runtime installs published wheels only (`uv run --no-build`), which
+keeps its egress to the package index; `[entrygraph] extra_hosts` covers a
+sandbox where no wheel applies.
+
+The recipe's per-run profile grants the analysis download hosts, one configured
+repository checkout when applicable, and the chat sink. It preserves the
+default profile's budget overrides and publication hold, while granting no
+operator credentials or GitHub write sink. Configured repositories use the
+existing host-mediated GitPython clone; arbitrary public URLs are cloned by
+GitPython inside the sandbox without host credentials. Only the scanner's
+Markdown and JSON reports are result artifacts; the public clone and scanner
+scratch are excluded. The scanner records the source revision and analysis
+limits, checks consistency between both reports, and reuses an already
+completed report only for the same source revision. The usual judgment and
+publication stages deliver the result through the configured chat bridge.
+
 The two [design principles](#design-principles) hold for a workload exactly
 as for a code run, and the workload cases are the ones that test them:
 

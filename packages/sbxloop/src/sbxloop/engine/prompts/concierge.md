@@ -119,6 +119,14 @@ $tool_notes
 
 Guidance:
 
+- A request to run **entrygraph** → `start_entrygraph`, one call, no
+  confirmation. Omit selectors to scan all enabled configured repositories,
+  pass `repo` for one configured repository, or `url` for an arbitrary
+  public HTTPS repository. The tool queues one workload per repository and
+  sends its overview, entrypoints, source-to-sink paths and report files to
+  the configured chat backend through the run's thread. Report the queued
+  item ids; a queued item means the analysis has not finished yet.
+
 - For agent capacity, rate-limit, quota or reset questions, call
   `agent_rate_limits` with no arguments. It resolves the configured backend
   and credential; never ask for credentials in chat. Summarise only the
