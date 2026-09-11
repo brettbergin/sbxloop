@@ -1,0 +1,122 @@
+{
+ "events": [
+  {
+   "kind": "tool",
+   "type": "run.start"
+  },
+  {
+   "state": "provisioning",
+   "type": "run.state"
+  },
+  {
+   "state": "executing",
+   "type": "run.state"
+  },
+  {
+   "state": "pending",
+   "task_id": "scan",
+   "type": "task.state"
+  },
+  {
+   "type": "run.tasks"
+  },
+  {
+   "state": "executing",
+   "task_id": "scan",
+   "type": "task.state"
+  },
+  {
+   "task_id": "scan",
+   "type": "task.start"
+  },
+  {
+   "sandbox": "sbxloop-<run>-agent",
+   "task_id": "scan",
+   "type": "policy.allow"
+  },
+  {
+   "kind": "shell.batch",
+   "type": "worker.start"
+  },
+  {
+   "status": "ok",
+   "type": "worker.result"
+  },
+  {
+   "type": "worker.end"
+  },
+  {
+   "phase": "execute",
+   "status": "ok",
+   "task_id": "scan",
+   "type": "phase.end"
+  },
+  {
+   "attempt": 1,
+   "task_id": "scan",
+   "type": "task.output"
+  },
+  {
+   "state": "done",
+   "task_id": "scan",
+   "type": "task.state"
+  },
+  {
+   "state": "done",
+   "task_id": "scan",
+   "type": "task.end"
+  },
+  {
+   "state": "publishing",
+   "type": "run.state"
+  },
+  {
+   "type": "run.published"
+  },
+  {
+   "mounted": true,
+   "type": "run.artifacts"
+  },
+  {
+   "state": "completed",
+   "type": "run.state"
+  },
+  {
+   "exhausted": null,
+   "pr": null,
+   "state": "completed",
+   "type": "run.end"
+  }
+ ],
+ "sandbox_events": [
+  {
+   "delivery": "env-file",
+   "name": "sbxloop-<run>-agent",
+   "type": "sandbox.secret_env_fallback"
+  },
+  {
+   "mounted": true,
+   "name": "sbxloop-<run>-agent",
+   "type": "sandbox.workspace_mount"
+  },
+  {
+   "name": "sbxloop-<run>-agent",
+   "role": "agent",
+   "type": "sandbox.provision_start"
+  },
+  {
+   "name": "sbxloop-<run>-agent",
+   "role": "agent",
+   "type": "sandbox.ready"
+  },
+  {
+   "type": "sandbox.languages"
+  }
+ ],
+ "states": [
+  "provisioning",
+  "executing",
+  "publishing",
+  "completed"
+ ]
+}

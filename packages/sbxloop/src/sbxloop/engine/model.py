@@ -18,8 +18,11 @@ from sbxloop.paths import SbxloopHome
 # ends in a pull request. `workload` runs the operator persona through the
 # same run shape — sandboxes, store, events, thread — but its stages are
 # plan → execute → judge → publish, and its result is whatever the ask
-# named, not a PR. Persisted with the run; a resume never re-derives it.
-RunKind = Literal["code", "workload"]
+# named, not a PR. A `tool` run is a fixed recipe with no agent in it:
+# one command the host chose, its checks, its files to a sink — the same
+# sandbox, chronology and publication, and not one model turn. Persisted
+# with the run; a resume never re-derives it.
+RunKind = Literal["code", "workload", "tool"]
 
 RunState = Literal[
     "provider_held",
@@ -72,6 +75,16 @@ WORKLOAD_STAGES: tuple[str, ...] = (
     "planning",
     "executing",
     "judging",
+    "publishing",
+)
+
+# A `tool` run's stages in order: the command and its checks, then the
+# sinks. No planning (the recipe is the plan) and no judging (the checks
+# are the exit criterion, and they ran with the command). `executing`
+# re-enters itself on resume — a recipe's command is idempotent by
+# contract — and `publishing` re-enters itself as a workload's does.
+TOOL_STAGES: tuple[str, ...] = (
+    "executing",
     "publishing",
 )
 
@@ -231,6 +244,14 @@ class TaskSpec(_Model):
     # A workload task's declared needs (operator-authored); a code run's
     # tasks leave it empty.
     needs: TaskNeeds = Field(default_factory=TaskNeeds)
+    # A `tool` run's task is mechanical: ``command`` is the work itself,
+    # run as one shell job in the data directory and never handed to an
+    # agent; ``verify_commands`` are its exit criterion; ``result_files``
+    # are the data-directory paths the command must leave behind, which
+    # the sink carries — declared by the recipe, checked by the engine.
+    # Both empty on every agent-authored task.
+    command: str | None = None
+    result_files: list[str] = Field(default_factory=list)
 
 
 class VerifyReauthor(_Model):
@@ -570,6 +591,36 @@ class RunResult(_Model):
         return [(t.spec.id, t.output) for t in self.tasks if t.output is not None]
 
 
+def tool_summary(tasks: Sequence[TaskRecord], title: str | None = None) -> str:
+    """A tool run's closing line: what ran, whether its checks passed, and
+    what each task left — from the persisted outputs, like a workload's,
+    so every reader composes the same line from the same rows."""
+    done = sum(1 for t in tasks if t.state == "done")
+    head = f"{done}/{len(tasks)} command(s) passed their checks" if tasks else "no command ran"
+    if title:
+        head = f"{title} — {head}"
+    lines = [head]
+    for t in tasks:
+        if t.output is None:
+            continue
+        line = f"{t.spec.id}: {t.output.summary or '(no result)'}"
+        if count := t.output.file_count:
+            line += f" ({count} file{'s' if count != 1 else ''})"
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def run_summary(kind: RunKind, tasks: Sequence[TaskRecord], title: str | None) -> str | None:
+    """The closing line a run of ``kind`` gets: a workload's and a tool's
+    are composed from their tasks' outputs; a code run has none — its
+    result is the pull request."""
+    if kind == "workload":
+        return workload_summary(tasks, title)
+    if kind == "tool":
+        return tool_summary(tasks, title)
+    return None
+
+
 def workload_summary(tasks: Sequence[TaskRecord], title: str | None = None) -> str:
     """A workload's closing line (#757): what was asked, how many tasks
     the judge passed, and what each produced — composed from the tasks'
@@ -763,7 +814,7 @@ def artifacts_dir(run: RunRecord | RunResult, home: SbxloopHome) -> Path | None:
     """
     if run.workspace is None:
         return None
-    if run.kind == "workload":
+    if run.kind in ("workload", "tool"):
         return home.run_artifacts(run.run_id)
     if run.mounted:
         return run.workspace

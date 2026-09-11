@@ -13,7 +13,8 @@ The target repository is the customer. Developer work (plan, build, verify,
 deliver, land) is the first run kind, `code`; the second, `workload` (plan,
 execute, judge, publish — a brief, a report, a set of files, delivered to a
 sink rather than landed as a pull request), is real and rides the same run
-shape. Nothing in this codebase may assume the task ends in code, and the
+shape; the third, `tool` (a fixed recipe: one command, its checks, its
+files to a sink — no agent anywhere in it), rides it too. Nothing in this codebase may assume the task ends in code, and the
 trail fixture `tests/unit/test_code_run_trail.py` holds a `code` run
 byte-identical across every change the workload kind brings — read
 `docs/architecture.md` "Workloads" before touching either. sbxloop's own

@@ -125,8 +125,8 @@ from sbxloop.engine.model import (
     TaskSpec,
     TaskState,
     artifacts_dir,
+    run_summary,
     scan_artifacts,
-    workload_summary,
 )
 from sbxloop.engine.phases import (
     VERIFY_FAILURE_PREFIX,
@@ -488,9 +488,22 @@ class LoopEngine:
         run_id = run_id or new_run_id()
         if profile is not None and kind != "workload":
             raise ConfigError("a workload profile applies to `--kind workload` runs only")
+        if kind == "tool":
+            # A tool run is its recipe: every task is a command the host
+            # chose, and there is no planner to write one. Fail here, before
+            # the run row exists, rather than provision a sandbox for nothing.
+            if not tasks or any(t.command is None for t in tasks):
+                raise ConfigError("a `tool` run is seeded with tasks that each carry a command")
+            if credentials:
+                raise ConfigError("a `tool` run holds no credentials: it has no agent to use them")
+            # The recipe staged the run's inputs; a sandbox that came up
+            # without them has no work, so the mount is required unless the
+            # caller says otherwise.
+            expects_mount = True if expects_mount is None else expects_mount
         self._select_repo(repo)
         if kind == "workload":
             self.config = self.config.for_workload_profile(profile)
+        if kind != "code":
             self.config = self.config.model_copy(update={"run_model_repo": repo or ""})
         granted = [c.name for c in self.config.credentials_named(credentials)]
         self.store.create_run(
@@ -498,7 +511,7 @@ class LoopEngine:
         )
         if tasks:
             self.store.save_tasks(run_id, list(tasks))
-        if kind == "workload":
+        if kind != "code":
             # The data dir is cut at provisioning (`sandbox.workspace_mount`
             # names it); the start event says only that no checkout is in
             # play. A code run's event is untouched — its `kind` is implied,
@@ -941,8 +954,9 @@ class LoopEngine:
                             run_id,
                             pair.agent.name,
                             repo=self.config.github.repo,
-                            # A workload's profile bounds its hosts (#758).
-                            extra_allow=self._profile_egress(kind),
+                            # A workload's profile bounds its hosts (#758);
+                            # a tool's recipe declares them outright.
+                            extra_allow=self._profile_egress(kind, run_id),
                         ),
                         deadline=deadline,
                         ops=ops,
@@ -1033,7 +1047,7 @@ class LoopEngine:
             pr_number=run.pr_number,
             pr_url=run.pr_url,
             reason=reason,
-            summary=workload_summary(tasks, run.pr_title) if kind == "workload" else None,
+            summary=run_summary(kind, tasks, run.pr_title),
             published=list(run.published),
         )
 
@@ -1349,7 +1363,7 @@ class LoopEngine:
         if pair.mounted:
             return
         home = self.config.paths
-        target = home.run_data(run_id) if kind == "workload" else home.run_artifacts(run_id)
+        target = home.run_data(run_id) if kind != "code" else home.run_artifacts(run_id)
         target.mkdir(parents=True, exist_ok=True)
         exclude = self.config.artifacts.exclude
         # Build tar exclude flags: --exclude=<name> for each entry.
@@ -1396,7 +1410,7 @@ class LoopEngine:
         self, run_id: str, pair: SandboxPair, kind: RunKind = "code"
     ) -> Path | None:
         target: Path | None
-        if kind == "workload":
+        if kind != "code":
             # What the artifact sink delivered (#759), when it did.
             target = self.config.paths.run_artifacts(run_id)
         else:
@@ -1631,6 +1645,11 @@ class LoopEngine:
     def _run_pipeline(self, p: Pipeline, stage: str | None) -> tuple[RunState, str | None]:
         """Drive the run from ``stage`` (None: the beginning) to a terminal
         state; returns it with the reason the run stopped short of merged."""
+        if p.kind == "tool":
+            # No agent anywhere in a tool run — including for chat: a
+            # message to its thread has nothing to steer and no one to
+            # answer it. The queue controls (cancel, resume) are the ways in.
+            return self._tool_stages(p, stage)
         state, reason = (
             self._workload_stages(p, stage) if p.kind == "workload" else self._stages(p, stage)
         )
@@ -1638,6 +1657,227 @@ class LoopEngine:
         # answered — as steer_run; there is nothing left to steer.
         self._process_chat(p.run_id, p.phases, None, stage=f"finished ({state})")
         return state, reason
+
+    def _tool_stages(self, p: Pipeline, stage: str | None) -> tuple[RunState, str | None]:
+        """A ``tool`` run's life: execute → publish, with no agent in either.
+
+        The recipe seeded the tasks; each one's command runs as a shell job
+        in the data directory and its checks run right behind it in the
+        same job, so "did it work" is decided by the recipe's own exit
+        criterion and nothing else. A failed command or check ends the run
+        named — there is no revision to spend, because there is no one to
+        revise. Publish hands the declared files to the sinks exactly as a
+        workload's does. A resume at ``executing`` runs the command again
+        (a recipe's command is idempotent by contract); one at
+        ``publishing`` re-enters there.
+        """
+        if stage != "publishing":
+            reason = self._stage_execute_tool(p)
+            if reason is not None:
+                return "failed", reason
+        self._check_cancelled_and_clock(p.run_id, p.deadline)
+        reason = self._stage_publish(p)
+        if reason is not None:
+            return "failed", reason
+        return "completed", None
+
+    def _stage_execute_tool(self, p: Pipeline) -> str | None:
+        """Run every seeded command, in order, each with its checks.
+
+        Per task: the declared hosts are granted (the same granter, the
+        same refusals as an agent's declared egress — `[policy] deny`
+        wins), a declared repository is cut into the data directory, and
+        one shell job carries the command followed by its checks. The
+        phase row records the whole transcript. Success means every
+        declared result file is there too; a check that passed while a
+        file the sink needs is missing is a failure, not a partial result.
+        Returns the reason the run failed, or None when every task is done.
+        """
+        run_id, pair = p.run_id, p.pair
+        self._set_run_state(run_id, "executing")
+        tasks = self.store.get_tasks(run_id)
+        self._announce_roster(run_id, tasks)
+        for task in tasks:
+            if task.state == "done":
+                continue
+            self._check_cancelled_and_clock(run_id, p.deadline)
+            spec = task.spec
+            assert spec.command is not None
+            self._set_task_state(run_id, task, "executing")
+            self.bus.emit(HostEventTypes.TASK_START, run_id, task_id=spec.id, title=spec.title)
+            reason = self._tool_inputs(p, task) or self._tool_egress(p, task)
+            if reason is None:
+                reason = self._tool_command(p, task)
+            if reason is not None:
+                task.last_feedback = reason
+                self._set_task_state(run_id, task, "failed")
+                self._emit_task_end(run_id, task)
+                return reason
+            self._set_task_state(run_id, task, "done")
+            self._emit_task_end(run_id, task)
+        if self.config.artifacts.harvest_mode == "per-task":
+            with self._sandbox_lock:
+                self._harvest(run_id, pair, p.kind)
+        return None
+
+    def _tool_inputs(self, p: Pipeline, task: TaskRecord) -> str | None:
+        """A tool task's declared repository, cut into the data directory.
+
+        The recipe names the repository; it must be one the operator
+        configured — a tool run has no profile to consult, so the
+        configuration is the whole authority — and the data directory must
+        be mounted, or the checkout would land where the command never
+        looks. Either failure is the run's reason, before anything runs.
+        """
+        repo = task.spec.needs.repo
+        if repo is None:
+            return None
+        if self.config.github.effective_repo(repo) is None:
+            return f"task {task.spec.id} needs repository `{repo}`, which is not configured"
+        if not p.pair.mounted:
+            return (
+                f"task {task.spec.id} needs repository `{repo}`, but the data directory is "
+                "not mounted in the agent sandbox, so a checkout there would never be seen "
+                "(see the sandbox row of `sbxloop doctor`)"
+            )
+        assert p.provisioner is not None and p.pair.workspace is not None
+        p.provisioner.clone_repo_into_data_dir(p.run_id, p.pair.workspace, repo)
+        return None
+
+    def _tool_egress(self, p: Pipeline, task: TaskRecord) -> str | None:
+        """Grant the task's declared hosts, or fail closed on the first the
+        operator's policy refuses.
+
+        An agent's refused egress is a line in its chronology and the agent
+        carries on without the host; a recipe's command cannot carry on
+        without one — it was declared because the command needs it — so a
+        refusal is the run's reason, named before anything runs. `[policy]
+        deny` is the only refusal possible: the declared hosts are the
+        run's own allow bound.
+        """
+        granter = p.granter
+        for host in task.spec.needs.hosts:
+            rejection = egress_rejection(host, granter.allow, granter.deny)
+            if rejection is not None:
+                return f"task {task.spec.id} needs host `{host}` — {rejection}"
+        with self._sandbox_lock:
+            granter.apply(
+                task.spec.id,
+                [(host, "declared by the recipe") for host in task.spec.needs.hosts],
+            )
+        return None
+
+    def _tool_command(self, p: Pipeline, task: TaskRecord) -> str | None:
+        """One shell job: the command, then its checks. The transcript is
+        the phase row; the first non-zero exit is the reason."""
+        run_id, phases, spec = p.run_id, p.phases, task.spec
+        assert spec.command is not None
+        commands = [spec.command, *dict.fromkeys(spec.verify_commands)]
+        started = time.time()
+        results = phases.shell_batch(commands)
+        transcript = [
+            {
+                "command": result.command,
+                "exit_code": result.exit_code,
+                "output": clip_head_tail(result.output),
+            }
+            for result in results
+        ]
+        failed = next((entry for entry in transcript if entry["exit_code"] != 0), None)
+        missing = (
+            [name for name in spec.result_files if not self._tool_result_exists(p, name)]
+            if failed is None
+            else []
+        )
+        status = "ok" if failed is None and not missing else "failed"
+        self.store.record_phase(
+            run_id,
+            "execute",
+            task_id=spec.id,
+            attempt=1,
+            status=status,
+            output_json=json.dumps({"commands": transcript, "missing": missing}),
+            started_at=started,
+        )
+        if failed is not None:
+            what = "command" if failed["command"] == spec.command else "check"
+            message = (
+                f"task {spec.id}: {what} `{failed['command']}` exited "
+                f"{failed['exit_code']}: {clip(str(failed['output']))}"
+            )
+            self.bus.emit(
+                HostEventTypes.PHASE_END,
+                run_id,
+                task_id=spec.id,
+                phase="execute",
+                status="failed",
+                message=message,
+            )
+            return message
+        if missing:
+            listed = ", ".join(f"`{name}`" for name in missing)
+            message = f"task {spec.id}: the command left no {listed}, which the sink carries"
+            self.bus.emit(
+                HostEventTypes.PHASE_END,
+                run_id,
+                task_id=spec.id,
+                phase="execute",
+                status="failed",
+                message=message,
+            )
+            return message
+        self.bus.emit(
+            HostEventTypes.PHASE_END,
+            run_id,
+            task_id=spec.id,
+            phase="execute",
+            status="ok",
+            message=(
+                f"`{spec.command}` and {len(commands) - 1} check(s) passed"
+                if len(commands) > 1
+                else f"`{spec.command}` passed"
+            ),
+        )
+        task.output = self._tool_output(p, task)
+        self.bus.emit(
+            HostEventTypes.TASK_OUTPUT,
+            run_id,
+            task_id=spec.id,
+            attempt=1,
+            summary=task.output.summary,
+            files=task.output.file_count,
+        )
+        return None
+
+    def _tool_result_exists(self, p: Pipeline, name: str) -> bool:
+        rel = sinks.safe_relative(name)
+        if rel is None or p.pair.workspace is None:
+            return False
+        return (p.pair.workspace / rel).is_file()
+
+    def _tool_output(self, p: Pipeline, task: TaskRecord) -> TaskOutput:
+        """What a tool task produced, composed by code from what it left.
+
+        The result text is the first declared Markdown file — a recipe
+        that wants its report read in the thread writes one — clipped as
+        an agent's report is; the summary is its first line. No file, and
+        the text names the command and its files instead. Never a model's
+        words: the recipe decides what the result says.
+        """
+        spec = task.spec
+        assert p.pair.workspace is not None
+        report = ""
+        for name in spec.result_files:
+            rel = sinks.safe_relative(name)
+            if rel is not None and rel.suffix == ".md":
+                with repofiles.open_file(p.pair.workspace, str(rel)) as handle:
+                    report = handle.read().decode("utf-8", "replace")
+                break
+        if not report.strip():
+            report = f"`{spec.command}` completed; result files: " + (
+                ", ".join(f"`{name}`" for name in spec.result_files) or "none declared"
+            )
+        return TaskOutput.from_report(clip(report), files=list(spec.result_files))
 
     def _workload_stages(self, p: Pipeline, stage: str | None) -> tuple[RunState, str | None]:
         """A ``workload`` run's life (#755): plan → execute → judge → publish.
@@ -1928,9 +2168,16 @@ class LoopEngine:
             "the result is judged and kept; release it to publish"
         )
 
-    def _profile_egress(self, kind: RunKind) -> list[str]:
-        """The hosts a workload's profile lets its plan ask for; nothing for
-        a code run, whose bounds are `[policy]` alone."""
+    def _profile_egress(self, kind: RunKind, run_id: str) -> list[str]:
+        """The hosts a workload's profile lets its plan ask for, or the ones
+        a tool's recipe declared for its commands; nothing for a code run,
+        whose bounds are `[policy]` alone."""
+        if kind == "tool":
+            return list(
+                dict.fromkeys(
+                    host for task in self.store.get_tasks(run_id) for host in task.spec.needs.hosts
+                )
+            )
         if kind != "workload":
             return []
         profile = self.config.workload_profile()

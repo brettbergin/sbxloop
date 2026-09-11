@@ -1730,6 +1730,30 @@ class TestRunCommand:
         monkeypatch.setenv("SBXLOOP_WORKER_PYTHON", sys.executable)
         monkeypatch.setenv("SBXLOOP_INSTALL_WORKERS", "false")
 
+    def test_a_tool_run_needs_its_recipe_and_target(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`--kind tool` is a recipe on a target and nothing else: the two
+        flags belong to it alone, and it refuses to start without them."""
+        self.make_run_env(workdir, monkeypatch, [])
+        result = runner.invoke(app, ["run", "scan", "--kind", "tool", "--no-tui"])
+        assert result.exit_code == 2, result.output
+        assert "--kind tool needs --recipe and --target" in result.output
+        result = runner.invoke(
+            app, ["run", "scan", "--kind", "tool", "--recipe", "no-such", "--target", "o/r"]
+        )
+        assert result.exit_code == 2, result.output
+        assert "unknown workload recipe 'no-such'" in result.output
+        result = runner.invoke(app, ["run", "scan", "--recipe", "entrygraph", "--no-tui"])
+        assert result.exit_code == 2, result.output
+        assert "--recipe and --target apply to --kind tool only" in result.output
+        result = runner.invoke(
+            app,
+            ["run", "scan", "--kind", "tool", "--recipe", "entrygraph", "--target", "o/r"],
+        )
+        assert result.exit_code == 2, result.output
+        assert "not an enabled configured repository" in result.output
+
     def test_run_no_tui_completes(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
     ) -> None:
