@@ -1518,9 +1518,13 @@ that typing still works, and a click that arrives late (or on a question
 already answered, or after a daemon restart, which forgets them — nothing
 is persisted) gets a private nudge to answer in the channel instead. The
 bot never waits on a click: a Discord that rejects the components, or a
-host without them, simply gets the plain numbered question. Backends
-without interactive components — Slack today — always get that prose
-rendering, so nothing about them changes.
+host without them, simply gets the plain numbered question. Every backend
+posts that same numbered prose and stays answerable by typing; what differs
+is the affordance laid on top. Slack adds Block Kit buttons. Mattermost
+seeds the question with one emoji per choice — reacting 1️⃣/2️⃣ answers it —
+because Mattermost's own interactive buttons post to a callback URL, which
+would cost the daemon the dial-out property its bridge is built on, while a
+reaction arrives on the websocket already open.
 "What's open?" lists the repository's open issues and which are queued or
 running; `queued: false` shows everything the daemon is not currently
 queued or running — the backlog plus issues that failed or are blocked and
@@ -1640,6 +1644,13 @@ steering are @mention-only (`@your-bot` in the control channel or in a
 run's thread), and people can talk to each other in a run's thread without
 the bot answering. `sbxloop doctor` shows one
 `chat bridge (mattermost)` row: extra installed, token present.
+Cards are coloured message attachments (`[mattermost] embeds`) — a post the
+server rejects is retried text-only, so a run's chronology never goes
+missing over presentation — a workload result's files are uploaded up to
+`max_attachment_bytes` and named by host path beyond it (or if an upload
+fails; a named file is never silently dropped), and the merge gate's
+approve button is a seeded ✅: reacting with it approves, exactly as
+`!sbx merge` does.
 
 ## Artifacts
 

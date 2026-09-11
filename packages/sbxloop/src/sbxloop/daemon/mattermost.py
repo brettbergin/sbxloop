@@ -50,25 +50,31 @@ is never logged.
 from __future__ import annotations
 
 import asyncio
+import functools
 import json
 import os
 import re
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, ClassVar
 
 from sbxloop.chatservices import MATTERMOST_TOKEN_ENV
 from sbxloop.config import ChatBackend, Config, MattermostConfig
 from sbxloop.daemon.chat import ChatBridge, Inbound
+from sbxloop.daemon.chat_choices import ChoiceQuestion, render_prose
 from sbxloop.daemon.chat_routing import MATTERMOST_MENTION_RE
 from sbxloop.daemon.concierge import Concierge
 from sbxloop.daemon.discord_format import EmbedSpec, _clip
 from sbxloop.daemon.mattermost_format import (
+    CHOICE_EMOJI,
     EMOJI_NAMES,
+    GATE_EMOJI,
+    embed_attachment,
     neutralize_mentions,
     thread_permalink,
 )
-from sbxloop.daemon.store import ChatThread, DaemonStore
+from sbxloop.daemon.store import ChatThread, DaemonStore, MergeGate
 from sbxloop.errors import DaemonError
 from sbxloop.log import get_logger
 
@@ -208,6 +214,16 @@ class MattermostClient:
             json={"user_id": user_id, "post_id": post_id, "emoji_name": emoji_name},
         )
 
+    async def upload_file(self, channel_id: str, name: str, content: bytes) -> str:
+        """Upload one attachment, returning its file id ("" when the server
+        accepted the call but named no file)."""
+        form = self._aiohttp.FormData()
+        form.add_field("channel_id", channel_id)
+        form.add_field("files", content, filename=name)
+        result = await self._request("POST", "/files", data=form)
+        infos = result.get("file_infos") or []
+        return str(infos[0].get("id") or "") if infos else ""
+
     async def get_user(self, user_id: str) -> dict[str, Any]:
         result: dict[str, Any] = await self._request("GET", f"/users/{user_id}")
         return result
@@ -271,6 +287,9 @@ class MattermostBridge(ChatBridge):
         self._username: str | None = None
         self._names: dict[str, str] = {}  # user id -> username
         self._team: str = ""  # the control channel's team, for permalinks
+        # Gate prompt post id -> run id, so a ✅ reaction finds its gate.
+        # In memory; a restart repopulates it lazily from the store.
+        self._gate_posts: dict[str, str] = {}
 
     # -- transport seams ------------------------------------------------------------
 
@@ -320,9 +339,14 @@ class MattermostBridge(ChatBridge):
     # -- inbound --------------------------------------------------------------------
 
     def _handle_ws_event(self, payload: dict[str, Any]) -> None:
-        """Every websocket frame lands here (client thread); only a human's
-        ``posted`` in the control channel goes on to routing."""
-        if str(payload.get("event") or "") != "posted":
+        """Every websocket frame lands here (client thread). A human's
+        ``posted`` in the control channel goes on to routing; a
+        ``reaction_added`` is this service's click (#932)."""
+        event = str(payload.get("event") or "")
+        if event == "reaction_added":
+            self._schedule(self._route_reaction(payload.get("data") or {}))
+            return
+        if event != "posted":
             return
         data = payload.get("data") or {}
         post = _decode_post(data.get("post"))
@@ -391,6 +415,108 @@ class MattermostBridge(ChatBridge):
             return None
         return self._inbound_from(message, {})
 
+    # -- reactions as clicks (#932) --------------------------------------------------
+
+    async def _route_reaction(self, data: dict[str, Any]) -> None:
+        """A reaction is this bridge's button: Mattermost's interactive
+        actions would post to a callback URL, which would cost the daemon
+        the dial-out property the bridge is built on, while a reaction
+        arrives on the websocket already open. The seeded emoji are the
+        affordance; a click lands on the same ``choice`` / ``approve`` paths
+        the other bridges' components use."""
+        reaction = _decode_json(data.get("reaction"))
+        if reaction is None:
+            return
+        user_id = str(reaction.get("user_id") or "")
+        post_id = str(reaction.get("post_id") or "")
+        emoji = str(reaction.get("emoji_name") or "")
+        # Our own seeded reactions come back as events; they are the
+        # affordance, not an answer.
+        if not post_id or not user_id or user_id == self._user_id:
+            return
+        if user_id not in self._names:
+            await self._lookup_name(user_id)
+        name = self._names.get(user_id, user_id)
+        author = f"Mattermost user `{name}`"
+        if emoji in CHOICE_EMOJI:
+            await self._choice_reacted(post_id, emoji, author, user_id, name)
+        elif emoji == GATE_EMOJI:
+            await self._gate_reacted(post_id, author)
+
+    async def _choice_reacted(
+        self, post_id: str, emoji: str, author: str, user_id: str, name: str
+    ) -> None:
+        """Anyone may answer, not just the asker; who did is recorded. A
+        reaction on a question the bridge no longer holds is left alone —
+        the typed route still works and a stale note would be noise."""
+        outstanding = self._outstanding(post_id)
+        if outstanding is None:
+            return
+        choices = outstanding.question.choices
+        index = CHOICE_EMOJI.index(emoji)
+        if index >= len(choices):
+            return
+        value = choices[index].value
+        try:
+            accepted = bool(
+                self._answer_choice(post_id, value, author, author_id=user_id, author_name=name)
+            )
+        except Exception:
+            log.warning("mattermost.choice_answer_failed", value=value, exc_info=True)
+            return
+        if not accepted:
+            return
+        try:
+            await self.client.patch_post(
+                post_id,
+                {"message": f"_Answered: **{value}** (by {name})._"},
+            )
+        except Exception:
+            log.debug("mattermost.choice_edit_failed", post=post_id, exc_info=True)
+
+    async def _gate_reacted(self, post_id: str, author: str) -> None:
+        """The approve reaction: the same call the typed command makes,
+        answered in the thread. It never clears the affordance — a failed
+        landing re-opens the gate and reacting again works."""
+        run_id = self._gate_run_for(post_id)
+        if run_id is None:
+            return
+        loop_ref = self.loop_ref
+        if loop_ref is None:
+            return
+        try:
+            reply = await asyncio.get_event_loop().run_in_executor(
+                None, functools.partial(loop_ref.approve_merge, run_id, by=author)
+            )
+        except (KeyError, ValueError) as exc:
+            reply = f"failed: {exc.args[0] if exc.args else exc}"
+        except Exception:
+            log.warning("mattermost.gate_reaction_failed", run=run_id, exc_info=True)
+            reply = (
+                f"something went wrong — `{self.chat.command_prefix} merge` / `release` still work"
+            )
+        await self._send(
+            MattermostTarget(self.mattermost.channel_id or "", root_id=post_id), str(reply)
+        )
+
+    def _gate_run_for(self, post_id: str) -> str | None:
+        """Which run's gate this prompt belongs to. The map is filled when
+        the prompt is posted; after a restart the prompt survives in the
+        store but the map does not, so fall back to the open gates (there
+        are few) and their recorded prompt ids."""
+        known = self._gate_posts.get(post_id)
+        if known is not None:
+            return known
+        try:
+            for gate in self.dstore.open_merge_gates():
+                where = self.dstore.gate_prompt(gate.run_id, self.backend)
+                if where is not None and where[1] == post_id:
+                    self._gate_posts[post_id] = str(gate.run_id)
+                    return str(gate.run_id)
+        except Exception:
+            log.debug("mattermost.gate_lookup_failed", post=post_id, exc_info=True)
+        return None
+
     # -- outbound -------------------------------------------------------------------
 
     async def _control_channel(self) -> Any:
@@ -416,25 +542,58 @@ class MattermostBridge(ChatBridge):
     ) -> Any:
         """The single send seam: the text is clipped, every ``@name`` in it
         made inert unless mentions were asked for (Mattermost has no
-        allowed-mentions control, so agent prose would otherwise ping), and
-        a card is appended as text. ``reply_to`` is accepted for the shared
-        signature and ignored — a reply here is a thread post, which
-        ``target`` already expresses. ``files`` are named by host path;
-        uploads are a follow-on (#932)."""
+        allowed-mentions control, so agent prose would otherwise ping), a
+        card becomes one coloured attachment, and a result's files are
+        uploaded under the attachment cap. ``reply_to`` is accepted for the
+        shared signature and ignored — a reply here is a thread post, which
+        ``target`` already expresses."""
+        notes: list[str] = []
+        file_ids: list[str] = []
         if files:
-            text = "\n".join(part for part in (text, self._files_note(files)) if part)
-        body = self._body(text, embed, mention_users=mention_users)
-        if not body:
+            attach, notes = self._split_files(files)
+            file_ids, failed = await self._upload(target.channel, attach)
+            notes.extend(failed)
+        if notes:
+            text = "\n".join(part for part in (text, "\n".join(notes)) if part)
+        card = embed if embed is not None and self.mattermost.embeds else None
+        body = self._body(text, None if card else embed, mention_users=mention_users)
+        if not body and card is None and not file_ids:
             return None
         payload: dict[str, Any] = {"channel_id": target.channel, "message": body}
         if target.root_id:
             payload["root_id"] = target.root_id
+        if card is not None:
+            payload["props"] = {"attachments": [embed_attachment(card)]}
+        if file_ids:
+            payload["file_ids"] = file_ids
+        return await self._post(target, payload)
+
+    async def _post(self, target: Any, payload: dict[str, Any]) -> Any:
+        """Create one post, converting a failure into None the way every
+        caller expects. A card the server rejects is retried without it, so
+        a run's chronology never goes missing over presentation."""
         try:
             post = await self.client.create_post(payload)
         except Exception as exc:
             if self._report_channel_error(exc):
                 return None
-            log.warning("mattermost.send_failed", target=target.id, chars=len(body), exc_info=True)
+            if "props" in payload:
+                log.warning(
+                    "mattermost.attachment_send_failed",
+                    target=target.id,
+                    action="retrying text-only",
+                    exc_info=True,
+                )
+                retry = {k: v for k, v in payload.items() if k != "props"}
+                if not retry.get("message"):
+                    return None
+                return await self._post(target, retry)
+            log.warning(
+                "mattermost.send_failed",
+                target=target.id,
+                chars=len(str(payload.get("message") or "")),
+                exc_info=True,
+            )
             return None
         return MattermostMessage(
             str(post.get("channel_id") or target.channel),
@@ -442,10 +601,29 @@ class MattermostBridge(ChatBridge):
             target.root_id,
         )
 
+    async def _upload(self, channel: str, paths: Sequence[Path]) -> tuple[list[str], list[str]]:
+        """(file ids, notes): every file that uploaded, and one line for each
+        that did not — a named file is never silently dropped."""
+        ids: list[str] = []
+        notes: list[str] = []
+        for path in paths:
+            try:
+                file_id = await self.client.upload_file(channel, path.name, path.read_bytes())
+            except Exception:
+                log.warning("mattermost.upload_failed", file=path.name, exc_info=True)
+                file_id = ""
+            if file_id:
+                ids.append(file_id)
+            else:
+                notes.append(
+                    f"📎 `{path.name}` — upload failed, kept on the daemon host at `{path}`"
+                )
+        return ids, notes
+
     def _body(self, text: str, embed: EmbedSpec | None, *, mention_users: bool = False) -> str:
-        """The post text: clipped, mention-safe, with a card rendered into
-        it. The card becomes text here; :mod:`mattermost_format` turns it
-        into a coloured attachment in #932."""
+        """The post text: clipped and mention-safe. ``embed`` reaches here
+        only when cards are off (``[mattermost] embeds = false``), in which
+        case it is rendered into the text as its plain twin."""
         limit = self.mattermost.max_message_chars
         parts = [part for part in (text, embed.as_text() if embed is not None else "") if part]
         body = _clip("\n\n".join(parts), limit)
@@ -472,9 +650,14 @@ class MattermostBridge(ChatBridge):
         return True
 
     async def _edit(self, message: Any, text: str, *, embed: EmbedSpec | None = None) -> None:
-        """``posts/{id}/patch`` with the same clipping and mention safety as
-        a send. Errors propagate: callers log them with their own context."""
-        await self.client.patch_post(message.post_id, {"message": self._body(text, embed)})
+        """``posts/{id}/patch`` with the same clipping, mention safety and
+        card conversion as a send. Errors propagate: callers log them with
+        their own context."""
+        card = embed if embed is not None and self.mattermost.embeds else None
+        body: dict[str, Any] = {"message": self._body(text, None if card else embed)}
+        if card is not None:
+            body["props"] = {"attachments": [embed_attachment(card)]}
+        await self.client.patch_post(message.post_id, body)
 
     async def _add_reaction(self, message: Any, emoji: str) -> None:
         name = EMOJI_NAMES.get(emoji)
@@ -494,6 +677,55 @@ class MattermostBridge(ChatBridge):
         # Mattermost threads have no name and no object of their own: the
         # thread *is* the reply stream under the headline post.
         return MattermostTarget(headline.channel, root_id=headline.post_id)
+
+    # -- seeded affordances ----------------------------------------------------------
+
+    async def _send_choices(
+        self,
+        target: Any,
+        text: str,
+        question: ChoiceQuestion,
+        *,
+        reply_to: Any = None,
+        pending_key: str | None = None,
+        mention_users: bool = False,
+    ) -> Any:
+        """A clarifying question seeded with one emoji per choice.
+
+        The message body is the same numbered prose the base seam posts, so
+        reacting is an extra way in and typing still answers; a post whose
+        seeding fails is still a working question. The digits match the
+        prose's numbering, which is what makes the affordance legible
+        without a label on it.
+        """
+        body = render_prose(question)
+        if text and text.strip() and text.strip() != question.prompt.strip():
+            body = f"{text.strip()}\n\n{body}"
+        posted = await self._send(target, body, mention_users=mention_users)
+        if posted is not None:
+            await self._seed(posted, CHOICE_EMOJI[: len(question.choices)])
+        return posted
+
+    async def _send_gate(self, target: Any, text: str, gate: MergeGate) -> Any:
+        """The approval prompt with the approve reaction seeded on it, on top
+        of the base prose — the typed command stays in the body, so a prompt
+        whose seeding fails still works by typing."""
+        posted = await self._send(target, text, mention_users=True)
+        if posted is not None:
+            self._gate_posts[posted.post_id] = str(gate.run_id)
+            await self._seed(posted, (GATE_EMOJI,))
+        return posted
+
+    async def _seed(self, message: Any, emoji: Sequence[str]) -> None:
+        """React with each affordance in order. A failure is logged and
+        skipped: the prose underneath is the real interface."""
+        if not self._user_id:
+            return
+        for name in emoji:
+            try:
+                await self.client.create_reaction(self._user_id, message.post_id, name)
+            except Exception:
+                log.debug("mattermost.seed_failed", post=message.post_id, emoji=name, exc_info=True)
 
     # -- identity -------------------------------------------------------------------
 
@@ -519,18 +751,22 @@ class MattermostBridge(ChatBridge):
         return f"[thread]({link})" if link else thread.thread_id
 
 
-def _decode_post(raw: Any) -> dict[str, Any] | None:
-    """A ``posted`` event carries its post as a JSON *string*."""
+def _decode_json(raw: Any) -> dict[str, Any] | None:
+    """A websocket event carries its payload objects as JSON *strings*."""
     if isinstance(raw, dict):
         return raw
     if not isinstance(raw, str) or not raw:
         return None
     try:
-        post = json.loads(raw)
+        parsed = json.loads(raw)
     except ValueError:
-        log.debug("mattermost.bad_post", exc_info=True)
+        log.debug("mattermost.bad_payload", exc_info=True)
         return None
-    return post if isinstance(post, dict) else None
+    return parsed if isinstance(parsed, dict) else None
+
+
+#: A ``posted`` event carries its post the same way.
+_decode_post = _decode_json
 
 
 __all__ = [

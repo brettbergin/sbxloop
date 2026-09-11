@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,8 @@ import pytest
 
 from sbxloop.config import Config, MattermostConfig
 from sbxloop.daemon.chat import build_bridge
+from sbxloop.daemon.chat_choices import Choice, ChoiceQuestion
+from sbxloop.daemon.discord_format import EmbedSpec
 from sbxloop.daemon.mattermost import (
     MattermostApiError,
     MattermostBridge,
@@ -29,7 +32,13 @@ from sbxloop.daemon.model import WorkItem
 from sbxloop.daemon.store import ChatThread, DaemonStore
 from sbxloop.errors import DaemonError
 from sbxloop.events import EventBus
-from tests.unit.test_daemon_discord import FakeConcierge, FakeEngine, FakeLoop, wait_for
+from tests.unit.test_daemon_discord import (
+    FakeConcierge,
+    FakeEngine,
+    FakeLoop,
+    make_gate,
+    wait_for,
+)
 
 URL = "https://mm.example.com"
 CHANNEL = "c" * 26
@@ -53,6 +62,8 @@ class FakeMattermostClient:
         self.connected = False
         self.closed = False
         self.fail_post: Exception | None = None
+        self.fail_upload = False
+        self.uploads: list[tuple[str, str, bytes]] = []
         self.team_name = "sbx"
         self._seq = 0
 
@@ -78,6 +89,12 @@ class FakeMattermostClient:
     async def create_reaction(self, user_id: str, post_id: str, emoji_name: str) -> None:
         self.reactions.append((user_id, post_id, emoji_name))
 
+    async def upload_file(self, channel_id: str, name: str, content: bytes) -> str:
+        if self.fail_upload:
+            raise MattermostApiError(413, "too large")
+        self.uploads.append((channel_id, name, content))
+        return f"f{len(self.uploads):025d}"
+
     async def get_user(self, user_id: str) -> dict[str, Any]:
         self.lookups.append(user_id)
         if user_id not in self.users:
@@ -93,6 +110,19 @@ class FakeMattermostClient:
     def deliver(self, payload: dict[str, Any]) -> None:
         """What the websocket reader does with one frame."""
         self.bridge._handle_ws_event(payload)
+
+    def react(self, post_id: str, emoji: str, *, user: str = USER_ID) -> None:
+        """A reaction_added frame, as the server sends it."""
+        self.deliver(
+            {
+                "event": "reaction_added",
+                "data": {
+                    "reaction": json.dumps(
+                        {"user_id": user, "post_id": post_id, "emoji_name": emoji}
+                    )
+                },
+            }
+        )
 
 
 def make_bridge(
@@ -326,13 +356,33 @@ class TestSendSeam:
         assert "`git blame @ana`" in client.posts[-1]["message"]
         bridge.close()
 
-    def test_files_are_named_by_host_path(self, tmp_path: Path) -> None:
+    def test_files_ride_the_post_as_uploads(self, tmp_path: Path) -> None:
         bridge, client, _ = make_bridge(tmp_path)
         artifact = tmp_path / "report.md"
         artifact.write_text("x")
         asyncio.run(bridge._send(MattermostTarget(CHANNEL), "done", files=[str(artifact)]))
+        assert client.uploads == [(CHANNEL, "report.md", b"x")]
+        assert client.posts[-1]["file_ids"] == [f"f{1:025d}"]
+        bridge.close()
+
+    def test_a_failed_upload_is_named_never_dropped(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        client.fail_upload = True
+        artifact = tmp_path / "report.md"
+        artifact.write_text("x")
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "done", files=[str(artifact)]))
+        assert "file_ids" not in client.posts[-1]
         assert "report.md" in client.posts[-1]["message"]
         assert str(artifact) in client.posts[-1]["message"]
+        bridge.close()
+
+    def test_a_file_over_the_cap_is_named_not_uploaded(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path, max_attachment_bytes=4)
+        artifact = tmp_path / "big.bin"
+        artifact.write_bytes(b"0123456789")
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "done", files=[str(artifact)]))
+        assert client.uploads == []
+        assert "too large to attach" in client.posts[-1]["message"]
         bridge.close()
 
 
@@ -413,4 +463,167 @@ class TestChannelErrors:
                 assert asyncio.run(bridge._send(MattermostTarget(CHANNEL), "x")) is None
         unreachable = [r for r in caplog.records if "channel_unreachable" in r.getMessage()]
         assert len(unreachable) == 1
+        bridge.close()
+
+
+class TestCards:
+    def test_a_card_becomes_a_coloured_attachment(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        spec = EmbedSpec(title="Fix login", description="run r1", color=0x00FF00)
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "", embed=spec))
+        (attachment,) = client.posts[-1]["props"]["attachments"]
+        assert attachment["title"] == "Fix login"
+        assert attachment["color"] == "#00FF00"
+        assert attachment["text"] == "run r1"
+        bridge.close()
+
+    def test_a_rejected_card_retries_text_only(self, tmp_path: Path) -> None:
+        """A run's chronology never goes missing over presentation."""
+        bridge, client, _ = make_bridge(tmp_path)
+        calls: list[dict[str, Any]] = []
+        original = client.create_post
+
+        async def once(body: dict[str, Any]) -> dict[str, Any]:
+            calls.append(body)
+            if "props" in body:
+                raise MattermostApiError(400, "invalid props")
+            return await original(body)
+
+        client.create_post = once  # type: ignore[method-assign]
+        asyncio.run(
+            bridge._send(MattermostTarget(CHANNEL), "done", embed=EmbedSpec(title="t", color=1))
+        )
+        assert len(calls) == 2 and "props" not in calls[1]
+        assert client.posts[-1]["message"] == "done"
+        bridge.close()
+
+    def test_embeds_off_renders_the_card_as_text(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path, embeds=False)
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "", embed=EmbedSpec(title="Fix login")))
+        assert "props" not in client.posts[-1]
+        assert "Fix login" in client.posts[-1]["message"]
+        bridge.close()
+
+    def test_an_edit_carries_the_card(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(
+            bridge._edit(
+                MattermostMessage(CHANNEL, "p" * 26), "updated", embed=EmbedSpec(title="t", color=2)
+            )
+        )
+        post_id, body = client.patches[-1]
+        assert post_id == "p" * 26 and body["message"] == "updated"
+        assert body["props"]["attachments"][0]["color"] == "#000002"
+        bridge.close()
+
+    def test_a_card_cannot_ping_anyone(self, tmp_path: Path) -> None:
+        """An attachment's text pings exactly as a post's does."""
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(
+            bridge._send(MattermostTarget(CHANNEL), "", embed=EmbedSpec(description="by @ana"))
+        )
+        text = client.posts[-1]["props"]["attachments"][0]["text"]
+        assert f"@{ZERO_WIDTH_SPACE}ana" in text
+        bridge.close()
+
+
+class TestReactionChoices:
+    def test_a_question_is_seeded_with_one_emoji_per_choice(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        question = ChoiceQuestion(
+            prompt="Which base?",
+            choices=[Choice(value="main", label="main"), Choice(value="dev", label="dev")],
+        )
+        posted_msg = asyncio.run(bridge._send_choices(MattermostTarget(CHANNEL), "", question))
+        assert posted_msg is not None
+        seeded = [r for r in client.reactions if r[1] == posted_msg.post_id]
+        assert [r[2] for r in seeded] == ["one", "two"]
+        # the numbered prose is still the body, so typing answers too
+        assert "main" in client.posts[-1]["message"]
+        bridge.close()
+
+    def test_reacting_answers_the_question(self, tmp_path: Path) -> None:
+        concierge = FakeConcierge()
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        question = ChoiceQuestion(
+            prompt="Which base?",
+            choices=[Choice(value="main", label="main"), Choice(value="dev", label="dev")],
+        )
+        asker = bridge._inbound(
+            json.loads(posted("@sbxloop which base?")["data"]["post"])  # type: ignore[arg-type]
+        )
+        assert asker is not None
+        posted_msg = asyncio.run(bridge._send_choices(MattermostTarget(CHANNEL), "", question))
+        assert posted_msg is not None
+        bridge._register_question(posted_msg.post_id, question, asker)
+        client.react(posted_msg.post_id, "two")
+        assert wait_for(lambda: bool(concierge.turns))
+        assert "dev" in concierge.turns[0][0]
+        # the post says what was chosen and by whom
+        assert wait_for(lambda: any("Answered" in b["message"] for _, b in client.patches))
+        bridge.close()
+
+    def test_our_own_seeded_reaction_is_not_an_answer(self, tmp_path: Path) -> None:
+        concierge = FakeConcierge()
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        client.react("p" * 26, "one", user=BOT_ID)
+        assert not wait_for(lambda: bool(concierge.turns), timeout=0.3)
+        bridge.close()
+
+    def test_a_reaction_on_an_unknown_question_is_ignored(self, tmp_path: Path) -> None:
+        concierge = FakeConcierge()
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        client.react("p" * 26, "one")
+        assert not wait_for(lambda: bool(concierge.turns), timeout=0.3)
+        bridge.close()
+
+
+class TestReactionGate:
+    def test_the_gate_prompt_is_seeded_and_reacting_approves(self, tmp_path: Path) -> None:
+        bridge, client, floop = make_bridge(tmp_path)
+        approved: list[tuple[str, str]] = []
+
+        def approve_merge(run_id: str, *, by: str) -> str:
+            approved.append((run_id, by))
+            return "merging"
+
+        floop.approve_merge = approve_merge  # type: ignore[attr-defined]
+        gate = make_gate("r1")
+        posted_msg = asyncio.run(bridge._send_gate(MattermostTarget(CHANNEL), "approve?", gate))
+        assert posted_msg is not None
+        assert (BOT_ID, posted_msg.post_id, "white_check_mark") in client.reactions
+        client.react(posted_msg.post_id, "white_check_mark")
+        assert wait_for(lambda: bool(approved))
+        assert approved[0] == ("r1", "Mattermost user `ana`")
+        bridge.close()
+
+    def test_a_gate_prompt_from_before_a_restart_is_found_in_the_store(
+        self, tmp_path: Path
+    ) -> None:
+        """The post id -> run map is in memory; the prompt is not."""
+        bridge, client, floop = make_bridge(tmp_path)
+        approved: list[tuple[str, str]] = []
+
+        def approve_merge(run_id: str, *, by: str) -> str:
+            approved.append((run_id, by))
+            return "merging"
+
+        floop.approve_merge = approve_merge  # type: ignore[attr-defined]
+        bridge.dstore.create_merge_gate(
+            "r1",
+            "gh:issue:4",
+            "you/repo",
+            7,
+            "https://x/pull/7",
+            "b",
+            [],
+            "tok1",
+            time.time(),
+        )
+        prompt_id = "g" * 26
+        bridge.dstore.set_gate_prompt("r1", CHANNEL, prompt_id, backend="mattermost")
+        bridge._gate_posts.clear()
+        client.react(prompt_id, "white_check_mark")
+        assert wait_for(lambda: bool(approved))
+        assert approved[0][0] == "r1"
         bridge.close()

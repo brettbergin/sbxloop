@@ -16,15 +16,24 @@ after the ``@`` of anything that would resolve: invisible to a reader,
 inert to the mention parser, and applied at the send/edit seam only, so
 nothing upstream knows there is a third service.
 
-Cards (``EmbedSpec``) are rendered into the post text for now; the coloured
-*message attachment* Mattermost supports is #932's half of this module.
+The cards (``EmbedSpec``) become one *message attachment* — Mattermost
+implements the Slack-legacy attachment schema, so the colour bar that makes
+a ✅/❌ verdict readable at a glance is available here too.
 """
 
 from __future__ import annotations
 
 import re
+from typing import Any
 
-from sbxloop.daemon.discord_format import _code_segments
+from sbxloop.daemon.discord_format import EmbedSpec, _code_segments, _cut
+
+# Mattermost's own limits for an attachment's parts. A post's own ceiling is
+# server-configurable (16383 by default), far above the 2000 the shared
+# ``max_message_chars`` allows, so the renderer never approaches it.
+ATTACHMENT_TEXT_MAX = 16383
+FIELD_VALUE_MAX = 2000
+FALLBACK_MAX = 1000
 
 #: Unicode emoji the bridge reacts with -> the emoji *names* the reactions
 #: API takes (never a glyph). The standard shortcode set, which is why these
@@ -38,6 +47,15 @@ EMOJI_NAMES: dict[str, str] = {
     "🎉": "tada",
     "👀": "eyes",
 }
+
+#: The emoji a clarifying question is seeded with, one per choice, in order:
+#: reacting with one answers it. Mattermost's interactive buttons would post
+#: to a callback URL, which would cost the bridge the dial-out property it is
+#: built on; a reaction arrives on the websocket already open. The choice
+#: model caps a question at five options, which is why the list stops there.
+CHOICE_EMOJI: tuple[str, ...] = ("one", "two", "three", "four", "five")
+#: The approve button's twin: reacting with this on a gate prompt approves.
+GATE_EMOJI = "white_check_mark"
 
 # A zero-width space: invisible in a rendered post, and enough to stop the
 # mention parser matching the name that follows.
@@ -66,6 +84,43 @@ def _park(match: re.Match[str]) -> str:
     return f"@{ZERO_WIDTH_SPACE}{match.group(1)}"
 
 
+def embed_attachment(spec: EmbedSpec) -> dict[str, Any]:
+    """One Mattermost message attachment for a card.
+
+    The Slack-legacy schema Mattermost implements: a colour bar, an
+    optionally linked title, the description as text, the card's fields as
+    attachment fields (``short`` honouring the spec's own inline flag) and
+    the footer. ``fallback`` is what a notification shows.
+
+    Mention-safe like the post text: an attachment's text pings exactly as a
+    post's does, so every part a card carries goes through the guard.
+    """
+    spec = spec.clamped()
+    attachment: dict[str, Any] = {
+        "fallback": _cut(neutralize_mentions(spec.as_text()), FALLBACK_MAX)
+    }
+    if spec.title:
+        attachment["title"] = neutralize_mentions(spec.title)
+        if spec.url:
+            attachment["title_link"] = spec.url
+    if spec.description:
+        attachment["text"] = _cut(neutralize_mentions(spec.description), ATTACHMENT_TEXT_MAX)
+    if spec.fields:
+        attachment["fields"] = [
+            {
+                "title": neutralize_mentions(name),
+                "value": _cut(neutralize_mentions(value), FIELD_VALUE_MAX),
+                "short": bool(inline),
+            }
+            for name, value, inline in spec.fields
+        ]
+    if spec.footer:
+        attachment["footer"] = neutralize_mentions(spec.footer)
+    if spec.color is not None:
+        attachment["color"] = f"#{spec.color:06X}"
+    return attachment
+
+
 def thread_permalink(base_url: str, team: str, post_id: str) -> str:
     """The deep link to a post (and so to the thread under it).
 
@@ -79,8 +134,11 @@ def thread_permalink(base_url: str, team: str, post_id: str) -> str:
 
 
 __all__ = [
+    "CHOICE_EMOJI",
     "EMOJI_NAMES",
+    "GATE_EMOJI",
     "ZERO_WIDTH_SPACE",
+    "embed_attachment",
     "neutralize_mentions",
     "thread_permalink",
 ]

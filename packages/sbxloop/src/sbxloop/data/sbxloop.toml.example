@@ -737,11 +737,16 @@ secret_strategy = "proxy"
 # thread_per_run = true
 # chronology_level = "normal"
 # max_message_chars = 1900
-# embeds = true
+# embeds = true                    # cards as coloured message attachments; a post
+#                                  # the server rejects is retried text-only
 # status_line = true
 # tool_batch_lines = 8
 # tool_output_lines = 0
 # tool_fail_output_lines = 20
+# max_attachment_bytes = 10000000  # a workload result's files ride the thread as
+#                                  # uploads up to this size; larger ones (and any
+#                                  # upload that fails) are named by host path.
+#                                  # 0 = name all
 
 # [tui]
 # The operator console, `sbxloop tui`, run on the daemon host — always on,
