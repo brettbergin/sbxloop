@@ -90,6 +90,11 @@ class TestToolRun:
         assert "One entrypoint, one path." in entry["message"]
         assert result.summary is not None
         assert result.summary.startswith("1/1 command(s) passed their checks")
+        # Nothing on the wire echoes the command: it is the recipe's, long,
+        # and reads to a person like an install log.
+        for event in harness.events:
+            for value in event.data.values():
+                assert not (isinstance(value, str) and "printf" in value), (event.type, value)
 
     def test_stages_are_the_two_and_the_states_record_no_judgment(self, harness: Harness) -> None:
         assert TOOL_STAGES == ("executing", "publishing")

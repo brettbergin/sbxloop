@@ -1838,10 +1838,13 @@ class LoopEngine:
             task_id=spec.id,
             phase="execute",
             status="ok",
+            # The command is never echoed to the thread: it is the recipe's,
+            # long, and reads to a person like an install log. The task
+            # names it; the phase row carries it.
             message=(
-                f"`{spec.command}` and {len(commands) - 1} check(s) passed"
+                f"task {spec.id}: the command and {len(commands) - 1} check(s) passed"
                 if len(commands) > 1
-                else f"`{spec.command}` passed"
+                else f"task {spec.id}: the command passed"
             ),
         )
         task.output = self._tool_output(p, task)
@@ -1880,7 +1883,7 @@ class LoopEngine:
                     report = handle.read().decode("utf-8", "replace")
                 break
         if not report.strip():
-            report = f"`{spec.command}` completed; result files: " + (
+            report = f"{spec.title}: completed; result files: " + (
                 ", ".join(f"`{name}`" for name in spec.result_files) or "none declared"
             )
         return TaskOutput.from_report(clip(report), files=list(spec.result_files))
