@@ -44,6 +44,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar
 
+from sbxloop.chatservices import SLACK_APP_TOKEN_ENV, SLACK_BOT_TOKEN_ENV
 from sbxloop.config import ChatBackend, Config, SlackConfig
 from sbxloop.daemon.chat import ChatBridge, Inbound
 from sbxloop.daemon.chat_choices import ChoiceQuestion, render_prose
@@ -63,8 +64,10 @@ from sbxloop.log import get_logger
 
 log = get_logger(__name__)
 
-BOT_TOKEN_ENV = "SLACK_BOT_TOKEN"  # nosec B105 - env var name, not a secret
-APP_TOKEN_ENV = "SLACK_APP_TOKEN"  # nosec B105 - env var name, not a secret
+#: Re-exported from the service descriptor, which is what doctor and
+#: ``build_bridge`` read; the spellings live in one place.
+BOT_TOKEN_ENV = SLACK_BOT_TOKEN_ENV
+APP_TOKEN_ENV = SLACK_APP_TOKEN_ENV
 INSTALL_HINT = (
     "slack_sdk is not installed on this host — install it with "
     "`pip install 'sbxloop[slack]'` to enable the daemon's Slack bridge"

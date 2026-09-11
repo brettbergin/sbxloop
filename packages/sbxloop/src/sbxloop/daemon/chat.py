@@ -55,6 +55,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
+from sbxloop.chatservices import service_for
 from sbxloop.config import BridgeBackend, ChatBridgeConfig, Config
 from sbxloop.daemon.chat_choices import (
     Choice,
@@ -2459,20 +2460,15 @@ def _tool_call_summary(name: str, args: dict[str, Any]) -> str:
 
 def build_bridge(config: Config, dstore: DaemonStore, *, loop_ref: Any = None) -> ChatBridge | None:
     """The bridge for ``config.chat_backend``, or None when the daemon runs
-    headless. The backend module (and its optional extra) is imported only
-    when that backend is chosen, so a Discord deployment never loads the
-    Slack SDK and vice versa. A missing extra or token surfaces from
-    ``start()`` as an actionable :class:`~sbxloop.errors.DaemonError`."""
-    backend = config.chat_backend
-    if backend is None:
+    headless. The service's descriptor (:mod:`sbxloop.chatservices`) names
+    the module, which is imported only when that backend is chosen, so a
+    Discord deployment never loads another service's SDK. A missing extra
+    or token surfaces from ``start()`` as an actionable
+    :class:`~sbxloop.errors.DaemonError`."""
+    service = service_for(config)
+    if service is None:
         return None
-    if backend == "discord":
-        from sbxloop.daemon.discord import DiscordBridge
-
-        return DiscordBridge(config, dstore, loop_ref=loop_ref)
-    from sbxloop.daemon.slack import SlackBridge
-
-    return SlackBridge(config, dstore, loop_ref=loop_ref)
+    return service.bridge_type()(config, dstore, loop_ref=loop_ref)
 
 
 __all__ = [

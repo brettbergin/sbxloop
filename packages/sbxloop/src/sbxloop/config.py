@@ -31,7 +31,7 @@ import string
 import tomllib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Literal, NamedTuple
+from typing import Any, Literal, NamedTuple, cast
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -47,6 +47,7 @@ from pydantic import (
 )
 
 from sbxloop.backends import ANTHROPIC_TOKEN_ENV, COPILOT_TOKEN_ENV, OPENAI_TOKEN_ENV
+from sbxloop.chatservices import CHAT_SERVICES, service_named
 from sbxloop.errors import ConfigError
 from sbxloop.ids import DEFAULT_BRANCH_PREFIX
 from sbxloop.log import LogFormat, LogLevel, get_logger
@@ -1677,7 +1678,13 @@ ChronologyLevel = Literal["quiet", "normal", "verbose"]
 
 
 ChatBackend = Literal["discord", "slack"]
-CHAT_BACKENDS: tuple[ChatBackend, ...] = ("discord", "slack")
+#: The same set as the Literal above, as data: every external service has a
+#: row in ``sbxloop.chatservices``, and the two are pinned together by
+#: ``test_config_chat``. Ordered as the descriptors are, so the implicit
+#: "the one section with a channel_id" search is stable.
+CHAT_BACKENDS: tuple[ChatBackend, ...] = tuple(
+    cast("ChatBackend", service.name) for service in CHAT_SERVICES
+)
 #: Every bridge the daemon can run: the external ``[chat] backend`` choices
 #: plus ``local``, the operator console's bridge, which is always on.
 BridgeBackend = Literal["discord", "slack", "local"]
@@ -2724,17 +2731,26 @@ class Config(_ConfigModel):
                 raise ValueError(
                     f'[chat] backend = "{explicit}" but [{explicit}] channel_id is not set'
                 )
-        elif self.discord.enabled and self.slack.enabled:
+            return self
+        configured = [name for name in CHAT_BACKENDS if self.chat_section(name).enabled]
+        if len(configured) > 1:
+            # "both [discord] and [slack]" while two services exist; "[a], [b]
+            # and [c]" once there are more, so the sentence stays grammatical
+            # however many rows chatservices grows.
+            sections = [f"[{name}]" for name in configured]
+            listed = " and ".join((", ".join(sections[:-1]), sections[-1]))
+            quantifier = "both " if len(configured) == 2 else ""
+            choices = " | ".join(f'"{name}"' for name in configured)
             raise ValueError(
-                "both [discord] and [slack] have a channel_id; pick one with "
-                '[chat] backend = "discord" | "slack"'
+                f"{quantifier}{listed} have a channel_id; pick one with [chat] backend = {choices}"
             )
         return self
 
     def chat_section(self, backend: BridgeBackend) -> DiscordConfig | SlackConfig | TuiConfig:
         if backend == "local":
             return self.tui
-        return self.discord if backend == "discord" else self.slack
+        section: DiscordConfig | SlackConfig = getattr(self, service_named(backend).section)
+        return section
 
     @property
     def chat_backend(self) -> ChatBackend | None:
@@ -2756,7 +2772,8 @@ class Config(_ConfigModel):
         backend = self.chat_backend
         if backend is None:
             return None
-        return self.discord if backend == "discord" else self.slack
+        settings: DiscordConfig | SlackConfig = getattr(self, service_named(backend).section)
+        return settings
 
     def workspace_for_repo(self, repo: str | None) -> Path | None:
         """The host checkout runs for ``repo`` clone and refresh from.

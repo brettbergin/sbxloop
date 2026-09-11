@@ -3,11 +3,22 @@ the Slack section's own validation."""
 
 from __future__ import annotations
 
+from importlib import import_module
 from pathlib import Path
+from typing import get_args
 
 import pytest
 
-from sbxloop.config import Config, DiscordConfig, SlackConfig, load_config
+from sbxloop.chatservices import CHAT_SERVICES, service_named
+from sbxloop.config import (
+    CHAT_BACKENDS,
+    ChatBackend,
+    ChatBridgeConfig,
+    Config,
+    DiscordConfig,
+    SlackConfig,
+    load_config,
+)
 from sbxloop.errors import ConfigError
 
 
@@ -115,3 +126,44 @@ class TestSlackSection:
         assert SlackConfig(channel_id="  C0123ABCDEF ").channel_id == "C0123ABCDEF"
         assert SlackConfig(channel_id="G0123ABCDEF").enabled
         assert SlackConfig(channel_id="").channel_id is None
+
+
+class TestServiceDescriptors:
+    """The descriptor set and the ``ChatBackend`` Literal name the same
+    services, and every lookup that used to branch on "discord, else slack"
+    resolves through it (#930)."""
+
+    def test_literal_and_descriptors_name_the_same_services(self) -> None:
+        assert tuple(service.name for service in CHAT_SERVICES) == CHAT_BACKENDS
+        assert set(get_args(ChatBackend)) == {service.name for service in CHAT_SERVICES}
+
+    def test_every_service_resolves_its_config_section(self) -> None:
+        config = Config.model_validate({})
+        for service in CHAT_SERVICES:
+            section = config.chat_section(service.name)
+            assert section is getattr(config, service.section)
+            assert isinstance(section, ChatBridgeConfig)
+
+    def test_every_service_names_an_importable_bridge(self) -> None:
+        for service in CHAT_SERVICES:
+            module = import_module(service.module)
+            bridge = getattr(module, service.bridge_class)
+            assert bridge.backend == service.name
+            assert bridge.label == service.label
+
+    def test_unknown_backend_names_the_known_ones(self) -> None:
+        with pytest.raises(
+            ValueError, match=r"unknown chat backend 'irc' \(known: discord, slack\)"
+        ):
+            service_named("irc")
+
+    def test_missing_extra_detail_names_the_sdk_and_its_extra(self) -> None:
+        # The wording doctor printed before the descriptor existed.
+        assert (
+            service_named("discord").missing_extra_detail
+            == "discord.py missing (pip install 'sbxloop[discord]')"
+        )
+        assert (
+            service_named("slack").missing_extra_detail
+            == "slack_sdk missing (pip install 'sbxloop[slack]')"
+        )

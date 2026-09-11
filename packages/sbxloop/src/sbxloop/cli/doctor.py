@@ -30,6 +30,7 @@ import sbxloop
 from sbxloop import toolchains
 from sbxloop.agentmodels import model_for_phase, model_plan
 from sbxloop.backends import backend_for
+from sbxloop.chatservices import ChatService, service_named
 from sbxloop.config import Config, MergeMethod, RepoConfig, load_config, load_config_with_sources
 from sbxloop.engine.landing import allowed_merge_methods, resolve_merge_method
 from sbxloop.engine.store import StateStore
@@ -150,6 +151,21 @@ def _repo_token_status(entry: RepoConfig, env: dict[str, str]) -> tuple[bool, st
     installation (#568)."""
     status = gh_credential_status(env, token_env=entry.token_env)
     return status.ok, status.detail
+
+
+def _extra_installed(service: ChatService) -> bool:
+    """Whether the chat service's optional extra is importable here.
+
+    ``find_spec`` rather than an import: doctor only needs to know the SDK
+    is present, and importing a gateway client for that is a side effect
+    a diagnostic should not have.
+    """
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec(service.import_name) is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def _login_name() -> str:
@@ -1348,23 +1364,14 @@ def collect_checks(
         problems: list[str] = []
         settings = config.chat_settings
         assert settings is not None
-        if backend == "discord":
-            try:
-                import discord as _discordpy  # noqa: F401
-            except ImportError:
-                problems.append("discord.py missing (pip install 'sbxloop[discord]')")
-            if not env.get("DISCORD_BOT_TOKEN"):
-                problems.append("DISCORD_BOT_TOKEN not set")
-            ready = "extra installed, token present"
-        else:
-            try:
-                import slack_sdk as _slack_sdk  # noqa: F401
-            except ImportError:
-                problems.append("slack_sdk missing (pip install 'sbxloop[slack]')")
-            for name in ("SLACK_BOT_TOKEN", "SLACK_APP_TOKEN"):
-                if not env.get(name):
-                    problems.append(f"{name} not set")
-            ready = "extra installed, tokens present"
+        service = service_named(backend)
+        if not _extra_installed(service):
+            problems.append(service.missing_extra_detail)
+        for name in service.token_envs:
+            if not env.get(name):
+                problems.append(f"{name} not set")
+        plural = "token" if len(service.token_envs) == 1 else "tokens"
+        ready = f"extra installed, {plural} present"
         checks.append(
             Check(
                 f"chat bridge ({backend})",
