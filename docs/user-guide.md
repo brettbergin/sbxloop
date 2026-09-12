@@ -1422,7 +1422,19 @@ Your message is
 relayed to the agent exactly like the CLI's `--chat` (answered at the next
 checkpoint, which can be minutes into a long step — a note under your
 message says where the agent is, `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far)`, edited in place until the ⏳ reaction turns ✅
-when the reply lands). `!sbx status|pause [--hold NAME]|resume [--hold NAME|--all]|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>|merge <item|run>|release <item|run>|grant-rounds <run> <n>|resume-repo <owner/name>|schedules [pause <name>|resume <name>]|log [--tail N] [--level L] [--grep T]|stop` in the control channel drive the daemon
+when the reply lands).
+
+Anything you address to the bot — a steer, or an @mention in the control
+channel — is marked on your own message as it moves: **⏳ received**, then
+**✅ answered** or **⚠ something went wrong**. The ⏳ goes on the moment the
+message is routed, before the work behind it starts, so it is there while
+the concierge is still thinking rather than arriving with the reply; a
+steer the run can no longer take settles to ⚠ rather than leaving a clock
+for an answer that will never come; and a message that gets a second turn
+against it later (answering a clarifying question does) is never marked
+received again after it has been answered.
+
+`!sbx status|pause [--hold NAME]|resume [--hold NAME|--all]|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>|merge <item|run>|release <item|run>|grant-rounds <run> <n>|resume-repo <owner/name>|schedules [pause <name>|resume <name>]|log [--tail N] [--level L] [--grep T]|stop` in the control channel drive the daemon
 itself. Pause is a set of **named holds**: a bare `pause`/`resume` acts on the
 operator's hold, the deploy pipeline holds `deploy-<run id>` while it waits for
 the daemon to go idle, and the daemon idles while any hold stands — so an
@@ -1525,6 +1537,16 @@ seeds the question with one emoji per choice — reacting 1️⃣/2️⃣ answer
 because Mattermost's own interactive buttons post to a callback URL, which
 would cost the daemon the dial-out property its bridge is built on, while a
 reaction arrives on the websocket already open.
+
+Answering settles the message the same way everywhere: the question stays
+readable, the chosen option and who chose it are recorded under it, and the
+affordance goes — Discord's buttons disappear, Slack's blocks drop, and
+Mattermost's seeded digits are taken back off, so nobody reacts to a
+question that is already answered. A reaction that arrives on a Mattermost
+question the daemon no longer holds is answered in the thread under it
+(a bot account there has no private note to send), once, however many
+people try it — for the life of the daemon process that asked; one that
+restarted in between no longer recognises the post and stays quiet.
 "What's open?" lists the repository's open issues and which are queued or
 running; `queued: false` shows everything the daemon is not currently
 queued or running — the backlog plus issues that failed or are blocked and
@@ -1647,10 +1669,22 @@ the bot answering. `sbxloop doctor` shows one
 Cards are coloured message attachments (`[mattermost] embeds`) — a post the
 server rejects is retried text-only, so a run's chronology never goes
 missing over presentation — a workload result's files are uploaded up to
-`max_attachment_bytes` and named by host path beyond it (or if an upload
-fails; a named file is never silently dropped), and the merge gate's
-approve button is a seeded ✅: reacting with it approves, exactly as
-`!sbx merge` does.
+`max_attachment_bytes` and five per post (Mattermost's own limit; the rest
+are named by host path, as is any file too large or whose upload fails — a
+named file is never silently dropped), and the merge gate's approve button
+is a seeded ✅: reacting with it approves, exactly as `!sbx merge` does, and
+the reaction comes back off once the gate resolves so a merged prompt never
+looks like it is still waiting for you.
+
+While the concierge is working on an @mention it shows **"…is typing"**
+under the message box, for as long as the turn takes — the same signal
+Discord gives, sent over the websocket the bridge already holds, so it
+costs no API call. The ⏳ / ✅ reactions on your own message say *received*
+and *answered* on top of it. Those marks go by Mattermost's standard emoji
+names; if your instance's emoji set does not carry one, the bridge says so
+once in the log (`mattermost.reaction_refused`, naming the emoji and what
+the server said) rather than leaving you with an ack that silently never
+appears.
 
 ## Artifacts
 
