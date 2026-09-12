@@ -12,7 +12,7 @@ lint:
 	uv run ruff format --check .
 	uv run ruff check .
 	uv run mdformat --check .
-	python3 scripts/check_self_references.py
+	uv run python scripts/check_self_references.py
 
 typecheck:
 	uv run mypy
