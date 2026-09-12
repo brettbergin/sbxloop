@@ -229,7 +229,13 @@ def _reset_live_branch(forge: LiveForge, branch: str) -> None:
     close it (the fake forgets everything per test). On a live forge the
     last run's request would refuse the next (409), so the branch starts
     every backend build fresh: its open requests closed, the branch cut
-    again from the base with one commit to diff."""
+    again from the base with one commit to diff. The commit's third line
+    is new every build, so it diffs against a base the last merge scenario
+    already landed ``a.py`` on (the review scenario anchors line 3), and
+    its head carries a green ``ci`` status: the seeded base only merges a
+    head whose pipeline succeeded, and the checks scenarios overwrite the
+    context with their own failure or pending status."""
+    from time import time_ns
     from urllib.parse import quote
 
     dev = forge.client("GITLAB_TOKEN", "Developer")
@@ -242,16 +248,25 @@ def _reset_live_branch(forge: LiveForge, branch: str) -> None:
     ):
         dev.put(f"{project}/merge_requests/{change['iid']}", {"state_event": "close"})
     dev.delete(f"{project}/repository/branches/{quote(branch, safe='')}", check=False)
-    dev.post(
+    on_base = dev.get(f"{project}/repository/files/a.py", query={"ref": "main"}, check=False)
+    commit = dev.post(
         f"{project}/repository/commits",
         {
             "branch": branch,
             "start_branch": "main",
             "commit_message": "sbxloop conformance: one change to review",
             "actions": [
-                {"action": "create", "file_path": "a.py", "content": "x = 1\ny = 2\nz = 3\n"}
+                {
+                    "action": "update" if on_base.ok else "create",
+                    "file_path": "a.py",
+                    "content": f"x = 1\ny = 2\nz = {time_ns()}\n",
+                }
             ],
         },
+    )
+    dev.post(
+        f"{project}/statuses/{commit.data['id']}",
+        {"state": "success", "name": "ci", "description": "sbxloop conformance: green head"},
     )
 
 

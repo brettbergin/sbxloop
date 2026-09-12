@@ -14,6 +14,10 @@ question the conformance work raised (#1014) by fixing the record contract
 instead: the keys consumers read are the shared vocabulary, in the first
 backend's spelling, and every backend folds into them
 (`docs/architecture.md`, "Records are the first backend's spelling").
+Steps 7 and 8, the review (#1018) and the landing (#1019), followed in
+the same package; the landing keeps merge trains behind a per-project
+capability, because the free tier has none and a project that has them
+is field-unverified beyond GitLab's documented API.
 
 Code-seam claims below were read off this tree and are reproducible with the
 commands quoted beside them. GitLab and Gitea claims are **verified** where

@@ -328,6 +328,36 @@ class ChecksVerdict(NamedTuple):
         return f"{len(self.failed)} of {self.total} check(s) failed: {', '.join(self.failed)}"
 
 
+class CredentialInfo(NamedTuple):
+    """What a forge token reports about itself (#1019): the kind of token,
+    its name, its scopes, when it expires (``None`` when it never does)
+    and whether it is still active (``None`` when the forge does not
+    say). The doctor prints it on the repository's row and warns on a
+    token that never expires. A backend whose credential is the
+    provisioner's business (GitHub's App installation, a PAT that cannot
+    read itself) answers ``None`` from ``credential_info`` instead."""
+
+    kind: str
+    name: str = ""
+    scopes: tuple[str, ...] = ()
+    expires_at: str | None = None
+    active: bool | None = None
+
+    @property
+    def never_expires(self) -> bool:
+        return self.expires_at is None
+
+    def summary(self) -> str:
+        head = f"{self.kind} {self.name!r}" if self.name else self.kind
+        details = []
+        if self.scopes:
+            details.append(f"scopes {', '.join(self.scopes)}")
+        details.append(f"expires {self.expires_at}" if self.expires_at else "never expires")
+        if self.active is False:
+            details.append("INACTIVE")
+        return f"{head} ({'; '.join(details)})"
+
+
 class ReviewVerdict(NamedTuple):
     """One reviewer's standing verdict on a pull request (#675)."""
 
@@ -397,6 +427,9 @@ class BaseRequirements(NamedTuple):
 
     ``forge`` names the backend that read them, so :meth:`blockers` can
     phrase each rule in that forge's own terms (:data:`BLOCKER_WORDING`).
+    ``extra_blockers`` are rules only that forge has, already phrased by
+    the backend that read them (a GitLab base only Maintainers may merge
+    into, #1019); :meth:`blockers` appends them as they are.
 
     ``all_checks_required`` is a forge that gates on the whole pipeline
     rather than on named contexts (GitLab's "pipeline must succeed",
@@ -422,6 +455,7 @@ class BaseRequirements(NamedTuple):
     unread: tuple[str, ...] = ()
     forge: str = "github"
     all_checks_required: bool = False
+    extra_blockers: tuple[str, ...] = ()
 
     @property
     def requires_reviews(self) -> bool | None:
@@ -485,6 +519,7 @@ class BaseRequirements(NamedTuple):
                 f"the base requires a successful deployment to {envs} before merging, which "
                 "the loop does not run"
             )
+        out.extend(self.extra_blockers)
         return out
 
 

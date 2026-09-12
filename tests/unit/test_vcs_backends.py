@@ -54,9 +54,9 @@ class TestFactory:
         assert github is not None and github["merge_queue"] is Capability.SUPPORTED
         assert gitlab is not None and gitlab["review_threads"] is Capability.SUPPORTED
         assert unimplemented_roles("github") == () and unimplemented_operations("github") == ()
-        assert unimplemented_roles("gitlab") == ("ChangeOps", "ContentOps")
-        assert "ChangeOps.pr_merge" in unimplemented_operations("gitlab")
-        assert not any(op.startswith("ReviewOps") for op in unimplemented_operations("gitlab"))
+        assert unimplemented_roles("gitlab") == ("ContentOps",)
+        assert "ContentOps.commit_get" in unimplemented_operations("gitlab")
+        assert not any(op.startswith("ChangeOps") for op in unimplemented_operations("gitlab"))
 
     def test_each_kinds_sandbox_token_variables(self) -> None:
         assert sandbox_token_envs("github") == ("GH_TOKEN", "GITHUB_TOKEN")

@@ -110,14 +110,31 @@ descriptor the worker needs.
   revision the conformance work anticipated and is left open.
 
 - **An operation a backend has not landed yet raises `RoleNotImplemented`.**
-  The GitLab backend answers the repository, issue, checks and policy
-  roles, the review role, and the merge request's create-and-read half of
-  the change role; the landing half and the content role raise a typed
-  error naming the backend, the role and the operation, so a run on a
-  GitLab repository fails closed at the first of them, and `sbxloop doctor`
-  lists the same operations before any run starts. The conformance suite reads that
-  error as a skip naming the operation, the way an `UNSUPPORTED`
-  capability skips with its name.
+  The GitLab backend answers every role but the content role; that one
+  raises a typed error naming the backend, the role and the operation, so
+  a run on a GitLab repository fails closed at the first of them, and
+  `sbxloop doctor` lists the same operations before any run starts. The
+  conformance suite reads that error as a skip naming the operation, the
+  way an `UNSUPPORTED` capability skips with its name.
+
+- **A landing reads the forge's refusals as data.** On GitLab the merge
+  endpoint's 405 (not mergeable now: a red pipeline, an unresolved
+  discussion, a draft), 406 (a conflict) and 401 are a blocked
+  `MergeOutcome` with the forge's words, and a 409 is a stale head, the
+  same shapes the landing already reads off GitHub; the rebase is the
+  branch update and runs asynchronously, so the next poll sees the new
+  head; the `Draft:` title prefix is the whole of a draft, so retitling
+  is the un-draft. Merge trains are a paid tier and a per-project
+  setting, so `merge_queue` is read off the project payload every landing
+  reads anyway (`true` a train, `false` or the free tier's `null` a direct
+  merge, an unreadable project `unknown`); their shapes past the free
+  tier's 404 are field-unverified. The one rule GitLab has that GitHub
+  does not, who may merge into the protected branch, arrives as an
+  `extra_blockers` entry the backend phrased, so the landing's blocker
+  list needs no forge branch. `PolicyOps.credential_info` lets a token
+  that can read its own record (GitLab's) tell the doctor its name,
+  scopes, expiry and whether it is still active; GitHub answers `None`,
+  because there the credential is the provisioner's knowledge.
 
 `[vcs] kind` (and a `[[github.repos]]` entry's own `kind`) names the forge;
 `Config.vcs_kind_for` resolves it per repository, `Config.vcs_api_url_for`

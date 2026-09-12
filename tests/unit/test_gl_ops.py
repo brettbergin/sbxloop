@@ -517,9 +517,8 @@ class TestNotImplementedRoles:
     @pytest.mark.parametrize(
         ("role", "call"),
         [
-            ("ChangeOps", lambda ops: ops.pr_merge(REPO, 1)),
-            ("ChangeOps", lambda ops: ops.pr_ready_for_review("1!1")),
             ("ContentOps", lambda ops: ops.commit_get(REPO, "base123")),
+            ("ContentOps", lambda ops: ops.ref_create(REPO, "refs/heads/b", "s")),
             (
                 "ContentOps",
                 lambda ops: ops.contents_put(REPO, "a", message="m", content_b64="", branch="b"),

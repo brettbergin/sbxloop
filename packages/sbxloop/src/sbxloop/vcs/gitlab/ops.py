@@ -13,9 +13,8 @@ Field-verified against GitLab CE 19.3.2 (#1016) where a docstring says
 so. Everything else is GitLab's documented API, labelled
 **field-unverified** where it is load-bearing.
 
-The operations that have not landed yet — the landing half of
-:class:`~sbxloop.vcs.protocol.ChangeOps` (#1019) and
-:class:`~sbxloop.vcs.protocol.ContentOps` (#1020) — raise
+The operations that have not landed yet (the
+:class:`~sbxloop.vcs.protocol.ContentOps` role, #1020) raise
 :class:`~sbxloop.errors.RoleNotImplemented` here, so a run on a GitLab
 repository fails closed at the first of them, naming the operation.
 """
@@ -70,6 +69,7 @@ from sbxloop.vcs.model import (
     BaseRequirements,
     ChecksVerdict,
     CloseReason,
+    CredentialInfo,
     FailedCheck,
     Identity,
     IssueRef,
@@ -77,6 +77,7 @@ from sbxloop.vcs.model import (
     PostedFinding,
     PrRef,
     QueueEntry,
+    QueueEntryState,
     QueueState,
     ReviewComment,
     ReviewEvent,
@@ -114,6 +115,21 @@ def gitlab_transport(api_url: str, *, token_env: str = SANDBOX_TOKEN_ENV) -> Tra
         token_env=[token_env],
         gh_cli=False,
     )
+
+
+# What GitLab reads as a draft in a title (the `Draft:` prefix is the whole
+# of a draft, field-verified; `WIP:` and `[Draft]` are the older spellings).
+_DRAFT_PREFIXES = ("Draft:", "WIP:", "[Draft]", "[WIP]", "(Draft)")
+
+
+def _undrafted_title(title: str) -> str:
+    """``title`` without its draft marker."""
+    stripped = title.strip()
+    lowered = stripped.lower()
+    for prefix in _DRAFT_PREFIXES:
+        if lowered.startswith(prefix.lower()):
+            return stripped[len(prefix) :].strip()
+    return stripped
 
 
 def _clip_head_tail(text: str, head: int, tail: int) -> str:
@@ -164,14 +180,8 @@ class GitlabOps(JobBackend):
     )
     #: The operations this backend does not answer yet, as ``Role.operation``;
     #: each raises :class:`RoleNotImplemented`, and the doctor lists them.
-    #: The landing half of ``ChangeOps`` is #1019, ``ContentOps`` is #1020.
+    #: ``ContentOps`` is #1020.
     UNIMPLEMENTED_OPERATIONS: ClassVar[tuple[str, ...]] = (
-        "ChangeOps.pr_request_reviewers",
-        "ChangeOps.pr_ready_for_review",
-        "ChangeOps.pr_update_branch",
-        "ChangeOps.pr_merge",
-        "ChangeOps.pr_enqueue",
-        "ChangeOps.pr_queue_state",
         "ContentOps.blobs_create_many",
         "ContentOps.commit_get",
         "ContentOps.tree_create",
@@ -219,7 +229,26 @@ class GitlabOps(JobBackend):
     # -- what this backend can do --------------------------------------------
 
     def capabilities(self) -> dict[str, Capability]:
-        return dict(self.CAPABILITIES)
+        """The class's report, with ``merge_queue`` answered from the
+        projects this object has read (#1019): merge trains are a paid
+        tier and a per-project setting, so the project payload (read by
+        every landing before it merges) is the only place the answer
+        lives. Nothing read yet is UNKNOWN, as the class says."""
+        report = dict(self.CAPABILITIES)
+        answers = {self._trains_of(payload) for payload in self._projects.values()}
+        if len(answers) == 1:
+            report["merge_queue"] = answers.pop()
+        return report
+
+    @staticmethod
+    def _trains_of(project: Mapping[str, Any]) -> Capability:
+        """``merge_trains_enabled`` as a capability: ``true`` is a train;
+        ``false`` and ``null`` (the free tier, field-verified) are none."""
+        return (
+            Capability.SUPPORTED
+            if project.get("merge_trains_enabled") is True
+            else Capability.UNSUPPORTED
+        )
 
     # -- RepoOps -------------------------------------------------------------
 
@@ -688,6 +717,30 @@ class GitlabOps(JobBackend):
             return None
         return tuple(str(s) for s in scopes)
 
+    def credential_info(self) -> CredentialInfo | None:
+        """What the token says about itself (``GET
+        /personal_access_tokens/self``, field-verified for a personal and a
+        project access token, #1016 V6): its name, scopes, expiry and
+        whether it is still active. ``None`` for a token that cannot read
+        itself. A missing ``expires_at`` is a token that never expires,
+        which the doctor makes visible (#1019)."""
+        data = self.raw_lookup("GET", "/personal_access_tokens/self", missing=(404, 401, 403))
+        if not isinstance(data, dict):
+            return None
+        scopes = data.get("scopes")
+        expires = data.get("expires_at")
+        active = data.get("active")
+        revoked = data.get("revoked")
+        if isinstance(revoked, bool) and revoked:
+            active = False
+        return CredentialInfo(
+            kind="GitLab access token",
+            name=str(data.get("name") or ""),
+            scopes=tuple(str(s) for s in scopes) if isinstance(scopes, list) else (),
+            expires_at=str(expires) if expires else None,
+            active=active if isinstance(active, bool) else None,
+        )
+
     def permission_probe(self, permission: str, repo: str, base: str) -> bool | None:
         """Whether the token can make :data:`READ_PROBES`'s read for
         ``permission``: False on 401/403, True on any other answer, None
@@ -822,14 +875,87 @@ class GitlabOps(JobBackend):
         rows = self.raw_pages(f"{self._mr_path(repo, number)}/diffs")
         return [file_record(row) for row in rows if isinstance(row, dict)]
 
+    # -- ChangeOps: landing the merge request (#1019) --------------------------
+    #
+    # GitLab's merge endpoint answers the refusals the loop reads as data
+    # (field-verified for 405 in #1016 V2): 405 is "not mergeable right now"
+    # (a red pipeline, an unresolved discussion, a draft), 406 a conflict,
+    # 409 a head that moved past the sha the caller judged, 401 a token that
+    # may not merge. The method is the project's own (`merge_method`); the
+    # loop's choice only decides whether the merge squashes.
+
+    @staticmethod
+    def _node(node_id: str) -> tuple[str, int]:
+        """``(project, iid)`` from the ``<project id>!<iid>`` node id the
+        change record carries."""
+        project, bang, iid = node_id.rpartition("!")
+        if not bang or not project or not iid.isdigit():
+            raise GithubOpsError(f"not a GitLab merge request id: {node_id!r}")
+        return project, int(iid)
+
+    def _user_id(self, username: str) -> int:
+        """The id of user ``username``, or a refusal naming them: GitLab
+        addresses reviewers by id."""
+        path = f"/users?{urlencode({'username': username})}"
+        rows = self._list("GET /users", self.raw("GET", path))
+        for row in rows:
+            if not isinstance(row, dict) or str(row.get("username") or "") != username:
+                continue
+            if isinstance(row.get("id"), int):
+                return int(row["id"])
+        raise GithubOpsError(f"GitLab has no user {username!r} to request a review from")
+
     def pr_request_reviewers(self, repo: str, number: int, reviewers: Sequence[str]) -> None:
-        raise self._unimplemented("ChangeOps", "pr_request_reviewers")
+        """Ask for reviews from ``reviewers`` (usernames; a ``group/name``
+        slug is not a GitLab reviewer and is refused by name). One the
+        instance does not know fails the whole request, as on GitHub."""
+        if not reviewers:
+            return
+        slugs = [name for name in reviewers if "/" in name]
+        if slugs:
+            raise GithubOpsError(f"GitLab reviewers are users, not groups: {', '.join(slugs)}")
+        ids = [self._user_id(name) for name in reviewers]
+        self.raw("PUT", self._mr_path(repo, number), {"reviewer_ids": ids})
 
     def pr_ready_for_review(self, node_id: str) -> bool:
-        raise self._unimplemented("ChangeOps", "pr_ready_for_review")
+        """Take a draft merge request out of draft: the ``Draft:`` prefix is
+        the whole of a draft on GitLab (field-verified), so retitling
+        clears it. True when the request is now not a draft."""
+        project, iid = self._node(node_id)
+        path = f"/projects/{quote(project, safe='')}/merge_requests/{iid}"
+        current = self._dict(f"GET {path}", self.raw("GET", path))
+        if not current.get("draft") and not current.get("work_in_progress"):
+            return True
+        title = _undrafted_title(str(current.get("title") or ""))
+        updated = self._dict(f"PUT {path}", self.raw("PUT", path, {"title": title}))
+        return not bool(updated.get("draft"))
 
     def pr_update_branch(self, repo: str, number: int, *, expected_head_sha: str = "") -> bool:
-        raise self._unimplemented("ChangeOps", "pr_update_branch")
+        """Bring the source branch up to date with its target: GitLab's
+        rebase (``PUT .../rebase``), which runs asynchronously, so the
+        caller observes the new head on its next poll, as on GitHub. A
+        head that has moved past ``expected_head_sha`` is not rebased; a
+        refusal (a token without push, a conflict) is False, not raised."""
+        if expected_head_sha:
+            head = str(self._merge_request(repo, number).get("sha") or "")
+            if head != expected_head_sha:
+                log.info(
+                    "gitlab.rebase_skipped",
+                    repo=repo,
+                    mr=number,
+                    head=head[:12],
+                    expected=expected_head_sha[:12],
+                    hint="the head moved; the next poll re-decides",
+                )
+                return False
+        try:
+            self.raw("PUT", f"{self._mr_path(repo, number)}/rebase", {"skip_ci": False})
+        except GithubOpsError as exc:
+            if exc.http_status in (403, 409, 422):
+                log.info("gitlab.rebase_refused", repo=repo, mr=number, detail=str(exc)[:300])
+                return False
+            raise
+        return True
 
     def pr_merge(
         self,
@@ -841,13 +967,112 @@ class GitlabOps(JobBackend):
         title: str = "",
         message: str = "",
     ) -> MergeOutcome:
-        raise self._unimplemented("ChangeOps", "pr_merge")
+        """Merge the request. ``sha`` is the head the caller judged: a push
+        in between loses the race with a 409 (``stale``) instead of being
+        merged over. ``method`` decides the squash; the merge commit or
+        fast-forward is the project's setting."""
+        body: dict[str, Any] = {"squash": method == "squash", "should_remove_source_branch": False}
+        if sha:
+            body["sha"] = sha
+        commit_message = message or title
+        if commit_message:
+            body["squash_commit_message" if method == "squash" else "merge_commit_message"] = (
+                commit_message
+            )
+        try:
+            data = self.raw("PUT", f"{self._mr_path(repo, number)}/merge", body)
+        except GithubOpsError as exc:
+            if exc.http_status in (401, 403, 405, 406, 422):
+                return MergeOutcome(False, "", str(exc), blocked=True)
+            if exc.http_status == 409:
+                return MergeOutcome(False, "", str(exc), stale=True)
+            raise
+        if not isinstance(data, dict) or str(data.get("state") or "") != "merged":
+            # A 200 that does not say merged is not one: the request was
+            # queued to merge when its pipeline succeeds, or the answer is
+            # not a merge request at all. No retry fixes it.
+            return MergeOutcome(False, "", f"merge was not confirmed: {data!r}", blocked=True)
+        merged_sha = (
+            data.get("merge_commit_sha") or data.get("squash_commit_sha") or data.get("sha")
+        )
+        return MergeOutcome(True, str(merged_sha or ""), "merged")
+
+    # -- merge trains ------------------------------------------------------------
+    #
+    # A paid tier and a per-project setting (#1016): the free tier has no
+    # train at all (`merge_trains_enabled` is null and the endpoint is 404,
+    # verified), and a project that has them is **field-unverified** beyond
+    # GitLab's documented API: the shapes below are the documented ones.
+
+    _TRAIN_STATES: ClassVar[dict[str, QueueEntryState]] = {
+        "idle": "queued",
+        "fresh": "testing",
+        "stale": "testing",
+        "merging": "mergeable",
+        "merged": "mergeable",
+    }
+
+    def _merge_trains(self, repo: str) -> Capability:
+        """Whether *this* project merges through a train: SUPPORTED when it
+        does, UNSUPPORTED when the project says it does not (or the
+        instance has none), UNKNOWN when the project could not be read."""
+        try:
+            payload = self._project_payload(repo)
+        except GithubOpsError:
+            return Capability.UNKNOWN
+        return (
+            Capability.SUPPORTED
+            if payload.get("merge_trains_enabled") is True
+            else Capability.UNSUPPORTED
+        )
+
+    def _train_entry(self, node: Any) -> QueueEntry | None:
+        if not isinstance(node, dict) or node.get("id") is None:
+            return None
+        pipeline = node.get("pipeline")
+        index = node.get("index")
+        return QueueEntry(
+            id=str(node["id"]),
+            state=self._TRAIN_STATES.get(str(node.get("status") or ""), "unknown"),
+            position=(int(index) + 1) if isinstance(index, int) else None,
+            head=str(pipeline.get("sha") or "") if isinstance(pipeline, dict) else "",
+        )
 
     def pr_enqueue(self, node_id: str, *, head: str = "") -> QueueEntry:
-        raise self._unimplemented("ChangeOps", "pr_enqueue")
+        """Add the merge request to its target's merge train
+        (``POST .../merge_trains/merge_requests/:iid``); ``head`` is the sha
+        the caller judged. A refusal (no train on this project, the
+        request not mergeable) is GitLab's 404 or 409, raised with its
+        words."""
+        project, iid = self._node(node_id)
+        path = f"/projects/{quote(project, safe='')}/merge_trains/merge_requests/{iid}"
+        body: dict[str, Any] = {"when_pipeline_succeeds": True}
+        if head:
+            body["sha"] = head
+        data = self.raw("POST", path, body)
+        entry = self._train_entry(data)
+        if entry is None:
+            raise GithubOpsError(f"merge train returned no entry: {data!r}")
+        return entry
 
     def pr_queue_state(self, repo: str, number: int) -> QueueState:
-        raise self._unimplemented("ChangeOps", "pr_queue_state")
+        """Where the merge request stands with its train: merged or closed
+        from the request itself, the live entry from the train (a 404 is
+        "not on the train"), and no removal count: GitLab keeps no event
+        the loop can count, so a request that left the train reads as
+        removed with no reason."""
+        current = self._merge_request(repo, number)
+        state = str(current.get("state") or "")
+        path = f"{self._project(repo)}/merge_trains/merge_requests/{number}"
+        data = self.raw_lookup("GET", path)
+        return QueueState(
+            merged=state == "merged",
+            closed=state == "closed",
+            entry=self._train_entry(data),
+            merge_sha=str(
+                current.get("merge_commit_sha") or current.get("squash_commit_sha") or ""
+            ),
+        )
 
     # -- ReviewOps: discussions, approvals, reviewer states (#1018) -----------
     #

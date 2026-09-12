@@ -157,6 +157,16 @@ class FakeGitlab(GitlabOps):
         self.resolved: list[tuple[str, bool]] = []
         self.approvals_posted: list[tuple[int, dict[str, Any]]] = []
         self._discussion_seq = 0
+        # Landing (#1019): the merge train (when `merge_trains_enabled`),
+        # whether the token may merge or rebase, and what was asked.
+        self.train: dict[int, dict[str, Any]] = {}
+        self.merge_ok = True
+        self.rebase_ok = True
+        self.merges: list[tuple[int, dict[str, Any]]] = []
+        self.rebases: list[int] = []
+        self.train_adds: list[tuple[int, dict[str, Any]]] = []
+        self._merges = 0
+        self._rebases = 0
         self.head_sha = "commit0"
         self._note_id = 0
         self._status_id = 100
@@ -250,6 +260,7 @@ class FakeGitlab(GitlabOps):
             "allow_merge_on_skipped_pipeline": self.settings["allow_merge_on_skipped_pipeline"],
             "merge_method": self.settings["merge_method"],
             "squash_option": self.settings["squash_option"],
+            "merge_trains_enabled": self.settings.get("merge_trains_enabled"),
             "permissions": {
                 "project_access": {"access_level": level, "notification_level": 3}
                 if level
@@ -548,6 +559,10 @@ class FakeGitlab(GitlabOps):
                 mr["description"] = str(body["description"])
             if body.get("state_event") == "close":
                 mr["state"] = "closed"
+            if "reviewer_ids" in body:
+                mr["reviewers"] = [
+                    {"user_id": int(uid), "state": "unreviewed"} for uid in body["reviewer_ids"]
+                ]
             return self._mr_payload(mr)
         if tail == "/diffs":
             per_page = int(params.get("per_page", ["20"])[0])
@@ -663,6 +678,89 @@ class FakeGitlab(GitlabOps):
             return {"approved": True, "user_has_approved": True}
         raise AssertionError(f"FakeGitlab: unexpected merge request call {method} {path}")
 
+    # -- landing (#1019) -----------------------------------------------------------
+
+    def _train_payload(self, iid: int) -> dict[str, Any]:
+        entry = self.train.get(iid)
+        assert entry is not None
+        return {
+            "id": entry["id"],
+            "merge_request": {"iid": iid},
+            "status": entry["status"],
+            "index": entry["index"],
+            "pipeline": {"id": 7, "sha": entry["sha"]},
+        }
+
+    def _landing_routes(
+        self, method: str, path: str, rest: str, params: dict[str, list[str]], body: Any
+    ) -> Any:
+        """The merge, rebase, reviewer and train endpoints; ``None`` when
+        ``rest`` is not one."""
+        if match := re.fullmatch(r"/merge_trains/merge_requests/(\d+)", rest):
+            iid = int(match.group(1))
+            if not self.settings.get("merge_trains_enabled"):
+                raise self._failed(method, path, 404, "404 Not Found")
+            mr = self.merge_requests.get(iid)
+            if mr is None:
+                raise self._failed(method, path, 404, "404 Not found")
+            if method == "POST":
+                self.train_adds.append((iid, dict(body or {})))
+                if body and body.get("sha") and body["sha"] != mr["sha"]:
+                    raise self._failed(method, path, 409, "409 SHA does not match")
+                if mr.get("detailed_merge_status", "mergeable") not in (
+                    "mergeable",
+                    "ci_must_pass",
+                ):
+                    raise self._failed(method, path, 409, "409 The merge request is not mergeable")
+                self.train[iid] = {
+                    "id": 900 + iid,
+                    "status": "idle",
+                    "index": len(self.train),
+                    "sha": "train1",
+                }
+                return self._train_payload(iid)
+            if iid not in self.train:
+                raise self._failed(method, path, 404, "404 Not found")
+            return self._train_payload(iid)
+        match = re.fullmatch(r"/merge_requests/(\d+)(/.*)", rest)
+        if match is None:
+            return None
+        iid, tail = int(match.group(1)), match.group(2)
+        mr = self.merge_requests.get(iid)
+        if mr is None:
+            raise self._failed(method, path, 404, "404 Not found")
+        if tail == "/merge" and method == "PUT":
+            request = dict(body or {})
+            self.merges.append((iid, request))
+            self._maybe_fail("pr_merge")
+            if not self.merge_ok:
+                raise self._failed(method, path, 401, "401 Unauthorized")
+            if request.get("sha") and request["sha"] != mr["sha"]:
+                raise self._failed(
+                    method, path, 409, "409 SHA does not match HEAD of source branch"
+                )
+            status = mr.get("detailed_merge_status", "mergeable")
+            if mr["title"].startswith("Draft:") or status == "draft_status":
+                raise self._failed(method, path, 405, "405 Method Not Allowed")
+            if status == "conflict":
+                raise self._failed(method, path, 406, "406 Branch cannot be merged")
+            if status != "mergeable":
+                raise self._failed(method, path, 405, "405 Method Not Allowed")
+            mr["state"] = "merged"
+            self._merges += 1
+            mr["merge_commit_sha"] = f"merge{self._merges:04d}"
+            self.branches["main"] = mr["merge_commit_sha"]
+            return self._mr_payload(mr)
+        if tail == "/rebase" and method == "PUT":
+            self.rebases.append(iid)
+            if not self.rebase_ok:
+                raise self._failed(method, path, 403, "403 Forbidden")
+            self._rebases += 1
+            mr["sha"] = f"rebased{self._rebases}"
+            mr["detailed_merge_status"] = "mergeable"
+            return {"rebase_in_progress": True}
+        return None
+
     # -- the transport ---------------------------------------------------------
 
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
@@ -693,6 +791,11 @@ class FakeGitlab(GitlabOps):
             user = self._user(user_id)
             user["bot"] = bool(self.users[user_id].get("bot"))
             return user
+        if path == "/users" and method == "GET":
+            wanted = params.get("username", [""])[0]
+            return [
+                self._user(uid) for uid, user in self.users.items() if user["username"] == wanted
+            ]
         if path == "/personal_access_tokens/self":
             if self.token_self is None:
                 raise self._failed(method, path, 404, "404 Not Found")
@@ -858,6 +961,9 @@ class FakeGitlab(GitlabOps):
             ]
             per_page = int(params.get("per_page", ["20"])[0])
             return [self._issue_payload(i) for i in rows[:per_page]]
+        landing = self._landing_routes(method, path, rest, params, body)
+        if landing is not None:
+            return landing
         if rest.startswith("/merge_requests"):
             return self._mr_routes(method, path, rest, params, body)
         if match := re.fullmatch(r"/issues/(\d+)(/.*)?", rest):

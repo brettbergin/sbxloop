@@ -24,6 +24,7 @@ from sbxloop.vcs.model import (
     CheckState as CheckState,
     ChecksVerdict as ChecksVerdict,
     CloseReason as CloseReason,
+    CredentialInfo as CredentialInfo,
     FailedCheck as FailedCheck,
     Identity as Identity,
     IssueRef as IssueRef,
@@ -1789,6 +1790,13 @@ class GithubOps:
         if isinstance(data, dict) and data.get("missing") is True:
             return None
         return data
+
+    def credential_info(self) -> CredentialInfo | None:
+        """``None``: what a GitHub credential is (an App installation, a
+        classic or fine-grained PAT) and how long it lives is the
+        provisioner's knowledge, and GitHub lets no token read its own
+        expiry (#1009); the doctor composes that row itself."""
+        return None
 
     def token_scopes(self) -> tuple[str, ...] | None:
         """The credential's classic OAuth scopes (``repo``, ``workflow``,

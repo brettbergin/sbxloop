@@ -149,12 +149,12 @@ class TestMergeRequests:
         (entry,) = fake.pr_files(REPO, 1)
         assert entry["filename"] == "hello.txt" and entry["patch"].startswith("@@")
 
-    def test_the_landing_half_is_still_not_implemented(self) -> None:
+    def test_the_remote_commit_is_still_not_implemented(self) -> None:
         fake = ready(FakeGitlab())
         with pytest.raises(RoleNotImplemented) as info:
-            fake.pr_merge(REPO, 1)
-        assert info.value.operation == "pr_merge"
-        assert "ChangeOps.pr_merge" in GitlabOps.UNIMPLEMENTED_OPERATIONS
+            fake.commit_get(REPO, "base123")
+        assert info.value.operation == "commit_get"
+        assert "ContentOps.commit_get" in GitlabOps.UNIMPLEMENTED_OPERATIONS
         assert "ReviewOps" not in " ".join(GitlabOps.UNIMPLEMENTED_OPERATIONS)
 
 

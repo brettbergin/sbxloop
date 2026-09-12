@@ -162,6 +162,11 @@ class RepoProbe:
     # fine-grained PAT that lives until someone revokes it. Empty = not
     # determined.
     credential: str = ""
+    # A soft row's worth of warning about the credential (#1019): a token
+    # that never expires. Empty = nothing to warn about.
+    credential_warning: str = ""
+    # A failing verdict on the credential itself: revoked or inactive.
+    credential_problem: str = ""
 
 
 def _repo_token_status(
@@ -398,6 +403,9 @@ def repo_checks(
             )
             rows.append(Check(name, False, "; ".join(notes)))
             continue
+        if result.credential_problem:
+            rows.append(Check(name, False, "; ".join([*notes, result.credential_problem])))
+            continue
         notes.append(result.detail or "reachable, token has the required permissions")
         if result.credential:
             notes.append(f"credential: {result.credential}")
@@ -406,6 +414,8 @@ def repo_checks(
         rows.append(Check(name, True, "; ".join(notes)))
         if merge_row is not None:
             rows.append(merge_row)
+        if result.credential_warning:
+            rows.append(Check(f"{name} credential", False, result.credential_warning, hard=False))
         if result.optional_permissions:
             rows.append(
                 Check(
@@ -729,7 +739,12 @@ def _credential_needs(
         else:
             found = (*_missing_from_push_bit(data), *_missing_from_probes(ops, repo, base))
             source = "a token that cannot read its own scopes, asked endpoint by endpoint"
-        credential = "GitLab access token (long-lived; its expiry is what the token reports)"
+        info = ops.credential_info()
+        credential = (
+            info.summary()
+            if info is not None
+            else "GitLab access token (long-lived; it cannot read its own record)"
+        )
         lacking = {n.permission for n in found}
         missing = tuple(n for n in NEEDS if n.permission in lacking)
     elif app_permissions is not None:
@@ -878,6 +893,7 @@ def sandbox_repo_probe(
             data,
             kind=kind,
         )
+        warning, problem = _credential_verdict(ops, kind)
         has_issues = data.get("has_issues")
         blockers, unread = (
             _base_blockers(
@@ -908,9 +924,36 @@ def sandbox_repo_probe(
             missing_labels=_missing_repo_labels(ops, config, entry),
             issues_enabled=has_issues if isinstance(has_issues, bool) else None,
             credential=credential,
+            credential_warning=warning,
+            credential_problem=problem,
         )
 
     return probe
+
+
+def _credential_verdict(ops: VcsOps, kind: str) -> tuple[str, str]:
+    """``(warning, problem)`` about the token itself (#1019), from what it
+    reports (:meth:`~sbxloop.vcs.protocol.PolicyOps.credential_info`): a
+    token that never expires is a warning: the reduction the spike
+    accepts for a forge with no host-minted token, made visible; a
+    revoked or inactive one is a problem no run survives."""
+    if kind == "github":
+        return "", ""
+    try:
+        info = ops.credential_info()
+    except GithubOpsError:
+        return "", ""
+    if info is None:
+        return "", ""
+    if info.active is False:
+        return "", f"the {info.kind} is revoked or inactive; mint a new one"
+    if info.never_expires:
+        return (
+            f"the {info.kind} never expires: a leaked token is useful until someone revokes "
+            "it; set an expiry when creating it and rotate it on a schedule",
+            "",
+        )
+    return "", ""
 
 
 def _missing_repo_labels(ops: VcsOps, config: Config, entry: RepoConfig) -> tuple[str, ...] | None:

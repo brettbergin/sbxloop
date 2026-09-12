@@ -25,6 +25,20 @@
   review degrades to a comment with the finding count, because the free
   tier records a requested change without holding the merge for it.
 
+- **A GitLab merge request lands.** The GitLab backend now takes a draft
+  request out of draft, requests reviewers by username, rebases the
+  branch as the update, and merges with the judged head, reading the
+  forge's refusals (not mergeable, a conflict, a moved head, no merge
+  access) as the same blocked and stale outcomes the landing reads off
+  GitHub. Merge trains are a per-project capability: the landing enters
+  one where the project has it and merges directly where it does not,
+  which is everywhere on the free tier. `sbxloop doctor` prints what the
+  GitLab token reports about itself (name, scopes, expiry), warns on a
+  token that never expires, fails the repository's row on a revoked one,
+  and names a base only Maintainers may merge into as a blocker for a
+  Developer token. Only the remote commit (the content role) is left for
+  the GitLab backend to answer.
+
 - **Playwright MCP setup for Copilot and Claude builders.**
   `sbxloop init --preset playwright` configures Node, a pinned MCP package,
   its matching headless Chromium installation, download hosts and builder

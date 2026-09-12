@@ -403,9 +403,9 @@ secret_strategy = "proxy"
 # [vcs]
 # The version-control backend: which forge the repositories live on.
 # "github" answers a run in full; "gitlab" answers the read paths (the
-# repository, issues, checks, the base's rules), the merge request and its
-# review threads, and stops a run, naming the operation, at the landing and
-# the remote commit until those land;
+# repository, issues, checks, the base's rules), the merge request, its
+# review threads and its landing, and stops a run, naming the operation, at
+# the remote commit until it lands;
 # "gitea" loads, and `sbxloop doctor` reports it as not yet implemented.
 # Anything else is refused at load. A `[[github.repos]]` entry may name its
 # own `kind`. Without this section `[github]` is read as kind = "github",

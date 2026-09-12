@@ -26,6 +26,7 @@ everything and the doctor says "unverifiable" rather than "fine".
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 from urllib.parse import quote
 
@@ -59,6 +60,11 @@ def read_base_requirements(ops: Any, repo: str, base: str) -> BaseRequirements:
     all_checks = settings.get("only_allow_merge_if_pipeline_succeeds") is True
     conversation = settings.get("only_allow_merge_if_all_discussions_are_resolved") is True
     code_owners = rule.get("code_owner_approval_required") is True
+    # Merge trains are a paid tier and a per-project setting (#1019):
+    # ``true`` is a train the landing enters; ``false`` and the free tier's
+    # ``null`` (field-verified) are a direct merge.
+    trains = settings.get("merge_trains_enabled") is True
+    extra = _merge_access_blockers(settings, rule)
 
     approvals: int | None
     if enterprise is False:
@@ -74,9 +80,11 @@ def read_base_requirements(ops: Any, repo: str, base: str) -> BaseRequirements:
             "unknown",
             code_owner_review=code_owners,
             conversation_resolution=conversation,
+            merge_queue=trains,
             unread=unread,
             forge=FORGE,
             all_checks_required=all_checks,
+            extra_blockers=extra,
         )
     return BaseRequirements(
         (),
@@ -84,8 +92,64 @@ def read_base_requirements(ops: Any, repo: str, base: str) -> BaseRequirements:
         "protected_branch+project" if protected is not None else "project",
         code_owner_review=code_owners,
         conversation_resolution=conversation,
+        merge_queue=trains,
         forge=FORGE,
         all_checks_required=all_checks,
+        extra_blockers=extra,
+    )
+
+
+# GitLab's access levels by name, for the merge-access reason.
+_LEVEL_NAMES = {
+    0: "no one",
+    10: "Guests",
+    20: "Reporters",
+    30: "Developers",
+    40: "Maintainers",
+    50: "Owners",
+}
+
+
+def _merge_access_blockers(settings: Mapping[str, Any], rule: Mapping[str, Any]) -> tuple[str, ...]:
+    """The one rule GitLab has that GitHub does not (#1019): who may merge
+    into the protected branch. A token below the lowest ``merge_access_levels``
+    entry can never land the change, whatever else is green; the reason is
+    phrased with the branch's own description (field-verified shape:
+    ``[{"access_level": 30, "access_level_description": "Developers + Maintainers"}]``)."""
+    levels = rule.get("merge_access_levels")
+    if not isinstance(levels, list) or not levels:
+        return ()
+    numeric = [
+        int(entry["access_level"])
+        for entry in levels
+        if isinstance(entry, dict) and isinstance(entry.get("access_level"), int)
+    ]
+    if not numeric:
+        return ()
+    required = min(numeric)
+    permissions = settings.get("permissions")
+    held = 0
+    if isinstance(permissions, dict):
+        for key in ("project_access", "group_access"):
+            access = permissions.get(key)
+            if isinstance(access, dict) and isinstance(access.get("access_level"), int):
+                held = max(held, int(access["access_level"]))
+    if held >= required:
+        return ()
+    described = next(
+        (
+            str(entry.get("access_level_description"))
+            for entry in levels
+            if isinstance(entry, dict)
+            and entry.get("access_level") == required
+            and entry.get("access_level_description")
+        ),
+        _LEVEL_NAMES.get(required, f"access level {required}"),
+    )
+    return (
+        f"the base allows merges by {described} only, and this token's access is "
+        f"{_LEVEL_NAMES.get(held, f'access level {held}')}; give the token a higher role "
+        "on the project or lower the branch's merge access",
     )
 
 
