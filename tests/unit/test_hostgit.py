@@ -19,36 +19,8 @@ from git import Git, GitCommandError, Repo
 from sbxloop import hostgit
 from sbxloop.errors import DeliveryError, ProvisionError
 from sbxloop_worker.gitops import GitMergeError, merge_from_base
+from tests.fakes.gitrepo import git, make_repo
 from tests.fakes.gitserver import PrivateGitServer, bare_from
-
-
-def git(*argv: str, cwd: Path) -> None:
-    subprocess.run(
-        ["git", *argv],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-        env={
-            "PATH": "/usr/bin:/bin:/usr/local/bin",
-            "GIT_AUTHOR_NAME": "t",
-            "GIT_AUTHOR_EMAIL": "t@example.com",
-            "GIT_COMMITTER_NAME": "t",
-            "GIT_COMMITTER_EMAIL": "t@example.com",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_CONFIG_SYSTEM": "/dev/null",
-            "GIT_SSL_CAINFO": os.environ.get("GIT_SSL_CAINFO", ""),
-        },
-    )
-
-
-def make_repo(tmp_path: Path, name: str = "src") -> Path:
-    root = tmp_path / name
-    root.mkdir()
-    git("init", "-b", "main", cwd=root)
-    (root / "hello.txt").write_text("hi\n")
-    git("add", ".", cwd=root)
-    git("commit", "-m", "init", cwd=root)
-    return root
 
 
 class TestRepoToplevel:

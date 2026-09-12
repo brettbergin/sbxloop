@@ -682,11 +682,10 @@ class TestWorkspaceIsolation:
             provisioner.ensure_pair("r1")
 
     def test_auto_unborn_head_refuses(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
-        import subprocess
+        from tests.fakes.gitrepo import init_repo
 
         source = tmp_path / "empty-repo"
-        source.mkdir()
-        subprocess.run(["git", "init", "-b", "main"], cwd=source, check=True, capture_output=True)
+        init_repo(source).close()
         provisioner, _events = make_isolation_provisioner(fake_sbx, tmp_path, source)
         with pytest.raises(ProvisionError, match="no commits"):
             provisioner.ensure_pair("r1")
