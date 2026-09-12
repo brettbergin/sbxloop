@@ -31,6 +31,8 @@ FEATURES: tuple[str, ...] = (
     "runs.control",
     "steering",
     "gates",
+    "artifacts",
+    "usage",
 )
 
 

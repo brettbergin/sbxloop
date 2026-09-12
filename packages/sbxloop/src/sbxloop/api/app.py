@@ -18,6 +18,7 @@ from sbxloop import __version__
 from sbxloop.api import errors, ws
 from sbxloop.api.context import ApiContext
 from sbxloop.api.routes import (
+    artifacts,
     auth,
     catalog,
     control,
@@ -28,6 +29,7 @@ from sbxloop.api.routes import (
     operations,
     runs,
     status,
+    usage,
 )
 
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
@@ -107,6 +109,8 @@ def create_app(ctx: ApiContext) -> FastAPI:
     app.include_router(runs.router)
     app.include_router(catalog.router)
     app.include_router(control.router)
+    app.include_router(artifacts.router)
+    app.include_router(usage.router)
     app.include_router(events.router)
     app.include_router(ws.router)
     app.include_router(auth.router)

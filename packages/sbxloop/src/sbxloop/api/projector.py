@@ -11,6 +11,7 @@ not correctness.
 from __future__ import annotations
 
 import threading
+from collections import deque
 from collections.abc import Callable
 
 from sbxloop.api.chronology import Chronology
@@ -43,9 +44,22 @@ class Projector:
         self._thread: threading.Thread | None = None
         self._last_prune = 0.0
         self._last_seen: int | None = None
+        #: Runs whose artifacts are to be catalogued, drained on this
+        #: thread so the loop's finish path never hashes a tree.
+        self._catalog: Callable[[str], None] | None = None
+        self._pending: deque[str] = deque()
 
     def wake(self) -> None:
         """Called from any thread: there is something to project."""
+        self._wake.set()
+
+    def catalog_with(self, fn: Callable[[str], None]) -> None:
+        """What to call, on this thread, for each run queued for cataloguing."""
+        self._catalog = fn
+
+    def catalog(self, run_id: str) -> None:
+        """From any thread: catalog this run's artifacts when convenient."""
+        self._pending.append(run_id)
         self._wake.set()
 
     def start(self) -> None:
@@ -73,6 +87,12 @@ class Projector:
         if copied or newest != self._last_seen:
             self._last_seen = newest
             self.hub.notify()
+        while self._pending and self._catalog is not None:
+            run_id = self._pending.popleft()
+            try:
+                self._catalog(run_id)
+            except Exception:
+                log.warning("api.catalog_failed", run=run_id, exc_info=True)
         if now - self._last_prune >= PRUNE_EVERY_S:
             self._last_prune = now
             try:

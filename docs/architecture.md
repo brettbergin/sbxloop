@@ -2249,6 +2249,24 @@ recorded decision and the committed release; the landing thread merges (or
 the next tick publishes) afterwards, and a base that requires an approving
 review still parks the run awaiting one.
 
+**Artifacts and usage (#1039).** `api_artifacts` (`api/artifacts.py`) is
+built once per finished run, on the projector thread (the API frontend
+queues the run on `run_finished`; a read catalogs a terminal run itself
+when the pass has not got to it), from the same `scan_artifacts` under
+`artifacts_dir` that `sbxloop artifacts` shows, each file opened through
+`repofiles.open_file` — relative to the run's directory, never following a
+link out of it — for its digest, so an escaping link is refused at catalog
+time and downloads take the same road. The catalog is bounded per run; a
+row survives the retention sweep with `available` off, tombstoned the
+first time a read finds the bytes gone, so history still says what was
+delivered. Downloads are bounded, streamed off the executor, always
+attachments, and never served as a type a browser would run. Usage
+(`api/usage.py`) is the concierge's fold (`usage_for_run`) shaped for a
+client: `null` stays `null`, `recorded` says whether anything was
+reported, and `spend` is `null` by construction with the basis stated —
+telemetry, not an invoice. A window folds every run touched in it from the
+samples' own timestamps and is at most 31 days wide.
+
 ### Repositories
 
 One daemon may tend several repositories. They are declared as an array of

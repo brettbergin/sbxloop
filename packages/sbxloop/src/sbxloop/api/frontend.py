@@ -104,6 +104,9 @@ class ApiFrontend:
         except Exception:
             log.warning("api.steering_settle_failed", run=report.run_id, exc_info=True)
         if self.projector is not None:
+            # The catalog is built off the loop thread: hashing a tree is
+            # the projector's work, not the finish path's.
+            self.projector.catalog(report.run_id)
             self.projector.wake()
 
     def merge_gate_opened(self, item: WorkItem, run_id: str, gate: MergeGate) -> None:

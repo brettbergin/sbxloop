@@ -38,6 +38,11 @@ carry their own prefix rather than ``daemon_``.
   what became of it — delivered to the run, handled with the agent's
   reply and action, refused, or never heard because the run ended first.
 
+* ``api_artifacts`` is the catalog of what a finished run left behind —
+  identity, digest, size, media type, the run and task it came from — and
+  whether the bytes are still on the host. A pruned run keeps its rows
+  with ``available`` off, so history still says what was delivered.
+
 JSON lives in ``TEXT`` columns, serialised in Python, as everywhere else.
 """
 
@@ -182,3 +187,23 @@ class SteeringRow(Base):
     action: Mapped[str | None] = mapped_column(Text)
     error: Mapped[str | None] = mapped_column(Text)
     operation_id: Mapped[str | None] = mapped_column(Text)
+
+
+class ArtifactRow(Base):
+    __tablename__ = "api_artifacts"
+    __table_args__ = (
+        UniqueConstraint("run_id", "relpath"),
+        Index("idx_api_artifacts_run", "run_id", "relpath"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    run_id: Mapped[str] = mapped_column(Text, nullable=False)
+    task_id: Mapped[str | None] = mapped_column(Text)
+    relpath: Mapped[str] = mapped_column(Text, nullable=False)
+    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256: Mapped[str] = mapped_column(Text, nullable=False)
+    media_type: Mapped[str] = mapped_column(Text, nullable=False)
+    origin: Mapped[str] = mapped_column(Text, nullable=False)
+    recorded_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    available: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+    tombstoned_at: Mapped[float | None] = mapped_column(REAL)

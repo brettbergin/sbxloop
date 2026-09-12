@@ -2049,6 +2049,26 @@ current), `/resume`, `/round-grants` (`budgets:grant`; `{"rounds": n}`) and
 optional `expected_revision`. Every one of these is a `command` on the
 WebSocket too.
 
+**Results and usage.** `GET /v1/runs/{id}/artifacts` (`artifacts:read`) is
+the run's catalog: every file the run left behind by an opaque `art_…` id
+with its path inside the run's artifact tree (never a host path), size,
+SHA-256 digest, media type, the task that declared it, and where it came from
+(`workspace` for a mounted code run's tree, `harvest` for one copied out,
+`sink` for what a workload or tool run declared) — the same files `sbxloop artifacts` lists, the operator's `[artifacts] exclude` applied, up to two
+thousand per run. The listing also says where the run **published** (its
+sinks), which is a separate fact from a file being on the host. `GET /v1/artifacts/{id}` is one entry; `GET /v1/artifacts/{id}/content` its bytes,
+always as an attachment (`Content-Disposition`, `nosniff`; HTML, SVG, XML and
+scripts are served as plain bytes), opened relative to the run's own
+directory without following a link out of it — a link that would escape the
+run is never catalogued. Once the retention sweep has pruned a run the entry
+stays with `available: false` and the download answers `410 artifact_gone`.
+`GET /v1/runs/{id}/usage` and `GET /v1/usage?since&until` (RFC 3339 or epoch;
+the daemon's calendar day when omitted; at most 31 days) are what the agent
+backend reported — tokens and turns by persona and by phase and model — with
+unknowns kept as `null` and `recorded: false` when nothing was reported, which
+is not zero. `spend` is always `null`, and `spend_basis` says why: no backend
+reports a charge in a known unit, and a token total is not a bill.
+
 ## Artifacts
 
 Every job in a run executes in the run's **workspace** — a host directory

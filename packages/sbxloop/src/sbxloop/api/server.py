@@ -60,6 +60,7 @@ class ApiServer:
                 clock=ctx.clock,
                 retention_s=float(config.replay_retention_s),
             )
+            ctx.projector.catalog_with(self._catalog_run)
         # uvicorn's loggers are noisy at INFO; the daemon narrates the start.
         for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
             logging.getLogger(name).setLevel(logging.WARNING)
@@ -80,6 +81,16 @@ class ApiServer:
             log.warning("api.steering_settle_failed", exc_info=True)
         self.ctx.projector.start()
         log.info("api.started", bind=self.config.bind, port=self.port)
+
+    def _catalog_run(self, run_id: str) -> None:
+        """Catalog a finished run's artifacts on the projector thread."""
+        from sbxloop.errors import SbxloopError
+
+        try:
+            record = self.ctx.loop.store.get_run(run_id)
+        except SbxloopError:
+            return
+        self.ctx.artifacts.catalog_run(record)
 
     def _run(self) -> None:
         try:

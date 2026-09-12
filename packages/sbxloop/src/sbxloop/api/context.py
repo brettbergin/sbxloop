@@ -18,6 +18,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 
+from sbxloop.api.artifacts import ArtifactCatalog
 from sbxloop.api.auth.keys import SigningKeys
 from sbxloop.api.auth.ratelimit import FailureLimiter
 from sbxloop.api.auth.store import ApiAuthStore
@@ -64,6 +65,7 @@ class ApiContext:
         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
         self._public_ids: PublicIds | None = None
         self._chronology: Chronology | None = None
+        self._artifacts: ArtifactCatalog | None = None
         #: Wakes every live stream; the projector, the frontend and the
         #: routes raise it from their own threads.
         self.hub = StreamHub()
@@ -88,6 +90,19 @@ class ApiContext:
         if self._chronology is None:
             self._chronology = Chronology(self.loop.dstore)
         return self._chronology
+
+    @property
+    def artifacts(self) -> ArtifactCatalog:
+        """The artifact catalog over the daemon's stores, built on first use."""
+        if self._artifacts is None:
+            self._artifacts = ArtifactCatalog(
+                self.loop.dstore,
+                self.loop.store,
+                self.config.paths,
+                exclude=self.config.artifacts.exclude,
+                clock=self.clock,
+            )
+        return self._artifacts
 
     def service(self) -> ControlService:
         """A service over the loop; one per request, since it collects the

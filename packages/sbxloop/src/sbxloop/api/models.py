@@ -571,3 +571,90 @@ class GateResult(ApiModel):
     gate: Gate
     operation: OperationOut
     message: str | None = None
+
+
+# -- artifacts and usage (#1039) ---------------------------------------------------
+
+
+class ArtifactOut(ApiModel):
+    id: str
+    workspace_id: str = WORKSPACE_ID
+    run_id: str
+    task_id: str | None = None
+    #: The file's path inside the run's artifact tree — never a host path.
+    path: str
+    size: int
+    sha256: str
+    media_type: str
+    #: ``workspace`` (a mounted code run's tree), ``harvest`` (copied out of
+    #: an unmounted one), ``sink`` (what a workload or tool run declared).
+    origin: str
+    recorded_at: str
+    available: bool
+    tombstoned_at: str | None = None
+
+
+class ArtifactPage(ApiModel):
+    """A run's catalog, and — separately — where the run published: a
+    catalog entry is a file on the host, a ``published`` entry a sink
+    that took it."""
+
+    data: list[ArtifactOut]
+    next_cursor: str | None = None
+    has_more: bool = False
+    published: list[PublishedOut] = Field(default_factory=list)
+    #: Files the catalog left out past its cap; the host listing has them.
+    beyond_cap: int = 0
+
+
+class UsageTotals(ApiModel):
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    cache_read_tokens: int | None = None
+    cache_write_tokens: int | None = None
+
+
+class UsageAgent(ApiModel):
+    agent: str
+    usage: UsageTotals
+    turns: int = 0
+    jobs: int = 0
+
+
+class RunUsage(ApiModel):
+    run_id: str
+    workspace_id: str = WORKSPACE_ID
+    #: Whether the backend reported anything at all; ``False`` is not zero.
+    recorded: bool
+    turns: int = 0
+    models: list[str] = Field(default_factory=list)
+    total: UsageTotals
+    by_agent: list[UsageAgent] = Field(default_factory=list)
+    by_phase_model: dict[str, UsageTotals] = Field(default_factory=dict)
+    #: Never a number: no backend reports a charge in a known unit.
+    spend: None = None
+    spend_basis: str
+
+
+class UsageWindowRun(ApiModel):
+    run_id: str
+    kind: str
+    state: str
+    recorded: bool
+    turns: int = 0
+    total: UsageTotals
+
+
+class UsageWindow(ApiModel):
+    workspace_id: str = WORKSPACE_ID
+    since: str
+    until: str
+    observed_at: str
+    runs: list[UsageWindowRun] = Field(default_factory=list)
+    runs_considered: int = 0
+    runs_recorded: int = 0
+    turns: int = 0
+    models: list[str] = Field(default_factory=list)
+    total: UsageTotals
+    spend: None = None
+    spend_basis: str
