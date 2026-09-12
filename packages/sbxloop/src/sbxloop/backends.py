@@ -12,6 +12,14 @@ so a claude-backend host is diagnosed, rotated and listed as itself.
 The Copilot descriptor carries the exact strings those commands printed
 before the descriptor existed — a copilot deployment reads byte-identical.
 
+A backend's credential path — the env var, the host it is bound to, the
+hosts it must reach, the wording when it is missing — is read through
+accessors that take the loaded :class:`~sbxloop.config.Config`, never off a
+constant. The three SDK-vendor backends bind to a fixed host and answer
+every config the same way; the accessors exist so a backend whose endpoint
+the operator names can answer from config instead, and so no consumer can
+ask for a host before one is knowable.
+
 This module imports nothing from the config package at runtime (only the
 type), so the low-level modules that need the credential constants —
 ``sbx.secretstate`` re-exports them — never form an import cycle.
@@ -19,6 +27,7 @@ type), so the low-level modules that need the credential constants —
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -54,8 +63,8 @@ OPENAI_TOKEN_HOST = "api.openai.com"  # nosec B105 - hostname, not a secret
 
 
 @dataclass(frozen=True)
-class AgentBackend:
-    """One agent backend as the host sees it.
+class CredentialBinding:
+    """One backend's credential path as it stands under one config.
 
     ``token_env``/``token_host`` are the sbx custom-secret registration
     provisioning makes for the agent sandbox; ``token_hosts`` are the
@@ -66,46 +75,90 @@ class AgentBackend:
     drifts.
     """
 
-    name: str
-    label: str
     token_env: str
     token_host: str
     token_hosts: tuple[str, ...]
-    credential: str
-    create_url: str
     missing_token_detail: str
     missing_token_error: str
+
+    @property
+    def secret(self) -> tuple[str, str]:
+        """The ``(env, host)`` custom-secret registration this binding owns."""
+        return (self.token_env, self.token_host)
+
+
+#: How a backend binds its credential under a config: a constant for a
+#: backend whose host is fixed, a resolver for one that reads it from config.
+Binding = CredentialBinding | Callable[["Config"], CredentialBinding]
+
+
+@dataclass(frozen=True)
+class AgentBackend:
+    """One agent backend as the host sees it.
+
+    Everything about the credential path goes through :meth:`bound` — the
+    config-taking accessors below are the only way to read it, so a caller
+    without a loaded config cannot name a host that may not be knowable
+    without one.
+    """
+
+    name: str
+    label: str
+    credential: str
+    create_url: str
     models_source: str
+    binding: Binding
 
     @property
     def is_default(self) -> bool:
         return self.name == "copilot"
 
-    @property
-    def secret(self) -> tuple[str, str]:
-        """The ``(env, host)`` custom-secret registration this backend owns."""
-        return (self.token_env, self.token_host)
+    def bound(self, config: Config) -> CredentialBinding:
+        """The credential path under ``config``."""
+        if isinstance(self.binding, CredentialBinding):
+            return self.binding
+        return self.binding(config)
 
-    @property
-    def doctor_check_name(self) -> str:
+    def token_env(self, config: Config) -> str:
+        """The env var carrying the agent sandbox's credential."""
+        return self.bound(config).token_env
+
+    def token_host(self, config: Config) -> str:
+        """The host sbx binds the credential to."""
+        return self.bound(config).token_host
+
+    def token_hosts(self, config: Config) -> tuple[str, ...]:
+        """The hosts the credential path must reach."""
+        return self.bound(config).token_hosts
+
+    def secret(self, config: Config) -> tuple[str, str]:
+        """The ``(env, host)`` custom-secret registration this backend owns."""
+        return self.bound(config).secret
+
+    def missing_token_detail(self, config: Config) -> str:
+        """Doctor's row text when the credential is not set."""
+        return self.bound(config).missing_token_detail
+
+    def missing_token_error(self, config: Config) -> str:
+        """Provisioning's failure when the credential is not set."""
+        return self.bound(config).missing_token_error
+
+    def doctor_check_name(self, config: Config) -> str:
         """The credential row's name: bare for the default backend, tagged
         with the backend otherwise so a reader sees *why* it is the row."""
+        token_env = self.token_env(config)
         if self.is_default:
-            return self.token_env
-        return f"{self.token_env} (agent backend: {self.name})"
+            return token_env
+        return f"{token_env} (agent backend: {self.name})"
 
-    def has_token(self, env: dict[str, str]) -> bool:
-        return bool(env.get(self.token_env))
+    def has_token(self, config: Config, env: dict[str, str]) -> bool:
+        return bool(env.get(self.token_env(config)))
 
 
-COPILOT = AgentBackend(
-    name="copilot",
-    label="copilot",
+COPILOT_BINDING = CredentialBinding(
     token_env=COPILOT_TOKEN_ENV,
     token_host=COPILOT_TOKEN_HOST,
     token_hosts=("api.githubcopilot.com", "api.github.com"),
-    credential='a fine-grained PAT with the "Copilot Requests" permission',
-    create_url="https://github.com/settings/personal-access-tokens",
     missing_token_detail=(
         'not set — create a fine-grained PAT with the "Copilot Requests" '
         f"permission and export {COPILOT_TOKEN_ENV}"
@@ -114,17 +167,21 @@ COPILOT = AgentBackend(
         f"{COPILOT_TOKEN_ENV} is not set on the host. Create a fine-grained PAT "
         'with the "Copilot Requests" permission and export it.'
     ),
-    models_source="the SDK",
 )
 
-CLAUDE = AgentBackend(
-    name="claude",
-    label="claude",
+COPILOT = AgentBackend(
+    name="copilot",
+    label="copilot",
+    credential='a fine-grained PAT with the "Copilot Requests" permission',
+    create_url="https://github.com/settings/personal-access-tokens",
+    models_source="the SDK",
+    binding=COPILOT_BINDING,
+)
+
+CLAUDE_BINDING = CredentialBinding(
     token_env=ANTHROPIC_TOKEN_ENV,
     token_host=ANTHROPIC_TOKEN_HOST,
     token_hosts=(ANTHROPIC_TOKEN_HOST,),
-    credential="an Anthropic API key",
-    create_url="https://console.anthropic.com/settings/keys",
     missing_token_detail=(
         "not set — create an Anthropic API key and export "
         f'{ANTHROPIC_TOKEN_ENV}, or switch [agent] backend back to "copilot"'
@@ -134,17 +191,21 @@ CLAUDE = AgentBackend(
         "Create an Anthropic API key and export it, or switch back to "
         'backend = "copilot".'
     ),
-    models_source="the Anthropic Models API",
 )
 
-CODEX = AgentBackend(
-    name="codex",
-    label="codex",
+CLAUDE = AgentBackend(
+    name="claude",
+    label="claude",
+    credential="an Anthropic API key",
+    create_url="https://console.anthropic.com/settings/keys",
+    models_source="the Anthropic Models API",
+    binding=CLAUDE_BINDING,
+)
+
+CODEX_BINDING = CredentialBinding(
     token_env=OPENAI_TOKEN_ENV,
     token_host=OPENAI_TOKEN_HOST,
     token_hosts=(OPENAI_TOKEN_HOST,),
-    credential="an OpenAI API key",
-    create_url="https://platform.openai.com/api-keys",
     missing_token_detail=(
         "not set — create an OpenAI API key and export "
         f'{OPENAI_TOKEN_ENV}, or switch [agent] backend back to "copilot"'
@@ -154,7 +215,15 @@ CODEX = AgentBackend(
         "Create an OpenAI API key and export it, or switch back to "
         'backend = "copilot".'
     ),
+)
+
+CODEX = AgentBackend(
+    name="codex",
+    label="codex",
+    credential="an OpenAI API key",
+    create_url="https://platform.openai.com/api-keys",
     models_source="the Codex SDK",
+    binding=CODEX_BINDING,
 )
 
 #: Every backend ``[agent] backend`` accepts, default first. The config

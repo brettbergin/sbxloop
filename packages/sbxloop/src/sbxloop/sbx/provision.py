@@ -106,8 +106,8 @@ GH_TOKEN_ENVS = ("GH_TOKEN", "GITHUB_TOKEN")
 # per agent backend (#533).
 # The hosts each agent credential path must reach, from the descriptor
 # (#617); kept under their historical names for the doctor rows.
-AGENT_TOKEN_HOSTS = backends.COPILOT.token_hosts
-CLAUDE_TOKEN_HOSTS = backends.CLAUDE.token_hosts
+AGENT_TOKEN_HOSTS = backends.COPILOT_BINDING.token_hosts
+CLAUDE_TOKEN_HOSTS = backends.CLAUDE_BINDING.token_hosts
 
 AGENT_ALLOW_DOMAINS = (
     "api.githubcopilot.com",
@@ -349,7 +349,7 @@ def agent_policy_allows(
             # The repository's own GitHub (#623): github.com is in the
             # constant above; an Enterprise Server host is not.
             *config.github.allow_domains,
-            *backends.backend_for(config).token_hosts,
+            *backends.backend_for(config).token_hosts(config),
             *baseline_allows((*PROMPT_ADVERTISED_DOMAINS, *installers), config.policy.deny),
             # Operator-declared hosts: a private registry the operator
             # configured is reachable like extra_allow_domains is, deny or
@@ -594,21 +594,21 @@ class Provisioner:
 
     def agent_token_env(self) -> str:
         """The env var carrying the agent sandbox's credential."""
-        return self.backend().token_env
+        return self.backend().token_env(self.config)
 
     def agent_token(self) -> str:
         """The chosen agent backend's credential, read from the host env."""
         return self._backend_token(self.backend())
 
     def _backend_token(self, backend: backends.AgentBackend) -> str:
-        token = self.env.get(backend.token_env, "")
+        token = self.env.get(backend.token_env(self.config), "")
         if not token:
-            raise ProvisionError(backend.missing_token_error)
+            raise ProvisionError(backend.missing_token_error(self.config))
         return token
 
     def agent_token_hosts(self) -> tuple[str, ...]:
         """Hosts the agent sandbox's credential path needs (doctor rows)."""
-        return self.backend().token_hosts
+        return self.backend().token_hosts(self.config)
 
     def agent_persistent_env(self, repo: str | None = None) -> dict[str, str]:
         """The plain environment the agent sandbox's worker — and so every
@@ -674,7 +674,7 @@ class Provisioner:
         return {**values, **registries.secret_env(regs, values)}
 
     def _agent_secret_spec(self) -> SecretSpec:
-        env, host = self.backend().secret
+        env, host = self.backend().secret(self.config)
         return SecretSpec(kind="custom", host=host, env=env)
 
     def _agent_secret_specs(self, roles: Sequence[str] | None = None) -> list[SecretSpec]:
@@ -1619,6 +1619,7 @@ class Provisioner:
                 mounted=mounted,
                 languages=languages,
                 service_workdir=service_workdir,
+                config=self.config,
             )
         except Exception as exc:
             log.warning(

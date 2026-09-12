@@ -20,6 +20,7 @@ import time
 from pydantic import BaseModel, ConfigDict
 
 from sbxloop.backends import BACKENDS
+from sbxloop.config import Config
 from sbxloop.engine.model import TERMINAL_RUN_STATES
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, StateError
@@ -199,7 +200,7 @@ def remove_sandbox(cli: SbxCLI, name: str) -> None:
     cli.rm(name, force=True)
 
 
-def remove_run_sandbox_secrets(cli: SbxCLI, name: str, role: SandboxRole) -> None:
+def remove_run_sandbox_secrets(cli: SbxCLI, name: str, role: SandboxRole, config: Config) -> None:
     """Best-effort: unregister the secrets provisioning bound to ``name``.
 
     ``sbx rm`` removes the microVM but not the secret registrations keyed
@@ -210,9 +211,10 @@ def remove_run_sandbox_secrets(cli: SbxCLI, name: str, role: SandboxRole) -> Non
     the Copilot SDK got 401). Agent sandboxes carry the configured
     backend's custom secret — and since the backend may have changed since
     the sandbox was provisioned, every backend's registration is tried
-    (#617); github sandboxes the built-in ``github`` service secret; a
-    service sandbox (#765) registers nothing — its credentials never touch
-    the sbx proxy — so there is nothing to remove.
+    (#617), each as it binds under ``config``; github sandboxes the
+    built-in ``github`` service secret; a service sandbox (#765) registers
+    nothing — its credentials never touch the sbx proxy — so there is
+    nothing to remove.
     """
     if role == "service":
         return
@@ -221,17 +223,18 @@ def remove_run_sandbox_secrets(cli: SbxCLI, name: str, role: SandboxRole) -> Non
             cli.secret_rm(service="github", sandbox=name)
         return
     for backend in BACKENDS:
+        env, host = backend.secret(config)
         with contextlib.suppress(SbxError):
-            cli.secret_rm(host=backend.token_host, env=backend.token_env, sandbox=name)
+            cli.secret_rm(host=host, env=env, sandbox=name)
 
 
-def remove_run_sandbox(cli: SbxCLI, name: str, role: SandboxRole) -> None:
+def remove_run_sandbox(cli: SbxCLI, name: str, role: SandboxRole, config: Config) -> None:
     """Remove a run's sandbox AND its registered secrets — the pair that a
     dead process leaves behind and a re-provision under the same name
     trips over. Sandbox removal errors propagate; secret removal is
     best-effort (registration syntax is not a stable sbx API)."""
     remove_sandbox(cli, name)
-    remove_run_sandbox_secrets(cli, name, role)
+    remove_run_sandbox_secrets(cli, name, role, config)
 
 
 def count_orphans(cli: SbxCLI, store: StateStore) -> int:

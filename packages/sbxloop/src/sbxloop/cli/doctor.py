@@ -1104,7 +1104,7 @@ def collect_checks(
                 )
 
         # network policy reachable for the chosen agent backend's hosts
-        for host in backend_for(config).token_hosts:
+        for host in backend_for(config).token_hosts(config):
             report(f"checking network policy for {host}")
             try:
                 allowed = cli.policy_check(host)
@@ -1247,9 +1247,9 @@ def collect_checks(
     agent = backend_for(config)
     checks.append(
         Check(
-            agent.doctor_check_name,
-            agent.has_token(env),
-            "set" if agent.has_token(env) else agent.missing_token_detail,
+            agent.doctor_check_name(config),
+            agent.has_token(config, env),
+            "set" if agent.has_token(config, env) else agent.missing_token_detail(config),
         )
     )
     checks.extend(registry_credential_checks(config, env))
@@ -1401,8 +1401,8 @@ def collect_checks(
     # will fail" on a host where nothing was wrong. It answers the console
     # too, so the row is not gated on a chat backend.
     if config.concierge.enabled:
-        token_env = agent.token_env
-        has_token = agent.has_token(env)
+        token_env = agent.token_env(config)
+        has_token = agent.has_token(config, env)
         checks.append(
             Check(
                 "chat concierge",

@@ -14,7 +14,7 @@ from sbxloop import backends
 from sbxloop.backends import BACKENDS, CLAUDE, COPILOT, backend_for, backend_named
 from sbxloop.cli import models
 from sbxloop.cli.app import app
-from sbxloop.config import AgentConfig, load_config
+from sbxloop.config import AgentConfig, Config, load_config
 from sbxloop.daemon.discord_format import KNOWN_BACKENDS
 from sbxloop.errors import SbxloopError
 from sbxloop.sbx.cli import SbxCLI
@@ -54,24 +54,39 @@ class TestDescriptor:
 
     def test_copilot_is_the_historical_wording(self) -> None:
         """The copilot deployment must read byte-identical (#617)."""
-        assert COPILOT.doctor_check_name == "COPILOT_GITHUB_TOKEN"
-        assert COPILOT.secret == ("COPILOT_GITHUB_TOKEN", "api.github.com")
-        assert COPILOT.token_hosts == ("api.githubcopilot.com", "api.github.com")
-        assert COPILOT.missing_token_detail == (
+        config = Config()
+        assert COPILOT.doctor_check_name(config) == "COPILOT_GITHUB_TOKEN"
+        assert COPILOT.secret(config) == ("COPILOT_GITHUB_TOKEN", "api.github.com")
+        assert COPILOT.token_hosts(config) == ("api.githubcopilot.com", "api.github.com")
+        assert COPILOT.missing_token_detail(config) == (
             'not set — create a fine-grained PAT with the "Copilot Requests" '
             "permission and export COPILOT_GITHUB_TOKEN"
         )
-        assert COPILOT.missing_token_error == (
+        assert COPILOT.missing_token_error(config) == (
             "COPILOT_GITHUB_TOKEN is not set on the host. Create a fine-grained PAT "
             'with the "Copilot Requests" permission and export it.'
         )
 
     def test_claude_is_tagged_with_its_backend(self) -> None:
-        assert CLAUDE.doctor_check_name == "ANTHROPIC_API_KEY (agent backend: claude)"
-        assert CLAUDE.secret == ("ANTHROPIC_API_KEY", "api.anthropic.com")
-        assert CLAUDE.token_hosts == ("api.anthropic.com",)
-        assert CLAUDE.has_token({"ANTHROPIC_API_KEY": "sk"})
-        assert not CLAUDE.has_token({"COPILOT_GITHUB_TOKEN": "tok"})
+        config = Config.model_validate({"agent": {"backend": "claude"}})
+        assert CLAUDE.doctor_check_name(config) == "ANTHROPIC_API_KEY (agent backend: claude)"
+        assert CLAUDE.secret(config) == ("ANTHROPIC_API_KEY", "api.anthropic.com")
+        assert CLAUDE.token_hosts(config) == ("api.anthropic.com",)
+        assert CLAUDE.has_token(config, {"ANTHROPIC_API_KEY": "sk"})
+        assert not CLAUDE.has_token(config, {"COPILOT_GITHUB_TOKEN": "tok"})
+
+    def test_fixed_host_backends_answer_every_config_the_same(self) -> None:
+        """The SDK-vendor backends bind to a constant host: which backend
+        the config selects does not change what each one says of itself."""
+        for backend in BACKENDS:
+            bindings = {
+                backend.bound(Config.model_validate({"agent": {"backend": name}}))
+                for name in ("copilot", "claude", "codex")
+            }
+            assert len(bindings) == 1
+            (binding,) = bindings
+            assert binding.secret == backend.secret(Config())
+            assert binding.token_host in binding.token_hosts
 
     def test_secretstate_reexports_the_constants(self) -> None:
         from sbxloop.sbx import secretstate
@@ -80,9 +95,11 @@ class TestDescriptor:
         assert secretstate.ANTHROPIC_TOKEN_HOST is backends.ANTHROPIC_TOKEN_HOST
 
     def test_tracked_secrets_follow_the_backend(self, workdir: Path) -> None:
-        assert tracked_custom_secrets(load_config()) == [COPILOT.secret]
+        config = load_config()
+        assert tracked_custom_secrets(config) == [COPILOT.secret(config)]
         claude_config(workdir)
-        assert tracked_custom_secrets(load_config()) == [CLAUDE.secret]
+        config = load_config()
+        assert tracked_custom_secrets(config) == [CLAUDE.secret(config)]
 
 
 class TestDoctor:
@@ -118,12 +135,12 @@ class TestDoctor:
         rows = self._checks({"COPILOT_GITHUB_TOKEN": "tok"}, fake_sbx)
         row = rows["ANTHROPIC_API_KEY (agent backend: claude)"]
         assert not row.ok
-        assert row.detail == CLAUDE.missing_token_detail
+        assert row.detail == CLAUDE.missing_token_detail(load_config())
 
     def test_copilot_rows_are_unchanged(self, workdir: Path, fake_sbx: FakeSbx) -> None:
         rows = self._checks({}, fake_sbx)
         row = rows["COPILOT_GITHUB_TOKEN"]
-        assert not row.ok and row.detail == COPILOT.missing_token_detail
+        assert not row.ok and row.detail == COPILOT.missing_token_detail(load_config())
         assert "copilot sdk permission kinds" in rows
         assert any("api.githubcopilot.com" in name for name in rows)
 

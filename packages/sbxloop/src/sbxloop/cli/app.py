@@ -1473,7 +1473,7 @@ def secrets_rotate(
     """
     try:
         config = load_config()
-        token_env = backend_for(config).token_env
+        token_env = backend_for(config).token_env(config)
         if prompt:
             token = typer.prompt(f"new {token_env}", hide_input=True)
         else:
@@ -1586,7 +1586,7 @@ def sandbox_prune(
                 # A pruned run sandbox takes its secret registrations with
                 # it; otherwise a later run under the same name (resume)
                 # cannot replace them and comes up with the proxy sentinel.
-                remove_run_sandbox(cli, v.name, v.role)  # type: ignore[arg-type]
+                remove_run_sandbox(cli, v.name, v.role, config)  # type: ignore[arg-type]
             else:
                 remove_sandbox(cli, v.name)
         except SbxloopError as exc:

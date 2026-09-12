@@ -86,7 +86,7 @@ def tracked_custom_secrets(config: Config) -> list[tuple[str, str]]:
     sandbox uses sbx's built-in ``github`` service secret, which is never
     managed here).
     """
-    return [backend_for(config).secret]
+    return [backend_for(config).secret(config)]
 
 
 def parsed_scope(stderr: str) -> str | None:
@@ -555,7 +555,7 @@ def rotate_registrations(
                 "(`sbxloop sandbox rm --all`, or the console's Sandboxes screen)",
             )
         )
-    token_env = backend_for(config).token_env
+    token_env = backend_for(config).token_env(config)
     lines.append(
         (
             "warn",
