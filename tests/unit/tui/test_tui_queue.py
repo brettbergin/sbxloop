@@ -17,7 +17,7 @@ from sbxloop.engine.store import StateStore
 from sbxloop.paths import SbxloopHome
 from sbxloop.tui.screens.items import SECTIONS, VERB_STATES, ItemsScreen, median, waited
 from sbxloop.tui.widgets.tables import ConsoleTable
-from tests.unit.tui.conftest import FakeCtl, drive, live_status, make_app
+from tests.unit.tui.conftest import FakeCtl, drive, live_status, make_app, until
 
 DAY = 86400.0
 
@@ -123,7 +123,7 @@ def test_the_queue_groups_by_what_you_would_do(tmp_path: Path) -> None:
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause(1.0)
             await pilot.press("3")
-            await pilot.pause(0.6)
+            await until(pilot, lambda: isinstance(app.screen, ItemsScreen))
             screen = app.screen
             assert isinstance(screen, ItemsScreen)
             counts = {
@@ -153,7 +153,7 @@ def test_a_filter_reaches_past_the_window(tmp_path: Path) -> None:
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause(1.0)
             await pilot.press("3")
-            await pilot.pause(0.6)
+            await until(pilot, lambda: isinstance(app.screen, ItemsScreen))
             screen = app.screen
             assert isinstance(screen, ItemsScreen)
             assert "gh:issue:12" not in [i.item_id for i in screen.shown["parked"]]
@@ -180,7 +180,7 @@ def test_the_footer_offers_only_what_the_row_allows(tmp_path: Path) -> None:
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause(1.0)
             await pilot.press("3")
-            await pilot.pause(0.6)
+            await until(pilot, lambda: isinstance(app.screen, ItemsScreen))
             screen = app.screen
             assert isinstance(screen, ItemsScreen)
             screen.query_one("#waiting", ConsoleTable).focus()
@@ -219,7 +219,7 @@ def test_the_daemon_s_block_is_stated_once_and_the_rows_keep_their_reason(
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause(1.0)
             await pilot.press("3")
-            await pilot.pause(0.6)
+            await until(pilot, lambda: isinstance(app.screen, ItemsScreen))
             screen = app.screen
             assert isinstance(screen, ItemsScreen)
             assert "breaker open" in screen.blocked and "nothing dispatches" in screen.blocked
@@ -240,7 +240,7 @@ def test_a_healthy_daemon_draws_no_banner(tmp_path: Path) -> None:
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause(1.0)
             await pilot.press("3")
-            await pilot.pause(0.6)
+            await until(pilot, lambda: isinstance(app.screen, ItemsScreen))
             screen = app.screen
             assert isinstance(screen, ItemsScreen)
             assert screen.blocked == ""
@@ -259,7 +259,7 @@ def test_j_and_k_cross_a_section_boundary(tmp_path: Path) -> None:
         async with app.run_test(size=(140, 50)) as pilot:
             await pilot.pause(1.0)
             await pilot.press("3")
-            await pilot.pause(0.6)
+            await until(pilot, lambda: isinstance(app.screen, ItemsScreen))
             screen = app.screen
             assert isinstance(screen, ItemsScreen)
             waiting = screen.query_one("#waiting", ConsoleTable)

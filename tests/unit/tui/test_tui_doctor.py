@@ -26,7 +26,7 @@ from sbxloop.tui.screens.secrets import SecretsScreen
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop.tui.widgets.tables import ConsoleTable
 from tests.conftest import FakeSbx
-from tests.unit.tui.conftest import drive, make_app
+from tests.unit.tui.conftest import drive, make_app, until
 
 REFRESH: dict[str, Any] = {"refresh_s": 3.0}
 
@@ -102,7 +102,7 @@ def test_doctor_screen_runs_the_report_and_secrets_clean_behind_a_typed_word(
         app = make_app(host, sbx=SbxCLI(), **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("8")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, DoctorScreen))
             assert isinstance(app.screen, DoctorScreen)
             screen: Any = app.screen
             await _wait(lambda: screen.report is not None, pilot)
@@ -115,7 +115,7 @@ def test_doctor_screen_runs_the_report_and_secrets_clean_behind_a_typed_word(
             # S: the registrations, the stale one flagged; x cleans it
             # after a dry run and the typed word.
             await pilot.press("S")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, SecretsScreen))
             assert isinstance(app.screen, SecretsScreen)
             secrets: Any = app.screen
             await _wait(lambda: bool(secrets.rows), pilot)
@@ -126,7 +126,7 @@ def test_doctor_screen_runs_the_report_and_secrets_clean_behind_a_typed_word(
             await _wait(lambda: isinstance(app.screen, OutcomeScreen), pilot)
             assert "would remove" in app.screen.text
             await pilot.press("escape")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, TypedConfirmScreen))
             assert isinstance(app.screen, TypedConfirmScreen)
             app.screen.query_one("#typed", Input).value = "clean"
             await pilot.press("enter")
@@ -139,7 +139,7 @@ def test_doctor_screen_runs_the_report_and_secrets_clean_behind_a_typed_word(
                 pilot,
             )
             await pilot.press("escape")
-            await pilot.pause(0.3)
+            await until(pilot, lambda: isinstance(app.screen, DoctorScreen))
             assert isinstance(app.screen, DoctorScreen)
 
     drive(scenario)
