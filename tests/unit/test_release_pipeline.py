@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from sbxloop.config import Config
 from tests.fakes.fake_github import FakeGithub
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -289,6 +290,68 @@ def test_deploy_refreshes_after_drain_before_fetch_and_mutation():
     assert "github.workflow_sha" in text
     assert "queue: max" in text
     assert "schedule:" in text  # deferred work is retried even without another merge
+
+
+def test_deploy_notice_overrides_the_channel_through_the_old_notifier_signature(tmp_path):
+    config = Config.model_validate(
+        {
+            "home": str(tmp_path),
+            "mattermost": {
+                "url": "https://mm.example.test",
+                "channel_id": "c" * 26,
+            },
+        }
+    )
+    calls = []
+
+    # This is deliberately the pre-channel-override post_notice signature.
+    def old_post(config, text):
+        calls.append((config, text))
+        return ("mattermost", config.mattermost.channel_ref)
+
+    posted = pipeline.deploy_notice(config, "deploying", "d" * 26, post=old_post)
+
+    assert posted == ("mattermost", "d" * 26)
+    assert len(calls) == 1
+    sent_config, sent_text = calls[0]
+    assert sent_text == "deploying"
+    assert sent_config.mattermost.channel_ref == "d" * 26
+    assert config.mattermost.channel_ref == "c" * 26
+
+
+def test_deploy_notify_command_uses_the_installed_notifier_without_github(
+    tmp_path, monkeypatch, capsys
+):
+    import sbxloop.config as config_module
+    from sbxloop.daemon import notify
+
+    config = Config.model_validate(
+        {
+            "home": str(tmp_path),
+            "mattermost": {
+                "url": "https://mm.example.test",
+                "channel_id": "c" * 26,
+            },
+        }
+    )
+    sent = []
+
+    def old_post(config, text):
+        sent.append((config.mattermost.channel_ref, text))
+        return notify.Posted("mattermost", config.mattermost.channel_ref)
+
+    monkeypatch.setattr(config_module, "load_secrets_env", lambda: None)
+    monkeypatch.setattr(config_module, "load_config", lambda: config)
+    monkeypatch.setattr(notify, "post_notice", old_post)
+    monkeypatch.setattr(sys, "argv", ["release_pipeline.py", "deploy-notify"])
+    monkeypatch.setenv("DEPLOY_NOTICE", "deploying")
+    monkeypatch.setenv("DEPLOY_CHANNEL", "d" * 26)
+    monkeypatch.delenv("GITHUB_REPOSITORY", raising=False)
+
+    pipeline.main()
+
+    assert sent == [("d" * 26, "deploying")]
+    assert capsys.readouterr().out == f"posted to mattermost channel {'d' * 26}\n"
 
 
 @pytest.fixture
