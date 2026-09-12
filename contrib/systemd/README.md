@@ -126,8 +126,12 @@ brings the backend up first.
 `github-runner.service` is **only needed for the automated upgrade above**.
 It runs a GitHub Actions runner as the *same user*, which is what lets a
 workflow do `systemctl --user restart sbxloop-daemon`;
-`sbxloop init --systemd --runner ~/actions-runner` renders it. It carries
-`SBXLOOP_HOME` for the home it was rendered against, so a job on that runner
-upgrades the installation that is there rather than assuming the default.
-Skip it if you upgrade by hand. All three are user units, so
-`loginctl enable-linger` (which init does) covers them.
+`sbxloop init --systemd --runner ~/actions-runner` renders it — with that
+directory's absolute path in `WorkingDirectory=` and `ExecStart=`, and
+`SBXLOOP_HOME` set to the home it was rendered against, so a job on that
+runner upgrades the installation that is there rather than assuming the
+default. That is why the template is never copied by hand. Carry
+`--runner DIR` on every later init on that host, the upgrade one above
+included, or the unit stops being refreshed. Skip all of it if you upgrade
+by hand. All three are user units, so `loginctl enable-linger` (which init
+does) covers them.

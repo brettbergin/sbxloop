@@ -497,6 +497,34 @@ class TestDocsSplit:
         unit = (ROOT / "contrib" / "systemd" / "github-runner.service").read_text()
         assert unit.startswith("# Only needed for the automated upgrade workflow")
 
+    def test_the_guide_renders_the_runner_unit_rather_than_copying_it(
+        self, guide: str, systemd_readme: str
+    ) -> None:
+        """#896: the recipe copied the template — from a relative path that
+        only exists in a source checkout, and without filling in @RUNNER@, so
+        the unit could not start. init renders it for the real directory."""
+        section = guide.split("### The runner", 1)[1].split("\n### ", 1)[0]
+        assert "cp contrib/" not in guide and "~/.config/systemd/user/" not in section
+        assert 'sbxloop init --systemd --no-sbx --runner "$HOME/actions-runner"' in section
+        # init enables, never starts, so the start is its own command.
+        assert "systemctl --user start github-runner" in section
+        assert "--now" not in section
+        # …and the systemd README documents the same flag.
+        assert "sbxloop init --systemd --runner ~/actions-runner" in systemd_readme
+
+    def test_the_documented_command_leaves_no_placeholder_in_the_unit(self, tmp_path: Path) -> None:
+        """The other half of #896: what that command renders is startable."""
+        from sbxloop.homeinit import render_unit
+        from sbxloop.paths import SbxloopHome
+
+        runner = tmp_path / "actions-runner"
+        text = render_unit(
+            "github-runner.service", SbxloopHome(tmp_path / "home"), runner_dir=runner
+        )
+        assert f"WorkingDirectory={runner}" in text
+        assert f"ExecStart={runner}/run.sh" in text
+        assert not re.search(r"@[A-Z]+@", text)
+
     def test_cutover_note_lives_in_the_changelog(self) -> None:
         changelog = (ROOT / "CHANGELOG.md").read_text()
         assert "### 1.0 cutover" in changelog

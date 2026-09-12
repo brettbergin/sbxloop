@@ -26,7 +26,7 @@ from sbxloop.tui.widgets.navrail import (
     NavRail,
     badges,
 )
-from tests.unit.tui.conftest import drive, make_app
+from tests.unit.tui.conftest import drive, make_app, until
 
 REFRESH = {"refresh_s": 3.0}
 
@@ -129,7 +129,7 @@ def test_a_narrow_terminal_hides_the_rail_but_keeps_the_keys(seeded: SbxloopHome
     async def scenario() -> None:
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(70, 24)) as pilot:
-            await pilot.pause(1.0)
+            await until(pilot, lambda: isinstance(app.screen, ConsoleScreen))
             screen = app.screen
             assert isinstance(screen, ConsoleScreen)
             assert screen.has_class("-narrow")
@@ -146,7 +146,7 @@ def test_a_wide_terminal_shows_the_rail(seeded: SbxloopHome) -> None:
     async def scenario() -> None:
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(120, 30)) as pilot:
-            await pilot.pause(1.0)
+            await until(pilot, lambda: isinstance(app.screen, ConsoleScreen))
             screen = app.screen
             assert isinstance(screen, ConsoleScreen)
             assert not screen.has_class("-narrow")
