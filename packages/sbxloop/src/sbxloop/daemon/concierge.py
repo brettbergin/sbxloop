@@ -35,7 +35,7 @@ import hashlib
 import json
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
@@ -141,6 +141,16 @@ CHAT_NAMES: dict[str, str] = {
 }
 
 
+def _sequence(effects: Sequence[Callable[[], None]]) -> Callable[[], None]:
+    """One callable running ``effects`` in order."""
+
+    def run() -> None:
+        for effect in effects:
+            effect()
+
+    return run
+
+
 class ConciergeReply(NamedTuple):
     text: str
     ok: bool = True
@@ -154,6 +164,10 @@ class ConciergeReply(NamedTuple):
     #: tells the concierge to proceed on the stated assumption instead of
     #: dropping the goal (ask, never block).
     pending: PendingFiling | None = None
+    #: An effect a tool promised that must follow the reply, not precede
+    #: it — a restart the daemon would otherwise begin under its own
+    #: answer (#969). The bridge runs it once the reply is posted.
+    after: Callable[[], None] | None = None
 
 
 class SessionHost(Protocol):
@@ -279,6 +293,8 @@ class Concierge:
         # an issue they ask for records them as its requester. Turns run one
         # at a time on the executor, so one slot is enough.
         self._turn_author_id: str | None = None
+        # Effects the turn's tools promised for after the reply (#969).
+        self._turn_after: list[Callable[[], None]] = []
         self._turn_message_id: str | None = None
 
         self.host = host
@@ -366,12 +382,21 @@ class Concierge:
             self._turn_author_id = author_id
             self._turn_via = via
             self._turn_message_id = message_id
+            self._turn_after = []
             try:
-                return self._run_turn(text, author=author, on_tool=on_tool)
+                reply = self._run_turn(text, author=author, on_tool=on_tool)
+            except BaseException:
+                # No reply will be posted, so nothing is waiting on one:
+                # the effects the tools promised still happen.
+                for effect in self._turn_after:
+                    effect()
+                raise
             finally:
                 self._turn_author_id = None
                 self._turn_via = None
                 self._turn_message_id = None
+            after, self._turn_after = self._turn_after, []
+            return reply._replace(after=_sequence(after)) if after else reply
 
         return self._executor.submit(run)
 
@@ -721,9 +746,14 @@ class Concierge:
                         "retry <item> | requeue <item> | merge <item|run> | "
                         "release <item|run> | grant-rounds <run> <n> | "
                         "resume-repo <owner/name> | "
-                        "schedules [pause <name>|resume <name>|remove <name>]. Pass the "
+                        "schedules [pause <name>|resume <name>|remove <name>] | "
+                        "restart [--now]. Pass the "
                         "command line without the prefix. Mutating commands take effect "
-                        "immediately. merge approves a PR parked behind the merge gate; "
+                        "immediately. restart exits the daemon once the current run "
+                        "finishes (--now cancels it first; it is resumable) and its "
+                        "service manager starts it again — it posts why when it is back; "
+                        "a daemon nothing would restart refuses, and says so. "
+                        "merge approves a PR parked behind the merge gate; "
                         "release publishes a workload result the profile held back "
                         "(both only when the person asking clearly wants it). "
                         "schedules lists the stored schedules (cadence, profile, ask, last "
@@ -1261,7 +1291,10 @@ class Concierge:
             self.loop, command, prefix=self._chat.command_prefix, by=by, via="concierge"
         )
         if reply.after is not None:
-            reply.after()
+            # Not here: the model has not composed its answer yet, and a
+            # restart begun now would close the bridge under it. The turn
+            # carries the effect out and the bridge runs it after posting.
+            self._turn_after.append(reply.after)
         text = plain(reply.text)
         if reply.status is not None:
             text += "\n" + _status_detail(reply.status)

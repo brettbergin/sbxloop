@@ -61,6 +61,7 @@ COMMANDS: tuple[str, ...] = (
     "--ask TEXT…|remove <name>|pause <name>|resume <name>]",
     "log [--tail N] [--level LEVEL] [--grep TEXT]",
     "stop",
+    "restart [--now]",
 )
 # Verbs that may talk to the source (GitHub through the ops sandbox —
 # seconds, not milliseconds); a surface with an event loop to protect runs
@@ -422,7 +423,12 @@ def _dispatch(
             f"**breaker:** {'open' if s['breaker_open'] else 'closed'} · **paused:** {s['paused']}",
             f"**holds:** {', '.join(holds) if holds else 'none'}",
         ]
-        if s.get("stopping"):
+        if s.get("restarting"):
+            lines.append(
+                "**restarting:** yes — nothing new is claimed; exits after the current run "
+                "and comes back under its service manager"
+            )
+        elif s.get("stopping"):
             lines.append("**stopping:** yes — nothing new is claimed; exits after the current run")
         if s.get("source_failures"):
             lines.append(
@@ -547,6 +553,37 @@ def _dispatch(
             "this is a restart that drops in-memory holds — `pause` keeps it off work "
             "for good.",
             after=loop.request_stop,
+        )
+    if word == "restart":
+        # A `stop` the supervisor undoes (#969): the same courtesy exit, a
+        # marker for the process that comes back, and a refusal by name
+        # when nothing would start the daemon again.
+        now = args == ["--now"]
+        if args and not now:
+            return CommandReply(
+                "usage: restart [--now] — `--now` cancels the current run first", ok=False
+            )
+        # Lazily: the loop imports nothing from here, and this module must
+        # not pull the whole loop in for one sentence.
+        from sbxloop.daemon.loop import UNSUPERVISED_REFUSAL
+
+        supervisor = loop.supervisor()
+        if supervisor is None:
+            return CommandReply(f"restart refused: {UNSUPERVISED_REFUSAL}.", ok=False)
+        who = by or "operator"
+        head = (
+            "restarting now: the current run is cancelled (resumable — the next start "
+            "recovers it) and the daemon exits; "
+            if now
+            else "restarting: nothing new is claimed; the daemon exits once the current run "
+            "and any landing it is completing finish; "
+        )
+        return CommandReply(
+            head
+            + ("systemd" if supervisor == "systemd" else "its supervisor")
+            + " starts it again and it says so here when it is back. In-memory holds do "
+            "not survive — `pause` first if it should stay off work.",
+            after=lambda: loop.request_restart(by=who, reason="operator restart", now=now),
         )
     if word in ("merge", "approve", "release"):
         # The opt-in merge gate's approval ([landing] merge_gate), or a

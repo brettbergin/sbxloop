@@ -121,6 +121,10 @@ class TestCtlOutcomes:
         ]
         stop = actions.stop_daemon(deps)
         assert stop.confirm == "typed" and stop.typed == "stop" and stop.needs_live
+        restart = actions.restart_daemon(deps)
+        assert restart.confirm == "typed" and restart.typed == "restart" and restart.needs_live
+        assert "finishes the run in flight" in restart.prompt
+        assert "cancels the run in flight" in actions.restart_daemon(deps, now=True).prompt
         assert actions.resume(deps).confirm == "none"
         assert actions.cancel_current(deps).confirm == "yes"
         assert "brett" in actions.cancel_current(deps).prompt

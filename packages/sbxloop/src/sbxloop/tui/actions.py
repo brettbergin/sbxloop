@@ -200,6 +200,26 @@ def stop_daemon(deps: Deps) -> Action:
     )
 
 
+def restart_daemon(deps: Deps, *, now: bool = False) -> Action:
+    """The daemon's own restart (#969): a graceful exit its service manager
+    undoes, with a marker so the next process says why it came back. The
+    unit's `B` restarts from outside and interrupts the run; this one
+    waits for it unless ``now``."""
+    return ctl_action(
+        deps,
+        "restart --now" if now else "restart",
+        title="restart the daemon",
+        confirm="typed",
+        typed="restart",
+        prompt=(
+            "Restart the daemon? It claims nothing new, "
+            + ("cancels the run in flight (resumable), " if now else "finishes the run in flight, ")
+            + "exits, and its service manager starts it again; it says so in the control "
+            "channel when it is back. Refused if nothing would restart it. Type restart to confirm."
+        ),
+    )
+
+
 def cancel_current(deps: Deps, *, retry: bool = False) -> Action:
     cmd = "cancel --retry" if retry else "cancel"
     what = "cancel the current run and queue a fresh one" if retry else "cancel the current run"
