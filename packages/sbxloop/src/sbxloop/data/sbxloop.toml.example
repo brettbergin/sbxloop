@@ -642,6 +642,9 @@ secret_strategy = "proxy"
 # max_consecutive_failures = 3     # circuit breaker ...
 # breaker_cooldown_s = 3600.0      # ... and how long it stays open
 # shutdown_grace_s = 60.0          # keep below systemd TimeoutStopSec
+# supervised = false               # `restart` exits and relies on a service manager to
+#                                  # start the daemon again: systemd is detected; set true
+#                                  # under any other supervisor, else restart is refused
 # Retention for ~/.sbxloop/runs/<run>/ (workspace clones, harvested artifacts):
 # swept on daemon start and daily; `sbxloop gc` for non-daemon use. 0 disables.
 # prune_runs_after_days = 14

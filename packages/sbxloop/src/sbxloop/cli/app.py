@@ -2786,6 +2786,44 @@ def daemon(
             reason=stop_reason,
             uptime_s=round(time.monotonic() - started_at, 1),
         )
+    if loop.restart_pending:
+        _relaunch_daemon(loop)
+
+
+def _relaunch_daemon(loop: Any) -> None:
+    """The restart's second half (#969), after a clean exit. Under systemd
+    the unit's ``Restart=always`` would bring the daemon back on its own
+    after ``RestartSec``; asking for the unit's restart now cuts that wait.
+    ``--no-block`` so the request is queued with systemd before this
+    process is gone (the unit's ``KillMode`` would otherwise take the
+    waiting systemctl with it), and a new session so the exit does not
+    take it down first. Any other supervisor is left to do its own job;
+    a failure to ask is a log line, never a reason to stay up."""
+    from sbxloop.homeinit import UNIT_NAMES
+
+    log = get_logger("sbxloop.daemon")
+    supervisor = loop.supervisor()
+    if supervisor != "systemd":
+        log.info("daemon.restart_awaits_supervisor", supervisor=supervisor)
+        return
+    unit = UNIT_NAMES[0]
+    argv = ["systemctl", "--user", "--no-block", "restart", unit]
+    try:
+        subprocess.Popen(  # nosec B603 - fixed argv, no shell
+            argv,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        log.warning(
+            "daemon.restart_fallback",
+            error=str(exc),
+            hint="the unit's Restart=always starts the daemon again after RestartSec",
+        )
+        return
+    log.info("daemon.restart_relaunch", unit=unit)
 
 
 @app.command()

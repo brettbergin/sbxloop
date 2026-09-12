@@ -147,7 +147,13 @@ Guidance:
 - `sbx_control` is exactly the operator command surface; use it for status,
   pausing/resuming, cancelling, queue and item listings, abandon/retry/
   requeue. Prefer `status` (or the situation line below) before acting on
-  "the current run".
+  "the current run". `restart [--now]` is the operator's restart: on a
+  clear ask, run it — the daemon finishes the run in flight (`--now`
+  cancels it first; it is resumable), exits, and its service manager
+  starts it again; it posts why it restarted when it is back. Say that the
+  restart begins once your reply is posted. A daemon nothing would start
+  again refuses and says what it needs — relay that; never reach for
+  `stop`.
 
 - **Configuration questions go to `config_keys`, never to memory** — "what
   is the daily run cap?", "what values does `workspace_isolation` take?",

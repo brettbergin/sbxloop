@@ -215,6 +215,9 @@ class FakeLoop:
         self.granted: list[tuple[str, int, str | None]] = []
         self.repos: list[dict[str, Any]] = []
         self.resumed_repos: list[tuple[str, str | None]] = []
+        # restart (#969): supervised unless a test says otherwise
+        self.supervisor_kind: str | None = "systemd"
+        self.restarts: list[dict[str, Any]] = []
 
     @property
     def paused(self) -> bool:
@@ -263,6 +266,19 @@ class FakeLoop:
         return True
 
     def request_stop(self) -> None:
+        self.stopped = True
+
+    def supervisor(self) -> str | None:
+        return self.supervisor_kind
+
+    def request_restart(
+        self, *, by: str | None, reason: str, now: bool = False, **fields: Any
+    ) -> None:
+        if self.supervisor() is None:
+            raise ValueError("unsupervised")
+        self.restarts.append({"by": by, "reason": reason, "now": now, **fields})
+        if now:
+            self.cancel_current(by)
         self.stopped = True
 
     # #229 item controls: the real loop wraps DaemonStore; the fake exposes
@@ -738,6 +754,39 @@ class TestBridge:
             idx = control.sent.index("two runs today; `r1` is live")
             assert control.sent_kwargs[idx].get("reference") is msg
             assert control.sent_kwargs[idx].get("mention_author") is False
+        finally:
+            bridge.close()
+
+    @pytest.mark.parametrize("ok", [True, False])
+    def test_a_replys_after_effect_runs_once_the_reply_is_posted(
+        self, tmp_path: Path, ok: bool
+    ) -> None:
+        """A restart the concierge's tool asked for (#969) must not begin
+        under the answer: `reply.after` runs after the send — for an error
+        reply too, since the tool already promised it."""
+        from sbxloop.daemon.concierge import ConciergeReply
+
+        seen_at_effect: list[list[str]] = []
+        concierge = FakeConcierge()
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        bridge.start()
+        try:
+            control = client.channels[42]
+
+            def effect() -> None:
+                seen_at_effect.append(list(control.sent))
+
+            concierge.replies = [
+                ConciergeReply("restarting after this run", after=effect)
+                if ok
+                else ConciergeReply("", ok=False, error="boom", after=effect)
+            ]
+            msg = FakeMessage("<@777> restart", control, mentions=[BOT_USER], mid=901)
+            bridge._handle_message(msg)
+            assert wait_for(lambda: bool(seen_at_effect))
+            (sent_when_effect_ran,) = seen_at_effect
+            expected = "restarting after this run" if ok else "⚠ concierge: boom"
+            assert expected in sent_when_effect_ran
         finally:
             bridge.close()
 
