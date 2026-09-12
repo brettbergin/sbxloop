@@ -46,6 +46,7 @@ from __future__ import annotations
 import re
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, unquote
 
@@ -261,6 +262,15 @@ class FakeGithub(GithubOps):
         self.check_runs_payload: list[dict[str, Any]] = []
         self.workflows_payload: list[dict[str, Any]] = []
         self.workflow_runs_payload: list[dict[str, Any]] = []
+        # Repository release automation uses gh directly, outside a worker.
+        # These are its REST payloads, served by release_request below.
+        self.release_heads: list[str] = ["a" * 40]
+        self.release_tags: list[dict[str, Any]] = []
+        self.release_payloads: list[dict[str, Any]] = []
+        self.release_compare_status = "ahead"
+        self.release_api_error: Exception | None = None
+        self.release_files: dict[tuple[str, str], bytes] = {}
+        self.release_commands: list[tuple[str, ...]] = []
         self.repos_created: list[tuple[str, dict[str, Any]]] = []
         self.contents_written: list[tuple[str, dict[str, Any]]] = []
         self.comments_deleted: list[int] = []
@@ -273,6 +283,60 @@ class FakeGithub(GithubOps):
         self._updates = 0
 
     # -- plumbing ------------------------------------------------------------
+
+    def release_request(self, path: str) -> Any:
+        """GETs used by the release/deploy workflow helper, including pagination."""
+        self.raw_calls.append(("GET", path, None))
+        if self.release_api_error:
+            raise self.release_api_error
+        prefix = f"repos/{self.repo}/"
+        assert path.startswith(prefix), path
+        route = path.removeprefix(prefix)
+        if route == "git/ref/heads/main":
+            sha = (
+                self.release_heads.pop(0) if len(self.release_heads) > 1 else self.release_heads[0]
+            )
+            return {"object": {"sha": sha}}
+        if route.startswith("compare/"):
+            return {"status": self.release_compare_status}
+        resource, _, query = route.partition("?")
+        if resource in ("tags", "releases"):
+            page = int(parse_qs(query).get("page", ["1"])[0])
+            values = self.release_tags if resource == "tags" else self.release_payloads
+            return values[(page - 1) * 100 : page * 100]
+        raise AssertionError(f"release endpoint not modelled: {path}")
+
+    def release_command(self, *args: str) -> str:
+        """The gh release file transport used by workflow staging/retry tests."""
+        self.release_commands.append(args)
+        assert args[:2] == ("gh", "release"), args
+        operation, tag = args[2:4]
+        item = next((r for r in self.release_payloads if r["tag_name"] == tag), None)
+        if operation == "create":
+            assert item is None
+            self.release_payloads.append({"tag_name": tag, "draft": True, "assets": []})
+            return ""
+        assert item is not None
+        if operation == "upload":
+            paths = args[args.index("--repo") + 2 :]
+            for raw in paths:
+                if raw == "--clobber":
+                    continue
+                path = Path(raw)
+                key = (tag, path.name)
+                assert key not in self.release_files or "--clobber" in args
+                self.release_files[key] = path.read_bytes()
+                item["assets"] = [a for a in item["assets"] if a["name"] != path.name]
+                item["assets"].append(
+                    {"name": path.name, "state": "uploaded", "size": path.stat().st_size}
+                )
+            return ""
+        if operation == "download":
+            directory = Path(args[args.index("--dir") + 1])
+            name = args[args.index("--pattern") + 1]
+            (directory / name).write_bytes(self.release_files[tag, name])
+            return ""
+        raise AssertionError(f"release command not modelled: {args}")
 
     @contextmanager
     def _allow_missing(self) -> Iterator[None]:

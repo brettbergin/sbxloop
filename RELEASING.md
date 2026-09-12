@@ -1,102 +1,137 @@
 # Releasing
 
-Releases are **fully automated**. Every merge/push to `main` runs the check
-suite, bumps the patch version, tags it, builds both distributions, and
-publishes them to PyPI — no manual version edits, no release PRs, no tokens.
+Releases are **fully automated and batched**. A merge/push to `main` wakes
+`Release`, which waits for **three minutes without another observed merge**,
+or **thirty minutes from its first observation**, whichever comes first.
+One isolated PR waits for the short quiet window; a burst shares one patch
+version. Runner queueing and release checks add to that time.
+
+A reconciliation run at minutes 13 and 43 catches missed push events and
+changes left behind when a run first finishes an older partial publication.
+Already-published `main` is a no-op. Normal pushes still start their own
+short quiet window without waiting for that schedule.
+
+CI still checks every PR and push to `main`. Each release batch tests its
+own frozen commit before tagging or publishing. Both `sbxloop` and
+`sbxloop-worker` keep the same version; nothing is committed back to `main`.
 
 ## How it works
 
-1. A merge lands on `main` → [`.github/workflows/release.yml`](.github/workflows/release.yml) runs.
-   The run checks out the **current tip of `main`** — not the commit that
-   triggered it — and the release job tags/publishes the exact SHA the check
-   job tested.
-2. The full check suite must pass (ruff, mypy, pytest — the gate).
-3. The workflow finds the latest `vX.Y.Z` tag and computes the next **patch**
-   version (`v0.4.0` → `v0.4.1`). If `HEAD` is already tagged (a manual
-   minor/major bump, or a re-run), that version is released as-is. If `HEAD`
-   is already *contained in* an existing release tag, the run skips releasing
-   entirely rather than stamp old code with a new version.
-4. It creates and pushes the tag. [`hatch-vcs`](https://github.com/ofek/hatch-vcs)
-   derives **both** package versions (`sbxloop`, `sbxloop-worker`) from that
-   one tag, so the lockstep invariant holds by construction and nothing is
-   committed back to `main`.
-5. `uv build` produces the sdist + wheel for each package. The host build hook
+1. [`.github/workflows/release.yml`](.github/workflows/release.yml) observes
+   the current tip of `main`, rather than the triggering event's commit.
+   A changed tip resets the quiet window, never the thirty-minute limit.
+   At the deadline it freezes one SHA. Subsequent merges belong to the next
+   batch. An already published tip exits before waiting or running checks.
+2. The full release suite checks that SHA: formatting, lint, typing,
+   security, and tests with coverage. The release job checks out the same
+   SHA, never a moving branch.
+3. A new batch reserves the next patch tag. An existing reservation whose
+   publication is incomplete is finished first, at its original version
+   and commit, even if `main` has advanced. A latest tag outside `main`'s
+   history fails closed. The tag must resolve to the tested SHA.
+4. `hatch-vcs` derives both versions from the tag. The host build hook
    ([`packages/sbxloop/hatch_build.py`](packages/sbxloop/hatch_build.py))
-   vendors the worker wheel into the host wheel and injects the exact
-   `sbxloop-worker==X.Y.Z` pin into the wheel metadata. A guard step fails the
-   release if the vendored wheel is missing or at the wrong version.
-6. Both distributions are published to PyPI via **Trusted Publishing (OIDC)**
-   (environment `pypi`) and attached to an auto-generated GitHub Release.
+   vendors the matching worker wheel and injects the exact worker pin.
+   The workflow verifies the vendored wheel before publishing.
+5. The two wheels and two source distributions are staged on a draft
+   GitHub Release. `release-manifest.json`, uploaded last, records their
+   SHA-256 hashes, version, and tested commit. PyPI publication cannot
+   start before that marker exists.
+6. Both distributions publish through **Trusted Publishing (OIDC)**.
+   Only after the PyPI uploads succeed does the draft become a published
+   GitHub Release. Publication attestations are attached too.
+7. Every successful workflow uploads a `release-result` artifact containing
+   the version, commit, and whether publication occurred. Deployment reads
+   that exact run's result; it never infers the release from the triggering
+   event's SHA. An explicit no-op causes no upgrade.
 
-Pull requests are tested separately by [`.github/workflows/ci.yml`](.github/workflows/ci.yml)
-across Python 3.13–3.14, so broken code never reaches `main`.
-
-## Release ordering
-
-Tag numeric order is guaranteed to match `main`'s history order — a higher
-version is always a superset of every lower one. Three mechanisms enforce
-this (added after 2026-07-25, when five same-day merges raced and
-v0.5.29–v0.5.32 tagged out of order, leaving PyPI 0.5.32 without a feature
-present in 0.5.31):
-
-- **Serialization** — a `concurrency: release` group with
-  `cancel-in-progress: false` queues runs instead of letting them race.
-  GitHub keeps at most one *pending* run per group (newer pushes supersede
-  older pending runs); that's fine because of the next point.
-- **Tip-of-main releases** — every run checks out and releases the current
-  tip of `main`, never its (possibly stale) trigger commit. A superseded
-  merge simply ships as part of the next run's release.
-- **Ancestor guard** — if the commit to release is already contained in an
-  existing `v*` tag, the run skips tagging and publishing entirely. This
-  makes late re-runs of old, failed, or cancelled runs harmless no-ops.
+A concurrency group with `cancel-in-progress: false` serializes the whole
+release, including batching and validation. `queue: max` keeps a push from
+replacing a pending manual request. Redundant wakeups exit without another
+version when their changes have already shipped. GitHub caps the queue at
+100 pending runs.
 
 ## Everyday use
 
-Just merge to `main`. That's it — a new patch version of both packages ships
-automatically.
+Merge to `main`. The next quiet window publishes one patch version for the
+accumulated changes. To release without the batching delay:
+
+```bash
+gh workflow run release.yml --ref main
+```
+
+This still waits for the serialized release slot and checks. Manual runs
+must target `main`. Deploying an already published version is a separate
+operation that creates no packages:
+
+```bash
+gh workflow run deploy.yml --ref main -f version=X.Y.Z
+```
+
+The deploy workflow waits for the daemon's task to finish, then refreshes
+the selected release unless an explicit version was requested. Automatic
+upgrades have a thirty-minute cooldown; manual deployment bypasses it.
+A periodic reconciliation retries deferred deployments even without another
+merge. See [self-deploy.md](docs/self-deploy.md) for recovery and notices.
+
+## Retrying a failed publication
+
+Re-run `Release`, or dispatch it manually on `main`. A draft carrying the
+manifest reuses its original files and verifies their hashes before upload.
+It never rebuilds that version, including when one package reached PyPI and
+the other did not. Existing uploads are skipped. A draft without a manifest
+was interrupted before PyPI publication could start, so staging can be rebuilt.
+Missing or corrupt files after the marker exists fail closed for repair.
+
+Do not delete or edit reserved tags or staged files to force a retry. A
+legacy incomplete release created before this staging protocol needs manual
+inspection: recover any already published bytes before retrying it. If `main`
+has moved while an older reservation is completed, a queued push or the
+reconciliation schedule releases those later changes. Manual dispatch can
+release them sooner.
 
 ## Cutting a minor or major release
 
-The workflow only auto-bumps the **patch** segment. To move the minor or
-major, tag the **tip of `main`** yourself (the workflow always releases the
-tip, so a tag on an older commit won't be picked up) and run the **Release**
-workflow manually from the Actions tab (`workflow_dispatch`) — it detects
-that `HEAD` is already tagged and publishes that exact version:
+Automatic batches increment the patch segment. To reserve a minor or major
+version, tag the tip of `main` and dispatch `Release` on `main`:
 
 ```bash
-git tag -a v0.5.0 -m "Release v0.5.0"
-git push origin v0.5.0
+git tag -a v2.0.0 -m "Release v2.0.0"
+git push origin v2.0.0
+gh workflow run release.yml --ref main
 ```
 
-(If you skip the manual dispatch, the tag still takes effect on the next
-merge: the workflow continues from the newest tag, so the next release is
-`v0.5.1`.)
+The reserved tag is released at its exact commit. If you omit dispatch,
+the next merge wakes the workflow, which finishes that reservation first.
+A completed release at the selected tip is a no-op, not another publication.
 
-## One-time setup (already done)
+## Setup and policy
 
-- **PyPI Trusted Publishing** is configured for both projects (`sbxloop` and
-  `sbxloop-worker`): repo `brettbergin/sbxloop`, workflow `release.yml`,
-  environment `pypi`. No API token secrets exist or are needed.
-- The workflow pushes tags with the built-in `GITHUB_TOKEN` (granted
-  `contents: write`). If a tag protection rule is ever added, allow `v*` tags
-  to be created by Actions.
+The existing PyPI Trusted Publishers for both projects use repository
+`brettbergin/sbxloop`, workflow `release.yml`, and environment `pypi`.
+Those identities are preserved; no new publication tokens are needed.
+The workflow's `GITHUB_TOKEN` needs `contents: write` to reserve tags and
+stage releases, and `id-token: write` for PyPI Trusted Publishing.
 
-## Versioning notes
+The three-minute quiet window, thirty-minute batching limit, and
+thirty-minute deployment cooldown are repository workflow policy in
+`scripts/release_pipeline.py`; they are not daemon configuration options.
+The generic deployment example remains a standalone PyPI upgrade example.
 
-- Package versions are **not** stored in the repo. `pyproject.toml` declares
-  `dynamic = ["version"]` and hatch-vcs computes the version from git: exactly
-  `X.Y.Z` on a tagged commit, `X.Y.(Z+1).devN` on commits in between.
-- `_version.py` is generated into each package at build/sync time (gitignored)
-  so `sbxloop.__version__` / `sbxloop_worker.__version__` report the real
-  version at runtime, including inside sandboxes.
-- The CHANGELOG is no longer the release trigger; per-release notes are
-  auto-generated on the GitHub Release. Keep using CHANGELOG.md for anything
-  worth narrating beyond commit titles.
+GitHub's [concurrency documentation](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/control-workflow-concurrency)
+describes pending queues. Scheduled reconciliation is best-effort; see
+[workflow scheduling](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule).
 
-## Local sanity check
+## Versioning and local builds
+
+Package versions are not stored in `pyproject.toml`; both packages declare
+`dynamic = ["version"]`. `hatch-vcs` computes `X.Y.Z` on a tagged commit and
+a development version between tags. Generated `_version.py` files are ignored.
+GitHub Release notes cover the batch's commits. Keep CHANGELOG entries for
+changes worth explaining beyond their commit titles.
 
 ```bash
-make build          # versions come from `git describe`; a dev tree -> X.Y.Z.devN
+make build
 uv run sbxloop --version
-unzip -l dist/sbxloop-*.whl | grep _vendor    # worker wheel made it into the host wheel
+unzip -l dist/sbxloop-*.whl | grep _vendor
 ```
