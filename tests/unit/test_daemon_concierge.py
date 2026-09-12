@@ -271,6 +271,7 @@ class TestJobShape:
             "start_entrygraph",
             "create_schedule",
             "delete_schedule",
+            "config_keys",
             # Last, and never gated: it reaches nothing outside the host, and
             # with `available_tools == []` it is this session's only way to
             # read a procedure at all.
@@ -3062,3 +3063,100 @@ class TestSchedules:
     def test_the_tools_are_offered(self, tmp_path: Path) -> None:
         concierge, _, _, _, _ = make(tmp_path, [], config=self.PROFILES)
         assert {"create_schedule", "delete_schedule"} <= set(concierge.tool_names)
+
+
+class TestConfigKeys:
+    """`config_keys` (#970): the configuration as resolved from the
+    operator's file on disk, sections first, cards by prefix, addressed by
+    repository — read-only, bounded, and never a repr."""
+
+    TWO: ClassVar[dict[str, Any]] = {
+        "github": {"repos": [{"repo": "owner/one"}, {"repo": "owner/two"}]}
+    }
+
+    @staticmethod
+    def _write(concierge: Concierge, text: str) -> None:
+        path = concierge.config.paths.config_toml
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def _run(self, tmp_path: Path, args: dict[str, Any], **make_kw: Any) -> str:
+        concierge, client, *_ = make(tmp_path, [{"calls": [("config_keys", args)]}], **make_kw)
+        self._write(concierge, "[daemon]\nmax_runs_per_day = 20\n")
+        turn(concierge, "config?")
+        (resp,) = client.responses
+        assert resp.ok
+        return resp.text
+
+    def test_no_arguments_lists_the_sections(self, tmp_path: Path) -> None:
+        text = self._run(tmp_path, {})
+        assert "sections (ask for one by prefix)" in text
+        (daemon,) = [line for line in text.splitlines() if line.startswith("- `daemon`")]
+        assert "1 set in the operator's file" in daemon
+
+    def test_a_prefix_gives_cards_with_layer_and_applies(self, tmp_path: Path) -> None:
+        text = self._run(tmp_path, {"prefix": "daemon.max_runs_per_day"})
+        assert text.startswith("`daemon.max_runs_per_day` = 20 · set by home config · accepts int")
+        assert "applies restart" in text and "calendar-day cap" in text
+        live = self._run(tmp_path, {"prefix": "agent.models.build"})
+        assert "applies live" in live and "set by default" in live
+        never = self._run(tmp_path, {"prefix": "concierge.enabled"})
+        assert "never from chat: it is the concierge's own switch" in never
+
+    def test_grep_finds_by_name_or_description(self, tmp_path: Path) -> None:
+        text = self._run(tmp_path, {"grep": "calendar-day"})
+        assert text.startswith("`daemon.max_runs_per_day`") and "\n`" not in text
+        assert self._run(tmp_path, {"grep": "no such thing"}).startswith(
+            "no key mentions 'no such thing' — call with no arguments"
+        )
+        assert self._run(tmp_path, {"prefix": "nowhere"}).startswith("no key under `nowhere`")
+
+    def test_a_repository_is_addressed_by_name_not_index(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("config_keys", {"repo": "owner/two", "prefix": "repo"}),
+                        ("config_keys", {"repo": "two", "prefix": "agent_models.build"}),
+                        ("config_keys", {"repo": "owner/nope"}),
+                    ]
+                }
+            ],
+            config=self.TWO,
+        )
+        self._write(
+            concierge,
+            '[[github.repos]]\nrepo = "owner/one"\n[[github.repos]]\nrepo = "owner/two"\n',
+        )
+        turn(concierge, "what's the base for two?")
+        by_full, by_name, unknown = client.responses
+        assert by_full.text.startswith("`github.repos[1].repo` = owner/two · set by home config")
+        assert by_name.text.startswith("`github.repos[1].agent_models.build` =")
+        assert "applies live" in by_name.text
+        assert unknown.text == (
+            "unknown repository 'owner/nope' — configured repositories: owner/one, owner/two"
+        )
+
+    def test_a_long_listing_is_cut_on_a_card_and_says_so(self, tmp_path: Path) -> None:
+        text = self._run(
+            tmp_path, {"prefix": "daemon"}, config={"concierge": {"max_tool_result_chars": 1000}}
+        )
+        assert len(text) <= 1000
+        assert "more — narrow the prefix or add grep" in text
+        assert "'" not in text.split("\n")[0]  # values, not reprs
+
+    def test_it_reads_the_file_on_disk_not_the_process_copy(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(
+            tmp_path,
+            [{"calls": [("config_keys", {"prefix": "daemon.max_runs_per_day"})]}],
+        )
+        self._write(concierge, "[daemon]\nmax_runs_per_day = 7\n")
+        turn(concierge, "cap?")
+        (resp,) = client.responses
+        assert "= 7 · set by home config" in resp.text
+        assert concierge.config.daemon.max_runs_per_day == 12  # the process still holds the default
+
+    def test_the_tool_is_offered(self, tmp_path: Path) -> None:
+        concierge, *_ = make(tmp_path, [])
+        assert "config_keys" in concierge.tool_names

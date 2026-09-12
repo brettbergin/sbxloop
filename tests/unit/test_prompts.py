@@ -356,6 +356,10 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "thread" in text and "not here" in text
     assert "Never claim to have done something you did not do" in text
     assert "!sbx" in text  # the configured prefix reaches the model
+    # configuration is read through the tool, never recalled
+    assert "**Configuration questions go to `config_keys`, never to memory**" in text
+    assert "name the layer that set it" in text and "**never from chat**" in text
+    assert "The tool reads; it changes nothing." in text
     # intake is one hop: the issue is filed with the trigger label and runs
     assert "`sbxloop:run`" in text
     assert "`create_issue`, **one call, no confirmation**" in text

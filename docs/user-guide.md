@@ -1589,6 +1589,15 @@ Watching a run that has already finished answers with the outcome
 immediately instead of registering. Watches are **persisted** in the daemon state: they are
 reloaded at startup, so a watch registered before a daemon restart still
 pings you when the run lands.
+Ask "what is the daily run cap?", "what values does `merge_method` take?"
+or "what can you change?" and `config_keys` answers from the operator's
+`config/sbxloop.toml` as it is on disk, every other layer applied — never
+from memory: the sections first (how many keys, how many the file sets),
+then one card per key with its value, the layer that set it, what it
+accepts, whether a change applies live or at the daemon's next start, and
+what it is for. A key of one repository is addressed by `owner/name`. The
+chat sections and the concierge's own switches are marked *never from
+chat*. The tool is read-only; changing a key from chat is its own feature.
 
 It finishes triage too: "reply on #12 that we're waiting on upstream"
 posts a comment signed with your name, and "close #12 as a duplicate of
