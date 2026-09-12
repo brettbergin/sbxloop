@@ -360,6 +360,11 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "**Configuration questions go to `config_keys`, never to memory**" in text
     assert "name the layer that set it" in text and "**never from chat**" in text
     assert "The tool reads; it changes nothing." in text
+    # #969: the restart is an operator verb it may run; it never reaches for stop
+    assert "`restart [--now]` is the operator's restart" in text
+    assert (
+        "restart begins once your reply is posted" in text and "never reach for\n  `stop`" in text
+    )
     # intake is one hop: the issue is filed with the trigger label and runs
     assert "`sbxloop:run`" in text
     assert "`create_issue`, **one call, no confirmation**" in text

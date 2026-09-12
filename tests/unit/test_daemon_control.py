@@ -239,6 +239,50 @@ class TestDispatch:
         (reply_path,) = server.dir.glob("*.reply.json")
         assert json.loads(reply_path.read_text())["ok"]
 
+    def test_restart_is_a_stop_the_supervisor_undoes(self, tmp_path: Path) -> None:
+        """`restart` (#969): the reply first, the exit through `after`, and a
+        marker for the process that comes back. `--now` cancels the run in
+        flight first; anything else after the verb is a usage error."""
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        reply = dispatch(floop, "restart", by="ops")
+        assert reply.ok and not getattr(floop, "stopped", False)
+        assert "exits once the current run" in reply.text
+        assert "systemd starts it again" in reply.text and "when it is back" in reply.text
+        assert reply.after is not None
+        reply.after()
+        assert floop.stopped and floop.cancelled == 0
+        assert floop.restarts == [{"by": "ops", "reason": "operator restart", "now": False}]
+
+        now_loop = FakeLoop(_dstore(SbxloopHome(tmp_path / "now")))
+        reply = dispatch(now_loop, "restart --now", by="ops")
+        assert reply.ok and "current run is cancelled" in reply.text
+        assert reply.after is not None
+        reply.after()
+        assert now_loop.cancelled == 1 and now_loop.stopped
+        assert now_loop.restarts[0]["now"] is True
+
+        assert not dispatch(floop, "restart later").ok
+        assert "usage: restart [--now]" in dispatch(floop, "restart later").text
+
+    def test_restart_is_refused_when_nothing_would_start_the_daemon_again(
+        self, tmp_path: Path
+    ) -> None:
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        floop.supervisor_kind = None
+        reply = dispatch(floop, "restart", by="ops")
+        assert not reply.ok and reply.after is None
+        assert reply.text.startswith("restart refused:")
+        assert "`[daemon] supervised = true`" in reply.text and "`stop`" in reply.text
+        assert not getattr(floop, "stopped", False) and not getattr(floop, "restarts", [])
+
+    def test_status_says_a_restart_is_pending(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        plain_status = floop.status
+        floop.status = lambda: {**plain_status(), "stopping": True, "restarting": True}  # type: ignore[method-assign]
+        text = dispatch(floop, "status").text
+        assert "**restarting:** yes" in text and "comes back" in text
+        assert "**stopping:**" not in text
+
     def test_unknown_verb_returns_usage_with_the_callers_prefix(self, tmp_path: Path) -> None:
         reply = dispatch(
             FakeLoop(_dstore(SbxloopHome(tmp_path))), "bogus", prefix="sbxloop daemon ctl"
@@ -249,7 +293,7 @@ class TestDispatch:
             "sbxloop daemon ctl status|pause [--hold NAME]|resume [<item|run>|--hold NAME|--all]|"
             "cancel [<item|run>|--retry]|queue|items|" in reply.text
         )
-        assert "log [--tail N] [--level LEVEL] [--grep TEXT]|stop" in reply.text
+        assert "log [--tail N] [--level LEVEL] [--grep TEXT]|stop|restart [--now]" in reply.text
 
     def test_cancel_rejects_unknown_arguments(self, tmp_path: Path) -> None:
         # A typo (`--rety`) must not silently become a terminal no-retry
