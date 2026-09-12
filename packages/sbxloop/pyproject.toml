@@ -26,7 +26,7 @@ dependencies = [
     # (hatch_build.py) adds the exact lockstep pin `sbxloop-worker==X.Y.Z`
     # to the wheel metadata at build time.
     "sbxloop-worker",
-    "gitpython>=3.1.59",
+    "gitpython>=3.1.62",
     "structlog>=24.1",
     # Optional host error reporting is dormant until the operator supplies a DSN.
     "sentry-sdk>=2.68.0,<3",
