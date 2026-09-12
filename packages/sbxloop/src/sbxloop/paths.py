@@ -6,7 +6,7 @@ Every path sbxloop reads or writes on the host hangs off one directory,
     ~/.sbxloop/
     ├── bin/         sbxloop, sbx      launchers; no secrets in them
     ├── venv/                          the interpreter and the packages
-    ├── config/      sbxloop.toml, secrets.env (0600), github-app.pem (0600)
+    ├── config/      sbxloop.toml, secrets.env, github-app.pem (private)
     ├── state/       state.db, bake.json, conformance/, daemon/{ctl,…}, gc-pending/
     ├── runs/        <run_id>/{workspace,artifacts,data}
     ├── workspaces/  <owner>/<repo>    dedicated clones the daemon refreshes
@@ -29,6 +29,11 @@ process. A path that is not derived from :class:`SbxloopHome` is a bug.
 second daemon on the same host is a second home. Nothing here resolves
 the working directory: the daemon's ``WorkingDirectory`` is the home, and
 the run commands answer the same from any directory.
+
+The shape above is the same on every host. Two details are not, and both
+are the *host's* operating system, never the sandbox guest's: where a
+virtualenv puts its entry points, and how a private file is made private —
+see :attr:`SbxloopHome.os_name` and :mod:`sbxloop.hostfiles`.
 """
 
 from __future__ import annotations
@@ -47,6 +52,10 @@ from pydantic import BaseModel, ConfigDict
 HOME_ENV = "SBXLOOP_HOME"
 #: The default home, under the user's home directory.
 HOME_DIRNAME = ".sbxloop"
+#: Where the user's home directory is named, in the order consulted. POSIX
+#: sets ``HOME``; a native Windows session sets ``USERPROFILE`` instead and
+#: may set neither ``HOME`` nor the older ``HOMEDRIVE``/``HOMEPATH`` pair.
+USER_HOME_ENV = ("HOME", "USERPROFILE")
 #: Bumped when the on-disk layout changes shape; ``home.json`` records the
 #: version a home was laid out with so a later ``sbxloop init`` can migrate.
 LAYOUT_VERSION = 1
@@ -59,16 +68,42 @@ PRIVATE_DIR_MODE = 0o700
 DIR_MODE = 0o755
 
 
+def user_home_from_env(env: Mapping[str, str]) -> Path | None:
+    """The user's home directory ``env`` names, or None when it names none.
+
+    ``HOME`` is the POSIX answer. A native Windows session need not set it
+    at all — there the user directory is ``USERPROFILE``, or the older
+    ``HOMEDRIVE`` + ``HOMEPATH`` pair — which is why an environment-only
+    lookup for ``HOME`` alone found no home on Windows while
+    :func:`resolve_home_root` fell back to one, and a host read its config
+    and secrets from a different place than it ran from.
+
+    None is the hermetic case, kept deliberately: a caller that passed an
+    environment naming none of these (tests, embedders) must not reach the
+    real user's home, so this never falls back to ``Path.home()``.
+    """
+    for name in USER_HOME_ENV:
+        value = env.get(name, "").strip()
+        if value:
+            return Path(value)
+    drive = env.get("HOMEDRIVE", "").strip()
+    tail = env.get("HOMEPATH", "").strip()
+    if drive and tail:
+        return Path(drive + tail)
+    return None
+
+
 def home_root_from_env(env: Mapping[str, str]) -> Path | None:
-    """The home ``env`` names: ``$SBXLOOP_HOME``, else ``$HOME/.sbxloop``,
-    else None — the hermetic case, for a caller that passed an environment
-    naming neither (tests, embedders) and must not touch the real home."""
+    """The home ``env`` names: ``$SBXLOOP_HOME``, else ``<user home>/.sbxloop``
+    (see :func:`user_home_from_env`), else None — the hermetic case, for a
+    caller that passed an environment naming neither (tests, embedders) and
+    must not touch the real home."""
     raw = env.get(HOME_ENV, "").strip()
     if raw:
         return _expand(raw, env)
-    home = env.get("HOME", "").strip()
-    if home:
-        return Path(home) / HOME_DIRNAME
+    home = user_home_from_env(env)
+    if home is not None:
+        return home / HOME_DIRNAME
     return None
 
 
@@ -84,8 +119,8 @@ def _expand(raw: str, env: Mapping[str, str]) -> Path:
     value is anchored at the current directory once, here, so it cannot
     drift with a later chdir."""
     if raw == "~" or raw.startswith("~/"):
-        home = env.get("HOME", "").strip() or str(Path.home())
-        raw = home + raw[1:]
+        home = user_home_from_env(env) or Path.home()
+        raw = str(home) + raw[1:]
     return Path(raw).resolve()
 
 
@@ -104,9 +139,29 @@ class HomeRecord(BaseModel):
 
 @dataclass(frozen=True)
 class SbxloopHome:
-    """Every host path, derived from the one root."""
+    """Every host path, derived from the one root.
+
+    Two things about the tree depend on the *host's* operating system: where
+    a virtualenv puts its entry points (``bin/`` on POSIX, ``Scripts/`` on
+    Windows) and whether an executable carries a suffix. ``os_name`` — as
+    :data:`os.name` spells it, ``"nt"`` or ``"posix"`` — decides both, and
+    nothing else here turns on it. It is *only* the host: a sandbox guest is
+    Linux whatever the host is, and the guest paths (``/home/agent`` and
+    friends) are constants elsewhere. Pass it to lay out, or assert about,
+    the other platform's home from a test.
+    """
 
     root: Path
+    os_name: str = os.name
+
+    @property
+    def windows(self) -> bool:
+        """Whether this home is laid out for a native Windows host."""
+        return self.os_name == "nt"
+
+    def exe(self, name: str) -> str:
+        """``name`` as an executable file is spelled on this host."""
+        return f"{name}.exe" if self.windows else name
 
     # -- the tree -------------------------------------------------------------
 
@@ -166,19 +221,31 @@ class SbxloopHome:
 
     @property
     def launcher(self) -> Path:
-        return self.bin / "sbxloop"
+        """The command that binds a shell to this home. A ``.cmd`` on
+        Windows: a ``#!/bin/sh`` file under that name is not something cmd
+        or PowerShell can run."""
+        return self.bin / ("sbxloop.cmd" if self.windows else "sbxloop")
 
     @property
     def sbx_launcher(self) -> Path:
+        """The wrapper around the home's own ``sbx``. There is no native
+        Windows ``sbx`` to wrap (:mod:`sbxloop.hostos`), so this path is
+        written only on a host that can boot sandboxes."""
         return self.bin / "sbx"
 
     @property
+    def venv_bin(self) -> Path:
+        """The venv's entry points: ``Scripts`` on Windows — what ``uv venv``
+        and the stdlib ``venv`` create there — ``bin`` everywhere else."""
+        return self.venv / ("Scripts" if self.windows else "bin")
+
+    @property
     def venv_python(self) -> Path:
-        return self.venv / "bin" / "python"
+        return self.venv_bin / self.exe("python")
 
     @property
     def venv_sbxloop(self) -> Path:
-        return self.venv / "bin" / "sbxloop"
+        return self.venv_bin / self.exe("sbxloop")
 
     @property
     def config_toml(self) -> Path:
@@ -243,7 +310,7 @@ class SbxloopHome:
     @property
     def uv(self) -> Path:
         """The uv the home installs and updates itself with."""
-        return self.bin / "uv"
+        return self.bin / self.exe("uv")
 
     @property
     def python(self) -> Path:
@@ -257,7 +324,7 @@ class SbxloopHome:
 
     @property
     def sbx_binary(self) -> Path:
-        return self.sbx_prefix / "bin" / "sbx"
+        return self.sbx_prefix / "bin" / self.exe("sbx")
 
     @property
     def sbx_version_file(self) -> Path:
@@ -373,7 +440,7 @@ def legacy_paths(
     is exactly what the home ends.
     """
     found: list[LegacyPath] = []
-    user_home = Path(env.get("HOME", "").strip() or str(Path.home()))
+    user_home = user_home_from_env(env) or Path.home()
     xdg_config = env.get("XDG_CONFIG_HOME", "").strip()
     xdg_state = env.get("XDG_STATE_HOME", "").strip()
     config_root = Path(xdg_config) if xdg_config else user_home / ".config"
@@ -411,6 +478,7 @@ __all__ = [
     "HOME_RECORD",
     "LAYOUT_VERSION",
     "PRIVATE_DIR_MODE",
+    "USER_HOME_ENV",
     "HomeRecord",
     "LegacyPath",
     "SbxloopHome",
@@ -418,4 +486,5 @@ __all__ = [
     "home_root_from_env",
     "legacy_paths",
     "resolve_home_root",
+    "user_home_from_env",
 ]

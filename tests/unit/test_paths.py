@@ -16,6 +16,7 @@ from sbxloop.paths import (
     home_root_from_env,
     legacy_paths,
     resolve_home_root,
+    user_home_from_env,
 )
 
 
@@ -29,6 +30,40 @@ class TestRoot:
 
     def test_hermetic_mapping_names_no_home(self) -> None:
         assert home_root_from_env({}) is None
+        assert user_home_from_env({}) is None
+
+    def test_a_windows_session_names_its_home_as_userprofile(self, tmp_path: Path) -> None:
+        """#899: a native Windows session need not set HOME at all. The
+        environment-only lookup used to find no home there while
+        `resolve_home_root` fell back to one, so the process ran out of one
+        home and read its config and secrets out of another."""
+        profile = tmp_path / "Users" / "Ada"
+        env = {"USERPROFILE": str(profile)}
+        assert user_home_from_env(env) == profile
+        assert home_root_from_env(env) == profile / ".sbxloop"
+        assert resolve_home_root(env) == home_root_from_env(env)
+
+    def test_a_home_with_spaces_in_it_survives(self, tmp_path: Path) -> None:
+        profile = tmp_path / "Users" / "Ada Lovelace"
+        assert home_root_from_env({"USERPROFILE": str(profile)}) == profile / ".sbxloop"
+        assert home_root_from_env({HOME_ENV: str(profile / "loop")}) == (profile / "loop").resolve()
+
+    def test_the_older_homedrive_homepath_pair_is_read_too(self, tmp_path: Path) -> None:
+        env = {"HOMEDRIVE": str(tmp_path), "HOMEPATH": "/Users/Ada"}
+        assert user_home_from_env(env) == tmp_path / "Users" / "Ada"
+
+    def test_posix_home_wins_over_userprofile(self, tmp_path: Path) -> None:
+        """A WSL2 distribution can carry both; HOME is the host it is."""
+        env = {"HOME": str(tmp_path / "wsl"), "USERPROFILE": str(tmp_path / "win")}
+        assert user_home_from_env(env) == tmp_path / "wsl"
+
+    def test_sbxloop_home_still_wins_over_userprofile(self, tmp_path: Path) -> None:
+        env = {HOME_ENV: str(tmp_path / "explicit"), "USERPROFILE": str(tmp_path / "win")}
+        assert home_root_from_env(env) == (tmp_path / "explicit").resolve()
+
+    def test_tilde_expands_against_userprofile_too(self, tmp_path: Path) -> None:
+        env = {HOME_ENV: "~/loop", "USERPROFILE": str(tmp_path)}
+        assert home_root_from_env(env) == (tmp_path / "loop").resolve()
 
     def test_tilde_expands_against_the_mapped_home(self, tmp_path: Path) -> None:
         env = {HOME_ENV: "~/loop", "HOME": str(tmp_path)}
@@ -121,6 +156,69 @@ class TestLayout:
         assert SbxloopHome(tmp_path).as_env() == {HOME_ENV: str(tmp_path)}
 
 
+class TestHostExecutables:
+    """#899: where a venv puts its entry points, and whether an executable
+    carries a suffix, is the *host's* platform — not the sandbox guest's."""
+
+    def test_a_posix_home_keeps_the_layout_it_had(self, tmp_path: Path) -> None:
+        home = SbxloopHome(tmp_path, os_name="posix")
+        assert not home.windows
+        assert home.venv_python == tmp_path / "venv" / "bin" / "python"
+        assert home.venv_sbxloop == tmp_path / "venv" / "bin" / "sbxloop"
+        assert home.uv == tmp_path / "bin" / "uv"
+        assert home.sbx_binary == tmp_path / "sbx" / "bin" / "sbx"
+        assert home.launcher == tmp_path / "bin" / "sbxloop"
+
+    def test_a_windows_home_uses_scripts_and_exe(self, tmp_path: Path) -> None:
+        home = SbxloopHome(tmp_path, os_name="nt")
+        assert home.windows
+        assert home.venv_bin == tmp_path / "venv" / "Scripts"
+        assert home.venv_python == tmp_path / "venv" / "Scripts" / "python.exe"
+        assert home.venv_sbxloop == tmp_path / "venv" / "Scripts" / "sbxloop.exe"
+        assert home.uv == tmp_path / "bin" / "uv.exe"
+        assert home.sbx_binary == tmp_path / "sbx" / "bin" / "sbx.exe"
+
+    def test_the_windows_launcher_is_a_cmd_file(self, tmp_path: Path) -> None:
+        """A `#!/bin/sh` file named `bin\\sbxloop` is not something cmd or
+        PowerShell can run, so the entry point is named for what it is."""
+        assert SbxloopHome(tmp_path, os_name="nt").launcher == tmp_path / "bin" / "sbxloop.cmd"
+
+    def test_nothing_else_in_the_tree_moves(self, tmp_path: Path) -> None:
+        posix = SbxloopHome(tmp_path, os_name="posix")
+        windows = SbxloopHome(tmp_path, os_name="nt")
+        for name in ("config_toml", "secrets_env", "state_db", "runs", "logs", "tmp", "record"):
+            assert getattr(posix, name) == getattr(windows, name), name
+        assert posix.directories == windows.directories
+
+    def test_a_home_defaults_to_this_process_platform(self, tmp_path: Path) -> None:
+        assert SbxloopHome(tmp_path).os_name == os.name
+
+    @pytest.mark.windows_host
+    def test_every_command_can_load_a_config_on_this_host(self, tmp_path: Path) -> None:
+        """`daemon.run_cap_timezone` defaults to "UTC" and is validated on
+        every `load_config()` through `zoneinfo`, which reads the *system*
+        tz database — and Windows ships none. Without the `tzdata`
+        dependency every command there, `doctor` and `config` included,
+        failed with "must be a valid IANA timezone, got 'UTC'" (found by the
+        windows-host CI job)."""
+        from zoneinfo import ZoneInfo
+
+        assert ZoneInfo("UTC") is not None
+        assert load_config(cwd=tmp_path, env={}).daemon.run_cap_timezone == "UTC"
+
+    @pytest.mark.windows_host
+    @pytest.mark.slow
+    def test_a_real_venv_puts_its_interpreter_where_this_host_says(self, tmp_path: Path) -> None:
+        """The claim that decides every interpreter path, checked against a
+        venv this interpreter actually built — the one thing a table of
+        expected paths cannot settle for the host it is running on."""
+        import venv
+
+        home = SbxloopHome(tmp_path / "h")
+        venv.create(home.venv, with_pip=False)
+        assert home.venv_python.is_file(), sorted(p.name for p in home.venv_bin.iterdir())
+
+
 class TestConfigHome:
     """``Config.home`` comes from the environment, never from a file."""
 
@@ -180,6 +278,20 @@ class TestConfigHome:
         config, sources = load_config_with_sources(cwd=project, env={"HOME": str(tmp_path)})
         assert config.model == "from-project" and sources["model"] == "sbxloop.toml"
         assert config.budgets.max_tasks == 3
+
+    def test_a_windows_session_reads_the_home_config_it_runs_out_of(self, tmp_path: Path) -> None:
+        """#899: config discovery and home resolution have to agree on a
+        host with no Unix ``HOME``, or the operator edits one file and the
+        daemon reads another."""
+        profile = tmp_path / "Users" / "Ada"
+        home = SbxloopHome(profile / ".sbxloop")
+        home.config.mkdir(parents=True, exist_ok=True)
+        home.config_toml.write_text('model = "from-userprofile"\n')
+        project = tmp_path / "proj"
+        project.mkdir()
+        config, sources = load_config_with_sources(cwd=project, env={"USERPROFILE": str(profile)})
+        assert config.home == home.root
+        assert config.model == "from-userprofile" and sources["model"] == "home config"
 
     def test_hermetic_mapping_reads_no_home_config(self, tmp_path: Path) -> None:
         home = SbxloopHome(tmp_path / ".sbxloop")

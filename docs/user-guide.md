@@ -467,6 +467,30 @@ naming the WSL2 path before writing any state, and `sbxloop doctor`'s
 first row (`host`) says the same. The read-only commands still answer so
 the refusal can be diagnosed from the host itself.
 
+What a **native Windows** host does support, precisely, is that diagnosis
+— and nothing beyond it:
+
+- **The home resolves from `USERPROFILE`.** A Windows session need not set
+  a Unix `HOME`, so the home, `config\sbxloop.toml` and `config\secrets.env`
+  are all found from `%USERPROFILE%\.sbxloop` (or `%HOMEDRIVE%%HOMEPATH%`).
+  `SBXLOOP_HOME` overrides it as it does anywhere, spaces in the path and
+  all. `doctor`, `config` and `logs` therefore read the same home the
+  process runs out of, which is what makes the refusal legible.
+- **`sbxloop init` writes a `bin\sbxloop.cmd`, not a shell script**, and
+  points it at `venv\Scripts\sbxloop.exe`. It writes no `bin\sbx`
+  wrapper: there is no native Windows `sbx` for one to stand in front of,
+  and `init` says so in its notes.
+- **Secrets are private by ACL, not by mode.** `chmod 600` does nothing on
+  Windows — a file written that way still reports `0666` — so
+  `config\secrets.env` is restricted with `icacls` and doctor's
+  `secrets file` row reads the ACL back. A host whose ACL could not be
+  read **fails** that row saying so, rather than passing a file it could
+  not vouch for.
+- **`sbxloop init --sbx` is not supported.** The sbx installer and its
+  release assets are POSIX (`install.sh`, `.tar.gz`); installing the
+  sandbox runtime natively is the WSL2 path above. The agent backends
+  themselves are not the constraint here — the sandbox layer is.
+
 ## How a run works
 
 ```

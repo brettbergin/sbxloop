@@ -1399,6 +1399,20 @@ the sbx install without `mkfs.ext4`, to refuse `--systemd` where no user manager
 and to read lingering back before recording it; `doctor` shows the same capabilities as
 rows, scoped to the platform and to the mode the home was installed in.
 
+The shape is the same on every host; two details are the **host's** operating
+system, never the sandbox guest's (a guest is Linux whatever the host is, and
+`/home/agent` and friends are constants elsewhere). `SbxloopHome.os_name`
+decides where the venv keeps its entry points (`bin/` against `Scripts/`) and
+whether an executable carries a suffix, and it is the only thing in the tree
+that varies; `sbxloop.hostfiles` decides how a private file is made private —
+a mode on POSIX, a discretionary ACL through `icacls` on Windows, where
+`chmod` sets no mode at all. Both answer three-valued where they must: a
+privacy check that could not read a host's access control reports *could not
+tell*, which `doctor` fails on, rather than passing a file it cannot vouch
+for. Which home is in play is settled the same way everywhere — `SBXLOOP_HOME`,
+else `$HOME`, else Windows' `%USERPROFILE%` — so config and secrets discovery
+cannot disagree with the home the process runs out of.
+
 ## Persistence and resume
 
 `~/.sbxloop/state/state.db` (the home's `state/`, see *The home* below) is one

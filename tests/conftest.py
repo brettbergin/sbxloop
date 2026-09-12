@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import stat
 import subprocess
 import sys
@@ -45,8 +46,16 @@ def git_server_certificate(tmp_path_factory: pytest.TempPathFactory) -> Path:
 
 
 @pytest.fixture(autouse=True)
-def trust_git_test_server(git_server_certificate: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("GIT_SSL_CAINFO", str(git_server_certificate))
+def trust_git_test_server(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point git at the suite's own certificate — on a host that can mint
+    one. The certificate is autouse because the real-git tests need it
+    before they touch git at all, but `openssl` is not on every host (a
+    Windows runner is the case in hand), and demanding it there would fail
+    every test rather than the handful that talk to the HTTPS server. Those
+    still fail loudly, on their own, when they cannot reach it."""
+    if shutil.which("openssl") is None:
+        return
+    monkeypatch.setenv("GIT_SSL_CAINFO", str(request.getfixturevalue("git_server_certificate")))
 
 
 class FakeSbx:
