@@ -546,8 +546,10 @@ warn: the operator named them. The commands run from the engine after both
 worker installs, in the agent's workdir, launched exactly as a job is (the
 login shell evals the stdin-delivered exports or sources the env file), each
 reported as a `sandbox.setup` event with delivered secret values scrubbed from
-the tail; the first failure raises out of provisioning like an install failure,
-so `keep_on_failure` applies. The bake installs the global package list only.
+the tail and the login profile's own output cut from it — the script echoes a
+mark once the profile has run, and a stream without the mark is kept whole; the
+first failure raises out of provisioning like an install failure, so
+`keep_on_failure` applies. The bake installs the global package list only.
 
 ### Verify mode (#682)
 

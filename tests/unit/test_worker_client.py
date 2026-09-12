@@ -1970,6 +1970,51 @@ class TestSetupCommands:
         assert [e.data["rc"] for e in setup] == [0, 3]
         assert setup[1].data["tail"] == "no browsers"
 
+    def test_what_the_image_prints_on_login_is_not_the_command_s_output(
+        self, sandbox: Sandbox, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A sandbox image is free to announce itself on login — a version
+        manager, a banner, an MOTD, on either stream — and none of it is the
+        operator's command talking. It stays out of the event and out of the
+        failure, which a long enough banner would otherwise push the real
+        error out of.
+        """
+        monkeypatch.setenv(
+            "SBX_FAKE_PROFILE", "echo 'toolchain 22.3.0 selected'\necho 'welcome' >&2\n"
+        )
+        bus = EventBus()
+        seen = self.events(bus)
+        client = make_client(sandbox, bus)
+        with pytest.raises(WorkerError) as info:
+            client.run_setup(
+                ["printf ok", "echo 'no browsers' >&2; exit 3"],
+                run_id="r1",
+                cwd=str(tmp_path),
+            )
+        setup = [e for e in seen if e.type == "sandbox.setup"]
+        assert [e.data["tail"] for e in setup] == ["ok", "no browsers"]
+        assert "toolchain" not in str(info.value)
+        assert "welcome" not in str(info.value)
+
+    def test_a_stream_without_the_mark_is_kept_whole(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """Nothing is dropped on a guess: a launch that died before the
+        script's own echo has no mark to cut on, and that output is the
+        only diagnostic there is."""
+        bus = EventBus()
+        seen = self.events(bus)
+        fake_sbx.script(
+            "exec boxa sh -c exec sh -lc",
+            returncode=1,
+            stderr="/home/agent/.profile: 3: exec: node: not found\n",
+        )
+        client = make_client(sandbox, bus)
+        with pytest.raises(WorkerError):
+            client.run_setup(["printf never"], run_id="r1", cwd=str(tmp_path))
+        (setup,) = [e for e in seen if e.type == "sandbox.setup"]
+        assert setup.data["tail"] == "/home/agent/.profile: 3: exec: node: not found"
+
     def test_no_commands_is_a_no_op(self, sandbox: Sandbox, fake_sbx: FakeSbx) -> None:
         client = make_client(sandbox, EventBus())
         client.run_setup([], run_id="r1", cwd="/work")
