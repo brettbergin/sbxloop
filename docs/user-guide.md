@@ -1782,6 +1782,15 @@ once in the log (`mattermost.reaction_refused`, naming the emoji and what
 the server said) rather than leaving you with an ack that silently never
 appears.
 
+One Mattermost quirk the bridge works around rather than documents away: the
+web and desktop apps drop a reaction on *your own* message if it arrives
+before your client has finished posting it. The bot reacts within
+milliseconds, your create-post reply comes back carrying no reactions, and
+the app takes the reply's word over the one it already had — so the ⏳ is on
+the server (everyone else sees it; a reload shows it) while your screen
+skips straight to ✅. The bridge puts the ⏳ on a second time about a second
+and a half later, which the server re-broadcasts and your client keeps.
+
 ## Artifacts
 
 Every job in a run executes in the run's **workspace** — a host directory
