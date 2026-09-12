@@ -79,6 +79,36 @@ class FakeRun:
         binary.chmod(0o755)
 
 
+class RecordingRun:
+    """``FakeRun`` plus what each command saw of uv's directory settings.
+    A real uv reads them from its environment; a fake one can only report
+    the environment it was handed."""
+
+    KEYS = ("UV_PYTHON_INSTALL_DIR", "UV_CACHE_DIR", "UV_INSTALL_DIR")
+
+    def __init__(self, inner: FakeRun) -> None:
+        self.inner = inner
+        self.seen: list[tuple[list[str], dict[str, str | None]]] = []
+
+    def __call__(self, argv: Any) -> subprocess.CompletedProcess[str]:
+        argv = [str(a) for a in argv]
+        self.seen.append((argv, {key: os.environ.get(key) for key in self.KEYS}))
+        return self.inner(argv)
+
+    def env_of(self, *words: str) -> dict[str, str | None]:
+        """The environment of the one uv command whose arguments start with
+        *words* — ``python install``, ``venv``, ``pip install``."""
+        found = [env for argv, env in self.seen if argv[1 : 1 + len(words)] == list(words)]
+        assert len(found) == 1, f"{words}: {[argv for argv, _ in self.seen]}"
+        return found[0]
+
+    def env_of_bootstrap(self) -> dict[str, str | None]:
+        """The environment Astral's installer script ran under."""
+        found = [env for argv, env in self.seen if argv[0] == "sh"]
+        assert len(found) == 1, f"bootstrap: {[argv for argv, _ in self.seen]}"
+        return found[0]
+
+
 class FakeFetch:
     def __init__(self) -> None:
         self.urls: list[str] = []
@@ -696,3 +726,124 @@ class TestCli:
         result = runner.invoke(app, ["init", "--preset", "huge-repo", "--dry-run"])
         assert result.exit_code == 2, result.output
         assert "unknown preset" in result.output
+
+
+class TestUvDirectories:
+    """Init builds one home, and every uv command it runs must build *that*
+    home: the managed CPython under ``python/`` and the cache under
+    ``cache/uv``, whatever uv directories the operator's own environment
+    names. The launcher exports the same two, so a home whose init wrote
+    them elsewhere is a home whose launcher cannot find its interpreter."""
+
+    DECOY = "/somewhere/else"
+
+    def arrange(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **overrides: Any
+    ) -> tuple[SbxloopHome, HomeInit, RecordingRun, FakeRun]:
+        monkeypatch.setattr("shutil.which", lambda _name: None)  # no uv on PATH: fetch it
+        home, init, run, _fetch, _said = make(tmp_path, **overrides)
+        recorder = RecordingRun(run)
+        init.run = recorder
+        return home, init, recorder, run
+
+    def wanted(self, home: SbxloopHome) -> dict[str, str]:
+        return {
+            "UV_PYTHON_INSTALL_DIR": str(home.python),
+            "UV_CACHE_DIR": str(home.cache / "uv"),
+        }
+
+    def assert_home_scoped(self, home: SbxloopHome, seen: dict[str, str | None]) -> None:
+        wanted = self.wanted(home)
+        assert {key: seen[key] for key in wanted} == wanted
+
+    def test_every_uv_command_builds_under_the_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for key in RecordingRun.KEYS:
+            monkeypatch.delenv(key, raising=False)
+        home, init, recorder, _ = self.arrange(tmp_path, monkeypatch)
+        init.execute()
+        for words in (("python", "install"), ("venv",), ("pip", "install")):
+            self.assert_home_scoped(home, recorder.env_of(*words))
+        # and nothing of ours is left behind for whatever runs next
+        assert not any(os.environ.get(key) for key in RecordingRun.KEYS)
+
+    def test_inherited_settings_cannot_redirect_the_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for key in RecordingRun.KEYS:
+            monkeypatch.setenv(key, self.DECOY)
+        home, init, recorder, _ = self.arrange(tmp_path, monkeypatch)
+        init.execute()
+        for words in (("python", "install"), ("venv",), ("pip", "install")):
+            self.assert_home_scoped(home, recorder.env_of(*words))
+        # the operator's own settings are theirs again once init returns
+        assert all(os.environ[key] == self.DECOY for key in RecordingRun.KEYS)
+
+    def test_the_bootstrap_routes_agree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("UV_PYTHON_INSTALL_DIR", self.DECOY)
+        monkeypatch.setenv("UV_CACHE_DIR", self.DECOY)
+        # downloaded: the installer script itself runs pointed at the home
+        home, init, recorder, _ = self.arrange(tmp_path, monkeypatch)
+        init.execute()
+        downloaded = recorder.env_of_bootstrap()
+        self.assert_home_scoped(home, downloaded)
+        assert downloaded["UV_INSTALL_DIR"] == str(home.bin)
+        # copied from PATH: no installer to run, and the same directories after
+        other = tmp_path / "other"
+        fake_uv = tmp_path / "uv-on-path"
+        fake_uv.write_text("#!uv\n")
+        fake_uv.chmod(0o755)
+        monkeypatch.setattr("shutil.which", lambda name: str(fake_uv) if name == "uv" else None)
+        copied_home = SbxloopHome(other / "home")
+        copied = RecordingRun(FakeRun(copied_home))
+        HomeInit(
+            copied_home,
+            InitOptions(version="1.2.3", sbx=False),
+            env={"HOME": str(other), "PATH": "/usr/bin"},
+            run=copied,
+            fetch=FakeFetch(),
+            system="Linux",
+            machine="x86_64",
+            sys_prefix=other / "elsewhere-venv",
+            user_units=other / "units",
+        ).execute()
+        assert not any(argv[0] == "sh" for argv, _ in copied.seen)  # nothing to bootstrap
+        for words in (("python", "install"), ("venv",), ("pip", "install")):
+            self.assert_home_scoped(home, recorder.env_of(*words))
+            self.assert_home_scoped(copied_home, copied.env_of(*words))
+
+    def test_a_failed_uv_command_restores_the_environment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for key in RecordingRun.KEYS:
+            monkeypatch.setenv(key, self.DECOY)
+        home, init, _recorder, run = self.arrange(tmp_path, monkeypatch)
+        run.fail = {f"{home.uv} pip install": 3}
+        with pytest.raises(subprocess.CalledProcessError):
+            init.execute()
+        assert all(os.environ[key] == self.DECOY for key in RecordingRun.KEYS)
+
+    def test_running_from_the_home_venv_touches_neither(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for key in RecordingRun.KEYS:
+            monkeypatch.setenv(key, self.DECOY)
+        home, init, _recorder, run = self.arrange(tmp_path, monkeypatch)
+        init.execute()
+        again = RecordingRun(run)
+        HomeInit(
+            home,
+            InitOptions(),  # this version, from the home's own venv
+            env={"HOME": str(tmp_path), "PATH": ""},
+            run=again,
+            fetch=FakeFetch(),
+            system="Linux",
+            machine="x86_64",
+            sys_prefix=home.venv,
+            user_units=tmp_path / "units",
+        ).execute()
+        assert again.seen == []  # no uv command at all: nothing to rebuild
+        assert all(os.environ[key] == self.DECOY for key in RecordingRun.KEYS)
