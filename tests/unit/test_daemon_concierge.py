@@ -418,6 +418,40 @@ class TestTools:
         assert resp.text.startswith("(command not accepted)") and "cancel" in resp.text
         assert not getattr(loop, "stopped", False)
 
+    def test_sbx_control_restart_takes_effect_only_after_the_reply(self, tmp_path: Path) -> None:
+        """`restart` (#969) is accepted, but its exit rides the reply: the
+        tool result says it will happen, nothing has happened when the turn
+        returns, and the bridge runs `reply.after` once the answer is out."""
+        concierge, client, _, loop, _ = make(
+            tmp_path,
+            [{"calls": [("sbx_control", {"command": "restart"})], "text": "restarting now"}],
+        )
+        reply = turn(concierge, "restart yourself")
+        (resp,) = client.responses
+        assert resp.ok and "exits once the current run" in resp.text
+        assert not getattr(loop, "stopped", False) and not getattr(loop, "restarts", [])
+        assert reply.text == "restarting now" and reply.after is not None
+        reply.after()
+        assert loop.stopped
+        assert loop.restarts == [
+            {
+                "by": "Discord user `brett` (via concierge)",
+                "reason": "operator restart",
+                "now": False,
+            }
+        ]
+
+    def test_sbx_control_restart_refusal_carries_no_effect(self, tmp_path: Path) -> None:
+        concierge, client, _, loop, _ = make(
+            tmp_path, [{"calls": [("sbx_control", {"command": "restart"})]}]
+        )
+        loop.supervisor_kind = None
+        reply = turn(concierge, "restart yourself")
+        (resp,) = client.responses
+        assert resp.text.startswith("(command not accepted) restart refused:")
+        assert "[daemon] supervised = true" in resp.text  # `plain` strips the code spans
+        assert reply.after is None and not getattr(loop, "stopped", False)
+
     def test_sbx_control_bad_verb_is_not_accepted(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(
             tmp_path, [{"calls": [("sbx_control", {"command": "explode"})]}]

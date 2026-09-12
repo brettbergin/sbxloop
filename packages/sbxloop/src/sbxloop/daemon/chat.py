@@ -1133,6 +1133,17 @@ class ChatBridge(ABC):
     async def _post_concierge_reply(
         self, msg: Inbound, reply: ConciergeReply, *, nudge: bool = False
     ) -> None:
+        try:
+            await self._post_concierge_reply_text(msg, reply, nudge=nudge)
+        finally:
+            if reply.after is not None:
+                # A restart the turn asked for (#969): only now the answer
+                # is on its way, as a command's `after` runs after its reply.
+                reply.after()
+
+    async def _post_concierge_reply_text(
+        self, msg: Inbound, reply: ConciergeReply, *, nudge: bool = False
+    ) -> None:
         channel = msg.channel
         if not reply.ok:
             await self._ack_now(msg, ACK_FAILED)

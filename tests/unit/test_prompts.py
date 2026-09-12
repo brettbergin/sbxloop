@@ -356,6 +356,11 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "thread" in text and "not here" in text
     assert "Never claim to have done something you did not do" in text
     assert "!sbx" in text  # the configured prefix reaches the model
+    # #969: the restart is an operator verb it may run; it never reaches for stop
+    assert "`restart [--now]` is the operator's restart" in text
+    assert (
+        "restart begins once your reply is posted" in text and "never reach for\n  `stop`" in text
+    )
     # intake is one hop: the issue is filed with the trigger label and runs
     assert "`sbxloop:run`" in text
     assert "`create_issue`, **one call, no confirmation**" in text

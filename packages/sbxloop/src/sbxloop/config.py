@@ -1706,6 +1706,12 @@ class DaemonConfig(_ConfigModel):
     # only at task-phase boundaries and interrupted runs are resumable, so
     # this is a courtesy wait, not a correctness requirement.
     shutdown_grace_s: float = 60.0
+    # An operator's `restart` (#969) exits and relies on a service manager to
+    # start the daemon again. Under systemd the daemon can tell; under any
+    # other supervisor (launchd, a container runtime, a process manager)
+    # this says one is there. False and no systemd: `restart` is refused by
+    # name, because the daemon would exit into nothing.
+    supervised: bool = False
     # Retention for runs/<run_id>/ on disk (workspace clone + harvested
     # artifacts). Swept on daemon start and daily; 0 disables. The SQLite
     # rows are never removed. See sbxloop.gc for what is exempt.
