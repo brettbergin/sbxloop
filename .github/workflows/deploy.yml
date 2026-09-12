@@ -237,9 +237,10 @@ jobs:
           else
             MSG="🚀 sbxloop \`${FROM}\` → \`${VERSION}\` staged on \`${HOST}\` — restart deferred until the daemon is idle (now: ${CURRENT}); hold \`${HOLD}\` — [run](${RUN_URL})"
           fi
-          # Through the configured [chat] backend, with the bot already in
-          # the channel: this job reads no secrets file and no config (#639).
-          "${SBXLOOP}" daemon notify "${MSG}" --channel "${DEPLOY_CHANNEL}"
+          # The trusted workflow helper calls the installed notifier library
+          # through its old two-argument API, so this works before the host is
+          # upgraded and after a rollback. sbxloop still owns config + secrets.
+          DEPLOY_NOTICE="${MSG}" "${VENV_PYTHON}" "${PIPELINE}" deploy-notify
 
       - name: Wait for the daemon to go idle
         id: drain
@@ -306,7 +307,7 @@ jobs:
         env:
           VERSION: ${{ steps.final.outputs.version }}
         run: |
-          "${SBXLOOP}" daemon notify "Deploy batch refreshed after draining: installing ${VERSION} on ${HOST}." --channel "${DEPLOY_CHANNEL}"
+          DEPLOY_NOTICE="Deploy batch refreshed after draining: installing ${VERSION} on ${HOST}." "${VENV_PYTHON}" "${PIPELINE}" deploy-notify
 
       - name: Fetch the release wheels
         id: wheels
@@ -556,6 +557,6 @@ jobs:
           else
             MSG="❌ deploy of sbxloop \`${VERSION}\` to \`${HOST}\` **${RESULT}** — rollback could not restore health; ${HOST} needs a human. [run](${RUN_URL})"
           fi
-          # Through the configured [chat] backend (#639): sbxloop reads its
-          # own secrets file; this job reads no secrets and no config.
-          "${SBXLOOP}" daemon notify "${MSG}" --channel "${DEPLOY_CHANNEL}"
+          # The helper survives an upgrade or rollback; the installed
+          # notifier still reads sbxloop's config and secrets (#639).
+          DEPLOY_NOTICE="${MSG}" "${VENV_PYTHON}" "${PIPELINE}" deploy-notify
