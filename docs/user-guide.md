@@ -1699,7 +1699,9 @@ are named by host path, as is any file too large or whose upload fails — a
 named file is never silently dropped), and the merge gate's approve button
 is a seeded ✅: reacting with it approves, exactly as `!sbx merge` does, and
 the reaction comes back off once the gate resolves so a merged prompt never
-looks like it is still waiting for you.
+looks like it is still waiting for you. A prompt or a status message that
+somebody deleted is noticed and put back on the next restart, rather than
+leaving a standing gate with nothing to approve it with.
 
 While the concierge is working on an @mention it shows **"…is typing"**
 under the message box, for as long as the turn takes — the same signal

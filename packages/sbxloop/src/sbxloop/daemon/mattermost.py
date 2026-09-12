@@ -112,6 +112,9 @@ _MATTERMOST_ID_RE = re.compile(r"^[a-z0-9]{26}$")
 # HTTP statuses that mean the control channel is misconfigured, reported
 # once with the fix rather than on every flush.
 _CHANNEL_STATUSES = frozenset({403, 404})
+# ...and what the same two mean about a single post: it is not there, or is
+# no longer ours to touch. Either way the caller should put a new one up.
+_MISSING_STATUSES = frozenset({403, 404})
 #: Mattermost takes at most five files on one post (Discord takes ten); the
 #: rest are named by host path, so a workload result never silently loses an
 #: artifact to a transport limit.
@@ -325,6 +328,10 @@ class MattermostClient:
         result = await self._request("POST", "/files", data=form)
         infos = result.get("file_infos") or []
         return str(infos[0].get("id") or "") if infos else ""
+
+    async def get_post(self, post_id: str) -> dict[str, Any]:
+        result: dict[str, Any] = await self._request("GET", f"/posts/{post_id}")
+        return result
 
     async def get_user(self, user_id: str) -> dict[str, Any]:
         result: dict[str, Any] = await self._request("GET", f"/users/{user_id}")
@@ -784,7 +791,37 @@ class MattermostBridge(ChatBridge):
         return MattermostTarget(self.mattermost.channel_id or "", root_id=thread_id)
 
     async def _fetch_message(self, channel: Any, message_id: str) -> Any:
-        return MattermostMessage(channel.channel, message_id, getattr(channel, "root_id", None))
+        """The handle for a post we made, or None when it is not there any
+        more.
+
+        This used to be free — ``(channel_id, post_id)`` is everything
+        ``patch`` and ``reactions`` need, so the handle could be built
+        without asking. But no caller wants a handle: each one is asking
+        whether the *message* is still there, and each treats None as "it
+        is gone, put a new one up". A fabricated handle answered "still
+        there" every time, so a gate prompt somebody deleted was never
+        re-posted, and a deleted status message was never replaced — every
+        later edit 404ing into a warning instead. One GET per recovery path
+        is the honest price.
+
+        A status the server could not answer with is *not* an absence: a
+        transient failure propagates rather than being reported as a
+        missing post, which would put a duplicate up.
+        """
+        try:
+            post = await self.client.get_post(message_id)
+        except MattermostApiError as exc:
+            if exc.status not in _MISSING_STATUSES:
+                raise
+            log.debug("mattermost.post_gone", post=message_id, status=exc.status)
+            return None
+        if _deleted_at(post):
+            return None
+        return MattermostMessage(
+            str(post.get("channel_id") or getattr(channel, "channel", "") or ""),
+            str(post.get("id") or message_id),
+            str(post.get("root_id") or "") or None,
+        )
 
     async def _send(
         self,
@@ -1151,6 +1188,16 @@ class _MattermostTyping:
         while True:
             await self.bridge._send_typing(self.target)
             await asyncio.sleep(TYPING_INTERVAL_S)
+
+
+def _deleted_at(post: dict[str, Any]) -> bool:
+    """Whether a post the server still returned is soft-deleted. A missing
+    post is normally a 404, but Mattermost keeps deleted rows and some
+    paths hand one back with ``delete_at`` set."""
+    try:
+        return int(post.get("delete_at") or 0) > 0
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return False
 
 
 def _decode_json(raw: Any) -> dict[str, Any] | None:

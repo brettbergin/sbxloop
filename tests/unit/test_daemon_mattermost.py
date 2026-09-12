@@ -79,6 +79,10 @@ class FakeMattermostClient:
         self._closed: asyncio.Event | None = None
         self.fail_connect: Exception | None = None
         self.fail_post: Exception | None = None
+        self.fail_get_post: Exception | None = None
+        # Posts the server still has, by id, and the ones it soft-deleted.
+        self.by_id: dict[str, dict[str, Any]] = {}
+        self.deleted: set[str] = set()
         self.fail_upload = False
         self.uploads: list[tuple[str, str, bytes]] = []
         self.team_name = "sbx"
@@ -115,7 +119,23 @@ class FakeMattermostClient:
         self._seq += 1
         post_id = f"p{self._seq:025d}"
         self.posts.append({**body, "id": post_id})
+        self.by_id[post_id] = {
+            "id": post_id,
+            "channel_id": body["channel_id"],
+            "root_id": body.get("root_id", ""),
+            "delete_at": 0,
+        }
         return {"id": post_id, "channel_id": body["channel_id"]}
+
+    async def get_post(self, post_id: str) -> dict[str, Any]:
+        if self.fail_get_post is not None:
+            raise self.fail_get_post
+        known = self.by_id.get(post_id)
+        if known is None:
+            raise MattermostApiError(404, "Unable to get the post")
+        if post_id in self.deleted:
+            return {**known, "delete_at": 1700000000000}
+        return known
 
     async def patch_post(self, post_id: str, body: dict[str, Any]) -> dict[str, Any]:
         self.patches.append((post_id, body))
@@ -1092,3 +1112,85 @@ class TestLinkPreviews:
         )
         assert client.posts[-1]["message"] == "@ana [https://git/pull/7](https://git/pull/7)"
         bridge.close()
+
+
+class TestMessageFetch:
+    """Every caller of the fetch is asking whether a message is still
+    there, and treats None as "put a new one up". A handle built without
+    asking answered "still there" for a post that had been deleted."""
+
+    def test_a_gate_prompt_that_is_gone_is_re_posted(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            start_run(bridge)
+            gate = make_gate("r1", notify=())
+            asyncio.run(bridge._post_gate_prompt(gate))
+            prompt_id = client.posts[-1]["id"]
+            assert bridge.dstore.gate_prompt("r1", "mattermost") is not None
+            bridge.dstore.create_merge_gate(
+                "r1", "gh:issue:7", "you/repo", 7, "https://x/pull/7", "b", [], "tok77", time.time()
+            )
+            bridge.dstore.set_gate_prompt("r1", CHANNEL, prompt_id, backend="mattermost")
+            # somebody tidied the channel
+            del client.by_id[prompt_id]
+            posted_before = len(client.posts)
+            asyncio.run(bridge._reattach_gates())
+            assert len(client.posts) > posted_before
+            assert "waiting for your approval" in client.posts[-1]["message"]
+        finally:
+            bridge.close()
+
+    def test_a_gate_prompt_still_there_is_left_alone(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            start_run(bridge)
+            asyncio.run(bridge._post_gate_prompt(make_gate("r1", notify=())))
+            prompt_id = client.posts[-1]["id"]
+            bridge.dstore.create_merge_gate(
+                "r1", "gh:issue:7", "you/repo", 7, "https://x/pull/7", "b", [], "tok77", time.time()
+            )
+            bridge.dstore.set_gate_prompt("r1", CHANNEL, prompt_id, backend="mattermost")
+            posted_before = len(client.posts)
+            asyncio.run(bridge._reattach_gates())
+            assert len(client.posts) == posted_before
+        finally:
+            bridge.close()
+
+    def test_a_soft_deleted_post_reads_as_gone(self, tmp_path: Path) -> None:
+        """Mattermost keeps deleted rows; some paths hand one back with
+        `delete_at` set rather than answering 404."""
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            asyncio.run(bridge._send(MattermostTarget(CHANNEL), "hi"))
+            post_id = client.posts[-1]["id"]
+            client.deleted.add(post_id)
+            found = asyncio.run(bridge._fetch_message(MattermostTarget(CHANNEL), post_id))
+            assert found is None
+        finally:
+            bridge.close()
+
+    def test_a_server_that_could_not_answer_is_not_an_absence(self, tmp_path: Path) -> None:
+        """Fail closed: reporting a post missing because the lookup broke
+        would put a duplicate up next to the one still standing."""
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            asyncio.run(bridge._send(MattermostTarget(CHANNEL), "hi"))
+            post_id = client.posts[-1]["id"]
+            client.fail_get_post = MattermostApiError(500, "internal server error")
+            with pytest.raises(MattermostApiError):
+                asyncio.run(bridge._fetch_message(MattermostTarget(CHANNEL), post_id))
+        finally:
+            bridge.close()
+
+    def test_the_handle_carries_the_server_s_own_thread_root(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            root = "r" * 26
+            asyncio.run(bridge._send(MattermostTarget(CHANNEL, root_id=root), "in a thread"))
+            post_id = client.posts[-1]["id"]
+            found = asyncio.run(bridge._fetch_message(MattermostTarget(CHANNEL), post_id))
+            assert found is not None
+            assert found.post_id == post_id
+            assert found.root_id == root
+        finally:
+            bridge.close()
