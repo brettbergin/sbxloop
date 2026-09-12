@@ -143,6 +143,20 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
     assert config.concierge.enabled is True and config.concierge.model is None
     assert config.concierge.timeout_s == 180.0 and config.concierge.session_turns == 40
     assert config.concierge.github_tools is True and config.concierge.create_issues is True
+    # #971: the config tools are on, with egress, tool grants and credential
+    # names locked by default; the list is the operator's to narrow or widen
+    assert config.concierge.edit_config is True
+    assert config.concierge.config_locked == [
+        "policy",
+        "mcp",
+        "credentials",
+        "registries",
+        "github.repos.token_env",
+        "telemetry.dsn_env",
+    ]
+    (tmp_path / "sbxloop.toml").write_text('[concierge]\nconfig_locked = ["policy"]\n')
+    assert load_config(cwd=tmp_path, env={}).concierge.config_locked == ["policy"]
+    (tmp_path / "sbxloop.toml").unlink()
     over2 = load_config(
         cwd=tmp_path,
         env={"SBXLOOP_CONCIERGE__MODEL": "gpt-5", "SBXLOOP_CONCIERGE__TIMEOUT_S": "300"},

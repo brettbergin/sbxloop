@@ -62,7 +62,9 @@ def parse(text: str) -> dict[str, str]:
             continue
         continuation = _CONTINUATION.match(line)
         if continuation and last_key is not None:
-            docs[last_key] = f"{docs[last_key]} {continuation.group(1)}".strip()
+            # An aligned `#   # text` line under a key documents that key,
+            # whether it continues a trailing comment or starts one.
+            docs[last_key] = f"{docs.get(last_key, '')} {continuation.group(1)}".strip()
             continue
         key = _KEY.match(line)
         # A commented key line reads as a comment too; the key match wins
@@ -77,7 +79,7 @@ def parse(text: str) -> dict[str, str]:
             doc = trailing or above
             if doc and dotted not in docs:
                 docs[dotted] = doc
-            last_key = dotted if trailing else None
+            last_key = dotted
             block = []
             continue
         comment = _COMMENT.match(line)

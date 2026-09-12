@@ -1810,6 +1810,29 @@ repo-attribution passes skip `sched:` rows as they skip `chat:` rows;
 and its due. `schedules` (ctl, `!sbx`, the concierge's `sbx_control`) lists
 each schedule's cadence, last fire and next due.
 
+**Configuration from chat (#967).** The concierge's `config_keys` and
+`set_config` tools are the console's per-key editor (`sbxloop.configedit`:
+what a key accepts from the model, the comment-keeping `tomlkit` write, the
+loader's verdict on the whole draft with every other layer applied, the
+atomic save with a timestamped backup) run in the daemon process against
+the home's `config/sbxloop.toml` as it is on disk — the sandbox never sees
+the file or a path. A write needs the person's own words in `confirmation`
+(the `close_issue` pattern), and nothing is written until the loader has
+accepted the draft, so a restart never fails on a file this path wrote.
+Then `DaemonLoop.request_restart` (the `restart` verb, #969: the courtesy
+exit, a marker in `daemon_state`, the supervisor's relaunch) rides the
+reply out on `ConciergeReply.after` — a restart begun inside the tool call
+would close the bridge under the answer — and the process that comes back
+re-resolves the key and posts *now in effect* or *written, but `<layer>`
+sets … and wins*. `daemon/configpolicy.py` holds what chat may never
+change whatever the operator says: the chat sections (the channel the
+outcome is reported on), the concierge's own switch and gate keys (no
+self-widening), and the env-only keys; `[concierge] config_locked` is the
+operator's own list on top (egress, tool grants and credential names by
+default). Model keys apply live (`refreshed_models`); everything else at
+the next start, which is why the restart is part of the write rather than
+advice after it.
+
 ### Repositories
 
 One daemon may tend several repositories. They are declared as an array of

@@ -13,6 +13,7 @@ nothing. Everything else is the operator's to lock or unlock (#971).
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 
 from sbxloop.configedit import keys as configkeys
 
@@ -52,4 +53,38 @@ def never_from_chat(dotted: str) -> str | None:
     return None
 
 
-__all__ = ["NEVER_FROM_CHAT", "never_from_chat"]
+def _pattern_matches(pattern: str, key: str) -> bool:
+    """``pattern``'s segments against a prefix of ``key``'s; ``*`` is one
+    whole segment. Indices are not segments (``github.repos[1].token_env``
+    is ``github.repos.token_env`` here)."""
+    wanted = pattern.split(".")
+    have = _bare(key).split(".")
+    if len(wanted) > len(have):
+        return False
+    return all(w == "*" or w == h for w, h in zip(wanted, have, strict=False))
+
+
+def locked_by(dotted: str, patterns: Sequence[str]) -> str | None:
+    """The first ``[concierge] config_locked`` pattern that covers ``dotted``."""
+    for pattern in patterns:
+        if pattern and _pattern_matches(pattern, dotted):
+            return pattern
+    return None
+
+
+def refusal(dotted: str, patterns: Sequence[str]) -> str | None:
+    """Why chat may not change ``dotted`` right now, or ``None``: the
+    built-in never-from-chat reason first, then the operator's lock."""
+    why = never_from_chat(dotted)
+    if why is not None:
+        return f"never from chat: {why}"
+    pattern = locked_by(dotted, patterns)
+    if pattern is not None:
+        return (
+            f"locked by `[concierge] config_locked` (`{pattern}`) — an operator unlocks it "
+            "in the config file on the host"
+        )
+    return None
+
+
+__all__ = ["NEVER_FROM_CHAT", "locked_by", "never_from_chat", "refusal"]
