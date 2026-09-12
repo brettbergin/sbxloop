@@ -18,6 +18,14 @@ carry their own prefix rather than ``daemon_``.
   transitions and, later, the daemon's notices and a projection of the
   engine's own ``events`` (``source_seq`` points at that row when it is
   one). ``seq`` is the one cursor every replay pages by.
+* ``api_clients`` are the registered clients: a name, the scrypt verifier
+  of a secret shown once at creation, and the capabilities granted. The
+  secret itself is never stored.
+* ``api_refresh_tokens`` are the long-lived halves of a token pair, by
+  digest: a ``family`` is one client-credentials grant and every rotation
+  descended from it, so a refresh token presented twice revokes the whole
+  family. ``api_token_revocations`` is the denylist of access-token ids
+  (``jti``) revoked before they expired, pruned past their expiry.
 
 JSON lives in ``TEXT`` columns, serialised in Python, as everywhere else.
 """
@@ -81,3 +89,46 @@ class ApiEventRow(Base):
     source_seq: Mapped[int | None] = mapped_column(Integer)
     data_json: Mapped[str | None] = mapped_column(Text)
     schema_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
+
+
+class ClientRow(Base):
+    __tablename__ = "api_clients"
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    name: Mapped[str] = mapped_column(Text, nullable=False)
+    secret_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    capabilities_json: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'[]'")
+    )
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    created_by: Mapped[str | None] = mapped_column(Text)
+    revoked_at: Mapped[float | None] = mapped_column(REAL)
+    last_used_at: Mapped[float | None] = mapped_column(REAL)
+
+
+class RefreshTokenRow(Base):
+    __tablename__ = "api_refresh_tokens"
+    __table_args__ = (
+        Index("idx_api_refresh_tokens_client", "client_id", "family_id"),
+        Index("idx_api_refresh_tokens_hash", "token_hash"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    client_id: Mapped[str] = mapped_column(Text, nullable=False)
+    family_id: Mapped[str] = mapped_column(Text, nullable=False)
+    token_hash: Mapped[str] = mapped_column(Text, nullable=False)
+    issued_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    expires_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    used_at: Mapped[float | None] = mapped_column(REAL)
+    replaced_by: Mapped[str | None] = mapped_column(Text)
+    revoked_at: Mapped[float | None] = mapped_column(REAL)
+
+
+class TokenRevocationRow(Base):
+    __tablename__ = "api_token_revocations"
+    __table_args__ = (Index("idx_api_token_revocations_expires", "expires_at"),)
+
+    jti: Mapped[str] = mapped_column(Text, primary_key=True)
+    client_id: Mapped[str] = mapped_column(Text, nullable=False)
+    expires_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    revoked_at: Mapped[float] = mapped_column(REAL, nullable=False)

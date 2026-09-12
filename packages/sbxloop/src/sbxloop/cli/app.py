@@ -2218,6 +2218,15 @@ backup_app = typer.Typer(
 app.add_typer(backup_app, name="backup")
 
 
+def _api_app() -> typer.Typer:
+    from sbxloop.cli.api import api_app
+
+    return api_app
+
+
+app.add_typer(_api_app(), name="api")
+
+
 @backup_app.callback()
 def backup_default(
     ctx: typer.Context,
@@ -2476,6 +2485,20 @@ def daemon(
     configure_logging(
         config.daemon.log_level, fmt=config.daemon.log_format, file=config.paths.daemon_log
     )
+    if config.api.enabled and not once:
+        # Before any sandbox work: a missing extra is a configuration
+        # error to fix, not something to discover after recovery.
+        from sbxloop.api import require_available
+
+        try:
+            require_available()
+        except ConfigError as exc:
+            log.error(
+                "api.unavailable",
+                error=str(exc),
+                hint="install the extra into the daemon's venv, or set [api] enabled = false",
+            )
+            raise typer.Exit(2) from exc
 
     # Work comes from the labelled issues of the configured repositories,
     # or (#760) from workloads asked for in chat — a daemon with a chat
@@ -2777,6 +2800,9 @@ def daemon(
         )
 
     ctl = ControlServer(loop, config.paths)
+    api_server = None
+    if config.api.enabled and not once:
+        api_server = _start_api(config, loop)
     cleanup_registry.install_handlers()
     cleanup_registry.set_quiesce(loop.quiesce)
     stop_reason = "finished"
@@ -2787,6 +2813,10 @@ def daemon(
         # own verdict. Requests submitted before this point are refused as
         # stale, never executed.
         ctl.start()
+        if api_server is not None:
+            # The listener answered liveness through recovery; commands are
+            # taken from here, the same moment the ctl queue takes them.
+            api_server.ctx.ready.set()
         if once:
             result = loop.tick()
             # --once is a smoke/cron probe: its one-line verdict stays on
@@ -2810,6 +2840,9 @@ def daemon(
         raise
     finally:
         cleanup_registry.set_quiesce(None)
+        if api_server is not None:
+            log.debug("daemon.shutdown", step="api listener")
+            api_server.close()
         log.debug("daemon.shutdown", step="control server")
         ctl.close()
         log.debug("daemon.shutdown", step="chat bridges")
@@ -2923,6 +2956,28 @@ def concierge_wanted(config: Config, *, once: bool) -> bool:
 def _home() -> SbxloopHome:
     """The home the daemon runs against — the same one every command sees."""
     return load_config().paths
+
+
+def _start_api(config: Config, loop: Any) -> Any:
+    """The remote API listener beside the daemon: built over the daemon's
+    own stores, started before recovery (liveness answers at once), told
+    it is ready after the control queue is."""
+    from sbxloop.api.app import create_app
+    from sbxloop.api.auth.keys import load_or_create
+    from sbxloop.api.auth.store import ApiAuthStore
+    from sbxloop.api.context import ApiContext
+    from sbxloop.api.server import ApiServer
+
+    ctx = ApiContext(
+        config,
+        loop=loop,
+        auth=ApiAuthStore(loop.dstore),
+        keys=load_or_create(config.paths),
+        clock=loop.clock,
+    )
+    server = ApiServer(create_app(ctx), config.api, ctx=ctx)
+    server.start()
+    return server
 
 
 def _daemon_store() -> DaemonStore:

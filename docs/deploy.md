@@ -102,6 +102,19 @@ a sandbox cannot boot. Off Linux, and in a `--no-systemd` install, the rows that
 apply are not shown, so a supported mode is never judged against a capability it never
 wanted.
 
+## The remote API behind a proxy
+
+`[api] enabled = true` makes the daemon serve its remote API on `127.0.0.1:8420`.
+It speaks plain HTTP and never terminates TLS itself: put a reverse proxy in front
+(Caddy, nginx, your ingress), let it terminate TLS and forward to loopback, and
+list the proxy's address in `[api] trusted_proxies` so the client address behind
+`X-Forwarded-For` is the one the authentication limiter keys on. Nothing else on
+the host needs to change: the listener runs inside `sbxloop daemon`, under the same
+unit, and stops with it. `sbxloop api client create` registers a client and prints
+its secret once; `sbxloop api key rotate` replaces the token signing key (restart
+the daemon for the listener to sign with it — tokens signed by the old key still
+verify until they expire).
+
 ## Upgrading by hand
 
 Two commands as the service user, once the daemon is idle:

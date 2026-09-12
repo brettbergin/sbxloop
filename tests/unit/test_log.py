@@ -511,3 +511,18 @@ class TestErrorEventsExplainThemselves:
             "ERROR events with neither an exception nor a hint explain nothing to "
             f"whoever reads them: {missing}"
         )
+
+
+def test_a_level_another_library_registered_is_still_unknown() -> None:
+    """uvicorn registers ``TRACE`` with ``logging`` on import; the daemon's
+    levels are a closed set, so an operator asking for it is still told."""
+    import logging
+
+    from sbxloop.log import LogBuffer, LogRecordLine
+
+    logging.addLevelName(5, "TRACE")
+    buffer = LogBuffer()
+    buffer.append(LogRecordLine("t", "INFO", "x", "line"))
+    with pytest.raises(ValueError, match="unknown log level 'TRACE'"):
+        buffer.tail(10, level="TRACE")
+    assert [r.line for r in buffer.tail(10, level="info")] == ["line"]

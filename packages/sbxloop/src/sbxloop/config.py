@@ -2621,6 +2621,61 @@ class TelemetryConfig(_ConfigModel):
         return value
 
 
+class ApiConfig(_ConfigModel):
+    """The remote operations API, served by ``sbxloop daemon`` in-process.
+
+    Off by default: a daemon without ``enabled = true`` opens no listener
+    and behaves exactly as before. On, the daemon serves ``/v1`` (REST,
+    generated OpenAPI) on ``bind:port`` — loopback unless told otherwise —
+    and a remote client authenticates with a short-lived access token
+    minted from client credentials (``sbxloop api client create``) or a
+    refresh token. TLS is the operator's reverse proxy; ``trusted_proxies``
+    says whose forwarded headers the listener believes. Needs the
+    ``sbxloop[api]`` extra; the daemon refuses to start without it.
+    """
+
+    enabled: bool = False
+    # Loopback by default: a broader bind is an explicit choice, and local
+    # binding alone never establishes identity — every request authenticates.
+    bind: str = "127.0.0.1"
+    port: int = Field(default=8420, ge=1, le=65535)
+    # Proxies (addresses or CIDRs) whose X-Forwarded-* headers are believed;
+    # empty means none are.
+    trusted_proxies: list[str] = Field(default_factory=list)
+    # A minted access token lives this long; a refresh token this long.
+    access_token_ttl_s: int = Field(default=900, ge=60, le=3600)
+    refresh_token_ttl_s: int = Field(default=604800, ge=300)
+    # Browser origins allowed to call the API; empty disables CORS entirely.
+    cors_origins: list[str] = Field(default_factory=list)
+    # Request bodies above this are refused with 413.
+    max_body_bytes: int = Field(default=262144, ge=1024)
+    # Live streams (SSE and WebSocket) served at once.
+    max_stream_clients: int = Field(default=32, ge=1)
+    # Public chronology rows older than this are pruned; a client resuming
+    # from a pruned cursor is told so (410) rather than skipped ahead.
+    replay_retention_s: int = Field(default=604800, ge=3600)
+    # How long an idempotency key keeps returning the same operation.
+    idempotency_retention_s: int = Field(default=86400, ge=60)
+    # A command accepted but not claimed within this expires rather than
+    # applying stale intent later.
+    operation_deadline_s: int = Field(default=300, ge=10)
+
+    @field_validator("bind")
+    @classmethod
+    def _bind_is_an_address(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("api.bind must be a host address")
+        return value
+
+    @field_validator("cors_origins")
+    @classmethod
+    def _no_wildcard_origin(cls, value: list[str]) -> list[str]:
+        if "*" in value:
+            raise ValueError("api.cors_origins must list origins; '*' is refused")
+        return value
+
+
 class Config(_ConfigModel):
     model: str = "auto"
     # Runtime provenance, not operator knobs. Persisted so CLI precedence
@@ -2681,6 +2736,7 @@ class Config(_ConfigModel):
     mattermost: MattermostConfig = Field(default_factory=MattermostConfig)
     tui: TuiConfig = Field(default_factory=TuiConfig)
     concierge: ConciergeConfig = Field(default_factory=ConciergeConfig)
+    api: ApiConfig = Field(default_factory=ApiConfig)
     entrygraph: EntrygraphConfig = Field(default_factory=EntrygraphConfig)
     # Named bounds for workload runs (#758) and the one a run gets by
     # default; a code run ignores both.

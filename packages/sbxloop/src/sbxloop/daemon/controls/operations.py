@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import insert, select, update
+from sqlalchemy import and_, insert, or_, select, update
 from sqlalchemy.orm import Session
 
 from sbxloop.daemon.controls.principal import Principal
@@ -308,6 +308,39 @@ class OperationStore:
         if target is not None:
             stmt = stmt.where(
                 OperationRow.target_kind == target[0], OperationRow.target_key == target[1]
+            )
+        with self.dstore.read() as session:
+            return [_row(row) for row in session.scalars(stmt)]
+
+    def page(
+        self,
+        *,
+        states: Sequence[str] | None = None,
+        target: tuple[str, str] | None = None,
+        after: tuple[float, str] | None = None,
+        limit: int = 50,
+    ) -> list[Operation]:
+        """A page newest first, keyed on ``(accepted_at, id)``: ``after`` is
+        the last row of the previous page, so a listing never skips or
+        repeats a row that landed between two requests."""
+        stmt = (
+            select(OperationRow)
+            .order_by(OperationRow.accepted_at.desc(), OperationRow.id.desc())
+            .limit(limit)
+        )
+        if states:
+            stmt = stmt.where(OperationRow.state.in_(list(states)))
+        if target is not None:
+            stmt = stmt.where(
+                OperationRow.target_kind == target[0], OperationRow.target_key == target[1]
+            )
+        if after is not None:
+            accepted_at, op_id = after
+            stmt = stmt.where(
+                or_(
+                    OperationRow.accepted_at < accepted_at,
+                    and_(OperationRow.accepted_at == accepted_at, OperationRow.id < op_id),
+                )
             )
         with self.dstore.read() as session:
             return [_row(row) for row in session.scalars(stmt)]

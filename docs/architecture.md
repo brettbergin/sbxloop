@@ -1521,14 +1521,15 @@ cannot disagree with the home the process runs out of.
 ## Persistence and resume
 
 `~/.sbxloop/state/state.db` (the home's `state/`, see *The home* below) is one
-WAL-mode SQLite database holding **twenty-two** tables, and two stores read it
+WAL-mode SQLite database holding **twenty-five** tables, and two stores read it
 through separate connections. `StateStore` owns five — `runs`, `tasks`,
 `phase_attempts`, `reconciliations`, `events` — and `DaemonStore` the
 fifteen `daemon_*` ones (the queue, the run ledger, the resume budget,
 key/value state, run watches, requesters, prior attempts, chat threads,
 merge gates and their prompts, review holds, pending clarifications, the
-operator console's mailbox, the schedules and the pause holds) plus the two
-`api_*` tables behind the operations record.
+operator console's mailbox, the schedules and the pause holds) plus the five
+`api_*` tables behind the remote API (operations, the public chronology,
+clients, refresh tokens, revoked tokens).
 
 Both are SQLAlchemy models under `sbxloop/db/` (#539), and Alembic owns the
 upgrade path — one revision chain for the whole file, applied when a store
@@ -2131,6 +2132,36 @@ cancel, the gate's state for an approval, the item's state for an item verb,
 the fact that a new generation is answering for a stop or restart. What the
 evidence cannot decide is `reconciling` with the reason, for an operator; it is
 never guessed `succeeded`, and a timeout is never evidence.
+
+### The remote API listener
+
+`sbxloop.api` is the one package that imports FastAPI, lazily: an install
+without the `sbxloop[api]` extra imports it fine and learns by name what it
+lacks when `[api] enabled = true` asks for the listener. `ApiServer` runs
+uvicorn on a thread inside `sbxloop daemon` — started before `recover()` so
+liveness answers through recovery, told it is ready the moment the control
+queue is, closed in the daemon's shutdown sequence. uvicorn on a thread
+captures no signals, so the daemon's own handlers stand. One daemon owns
+execution; the API is a second way in, never a second scheduler: every route
+authenticates a `Principal` from a bearer token, builds a `ControlService`
+over the loop, and calls it on the context's bounded executor — the stores'
+single connections and the loop's locks are never touched from the event
+loop thread. Refusals are `application/problem+json` with the `ControlError`
+code mapped to a status; every response carries an `X-Request-Id`.
+
+Authentication is the daemon's own. `sbxloop api client create` registers a
+client (`api_clients`: a name, the scrypt verifier of a secret shown once,
+the capabilities granted); `POST /v1/auth/token` exchanges the secret for an
+Ed25519-signed access token (`iss=sbxloop`, `aud=sbxloop-api`, `scope`, a
+`jti`; the algorithm list is exactly `EdDSA`) and a refresh token stored by
+digest in a *family* — one grant and every rotation descended from it, so a
+refresh token presented twice revokes the family and the client
+re-authenticates with its secret. Expiry is judged by the daemon's clock. A
+token's scope is what its client still holds: a grant narrowed after minting
+narrows the live token at once, and a revoked client is refused on its next
+request. The signing key lives at `config/api-signing.key` (0600); a rotation
+keeps the previous key until its tokens expire. Authentication failures are
+limited per client id and per source address, apart from work admission.
 
 ### Repositories
 
