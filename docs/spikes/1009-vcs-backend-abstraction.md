@@ -1,8 +1,11 @@
 # Spike: a configurable version-control backend (GitHub, GitLab, Gitea)
 
-Status: **design proposal — no implementation commitment yet.** No tracking
-issue filed; this document is the proposal, and the file should be renamed
-`<issue>-vcs-backend-abstraction.md` once one exists.
+Status: **design proposal — tracked as an epic, no implementation landed
+yet.** The epic is
+[issue #1009](https://github.com/brettbergin/sbxloop/issues/1009); its
+child issues follow the sequence at the end of this document, with the
+field-verification questions filed as their own gate between the
+forge-agnostic steps and the first backend.
 
 Code-seam claims below were read off this tree and are reproducible with the
 commands quoted beside them. **Every claim about GitLab and Gitea API
