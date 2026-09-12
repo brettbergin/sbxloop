@@ -297,7 +297,7 @@ def is_dirty(repo_path: Path, *, ignore: Sequence[str] = ()) -> bool:
             pathspecs = [f":!{name}" for name in ignore]
             output = _dirty_listing(repo, pathspecs)
             return bool(output.strip()) or any(
-                submodule_is_dirty(repo_path / path) for path in _gitlinks(repo, pathspecs)
+                submodule_is_dirty(repo_path / path) for path in _gitlinks(repo, ignore)
             )
     except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError) as exc:
         raise ProvisionError(f"git status failed in {repo_path}: {exc}") from exc
@@ -1227,10 +1227,14 @@ def resolve_diff_base(repo_path: Path, remote_base_sha: str | None) -> str | Non
 
 
 def _merge_base(repo: Repo, ref: str, head: str) -> str | None:
+    """The merge base of ``ref`` and ``head``, or None: unrelated histories
+    are a legitimate answer (an empty list), and so is a ``ref`` the
+    checkout does not have (``origin/HEAD`` on a pinned clone)."""
     try:
-        return str(repo.git.merge_base(ref, head)).strip() or None
-    except GitCommandError:
+        bases = repo.merge_base(ref, head)
+    except (GitCommandError, ValueError):
         return None
+    return bases[0].hexsha if bases else None
 
 
 def changes_since(
@@ -1341,9 +1345,15 @@ def submodule_is_dirty(sub: Path) -> bool:
         return False
 
 
-def _gitlinks(repo: Repo, pathspecs: Sequence[str] = ()) -> list[str]:
-    entries = repo.git.ls_files("--stage", "-z", "--", *pathspecs).split("\0")
-    return [entry.partition("\t")[2] for entry in entries if entry.startswith(GITLINK_MODE + " ")]
+def _gitlinks(repo: Repo, ignore: Sequence[str] = ()) -> list[str]:
+    """Paths of the gitlinks in the index, skipping any top-level entry named
+    in ``ignore`` (the ``:!<name>`` exclusion the status listing applies)."""
+    gitlink = int(GITLINK_MODE, 8)
+    return [
+        str(path)
+        for (path, _stage), entry in repo.index.entries.items()
+        if entry.mode == gitlink and str(path).split("/", 1)[0] not in ignore
+    ]
 
 
 def _dirty_listing(repo: Repo, pathspecs: Sequence[str] = ()) -> str:
@@ -1363,10 +1373,19 @@ def _commit_is_published(sub: Path, sha: str) -> bool:
     word: the gitlink is delivered rather than second-guessed."""
     try:
         with read_repo(sub) as repo:
-            listing = repo.git.for_each_ref(
-                f"--contains={sha}", "refs/remotes", "refs/tags", "--format=%(refname)"
-            )
-            return bool(listing.strip())
+            published = [
+                ref.object.hexsha
+                for ref in repo.refs
+                if str(ref.path).startswith(("refs/remotes/", "refs/tags/"))
+            ]
+            # `sha` minus everything the remote refs and tags reach: empty
+            # exactly when one of them contains it. One walk, not one
+            # ancestry query per ref.
+            # GitPython annotates one rev; rev-list takes many and the
+            # wrapper passes a list straight through.
+            revs = [sha, *(f"^{oid}" for oid in published)]
+            unreached = repo.iter_commits(rev=revs)  # type: ignore[arg-type]
+            return next(unreached, None) is None
     except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError, ValueError):
         return True
 
@@ -1399,6 +1418,10 @@ def diff_text(repo_path: Path, remote_base_sha: str | None) -> str | None:
             body = repo.git.diff(
                 "--ignore-submodules=dirty", "--no-ext-diff", "--no-textconv", "--no-color", base
             )
+            # Not `repo.untracked_files`: GitPython answers that with
+            # `git status`, which recurses into submodules and would run a
+            # nested checkout's fsmonitor hook on the host. `ls-files` does
+            # not descend.
             untracked = [
                 path
                 for path in repo.git.ls_files("--others", "--exclude-standard", "-z").split("\0")
@@ -1580,7 +1603,7 @@ def base_bundle(
     """
     try:
         with read_repo(workspace) as repo:
-            known = repo.git.for_each_ref("--format=%(objectname)").splitlines()
+            known = [ref.object.hexsha for ref in repo.refs]
             if repo.head.is_valid():
                 known.append(repo.head.commit.hexsha)
             ref = "refs/sbxloop/fetched-base"
@@ -1591,10 +1614,10 @@ def base_bundle(
                 f"+refs/heads/{base_branch}:{ref}",
                 env=_clone_env(token, credential_url=repo_url),
             )
-            sha = str(repo.git.rev_parse("--verify", ref)).strip()
+            sha = repo.commit(ref).hexsha
             exclusions = [f"^{oid}" for oid in sorted(set(known))]
-            missing = repo.git.rev_list("--count", ref, *exclusions).strip()
-            if missing == "0":
+            missing = repo.iter_commits(rev=[ref, *exclusions])  # type: ignore[arg-type]
+            if next(missing, None) is None:
                 yield sha, None
             else:
                 bundle = Path(repo.git_dir).parent / "base.bundle"
