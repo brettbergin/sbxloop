@@ -38,6 +38,18 @@
 
 ### Fixed
 
+- **The ⏳ "received" mark now shows up for the person who asked, on
+  Mattermost.** It was already on the server — the bot reacts within
+  milliseconds of a post — but the asker's own web/desktop app never
+  showed it: the reaction arrived over the websocket before their
+  create-post reply did, and the app's reactions reducer replaces what it
+  holds for a post with the reply's (empty) list. Everyone else saw the
+  clock; the one person it was for saw the ✅ appear on its own, which
+  reads as a bot that only noticed them once it was done. The bridge now
+  puts the ⏳ on a second time a beat later — saving an identical reaction
+  is a 200 the server re-broadcasts — and the client keeps that one.
+  Mattermost only; Discord and Slack merge reactions additively.
+
 - **The re-authoring counter now reaches databases that already exist.**
   `tasks.verify_reauthors` was added to the body of Alembic revision 0001
   rather than to a revision of its own. 0001 had already shipped, and
