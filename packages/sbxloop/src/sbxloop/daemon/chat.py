@@ -556,6 +556,21 @@ class ChatBridge(ABC):
     def _mentions(self, user_ids: Iterable[str]) -> str:
         return " ".join(self.mention_user(uid) for uid in user_ids if self._owns_user_id(uid))
 
+    async def _resolve_mentions(self, user_ids: Iterable[str]) -> None:
+        """Make sure :meth:`mention_user` can render each id as a real ping.
+
+        A no-op where the id is all a mention needs — Discord's and Slack's
+        ``<@id>`` — and overridden by a backend whose mentions are spelled
+        with a handle instead. Every caller of this is a message built from
+        *stored* ids (a run watch, a gate's notify list, a review ask, an
+        expired question's asker) rather than from someone who just posted,
+        which is precisely when such a backend has never seen the name.
+        Never raises: a ping that cannot be resolved must still go out as
+        the notice it is attached to.
+        """
+        # Nothing to learn: on every service but one the id *is* the mention.
+        return
+
     def _typing(self, channel: Any) -> Any:
         """A "typing…" indicator context while the concierge thinks; a no-op
         where the service has none."""
@@ -1025,6 +1040,7 @@ class ChatBridge(ABC):
             return
         try:
             thread = self.dstore.chat_thread(run_id, self.backend)
+            await self._resolve_mentions(watchers)
             await self._send_channel(
                 self._watch_notice(run_id, watchers, state, report, thread),
                 mentions=True,
@@ -1335,6 +1351,8 @@ class ChatBridge(ABC):
         if channel is None:
             self.log.warning("chat.clarify_unreachable", id=row.id)
             return
+        if row.asker_id:
+            await self._resolve_mentions([row.asker_id])
         mention = f"{self.mention_user(row.asker_id)} " if row.asker_id else ""
         await self._send(
             channel,
@@ -1968,6 +1986,7 @@ class ChatBridge(ABC):
         target = thread if thread is not None else await self._control_channel()
         if target is None:
             return
+        await self._resolve_mentions(gate.notify_ids)
         posted = await self._send_gate(target, self._gate_prompt_text(gate), gate)
         if posted is None:
             return
@@ -2000,6 +2019,7 @@ class ChatBridge(ABC):
                 "🚫 held result dropped" if fresh.kind == "publish" else "🚫 merge gate dismissed"
             ) + (f" — {_one_line(str(detail), 200)}" if detail else "")
         else:
+            await self._resolve_mentions(fresh.notify_ids)
             mentions = self._mentions(fresh.notify_ids)
             text = (
                 "⚠ approval by "
@@ -2050,6 +2070,7 @@ class ChatBridge(ABC):
             known = self.dstore.chat_thread(notice.run_id, self.backend)
         # A notice with people to address (#675: a PR waiting for their
         # review) pings them where it lands — the ask has to reach them.
+        await self._resolve_mentions(notice.mention_ids)
         prefix = self._mentions(notice.mention_ids)
         pings = bool(prefix)
         text = f"{prefix} {daemon_notice(notice)}" if pings else daemon_notice(notice)
