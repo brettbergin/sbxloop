@@ -1676,6 +1676,14 @@ steering are @mention-only (`@your-bot` in the control channel or in a
 run's thread), and people can talk to each other in a run's thread without
 the bot answering. `sbxloop doctor` shows one
 `chat bridge (mattermost)` row: extra installed, token present.
+A mention here is `@username` rather than an id, so before the daemon pings
+anyone from something it remembered — a run watch, a merge gate's notify
+list, a review ask — it resolves those ids to handles through the users
+API. That matters after a restart, when the bridge has not yet seen any of
+those people post: without it the notice telling you your run finished went
+out carrying a bare 26-character id, which is text, not a notification. An
+id that cannot be resolved (a deactivated account) renders as itself and is
+not looked up again.
 Cards are coloured message attachments (`[mattermost] embeds`) — a post the
 server rejects is retried text-only, so a run's chronology never goes
 missing over presentation — a workload result's files are uploaded up to

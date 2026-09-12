@@ -64,7 +64,7 @@ import functools
 import json
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
@@ -1072,9 +1072,29 @@ class MattermostBridge(ChatBridge):
 
     def mention_user(self, user_id: str) -> str:
         """``@handle`` — a Mattermost mention is a username, so a stored user
-        id is resolved through the cache the inbound path fills. An id we
-        never saw post renders as itself rather than as a broken ping."""
+        id is resolved through the name cache. An id whose handle could not
+        be learned renders as itself rather than as a broken ping."""
         return f"@{self._names.get(user_id, user_id)}"
+
+    async def _resolve_mentions(self, user_ids: Iterable[str]) -> None:
+        """Learn the handles this bridge's mentions are spelled with.
+
+        A Mattermost mention is ``@username``, and the name cache is filled
+        by the *inbound* path — so it holds whoever has posted since this
+        process started, and nobody else. Every id that reaches here came
+        off the store instead: a run watch, a gate's notify list, a review
+        ask. After a restart the cache has none of them, and the notice
+        that tells somebody their run finished went out carrying a bare
+        26-character id — text, not a notification, to the one person who
+        asked to be told.
+
+        One users call per id never seen; ``_lookup_name`` caches the id
+        itself when the lookup fails, so a deactivated account is not
+        looked up again on every notice.
+        """
+        for user_id in user_ids:
+            if user_id and user_id not in self._names and self._owns_user_id(user_id):
+                await self._lookup_name(user_id)
 
     def _owns_user_id(self, user_id: str) -> bool:
         return bool(_MATTERMOST_ID_RE.match(user_id))

@@ -36,7 +36,7 @@ from sbxloop.daemon.mattermost import (
     MattermostTarget,
 )
 from sbxloop.daemon.mattermost_format import ZERO_WIDTH_SPACE
-from sbxloop.daemon.model import WorkItem
+from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.store import ChatThread, DaemonStore
 from sbxloop.errors import DaemonError
 from sbxloop.events import EventBus
@@ -952,3 +952,73 @@ class TestReconnect:
         bridge.close()
         settled = client.connects
         assert not wait_for(lambda: client.connects > settled, timeout=0.3)
+
+
+class TestMentionHandles:
+    """A Mattermost mention is `@username`, so an id alone cannot be one.
+    Every notice built from *stored* ids — a run watch, a gate's notify
+    list — is sent exactly when the name cache the inbound path fills is
+    empty, which is what made these pings text instead of notifications."""
+
+    def test_a_watcher_from_before_a_restart_is_pinged_by_handle(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            item, _, _ = start_run(bridge)
+            # The watch is in the store; the name cache is not — the shape a
+            # restart leaves behind, and the shape that used to post a bare
+            # 26-character id at the person who asked to be told.
+            bridge.dstore.add_run_watch("r1", USER_ID, time.time(), backend="mattermost")
+            bridge._watchers["r1"] = [USER_ID]
+            assert USER_ID not in bridge._names
+            bridge.run_finished(item, RunReport("r1", "completed", "done"))
+            marker = "run `r1` finished"
+            assert wait_for(lambda: any(marker in p["message"] for p in client.posts))
+            notice = next(p for p in client.posts if marker in p["message"])
+            assert notice["message"].startswith("@ana ")
+            assert USER_ID not in notice["message"]
+        finally:
+            bridge.close()
+
+    def test_a_gate_prompt_pings_its_notify_list_by_handle(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            start_run(bridge)
+            asyncio.run(bridge._post_gate_prompt(make_gate("r1", notify=(USER_ID,))))
+            prompt = client.posts[-1]["message"]
+            assert prompt.startswith("@ana ")
+        finally:
+            bridge.close()
+
+    def test_a_handle_is_looked_up_once_per_id(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            asyncio.run(bridge._resolve_mentions([USER_ID, USER_ID]))
+            asyncio.run(bridge._resolve_mentions([USER_ID]))
+            assert client.lookups == [USER_ID]
+        finally:
+            bridge.close()
+
+    def test_an_id_that_cannot_be_resolved_is_not_retried_on_every_notice(
+        self, tmp_path: Path
+    ) -> None:
+        """A deactivated account 404s. It renders as itself — a broken ping
+        is better than a wrong one — and is not looked up again."""
+        bridge, client, _ = make_bridge(tmp_path)
+        gone = "z" * 26
+        try:
+            asyncio.run(bridge._resolve_mentions([gone]))
+            asyncio.run(bridge._resolve_mentions([gone]))
+            assert client.lookups == [gone]
+            assert bridge.mention_user(gone) == f"@{gone}"
+        finally:
+            bridge.close()
+
+    def test_another_service_s_ids_are_left_alone(self, tmp_path: Path) -> None:
+        """Several bridges can run at once and watcher ids are backend-less
+        in the store: a Discord snowflake must not become a users lookup."""
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            asyncio.run(bridge._resolve_mentions(["1234567890"]))
+            assert client.lookups == []
+        finally:
+            bridge.close()
