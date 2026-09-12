@@ -1652,7 +1652,17 @@ environment / `.env` — never in `sbxloop.toml`. Create a bot account in the
 *System Console* → *Integrations* → *Bot Accounts*, then add it to the
 control channel. The bridge connects over a **websocket**, so like Slack's
 Socket Mode it dials out: no public URL, no inbound hole, and a daemon
-behind NAT works.
+behind NAT works. It holds that connection open for as long as the daemon
+runs: a socket that drops — a server restart, an idle proxy timeout, a
+network blip — is rebuilt with a backoff (one second, doubling to one a
+minute) for as long as it takes, and each attempt is in the log
+(`mattermost.disconnected`, `mattermost.reconnected`). It matters that this
+heals on its own: REST is unaffected by the drop, so a bridge holding a
+dead socket would keep posting every run's chronology while silently
+discarding every steer, command and @mention. A *first* connect that fails
+is not retried — a bad token or a wrong URL is something to fix, not to
+wait out — and is reported as `chat.connect_failed` with the daemon
+carrying on without chat.
 On Mattermost's shapes: the run thread is the reply stream under the
 headline post (its post id is the thread id; `thread_per_run = false` posts
 everything top-level), and Mattermost does not nest, so the one-level
@@ -1660,12 +1670,27 @@ chronology is the shape it already wants. Reactions use the standard emoji
 names. Mattermost has no allowed-mentions control, so agent prose is passed
 through a mention guard — a zero-width space parks every `@name` that would
 resolve, leaving it readable and inert — which is why a run's prose can
-never ping `@channel`. Replying on Mattermost means posting in a thread
+never ping `@channel`. **Link previews** are off the same way. Discord and
+Slack each have a per-message switch; Mattermost's `EnableLinkPreviews` is
+server-wide, and a chronology carrying a PR, an issue and a CI link would
+otherwise grow a website card under each one. But the server picks what to
+embed from the *first autolink* in a post, and a markdown link is never an
+autolink — so every bare URL goes out written as a link to itself: same
+text, same click, no card. (Angle brackets would not do it: `<url>` is an
+autolink too, which is why Discord's trick is not the one used here.) Replying on Mattermost means posting in a thread
 rather than answering one message, so — as on Slack — the concierge and
 steering are @mention-only (`@your-bot` in the control channel or in a
 run's thread), and people can talk to each other in a run's thread without
 the bot answering. `sbxloop doctor` shows one
 `chat bridge (mattermost)` row: extra installed, token present.
+A mention here is `@username` rather than an id, so before the daemon pings
+anyone from something it remembered — a run watch, a merge gate's notify
+list, a review ask — it resolves those ids to handles through the users
+API. That matters after a restart, when the bridge has not yet seen any of
+those people post: without it the notice telling you your run finished went
+out carrying a bare 26-character id, which is text, not a notification. An
+id that cannot be resolved (a deactivated account) renders as itself and is
+not looked up again.
 Cards are coloured message attachments (`[mattermost] embeds`) — a post the
 server rejects is retried text-only, so a run's chronology never goes
 missing over presentation — a workload result's files are uploaded up to
@@ -1674,7 +1699,9 @@ are named by host path, as is any file too large or whose upload fails — a
 named file is never silently dropped), and the merge gate's approve button
 is a seeded ✅: reacting with it approves, exactly as `!sbx merge` does, and
 the reaction comes back off once the gate resolves so a merged prompt never
-looks like it is still waiting for you.
+looks like it is still waiting for you. A prompt or a status message that
+somebody deleted is noticed and put back on the next restart, rather than
+leaving a standing gate with nothing to approve it with.
 
 While the concierge is working on an @mention it shows **"…is typing"**
 under the message box, for as long as the turn takes — the same signal
