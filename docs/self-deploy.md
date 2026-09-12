@@ -6,34 +6,52 @@ workflow — is [docs/deploy.md](deploy.md). This page records where sbxloop's o
 departs from that pattern and the facts about the host that operating it needs.
 
 ```
-merge to main → Release (tag + PyPI, ~4 min) → Deploy the daemon (self-hosted runner on db)
+merge to main → quiet batch → Release (test + tag + PyPI) → Deploy the daemon
+                                                 ├─ check version, cooldown, and blocked releases
                                                  ├─ check the existing host with doctor
                                                  ├─ take a named pause hold (deploy-<run id>)
                                                  ├─ wait — no cap — for the in-flight run to finish
+                                                 ├─ refresh to the latest complete release
                                                  ├─ pip install the release wheels
                                                  ├─ systemctl --user restart sbxloop-daemon
                                                  ├─ health check, or roll back
                                                  └─ restore the other holds + tell the control channel
 ```
 
-Every merge to `main` auto-releases a patch to PyPI ([RELEASING.md](../RELEASING.md));
-`.github/workflows/deploy.yml` carries that release the last mile onto the host running
-`sbxloop daemon`, so a running daemon never silently drifts behind its own releases. Since
-1.0 the loop merges its own PRs, every merge deploys, and the next queued item is usually
-already running when the deploy lands — which is why the wait for idle has no cap (#534): a
-capped drain that "restarts anyway" killed in-flight tasks and spent the item's resume budget
-for nothing of its own doing.
+Merges share a release after three quiet minutes, with a maximum thirty-minute batch
+wait ([RELEASING.md](../RELEASING.md)). `.github/workflows/deploy.yml` carries completed
+releases onto the daemon host. A task may already be in flight when a release arrives,
+which is why draining has no cap apart from the job timeout (#534): restarting anyway
+killed tasks and spent their resume budgets.
+
+Automatic deployments have a thirty-minute cooldown after a deployment finishes,
+including a verified rollback. No hold is taken during that cooldown. A reconciliation
+schedule at minutes 7, 22, 37 and 52 retries deferred releases even if no further merge
+arrives. It creates no tags or packages and does nothing when the host is current.
+GitHub can delay scheduled jobs; this is eventual reconciliation, not a deadline.
+
+At idle, automatic and manual "latest" deployments select the newest complete stable
+release again. If B and C published while A waited, the host installs C directly.
+Explicit manual versions remain pinned. Automatic deployment never downgrades a host.
+The selected version is frozen before downloading, backing up, installing, and checking
+health; reports and history use that final version.
 
 ## Where it departs from the example
 
 `deploy.yml` is `contrib/workflows/deploy-daemon.yml.example` with these differences:
 
-- **Trigger.** `workflow_run` on `Release` (which is push-to-`main` only and always runs in
-  base-repository context) instead of a schedule, plus `workflow_dispatch`. Both satisfy the
-  self-hosted security invariant in the generic guide.
-- **Version.** The tag on the commit `Release` just published (matched via `/tags`, whose
-  `.commit.sha` dereferences the annotated tag), falling back to the latest release when
-  `Release`'s ancestor guard skipped tagging.
+- **Trigger.** Successful `workflow_run` on `Release`, reconciliation `schedule`, and
+  `workflow_dispatch` restricted to `main`. The completion's `release-result` artifact
+  explicitly distinguishes a publication from a no-op. A missing/malformed artifact
+  fails the event-triggered attempt; reconciliation can still find a completed release.
+- **Version.** The greatest stable numeric version with a published GitHub Release and
+  both wheels and source distributions uploaded. Drafts are ignored; an incomplete
+  published release fails closed. The tag must resolve to a commit on `main`.
+- **Workflow helper.** No checkout runs on the host. The job downloads
+  `scripts/release_pipeline.py` at its own `github.workflow_sha`, with the workflow's
+  token. Only this trusted workflow revision supplies executable helper code. The
+  release result and manifest are parsed as data. The token needs `contents: read`
+  and `actions: read` to read releases and the completion artifact.
 - **Wheels from the release, not PyPI.** `gh release download` fetches the same `dist/` that
   `Release` uploads to PyPI, which exists the moment that workflow finishes — whereas the
   PyPI simple index is Fastly-cached with `max-age=600`, so for up to ten minutes pip can be
@@ -44,6 +62,13 @@ for nothing of its own doing.
   installs from PyPI: the previous version has been published for a while, so its page is
   long since warm. Both install `[discord,slack]` (#619) so a rollback never drops an extra
   the upgrade had.
+- **Manifest.** New releases carry `release-manifest.json`; the downloaded wheels must
+  match its hashes and its commit must match the release tag. Existing completed releases
+  without that manifest remain deployable for rollback compatibility.
+- **Deployment state.** `state/deploy.json` under the resolved sbxloop home records the
+  last completion time, versions suppressed after attempts/rollbacks, and whether an
+  upgrade was interrupted. Writes replace the file atomically. Malformed state and an
+  interrupted or unhealthy deployment block automatic work and name the recovery need.
 - **`GH_TOKEN` is set explicitly** on every step calling `gh`. The host's `secrets.env`
   exports its own `GH_TOKEN`, and the `sbxloop` wrapper sources it with `set -a`; without
   the override, a host PAT would be the identity for Actions API calls.
@@ -80,10 +105,10 @@ label. `deploy.yml` does not change, and neither does anything `make check` runs
 
 ```bash
 # deploy a specific version (also the rollback path)
-gh workflow run deploy.yml -f version=X.Y.Z
+gh workflow run deploy.yml --ref main -f version=X.Y.Z
 
 # deploy whatever the latest release is
-gh workflow run deploy.yml
+gh workflow run deploy.yml --ref main
 
 gh run watch                                            # from the repo
 ssh db 'journalctl --user -u sbxloop-daemon -f'         # from the host
@@ -95,6 +120,24 @@ passes only after its version, service, doctor and control checks pass. If a dep
 fails *and* its rollback fails, the job says `ROLLBACK ALSO FAILED — db needs a human`; fix
 by hand with the commands in the generic guide, from any directory. Every deploy leaves a
 snapshot under `~/.sbxloop/backups/` and a line in `~/.sbxloop/logs/deploy/history.log`.
+
+Manual deploys bypass the cooldown and failed-version suppression, but wait for the
+shared deployment slot and for the current daemon task to drain. Pending manual requests
+are retained (`queue: max`, at most 100 pending runs). An explicit manual recovery can
+reinstall the same version after an interrupted deployment; it still must pass preflight.
+
+A failed upgrade followed by rollback suppresses that target and older versions from
+automatic retries. A manual rollback suppresses automatic releases through the latest
+published version observed when that rollback starts, so the next schedule cannot undo
+it. A newer version or an explicit manual retry can proceed. If rollback cannot restore
+health, repair the host manually; after repair, use a manual deployment to verify health
+and clear the interrupted state. To stay pinned across future releases, disable the
+workflow and use the by-hand procedure until automatic deployment is wanted again.
+
+Cooldown/current/blocked decisions appear in the Actions summary without chat notices.
+The control channel sees actual draining, a changed target after draining, and the final
+deployment or rollback outcome. Normal successful upgrades are spaced apart; manual
+operations and necessary rollback recovery can restart sooner.
 
 Set `[daemon] version_check = false` in this host's `sbxloop.toml` (#641): the pipeline keeps it current,
 so the daemon neither asks PyPI nor advises a hand upgrade the next deploy would undo. A
