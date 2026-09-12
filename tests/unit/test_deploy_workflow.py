@@ -330,6 +330,7 @@ class TestStructuredControl:
         assert deploy.index("name: Load the trusted workflow helper") < deploy.index(
             "name: Announce"
         )
+        assert deploy.index("name: Report") < deploy.index("name: Clean up the workflow helper")
 
     def test_generic_deploy_notices_keep_using_the_control_channel(self, example: str) -> None:
         assert "DEPLOY_CHANNEL" not in example
