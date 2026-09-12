@@ -12,7 +12,6 @@ import hashlib
 import io
 import json
 import os
-import subprocess
 import tempfile
 import time
 import urllib.error
@@ -22,6 +21,16 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, BinaryIO
+
+from git import (
+    BadName,
+    Git,
+    GitCommandError,
+    InvalidGitRepositoryError,
+    NoSuchPathError,
+    Reference,
+    Repo,
+)
 
 from sbxloop_worker.protocol import RegistryFetchParams
 from sbxloop_worker.serviceops import FAKE_ENV, FakeTransport, _NoRedirect
@@ -171,8 +180,16 @@ def _download(url: str, header: str, env: Mapping[str, str], timeout: float) -> 
 
 
 def _git_bundle(url: str, ref: str, header: str, destination: Path, timeout: float) -> None:
-    """Fetch objects into a fresh bare repository: no checkout or project config."""
-    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    """Fetch objects into a fresh bare repository: no checkout or project config.
+
+    The repository and the ref it pins are typed (`Repo.init`,
+    `Reference.create`); the fetch takes a URL rather than a configured
+    remote and the bundle has no model, so both stay git commands. Every
+    failure is reported as the operation and its exit status and nothing
+    else: remote error text can echo the `Authorization` header, and a
+    `GitCommandError` carries stderr in its message.
+    """
+    env: dict[str, str | None] = {key: None for key in os.environ if key.startswith("GIT_")}
     env.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -199,30 +216,50 @@ def _git_bundle(url: str, ref: str, header: str, destination: Path, timeout: flo
         env[f"GIT_CONFIG_KEY_{index}"] = key
         env[f"GIT_CONFIG_VALUE_{index}"] = value
     deadline = time.monotonic() + timeout
+
+    def budget() -> float:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RegistryFetchError("registry Git fetch timed out")
+        return remaining
+
     with tempfile.TemporaryDirectory(prefix="sbxloop-registry-git-") as directory:
-        for args in (
-            ("init", "--bare", "."),
-            ("fetch", "--no-tags", "--no-recurse-submodules", "--", url, ref),
-            ("update-ref", "refs/sbxloop/dependency", "FETCH_HEAD"),
-            ("bundle", "create", str(destination), "refs/sbxloop/dependency"),
-        ):
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise RegistryFetchError("registry Git fetch timed out")
-            result = subprocess.run(  # nosec B603 B607 - fixed Git ops, fresh bare metadata, HTTPS only, no checkout
-                ["git", *args],
-                cwd=directory,
-                env=env,
-                capture_output=True,
-                timeout=remaining,
-                check=False,
-            )
-            if result.returncode:
-                # Remote error text can echo authentication headers. The
-                # fixed operation and exit status suffice; never relay it.
-                raise RegistryFetchError(
-                    f"registry Git {args[0]} failed (exit {result.returncode})"
+        operation = "init"
+        try:
+            # `Repo.init` overlays its `env` on the inherited environment;
+            # only `update_environment` can *remove* a variable, and every
+            # inherited `GIT_*` must go. So the init runs on a `Git` bound
+            # to the scrubbed environment, and the typed objects take over.
+            git = Git(directory)
+            git.update_environment(**env)
+            git.init("--bare")
+            with Repo(directory) as repo, repo.git.custom_environment(**env):
+                operation = "fetch"
+                repo.git.fetch(
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--",
+                    url,
+                    ref,
+                    kill_after_timeout=budget(),
                 )
+                operation = "update-ref"
+                Reference.create(repo, "refs/sbxloop/dependency", repo.commit("FETCH_HEAD"))
+                operation = "bundle"
+                repo.git.bundle(
+                    "create",
+                    str(destination),
+                    "refs/sbxloop/dependency",
+                    kill_after_timeout=budget(),
+                )
+        except GitCommandError as exc:
+            # Never relay stderr, and never chain the exception: either can
+            # carry the header. The fixed operation and status suffice.
+            raise RegistryFetchError(
+                f"registry Git {operation} failed (exit {exc.status})"
+            ) from None
+        except (InvalidGitRepositoryError, NoSuchPathError, BadName, ValueError, OSError):
+            raise RegistryFetchError(f"registry Git {operation} failed") from None
 
 
 def execute_fetch(
