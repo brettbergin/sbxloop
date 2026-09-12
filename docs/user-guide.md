@@ -1422,7 +1422,19 @@ Your message is
 relayed to the agent exactly like the CLI's `--chat` (answered at the next
 checkpoint, which can be minutes into a long step — a note under your
 message says where the agent is, `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far)`, edited in place until the ⏳ reaction turns ✅
-when the reply lands). `!sbx status|pause [--hold NAME]|resume [--hold NAME|--all]|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>|merge <item|run>|release <item|run>|grant-rounds <run> <n>|resume-repo <owner/name>|schedules [pause <name>|resume <name>]|log [--tail N] [--level L] [--grep T]|stop` in the control channel drive the daemon
+when the reply lands).
+
+Anything you address to the bot — a steer, or an @mention in the control
+channel — is marked on your own message as it moves: **⏳ received**, then
+**✅ answered** or **⚠ something went wrong**. The ⏳ goes on the moment the
+message is routed, before the work behind it starts, so it is there while
+the concierge is still thinking rather than arriving with the reply; a
+steer the run can no longer take settles to ⚠ rather than leaving a clock
+for an answer that will never come; and a message that gets a second turn
+against it later (answering a clarifying question does) is never marked
+received again after it has been answered.
+
+`!sbx status|pause [--hold NAME]|resume [--hold NAME|--all]|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>|merge <item|run>|release <item|run>|grant-rounds <run> <n>|resume-repo <owner/name>|schedules [pause <name>|resume <name>]|log [--tail N] [--level L] [--grep T]|stop` in the control channel drive the daemon
 itself. Pause is a set of **named holds**: a bare `pause`/`resume` acts on the
 operator's hold, the deploy pipeline holds `deploy-<run id>` while it waits for
 the daemon to go idle, and the daemon idles while any hold stands — so an
