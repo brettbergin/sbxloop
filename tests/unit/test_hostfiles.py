@@ -107,6 +107,17 @@ class TestWindows:
         )
         assert privacy(path, os_name="nt", runner=icacls).ok
 
+    def test_owner_rights_is_the_owner_not_a_stranger(self, tmp_path: Path) -> None:
+        """Windows leaves an `OWNER RIGHTS` (S-1-3-4) entry on a file
+        restricted with `/inheritance:r /grant:r` — the shape make_private
+        produces. It names whoever owns the object, not a third party, so
+        reading it as one reported every correctly-restricted file as
+        readable by someone else (found by the windows-host CI job)."""
+        path = tmp_path / "secrets.env"
+        icacls = FakeIcacls(stdout=_listing(path, f"HOST\\{_me()}:(F)", "OWNER RIGHTS:(F)"))
+        verdict = privacy(path, os_name="nt", runner=icacls)
+        assert verdict.ok, verdict.detail
+
     def test_another_principal_makes_it_not_private(self, tmp_path: Path) -> None:
         path = tmp_path / "secrets.env"
         icacls = FakeIcacls(
@@ -163,6 +174,22 @@ class TestWindows:
         icacls = FakeIcacls()
         create_private(path, os_name="nt", runner=icacls)
         assert path.is_file() and len(icacls.calls) == 1
+
+
+class TestTimezoneDatabase:
+    """`zoneinfo` reads the *system* tz database and Windows ships none, so
+    the package carries `tzdata` there. Asserted from any host: the
+    windows-host job proves the effect, this keeps the declaration from
+    being dropped where nobody would notice until that job ran."""
+
+    def test_the_package_declares_tzdata_for_windows(self) -> None:
+        import tomllib
+
+        root = Path(__file__).resolve().parents[2]
+        text = (root / "packages" / "sbxloop" / "pyproject.toml").read_bytes()
+        deps = tomllib.loads(text.decode())["project"]["dependencies"]
+        (tz,) = [d for d in deps if d.split(";")[0].strip() == "tzdata"]
+        assert "sys_platform" in tz and "win32" in tz
 
 
 @pytest.mark.windows_host

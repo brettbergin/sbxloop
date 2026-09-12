@@ -37,11 +37,24 @@ from sbxloop.errors import SbxloopError
 #: The private-file mode on a POSIX host: the owner, and nobody else.
 PRIVATE_FILE_MODE = 0o600
 
-#: Principals a private file may still name on Windows besides its owner.
-#: Both are the machine's own administrative identities: they can read any
-#: file on the host regardless of its ACL, so requiring their absence would
-#: fail every file without protecting anything.
-WINDOWS_ALLOWED_PRINCIPALS = ("NT AUTHORITY\\SYSTEM", "BUILTIN\\ADMINISTRATORS")
+#: Principals a private file may still name on Windows besides the account
+#: it is granted to. None of them is a third party:
+#:
+#: - ``SYSTEM`` and ``Administrators`` are the machine's own administrative
+#:   identities. They can read any file on the host regardless of its ACL,
+#:   so requiring their absence would fail every file without protecting
+#:   anything.
+#: - ``OWNER RIGHTS`` (S-1-3-4) is not an account at all — it stands for
+#:   whoever currently owns the object, and Windows leaves it behind on a
+#:   file restricted with ``/inheritance:r /grant:r``, which is exactly what
+#:   :func:`make_private` does. An owner can rewrite the DACL anyway, so it
+#:   grants nothing the owner did not already have. Reading it as a stranger
+#:   reported every correctly-restricted file as readable by someone else.
+WINDOWS_ALLOWED_PRINCIPALS = (
+    "NT AUTHORITY\\SYSTEM",
+    "BUILTIN\\ADMINISTRATORS",
+    "OWNER RIGHTS",
+)
 
 
 class PrivacyError(SbxloopError):

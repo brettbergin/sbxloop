@@ -194,6 +194,19 @@ class TestHostExecutables:
         assert SbxloopHome(tmp_path).os_name == os.name
 
     @pytest.mark.windows_host
+    def test_every_command_can_load_a_config_on_this_host(self, tmp_path: Path) -> None:
+        """`daemon.run_cap_timezone` defaults to "UTC" and is validated on
+        every `load_config()` through `zoneinfo`, which reads the *system*
+        tz database — and Windows ships none. Without the `tzdata`
+        dependency every command there, `doctor` and `config` included,
+        failed with "must be a valid IANA timezone, got 'UTC'" (found by the
+        windows-host CI job)."""
+        from zoneinfo import ZoneInfo
+
+        assert ZoneInfo("UTC") is not None
+        assert load_config(cwd=tmp_path, env={}).daemon.run_cap_timezone == "UTC"
+
+    @pytest.mark.windows_host
     @pytest.mark.slow
     def test_a_real_venv_puts_its_interpreter_where_this_host_says(self, tmp_path: Path) -> None:
         """The claim that decides every interpreter path, checked against a
