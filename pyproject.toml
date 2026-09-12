@@ -82,6 +82,8 @@ module = [
     "openai_codex.*",
     "codex_cli_bin",
     "codex_cli_bin.*",
+    "openai",
+    "openai.*",
     "discord",
     "discord.*",
     "slack_sdk",

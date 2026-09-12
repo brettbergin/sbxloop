@@ -294,7 +294,8 @@ def test_persisted_session_identity_restores_only_known_matching_sessions(tmp_pa
 
 
 def test_tui_nested_keys_can_be_set_and_unset_without_losing_other_roles():
-    from sbxloop.tui import configkeys, configtoml
+    from sbxloop.configedit import keys as configkeys
+    from sbxloop.configedit import toml as configtoml
 
     text = 'model = "fallback"\n[[github.repos]]\nrepo = "org/one"\n'
     for name in ["agent.models.build", "github.repos[0].agent_models.review"]:

@@ -26,6 +26,12 @@ claude = ["claude-agent-sdk>=0.2.149"]
 # The Python Codex SDK includes its matching CLI runtime. Pin the pair:
 # tool registration and environment suppression use the experimental API.
 codex = ["openai-codex==0.147.0"]
+# The openai backend: the official client, driven against the endpoint
+# [agent.openai] names. The extra is named after the backend because
+# provisioning installs `sbxloop-worker[<backend>]` verbatim. Only the
+# long-stable surface is used (chat completions with tools and streaming,
+# the models listing), so a floor rather than a pin.
+openai = ["openai>=1.99"]
 
 [project.urls]
 Homepage = "https://github.com/brettbergin/sbxloop"

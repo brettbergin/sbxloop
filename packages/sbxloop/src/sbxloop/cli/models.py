@@ -20,6 +20,13 @@ host's credential can use, so `model = "..."` in sbxloop.toml (or
 - codex: the Codex SDK's model catalogue, with OPENAI_API_KEY and an
   isolated runtime configuration. The optional host `[codex]` extra is
   needed for this command; listing authenticates but starts no model turn.
+- openai: ``GET {base_url}/models`` on the endpoint `[agent.openai]` names
+  — served by vLLM, LiteLLM and the hosted API alike — with the credential
+  `api_key_env` names as a bearer token, over the stdlib. The listing
+  carries no billing, context or reasoning metadata, so the row is id and
+  name. An endpoint that 404s the listing serves none: reported as exactly
+  that, with the configured model still valid to use. FIELD-UNVERIFIED
+  against a live served endpoint.
 
 Runs on the host and needs no sandbox either way.
 
@@ -44,11 +51,15 @@ import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from sbxloop.backends import ANTHROPIC_TOKEN_ENV, OPENAI_TOKEN_ENV, AgentBackend
+from sbxloop.endpoint import parse_endpoint
 from sbxloop.errors import SbxloopError
 from sbxloop.log import redact_text
+
+if TYPE_CHECKING:
+    from sbxloop.config import Config
 
 # The SDK's documented auth resolution order.
 SDK_TOKEN_ENVS = ("COPILOT_GITHUB_TOKEN", "GH_TOKEN", "GITHUB_TOKEN")
@@ -58,6 +69,18 @@ ANTHROPIC_VERSION = "2023-06-01"
 ANTHROPIC_PAGE_SIZE = 100
 # Pages are ~100 short records; anything past this is not a model list.
 ANTHROPIC_MAX_BYTES = 1 << 20
+
+# A listing is ~100 short records; anything past this is not a model list.
+OPENAI_MAX_BYTES = 1 << 20
+# How long doctor waits for the endpoint to answer from the host.
+ENDPOINT_PROBE_TIMEOUT_S = 5.0
+
+
+class NoModelListing(SbxloopError):
+    """The configured endpoint serves no model listing (a 404 on
+    ``/models``). Not a failure: the configured model is still valid, and
+    the catalog is advisory."""
+
 
 SDK_INSTALL_HINT = (
     "github-copilot-sdk is not installed on this host — install it with "
@@ -335,23 +358,158 @@ def codex_model_row(record: dict[str, Any]) -> ModelRow:
     )
 
 
-def fetch_backend_rows(backend: AgentBackend, timeout_s: float = 60.0) -> list[ModelRow]:
-    """The configured backend's models, flattened for display."""
+# -- the openai backend: the endpoint's own listing over the stdlib ----------
+
+
+def _openai_target(config: Config) -> tuple[str, str, str]:
+    """(models URL, endpoint authority, credential env) for the configured
+    endpoint; config validation has required the URL under the backend."""
+    settings = config.openai_for()
+    if settings.base_url is None:
+        raise SbxloopError(
+            '[agent.openai] base_url is not set — [agent] backend = "openai" lists models '
+            "from the endpoint it names"
+        )
+    endpoint = parse_endpoint(settings.base_url)
+    return f"{endpoint.url}/models", endpoint.authority, settings.api_key_env
+
+
+def fetch_openai_models(
+    config: Config,
+    timeout_s: float = 60.0,
+    env: dict[str, str] | None = None,
+    *,
+    open_url: OpenUrl | None = None,
+) -> list[dict[str, Any]]:
+    """Every model record the configured endpoint lists, as its own dicts."""
+    env = dict(os.environ) if env is None else env
+    url, authority, key_env = _openai_target(config)
+    key = env.get(key_env, "")
+    if not key:
+        raise SbxloopError(
+            f'{key_env} is not set — [agent] backend = "openai" lists models from the '
+            f"endpoint at {authority} with it; export it (a placeholder value if the "
+            "endpoint wants no credential)"
+        )
+    opener = _open_url if open_url is None else open_url
+    request = urllib.request.Request(
+        url, headers={"Authorization": f"Bearer {key}", "Accept": "application/json"}
+    )
+    try:
+        raw = opener(request, timeout_s)
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            raise NoModelListing(
+                f"the endpoint at {authority} serves no model listing (HTTP 404 for {url})"
+            ) from exc
+        hint = f" — the key in {key_env} was refused" if exc.code in (401, 403) else ""
+        raise SbxloopError(
+            f"listing models from {authority} failed: HTTP {exc.code}{hint}"
+        ) from exc
+    except urllib.error.URLError as exc:
+        raise SbxloopError(f"listing models from {authority} failed: {exc.reason}") from exc
+    except TimeoutError as exc:
+        raise SbxloopError(
+            f"listing models from {authority} timed out after {timeout_s:.0f}s"
+        ) from exc
+    except OSError as exc:
+        raise SbxloopError(f"listing models from {authority} failed: {exc}") from exc
+    if len(raw) > OPENAI_MAX_BYTES:
+        raise SbxloopError(
+            f"listing models from {authority} failed: response is not a model list (too large)"
+        )
+    try:
+        page = json.loads(raw)
+    except ValueError as exc:
+        raise SbxloopError(f"listing models from {authority} failed: response is not JSON") from exc
+    data = page.get("data") if isinstance(page, dict) else None
+    if not isinstance(data, list):
+        raise SbxloopError(f"listing models from {authority} failed: response is not a model list")
+    return [item for item in data if isinstance(item, dict) and isinstance(item.get("id"), str)]
+
+
+def openai_model_row(record: dict[str, Any]) -> ModelRow:
+    """Flatten one listing record: the id, and whatever the server calls it
+    (a display name where one is given, else who serves it)."""
+    name = next(
+        (
+            str(record[key])
+            for key in ("display_name", "name", "owned_by")
+            if isinstance(record.get(key), str) and record[key]
+        ),
+        "",
+    )
+    return ModelRow(
+        id=str(record.get("id") or ""),
+        name=name,
+        multiplier=None,
+        context_window=None,
+        vision=False,
+        reasoning_efforts=None,
+        default_reasoning_effort=None,
+        policy_state=None,
+        raw=dict(record),
+    )
+
+
+def probe_openai_endpoint(
+    config: Config,
+    timeout_s: float = ENDPOINT_PROBE_TIMEOUT_S,
+    env: dict[str, str] | None = None,
+    *,
+    open_url: OpenUrl | None = None,
+) -> tuple[bool, str]:
+    """Whether the configured endpoint answers **from the host** — stated
+    as exactly that: the agent sandbox's route to it is a separate
+    question this probe cannot answer, and the detail says so. Any HTTP
+    answer counts, a 404 for the listing included; only no answer at all
+    (refused, unresolved, timed out) is a failure."""
+    env = dict(os.environ) if env is None else env
+    url, _authority, key_env = _openai_target(config)
+    headers = {"Accept": "application/json"}
+    if env.get(key_env):
+        headers["Authorization"] = f"Bearer {env[key_env]}"
+    opener = _open_url if open_url is None else open_url
+    caveat = "; whether the agent sandbox can reach it is a separate question doctor cannot answer"
+    try:
+        opener(urllib.request.Request(url, headers=headers), timeout_s)
+    except urllib.error.HTTPError as exc:
+        return True, f"answers from the host (HTTP {exc.code} for {url}){caveat}"
+    except urllib.error.URLError as exc:
+        return False, f"no answer from the host ({redact_text(str(exc.reason))}){caveat}"
+    except TimeoutError:
+        return False, f"no answer from the host within {timeout_s:.0f}s{caveat}"
+    except OSError as exc:
+        return False, f"no answer from the host ({redact_text(str(exc))}){caveat}"
+    return True, f"answers from the host (served {url}){caveat}"
+
+
+def fetch_backend_rows(
+    backend: AgentBackend, timeout_s: float = 60.0, *, config: Config | None = None
+) -> list[ModelRow]:
+    """The configured backend's models, flattened for display. The openai
+    backend lists from its configured endpoint, so it needs the config."""
     if backend.name == "claude":
         return [anthropic_model_row(record) for record in fetch_anthropic_models(timeout_s)]
     if backend.name == "codex":
         return [codex_model_row(record) for record in fetch_codex_models(timeout_s)]
+    if backend.name == "openai":
+        if config is None:
+            raise SbxloopError("the openai backend lists models from its configured endpoint")
+        return [openai_model_row(record) for record in fetch_openai_models(config, timeout_s)]
     return [model_row(info) for info in fetch_models(timeout_s=timeout_s)]
 
 
 def table_columns(backend: AgentBackend) -> tuple[str, ...]:
     """The columns `list-models` renders for ``backend``: the Models API
     carries no billing/context/reasoning metadata, so the claude table is
-    id, name and release date."""
+    id, name and release date; an endpoint's listing carries id and name."""
     if backend.name == "claude":
         return ("model", "name", "created")
     if backend.name == "codex":
         return ("model", "name", "vision", "reasoning")
+    if backend.name == "openai":
+        return ("model", "name")
     return ("model", "name", "billing", "context", "vision", "reasoning", "policy")
 
 

@@ -43,6 +43,7 @@ from sbxloop.config import (
     load_config_with_sources,
     load_secrets_env,
 )
+from sbxloop.configedit import Change, ConfigEditError, ConfigEditor, applies_for
 from sbxloop.daemon.control import DEFAULT_TIMEOUT_S
 from sbxloop.daemon.store import DaemonStore, apply_item_verb
 from sbxloop.daemon.versions import VersionProbe, start_drift_check
@@ -91,7 +92,7 @@ app = typer.Typer(
     pretty_exceptions_show_locals=False,
 )
 sandbox_app = typer.Typer(help="Manage sbxloop sandboxes.", no_args_is_help=True)
-config_app = typer.Typer(help="Inspect configuration.", no_args_is_help=True)
+config_app = typer.Typer(help="Inspect and change configuration.", no_args_is_help=True)
 secrets_app = typer.Typer(
     help="Manage the sbx custom-secret registrations sbxloop owns.", no_args_is_help=True
 )
@@ -1473,7 +1474,7 @@ def secrets_rotate(
     """
     try:
         config = load_config()
-        token_env = backend_for(config).token_env
+        token_env = backend_for(config).token_env(config)
         if prompt:
             token = typer.prompt(f"new {token_env}", hide_input=True)
         else:
@@ -1586,7 +1587,7 @@ def sandbox_prune(
                 # A pruned run sandbox takes its secret registrations with
                 # it; otherwise a later run under the same name (resume)
                 # cannot replace them and comes up with the proxy sentinel.
-                remove_run_sandbox(cli, v.name, v.role)  # type: ignore[arg-type]
+                remove_run_sandbox(cli, v.name, v.role, config)  # type: ignore[arg-type]
             else:
                 remove_sandbox(cli, v.name)
         except SbxloopError as exc:
@@ -1681,6 +1682,9 @@ def config_show() -> None:
     table.add_column("key")
     table.add_column("value")
     table.add_column("source")
+    # When a change to the key is what the loop sees: model keys are re-read
+    # before every phase; everything else at the daemon's next start.
+    table.add_column("applies")
     flat: dict[str, Any] = {}
 
     def flatten(prefix: str, data: dict[str, Any]) -> None:
@@ -1699,7 +1703,9 @@ def config_show() -> None:
     dumped.pop("workloads", None)
     flatten("", dumped)
     for dotted in sorted(flat):
-        table.add_row(dotted, repr(flat[dotted]), sources.get(dotted, "default"))
+        table.add_row(
+            dotted, repr(flat[dotted]), sources.get(dotted, "default"), applies_for(dotted)
+        )
     console.print(table)
     if config.credentials:
         creds = Table(title="credentials (values never shown)")
@@ -1725,6 +1731,97 @@ def config_show() -> None:
                 ", ".join(f"{k}={v}" for k, v in overrides.items()) or "-",
             )
         console.print(profiles)
+
+
+def _config_editor() -> ConfigEditor:
+    """The home's operator config, whether or not it currently loads: a
+    repair command must still answer on a host whose file is broken."""
+    return ConfigEditor(SbxloopHome(resolve_home_root()), os.environ)
+
+
+@config_app.command("describe")
+def config_describe(
+    key: Annotated[str, typer.Argument(help="A dotted key, e.g. daemon.max_runs_per_day.")],
+) -> None:
+    """Show one key: its value, which layer set it, what it accepts, when a change applies."""
+    try:
+        row = _config_editor().describe(key)
+    except ConfigEditError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    except SbxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    lines = [
+        f"[bold]{row.key}[/]",
+        f"  value    {rich_escape(row.display)}",
+        f"  set by   {row.source}",
+        f"  accepts  {rich_escape(row.spec.summary)}"
+        + ("" if row.spec.optional else " (required)"),
+        f"  applies  {row.applies}"
+        + (" — the daemon reads it at its next start" if row.applies == "restart" else ""),
+    ]
+    if row.doc:
+        lines.append(f"  about    {rich_escape(row.doc)}")
+    console.print("\n".join(lines), highlight=False)
+
+
+def _apply_change(editor: ConfigEditor, change: Change) -> None:
+    """Report the loader's verdict; write only when it accepted the draft."""
+    if not change.ok:
+        console.print(f"[bold red]{change.key}: {rich_escape(change.verdict.text)}[/]")
+        console.print(f"nothing written to {editor.path}", highlight=False)
+        raise typer.Exit(2)
+    try:
+        backup = editor.commit(change)
+    except OSError as exc:
+        console.print(f"[bold red]could not write {editor.path}: {exc}[/]")
+        raise typer.Exit(1) from exc
+    what = f"unset {change.key}" if change.unset else f"set {change.key}"
+    console.print(f"{what} in {editor.path}", highlight=False)
+    if backup is not None:
+        console.print(f"previous kept as {backup.name}", highlight=False)
+    if change.note is not None:
+        style = "yellow" if change.note_level == "warning" else ""
+        console.print(f"[{style}]{rich_escape(change.note)}[/]" if style else change.note)
+    if change.applies == "live":
+        console.print("model settings refresh before the next phase or concierge turn")
+    else:
+        console.print("the daemon reads it at its next start: restart to apply")
+
+
+@config_app.command("set")
+def config_set(
+    key: Annotated[str, typer.Argument(help="A dotted key, e.g. daemon.max_runs_per_day.")],
+    value: Annotated[
+        str, typer.Argument(help="The value as an operator writes it: 20, true, squash.")
+    ],
+) -> None:
+    """Set one key in the home's config/sbxloop.toml, every comment kept.
+
+    The real loader judges the whole file with every other layer applied
+    before anything is written; the previous file is kept as a backup."""
+    editor = _config_editor()
+    try:
+        change = editor.set(key, value)
+    except ConfigEditError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    _apply_change(editor, change)
+
+
+@config_app.command("unset")
+def config_unset(
+    key: Annotated[str, typer.Argument(help="A dotted key to remove from the file.")],
+) -> None:
+    """Remove one key from the home's config/sbxloop.toml so the layer beneath answers."""
+    editor = _config_editor()
+    try:
+        change = editor.unset(key)
+    except ConfigEditError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    _apply_change(editor, change)
 
 
 @config_app.command("repos")
@@ -2689,6 +2786,44 @@ def daemon(
             reason=stop_reason,
             uptime_s=round(time.monotonic() - started_at, 1),
         )
+    if loop.restart_pending:
+        _relaunch_daemon(loop)
+
+
+def _relaunch_daemon(loop: Any) -> None:
+    """The restart's second half (#969), after a clean exit. Under systemd
+    the unit's ``Restart=always`` would bring the daemon back on its own
+    after ``RestartSec``; asking for the unit's restart now cuts that wait.
+    ``--no-block`` so the request is queued with systemd before this
+    process is gone (the unit's ``KillMode`` would otherwise take the
+    waiting systemctl with it), and a new session so the exit does not
+    take it down first. Any other supervisor is left to do its own job;
+    a failure to ask is a log line, never a reason to stay up."""
+    from sbxloop.homeinit import UNIT_NAMES
+
+    log = get_logger("sbxloop.daemon")
+    supervisor = loop.supervisor()
+    if supervisor != "systemd":
+        log.info("daemon.restart_awaits_supervisor", supervisor=supervisor)
+        return
+    unit = UNIT_NAMES[0]
+    argv = ["systemctl", "--user", "--no-block", "restart", unit]
+    try:
+        subprocess.Popen(  # nosec B603 - fixed argv, no shell
+            argv,
+            start_new_session=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except OSError as exc:
+        log.warning(
+            "daemon.restart_fallback",
+            error=str(exc),
+            hint="the unit's Restart=always starts the daemon again after RestartSec",
+        )
+        return
+    log.info("daemon.restart_relaunch", unit=unit)
 
 
 @app.command()
@@ -3057,6 +3192,7 @@ def list_models(
     `sbxloop run --model`.
     """
     from sbxloop.cli.models import (
+        NoModelListing,
         fetch_backend_rows,
         format_context,
         format_efforts,
@@ -3068,17 +3204,29 @@ def list_models(
     selected_repo = _resolve_repo(config, repo).repo if repo is not None else None
     choices = model_plan(config, repo=selected_repo)
     try:
-        rows = fetch_backend_rows(backend, timeout_s=timeout_s)
+        rows = fetch_backend_rows(backend, timeout_s=timeout_s, config=config)
+    except NoModelListing as exc:
+        # Not a failure: a served endpoint need not list its models, and
+        # the configured model is still the one to use. The cache is
+        # advisory, so there is nothing to update either.
+        if json_output:
+            typer.echo("[]")
+        typer.echo(
+            f"{exc} — the configured model ({config.model}) is still valid to use; an "
+            "absent listing is not a failure",
+            err=True,
+        )
+        return
     except SbxloopError as exc:
         # escape(): the install hint (`sbxloop[copilot]`) and arbitrary SDK
         # error text must not be parsed as rich markup.
         console.print(f"[bold red]list-models failed:[/] {rich_escape(str(exc))}")
         raise typer.Exit(2) from exc
     if rows:
-        from sbxloop.modelcatalog import save_catalog
+        from sbxloop.modelcatalog import catalog_endpoint, save_catalog
 
         try:
-            save_catalog(config.paths, backend, rows)
+            save_catalog(config.paths, backend, rows, endpoint=catalog_endpoint(config))
         except (OSError, ValueError):
             typer.echo("Models listed, but the TUI model cache could not be updated.", err=True)
     if json_output:

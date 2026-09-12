@@ -793,6 +793,89 @@ class TestRefusedReactions:
         bridge.close()
 
 
+class TestReceivedAckReassert:
+    """The asker's own webapp drops a reaction that lands before their
+    create-post reply: the reply's empty reaction list replaces the one the
+    websocket already delivered, and only the person who asked loses the
+    mark. Saving it again is a 200 the server re-broadcasts, so the ⏳ — and
+    only the ⏳ — goes on twice."""
+
+    def test_the_received_mark_is_saved_twice(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge._reassert_s = 0.02
+        msg = MattermostMessage(CHANNEL, "p" * 26)
+
+        async def scenario() -> None:
+            await bridge._add_reaction(msg, "⏳")
+            # The first save is immediate: everyone else's client keeps it.
+            assert client.reactions == [(BOT_ID, "p" * 26, "hourglass_flowing_sand")]
+            await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        assert client.reactions == [(BOT_ID, "p" * 26, "hourglass_flowing_sand")] * 2
+        bridge.close()
+
+    def test_only_the_received_mark_is_reasserted(self, tmp_path: Path) -> None:
+        """✅ and ⚠ land seconds after the post, long past the reply that
+        does the wiping; a second save would be a wasted call."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge._reassert_s = 0.02
+        msg = MattermostMessage(CHANNEL, "p" * 26)
+
+        async def scenario() -> None:
+            await bridge._add_reaction(msg, "✅")
+            await bridge._add_reaction(msg, "⚠")
+            await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        assert client.reactions == [
+            (BOT_ID, "p" * 26, "white_check_mark"),
+            (BOT_ID, "p" * 26, "warning"),
+        ]
+        bridge.close()
+
+    def test_a_refused_received_mark_is_not_reasserted(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A server that would not take the first save will not take the
+        second; retrying it only re-asks the question the refusal already
+        answered once."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge._reassert_s = 0.02
+        client.fail_reaction = MattermostApiError(400, "Invalid or missing emoji_name parameter")
+
+        async def scenario() -> None:
+            with caplog.at_level(logging.WARNING):
+                await bridge._add_reaction(MattermostMessage(CHANNEL, "p" * 26), "⏳")
+                await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        assert client.reactions == []
+        assert len([r for r in caplog.records if "reaction_refused" in r.getMessage()]) == 1
+        bridge.close()
+
+    def test_a_reassert_that_fails_is_quiet(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The post can be gone by the time the second save runs; the first
+        one already did the job for everyone but the asker, and a 404 here
+        is not news anyone needs above debug."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge._reassert_s = 0.02
+        msg = MattermostMessage(CHANNEL, "p" * 26)
+
+        async def scenario() -> None:
+            await bridge._add_reaction(msg, "⏳")
+            client.fail_reaction = MattermostApiError(404, "post not found")
+            with caplog.at_level(logging.WARNING):
+                await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        assert client.reactions == [(BOT_ID, "p" * 26, "hourglass_flowing_sand")]
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        bridge.close()
+
+
 class TestSpentAffordances:
     """A seeded emoji is this bridge's button; one left on a settled prompt
     is a button that can only fail. Discord clears its view and Slack its

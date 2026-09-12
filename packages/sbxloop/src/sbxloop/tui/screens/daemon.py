@@ -48,6 +48,7 @@ class DaemonScreen(ConsoleScreen):
         Binding("c", "cancel", "Cancel run"),
         Binding("C", "cancel_retry", "Cancel + retry", show=False),
         Binding("g", "stop_daemon", "Graceful stop", show=False),
+        Binding("b", "restart_daemon", "Graceful restart", show=False),
         Binding("S", "unit_start", "Start unit"),
         Binding("T", "unit_stop", "Stop unit", show=False),
         Binding("B", "unit_restart", "Restart unit"),
@@ -395,6 +396,11 @@ class DaemonScreen(ConsoleScreen):
 
     def action_stop_daemon(self) -> None:
         self.console_app.perform(actions.stop_daemon(self.console_app.deps))
+
+    def action_restart_daemon(self) -> None:
+        self.console_app.perform(
+            actions.restart_daemon(self.console_app.deps), then=self.probe_unit
+        )
 
     def _unit(self, verb: str) -> None:
         unit = self.unit

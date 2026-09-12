@@ -114,6 +114,15 @@ from sbxloop.sbx.prune import remove_run_sandbox, remove_run_sandbox_secrets
 
 log = get_logger(__name__)
 
+#: The ``daemon_state`` key an operator's `restart` leaves for the next
+#: process (#969): who asked, why, when, and how.
+RESTART_MARKER_KEY = "restart_requested"
+UNSUPERVISED_REFUSAL = (
+    "this daemon is not under a service manager that would start it again (no systemd "
+    "unit around it, and `[daemon] supervised` is false) — `stop` and start it yourself, "
+    "or set `[daemon] supervised = true` if something does"
+)
+
 # Hidden markers sbxloop leaves in issue bodies and comments; they are
 # bookkeeping, not part of the outcome the agent should read.
 _MARKER_RE = HIDDEN_MARKER_RE
@@ -310,6 +319,10 @@ class DaemonLoop:
         # An operator's `stop`: unlike a signal, it lets a landing the
         # daemon is completing finish before the process exits.
         self._graceful = False
+        # An operator's `restart` (#969): the marker written for the next
+        # process, kept here so the daemon entry knows to ask the supervisor
+        # for the relaunch once run_forever returns.
+        self._restart: dict[str, Any] | None = None
         self._landing_threads: list[threading.Thread] = []
         # Pause is a set of named holds (#534): an operator's `pause` and a
         # deploy's `pause --hold deploy-<id>` coexist, and each side releases
@@ -415,6 +428,134 @@ class DaemonLoop:
         and any landing in progress, then let ``run_forever`` return."""
         self._graceful = True
         self._stop.set()
+
+    # -- restart (#969) ------------------------------------------------------------
+
+    def supervisor(self) -> str | None:
+        """Who starts this daemon again once it exits: ``systemd`` when the
+        process runs inside a unit (systemd stamps ``INVOCATION_ID`` on
+        every process it starts), ``declared`` when ``[daemon] supervised``
+        says an operator's own supervisor does, else ``None`` — a daemon
+        started by hand, which a restart must never exit into nothing."""
+        if os.environ.get("INVOCATION_ID"):
+            return "systemd"
+        if self.config.daemon.supervised:
+            return "declared"
+        return None
+
+    @property
+    def restart_pending(self) -> bool:
+        return self._restart is not None
+
+    def request_restart(
+        self,
+        *,
+        by: str | None,
+        reason: str,
+        now: bool = False,
+        **fields: Any,
+    ) -> None:
+        """Operator ``restart``: like ``request_stop`` — nothing new is
+        claimed, the run and landing in flight finish (``now`` cancels the
+        run first; it is resumable) — plus a marker in the store so the
+        process that comes back can say why it did. ``fields`` ride the
+        marker for that report (a config key and value, #971). Refused by
+        name when no supervisor would start the daemon again."""
+        supervisor = self.supervisor()
+        if supervisor is None:
+            raise ValueError(UNSUPERVISED_REFUSAL)
+        who = by or "operator"
+        marker = {
+            "by": who,
+            "reason": reason,
+            "requested_at": self.clock(),
+            "mode": "now" if now else "graceful",
+            "supervisor": supervisor,
+            **fields,
+        }
+        self.dstore.set_value(RESTART_MARKER_KEY, json.dumps(marker))
+        self._restart = marker
+        self._notice(
+            "daemon.restart_requested",
+            f"restart requested by {who}: {reason} — "
+            + ("cancelling the current run first" if now else "after the current run"),
+            by=who,
+            reason=reason,
+            mode=marker["mode"],
+            supervisor=supervisor,
+        )
+        if now:
+            self.cancel_current(who)
+        self.request_stop()
+
+    def _report_restart(self) -> None:
+        """The first thing a started daemon says when the previous process
+        left a restart marker: who asked and why. A marker older than the
+        claim-staleness window is reported as stale, never as this start's
+        cause — a restart that was requested and never completed is worth
+        knowing about, but it is not what just happened."""
+        raw = self.dstore.get_value(RESTART_MARKER_KEY)
+        if raw is None:
+            return
+        self.dstore.set_value(RESTART_MARKER_KEY, None)
+        try:
+            marker = json.loads(raw)
+        except ValueError:
+            marker = None
+        if not isinstance(marker, dict):
+            log.warning("daemon.restart_marker_invalid", raw=raw[:200])
+            return
+        who = str(marker.get("by") or "operator")
+        reason = str(marker.get("reason") or "operator restart")
+        try:
+            age = self.clock() - float(marker.get("requested_at", 0.0))
+        except (TypeError, ValueError):
+            age = float("inf")
+        extra = {
+            key: value
+            for key, value in marker.items()
+            if key not in ("by", "reason", "requested_at", "mode", "supervisor")
+        }
+        if age > self.config.daemon.claim_stale_after_s:
+            self._notice(
+                "daemon.restart_marker_stale",
+                f"a restart requested by {who} ({reason}) never completed; this start is not it",
+                level="warning",
+                by=who,
+                reason=reason,
+                age_s=round(age, 1) if age != float("inf") else None,
+            )
+            return
+        text = f"restarted by {who}: {reason} — up again {age:.0f}s after the request"
+        key = marker.get("key")
+        if isinstance(key, str) and key:
+            # A config change (#971): the process that actually read the file
+            # says whether the value is what it now sees, or which layer
+            # still wins — the same judgement the write made, re-made here.
+            text = f"restarted to apply {reason} (by {who}) — {self._config_in_effect(key)}"
+        self._notice(
+            "daemon.restarted",
+            text,
+            by=who,
+            reason=reason,
+            mode=marker.get("mode"),
+            after_s=round(age, 1),
+            **extra,
+        )
+
+    def _config_in_effect(self, key: str) -> str:
+        from sbxloop.configedit import ConfigEditError, ConfigEditor
+        from sbxloop.configedit.edit import FILE_LAYER
+
+        try:
+            row = ConfigEditor(self.config.paths, os.environ).describe(key)
+        except (ConfigEditError, SbxloopError) as exc:
+            return f"could not re-read `{key}`: {exc}"
+        if row.source == FILE_LAYER:
+            return "now in effect"
+        if row.source == "unset":
+            return f"`{key}` is not a setting this daemon knows"
+        return f"written, but {row.source} sets `{row.display}` and wins"
 
     def cancel_current(self, requester: str | None = None, *, retry: bool = False) -> bool:
         """Operator cancel of the in-flight run. The engine stops at its next
@@ -777,6 +918,7 @@ class DaemonLoop:
             # either — a restart here orphans the issue (#530).
             "claiming": self._claiming,
             "stopping": self._stop.is_set(),
+            "restarting": self._restart is not None,
             # The process behind the answer: what a console needs to signal
             # it when no service manager stands in front, and to show uptime.
             "pid": os.getpid(),
@@ -832,6 +974,7 @@ class DaemonLoop:
             poll_interval_s=self.config.daemon.poll_interval_s,
             source=self.source.name,
         )
+        self._report_restart()
         ticks = 0
         try:
             while not self._stop.is_set():
@@ -3714,7 +3857,7 @@ class DaemonLoop:
         for role in roles:
             name = sandbox_name(run_id, role)
             try:
-                remove_run_sandbox(self.sbx, name, role)
+                remove_run_sandbox(self.sbx, name, role, self.config)
                 self._notice(
                     "recovery.stale_sandbox_removed",
                     f"recovery: removed stale sandbox {name} (and its secrets)",
@@ -3726,7 +3869,7 @@ class DaemonLoop:
                 # No such sandbox — the common case — but a secret may
                 # still linger from a rollback race; clearing it is cheap.
                 log.debug("recovery.no_stale_sandbox", run=run_id, sandbox=name, role=role)
-                remove_run_sandbox_secrets(self.sbx, name, role)
+                remove_run_sandbox_secrets(self.sbx, name, role, self.config)
 
     def _any_credentialed_registries(self) -> bool:
         """Whether any repo this daemon runs for fetches through a service

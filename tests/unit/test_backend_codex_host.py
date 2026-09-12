@@ -48,12 +48,12 @@ def test_codex_attribution_preserves_the_backend() -> None:
 def test_codex_credential_registration_follows_the_descriptor(tmp_path: Path) -> None:
     config = codex_config(tmp_path)
     backend = backend_for(config)
-    assert backend.secret == ("OPENAI_API_KEY", "api.openai.com")
-    assert backend.token_hosts == ("api.openai.com",)
-    assert backend.doctor_check_name == "OPENAI_API_KEY (agent backend: codex)"
-    assert tracked_custom_secrets(config) == [backend.secret]
-    assert backend.has_token({"OPENAI_API_KEY": "sk-test-key"})
-    assert not backend.has_token({"COPILOT_GITHUB_TOKEN": "other"})
+    assert backend.secret(config) == ("OPENAI_API_KEY", "api.openai.com")
+    assert backend.token_hosts(config) == ("api.openai.com",)
+    assert backend.doctor_check_name(config) == "OPENAI_API_KEY (agent backend: codex)"
+    assert tracked_custom_secrets(config) == [backend.secret(config)]
+    assert backend.has_token(config, {"OPENAI_API_KEY": "sk-test-key"})
+    assert not backend.has_token(config, {"COPILOT_GITHUB_TOKEN": "other"})
 
 
 def test_codex_spec_keeps_the_inference_key_on_the_agent(tmp_path: Path) -> None:

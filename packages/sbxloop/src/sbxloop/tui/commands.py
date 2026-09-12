@@ -103,6 +103,12 @@ CATALOGUE: tuple[Command, ...] = (
         True,
     ),
     Command(
+        "Restart the daemon gracefully",
+        "ctl restart: finish the run in flight, exit, come back under the service manager",
+        _act(actions.restart_daemon),
+        True,
+    ),
+    Command(
         "Start the unit",
         "systemctl --user start",
         _on_daemon("unit_start"),
