@@ -14,7 +14,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from git import GitCommandError, Repo
+from git import Git, GitCommandError, Repo
 
 from sbxloop import hostgit
 from sbxloop.errors import DeliveryError, ProvisionError
@@ -1526,6 +1526,33 @@ class TestSubmoduleHosts:
 needs_git_lfs = pytest.mark.skipif(
     hostgit.lfs_version() is None, reason="git-lfs is not installed on this host"
 )
+
+
+class TestLfsVersion:
+    @needs_git_lfs
+    def test_reports_the_installed_version_line(self) -> None:
+        version = hostgit.lfs_version()
+        assert version is not None
+        assert version.startswith("git-lfs/")
+
+    def test_none_when_git_lfs_is_not_on_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """git-lfs genuinely absent — a PATH holding git alone — rather than a
+        patched probe: this is the arm `populate_lfs` fails closed on."""
+        git = shutil.which("git")
+        assert git is not None
+        bindir = tmp_path / "bin"
+        bindir.mkdir()
+        (bindir / "git").symlink_to(git)
+        monkeypatch.setenv("PATH", str(bindir))
+        assert hostgit.lfs_version() is None
+
+    def test_none_when_there_is_no_git_at_all(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(Git, "GIT_PYTHON_GIT_EXECUTABLE", str(tmp_path / "no-git"))
+        assert hostgit.lfs_version() is None
 
 
 def make_lfs_repo(tmp_path: Path, name: str = "app") -> tuple[Path, bytes]:
