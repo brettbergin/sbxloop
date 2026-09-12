@@ -294,7 +294,11 @@ class TestWiring:
         assert "uv run python scripts/check_self_references.py" in lint_target
         workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
         steps = workflow["jobs"]["lint"]["steps"]
-        assert {"run": "uv run python scripts/check_self_references.py"} in steps
+        # The step's command, not the whole mapping: the static gates share one
+        # job and each carries an `if:` so a failing one does not hide the rest.
+        assert any(
+            step.get("run") == "uv run python scripts/check_self_references.py" for step in steps
+        )
 
     def test_ci_push_filter_is_main_alone(self) -> None:
         """#643: working branches are built through their pull request; a
