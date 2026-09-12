@@ -514,21 +514,10 @@ class TestBaseRequirements:
 
 
 class TestNotImplementedRoles:
-    @pytest.mark.parametrize(
-        ("role", "call"),
-        [
-            ("ContentOps", lambda ops: ops.commit_get(REPO, "base123")),
-            ("ContentOps", lambda ops: ops.ref_create(REPO, "refs/heads/b", "s")),
-            (
-                "ContentOps",
-                lambda ops: ops.contents_put(REPO, "a", message="m", content_b64="", branch="b"),
-            ),
-        ],
-    )
-    def test_a_write_role_fails_closed_naming_the_operation(self, role: str, call: Any) -> None:
-        with pytest.raises(RoleNotImplemented) as info:
-            call(FakeGitlab())
-        assert info.value.kind == "gitlab" and info.value.role == role
-        assert f"{role}.{info.value.operation}" in str(info.value)
-        assert isinstance(info.value, GithubOpsError)
-        assert f"{role}.{info.value.operation}" in GitlabOps.UNIMPLEMENTED_OPERATIONS
+    def test_every_role_is_answered_and_the_typed_error_stays_for_the_next_backend(
+        self,
+    ) -> None:
+        assert GitlabOps.UNIMPLEMENTED_OPERATIONS == ()
+        error = FakeGitlab()._unimplemented("ContentOps", "commit_get")
+        assert isinstance(error, RoleNotImplemented) and isinstance(error, GithubOpsError)
+        assert error.kind == "gitlab" and "ContentOps.commit_get" in str(error)

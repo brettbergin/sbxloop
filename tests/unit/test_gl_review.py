@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from sbxloop.errors import GithubOpsError, RoleNotImplemented
+from sbxloop.errors import GithubOpsError
 from sbxloop.vcs.gitlab.changes import (
     change_record,
     file_record,
@@ -149,13 +149,9 @@ class TestMergeRequests:
         (entry,) = fake.pr_files(REPO, 1)
         assert entry["filename"] == "hello.txt" and entry["patch"].startswith("@@")
 
-    def test_the_remote_commit_is_still_not_implemented(self) -> None:
-        fake = ready(FakeGitlab())
-        with pytest.raises(RoleNotImplemented) as info:
-            fake.commit_get(REPO, "base123")
-        assert info.value.operation == "commit_get"
-        assert "ContentOps.commit_get" in GitlabOps.UNIMPLEMENTED_OPERATIONS
-        assert "ReviewOps" not in " ".join(GitlabOps.UNIMPLEMENTED_OPERATIONS)
+    def test_nothing_is_left_unimplemented(self) -> None:
+        assert GitlabOps.UNIMPLEMENTED_OPERATIONS == ()
+        assert ready(FakeGitlab()).commit_get(REPO, "base123")["sha"] == "base123"
 
 
 class TestReviewThreads:

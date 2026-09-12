@@ -35,6 +35,7 @@ pretending, exactly as ``FakeGithub`` does.
 from __future__ import annotations
 
 import base64
+import posixpath
 import re
 from collections.abc import Sequence
 from contextlib import contextmanager
@@ -69,6 +70,10 @@ class FakeGitlab(GitlabOps):
         self._bots = {}
         self._note_discussion = {}
         self._mr_urls = {}
+        self._blobs: dict[tuple[str, str], bytes] = {}
+        self._trees: dict[tuple[str, str], Any] = {}
+        self._pending: dict[tuple[str, str], Any] = {}
+        self._listings: dict[tuple[str, str, str], Any] = {}
         self.repo = repo
         self.user_login = "sbxloop-bot"
         self.user_id = 2
@@ -95,6 +100,15 @@ class FakeGitlab(GitlabOps):
         self.approval_rules: list[dict[str, Any]] = []
         self.branches: dict[str, str] = {"main": "base123"}
         self.files: dict[tuple[str, str], bytes] = {("main", "README.md"): b"# widgets\n"}
+        # The content role's world (#1020): each commit's whole tree
+        # (path -> (mode, bytes)) and its record; branches point at commits.
+        self.trees: dict[str, dict[str, tuple[str, bytes]]] = {
+            "base123": {"README.md": ("100644", b"# widgets\n")}
+        }
+        self.commits: dict[str, dict[str, Any]] = {
+            "base123": {"id": "base123", "parent_ids": [], "message": "initial", "title": "initial"}
+        }
+        self._commit_count = 0
         self.ci_file = False
         self.issues: dict[int, dict[str, Any]] = {}
         self.notes: dict[int, list[dict[str, Any]]] = {}
@@ -128,6 +142,8 @@ class FakeGitlab(GitlabOps):
         self.notes_deleted: list[tuple[int, int]] = []
         self.statuses_posted: list[tuple[str, dict[str, Any]]] = []
         self.deleted_branches: list[str] = []
+        self.commit_posts: list[tuple[str, dict[str, Any]]] = []
+        self.branch_creates: list[tuple[str, str]] = []
         # Merge requests (#1018): by iid; their discussions by iid; the
         # diff every seeded request carries unless told otherwise.
         self.merge_requests: dict[int, dict[str, Any]] = {}
@@ -678,6 +694,177 @@ class FakeGitlab(GitlabOps):
             return {"approved": True, "user_has_approved": True}
         raise AssertionError(f"FakeGitlab: unexpected merge request call {method} {path}")
 
+    # -- content (#1020) -------------------------------------------------------------
+
+    def _tree_at(self, ref: str) -> dict[str, tuple[str, bytes]] | None:
+        return self.trees.get(self.branches.get(ref, ref))
+
+    def _commit_payload(self, sha: str) -> dict[str, Any]:
+        return {**self.commits[sha], "web_url": f"{self.web_url}/-/commit/{sha}"}
+
+    def _content_routes(
+        self, method: str, path: str, rest: str, params: dict[str, list[str]], body: Any
+    ) -> Any:
+        """Branch creation, the commits API with actions, a commit's record
+        and a directory listing; ``None`` when ``rest`` is not one."""
+        if rest == "/repository/branches" and method == "POST":
+            assert body is not None
+            name, ref = str(body["branch"]), str(body["ref"])
+            self.branch_creates.append((name, ref))
+            if name in self.branches:
+                raise self._failed(method, path, 400, '{"message":"Branch already exists"}')
+            sha = self.branches.get(ref, ref)
+            if sha not in self.commits:
+                raise self._failed(method, path, 400, '{"message":"Invalid reference name"}')
+            self.branches[name] = sha
+            return {"name": name, "commit": {"id": sha}, "protected": False}
+        if rest == "/repository/commits" and method == "POST":
+            assert body is not None
+            return self._commit_with_actions(method, path, dict(body))
+        if (match := re.fullmatch(r"/repository/commits/([^/]+)", rest)) and method == "GET":
+            sha = unquote(match.group(1))
+            if sha in self.commits:
+                return self._commit_payload(sha)
+            if sha in self.statuses or any(sha == s for s in self.branches.values()):
+                return {
+                    "id": sha,
+                    "parent_ids": ["base123"],
+                    "message": "seeded",
+                    "title": "seeded",
+                }
+            raise self._failed(method, path, 404, "404 Commit Not Found")
+        if rest == "/repository/tree" and method == "GET":
+            tree = self._tree_at(params.get("ref", ["main"])[0])
+            if tree is None:
+                return []
+            directory = params.get("path", [""])[0]
+            rows: list[dict[str, Any]] = []
+            seen: set[str] = set()
+            for file_path, (mode, _) in sorted(tree.items()):
+                head, name = posixpath.split(file_path)
+                if head == directory:
+                    rows.append({"name": name, "type": "blob", "path": file_path, "mode": mode})
+                    continue
+                prefix = f"{directory}/" if directory else ""
+                if file_path.startswith(prefix) and "/" in file_path[len(prefix) :]:
+                    sub = file_path[len(prefix) :].split("/", 1)[0]
+                    if sub not in seen:
+                        seen.add(sub)
+                        rows.append(
+                            {
+                                "name": sub,
+                                "type": "tree",
+                                "path": f"{prefix}{sub}",
+                                "mode": "040000",
+                            }
+                        )
+            per_page = int(params.get("per_page", ["20"])[0])
+            page = int(params.get("page", ["1"])[0])
+            return rows[(page - 1) * per_page : page * per_page]
+        return None
+
+    def _commit_with_actions(self, method: str, path: str, body: dict[str, Any]) -> Any:
+        branch = str(body["branch"])
+        self.commit_posts.append((branch, body))
+        self._maybe_fail("commit_create")
+        if branch == "main" and self.protected is not None:
+            raise self._failed(
+                method, path, 403, "403 Forbidden - You are not allowed to push into this branch"
+            )
+        exists = branch in self.branches
+        parent: str | None
+        if exists and not body.get("force"):
+            parent = self.branches[branch]
+        elif body.get("start_sha"):
+            parent = str(body["start_sha"])
+            if parent not in self.trees:
+                raise self._failed(method, path, 400, '{"message":"start_sha does not exist"}')
+        elif body.get("start_branch"):
+            parent = self.branches.get(str(body["start_branch"]))
+            if parent is None:
+                raise self._failed(method, path, 400, '{"message":"start_branch does not exist"}')
+        elif exists:
+            parent = self.branches[branch]
+        elif self.branches and not self.empty_repo:
+            raise self._failed(
+                method,
+                path,
+                400,
+                '{"message":"You can only create or edit files when you are on a branch"}',
+            )
+        else:
+            parent = None
+        tree = dict(self.trees.get(parent, {})) if parent else {}
+        actions = body.get("actions") or []
+        if not actions and not body.get("allow_empty"):
+            raise self._failed(
+                method,
+                path,
+                400,
+                "400 Bad request - Provide at least one action, or set allow_empty to true",
+            )
+        for action in actions:
+            kind, file_path = str(action["action"]), str(action.get("file_path") or "")
+            if kind == "create":
+                if file_path in tree:
+                    raise self._failed(
+                        method, path, 400, '{"message":"A file with this name already exists"}'
+                    )
+                tree[file_path] = (
+                    "100755" if action.get("execute_filemode") else "100644",
+                    self._action_bytes(action),
+                )
+            elif kind == "update":
+                if file_path not in tree:
+                    raise self._failed(
+                        method, path, 400, '{"message":"A file with this name doesn\'t exist"}'
+                    )
+                tree[file_path] = (tree[file_path][0], self._action_bytes(action))
+            elif kind == "delete":
+                if file_path not in tree:
+                    raise self._failed(
+                        method, path, 400, '{"message":"A file with this name doesn\'t exist"}'
+                    )
+                del tree[file_path]
+            elif kind == "chmod":
+                if file_path not in tree:
+                    raise self._failed(
+                        method, path, 400, '{"message":"A file with this name doesn\'t exist"}'
+                    )
+                tree[file_path] = (
+                    "100755" if action.get("execute_filemode") else "100644",
+                    tree[file_path][1],
+                )
+            elif kind == "move":
+                previous = str(action.get("previous_path") or "")
+                if previous not in tree:
+                    raise self._failed(
+                        method, path, 400, '{"message":"A file with this name doesn\'t exist"}'
+                    )
+                tree[file_path] = tree.pop(previous)
+            else:
+                raise self._failed(method, path, 400, f'{{"message":"unknown action {kind}"}}')
+        self._commit_count += 1
+        sha = f"gl{self._commit_count:06d}"
+        message = str(body.get("commit_message") or "")
+        self.trees[sha] = tree
+        self.commits[sha] = {
+            "id": sha,
+            "parent_ids": [parent] if parent else [],
+            "message": message,
+            "title": message.splitlines()[0] if message else "",
+        }
+        self.branches[branch] = sha
+        self.empty_repo = False
+        return self._commit_payload(sha)
+
+    @staticmethod
+    def _action_bytes(action: dict[str, Any]) -> bytes:
+        content = str(action.get("content") or "")
+        if action.get("encoding") == "base64":
+            return base64.b64decode(content)
+        return content.encode()
+
     # -- landing (#1019) -----------------------------------------------------------
 
     def _train_payload(self, iid: int) -> dict[str, Any]:
@@ -826,6 +1013,9 @@ class FakeGitlab(GitlabOps):
             if self.enterprise is not True:
                 raise self._failed(method, path, 404, "404 Not Found")
             return list(self.approval_rules)
+        content = self._content_routes(method, path, rest, params, body)
+        if content is not None:
+            return content
         if match := re.fullmatch(r"/repository/branches/([^/]+)", rest):
             name = unquote(match.group(1))
             if method == "DELETE":
@@ -860,7 +1050,12 @@ class FakeGitlab(GitlabOps):
         if match := re.fullmatch(r"/repository/files/([^/]+)", rest):
             file_path = unquote(match.group(1))
             ref = params.get("ref", ["main"])[0]
-            content = self.files.get((ref, file_path))
+            mode = "100644"
+            tree = self._tree_at(ref)
+            if tree is not None and file_path in tree:
+                mode, content = tree[file_path]
+            else:
+                content = self.files.get((ref, file_path))
             if file_path == ".gitlab-ci.yml" and self.ci_file:
                 content = b"stages: [test]\n"
             if content is None:
@@ -872,10 +1067,9 @@ class FakeGitlab(GitlabOps):
                 "ref": ref,
                 "encoding": "base64",
                 "content": base64.b64encode(content).decode(),
+                "execute_filemode": mode == "100755",
             }
-        if rest == "/repository/tree" or (
-            rest == "/pipelines" and method == "GET" and "ref" not in params
-        ):
+        if rest == "/pipelines" and method == "GET" and "ref" not in params:
             self._maybe_fail("permission_probe")
             return []
         if rest == "/pipelines":

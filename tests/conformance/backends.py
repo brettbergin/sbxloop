@@ -222,6 +222,9 @@ def _live_gitlab() -> VcsOps:
 # cuts it fresh per backend build and the live seeds put statuses on its
 # head, the change's head.
 CHANGE_BRANCH = "sbxloop/r1"
+# The branch the remote-commit scenario creates and rewrites; never the
+# change branch, which the live reset already cut.
+CONTENT_BRANCH = "sbxloop/r2"
 
 
 def _reset_live_branch(forge: LiveForge, branch: str) -> None:
@@ -248,6 +251,13 @@ def _reset_live_branch(forge: LiveForge, branch: str) -> None:
     ):
         dev.put(f"{project}/merge_requests/{change['iid']}", {"state_event": "close"})
     dev.delete(f"{project}/repository/branches/{quote(branch, safe='')}", check=False)
+    # The content scenario's branch and any pending branch a delivery that
+    # died mid-way left behind (the GitLab backend commits on one first).
+    dev.delete(f"{project}/repository/branches/{quote(CONTENT_BRANCH, safe='')}", check=False)
+    for stale in (
+        dev.get(f"{project}/repository/branches", query={"search": "^sbxloop/pending/"}).data or []
+    ):
+        dev.delete(f"{project}/repository/branches/{quote(stale['name'], safe='')}", check=False)
     on_base = dev.get(f"{project}/repository/files/a.py", query={"ref": "main"}, check=False)
     commit = dev.post(
         f"{project}/repository/commits",

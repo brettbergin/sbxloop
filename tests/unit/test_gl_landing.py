@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import pytest
 
-from sbxloop.errors import GithubOpsError, RoleNotImplemented
+from sbxloop.errors import GithubOpsError
 from sbxloop.vcs.gitlab.ops import GitlabOps, _undrafted_title
 from sbxloop.vcs.model import CredentialInfo, MergeOutcome, QueueEntry, QueueState
 from sbxloop.vcs.protocol import Capability
@@ -192,5 +192,3 @@ class TestBlockers:
 
     def test_nothing_of_the_landing_is_left_unimplemented(self) -> None:
         assert not any(op.startswith("ChangeOps") for op in GitlabOps.UNIMPLEMENTED_OPERATIONS)
-        with pytest.raises(RoleNotImplemented):
-            FakeGitlab().commit_get(REPO, "base123")

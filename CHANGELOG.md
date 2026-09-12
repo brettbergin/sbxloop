@@ -39,6 +39,18 @@
   Developer token. Only the remote commit (the content role) is left for
   the GitLab backend to answer.
 
+- **A GitLab delivery without a checkout.** The GitLab backend answers the
+  content role, so a run on a GitLab repository now goes end to end: the
+  blob, tree, commit and ref steps the delivery speaks are staged in the
+  backend and written as one commits-API changeset on a pending branch,
+  then the run's branch is created at that commit. A fix round rewrites
+  the branch under `force` with a new commit of the same tree, because
+  GitLab has no call that moves a branch and deleting one closes its open
+  merge request. A submodule pointer and a symlink are refused by name
+  (the commits API writes neither), an executable keeps its mode, and a
+  deletion the base no longer has is dropped rather than failing the
+  commit. `sbxloop doctor` lists nothing as not implemented for GitLab.
+
 - **Playwright MCP setup for Copilot and Claude builders.**
   `sbxloop init --preset playwright` configures Node, a pinned MCP package,
   its matching headless Chromium installation, download hosts and builder

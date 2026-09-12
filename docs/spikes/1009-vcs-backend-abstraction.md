@@ -641,6 +641,27 @@ with 403. What the capability model must carry:
   GitHub) was not exercised on either forge: GitLab's `force` parameter on the
   commits API and Gitea's lack of one are **field-unverified** until #1020.
 
+**Outcome (#1020).** The role kept its GitHub-shaped methods and
+`deliver.py` its sequence; the GitLab backend stages the blobs and the
+tree and writes the commit as one changeset when it is created, on a
+pending branch, so no neutral operation was needed and the conformance
+scenario is the same on every forge. Verified on GitLab CE 19.3.2 the same
+day, as `dev-alice`:
+
+- `POST /repository/commits` with `start_sha` creates the branch at that sha
+  and commits on it; with `force: true` on an existing branch it rewrites
+  the branch with a new commit whose parent is `start_sha`.
+- `POST /repository/branches {branch, ref: <sha>}` creates a branch at a
+  commit; a second create is a 400 `Branch already exists`.
+- Deleting the source branch of an open merge request **closes** it
+  (`state: closed`, `detailed_merge_status: not_open`), and recreating the
+  branch at another commit does not reopen it. A backend must never move a
+  branch by delete-and-create.
+- `execute_filemode: true` on a `create` action lists the file as `100755`;
+  a base64 binary reads back byte-identical; an empty `actions` list is a 400
+  unless `allow_empty` is set.
+- `GET /repository/commits/:sha` carries no tree id; `HEAD` and `GET /repository/files/:path?ref=` answer 200 or 404 per path.
+
 ### V6: does a token expose an expiry readable by itself?
 
 **GitLab: yes.**

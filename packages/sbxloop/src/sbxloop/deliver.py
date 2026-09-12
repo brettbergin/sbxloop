@@ -150,9 +150,13 @@ STATUS_MARKER = {"added": "A", "modified": "M", "deleted": "D"}
 
 def _is_ref_collision(exc: GithubOpsError) -> bool:
     """Whether a refs POST failed because the branch already exists —
-    GitHub's documented answer is HTTP 422 "Reference already exists"."""
+    GitHub's documented answer is HTTP 422 "Reference already exists";
+    GitLab answers "Branch already exists" with a 400 (#1020, observed
+    on CE 19.3.2)."""
     text = str(exc)
-    return "HTTP 422" in text and "already exists" in text.lower()
+    if "already exists" not in text.lower():
+        return False
+    return "HTTP 422" in text or exc.http_status in (400, 422)
 
 
 def _is_ref_refusal(exc: GithubOpsError) -> bool:

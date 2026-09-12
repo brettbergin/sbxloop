@@ -193,9 +193,28 @@ class TestContent:
         commit = ops.commit_create(
             repo, message="sbxloop run r1: deliver", tree=str(tree["sha"]), parents=[base_sha]
         )
-        ops.ref_create(repo, "refs/heads/sbxloop/r1", str(commit["sha"]))
-        assert ops.ref_lookup(repo, "heads/sbxloop/r1") == commit["sha"]
-        ops.ref_force_update(repo, "sbxloop/r1", str(commit["sha"]))
+        ops.ref_create(repo, "refs/heads/sbxloop/r2", str(commit["sha"]))
+        assert ops.ref_lookup(repo, "heads/sbxloop/r2") == commit["sha"]
+        ops.ref_force_update(repo, "sbxloop/r2", str(commit["sha"]))
+        assert ops.ref_lookup(repo, "heads/sbxloop/r2") == commit["sha"]
+        # A fix round: the same branch carries a second commit of the base
+        # plus a changed file, however the forge moves a branch.
+        again = base64.b64encode(b"hello again\n").decode()
+        shas = ops.blobs_create_many(repo, [{"path": "hello.txt", "content_b64": again}])
+        tree = ops.tree_create(
+            repo,
+            base_tree=base_tree,
+            entries=[
+                {"path": "hello.txt", "mode": "100644", "type": "blob", "sha": shas["hello.txt"]}
+            ],
+        )
+        second = ops.commit_create(
+            repo, message="sbxloop run r1: deliver again", tree=str(tree["sha"]), parents=[base_sha]
+        )
+        ops.ref_force_update(repo, "sbxloop/r2", str(second["sha"]))
+        head = ops.ref_lookup(repo, "heads/sbxloop/r2")
+        assert head and head != commit["sha"]
+        assert ops.commit_get(repo, head)["tree"]["sha"]
 
     @pytest.mark.needs("remote_commit")
     def test_a_file_on_a_branch_through_the_contents_path(self, subject: Subject) -> None:
@@ -204,6 +223,14 @@ class TestContent:
             "README.md",
             message="initialize",
             content_b64=base64.b64encode(b"# r\n").decode(),
-            branch=subject.base,
+            branch="sbxloop/r1",
         )
         assert written
+        replaced = subject.ops.contents_put(
+            subject.repo,
+            "README.md",
+            message="initialize again",
+            content_b64=base64.b64encode(b"# r again\n").decode(),
+            branch="sbxloop/r1",
+        )
+        assert replaced

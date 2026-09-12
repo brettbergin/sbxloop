@@ -110,12 +110,32 @@ descriptor the worker needs.
   revision the conformance work anticipated and is left open.
 
 - **An operation a backend has not landed yet raises `RoleNotImplemented`.**
-  The GitLab backend answers every role but the content role; that one
+  A backend lists such operations in `UNIMPLEMENTED_OPERATIONS`; each
   raises a typed error naming the backend, the role and the operation, so
-  a run on a GitLab repository fails closed at the first of them, and
-  `sbxloop doctor` lists the same operations before any run starts. The
-  conformance suite reads that error as a skip naming the operation, the
-  way an `UNSUPPORTED` capability skips with its name.
+  a run on that forge fails closed at the first of them, and `sbxloop doctor` lists the same operations before any run starts. The conformance
+  suite reads that error as a skip naming the operation, the way an
+  `UNSUPPORTED` capability skips with its name. The GitLab backend's list
+  is empty since #1020; the mechanism stays for the next backend.
+
+- **A delivery on GitLab is one changeset.** `deliver.py` speaks GitHub's
+  blob, tree, commit and ref steps, and GitLab has none of those objects
+  (#1016 V5): its commits API takes a whole changeset and writes the commit
+  on a branch, atomically. So the GitLab backend stages: a blob is hashed as
+  git would and kept, a tree is the list of actions that turns the base
+  commit's tree into it (create versus update decided against a listing of
+  each touched directory, because GitLab refuses either in the other's
+  place), and the commit is written when it is created, on a pending
+  branch, because the API writes no commit that no branch points at. The
+  ref step creates the run's branch at that commit and drops the pending
+  one. A branch that already exists (a fix round) is never deleted and
+  recreated, because deleting the source branch of an open merge request
+  closes it (field-verified on CE 19.3.2); it is written again under
+  `force` from the same parent with the same actions, a new commit of the
+  same tree that the merge request follows. Only a commit the same backend
+  object wrote can be written again, which every delivery satisfies, since
+  it builds its blobs, tree and commit in one process. `deliver.py` is
+  unchanged but for reading GitLab's "Branch already exists" (a 400) as
+  the collision GitHub answers with a 422.
 
 - **A landing reads the forge's refusals as data.** On GitLab the merge
   endpoint's 405 (not mergeable now: a red pipeline, an unresolved

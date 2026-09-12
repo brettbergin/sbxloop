@@ -13,18 +13,19 @@ Field-verified against GitLab CE 19.3.2 (#1016) where a docstring says
 so. Everything else is GitLab's documented API, labelled
 **field-unverified** where it is load-bearing.
 
-The operations that have not landed yet (the
-:class:`~sbxloop.vcs.protocol.ContentOps` role, #1020) raise
-:class:`~sbxloop.errors.RoleNotImplemented` here, so a run on a GitLab
-repository fails closed at the first of them, naming the operation.
+Every role is answered since #1020; :class:`~sbxloop.errors.RoleNotImplemented`
+stays the answer a backend gives for an operation it has not landed, and
+:data:`GitlabOps.UNIMPLEMENTED_OPERATIONS` is the (empty) list of them.
 """
 
 from __future__ import annotations
 
 import base64
+import binascii
 from collections.abc import Mapping, Sequence
 from typing import Any, ClassVar
 from urllib.parse import quote, urlencode
+from uuid import uuid4
 
 from sbxloop.config import MergeMethod
 from sbxloop.errors import GithubOpsError, RoleNotImplemented
@@ -39,6 +40,16 @@ from sbxloop.vcs.gitlab.changes import (
     review_records,
     review_thread,
     thread_id_for,
+)
+from sbxloop.vcs.gitlab.content import (
+    REGULAR_MODE,
+    Listing,
+    Pending,
+    Staged,
+    blob_sha,
+    commit_record,
+    plan_actions,
+    tree_handle,
 )
 from sbxloop.vcs.gitlab.permissions import READ_PROBES
 from sbxloop.vcs.gitlab.protection import read_base_requirements
@@ -64,7 +75,7 @@ from sbxloop.vcs.gitlab.records import (
     repo_record as repo_record,
     user_record as user_record,
 )
-from sbxloop.vcs.jobs import JobBackend
+from sbxloop.vcs.jobs import MAX_PAGES, PAGE_SIZE, JobBackend, PaginationError
 from sbxloop.vcs.model import (
     BaseRequirements,
     ChecksVerdict,
@@ -180,16 +191,8 @@ class GitlabOps(JobBackend):
     )
     #: The operations this backend does not answer yet, as ``Role.operation``;
     #: each raises :class:`RoleNotImplemented`, and the doctor lists them.
-    #: ``ContentOps`` is #1020.
-    UNIMPLEMENTED_OPERATIONS: ClassVar[tuple[str, ...]] = (
-        "ContentOps.blobs_create_many",
-        "ContentOps.commit_get",
-        "ContentOps.tree_create",
-        "ContentOps.commit_create",
-        "ContentOps.ref_create",
-        "ContentOps.ref_force_update",
-        "ContentOps.contents_put",
-    )
+    #: None since #1020.
+    UNIMPLEMENTED_OPERATIONS: ClassVar[tuple[str, ...]] = ()
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -207,6 +210,13 @@ class GitlabOps(JobBackend):
         # this object made, so a reply and a url need no second read.
         self._note_discussion: dict[tuple[str, int, int], str] = {}
         self._mr_urls: dict[tuple[str, int], str] = {}
+        # The content role's staging (#1020): blobs by sha, trees by
+        # handle, commits written on a pending branch, and each base
+        # directory listed once, all per repository.
+        self._blobs: dict[tuple[str, str], bytes] = {}
+        self._trees: dict[tuple[str, str], Staged] = {}
+        self._pending: dict[tuple[str, str], Pending] = {}
+        self._listings: dict[tuple[str, str, str], Listing] = {}
 
     # -- paths ------------------------------------------------------------------
 
@@ -1370,34 +1380,246 @@ class GitlabOps(JobBackend):
                 return thread.is_resolved if thread is not None else False
         return False
 
-    # -- ContentOps (not implemented yet; #1020) -------------------------------
+    # -- ContentOps: a changeset staged here, written as one commit (#1020) ----
+    #
+    # GitHub's blob, tree, commit and ref steps, which `deliver.py` speaks,
+    # onto GitLab's one commits-API call; `vcs/gitlab/content.py` says why
+    # a branch is rewritten and never deleted and recreated.
 
     def blobs_create_many(self, repo: str, files: list[dict[str, str]]) -> dict[str, str]:
-        raise self._unimplemented("ContentOps", "blobs_create_many")
+        """Hash each ``{path, content_b64}`` as git would and keep the bytes
+        for the commit; returns path -> blob sha. Nothing reaches GitLab:
+        it has no blob a client creates (#1016 V5)."""
+        shas: dict[str, str] = {}
+        for entry in files:
+            path = str(entry.get("path") or "")
+            try:
+                raw = base64.b64decode(str(entry.get("content_b64") or ""), validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise GithubOpsError(f"blob for {path!r} is not base64: {exc}") from exc
+            sha = blob_sha(raw)
+            self._blobs[(repo, sha)] = raw
+            shas[path] = sha
+        return shas
 
     def commit_get(self, repo: str, sha: str) -> dict[str, Any]:
-        raise self._unimplemented("ContentOps", "commit_get")
+        """The commit record behind ``sha`` (``GET .../repository/commits/:sha``,
+        field-verified: no tree id in the payload, so the ``tree`` sha is
+        the commit's own and :meth:`tree_create` reads the base tree by it)."""
+        path = f"{self._project(repo)}/repository/commits/{quote(sha, safe='')}"
+        return commit_record(self._dict(f"GET {path}", self.raw("GET", path)))
+
+    def _listing(self, repo: str, ref: str, directory: str) -> Listing:
+        """One directory of the tree at ``ref`` (``GET .../repository/tree``,
+        paged; a directory the ref does not have is empty), read once per
+        backend object."""
+        key = (repo, ref, directory)
+        if key not in self._listings:
+            found: dict[str, tuple[str, str]] = {}
+            query: dict[str, Any] = {"ref": ref, "per_page": PAGE_SIZE}
+            if directory:
+                query["path"] = directory
+            for page in range(1, MAX_PAGES + 1):
+                url = f"{self._project(repo)}/repository/tree?{urlencode({**query, 'page': page})}"
+                data = self.raw_lookup("GET", url)
+                if not isinstance(data, list):
+                    break
+                for row in data:
+                    if isinstance(row, dict) and row.get("name"):
+                        found[str(row["name"])] = (
+                            str(row.get("type") or "blob"),
+                            str(row.get("mode") or REGULAR_MODE),
+                        )
+                if len(data) < PAGE_SIZE:
+                    break
+            else:
+                raise PaginationError(
+                    f"{repo}:{ref}:{directory or '/'} has more than {MAX_PAGES * PAGE_SIZE} "
+                    "entries; the directory was not read to its end"
+                )
+            self._listings[key] = found
+        return self._listings[key]
 
     def tree_create(
         self, repo: str, *, base_tree: str, entries: list[dict[str, Any]]
     ) -> dict[str, Any]:
-        raise self._unimplemented("ContentOps", "tree_create")
+        """Stage the tree ``entries`` make of ``base_tree`` (the base commit's
+        sha, see :meth:`commit_get`) as the actions that write it; the
+        returned ``sha`` is an opaque handle :meth:`commit_create` takes.
+        A deletion of a path the base does not have is dropped and logged
+        rather than refused by GitLab along with the whole commit."""
+        if not base_tree:
+            raise GithubOpsError("tree_create needs the base commit's sha as base_tree")
+        blobs = {sha: raw for (owner, sha), raw in self._blobs.items() if owner == repo}
+        actions, skipped = plan_actions(
+            entries, lambda directory: self._listing(repo, base_tree, directory), blobs
+        )
+        if skipped:
+            log.info(
+                "gitlab.delete_skipped",
+                repo=repo,
+                base=base_tree[:12],
+                paths=skipped,
+                hint="the base has no such file to delete",
+            )
+        handle = tree_handle(base_tree, actions)
+        self._trees[(repo, handle)] = Staged(base_tree, tuple(actions))
+        return {"sha": handle, "truncated": False}
+
+    def _commit(
+        self,
+        repo: str,
+        *,
+        branch: str,
+        message: str,
+        actions: Sequence[Mapping[str, Any]],
+        start_sha: str = "",
+        start_branch: str = "",
+        force: bool = False,
+    ) -> str:
+        """One ``POST .../repository/commits``: the sha it wrote. ``force``
+        rewrites an existing ``branch`` from ``start_sha`` (field-verified);
+        no action at all needs ``allow_empty`` (field-verified: a 400
+        otherwise)."""
+        body: dict[str, Any] = {
+            "branch": branch,
+            "commit_message": message,
+            "actions": [dict(action) for action in actions],
+        }
+        if start_sha:
+            body["start_sha"] = start_sha
+        elif start_branch:
+            body["start_branch"] = start_branch
+        if force:
+            body["force"] = True
+        if not actions:
+            body["allow_empty"] = True
+        path = f"{self._project(repo)}/repository/commits"
+        data = self._dict(f"POST {path}", self.raw("POST", path, body))
+        sha = str(data.get("id") or "")
+        if not sha:
+            raise GithubOpsError(f"POST {path} returned no commit id: {data!r}")
+        return sha
 
     def commit_create(
         self, repo: str, *, message: str, tree: str, parents: list[str]
     ) -> dict[str, Any]:
-        raise self._unimplemented("ContentOps", "commit_create")
+        """Write the staged ``tree`` as a commit on ``parents[0]``: GitLab
+        writes a commit only onto a branch, so it goes on a pending branch
+        of its own (``sbxloop/pending/<id>``) that the ref step removes;
+        one that outlives a failed delivery says what it is by name."""
+        staged = self._trees.get((repo, tree))
+        if staged is None:
+            raise GithubOpsError(
+                f"tree {tree!r} was not staged by this backend; the tree and the commit of "
+                "one delivery are built by the same backend object"
+            )
+        if len(parents) > 1:
+            raise GithubOpsError("GitLab's commits API writes a commit with one parent")
+        start = parents[0] if parents else staged.base
+        branch = f"sbxloop/pending/{uuid4().hex[:12]}"
+        sha = self._commit(
+            repo, branch=branch, message=message, actions=staged.actions, start_sha=start
+        )
+        self._pending[(repo, sha)] = Pending(message, start, staged.actions, branch)
+        return {"sha": sha, "tree": {"sha": sha}, "parents": [{"sha": start}], "message": message}
+
+    def _drop_pending(self, repo: str, sha: str) -> None:
+        pending = self._pending.get((repo, sha))
+        if pending is None or not pending.branch:
+            return
+        self.raw_lookup(
+            "DELETE",
+            f"{self._project(repo)}/repository/branches/{quote(pending.branch, safe='')}",
+        )
+        self._pending[(repo, sha)] = pending._replace(branch="")
 
     def ref_create(self, repo: str, ref: str, sha: str) -> None:
-        raise self._unimplemented("ContentOps", "ref_create")
+        """Create ``refs/heads/<branch>`` at ``sha`` (``POST .../repository/branches``,
+        field-verified). A branch that already exists is GitLab's 400
+        "Branch already exists", raised for the caller to read."""
+        if not ref.startswith("refs/heads/"):
+            raise GithubOpsError(f"ref_create takes refs/heads/<branch>, got {ref!r}")
+        branch = ref[len("refs/heads/") :]
+        path = f"{self._project(repo)}/repository/branches"
+        self.raw("POST", path, {"branch": branch, "ref": sha})
+        self._drop_pending(repo, sha)
 
     def ref_force_update(self, repo: str, branch: str, sha: str) -> None:
-        raise self._unimplemented("ContentOps", "ref_force_update")
+        """Make ``branch`` carry the commit ``sha`` stands for. GitLab has no
+        call that moves a branch, and deleting one closes its open merge
+        request (both field-verified), so a branch that exists is written
+        again under ``force``: the same actions from the same parent, a new
+        commit of the same tree, which the merge request follows. Only a
+        commit this backend wrote can be written again."""
+        head = self.ref_lookup(repo, f"heads/{branch}")
+        if head == sha:
+            self._drop_pending(repo, sha)
+            return
+        if head is None:
+            self.ref_create(repo, f"refs/heads/{branch}", sha)
+            return
+        pending = self._pending.get((repo, sha))
+        if pending is None:
+            raise GithubOpsError(
+                f"GitLab has no call that moves branch {branch!r} to {sha[:12]}, and only a "
+                "commit this backend wrote can be written onto it again"
+            )
+        rewritten = self._commit(
+            repo,
+            branch=branch,
+            message=pending.message,
+            actions=pending.actions,
+            start_sha=pending.start,
+            force=True,
+        )
+        log.info(
+            "gitlab.branch_rewritten",
+            repo=repo,
+            branch=branch,
+            previous=head[:12],
+            wanted=sha[:12],
+            commit=rewritten[:12],
+            hint="a new commit of the same tree; the merge request follows the branch",
+        )
+        self._pending[(repo, rewritten)] = pending._replace(branch="")
+        self._drop_pending(repo, sha)
 
     def contents_put(
         self, repo: str, path: str, *, message: str, content_b64: str, branch: str
     ) -> dict[str, Any]:
-        raise self._unimplemented("ContentOps", "contents_put")
+        """Create or replace one file on ``branch`` in one commit. A branch
+        the project does not have is cut from its default branch, or is
+        the first commit of a project with none (field-unverified: the
+        harness project is never empty)."""
+        head = self.ref_lookup(repo, f"heads/{branch}")
+        start_branch = ""
+        if head is None:
+            project = self._project_payload(repo)
+            default = str(project.get("default_branch") or "")
+            if default and default != branch and not project.get("empty_repo"):
+                start_branch = default
+        exists = False
+        if head is not None or start_branch:
+            # Create versus update is decided against the tree the commit
+            # lands on: the branch's own, or the default branch it is cut from.
+            target = f"{self._project(repo)}/repository/files/{quote(path, safe='')}"
+            query = urlencode({"ref": branch if head is not None else start_branch})
+            exists = self.raw_lookup("GET", f"{target}?{query}") is not None
+        action = {
+            "action": "update" if exists else "create",
+            "file_path": path,
+            "content": content_b64,
+            "encoding": "base64",
+        }
+        sha = self._commit(
+            repo, branch=branch, message=message, actions=(action,), start_branch=start_branch
+        )
+        try:
+            blob = blob_sha(base64.b64decode(content_b64, validate=True))
+        except (ValueError, binascii.Error):
+            blob = ""
+        return {"content": {"path": path, "sha": blob}, "commit": {"sha": sha}}
 
 
 def _implements(ops: GitlabOps) -> VcsOps:
