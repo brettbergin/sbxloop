@@ -1,42 +1,62 @@
 name: Release
 
-# Every merge/push to main auto-bumps the patch version (via a new git tag) and
-# publishes both distributions (sbxloop, sbxloop-worker) to PyPI using Trusted
-# Publishing (OIDC — no tokens). hatch-vcs derives the package versions from
-# the tag, so nothing is committed back to main.
-#
-# Every run releases the CURRENT TIP of main — never the (possibly stale)
-# commit that triggered it. Together with the concurrency group below and the
-# ancestor guard in "Compute release version", this keeps tag numeric order
-# aligned with main's history: a queued, superseded, or re-run job for an
-# older merge can no longer stamp old code with a newer version (which is how
-# v0.5.29–v0.5.32 ended up tagging out of order on 2026-07-25).
+# Pushes wake one serialized batch: three quiet minutes, at most thirty minutes
+# from the first observation, then one frozen SHA. Redundant wakeups no-op.
+# Keep this workflow/environment identity: both PyPI Trusted Publishers use it.
 on:
   push:
     branches: [main]
-  workflow_dispatch: {}  # allow a manual release from the Actions tab
+  # Catch up after a missed push or after finishing an older partial release.
+  # Already-published main exits without checks, tagging, or uploading.
+  schedule:
+    - cron: '13,43 * * * *'
+  workflow_dispatch: {}  # Release now: bypass the quiet window.
 
-# Serialize releases so two quick merges can't race on the tag / version.
-# Note GitHub keeps at most ONE pending run per group (newer pushes supersede
-# older pending runs) — that's fine, because whichever run executes releases
-# the tip of main, which contains every superseded merge.
 concurrency:
   group: release
   cancel-in-progress: false
+  # A push must not replace a pending manual release.
+  queue: max
+
+permissions:
+  contents: read
 
 jobs:
-  check:
+  batch:
+    if: github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    timeout-minutes: 40
     outputs:
-      sha: ${{ steps.tip.outputs.sha }}  # the exact commit the release job tags + publishes
+      sha: ${{ steps.batch.outputs.sha }}
+      version: ${{ steps.batch.outputs.version }}
+      proceed: ${{ steps.batch.outputs.proceed }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: main       # test the tip of main, not the (possibly stale) trigger commit
-          fetch-depth: 0  # hatch-vcs needs tags to resolve the version
-      - name: Record the tested commit
-        id: tip
-        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          ref: ${{ github.workflow_sha }}
+      - name: Collect the release batch
+        id: batch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
+        run: python3 scripts/release_pipeline.py batch
+      - name: Keep the helper with the frozen plan
+        run: cp scripts/release_pipeline.py pipeline/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-plan
+          path: pipeline/
+          if-no-files-found: error
+
+  check:
+    needs: batch
+    if: needs.batch.outputs.proceed == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.batch.outputs.sha }}
+          fetch-depth: 0
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --all-packages
       - run: uv run ruff format --check .
@@ -46,101 +66,85 @@ jobs:
       - run: uv run pytest --cov=sbxloop --cov=sbxloop_worker --cov-report=term-missing --cov-fail-under=85
 
   release:
-    needs: check
+    needs: [batch, check]
+    if: needs.batch.outputs.proceed == 'true'
     runs-on: ubuntu-latest
-    # Trusted Publishing (OIDC): this repo + workflow + environment are
-    # configured as a Trusted Publisher on pypi.org for BOTH projects
-    # (sbxloop and sbxloop-worker). No API token secrets are used.
     environment: pypi
     permissions:
-      contents: write   # push the new version tag + create the GitHub Release
-      id-token: write   # PyPI Trusted Publishing (OIDC)
+      contents: write
+      id-token: write
+    outputs:
+      published: ${{ steps.publish.outputs.published }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      VERSION: ${{ needs.batch.outputs.version }}
+      RELEASE_SHA: ${{ needs.batch.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ needs.check.outputs.sha }}  # release exactly what the check job tested
-          fetch-depth: 0   # full history + all tags so hatch-vcs can resolve the version
-
-      - name: Compute release version
-        id: ver
+          ref: ${{ needs.batch.outputs.sha }}
+          fetch-depth: 0
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+          path: ${{ runner.temp }}/release-plan
+      - name: Reserve the tested version
         run: |
           set -euo pipefail
+          echo "PLAN=${RUNNER_TEMP}/release-plan/plan.json" >> "$GITHUB_ENV"
           git fetch --tags --force --quiet
-          # If this commit is already tagged (manual minor/major bump, or a
-          # re-run), release that version as-is instead of minting a new tag.
-          if existing="$(git describe --exact-match --tags HEAD 2>/dev/null)"; then
-            echo "HEAD is already tagged as ${existing} — releasing it without re-tagging."
-            echo "proceed=true"  >> "$GITHUB_OUTPUT"
-            echo "need_tag=false" >> "$GITHUB_OUTPUT"
-            echo "version=${existing#v}" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Refuse to mint a new tag for code already contained in an existing
-          # release: a stale queued/re-run job would otherwise stamp OLDER code
-          # with a NEWER version, breaking "higher version ⊇ more features".
-          for tag in $(git tag --list 'v[0-9]*'); do
-            if git merge-base --is-ancestor HEAD "${tag}^{commit}"; then
-              echo "HEAD is already contained in release ${tag} — skipping this release."
-              echo "proceed=false" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-          done
-          latest="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -n1)"
-          if [ -z "$latest" ]; then
-            next="0.1.0"                       # first release
+          if git show-ref --verify --quiet "refs/tags/v${VERSION}"; then
+            [ "$(git rev-parse "v${VERSION}^{commit}")" = "${RELEASE_SHA}" ]
           else
-            v="${latest#v}"
-            IFS=. read -r major minor patch <<< "$v"
-            next="${major}.${minor}.$((patch + 1))"   # bump patch on every merge
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git tag -a "v${VERSION}" "${RELEASE_SHA}" -m "Release v${VERSION}"
+            git push origin "refs/tags/v${VERSION}"
           fi
-          echo "Releasing v${next} (previous: ${latest:-none})"
-          echo "proceed=true"  >> "$GITHUB_OUTPUT"
-          echo "need_tag=true" >> "$GITHUB_OUTPUT"
-          echo "version=${next}" >> "$GITHUB_OUTPUT"
-
-      - name: Create and push tag
-        if: steps.ver.outputs.proceed == 'true' && steps.ver.outputs.need_tag == 'true'
-        run: |
-          set -euo pipefail
-          git config user.name  "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "v${{ steps.ver.outputs.version }}" -m "Release v${{ steps.ver.outputs.version }}"
-          git push origin "v${{ steps.ver.outputs.version }}"
-
+      - name: Restore the original files for a publication retry
+        id: staged
+        run: python3 "${RUNNER_TEMP}/release-plan/release_pipeline.py" restore
       - uses: astral-sh/setup-uv@v5
-        if: steps.ver.outputs.proceed == 'true'
-
-      - name: Build sdists + wheels
-        if: steps.ver.outputs.proceed == 'true'
+        if: steps.staged.outputs.reused != 'true'
+      - name: Build both distributions once
+        if: steps.staged.outputs.reused != 'true'
         run: |
           uv build --package sbxloop-worker -o dist
           uv build --package sbxloop -o dist
-
-      - name: Assert worker wheel is vendored inside the host wheel at the release version
-        if: steps.ver.outputs.proceed == 'true'
+      - name: Assert the matching worker wheel is vendored
         run: |
-          unzip -l "dist/sbxloop-${{ steps.ver.outputs.version }}-py3-none-any.whl" \
-            | grep -F "sbxloop/_vendor/sbxloop_worker-${{ steps.ver.outputs.version }}-py3-none-any.whl"
-
-      - name: Publish to PyPI
-        if: steps.ver.outputs.proceed == 'true'
+          unzip -l "dist/sbxloop-${VERSION}-py3-none-any.whl" \
+            | grep -F "sbxloop/_vendor/sbxloop_worker-${VERSION}-py3-none-any.whl"
+      - name: Stage original files before any PyPI upload
+        run: python3 "${RUNNER_TEMP}/release-plan/release_pipeline.py" stage
+      - name: Publish both distributions to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           packages-dir: dist/
-          # Both dists publish from one job; if one project's upload fails
-          # (e.g. missing Trusted Publisher) the re-run must not trip over
-          # the files that already made it to PyPI.
+          # Retries reuse the draft's original bytes if one upload failed.
           skip-existing: true
+      - name: Publish the completed GitHub Release
+        id: publish
+        run: python3 "${RUNNER_TEMP}/release-plan/release_pipeline.py" publish
 
-      - name: Create GitHub Release
-        if: steps.ver.outputs.proceed == 'true'
+  result:
+    needs: [batch, check, release]
+    if: >-
+      always() && needs.batch.result == 'success' &&
+      (needs.batch.outputs.proceed != 'true' || needs.release.result == 'success')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-plan
+          path: pipeline
+      - name: Record publication or an explicit no-op
         env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag="v${{ steps.ver.outputs.version }}"
-          if gh release view "$tag" >/dev/null 2>&1; then
-            echo "GitHub Release $tag already exists — skipping."
-          else
-            gh release create "$tag" --title "$tag" --generate-notes dist/*
-          fi
+          PLAN: pipeline/plan.json
+          PUBLISHED: ${{ needs.release.outputs.published }}
+        run: python3 pipeline/release_pipeline.py receipt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-result
+          path: release-result.json
+          if-no-files-found: error
