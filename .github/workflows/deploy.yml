@@ -91,8 +91,9 @@ jobs:
     # nothing from the tree. Skipping it keeps the runner's _work empty and
     # removes the largest supply-chain surface on a root-equivalent host.
 
+    # Scope the Actions token to GitHub steps below. Host commands must use
+    # the operator's credentials; a job token conflicts with GitHub App auth.
     env:
-      GH_TOKEN: ${{ github.token }}
       MANUAL: ${{ github.event_name == 'workflow_dispatch' }}
       INPUT_VERSION: ${{ inputs.version }}
       # The host, as the notices name it (and the runner label above).
@@ -159,6 +160,7 @@ jobs:
       - name: Load the trusted workflow helper
         id: helper
         env:
+          GH_TOKEN: ${{ github.token }}
           WORKFLOW_SHA: ${{ github.workflow_sha }}
         run: |
           set -euo pipefail
@@ -173,6 +175,7 @@ jobs:
       - name: Read the release result
         id: receipt
         env:
+          GH_TOKEN: ${{ github.token }}
           EVENT_NAME: ${{ github.event_name }}
           SOURCE_RUN: ${{ github.event.workflow_run.id }}
         run: |
@@ -189,6 +192,8 @@ jobs:
       - name: Compare against what is installed
         id: installed
         if: steps.receipt.outputs.eligible == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # Cooldown and blocked releases exit before doctor or a pause hold.
           "${VENV_PYTHON}" "${PIPELINE}" deploy-check
@@ -286,6 +291,8 @@ jobs:
       - name: Refresh the target after draining
         id: final
         if: steps.installed.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           # INPUT_VERSION remains pinned for an explicit manual operation;
           # automatic/latest operations include releases published during the wait.
@@ -334,6 +341,7 @@ jobs:
         id: attempt
         if: steps.final.outputs.changed == 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ steps.final.outputs.version }}
         run: |
           "${VENV_PYTHON}" "${PIPELINE}" deploy-start
