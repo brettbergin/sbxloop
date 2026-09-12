@@ -468,12 +468,32 @@ class TestInbound:
             client.deliver({**message("!sbx pause"), "subtype": "message_changed"})
             client.deliver({**message("!sbx pause"), "bot_id": "B1"})
             client.deliver({**message("!sbx pause"), "user": BOT})
-            client.deliver(
-                {**message("!sbx pause"), "channel": CHANNEL, "thread_ts": "1.2"}
-            )  # a human thread
             bridge.daemon_notice(DaemonNotice("daemon.started", "tick"))
             assert wait_for(lambda: any("tick" in p["text"] for p in client.web.posted))
             assert floop.hold_calls == []
+        finally:
+            bridge.close()
+
+    def test_a_thread_under_a_control_channel_post_is_the_control_channel(
+        self, tmp_path: Path
+    ) -> None:
+        """A thread somebody opens under an ordinary control-channel post —
+        a notice, a concierge answer — is its own surface on Slack, and used
+        to be neither the control channel nor a run thread: a command or an
+        @mention there was dropped without a trace. It is control-channel
+        traffic, answered in that thread."""
+        concierge = FakeConcierge()
+        bridge, client, floop = make_bridge(tmp_path, concierge=concierge)
+        try:
+            client.deliver({**message("!sbx pause"), "thread_ts": "1.2", "ts": "1.3"})
+            assert wait_for(lambda: bool(floop.hold_calls))
+            client.deliver(
+                {**message(f"<@{BOT}> what is running?"), "thread_ts": "1.2", "ts": "1.4"}
+            )
+            assert wait_for(lambda: bool(concierge.turns))
+            assert concierge.turns[0][0] == "what is running?"
+            answer = next(p for p in client.web.posted if "hello" in p["text"])
+            assert answer.get("thread_ts") == "1.2"
         finally:
             bridge.close()
 

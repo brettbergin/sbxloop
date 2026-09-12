@@ -1755,7 +1755,11 @@ never ping `@channel`. Replying on Mattermost means posting in a thread
 rather than answering one message, so — as on Slack — the concierge and
 steering are @mention-only (`@your-bot` in the control channel or in a
 run's thread), and people can talk to each other in a run's thread without
-the bot answering. `sbxloop doctor` shows one
+the bot answering. A thread you open under any *other* post in the control
+channel — a run's finish notice, a concierge answer, a gate prompt — counts
+as the control channel: an @mention there reaches the concierge and is
+answered in that thread, and `!sbx` commands work there too. Only a run's
+own thread steers. `sbxloop doctor` shows one
 `chat bridge (mattermost)` row: extra installed, token present.
 Cards are coloured message attachments (`[mattermost] embeds`) — a post the
 server rejects is retried text-only, so a run's chronology never goes

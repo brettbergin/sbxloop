@@ -12,7 +12,12 @@ unit-testable without a client and identical on both services:
 - messages from bots (including our own) are ignored;
 - the bot listens on exactly two surfaces — the control channel and a run
   thread it opened itself (``is_run_thread``). Anywhere else — a DM, an
-  unrelated channel — is ignored outright;
+  unrelated channel — is ignored outright. On a service where a thread is
+  a surface of its own (Slack, Mattermost), a thread somebody opened under
+  an ordinary control-channel post *is* the control channel: the bridge
+  folds it in before calling this (``Inbound.parent_channel_id``), so an
+  @mention under a notice or a concierge answer is not lost between the
+  two surfaces;
 - on either surface, text starting with the command prefix is a
   ``command`` (mention or not), and a message that @mentions the bot or
   replies to one of its messages is *addressed* to it: in the control

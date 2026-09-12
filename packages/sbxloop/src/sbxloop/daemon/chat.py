@@ -194,6 +194,13 @@ class Inbound:
     channel's id, or the id of a run thread (for Slack, the thread's
     ``thread_ts``). ``channel`` is the handle to send an answer to and
     ``raw`` the handle to react to / reply under — opaque to this module.
+
+    ``parent_channel_id`` is the channel a *threaded* message physically
+    lives in, on a service where a thread is a surface of its own (Slack,
+    Mattermost) — None otherwise. It is what lets a thread somebody opened
+    under an ordinary control-channel post count as the control channel:
+    without it that thread is neither surface the bot listens on, and an
+    @mention there is dropped without a trace.
     """
 
     content: str
@@ -210,6 +217,7 @@ class Inbound:
     # A clarifying question is matched to its answer by this reference before
     # anything falls back to guessing.
     reply_to_id: str | None = None
+    parent_channel_id: str | None = None
 
 
 class _Pending:
@@ -776,18 +784,48 @@ class ChatBridge(ABC):
             return
         # Our own chronology posts arrive here too, so settle the free facts
         # before the one that costs a store lookup.
+        control = self.chat.channel_ref or None
+        is_run_thread = not msg.author_is_bot and self._is_run_thread(msg.channel_id)
+        surface = msg.channel_id
+        if (
+            not is_run_thread
+            and surface is not None
+            and control is not None
+            and surface != control
+            and msg.parent_channel_id == control
+        ):
+            # A thread somebody opened under an ordinary control-channel
+            # post — a notice, a concierge answer, a gate prompt. On a
+            # service where a thread is its own surface that is neither
+            # the control channel nor a run thread, and the message used
+            # to fall between them. It is control-channel traffic, and the
+            # answer goes to ``msg.channel``, which is still the thread.
+            surface = control
         route = route_message(
             content=msg.content,
-            channel_id=msg.channel_id,
+            channel_id=surface,
             author_is_bot=msg.author_is_bot,
             mentioned_ids=msg.mentioned_ids,
             reply_to_bot=not msg.author_is_bot and msg.reply_to_bot,
-            control_channel_id=self.chat.channel_ref or None,
+            control_channel_id=control,
             prefix=self.chat.command_prefix,
             bot_user_id=self._bot_user_id(),
-            is_run_thread=not msg.author_is_bot and self._is_run_thread(msg.channel_id),
+            is_run_thread=is_run_thread,
             mention_re=self.mention_re,
         )
+        if route.kind == "ignore" and not msg.author_is_bot:
+            # The one outcome with no visible trace. At debug, so a person
+            # asking "why did it not answer me" has somewhere to look.
+            bot = self._bot_user_id()
+            self.log.debug(
+                "chat.message_ignored",
+                surface=msg.channel_id,
+                parent=msg.parent_channel_id,
+                in_control=surface == control,
+                run_thread=is_run_thread,
+                mentioned=bot is not None and str(bot) in {str(m) for m in msg.mentioned_ids},
+            )
+            return
         if route.kind in ("concierge", "steer"):
             # Before the turn is even queued: "received" is only worth
             # anything while the person is still looking at what they sent.
