@@ -239,6 +239,18 @@ class TestGitignoredFiles:
         monkeypatch.setattr(hostgit, "find_git", lambda: None)
         assert hostgit.gitignored_files(tmp_path) is None
 
+    def test_a_path_git_cannot_decode_is_still_listed(self, tmp_path: Path) -> None:
+        """Bytes in, bytes out: a non-UTF-8 name under an ignore rule must
+        not drop out of the listing on the way through a str."""
+        root = make_repo(tmp_path)
+        (root / ".gitignore").write_text("dist/\n")
+        (root / "dist").mkdir()
+        raw = b"dist/caf\xe9.whl"
+        (root / os.fsdecode(raw)).write_bytes(b"")
+        listed = hostgit.gitignored_files(root)
+        assert listed is not None
+        assert {os.fsencode(p) for p in listed} == {raw}
+
 
 def rev(cwd: Path, ref: str = "HEAD") -> str:
     return subprocess.run(
@@ -312,6 +324,19 @@ class TestChangesSince:
         (clone / "link").symlink_to("hello.txt")
         (change,) = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF))
         assert (change.path, change.mode) == ("link", "120000")
+
+    def test_a_path_git_cannot_decode_is_still_a_change(self, tmp_path: Path) -> None:
+        """The record's path comes from the raw bytes: a non-UTF-8 name must
+        not be replaced on the way through a str, or the file on disk is
+        never found and the change is reported as a deletion."""
+        _, clone = make_clone(tmp_path)
+        raw = b"caf\xe9.txt"
+        (clone / os.fsdecode(raw)).write_text("x\n")
+        git("add", "-A", cwd=clone)
+        git("commit", "-q", "-m", "undecodable", cwd=clone)
+        (change,) = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF))
+        assert os.fsencode(change.path) == raw
+        assert (change.status, change.mode) == ("added", "100644")
 
     def test_unchanged_clone_is_empty(self, tmp_path: Path) -> None:
         _, clone = make_clone(tmp_path)
@@ -665,6 +690,26 @@ class TestCloneExistingBranch:
         with Repo(target) as clone:
             assert clone.git.rev_parse(hostgit.CLONE_BASE_REF).strip() == sha
 
+    def test_the_branch_the_source_has_checked_out_lands_consistently(self, tmp_path: Path) -> None:
+        """A single-branch clone of the source carries the source's checked-out
+        branch as `origin/<name>` (its local state, not its remote-tracking
+        ref), and the clone starts on that branch already. `-B` onto it is a
+        no-move for the ref, and ref, HEAD and work tree must still agree —
+        a bare ref update on the checked-out branch would not touch the tree."""
+        _, checkout = make_upstream_and_clone(tmp_path)
+        (checkout / "local.txt").write_text("local\n")
+        git("add", ".", cwd=checkout)
+        git("commit", "-q", "-m", "local work on main", cwd=checkout)
+        local = hostgit.head_commit(checkout)
+        target = tmp_path / "run"
+        assert hostgit.clone_existing_branch(checkout, target, "main") == local
+        with Repo(target) as clone:
+            assert clone.active_branch.name == "main"
+            assert clone.head.commit.hexsha == local
+            assert clone.git.rev_parse(hostgit.CLONE_BASE_REF).strip() == local
+            assert not clone.is_dirty(untracked_files=True)
+        assert (target / "local.txt").read_text() == "local\n"
+
     def test_a_missing_branch_refuses_rather_than_falling_back(self, tmp_path: Path) -> None:
         """The failure that matters. Provisioning failing is recoverable;
         delivering a tree that never had the PR's work is not."""
@@ -771,6 +816,42 @@ class TestMergeFromBase:
         assert (clone / "wip.txt").read_text() == "not yet committed\n"
         assert (clone / "hello.txt").read_text() == "edited but not committed\n"
         assert (clone / "pusher.txt").exists()
+
+    def test_a_repository_pre_commit_hook_does_not_run_for_the_checkpoint(
+        self, tmp_path: Path
+    ) -> None:
+        """The checkpoint is sbxloop's own commit; a hook the repository
+        ships must neither veto it nor run on its behalf."""
+        upstream, clone = make_run_clone(tmp_path)
+        marker = tmp_path / "hook-ran"
+        hooks = clone / ".git" / "hooks"
+        hooks.mkdir(exist_ok=True)
+        hook = hooks / "pre-commit"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+        hook.chmod(0o755)
+        (clone / "wip.txt").write_text("not yet committed\n")
+        new_sha = push_upstream_commit(tmp_path, upstream)
+        result = merge_from_base(clone, "main")
+        assert result.merged is True, result.message
+        assert not marker.exists()
+        with Repo(clone) as repo:
+            assert any(c.message.startswith("sbxloop: checkpoint") for c in repo.iter_commits())
+            assert repo.is_ancestor(repo.commit(new_sha), repo.head.commit)
+
+    def test_a_name_git_cannot_decode_is_checkpointed_and_merged(self, tmp_path: Path) -> None:
+        """A filename that is not valid UTF-8 must not turn the checkpoint
+        into a decode error: the work-tree steps read bytes."""
+        upstream, clone = make_run_clone(tmp_path)
+        raw = b"caf\xe9.txt"
+        (clone / os.fsdecode(raw)).write_text("undecodable\n")
+        new_sha = push_upstream_commit(tmp_path, upstream)
+        result = merge_from_base(clone, "main")
+        assert result.merged is True, result.message
+        with Repo(clone) as repo:
+            assert repo.is_ancestor(repo.commit(new_sha), repo.head.commit)
+            tracked: bytes = repo.git.ls_files("-z", stdout_as_string=False)
+            assert raw in tracked.split(b"\0")
+        assert (clone / os.fsdecode(raw)).read_text() == "undecodable\n"
 
     def test_conflict_is_left_in_progress_with_the_paths(self, tmp_path: Path) -> None:
         """Both sides edit the same line: the merge stays in progress, the
@@ -1146,6 +1227,39 @@ class TestIsTracked:
         monkeypatch.setattr(hostgit, "find_git", lambda: None)
         assert hostgit.is_tracked(root, root / "hello.txt") is None
 
+    def test_a_tracked_name_git_cannot_decode_is_still_answered(self, tmp_path: Path) -> None:
+        """One undecodable filename must not turn every answer for the
+        repository into "could not tell"."""
+        root = make_repo(tmp_path)
+        raw = b"caf\xe9.toml"
+        (root / os.fsdecode(raw)).write_text("x = 1\n")
+        git("add", "-A", cwd=root)
+        git("commit", "-q", "-m", "undecodable", cwd=root)
+        assert hostgit.is_tracked(root, root / os.fsdecode(raw)) is True
+        assert hostgit.is_tracked(root, root / "hello.txt") is True
+        (root / "local.toml").write_text("x = 1\n")
+        assert hostgit.is_tracked(root, root / "local.toml") is False
+
+    def test_checkout_config_cannot_run_an_fsmonitor_hook(self, tmp_path: Path) -> None:
+        """The agent can write the checkout's .git/config; a core.fsmonitor
+        hook there must not execute on the host during the probe."""
+        root = make_repo(tmp_path)
+        marker = tmp_path / "pwned"
+        hook = tmp_path / "hook.sh"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        hook.chmod(0o755)
+        git("config", "core.fsmonitor", str(hook), cwd=root)
+        git("config", "core.fsmonitorHookVersion", "1", cwd=root)
+        assert hostgit.is_tracked(root, root / "hello.txt") is True
+        assert not marker.exists()
+
+    def test_a_checkout_that_cannot_be_read_is_unknown(self, tmp_path: Path) -> None:
+        root = tmp_path / "ws"
+        (root / ".git").mkdir(parents=True)
+        (root / ".git" / "HEAD").write_text("ref\n")
+        (root / "hello.txt").write_text("x\n")
+        assert hostgit.is_tracked(root, root / "hello.txt") is None
+
 
 def make_submodule_setup(tmp_path: Path, remote_root: str) -> tuple[Path, Path, Path]:
     """A library repo, its bare copy under ``tmp_path/remotes`` (served at
@@ -1194,6 +1308,46 @@ class TestSubmodules:
             f"{remote.url}/lib.git",
         )
         assert hostgit.list_submodules(make_repo(tmp_path, "plain")) == []
+
+    def test_a_sibling_name_git_cannot_decode_does_not_break_populating(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        (app / os.fsdecode(b"caf\xe9.txt")).write_text("x\n")
+        git("add", "-A", cwd=app)
+        git("commit", "-q", "-m", "undecodable sibling", cwd=app)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert hostgit.populate_submodules(clone, source=app, token=None) == [
+            ("vendor/lib", "local")
+        ]
+        assert hostgit.is_dirty(clone) is False
+
+    def test_awkward_names_and_values_survive_the_parse(self, tmp_path: Path) -> None:
+        """Whitespace, dots and `=` in names and values, read from the file
+        alone: no checkout, no commit — a workspace whose submodules were
+        never populated still answers."""
+        root = tmp_path / "ws"
+        Repo.init(root).close()
+        (root / ".gitmodules").write_text(
+            '[submodule "lib one"]\n\tpath = vendor/lib one\n'
+            "\turl = https://example.com/o/lib one.git\n"
+            '[submodule "odd.path x"]\n\tpath = odd\n\turl = ../odd.git\n'
+            '[submodule "eq"]\n\tpath = c = d\n\turl = x\n'
+            '[submodule "pathless"]\n\turl = y\n'
+        )
+        assert hostgit.list_submodules(root) == [
+            hostgit.Submodule("lib one", "vendor/lib one", "https://example.com/o/lib one.git"),
+            hostgit.Submodule("odd.path x", "odd", "../odd.git"),
+            hostgit.Submodule("eq", "c = d", "x"),
+        ]
+
+    def test_an_unparseable_gitmodules_is_a_provision_error(self, tmp_path: Path) -> None:
+        root = tmp_path / "ws"
+        Repo.init(root).close()
+        (root / ".gitmodules").write_text('[submodule "a"\npath = a\n')
+        with pytest.raises(ProvisionError, match="reading"):
+            hostgit.list_submodules(root)
 
     def test_fresh_clone_populates_from_the_host_checkout(
         self, tmp_path: Path, remote: PrivateGitServer
@@ -1723,6 +1877,27 @@ class TestFetchTags:
             )
             assert fetched == hostgit.TagFetch(tags=1, source="remote")
             assert describe(clone) == "v0.9"
+
+    def test_the_credential_is_scoped_to_the_fetch(self, tmp_path: Path) -> None:
+        """The token rides a `custom_environment` block around the one fetch
+        that needs it: never the process environment, never the clone's
+        config, and gone once the fetch returns."""
+        upstream = make_repo(tmp_path, "upstream")
+        git("tag", "v0.9", cwd=upstream)
+        (tmp_path / "remotes").mkdir()
+        bare_from(upstream, tmp_path / "remotes", "o/app.git")
+        with PrivateGitServer(
+            tmp_path / "remotes", username="x-access-token", token="ghs_tags"
+        ) as private:
+            clone = tmp_path / "run"
+            hostgit.clone_from_remote(
+                f"{private.url}/o/app.git", clone, "sbxloop/r1", token="ghs_tags"
+            )
+            hostgit.fetch_tags(clone, source=None, token="ghs_tags", credential_url=private.url)
+        assert hostgit.CLONE_TOKEN_ENV not in os.environ
+        assert "ghs_tags" not in (clone / ".git" / "config").read_text()
+        with Repo(clone) as repo:
+            assert hostgit.CLONE_TOKEN_ENV not in repo.git.environment()
 
     def test_a_repository_without_tags_is_not_an_error(self, tmp_path: Path) -> None:
         app = make_repo(tmp_path, "app")
