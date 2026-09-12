@@ -1182,13 +1182,19 @@ sbxloop init --stdout --preset playwright
 ```
 
 For an existing installation, merge the generated `[sandbox]` settings and
-`[[mcp]]` entry into the home's `config/sbxloop.toml`. Keep any existing
+`[[mcp]]` entries into the home's `config/sbxloop.toml`. Keep any existing
 languages and append the setup commands to the existing list; a repository's
 `setup_commands` override replaces that list and must include the browser
 installation too. The preset selects `[agent] backend = "copilot"`; change
 it to `"claude"` to use the Claude Agent SDK and configure that backend's
 inference credential as usual. Native MCP is not supported by the Codex
 backend.
+
+The preset also gives builders [Context7](https://github.com/upstash/context7)
+for current library documentation and code examples. It uses the hosted
+HTTP server at `https://mcp.context7.com/mcp`, with no installation or API
+key required; anonymous access has lower rate limits. Its `hosts` entry
+allows the endpoint through the existing network policy.
 
 The preset installs `@playwright/mcp@0.0.80` into
 `$HOME/.sbxloop/playwright-mcp` inside the **agent sandbox**, then invokes
@@ -1201,7 +1207,7 @@ The MCP command uses that installed copy, with `--browser chromium`,
 profile. See the [Playwright MCP options](https://github.com/microsoft/playwright-mcp#configuration)
 and [browser installation guide](https://playwright.dev/docs/browsers#install-browsers).
 
-Only the builder receives the server. It can start the target's development
+Only the builder receives Playwright. It can start the target's development
 server in the sandbox, navigate to its loopback address, inspect pages and
 console errors, and exercise the UI. Ask it to save screenshots and other
 evidence inside the workspace so they survive harvest. The declared hosts
