@@ -38,6 +38,29 @@
 
 ### Fixed
 
+- **The automated upgrade now deploys to the home the host was installed
+  under.** An operator can put the whole sbxloop home anywhere with
+  `SBXLOOP_HOME`, but the reusable deploy workflow opened by writing
+  `SBXLOOP_HOME=$HOME/.sbxloop` into the job environment and derived the
+  launcher, the venv interpreter, uv and its caches from that same fixed
+  root. On a relocated host every step then addressed a directory that
+  either did not exist — the version check failed before anything was
+  installed — or, worse, was a second stale installation: the backup, the
+  install, `doctor`, the health check and the rollback all pointed away from
+  the daemon actually running.
+
+  The job now resolves the root **once**, in its first step, and derives
+  every path from it. A host tells the job where its home is through the
+  runner unit `sbxloop init --systemd --runner DIR` renders, which now
+  carries `Environment=SBXLOOP_HOME=` for the home it was built against, or
+  through the repository variable `SBXLOOP_HOME`, which wins over the
+  runner's environment. With neither set the default is unchanged,
+  `$HOME/.sbxloop`, so a default install needs no edits. A `~/` root expands
+  against the service user the way the loader does, a root holding spaces
+  survives as itself, and a root that is relative or holds a newline fails
+  the job before the host is touched rather than resolving differently in
+  every step.
+
 - **A failed sbx installation is no longer recorded as the installed
   version.** `sbxloop init` treated *any* installer failure that left an
   executable under the prefix as the one outcome an unprivileged run is
