@@ -5,8 +5,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tarfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -15,11 +17,14 @@ from typer.testing import CliRunner
 
 from sbxloop.cli.app import app
 from sbxloop.homeinit import (
+    RUNNER_UNIT,
     SBX_VERSION,
     UNIT_NAMES,
     HomeInit,
     InitError,
     InitOptions,
+    _render_unit_line,
+    _render_word,
     path_hint,
     render_unit,
     sbx_asset_name_matches,
@@ -33,10 +38,13 @@ runner = CliRunner()
 class FakeRun:
     """Records argv; answers success unless told to fail. Side effects a
     real command would have (uv creating the venv, Docker's installer
-    laying sbx out) are simulated so later steps see them."""
+    laying sbx out) are simulated so later steps see them — including the
+    installed executable answering ``sbx version`` with the version whose
+    installer wrote it, which is how a leftover binary gives itself away."""
 
-    def __init__(self, home: SbxloopHome) -> None:
+    def __init__(self, home: SbxloopHome, sbx_version: str = SBX_VERSION) -> None:
         self.home = home
+        self.sbx_version = sbx_version
         self.calls: list[list[str]] = []
         self.fail: dict[str, int] = {}
 
@@ -54,12 +62,51 @@ class FakeRun:
             # Docker's installer, honouring PREFIX from the environment; it
             # needs mkfs.ext4 on PATH, which Debian keeps under /usr/sbin.
             assert os.environ["PATH"].startswith("/usr/sbin:/sbin:")
-            prefix = Path(os.environ["PREFIX"])
-            (prefix / "bin").mkdir(parents=True, exist_ok=True)
-            (prefix / "bin" / "sbx").write_text("#!sbx\n")
+            self.install_sbx(Path(os.environ["PREFIX"]), self.sbx_version)
+        if argv[0] == str(self.home.sbx_binary) and argv[1:] == ["version"]:
+            # The real CLI reports the build that is on disk, not the one
+            # that was asked for.
+            return subprocess.CompletedProcess(argv, 0, Path(argv[0]).read_text(), "")
         if argv[0] == "sh" and argv[1].endswith("uv-install.sh"):
             self.home.uv.write_text("#!uv\n")
         return subprocess.CompletedProcess(argv, 0, "", "")
+
+    @staticmethod
+    def install_sbx(prefix: Path, version: str) -> None:
+        (prefix / "bin").mkdir(parents=True, exist_ok=True)
+        binary = prefix / "bin" / "sbx"
+        binary.write_text(f"#!sbx\nsbx version {version}\n")
+        binary.chmod(0o755)
+
+
+class RecordingRun:
+    """``FakeRun`` plus what each command saw of uv's directory settings.
+    A real uv reads them from its environment; a fake one can only report
+    the environment it was handed."""
+
+    KEYS = ("UV_PYTHON_INSTALL_DIR", "UV_CACHE_DIR", "UV_INSTALL_DIR")
+
+    def __init__(self, inner: FakeRun) -> None:
+        self.inner = inner
+        self.seen: list[tuple[list[str], dict[str, str | None]]] = []
+
+    def __call__(self, argv: Any) -> subprocess.CompletedProcess[str]:
+        argv = [str(a) for a in argv]
+        self.seen.append((argv, {key: os.environ.get(key) for key in self.KEYS}))
+        return self.inner(argv)
+
+    def env_of(self, *words: str) -> dict[str, str | None]:
+        """The environment of the one uv command whose arguments start with
+        *words* — ``python install``, ``venv``, ``pip install``."""
+        found = [env for argv, env in self.seen if argv[1 : 1 + len(words)] == list(words)]
+        assert len(found) == 1, f"{words}: {[argv for argv, _ in self.seen]}"
+        return found[0]
+
+    def env_of_bootstrap(self) -> dict[str, str | None]:
+        """The environment Astral's installer script ran under."""
+        found = [env for argv, env in self.seen if argv[0] == "sh"]
+        assert len(found) == 1, f"bootstrap: {[argv for argv, _ in self.seen]}"
+        return found[0]
 
 
 class FakeFetch:
@@ -99,12 +146,29 @@ class FakeFetch:
             target.write_text("#!/bin/sh\n")  # the uv installer
 
 
+def installer_fails(
+    run: FakeRun, *, stderr: str, code: int = 1, wrote: bool = True
+) -> Callable[[Any], subprocess.CompletedProcess[str]]:
+    """A runner whose ``install.sh`` fails — after laying the binaries down
+    (``wrote``, the shape of a step that needs root) or before touching
+    anything. Every other command still runs."""
+
+    def failing(argv: Any) -> subprocess.CompletedProcess[str]:
+        if str(argv[0]).endswith("install.sh"):
+            if wrote:
+                run(argv)
+            raise subprocess.CalledProcessError(code, [str(a) for a in argv], stderr=stderr)
+        return run(argv)
+
+    return failing
+
+
 def make(
     tmp_path: Path, **overrides: Any
 ) -> tuple[SbxloopHome, HomeInit, FakeRun, FakeFetch, list[str]]:
     home = SbxloopHome(tmp_path / "home")
-    run, fetch, said = FakeRun(home), FakeFetch(), []
     options = InitOptions(**{"version": "1.2.3", **overrides})
+    run, fetch, said = FakeRun(home, options.sbx_version), FakeFetch(), []
     init = HomeInit(
         home,
         options,
@@ -246,37 +310,89 @@ class TestLayout:
 
     def test_sbx_installer_failing_after_the_binary_landed_is_a_note(self, tmp_path: Path) -> None:
         """Docker's installer copies the binaries, then tries /etc/apparmor.d —
-        root's business; the unprivileged run still leaves a working sbx."""
+        root's business; the unprivileged run still leaves the executable it
+        was asked for, and the note says the backend is not ready."""
         home, init, run, _, _ = make(tmp_path)
-
-        original = run.__call__
-
-        def flaky(argv: Any) -> subprocess.CompletedProcess[str]:
-            result = original(argv)
-            if str(argv[0]).endswith("install.sh"):
-                raise subprocess.CalledProcessError(
-                    1, list(argv), stderr="apparmor: permission denied"
-                )
-            return result
-
-        init.run = flaky  # type: ignore[assignment]
+        init.run = installer_fails(run, stderr="apparmor: permission denied")  # type: ignore[assignment]
         report = init.execute()
         assert home.sbx_binary.exists()
-        assert any("AppArmor" in n for n in report.notes)
+        assert home.sbx_version_file.read_text().strip() == SBX_VERSION
+        note = next(n for n in report.notes if "AppArmor" in n)
+        assert "cannot start yet" in note and str(home.sbx_prefix) in note
 
     def test_sbx_installer_failing_outright_is_an_error(self, tmp_path: Path) -> None:
         _, init, run, _, _ = make(tmp_path)
         run.fail["sbx"] = 1  # no such prefix; the install.sh call fails before writing
-        original = run.__call__
-
-        def failing(argv: Any) -> subprocess.CompletedProcess[str]:
-            if str(argv[0]).endswith("install.sh"):
-                raise subprocess.CalledProcessError(2, list(argv), stderr="mkfs.ext4 not found")
-            return original(argv)
-
-        init.run = failing  # type: ignore[assignment]
+        init.run = installer_fails(run, stderr="mkfs.ext4 not found", code=2)  # type: ignore[assignment]
         with pytest.raises(InitError, match=r"mkfs\.ext4"):
             init.execute()
+
+
+class TestSbxInstall:
+    """A recorded sbx version has to mean an sbx that was installed: an
+    executable left behind by an earlier release is not proof of one."""
+
+    def test_a_failed_upgrade_never_advances_the_marker(self, tmp_path: Path) -> None:
+        """The installer refuses before touching anything (Debian keeps
+        mkfs.ext4 off a non-root PATH); the previous release's executable is
+        still there, and it is not the release that was asked for."""
+        home, first, *_ = make(tmp_path)
+        first.execute()
+        assert home.sbx_version_file.read_text().strip() == SBX_VERSION
+
+        _, upgrade, run, _, _ = make(tmp_path, sbx_version="0.39.0")
+        upgrade.run = installer_fails(run, stderr="mkfs.ext4 not found", code=2, wrote=False)  # type: ignore[assignment]
+        with pytest.raises(InitError, match=r"exit 2.*mkfs\.ext4"):
+            upgrade.execute()
+        assert home.sbx_binary.exists()  # the old one, untouched
+        assert not home.sbx_version_file.exists()  # nothing claims an install
+
+    def test_an_unrelated_failure_after_the_binary_landed_is_an_error(self, tmp_path: Path) -> None:
+        """A copy that got as far as the executable and then broke is a
+        half-installed sbx, not the AppArmor step."""
+        home, init, run, _, _ = make(tmp_path)
+        init.run = installer_fails(run, stderr="cp: cannot stat 'sandboxd': no such file")  # type: ignore[assignment]
+        with pytest.raises(InitError, match="cannot stat"):
+            init.execute()
+        assert not home.sbx_version_file.exists()
+
+    def test_an_installer_that_left_the_old_executable_is_an_error(self, tmp_path: Path) -> None:
+        """Exit 0 is not enough either: what the prefix reports has to be the
+        release that was asked for."""
+        home, first, *_ = make(tmp_path)
+        first.execute()
+        _, upgrade, run, _, _ = make(tmp_path, sbx_version="0.39.0")
+        run.sbx_version = SBX_VERSION  # the installer copied nothing new
+        with pytest.raises(InitError, match=f"reporting {SBX_VERSION}"):
+            upgrade.execute()
+        assert not home.sbx_version_file.exists()
+
+    def test_an_executable_that_reports_nothing_is_an_error(self, tmp_path: Path) -> None:
+        home, init, run, _, _ = make(tmp_path)
+        original = run.__call__
+
+        def mute(argv: Any) -> subprocess.CompletedProcess[str]:
+            result = original(argv)
+            if list(argv)[1:] == ["version"]:
+                return subprocess.CompletedProcess([str(a) for a in argv], 0, "", "")
+            return result
+
+        init.run = mute  # type: ignore[assignment]
+        with pytest.raises(InitError, match="reported no version"):
+            init.execute()
+        assert not home.sbx_version_file.exists()
+
+    def test_a_failed_install_is_retried_by_the_next_init(self, tmp_path: Path) -> None:
+        home, init, run, _, _ = make(tmp_path)
+        init.run = installer_fails(run, stderr="cp: cannot stat 'sandboxd'", wrote=False)  # type: ignore[assignment]
+        with pytest.raises(InitError):
+            init.execute()
+
+        _, retry, run2, _, _ = make(tmp_path)
+        report = retry.execute()
+        assert [c for c in run2.calls if c[0].endswith("install.sh")]  # not skipped
+        assert home.sbx_version_file.read_text().strip() == SBX_VERSION
+        assert any(d.startswith(f"sbx {SBX_VERSION}") for d in report.done)
 
     def test_no_asset_for_this_platform_is_an_error(self, tmp_path: Path) -> None:
         _, init, *_ = make(tmp_path)
@@ -375,6 +491,219 @@ class TestTemplates:
         assert path_hint(home, {"PATH": "/usr/bin"}) == f'export PATH="{home.bin}:$PATH"'
 
 
+def expand_specifiers(value: str) -> str:
+    """systemd's specifier expansion, as far as a rendered unit uses it: the
+    only specifier a path may produce is ``%%``, one literal percent. A bare
+    ``%`` left on a line would expand to something else entirely."""
+    out: list[str] = []
+    index = 0
+    while index < len(value):
+        if value[index] == "%":
+            assert value[index + 1 : index + 2] == "%", f"unescaped specifier in {value!r}"
+            out.append("%")
+            index += 2
+        else:
+            out.append(value[index])
+            index += 1
+    return "".join(out)
+
+
+def parse_words(value: str) -> list[str]:
+    """systemd's own word splitting of a command line or an ``Environment=``
+    value: whitespace separates words, quotes group them, a backslash outside
+    single quotes escapes what follows, and specifiers expand per word.
+
+    This is deliberately a reader, not a mirror of the writer: it says what
+    systemd will hand the service, so a test can assert the value rather than
+    the punctuation around it.
+    """
+    words: list[str] = []
+    word: list[str] = []
+    quote: str | None = None
+    started = False
+    index = 0
+    while index < len(value):
+        char = value[index]
+        index += 1
+        if quote is None and char.isspace():
+            if started:
+                words.append("".join(word))
+                word, started = [], False
+            continue
+        started = True
+        if char == "\\" and quote != "'":
+            word.append(value[index])
+            index += 1
+        elif quote is None and char in "\"'":
+            quote = char
+        elif char == quote:
+            quote = None
+        else:
+            word.append(char)
+    assert quote is None, f"unterminated quote in {value!r}"
+    if started:
+        words.append("".join(word))
+    return [expand_specifiers(w) for w in words]
+
+
+def values_of(unit: str, key: str) -> list[str]:
+    return [line.partition("=")[2] for line in unit.splitlines() if line.startswith(f"{key}=")]
+
+
+def environment_of(unit: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in values_of(unit, "Environment"):
+        for word in parse_words(line):
+            name, _, value = word.partition("=")
+            out[name] = value
+    return out
+
+
+def working_directory_of(unit: str) -> str:
+    (value,) = values_of(unit, "WorkingDirectory")
+    # A verbatim directive: systemd keeps quotes as part of the path, so a
+    # quoted one is a bug however good it looks.
+    assert '"' not in value, f"WorkingDirectory= must not be quoted: {value!r}"
+    return expand_specifiers(value)
+
+
+class TestUnitPaths:
+    """#894: the home and the runner directory are whatever the operator
+    chose. Each systemd directive spells a space, a percent or a dollar its
+    own way, and a unit that spells one wrong starts the wrong command — or
+    nothing at all."""
+
+    def render_all(self, home: SbxloopHome, runner: Path) -> dict[str, str]:
+        return {
+            name: render_unit(name, home, runner_dir=runner) for name in (*UNIT_NAMES, RUNNER_UNIT)
+        }
+
+    @pytest.mark.parametrize(
+        "root",
+        [
+            "/home/alice/Loop Data",  # the issue's own reproduction
+            "/srv/loop 50%",  # a specifier systemd would otherwise expand
+            "/srv/$HOME dir",  # no expansion happens in an executable path
+        ],
+    )
+    def test_every_directive_carries_the_whole_path(self, root: str) -> None:
+        home = SbxloopHome(Path(root))
+        runner = Path(f"{root}/Actions Runner")
+        units = self.render_all(home, runner)
+
+        daemon = units["sbxloop-daemon.service"]
+        assert parse_words(values_of(daemon, "ExecStart")[0]) == [
+            f"{root}/bin/sbxloop",
+            "daemon",
+        ]
+        assert environment_of(daemon) == {"SBXLOOP_HOME": root, "PYTHONUNBUFFERED": "1"}
+        assert working_directory_of(daemon) == root
+
+        sandboxd = units["sbx-sandboxd.service"]
+        assert parse_words(values_of(sandboxd, "ExecStart")[0]) == [
+            f"{root}/bin/sbx",
+            "daemon",
+            "start",
+        ]
+        assert parse_words(values_of(sandboxd, "ExecStop")[0]) == [
+            f"{root}/bin/sbx",
+            "daemon",
+            "stop",
+        ]
+        assert environment_of(sandboxd)["SBXLOOP_HOME"] == root
+
+        runner_unit = units[RUNNER_UNIT]
+        assert parse_words(values_of(runner_unit, "ExecStart")[0]) == [f"{runner}/run.sh"]
+        assert working_directory_of(runner_unit) == str(runner)
+
+    def test_a_simple_path_renders_exactly_as_before(self, tmp_path: Path) -> None:
+        home = SbxloopHome(tmp_path / "home")
+        runner = tmp_path / "runner"
+        for name, unit in self.render_all(home, runner).items():
+            plain = (
+                template(name).replace("@HOME@", str(home.root)).replace("@RUNNER@", str(runner))
+            )
+            assert unit == plain, name
+
+    def test_a_path_in_a_comment_reads_as_the_operator_typed_it(self) -> None:
+        home = SbxloopHome(Path("/home/alice/Loop Data"))
+        unit = render_unit("sbxloop-daemon.service", home)
+        assert "# at /home/alice/Loop Data and linked into" in unit
+
+    @pytest.mark.parametrize(
+        ("root", "message"),
+        [
+            ("/home/o'brien/loop", "refuses"),  # quotes are out in an executable
+            ('/home/al"ice/loop', "refuses"),
+            ("/home/back\\slash/loop", "refuses"),
+            ("/home/alice/loop\tdata", "refuses"),  # a tab is a control character
+            ("/home/alice/loop\nExecStart=/bin/sh", "control characters"),
+            ("/home/alice/loop ", "whitespace"),  # WorkingDirectory= strips it
+        ],
+    )
+    def test_what_systemd_cannot_carry_stops_init_by_name(self, root: str, message: str) -> None:
+        home = SbxloopHome(Path(root))
+        with pytest.raises(InitError) as caught:
+            render_unit("sbxloop-daemon.service", home)
+        assert message in str(caught.value) and repr(root) in str(caught.value)
+
+    def test_a_runner_directory_is_checked_the_same_way(self) -> None:
+        home = SbxloopHome(Path("/home/alice/loop"))
+        with pytest.raises(InitError) as caught:
+            render_unit(RUNNER_UNIT, home, runner_dir=Path("/home/o'brien/runner"))
+        assert "/home/o'brien/runner" in str(caught.value)
+
+    def test_a_directive_with_no_rule_stops_rather_than_guesses(self) -> None:
+        values = {"@HOME@": "/home/alice/Loop Data"}
+        with pytest.raises(InitError, match="no systemd quoting rule"):
+            _render_unit_line("RuntimeDirectory=@HOME@", values)
+        with pytest.raises(InitError, match="not a directive"):
+            _render_unit_line("@HOME@", values)
+        with pytest.raises(InitError, match="open the executable word"):
+            _render_unit_line("ExecStart=-@HOME@/bin/sbxloop", values)
+
+    def test_an_argument_word_keeps_its_dollar_out_of_expansion(self) -> None:
+        # No template puts a path in an argument today; the rule that says how
+        # it would be spelled is the difference between $x and a variable.
+        rendered = _render_word(
+            "@HOME@/a b",
+            {"@HOME@": "/srv/$x 50%"},
+            directive="ExecStart",
+            executable=False,
+            expand_dollar=True,
+        )
+        assert rendered == '"/srv/$$x 50%%/a b"'
+        assert parse_words(rendered.replace("$$", "$")) == ["/srv/$x 50%/a b"]
+
+    @pytest.mark.slow
+    @pytest.mark.skipif(
+        shutil.which("systemd-analyze") is None, reason="systemd tooling is not on this host"
+    )
+    def test_systemd_itself_accepts_the_rendered_units(self, tmp_path: Path) -> None:
+        # Dummy executables at the real paths, verified read-only: nothing is
+        # installed, started, or enabled on the host running the test.
+        home = SbxloopHome(tmp_path / "sbxloop home 50% $x")
+        runner = tmp_path / "actions runner"
+        for executable in (home.bin / "sbxloop", home.bin / "sbx", runner / "run.sh"):
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.write_text("#!/bin/sh\n")
+            executable.chmod(0o755)
+        units = tmp_path / "units"
+        units.mkdir()
+        for name, text in self.render_all(home, runner).items():
+            (units / name).write_text(text)
+        proc = subprocess.run(
+            ["systemd-analyze", "verify", *(str(units / n) for n in (*UNIT_NAMES, RUNNER_UNIT))],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if "Failed to initialize manager" in proc.stderr:
+            pytest.skip(f"systemd-analyze cannot run here: {proc.stderr.strip()}")
+        assert proc.returncode == 0, proc.stderr
+        assert "Invalid environment assignment" not in proc.stderr
+
+
 class TestCli:
     def test_project_writes_the_repository_file(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -397,3 +726,124 @@ class TestCli:
         result = runner.invoke(app, ["init", "--preset", "huge-repo", "--dry-run"])
         assert result.exit_code == 2, result.output
         assert "unknown preset" in result.output
+
+
+class TestUvDirectories:
+    """Init builds one home, and every uv command it runs must build *that*
+    home: the managed CPython under ``python/`` and the cache under
+    ``cache/uv``, whatever uv directories the operator's own environment
+    names. The launcher exports the same two, so a home whose init wrote
+    them elsewhere is a home whose launcher cannot find its interpreter."""
+
+    DECOY = "/somewhere/else"
+
+    def arrange(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **overrides: Any
+    ) -> tuple[SbxloopHome, HomeInit, RecordingRun, FakeRun]:
+        monkeypatch.setattr("shutil.which", lambda _name: None)  # no uv on PATH: fetch it
+        home, init, run, _fetch, _said = make(tmp_path, **overrides)
+        recorder = RecordingRun(run)
+        init.run = recorder
+        return home, init, recorder, run
+
+    def wanted(self, home: SbxloopHome) -> dict[str, str]:
+        return {
+            "UV_PYTHON_INSTALL_DIR": str(home.python),
+            "UV_CACHE_DIR": str(home.cache / "uv"),
+        }
+
+    def assert_home_scoped(self, home: SbxloopHome, seen: dict[str, str | None]) -> None:
+        wanted = self.wanted(home)
+        assert {key: seen[key] for key in wanted} == wanted
+
+    def test_every_uv_command_builds_under_the_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for key in RecordingRun.KEYS:
+            monkeypatch.delenv(key, raising=False)
+        home, init, recorder, _ = self.arrange(tmp_path, monkeypatch)
+        init.execute()
+        for words in (("python", "install"), ("venv",), ("pip", "install")):
+            self.assert_home_scoped(home, recorder.env_of(*words))
+        # and nothing of ours is left behind for whatever runs next
+        assert not any(os.environ.get(key) for key in RecordingRun.KEYS)
+
+    def test_inherited_settings_cannot_redirect_the_home(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for key in RecordingRun.KEYS:
+            monkeypatch.setenv(key, self.DECOY)
+        home, init, recorder, _ = self.arrange(tmp_path, monkeypatch)
+        init.execute()
+        for words in (("python", "install"), ("venv",), ("pip", "install")):
+            self.assert_home_scoped(home, recorder.env_of(*words))
+        # the operator's own settings are theirs again once init returns
+        assert all(os.environ[key] == self.DECOY for key in RecordingRun.KEYS)
+
+    def test_the_bootstrap_routes_agree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("UV_PYTHON_INSTALL_DIR", self.DECOY)
+        monkeypatch.setenv("UV_CACHE_DIR", self.DECOY)
+        # downloaded: the installer script itself runs pointed at the home
+        home, init, recorder, _ = self.arrange(tmp_path, monkeypatch)
+        init.execute()
+        downloaded = recorder.env_of_bootstrap()
+        self.assert_home_scoped(home, downloaded)
+        assert downloaded["UV_INSTALL_DIR"] == str(home.bin)
+        # copied from PATH: no installer to run, and the same directories after
+        other = tmp_path / "other"
+        fake_uv = tmp_path / "uv-on-path"
+        fake_uv.write_text("#!uv\n")
+        fake_uv.chmod(0o755)
+        monkeypatch.setattr("shutil.which", lambda name: str(fake_uv) if name == "uv" else None)
+        copied_home = SbxloopHome(other / "home")
+        copied = RecordingRun(FakeRun(copied_home))
+        HomeInit(
+            copied_home,
+            InitOptions(version="1.2.3", sbx=False),
+            env={"HOME": str(other), "PATH": "/usr/bin"},
+            run=copied,
+            fetch=FakeFetch(),
+            system="Linux",
+            machine="x86_64",
+            sys_prefix=other / "elsewhere-venv",
+            user_units=other / "units",
+        ).execute()
+        assert not any(argv[0] == "sh" for argv, _ in copied.seen)  # nothing to bootstrap
+        for words in (("python", "install"), ("venv",), ("pip", "install")):
+            self.assert_home_scoped(home, recorder.env_of(*words))
+            self.assert_home_scoped(copied_home, copied.env_of(*words))
+
+    def test_a_failed_uv_command_restores_the_environment(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for key in RecordingRun.KEYS:
+            monkeypatch.setenv(key, self.DECOY)
+        home, init, _recorder, run = self.arrange(tmp_path, monkeypatch)
+        run.fail = {f"{home.uv} pip install": 3}
+        with pytest.raises(subprocess.CalledProcessError):
+            init.execute()
+        assert all(os.environ[key] == self.DECOY for key in RecordingRun.KEYS)
+
+    def test_running_from_the_home_venv_touches_neither(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for key in RecordingRun.KEYS:
+            monkeypatch.setenv(key, self.DECOY)
+        home, init, _recorder, run = self.arrange(tmp_path, monkeypatch)
+        init.execute()
+        again = RecordingRun(run)
+        HomeInit(
+            home,
+            InitOptions(),  # this version, from the home's own venv
+            env={"HOME": str(tmp_path), "PATH": ""},
+            run=again,
+            fetch=FakeFetch(),
+            system="Linux",
+            machine="x86_64",
+            sys_prefix=home.venv,
+            user_units=tmp_path / "units",
+        ).execute()
+        assert again.seen == []  # no uv command at all: nothing to rebuild
+        assert all(os.environ[key] == self.DECOY for key in RecordingRun.KEYS)
