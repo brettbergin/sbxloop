@@ -4,9 +4,7 @@ from __future__ import annotations
 
 import base64
 import logging
-import os
 import shutil
-import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -28,6 +26,7 @@ from sbxloop.errors import (
 )
 from sbxloop.gh.ops import PrRef
 from tests.fakes.github_errors import github_error
+from tests.fakes.gitrepo import git
 from tests.fakes.gitserver import PrivateGitServer, bare_from
 
 
@@ -769,26 +768,6 @@ class TestEmptyRepoBootstrap:
                 outcome="x",
                 source_dir=make_workspace(tmp_path),
             )
-
-
-def git(*argv: str, cwd: Path) -> str:
-    return subprocess.run(
-        ["git", *argv],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-        text=True,
-        env={
-            "PATH": "/usr/bin:/bin:/usr/local/bin",
-            "GIT_AUTHOR_NAME": "t",
-            "GIT_AUTHOR_EMAIL": "t@example.com",
-            "GIT_COMMITTER_NAME": "t",
-            "GIT_COMMITTER_EMAIL": "t@example.com",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_CONFIG_SYSTEM": "/dev/null",
-            "GIT_SSL_CAINFO": os.environ.get("GIT_SSL_CAINFO", ""),
-        },
-    ).stdout.strip()
 
 
 def make_clone_workspace(tmp_path: Path) -> tuple[Path, str]:
