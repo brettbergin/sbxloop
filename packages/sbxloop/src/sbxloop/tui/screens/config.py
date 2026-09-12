@@ -29,7 +29,6 @@ from textual import work
 from textual.app import ComposeResult
 from textual.binding import Binding, BindingType
 from textual.containers import Vertical, VerticalScroll
-from textual.notifications import SeverityLevel
 from textual.widgets import Input, TabbedContent, TabPane
 from textual.worker import get_current_worker
 
@@ -38,10 +37,10 @@ from sbxloop.cli.doctor import stored_schedules
 from sbxloop.cli.policyview import PolicyView, policy_view
 from sbxloop.cli.workloadview import NO_PROFILE_NOTE, ProfileView, profile_views
 from sbxloop.config import Config, load_config_with_sources
+from sbxloop.configedit import answered_by, applies_for
 from sbxloop.configedit import keys as configkeys
 from sbxloop.configedit import toml as configtoml
 from sbxloop.configedit.edit import (
-    FILE_LAYER,
     Verdict,
     config_path,
     home_env,
@@ -446,7 +445,7 @@ class ConfigScreen(ConsoleScreen):
             self._file_status()
             self.app.notify(verdict.text[:300], title=edit.path, severity="error", timeout=15)
             return
-        note, severity = self._answered_by(edit, verdict)
+        note, severity = answered_by(edit.path, verdict, unset=edit.unset)
         if note is not None:
             self.last_verdict = note
             self.app.notify(note[:300], title=edit.path, severity=severity, timeout=15)
@@ -457,31 +456,10 @@ class ConfigScreen(ConsoleScreen):
                 on_success=lambda: self._saved(edit.path),
             )
 
-    def _answered_by(self, edit: ValueEdit, verdict: Verdict) -> tuple[str | None, SeverityLevel]:
-        """Which layer answers for the edited key once the draft applies.
-        This file is written either way — the operator asked for it — but a
-        key the environment or a `sbxloop.toml` in the home also sets would
-        otherwise look applied when it is not, and an unset key should say
-        what it fell back to."""
-        if verdict.config is None:  # pragma: no cover - guarded by verdict.ok
-            return None, "information"
-        source = configkeys.source_for(edit.path, verdict.sources)
-        if source == FILE_LAYER:
-            return None, "information"
-        value = configkeys.flatten(verdict.config.model_dump(mode="json")).get(edit.path)
-        if edit.unset:
-            where = "its default" if source == "default" else source
-            return f"{edit.path} unset here; it now comes from {where}: {value!r}", "information"
-        return (
-            f"{edit.path} is written, but {source} sets it too and wins: "
-            f"the loop still sees {value!r}",
-            "warning",
-        )
-
     def _saved(self, key: str = "") -> None:
         self._file_status()
         self.load()
-        if configkeys.is_model_key(key):
+        if applies_for(key) == "live":
             self.app.notify(
                 "Model settings refresh before the next phase or concierge turn.", title="config"
             )

@@ -11,4 +11,22 @@ lands in the same file the daemon reads, validated the same way.
 
 from __future__ import annotations
 
-__all__: list[str] = []
+from sbxloop.configedit.editor import (
+    Applies,
+    Change,
+    ConfigEditError,
+    ConfigEditor,
+    Row,
+    answered_by,
+    applies_for,
+)
+
+__all__ = [
+    "Applies",
+    "Change",
+    "ConfigEditError",
+    "ConfigEditor",
+    "Row",
+    "answered_by",
+    "applies_for",
+]
