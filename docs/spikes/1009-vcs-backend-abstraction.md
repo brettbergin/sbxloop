@@ -1,16 +1,23 @@
 # Spike: a configurable version-control backend (GitHub, GitLab, Gitea)
 
-Status: **design proposal — tracked as an epic, no implementation landed
-yet.** The epic is
+Status: **tracked as an epic; the forge-agnostic steps have landed and the
+field questions are answered.** The epic is
 [issue #1009](https://github.com/brettbergin/sbxloop/issues/1009); its
-child issues follow the sequence at the end of this document, with the
-field-verification questions filed as their own gate between the
-forge-agnostic steps and the first backend.
+child issues follow the sequence at the end of this document. Steps 1-5
+landed as #1022-#1027 and #1029. The six field questions (#1016) were
+answered on 2026-09-12 against GitLab CE 19.3.2 and Gitea 1.24.7 running in
+Docker; the evidence, the corrected capability matrix and the decisions they
+force are in [Field verification](#field-verification-1016).
 
 Code-seam claims below were read off this tree and are reproducible with the
-commands quoted beside them. **Every claim about GitLab and Gitea API
-behaviour is field-unverified** — desk knowledge, not checked against a live
-instance — and is marked as such where it is load-bearing.
+commands quoted beside them. GitLab and Gitea claims are **verified** where
+the matrix and the field-verification section say so, with the version they
+were verified on; anything not exercised there is labelled
+**field-unverified** where it appears. Two limits apply to every verified
+row: GitLab was the free tier (CE, `enterprise: false`), so a Premium or
+Ultimate fact is field-unverified; and both instances ran their default
+configuration, so an instance-level setting (commit signing, a site-wide
+token policy) can change a row.
 
 ## The outcome
 
@@ -129,29 +136,38 @@ a design input, an unreadable one is a halt.
 
 ### Capability matrix
 
-**Field-unverified for the GitLab and Gitea columns.** Confirming this table
-against live instances is the first task of any implementation, and several
-rows below are the ones most likely to be wrong.
+Verified 2026-09-12 against GitLab CE 19.3.2 (revision `34042bf7d00`,
+`enterprise: false`) and Gitea 1.24.7, with the credential a run would hold:
+a Developer on GitLab and a write collaborator on Gitea. The GitHub column is
+what the GitHub backend already does. The evidence for each row is in
+[Field verification](#field-verification-1016); the name in parentheses is
+the one in `sbxloop.vcs.protocol.CAPABILITIES`.
 
-| Capability                     | GitHub                 | GitLab                | Gitea             |
-| ------------------------------ | ---------------------- | --------------------- | ----------------- |
-| merge queue / train            | merge queue            | merge trains (paid)   | none              |
-| resolvable review threads      | yes                    | discussions           | weak              |
-| draft change                   | `draft` flag           | `Draft:` title prefix | draft flag        |
-| request-changes review         | yes                    | paid tier             | yes               |
-| host-minted short-lived token  | GitHub App             | none                  | none              |
-| remote commit (no checkout)    | git data API           | commits API + actions | contents API      |
-| required-checks introspection  | protection + rulesets  | protected branches +  | branch protection |
-|                                | + PR rollup            | approval rules        |                   |
-| bot identity signal            | `[bot]` / `__typename` | `bot` user flag       | none              |
-| API-created commits are signed | App credential only    | no                    | no                |
-| author may approve own change  | policy-dependent       | forbidden             | policy-dependent  |
+| Capability                                                      | GitHub                            | GitLab CE 19.3.2                                                                                                                                         | Gitea 1.24.7                                                                                                                           |
+| --------------------------------------------------------------- | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| merge queue / train (`merge_queue`)                             | merge queue                       | **none on CE**, verified: `GET /merge_trains` is 404, `merge_trains_enabled: null`. Premium merge trains are field-unverified                            | **none**, verified: no queue path; `merge_when_checks_succeed` is auto-merge, not a queue                                              |
+| resolvable review threads (`review_threads`)                    | yes                               | **yes**, verified: resolve and reopen by `PUT .../discussions/:id`, reply by `POST .../discussions/:id/notes`; the id survives pushes                    | **no**, verified: no resolve and no reply path in the API; `resolver` is read-only                                                     |
+| draft change (`draft_changes`)                                  | `draft` flag                      | **`Draft:` title prefix**, verified: sets `draft: true` and `detailed_merge_status: draft_status`; retitling clears it                                   | **`WIP:` title prefix**, verified: no draft field on create; the prefix sets `draft: true`; retitling clears it                        |
+| request-changes review (`request_changes_review`)               | yes                               | **recorded, not enforced on CE**, verified: `reviewer_state=requested_changes` is accepted and the change stays `mergeable`. Premium is field-unverified | **yes**, verified: a `REQUEST_CHANGES` review blocks the merge when `block_on_rejected_reviews` is on                                  |
+| host-minted short-lived token (`short_lived_token`)             | GitHub App                        | **none**, verified: a PAT or project access token, with an `expires_at` the token reads itself. OAuth application tokens are field-unverified            | **none**, verified: tokens have no expiry at all                                                                                       |
+| remote commit, no checkout (`remote_commit`)                    | git data API                      | **yes**, verified: `POST /repository/commits` with `actions`; atomic, binary-safe, a new branch via `start_branch`                                       | **yes**, verified: `POST /contents` with `files`; atomic, binary-safe, a new branch via `new_branch`                                   |
+| required-checks introspection (`required_checks_introspection`) | protection + rulesets + PR rollup | **yes, with no named checks on CE**, verified: a Developer reads the protected branch and "pipeline must succeed"; every status in the pipeline counts   | **yes**, verified: a write collaborator reads required contexts and approvals from `GET /branches/{b}`; the other flags are admin-only |
+| bot identity signal (`bot_identity`)                            | `[bot]` / `__typename`            | **yes**, verified: `bot: true` on `GET /users/:id`, readable by a Developer; absent from a note's `author`                                               | **none**, verified: a `--user-type bot` account reads exactly like a human; the schema has no type field                               |
+| API-created commits are signed (`signed_api_commits`)           | App credential only               | **no on a default install**, verified: `GET .../commits/:sha/signature` is 404. An instance with signing configured is field-unverified                  | **no on a default install**, verified: `verification.verified: false`, `gpg.error.not_signed_commit`                                   |
+| author may approve own change                                   | policy-dependent                  | **allowed on CE**, verified: the author's `POST .../approve` is 201 and counts. The Premium setting that forbids it is field-unverified                  | **forbidden**, verified: 422 `approve your own pull is not allowed`                                                                    |
 
-Two rows carry most of the risk. **Bot identity** is what "one round for
-bots" depends on; with no signal, Gitea either treats every reviewer as human
-(safe, slower) or needs an operator-supplied list of bot logins. **Author may
-approve own change** feeds `BaseRequirements.blockers()`, whose current
-reasons are written in GitHub's terms and will need per-backend phrasing.
+Three rows moved from the desk version. **Author may approve own change** was
+"forbidden" on GitLab and is allowed on CE; it was "policy-dependent" on Gitea
+and is forbidden. **Request-changes review** on GitLab was "paid tier"; CE
+records the state and does not enforce it, so the backend reports the
+capability unsupported rather than read a recorded state as a gate.
+**Resolvable review threads** on Gitea was "weak" and is absent from the API.
+
+Two rows still carry most of the risk. **Bot identity** is what "one round
+for bots" depends on; GitLab has a signal and Gitea has none (decision below).
+**Author may approve own change** feeds `BaseRequirements.blockers()`, whose
+reasons need per-backend phrasing: on Gitea the loop can never approve its
+own change, and on GitLab CE an approval never gates a merge at all.
 
 ## The interface
 
@@ -184,8 +200,10 @@ accumulated.
 `ContentOps` deserves its own note. `deliver.py` builds commits remotely
 through GitHub's git data API (`/git/trees`, `/git/commits`, `/git/refs`) for
 the no-local-checkout path. GitLab and Gitea expose nothing shaped like it;
-each needs its own implementation behind the same three methods. This is the
-least portable corner of the system.
+each needs its own implementation. This is the least portable corner of the
+system. Verified (V5): both forges take a whole changeset in one atomic
+call, so the role is reshaped around that call rather than around GitHub's
+three methods.
 
 ## The domain model has to shed GitHub words
 
@@ -258,7 +276,8 @@ out loud:
   creation.
 - `doctor` should report the credential kind and, where the forge exposes it,
   the token's expiry — so "this token never expires" is a visible fact rather
-  than an assumption.
+  than an assumption. Verified (V6): a GitLab token reads its own
+  `expires_at`; a Gitea token has no expiry to read or set.
 
 This is a real reduction in posture for non-GitHub backends. It is accepted
 because the alternative is not shipping, and because the blast radius is
@@ -322,7 +341,334 @@ Each of these can invalidate part of the design above.
 
 V5 is the one that could force a structural answer: if the no-local-checkout
 path cannot be built on GitLab or Gitea, that path becomes GitHub-only and
-the capability model has to carry it.
+the capability model has to carry it. All six are answered in the next
+section, and V5 did not force it.
+
+## Field verification (#1016)
+
+Run 2026-09-12 against two forges in Docker, from the harness in
+`tests/live/` (see its `README.md`): `gitlab/gitlab-ce:19.3.2-ce.0` and
+`gitea/gitea:1.24.7`, both serving HTTPS from a throwaway CA. `GET /api/v4/version` answered `{"version": "19.3.2", "revision": "34042bf7d00"}`
+and `GET /api/v4/metadata` added `"enterprise": false`; `GET /api/v1/version`
+answered `{"version": "1.24.7"}`.
+
+The seeds built the same shape on both: `acme/widgets` with a README on
+`main`, a second branch with an open change and a review comment on it, a
+labelled open issue and a closed issue; `main` protected (no direct push, one
+approval, required checks `ci` and `lint`, or on GitLab CE the nearest
+settings: pipeline must succeed, discussions must be resolved); statuses on
+both heads. The credentials are the ones a run would hold, not an owner's:
+
+| Identity                | GitLab                                                | Gitea                                                                 |
+| ----------------------- | ----------------------------------------------------- | --------------------------------------------------------------------- |
+| the run's credential    | `dev-alice`, Developer, personal access token `api`   | `dev-alice`, write collaborator, token `write:repository,write:issue` |
+| a second human reviewer | `rev-bob`, Developer                                  | `rev-bob`, write collaborator                                         |
+| a bot                   | project access token at Developer (`project_1_bot_*`) | `ci-bot`, `gitea admin user create --user-type bot`                   |
+| setup only              | `root`                                                | `sbx-admin`, site admin                                               |
+
+`tests/live/fieldverify.py` is every request below, runnable again;
+`tests/live/test_field_verify.py` holds both forges to these answers.
+Responses are trimmed to the fields a finding rests on.
+
+### V1: can a review thread be resolved by API, and is its id stable?
+
+**GitLab: yes, and yes.** As `rev-bob` (Developer):
+
+```
+POST /api/v4/projects/1/merge_requests/2/discussions
+{"body": "beta looks wrong",
+ "position": {"base_sha": "33da92ad...", "start_sha": "33da92ad...", "head_sha": "9ddd6f5e...",
+              "position_type": "text", "old_path": "v1-986c31.txt", "new_path": "v1-986c31.txt", "new_line": 2}}
+-> 201 {"id": "193bff4c510488bf6c79352ff0e86478e48599d9", "individual_note": false,
+        "notes": [{"id": 3, "type": "DiffNote", "resolvable": true, "resolved": false, ...}]}
+```
+
+As `dev-alice` (Developer, the change's author):
+
+```
+POST /api/v4/projects/1/merge_requests/2/discussions/193bff4c.../notes {"body": "fixed in the next push"} -> 201
+PUT  /api/v4/projects/1/merge_requests/2/discussions/193bff4c... {"resolved": true}
+-> 200 {"id": "193bff4c...", "notes": [{"id": 3, "resolvable": true, "resolved": true,
+        "resolved_by": {"username": "dev-alice", ...}}, ...]}
+GET  /api/v4/projects/1/merge_requests/2 -> 200 {"blocking_discussions_resolved": true, ...}
+```
+
+Then two pushes to the source branch through the commits API, one touching
+another file and one rewriting the discussed line. After each, `GET .../discussions/193bff4c...` answered the same id, still `"resolved": true`;
+after the rewrite GitLab had moved the note's `position.head_sha` to the new
+head (`6362d378...`). `PUT ... {"resolved": false}` as the reviewer reopened
+it. The discussion id is a 40-hex string, the note ids are integers.
+
+**Gitea: no.** The review comment carries a `resolver` field
+(`GET /api/v1/repos/acme/widgets/pulls/1/reviews/1/comments -> 200 [{"id": 2, "path": "one.txt", "position": 2, "resolver": null, ...}]`), but the API has no
+way to set it: the 1.24.7 swagger document has no path naming "resolve", and
+the only review paths under `/pulls/{index}/` are `requested_reviewers`,
+`reviews`, `reviews/{id}`, `reviews/{id}/comments`, `reviews/{id}/dismissals`
+and `reviews/{id}/undismissals`. There is no reply-to-comment path either.
+Resolution exists in Gitea's web UI only.
+
+**Consequence.** `ReviewOps.resolve` is a real operation on GitLab keyed by
+the discussion id, which is the opaque `thread_id` the neutral model already
+carries (#1018). On Gitea `review_threads` is `UNSUPPORTED`: the loop posts
+findings and answers them with change-level comments, and never waits on a
+resolution it cannot make.
+
+### V2: what does GitLab report as required before a merge, to a non-owner?
+
+Every read below was made as `dev-alice`, Developer.
+
+```
+GET /api/v4/metadata -> 200 {"version": "19.3.2", "enterprise": false}
+GET /api/v4/projects/1/protected_branches/main
+-> 200 {"name": "main", "push_access_levels": [{"access_level": 0, "access_level_description": "No one"}],
+        "merge_access_levels": [{"access_level": 30, "access_level_description": "Developers + Maintainers"}],
+        "allow_force_push": false}
+GET /api/v4/projects/1
+-> 200 {"only_allow_merge_if_pipeline_succeeds": true, "only_allow_merge_if_all_discussions_are_resolved": true,
+        "allow_merge_on_skipped_pipeline": false, "merge_method": "merge",
+        "permissions": {"project_access": {"access_level": 30}}}
+GET /api/v4/projects/1/approvals                         -> 404
+GET /api/v4/projects/1/approval_rules                    -> 404
+GET /api/v4/projects/1/external_status_checks            -> 404
+GET /api/v4/projects/1/merge_requests/1/approval_state   -> 404
+GET /api/v4/projects/1/merge_requests/1/approvals
+-> 200 {"approved": false, "approved_by": [], "user_can_approve": true, "user_has_approved": false}
+```
+
+The same 404s answered the administrator, and the seed's attempts to require
+an approval (`POST /projects/1/approvals`, `POST /projects/1/approval_rules`)
+were 404 too: on CE these are not forbidden, they do not exist.
+
+A fresh merge request with no discussions, read after each status was posted
+(`POST /api/v4/projects/1/statuses/:sha`, as the same Developer):
+
+| Head pipeline                                               | `detailed_merge_status` |
+| ----------------------------------------------------------- | ----------------------- |
+| no status reported                                          | `ci_must_pass`          |
+| `ci` running                                                | `ci_still_running`      |
+| `ci` success, `lint` never reported                         | `mergeable`             |
+| a `docs` status failed, posted with `"allow_failure": true` | `ci_must_pass`          |
+| `lint` failed                                               | `ci_must_pass`          |
+
+`allow_failure` on an external status is ignored: the response echoed
+`"allow_failure": false`. `PUT .../merge_requests/3/merge` with a red status
+answered `405 {"message": "405 Method Not Allowed"}`, the same refusal shape
+`MergeOutcome.blocked` already reads. The seeded merge request, whose
+discussion was open, reported `discussions_not_resolved`.
+
+**Answer.** On CE a Developer can read everything that gates the merge: the
+protected branch, the two project settings, and the merge request's own
+verdict in `detailed_merge_status`. What CE cannot express is a *named*
+required check. When "pipeline must succeed" is on, every status and job the
+head pipeline reports is required (CI jobs marked `allow_failure` are the
+documented exception; not exercised here, no runner, **field-unverified**).
+Required approvals do not exist on CE. Premium approval rules and external
+status checks were not available to test and are **field-unverified**.
+
+**Does a backend have to gate on everything?** No. The forge itself gates on
+the whole pipeline, so "the pipeline" is exactly what the base requires, and
+the baseline comparison still works: a red on the change that is also red on
+the base's latest pipeline is not the loop's, even though GitLab will refuse
+the merge until someone fixes it (the landing holds for a human instead of
+looping on it).
+
+**`BaseRequirements` on GitLab (#1017).**
+
+- `source = "protected_branch+project"` when both reads answered;
+  `"unknown"` when either did not (a 401, a 403, or a project the token
+  cannot see), with `unread` naming which.
+- A new flag, `all_checks_required`, carries "pipeline must succeed": the
+  required set is whatever the change's pipeline reports, so
+  `required_contexts` is `()` and a caller treats every reported check as
+  required. With the setting off, nothing is required and `source` still
+  says the settings were read.
+- `approvals_required = 0` when `/metadata` says `enterprise: false`: a real
+  answer, CE cannot require one. On an enterprise instance the approval-rule
+  read decides, and an unreadable one leaves the count `None`.
+- `conversation_resolution` from `only_allow_merge_if_all_discussions_are_resolved`.
+
+### V3: is there a bot-identity signal?
+
+**GitLab: yes, on the user, one lookup away.**
+
+```
+GET /api/v4/user                  (as the project access token) -> 200 {"id": 4, "username": "project_1_bot_05b4100c...", "name": "ci-bot", "bot": true}
+GET /api/v4/users/4               (as dev-alice, Developer)     -> 200 {"id": 4, "username": "project_1_bot_05b4100c...", "bot": true}
+GET /api/v4/users/3               (as dev-alice)                -> 200 {"id": 3, "username": "rev-bob", "bot": false}
+GET /api/v4/users?username=project_1_bot_05b4100c...            -> 200 [{"id": 4, "username": "...", "name": "ci-bot", "state": "active"}]
+POST /api/v4/projects/1/merge_requests/1/notes (as the bot)     -> 201 {"author": {"id": 4, "username": "project_1_bot_...", "state": "active", ...}}
+GET /api/v4/projects/1/members/all (as dev-alice)               -> 200 [{"username": "root", "access_level": 50}, ...]
+```
+
+The `bot` flag is on `GET /users/:id` and nowhere a review is read from: not
+on a note's `author`, not on a user search, not on a member list. The
+username pattern `project_<id>_bot_<hex>` is GitLab's convention for project
+access tokens; it corroborates, it is not the signal. Group access tokens and
+Premium service accounts were not exercised (**field-unverified**).
+
+**Gitea: no.** `GET /api/v1/users/ci-bot` and `GET /api/v1/users/rev-bob`,
+both as the write collaborator, return the same keys (`active`,
+`avatar_url`, `created`, `description`, `email`, `followers_count`, ...,
+`visibility`, `website`), and no value differs but the identity and its timestamps; the swagger
+`User` definition has no type field. `GET /api/v1/users/gitea-actions` is
+`404 user redirect does not exist`. What an Actions-created status or comment
+reports as its author needs a runner and is **field-unverified**.
+
+**Decision (V3).**
+
+- **GitLab: the signal.** A reviewer is a bot when `GET /users/:id` says
+  `bot: true`, looked up once per distinct author per read and cached for the
+  run. A lookup that fails leaves the kind `None`, which the identity model
+  already treats as "not known", never as "human".
+- **Gitea: an operator-supplied list, empty by default, so every reviewer is
+  human until listed.** Treating a bot as human costs rounds; treating a
+  human as a bot drops their feedback after one answer, which is the failure
+  the project's one-round rule must never cause. The list is a per-repository
+  config key with a `[github]`-level default and lands with the Gitea backend
+  (#1021), in the three places.
+
+### V4: does Gitea expose branch protection richly enough?
+
+As `dev-alice`, write collaborator (`"permissions": {"admin": false, "push": true, "pull": true}`):
+
+```
+GET /api/v1/repos/acme/widgets/branch_protections      -> 403 {"message": "user should be an owner or a collaborator with admin write of a repository"}
+GET /api/v1/repos/acme/widgets/branch_protections/main -> 403 (same message)
+GET /api/v1/repos/acme/widgets/branches/main
+-> 200 {"name": "main", "protected": true, "required_approvals": 1, "enable_status_check": true,
+        "status_check_contexts": ["ci", "lint"], "user_can_push": false, "user_can_merge": true,
+        "effective_branch_protection_name": ""}
+```
+
+The rest of the rule is admin-only. As the site administrator the same rule
+also says `block_on_rejected_reviews`, `block_on_official_review_requests`,
+`block_on_outdated_branch`, `dismiss_stale_approvals`,
+`require_signed_commits`, `protected_file_patterns`,
+`enable_approvals_whitelist` and `block_admin_merge_override`.
+
+A fresh pull request, with the merge attempted as the write collaborator
+after each step (`POST /api/v1/repos/acme/widgets/pulls/{n}/merge {"Do": "merge"}`):
+
+| Statuses on the head                                | `GET /commits/{sha}/status` | Merge                                           |
+| --------------------------------------------------- | --------------------------- | ----------------------------------------------- |
+| none                                                | `state: ""`, no statuses    | `405 Not all required status checks successful` |
+| `ci` success, `docs` success, `lint` never reported | `state: "success"`          | `405 Not all required status checks successful` |
+| `lint` failure added                                | `state: "failure"`          | `405 Not all required status checks successful` |
+
+**Answer.** Yes. The required contexts and the approval count are readable
+without admin, from the branch rather than the protection endpoint, and the
+required set is distinguishable from what ran: the combined status said
+`success` while a required context had never reported, and Gitea refused the
+merge for exactly that. Context patterns (Gitea accepts globs in
+`status_check_contexts`) were not exercised and are **field-unverified**.
+
+**`BaseRequirements` on Gitea (#1021).** `source = "branch"` from `GET /branches/{base}`: `required_contexts` is `status_check_contexts` when
+`enable_status_check`, else `()`; `approvals_required` is
+`required_approvals`. The flags only an admin reads are left unknown for a
+non-admin credential, with `unread = ("protection",)`, so `signed_commits`
+and friends are never read as conclusively off; with an admin credential,
+`source = "branch+protection"`.
+
+### V5: can a commit be created remotely, without a checkout?
+
+**GitLab: yes.** As `dev-alice`, Developer:
+
+```
+POST /api/v4/projects/1/repository/commits
+{"branch": "v5/...", "start_branch": "main", "commit_message": "...",
+ "actions": [{"action": "create", "file_path": "v5/.../a.txt", "content": "a\n"},
+             {"action": "create", "file_path": "v5/.../b.bin", "content": "iVBORw0KGgoAAAANSUhEUgD//oA=", "encoding": "base64"},
+             {"action": "update", "file_path": "README.md", "content": "...", "encoding": "base64"}]}
+-> 201 {"id": "<sha>", "parent_ids": ["<main head>"], "stats": {...}}
+POST (same branch) {"actions": [{"action": "delete", ...}, {"action": "move", "previous_path": "...b.bin", "file_path": "...c.bin"}]}
+-> 201 {"parent_ids": ["<the first commit>"]}
+POST (same branch) {"actions": [{"action": "create", "file_path": ".../ok.txt"}, {"action": "update", "file_path": ".../missing.txt"}]}
+-> 400; the branch head did not move and ok.txt does not exist
+POST {"branch": "main", "actions": [{"action": "create", ...}]}
+-> 403 {"message": "403 Forbidden - You are not allowed to push into this branch"}
+```
+
+The binary file read back byte-identical (`GET .../repository/files/:path`,
+base64 `content`).
+
+**Gitea: yes.** As `dev-alice`, write collaborator:
+
+```
+POST /api/v1/repos/acme/widgets/contents
+{"branch": "main", "new_branch": "v5/...", "message": "...",
+ "files": [{"operation": "create", "path": "v5/.../a.txt", "content": "YQo="},
+           {"operation": "create", "path": "v5/.../b.bin", "content": "iVBORw0KGgoAAAANSUhEUgD//oA="},
+           {"operation": "update", "path": "README.md", "sha": "3f49aa96...", "content": "..."}]}
+-> 201 {"commit": {"sha": "9d8b0135...", ...}, "files": [...]}
+POST (same branch) {"files": [{"operation": "delete", "sha": "..."}, {"operation": "update", "from_path": "...b.bin", "path": "...c.bin", "sha": "...", "content": "..."}]}
+-> 201, parent is the first commit
+POST (same branch) {"files": [{"operation": "create", "path": ".../ok.txt"}, {"operation": "update", "path": ".../missing.txt", "sha": "000..."}]}
+-> 500 with an empty body; the branch head did not move and ok.txt does not exist
+POST {"branch": "main", "files": [{"operation": "create", ...}]} -> 403, empty body
+POST /api/v1/repos/acme/widgets/contents/v5/.../single.txt {"branch": "v5/...", "content": "b25lCg=="} -> 201
+```
+
+The binary file read back byte-identical.
+
+**Decision (V5): `ContentOps` on both.** Neither forge has GitHub's
+blob/tree/commit/ref vocabulary, and neither needs it: both take a whole
+changeset (create, update, delete, move; binary as base64) in one atomic
+call, onto a new branch cut from a base, and both refuse a protected base
+with 403. What the capability model must carry:
+
+- `remote_commit` is `SUPPORTED` on all three. The GitHub-shaped methods on
+  `ContentOps` (`blobs_create_many`, `tree_create`, `commit_create`,
+  `ref_create`) become private to the GitHub backend, and the role gains one
+  neutral operation that commits a changeset onto a branch (#1020).
+- The changeset must say create versus update: GitLab refuses an `update` of
+  a missing file and a `create` of an existing one, and Gitea wants the
+  current blob `sha` for an update or a delete. A backend reads the base tree
+  first rather than guess.
+- A refusal is not always classifiable: Gitea answers a bad operation with a
+  bare 500. Atomicity held on both, so the caller treats any non-2xx as
+  "nothing was written" and stops, never as a transient to retry.
+- Moving an existing branch to an unrelated commit (`ref_force_update` on
+  GitHub) was not exercised on either forge: GitLab's `force` parameter on the
+  commits API and Gitea's lack of one are **field-unverified** until #1020.
+
+### V6: does a token expose an expiry readable by itself?
+
+**GitLab: yes.**
+
+```
+GET /api/v4/personal_access_tokens/self (as dev-alice's personal access token)
+-> 200 {"id": 2, "name": "sbxloop-live", "scopes": ["api"], "active": true, "revoked": false, "expires_at": "2026-11-11", "user_id": 2}
+GET /api/v4/personal_access_tokens/self (as the project access token)
+-> 200 {"id": 4, "name": "ci-bot", "scopes": ["api"], "active": true, "revoked": false, "expires_at": "2026-11-11", "user_id": 4}
+GET /api/v4/projects/1/access_tokens (as the project access token, and as dev-alice) -> 401
+```
+
+The same endpoint answers for both kinds; listing the project's tokens needs
+more than Developer.
+
+**Gitea: no, because there is none to read.**
+
+```
+GET /api/v1/users/dev-alice/tokens (token auth)       -> 401 {"message": "auth required"}
+GET /api/v1/users/dev-alice/tokens (basic auth)       -> 200 [{"id": 2, "name": "sbxloop-live", "scopes": [...], "created_at": "...", "last_used_at": "...", ...}]
+swagger AccessToken:             created_at, id, last_used_at, name, scopes, sha1, token_last_eight
+swagger CreateAccessTokenOption: name, scopes
+```
+
+A token cannot read its own record (basic auth only, even for a site-admin
+token), and there is no expiry to read or to set.
+
+**Consequence for the doctor credential row (#1019).** GitLab: read
+`/personal_access_tokens/self` and report `expires_at` and `scopes`, failing
+the row when `active` is false. Gitea: report "this token never expires" as
+a fact of the forge, not as an unread value.
+
+### Gate
+
+Neither V2 nor V4 means a backend gates on every check on every run. GitLab
+CE gates on the whole pipeline because the forge does, and the loop can still
+tell its red from the base's; Gitea names its required contexts to a
+non-admin. #1017 can start.
 
 ## Recommendation
 
