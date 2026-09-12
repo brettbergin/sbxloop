@@ -289,7 +289,10 @@ totals; unavailable usage stays unknown and no price is inferred.
 Everything sbxloop puts on a host lives under one directory, the **home**:
 `~/.sbxloop` (`SBXLOOP_HOME` moves it). One command builds it — the
 interpreter, the launchers, Docker's `sbx`, the config and secrets files,
-and on Linux the systemd units.
+and on Linux the systemd units. A home whose path holds spaces or a `%` is
+fine; one holding a quote or a backslash is not, because systemd refuses
+those in the executable of a unit, and `init --systemd` says so rather than
+writing a unit that cannot start.
 
 The host brings what that command cannot: curl, tar, git and e2fsprogs
 (`mkfs.ext4`, for sandboxd's block driver). Git is a host dependency in its

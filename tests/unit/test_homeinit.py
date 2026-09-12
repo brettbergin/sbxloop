@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tarfile
 from collections.abc import Callable
@@ -16,11 +17,14 @@ from typer.testing import CliRunner
 
 from sbxloop.cli.app import app
 from sbxloop.homeinit import (
+    RUNNER_UNIT,
     SBX_VERSION,
     UNIT_NAMES,
     HomeInit,
     InitError,
     InitOptions,
+    _render_unit_line,
+    _render_word,
     path_hint,
     render_unit,
     sbx_asset_name_matches,
@@ -455,6 +459,219 @@ class TestTemplates:
         home = SbxloopHome(tmp_path)
         assert path_hint(home, {"PATH": f"/usr/bin:{home.bin}"}) is None
         assert path_hint(home, {"PATH": "/usr/bin"}) == f'export PATH="{home.bin}:$PATH"'
+
+
+def expand_specifiers(value: str) -> str:
+    """systemd's specifier expansion, as far as a rendered unit uses it: the
+    only specifier a path may produce is ``%%``, one literal percent. A bare
+    ``%`` left on a line would expand to something else entirely."""
+    out: list[str] = []
+    index = 0
+    while index < len(value):
+        if value[index] == "%":
+            assert value[index + 1 : index + 2] == "%", f"unescaped specifier in {value!r}"
+            out.append("%")
+            index += 2
+        else:
+            out.append(value[index])
+            index += 1
+    return "".join(out)
+
+
+def parse_words(value: str) -> list[str]:
+    """systemd's own word splitting of a command line or an ``Environment=``
+    value: whitespace separates words, quotes group them, a backslash outside
+    single quotes escapes what follows, and specifiers expand per word.
+
+    This is deliberately a reader, not a mirror of the writer: it says what
+    systemd will hand the service, so a test can assert the value rather than
+    the punctuation around it.
+    """
+    words: list[str] = []
+    word: list[str] = []
+    quote: str | None = None
+    started = False
+    index = 0
+    while index < len(value):
+        char = value[index]
+        index += 1
+        if quote is None and char.isspace():
+            if started:
+                words.append("".join(word))
+                word, started = [], False
+            continue
+        started = True
+        if char == "\\" and quote != "'":
+            word.append(value[index])
+            index += 1
+        elif quote is None and char in "\"'":
+            quote = char
+        elif char == quote:
+            quote = None
+        else:
+            word.append(char)
+    assert quote is None, f"unterminated quote in {value!r}"
+    if started:
+        words.append("".join(word))
+    return [expand_specifiers(w) for w in words]
+
+
+def values_of(unit: str, key: str) -> list[str]:
+    return [line.partition("=")[2] for line in unit.splitlines() if line.startswith(f"{key}=")]
+
+
+def environment_of(unit: str) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for line in values_of(unit, "Environment"):
+        for word in parse_words(line):
+            name, _, value = word.partition("=")
+            out[name] = value
+    return out
+
+
+def working_directory_of(unit: str) -> str:
+    (value,) = values_of(unit, "WorkingDirectory")
+    # A verbatim directive: systemd keeps quotes as part of the path, so a
+    # quoted one is a bug however good it looks.
+    assert '"' not in value, f"WorkingDirectory= must not be quoted: {value!r}"
+    return expand_specifiers(value)
+
+
+class TestUnitPaths:
+    """#894: the home and the runner directory are whatever the operator
+    chose. Each systemd directive spells a space, a percent or a dollar its
+    own way, and a unit that spells one wrong starts the wrong command — or
+    nothing at all."""
+
+    def render_all(self, home: SbxloopHome, runner: Path) -> dict[str, str]:
+        return {
+            name: render_unit(name, home, runner_dir=runner) for name in (*UNIT_NAMES, RUNNER_UNIT)
+        }
+
+    @pytest.mark.parametrize(
+        "root",
+        [
+            "/home/alice/Loop Data",  # the issue's own reproduction
+            "/srv/loop 50%",  # a specifier systemd would otherwise expand
+            "/srv/$HOME dir",  # no expansion happens in an executable path
+        ],
+    )
+    def test_every_directive_carries_the_whole_path(self, root: str) -> None:
+        home = SbxloopHome(Path(root))
+        runner = Path(f"{root}/Actions Runner")
+        units = self.render_all(home, runner)
+
+        daemon = units["sbxloop-daemon.service"]
+        assert parse_words(values_of(daemon, "ExecStart")[0]) == [
+            f"{root}/bin/sbxloop",
+            "daemon",
+        ]
+        assert environment_of(daemon) == {"SBXLOOP_HOME": root, "PYTHONUNBUFFERED": "1"}
+        assert working_directory_of(daemon) == root
+
+        sandboxd = units["sbx-sandboxd.service"]
+        assert parse_words(values_of(sandboxd, "ExecStart")[0]) == [
+            f"{root}/bin/sbx",
+            "daemon",
+            "start",
+        ]
+        assert parse_words(values_of(sandboxd, "ExecStop")[0]) == [
+            f"{root}/bin/sbx",
+            "daemon",
+            "stop",
+        ]
+        assert environment_of(sandboxd)["SBXLOOP_HOME"] == root
+
+        runner_unit = units[RUNNER_UNIT]
+        assert parse_words(values_of(runner_unit, "ExecStart")[0]) == [f"{runner}/run.sh"]
+        assert working_directory_of(runner_unit) == str(runner)
+
+    def test_a_simple_path_renders_exactly_as_before(self, tmp_path: Path) -> None:
+        home = SbxloopHome(tmp_path / "home")
+        runner = tmp_path / "runner"
+        for name, unit in self.render_all(home, runner).items():
+            plain = (
+                template(name).replace("@HOME@", str(home.root)).replace("@RUNNER@", str(runner))
+            )
+            assert unit == plain, name
+
+    def test_a_path_in_a_comment_reads_as_the_operator_typed_it(self) -> None:
+        home = SbxloopHome(Path("/home/alice/Loop Data"))
+        unit = render_unit("sbxloop-daemon.service", home)
+        assert "# at /home/alice/Loop Data and linked into" in unit
+
+    @pytest.mark.parametrize(
+        ("root", "message"),
+        [
+            ("/home/o'brien/loop", "refuses"),  # quotes are out in an executable
+            ('/home/al"ice/loop', "refuses"),
+            ("/home/back\\slash/loop", "refuses"),
+            ("/home/alice/loop\tdata", "refuses"),  # a tab is a control character
+            ("/home/alice/loop\nExecStart=/bin/sh", "control characters"),
+            ("/home/alice/loop ", "whitespace"),  # WorkingDirectory= strips it
+        ],
+    )
+    def test_what_systemd_cannot_carry_stops_init_by_name(self, root: str, message: str) -> None:
+        home = SbxloopHome(Path(root))
+        with pytest.raises(InitError) as caught:
+            render_unit("sbxloop-daemon.service", home)
+        assert message in str(caught.value) and repr(root) in str(caught.value)
+
+    def test_a_runner_directory_is_checked_the_same_way(self) -> None:
+        home = SbxloopHome(Path("/home/alice/loop"))
+        with pytest.raises(InitError) as caught:
+            render_unit(RUNNER_UNIT, home, runner_dir=Path("/home/o'brien/runner"))
+        assert "/home/o'brien/runner" in str(caught.value)
+
+    def test_a_directive_with_no_rule_stops_rather_than_guesses(self) -> None:
+        values = {"@HOME@": "/home/alice/Loop Data"}
+        with pytest.raises(InitError, match="no systemd quoting rule"):
+            _render_unit_line("RuntimeDirectory=@HOME@", values)
+        with pytest.raises(InitError, match="not a directive"):
+            _render_unit_line("@HOME@", values)
+        with pytest.raises(InitError, match="open the executable word"):
+            _render_unit_line("ExecStart=-@HOME@/bin/sbxloop", values)
+
+    def test_an_argument_word_keeps_its_dollar_out_of_expansion(self) -> None:
+        # No template puts a path in an argument today; the rule that says how
+        # it would be spelled is the difference between $x and a variable.
+        rendered = _render_word(
+            "@HOME@/a b",
+            {"@HOME@": "/srv/$x 50%"},
+            directive="ExecStart",
+            executable=False,
+            expand_dollar=True,
+        )
+        assert rendered == '"/srv/$$x 50%%/a b"'
+        assert parse_words(rendered.replace("$$", "$")) == ["/srv/$x 50%/a b"]
+
+    @pytest.mark.slow
+    @pytest.mark.skipif(
+        shutil.which("systemd-analyze") is None, reason="systemd tooling is not on this host"
+    )
+    def test_systemd_itself_accepts_the_rendered_units(self, tmp_path: Path) -> None:
+        # Dummy executables at the real paths, verified read-only: nothing is
+        # installed, started, or enabled on the host running the test.
+        home = SbxloopHome(tmp_path / "sbxloop home 50% $x")
+        runner = tmp_path / "actions runner"
+        for executable in (home.bin / "sbxloop", home.bin / "sbx", runner / "run.sh"):
+            executable.parent.mkdir(parents=True, exist_ok=True)
+            executable.write_text("#!/bin/sh\n")
+            executable.chmod(0o755)
+        units = tmp_path / "units"
+        units.mkdir()
+        for name, text in self.render_all(home, runner).items():
+            (units / name).write_text(text)
+        proc = subprocess.run(
+            ["systemd-analyze", "verify", *(str(units / n) for n in (*UNIT_NAMES, RUNNER_UNIT))],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if "Failed to initialize manager" in proc.stderr:
+            pytest.skip(f"systemd-analyze cannot run here: {proc.stderr.strip()}")
+        assert proc.returncode == 0, proc.stderr
+        assert "Invalid environment assignment" not in proc.stderr
 
 
 class TestCli:

@@ -117,11 +117,184 @@ def template(name: str) -> str:
     return resources.files("sbxloop.data").joinpath("home", name).read_text(encoding="utf-8")
 
 
-def render_unit(name: str, home: SbxloopHome, *, runner_dir: Path | None = None) -> str:
-    text = template(name).replace("@HOME@", str(home.root))
-    if runner_dir is not None:
-        text = text.replace("@RUNNER@", str(runner_dir))
+#: Directives systemd reads verbatim to the end of the line: no word
+#: splitting, no unescaping, only specifier expansion. A space inside one of
+#: these needs nothing; a literal ``%`` has to be doubled. Quoting them is
+#: what breaks them — systemd keeps the quotes as part of the path.
+_PATH_DIRECTIVES = frozenset({"WorkingDirectory", "RootDirectory"})
+
+#: Directives systemd splits into words the way a shell line is split —
+#: quotes group, backslash escapes, specifiers expand — but with no ``$``
+#: expansion, so an assignment holding a space has to be one quoted word.
+_ENV_DIRECTIVES = frozenset({"Environment"})
+
+#: Command lines: split into words like the above, and every word after the
+#: executable is also subject to ``$`` expansion.
+_EXEC_DIRECTIVES = frozenset(
+    {
+        "ExecCondition",
+        "ExecReload",
+        "ExecStart",
+        "ExecStartPost",
+        "ExecStartPre",
+        "ExecStop",
+        "ExecStopPost",
+    }
+)
+
+#: What no unit line can carry at all: the line ends at the first newline,
+#: and systemd rejects the rest as unprintable.
+_UNRENDERABLE = frozenset(chr(c) for c in range(0x20) if c != 0x09) | {"\x7f"}
+
+#: What systemd refuses in the *executable* of a command line, quoted or not
+#: ("Executable name contains special characters"): quotes, a backslash, and
+#: any control character — a tab included, though a plain space is fine.
+#: Arguments may hold all of these; the program to run may not.
+_EXEC_PATH_FORBIDDEN = frozenset("\"'\\\t")
+
+
+def _fill(text: str, values: Mapping[str, str]) -> str:
+    for placeholder, raw in values.items():
+        text = text.replace(placeholder, raw)
     return text
+
+
+def _check_renderable(raw: str, *, directive: str, placeholder: str) -> None:
+    bad = sorted(set(raw) & _UNRENDERABLE)
+    if bad:
+        chars = ", ".join(repr(c) for c in bad)
+        raise InitError(
+            f"{directive}=: {placeholder} is {raw!r}, which holds {chars}; a systemd "
+            "unit line ends at the first newline and carries no control characters. "
+            "Use a directory whose name has none."
+        )
+
+
+def _needs_quotes(word: str) -> bool:
+    return any(ch.isspace() or ch in "'\"" for ch in word)
+
+
+def _escape_word(raw: str, *, expand_dollar: bool) -> str:
+    escaped = raw.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return escaped.replace("$", "$$") if expand_dollar else escaped
+
+
+def _render_word(
+    word: str,
+    values: Mapping[str, str],
+    *,
+    directive: str,
+    executable: bool,
+    expand_dollar: bool,
+) -> str:
+    """One word of a split directive, with the host's paths escaped into it.
+
+    ``parsed`` is what systemd will read back out; ``rendered`` is what goes
+    on the line. Only the substituted paths are escaped — whatever the
+    template says around them (a ``%`` specifier, say) is left alone.
+    """
+    parsed = rendered = word
+    filled = False
+    for placeholder, raw in values.items():
+        if placeholder not in word:
+            continue
+        _check_renderable(raw, directive=directive, placeholder=placeholder)
+        if executable:
+            if not word.startswith(placeholder):
+                # `ExecStart=-@HOME@/bin/x` and friends: the prefix would end
+                # up inside the quotes. No template does this today.
+                raise InitError(
+                    f"{directive}=: {placeholder} has to open the executable word, "
+                    f"not sit inside {word!r}"
+                )
+            bad = sorted(set(raw) & _EXEC_PATH_FORBIDDEN)
+            if bad:
+                chars = ", ".join(repr(c) for c in bad)
+                raise InitError(
+                    f"{directive}=: {placeholder} is {raw!r}, and systemd refuses "
+                    f"{chars} in the executable of a command line however it is "
+                    "quoted. Use a directory whose name has none."
+                )
+        parsed = parsed.replace(placeholder, raw)
+        rendered = rendered.replace(placeholder, _escape_word(raw, expand_dollar=expand_dollar))
+        filled = True
+    if filled and _needs_quotes(parsed):
+        return f'"{rendered}"'
+    return rendered
+
+
+def _render_path_value(value: str, values: Mapping[str, str], *, directive: str) -> str:
+    parsed = rendered = value
+    for placeholder, raw in values.items():
+        if placeholder not in value:
+            continue
+        _check_renderable(raw, directive=directive, placeholder=placeholder)
+        parsed = parsed.replace(placeholder, raw)
+        rendered = rendered.replace(placeholder, raw.replace("%", "%%"))
+    if parsed != parsed.strip():
+        raise InitError(
+            f"{directive}=: systemd strips the whitespace around a verbatim path "
+            f"value, so {parsed!r} cannot be written into a unit. Use a directory "
+            "whose name neither opens nor ends with a space."
+        )
+    if parsed.endswith("\\"):
+        raise InitError(
+            f"{directive}=: a unit line ending in a backslash runs on into the next "
+            f"one, so {parsed!r} cannot be written into a unit. Use a directory whose "
+            "name does not end in a backslash."
+        )
+    return rendered
+
+
+def _render_unit_line(line: str, values: Mapping[str, str]) -> str:
+    if not any(placeholder in line for placeholder in values):
+        return line
+    if line.lstrip().startswith(("#", ";")):
+        return _fill(line, values)  # a comment is never parsed
+    directive, sep, value = line.partition("=")
+    key = directive.strip()
+    if not sep:
+        raise InitError(f"unit line {line!r} carries a host path but is not a directive")
+    if key in _PATH_DIRECTIVES:
+        return directive + sep + _render_path_value(value, values, directive=key)
+    if key in _ENV_DIRECTIVES or key in _EXEC_DIRECTIVES:
+        is_exec = key in _EXEC_DIRECTIVES
+        return (
+            directive
+            + sep
+            + " ".join(
+                _render_word(
+                    word,
+                    values,
+                    directive=key,
+                    executable=is_exec and index == 0,
+                    expand_dollar=is_exec and index > 0,
+                )
+                for index, word in enumerate(value.split())
+            )
+        )
+    raise InitError(
+        f"{key}=: sbxloop knows no systemd quoting rule for this directive, so a host "
+        "path cannot be put in it safely; add one to homeinit before the template does"
+    )
+
+
+def render_unit(name: str, home: SbxloopHome, *, runner_dir: Path | None = None) -> str:
+    """The packaged unit with this host's paths in it, spelled per directive.
+
+    A home is whatever directory the operator chose, so it may hold spaces,
+    quotes, dollars or percent signs — and every systemd directive spells
+    those differently. ``ExecStart=`` is split into words like a shell line,
+    ``Environment=`` the same but without ``$`` expansion, while
+    ``WorkingDirectory=`` is read whole to the end of the line and is broken,
+    not helped, by quotes. What systemd cannot represent at all (a control
+    character, a quote in an executable path) stops ``init`` here, naming the
+    path, rather than at the first start that cannot find its binary.
+    """
+    values = {"@HOME@": str(home.root)}
+    if runner_dir is not None:
+        values["@RUNNER@"] = str(runner_dir)
+    return "\n".join(_render_unit_line(line, values) for line in template(name).split("\n"))
 
 
 def _apparmor_only_failure(detail: str) -> bool:
