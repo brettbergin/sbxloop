@@ -10,7 +10,7 @@ members = ["packages/sbxloop", "packages/sbxloop-worker"]
 
 [dependency-groups]
 dev = [
-    "ruff>=0.12",
+    "ruff>=0.16.6",
     "mypy>=1.16",
     "pytest>=8.3",
     "pytest-cov>=6.0",
