@@ -38,6 +38,25 @@
 
 ### Fixed
 
+- **A failed sbx installation is no longer recorded as the installed
+  version.** `sbxloop init` treated *any* installer failure that left an
+  executable under the prefix as the one outcome an unprivileged run is
+  expected to hit — the AppArmor profile that needs root — and then wrote
+  the requested version into `sbx/VERSION`. An upgrade whose installer
+  refused before it copied anything (Debian keeps `mkfs.ext4` off a non-root
+  PATH) therefore reported success on the strength of the *previous*
+  release's binary, and the next init skipped the repair because the marker
+  said the version was installed.
+
+  The AppArmor outcome is now recognised only when the failure says so, and
+  its note says the sandbox backend cannot start until an administrator
+  installs the profile rather than reporting a finished install. Every other
+  failure keeps its own exit code and output, whatever is lying around under
+  the prefix. `sbx/VERSION` is written only after the executable is there,
+  is executable, and answers `sbx version` with the version that was asked
+  for; a failed install clears the marker, so a later init reinstalls
+  instead of skipping.
+
 - **The ⏳ "received" mark now shows up for the person who asked, on
   Mattermost.** It was already on the server — the bot reacts within
   milliseconds of a post — but the asker's own web/desktop app never
