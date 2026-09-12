@@ -54,8 +54,14 @@ secret_strategy = "proxy"
 # Put the DSN value in ~/.sbxloop/config/secrets.env; unset/empty disables reporting.
 # dsn_env = "GLITCHTIP_DSN"          # environment variable NAME, never the DSN
 # environment = "production"        # deployment label attached to reports
-# Reports contain exception messages/chains/groups, stack source context and static event names.
-# Recognizable credentials are redacted; locals and log fields stay on the host. No tracing/log export.
+# log_fields = "diagnostic"         # "none" | "diagnostic" | "all": how much of a log
+#                                   # record travels. "diagnostic" adds counts, durations,
+#                                   # flags and the static operator hint; "all" adds the
+#                                   # free text (reasons, errors, item ids, urls) that says
+#                                   # which run failed. "none" is the event name alone.
+# Reports contain exception messages/chains/groups, stack source context, static event names
+# and the logging call site. Recognizable credentials are redacted; locals and argv stay on
+# the host, and log fields travel only as far as log_fields allows. No tracing/log export.
 
 # [agent]
 # Which SDK runs the agent personas inside the agent sandbox:

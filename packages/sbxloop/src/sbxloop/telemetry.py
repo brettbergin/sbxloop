@@ -1,8 +1,16 @@
 """Opt-in GlitchTip reports from the host, isolated from the SDK's global scope.
 
 Reports include exception messages, chains, groups and stack source context.
-Recognizable credentials are redacted; locals, argv and log fields stay local.
-The worker never imports this module or receives the reporting credential.
+Recognizable credentials are redacted; locals and argv stay local, and how
+much of a log record's structured fields travel is the operator's choice
+(``[telemetry] log_fields``). The worker never imports this module or
+receives the reporting credential.
+
+An ERROR event logged without an exception — a circuit breaker opening, a
+work item abandoned, a sandbox that could not be provisioned — has no
+traceback to explain it, so the report carries the three things that do:
+the call site (``culprit``), the event's static operator ``hint`` as the
+report's title line, and the record's reportable fields.
 """
 
 from __future__ import annotations
@@ -21,8 +29,40 @@ if TYPE_CHECKING:
     from sbxloop.config import TelemetryConfig
 
 _client: sentry_sdk.Client | None = None
+_log_fields: Literal["none", "diagnostic", "all"] = "diagnostic"
 _EVENT_NAME = re.compile(r"[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+")
 _MAX_VALUE_LENGTH = 100_000
+
+#: Where this module parks the fields it chose, until :func:`_before_send`
+#: promotes them into ``extra``. Fields never sit in ``extra`` before that,
+#: so an ``extra`` the SDK itself put on an event is unambiguously not ours
+#: and is still discarded.
+_FIELDS_KEY = "sbxloop_log_fields"
+
+#: Record keys that are the log line's own scaffolding, not facts about what
+#: happened; they are already the report's message, level and stack.
+_NON_FIELDS = frozenset(
+    {"event", "level", "logger", "timestamp", "exc_info", "stack_info", "stack", "exception"}
+)
+
+#: String-valued keys whose vocabulary this codebase writes — a backend name,
+#: a sandbox role, a run kind. Unlike a reason or an error they cannot come to
+#: hold a target repository's text, so ``diagnostic`` reports them.
+_ENUM_FIELDS = frozenset(
+    {"backend", "kind", "mode", "outcome", "phase", "role", "source", "stage", "state", "status"}
+)
+
+#: The operator-facing sentence a call site writes for a human reading the
+#: journal. Static prose from this repository, so every level above ``none``
+#: reports it: it is what makes an exception-less event mean something.
+_HINT_FIELD = "hint"
+
+#: Module prefixes between a log call and this processor; skipped when
+#: naming the call site.
+_PLUMBING = ("structlog", "logging", "sbxloop.log", "sbxloop.telemetry")
+
+#: A single free-text field is worth a paragraph of context, not a payload.
+_MAX_FIELD_LENGTH = 2_000
 
 
 def _before_send(event: Event, _hint: dict[str, Any]) -> Event:
@@ -36,15 +76,21 @@ def _before_send(event: Event, _hint: dict[str, Any]) -> Event:
         "level",
         "message",
         "exception",
+        "culprit",
     }
-    return cast("Event", {key: value for key, value in event.items() if key in allowed})
+    kept = {key: value for key, value in event.items() if key in allowed}
+    fields = event.get(_FIELDS_KEY)
+    if fields:
+        kept["extra"] = fields
+    return cast("Event", kept)
 
 
 def configure_telemetry(config: TelemetryConfig) -> None:
     """Enable reporting only when the named DSN exists; never break startup."""
-    global _client
+    global _client, _log_fields
 
     shutdown_telemetry()
+    _log_fields = config.log_fields
     dsn = os.environ.get(config.dsn_env, "").strip()
     if not dsn:
         return
@@ -116,6 +162,60 @@ def _redact_diagnostics(value: Any) -> Any:
     return value
 
 
+def _call_site() -> str | None:
+    """``module in function`` for the frame that logged, or ``None``.
+
+    An event logged without an exception reaches the server with no stack at
+    all: two call sites emit ``breaker.opened`` and the report cannot say
+    which. This is the same class of fact a traceback frame already carries —
+    a module, a function — never a value.
+    """
+    frame: Any = sys._getframe(1)
+    while frame is not None:
+        module = str(frame.f_globals.get("__name__", ""))
+        plumbing = any(module == name or module.startswith(f"{name}.") for name in _PLUMBING)
+        if module and not plumbing:
+            return f"{module} in {frame.f_code.co_name}"
+        frame = frame.f_back
+    return None
+
+
+def _reportable(key: str, value: Any) -> bool:
+    """Whether one log field may travel, under the operator's policy.
+
+    ``diagnostic`` keeps what describes the *failure* and cannot describe the
+    *work*: numbers and flags (an attempt count, a cooldown, a duration), the
+    static ``hint``, and the enum-valued keys this codebase writes. A free-text
+    field — a reason, an error string, an item id, a url, a branch — can carry
+    a target repository's content, so it travels only under ``all``.
+    """
+    if key in _NON_FIELDS or key.startswith("_"):
+        return False
+    if _log_fields == "all":
+        return True
+    if key in (_HINT_FIELD, *_ENUM_FIELDS):
+        return True
+    return isinstance(value, bool | int | float)
+
+
+def _fields(event: EventDict) -> dict[str, Any]:
+    """The record's reportable fields, redacted and bounded."""
+    from sbxloop.log import redact_text
+
+    if _log_fields == "none":
+        return {}
+    fields: dict[str, Any] = {}
+    for key, value in event.items():
+        if not _reportable(key, value):
+            continue
+        if isinstance(value, bool | int | float):
+            fields[key] = value
+            continue
+        text = redact_text(str(value))
+        fields[key] = text[:_MAX_FIELD_LENGTH] if len(text) > _MAX_FIELD_LENGTH else text
+    return fields
+
+
 def capture_exception(error: BaseException) -> None:
     """Report an unhandled CLI exception without changing its exit behavior."""
     if _client is not None:
@@ -127,7 +227,7 @@ def capture_log(_logger: Any, method: str, event: EventDict) -> EventDict:
     """Structlog processor: ERROR events, and WARNING events with exceptions.
 
     Runs once before rendering, never in a handler shared by stderr/file/ring
-    outputs. Log fields stay local; they are not a reporting payload.
+    outputs. What of the record travels is :func:`_reportable`'s decision.
     """
     if _client is None or method not in {"warning", "error", "exception", "critical"}:
         return event
@@ -149,13 +249,28 @@ def capture_log(_logger: Any, method: str, event: EventDict) -> EventDict:
         )
         if method == "warning" and error is None:
             return event
-        payload: Event = {
-            "message": name,
+        fields = _fields(event)
+        # The event name stays the grouping key; ``formatted`` is what a
+        # human reads. The hint is static per call site, so a report that
+        # explains itself still groups with every other one of its kind.
+        hint = fields.get(_HINT_FIELD)
+        payload: dict[str, Any] = {
+            "message": {
+                "message": name,
+                "formatted": f"{name}: {hint}" if isinstance(hint, str) and hint else name,
+            },
             "level": "warning" if method == "warning" else "error",
         }
         if isinstance(error, BaseException):
             payload["exception"] = _exception_event(error)
-        _client.capture_event(payload)
+        else:
+            # No traceback to locate this one: name the frame that logged it.
+            culprit = _call_site()
+            if culprit is not None:
+                payload["culprit"] = culprit
+        if fields:
+            payload[_FIELDS_KEY] = fields
+        _client.capture_event(cast("Event", payload))
     return event
 
 
