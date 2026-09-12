@@ -83,6 +83,10 @@ Each of these has broken a real run when violated.
   - `toolchains.py`, `verifylint.py`, `policy.py`, `deliver.py`,
     `hostgit.py`, `config.py` — toolchain series, gate detection, network
     policy, delivery, host-side git, the config model.
+  - `configedit/` — the operator config edited one key at a time (what a
+    key accepts, the comment-keeping write, the loader's verdict, the
+    backup); the console, `sbxloop config set` and the daemon's tools share
+    it.
   - `data/` — the example config and secrets file, the `init` presets and
     the home's launcher and unit templates, shipped as package data.
 - `packages/sbxloop-worker/src/sbxloop_worker/` — runs inside the sandbox.

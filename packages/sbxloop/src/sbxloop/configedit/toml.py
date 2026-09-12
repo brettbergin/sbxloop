@@ -7,7 +7,7 @@ value must keep every one of them, so the draft is round-tripped with
 is touched: the file that comes back differs from the file that went in by
 that assignment alone.
 
-Paths are :mod:`sbxloop.tui.configkeys`', so ``github.repos[1].repo``
+Paths are :mod:`sbxloop.configedit.keys`', so ``github.repos[1].repo``
 reaches into the second array-of-tables entry. Containers on the way are
 created when missing — a table, or one new array entry appended at the
 end — and anything else that does not fit (an index past the end, a key
@@ -20,7 +20,7 @@ from typing import Any
 
 import tomlkit
 
-from sbxloop.tui.configkeys import PathError, PathPart, format_path
+from sbxloop.configedit.keys import PathError, PathPart, format_path
 
 
 class ConfigWriteError(ValueError):

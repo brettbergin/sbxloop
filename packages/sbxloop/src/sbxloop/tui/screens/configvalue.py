@@ -24,7 +24,7 @@ from textual.containers import Vertical
 from textual.screen import ModalScreen
 from textual.widgets import Input, Select, Static, TextArea
 
-from sbxloop.tui.configkeys import FieldSpec, parse_value, render_value
+from sbxloop.configedit.keys import FieldSpec, parse_value, render_value
 
 
 @dataclass(frozen=True)

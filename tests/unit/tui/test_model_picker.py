@@ -10,8 +10,8 @@ from textual.widgets import Input, OptionList, Static
 
 from sbxloop import modelcatalog
 from sbxloop.backends import backend_named
+from sbxloop.configedit.keys import describe
 from sbxloop.paths import SbxloopHome
-from sbxloop.tui.configkeys import describe
 from sbxloop.tui.screens.config import ConfigScreen
 from sbxloop.tui.screens.configvalue import ValueEdit, ValueScreen
 from sbxloop.tui.screens.modelvalue import ModelScreen

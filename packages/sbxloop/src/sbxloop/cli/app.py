@@ -43,6 +43,7 @@ from sbxloop.config import (
     load_config_with_sources,
     load_secrets_env,
 )
+from sbxloop.configedit import Change, ConfigEditError, ConfigEditor, applies_for
 from sbxloop.daemon.control import DEFAULT_TIMEOUT_S
 from sbxloop.daemon.store import DaemonStore, apply_item_verb
 from sbxloop.daemon.versions import VersionProbe, start_drift_check
@@ -91,7 +92,7 @@ app = typer.Typer(
     pretty_exceptions_show_locals=False,
 )
 sandbox_app = typer.Typer(help="Manage sbxloop sandboxes.", no_args_is_help=True)
-config_app = typer.Typer(help="Inspect configuration.", no_args_is_help=True)
+config_app = typer.Typer(help="Inspect and change configuration.", no_args_is_help=True)
 secrets_app = typer.Typer(
     help="Manage the sbx custom-secret registrations sbxloop owns.", no_args_is_help=True
 )
@@ -1681,6 +1682,9 @@ def config_show() -> None:
     table.add_column("key")
     table.add_column("value")
     table.add_column("source")
+    # When a change to the key is what the loop sees: model keys are re-read
+    # before every phase; everything else at the daemon's next start.
+    table.add_column("applies")
     flat: dict[str, Any] = {}
 
     def flatten(prefix: str, data: dict[str, Any]) -> None:
@@ -1699,7 +1703,9 @@ def config_show() -> None:
     dumped.pop("workloads", None)
     flatten("", dumped)
     for dotted in sorted(flat):
-        table.add_row(dotted, repr(flat[dotted]), sources.get(dotted, "default"))
+        table.add_row(
+            dotted, repr(flat[dotted]), sources.get(dotted, "default"), applies_for(dotted)
+        )
     console.print(table)
     if config.credentials:
         creds = Table(title="credentials (values never shown)")
@@ -1725,6 +1731,97 @@ def config_show() -> None:
                 ", ".join(f"{k}={v}" for k, v in overrides.items()) or "-",
             )
         console.print(profiles)
+
+
+def _config_editor() -> ConfigEditor:
+    """The home's operator config, whether or not it currently loads: a
+    repair command must still answer on a host whose file is broken."""
+    return ConfigEditor(SbxloopHome(resolve_home_root()), os.environ)
+
+
+@config_app.command("describe")
+def config_describe(
+    key: Annotated[str, typer.Argument(help="A dotted key, e.g. daemon.max_runs_per_day.")],
+) -> None:
+    """Show one key: its value, which layer set it, what it accepts, when a change applies."""
+    try:
+        row = _config_editor().describe(key)
+    except ConfigEditError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    except SbxloopError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    lines = [
+        f"[bold]{row.key}[/]",
+        f"  value    {rich_escape(row.display)}",
+        f"  set by   {row.source}",
+        f"  accepts  {rich_escape(row.spec.summary)}"
+        + ("" if row.spec.optional else " (required)"),
+        f"  applies  {row.applies}"
+        + (" — the daemon reads it at its next start" if row.applies == "restart" else ""),
+    ]
+    if row.doc:
+        lines.append(f"  about    {rich_escape(row.doc)}")
+    console.print("\n".join(lines), highlight=False)
+
+
+def _apply_change(editor: ConfigEditor, change: Change) -> None:
+    """Report the loader's verdict; write only when it accepted the draft."""
+    if not change.ok:
+        console.print(f"[bold red]{change.key}: {rich_escape(change.verdict.text)}[/]")
+        console.print(f"nothing written to {editor.path}", highlight=False)
+        raise typer.Exit(2)
+    try:
+        backup = editor.commit(change)
+    except OSError as exc:
+        console.print(f"[bold red]could not write {editor.path}: {exc}[/]")
+        raise typer.Exit(1) from exc
+    what = f"unset {change.key}" if change.unset else f"set {change.key}"
+    console.print(f"{what} in {editor.path}", highlight=False)
+    if backup is not None:
+        console.print(f"previous kept as {backup.name}", highlight=False)
+    if change.note is not None:
+        style = "yellow" if change.note_level == "warning" else ""
+        console.print(f"[{style}]{rich_escape(change.note)}[/]" if style else change.note)
+    if change.applies == "live":
+        console.print("model settings refresh before the next phase or concierge turn")
+    else:
+        console.print("the daemon reads it at its next start: restart to apply")
+
+
+@config_app.command("set")
+def config_set(
+    key: Annotated[str, typer.Argument(help="A dotted key, e.g. daemon.max_runs_per_day.")],
+    value: Annotated[
+        str, typer.Argument(help="The value as an operator writes it: 20, true, squash.")
+    ],
+) -> None:
+    """Set one key in the home's config/sbxloop.toml, every comment kept.
+
+    The real loader judges the whole file with every other layer applied
+    before anything is written; the previous file is kept as a backup."""
+    editor = _config_editor()
+    try:
+        change = editor.set(key, value)
+    except ConfigEditError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    _apply_change(editor, change)
+
+
+@config_app.command("unset")
+def config_unset(
+    key: Annotated[str, typer.Argument(help="A dotted key to remove from the file.")],
+) -> None:
+    """Remove one key from the home's config/sbxloop.toml so the layer beneath answers."""
+    editor = _config_editor()
+    try:
+        change = editor.unset(key)
+    except ConfigEditError as exc:
+        console.print(f"[bold red]{exc}[/]")
+        raise typer.Exit(2) from exc
+    _apply_change(editor, change)
 
 
 @config_app.command("repos")

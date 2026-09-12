@@ -14,16 +14,17 @@ from textual.widgets import Input, OptionList, Select, TabbedContent, TabPane, T
 from sbxloop.backends import backend_named
 from sbxloop.cli.policyview import policy_view
 from sbxloop.config import Config
-from sbxloop.modelcatalog import save_catalog
-from sbxloop.paths import SbxloopHome
-from sbxloop.tui import configkeys, configtoml
-from sbxloop.tui.configedit import (
+from sbxloop.configedit import keys as configkeys
+from sbxloop.configedit import toml as configtoml
+from sbxloop.configedit.edit import (
     FILE_LAYER,
     config_path,
     read_text,
     save_text,
     validate_text,
 )
+from sbxloop.modelcatalog import save_catalog
+from sbxloop.paths import SbxloopHome
 from sbxloop.tui.screens.config import ConfigScreen, flatten_config
 from sbxloop.tui.screens.configvalue import ValueScreen
 from sbxloop.tui.screens.modals import ConfirmScreen, TextPromptScreen
