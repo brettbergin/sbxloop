@@ -91,6 +91,25 @@ jobs:
       - run: uv sync --all-packages --extra codex --python ${{ matrix.python-version }}
       - run: uv run --no-sync pytest -n0 tests/unit/test_codex_sdk_contract.py
 
+  # Exercise the published openai client against a local server speaking
+  # the chat-completions wire shape. No credentials, models or endpoints
+  # beyond the loopback stub are involved.
+  openai-sdk:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --all-packages --extra openai --python ${{ matrix.python-version }}
+      - run: uv run --no-sync pytest -n0 tests/unit/test_openai_sdk_contract.py
+
   # Use the shipped preset to install and drive Chromium, without an agent
   # credential. Browser software is installed only in this dedicated runner.
   playwright-preset:

@@ -19,36 +19,8 @@ from git import Git, GitCommandError, Repo
 from sbxloop import hostgit
 from sbxloop.errors import DeliveryError, ProvisionError
 from sbxloop_worker.gitops import GitMergeError, merge_from_base
+from tests.fakes.gitrepo import git, make_repo
 from tests.fakes.gitserver import PrivateGitServer, bare_from
-
-
-def git(*argv: str, cwd: Path) -> None:
-    subprocess.run(
-        ["git", *argv],
-        cwd=cwd,
-        check=True,
-        capture_output=True,
-        env={
-            "PATH": "/usr/bin:/bin:/usr/local/bin",
-            "GIT_AUTHOR_NAME": "t",
-            "GIT_AUTHOR_EMAIL": "t@example.com",
-            "GIT_COMMITTER_NAME": "t",
-            "GIT_COMMITTER_EMAIL": "t@example.com",
-            "GIT_CONFIG_GLOBAL": "/dev/null",
-            "GIT_CONFIG_SYSTEM": "/dev/null",
-            "GIT_SSL_CAINFO": os.environ.get("GIT_SSL_CAINFO", ""),
-        },
-    )
-
-
-def make_repo(tmp_path: Path, name: str = "src") -> Path:
-    root = tmp_path / name
-    root.mkdir()
-    git("init", "-b", "main", cwd=root)
-    (root / "hello.txt").write_text("hi\n")
-    git("add", ".", cwd=root)
-    git("commit", "-m", "init", cwd=root)
-    return root
 
 
 class TestRepoToplevel:
@@ -816,6 +788,42 @@ class TestMergeFromBase:
         assert (clone / "wip.txt").read_text() == "not yet committed\n"
         assert (clone / "hello.txt").read_text() == "edited but not committed\n"
         assert (clone / "pusher.txt").exists()
+
+    def test_a_repository_pre_commit_hook_does_not_run_for_the_checkpoint(
+        self, tmp_path: Path
+    ) -> None:
+        """The checkpoint is sbxloop's own commit; a hook the repository
+        ships must neither veto it nor run on its behalf."""
+        upstream, clone = make_run_clone(tmp_path)
+        marker = tmp_path / "hook-ran"
+        hooks = clone / ".git" / "hooks"
+        hooks.mkdir(exist_ok=True)
+        hook = hooks / "pre-commit"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\nexit 1\n")
+        hook.chmod(0o755)
+        (clone / "wip.txt").write_text("not yet committed\n")
+        new_sha = push_upstream_commit(tmp_path, upstream)
+        result = merge_from_base(clone, "main")
+        assert result.merged is True, result.message
+        assert not marker.exists()
+        with Repo(clone) as repo:
+            assert any(c.message.startswith("sbxloop: checkpoint") for c in repo.iter_commits())
+            assert repo.is_ancestor(repo.commit(new_sha), repo.head.commit)
+
+    def test_a_name_git_cannot_decode_is_checkpointed_and_merged(self, tmp_path: Path) -> None:
+        """A filename that is not valid UTF-8 must not turn the checkpoint
+        into a decode error: the work-tree steps read bytes."""
+        upstream, clone = make_run_clone(tmp_path)
+        raw = b"caf\xe9.txt"
+        (clone / os.fsdecode(raw)).write_text("undecodable\n")
+        new_sha = push_upstream_commit(tmp_path, upstream)
+        result = merge_from_base(clone, "main")
+        assert result.merged is True, result.message
+        with Repo(clone) as repo:
+            assert repo.is_ancestor(repo.commit(new_sha), repo.head.commit)
+            tracked: bytes = repo.git.ls_files("-z", stdout_as_string=False)
+            assert raw in tracked.split(b"\0")
+        assert (clone / os.fsdecode(raw)).read_text() == "undecodable\n"
 
     def test_conflict_is_left_in_progress_with_the_paths(self, tmp_path: Path) -> None:
         """Both sides edit the same line: the merge stays in progress, the
