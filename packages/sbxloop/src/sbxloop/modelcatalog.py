@@ -48,7 +48,7 @@ class ModelCatalog(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
     version: Literal[1] = 1
-    backend: Literal["copilot", "claude", "codex"]
+    backend: Literal["copilot", "claude", "codex", "openai"]
     fetched_at: float = Field(ge=0, allow_inf_nan=False)
     models: list[CatalogModel] = Field(min_length=1, max_length=2000)
 

@@ -1,7 +1,8 @@
 """The agent backend descriptor (#617).
 
 ``[agent] backend`` picks which SDK the agent sandbox runs — GitHub Copilot
-(the default), Claude or Codex — and everything on the host that is *about* that
+(the default), Claude, Codex, or the ``openai`` client against an
+operator-named endpoint — and everything on the host that is *about* that
 choice reads it from here: which env var carries the credential and which
 host sbx binds it to, which hosts the credential path must reach, what the
 credential is called when it is missing, and where its model ids come from.
@@ -14,11 +15,12 @@ before the descriptor existed — a copilot deployment reads byte-identical.
 
 A backend's credential path — the env var, the host it is bound to, the
 hosts it must reach, the wording when it is missing — is read through
-accessors that take the loaded :class:`~sbxloop.config.Config`, never off a
-constant. The three SDK-vendor backends bind to a fixed host and answer
-every config the same way; the accessors exist so a backend whose endpoint
-the operator names can answer from config instead, and so no consumer can
-ask for a host before one is knowable.
+accessors that take the loaded :class:`~sbxloop.config.Config` (and the
+repository a run acts for, where one narrows it), never off a constant.
+The three SDK-vendor backends bind to a fixed host and answer every config
+the same way; the ``openai`` backend answers from ``[agent.openai]`` (and a
+repository's own ``[github.repos.openai]`` override), so no consumer can
+ask for its host before one is knowable.
 
 This module imports nothing from the config package at runtime (only the
 type), so the low-level modules that need the credential constants —
@@ -30,6 +32,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
+
+from sbxloop.endpoint import parse_endpoint
 
 if TYPE_CHECKING:
     from sbxloop.config import Config
@@ -88,8 +92,9 @@ class CredentialBinding:
 
 
 #: How a backend binds its credential under a config: a constant for a
-#: backend whose host is fixed, a resolver for one that reads it from config.
-Binding = CredentialBinding | Callable[["Config"], CredentialBinding]
+#: backend whose host is fixed, a resolver — taking the config and the
+#: repository a run acts for — for one that reads it from config.
+Binding = CredentialBinding | Callable[["Config", "str | None"], CredentialBinding]
 
 
 @dataclass(frozen=True)
@@ -99,7 +104,9 @@ class AgentBackend:
     Everything about the credential path goes through :meth:`bound` — the
     config-taking accessors below are the only way to read it, so a caller
     without a loaded config cannot name a host that may not be knowable
-    without one.
+    without one. ``repo`` is the repository a run acts for: a backend whose
+    endpoint a ``[[github.repos]]`` entry may override answers for that
+    repository; the fixed-host backends ignore it.
     """
 
     name: str
@@ -113,46 +120,46 @@ class AgentBackend:
     def is_default(self) -> bool:
         return self.name == "copilot"
 
-    def bound(self, config: Config) -> CredentialBinding:
-        """The credential path under ``config``."""
+    def bound(self, config: Config, repo: str | None = None) -> CredentialBinding:
+        """The credential path under ``config``, for ``repo``."""
         if isinstance(self.binding, CredentialBinding):
             return self.binding
-        return self.binding(config)
+        return self.binding(config, repo)
 
-    def token_env(self, config: Config) -> str:
+    def token_env(self, config: Config, repo: str | None = None) -> str:
         """The env var carrying the agent sandbox's credential."""
-        return self.bound(config).token_env
+        return self.bound(config, repo).token_env
 
-    def token_host(self, config: Config) -> str:
+    def token_host(self, config: Config, repo: str | None = None) -> str:
         """The host sbx binds the credential to."""
-        return self.bound(config).token_host
+        return self.bound(config, repo).token_host
 
-    def token_hosts(self, config: Config) -> tuple[str, ...]:
+    def token_hosts(self, config: Config, repo: str | None = None) -> tuple[str, ...]:
         """The hosts the credential path must reach."""
-        return self.bound(config).token_hosts
+        return self.bound(config, repo).token_hosts
 
-    def secret(self, config: Config) -> tuple[str, str]:
+    def secret(self, config: Config, repo: str | None = None) -> tuple[str, str]:
         """The ``(env, host)`` custom-secret registration this backend owns."""
-        return self.bound(config).secret
+        return self.bound(config, repo).secret
 
-    def missing_token_detail(self, config: Config) -> str:
+    def missing_token_detail(self, config: Config, repo: str | None = None) -> str:
         """Doctor's row text when the credential is not set."""
-        return self.bound(config).missing_token_detail
+        return self.bound(config, repo).missing_token_detail
 
-    def missing_token_error(self, config: Config) -> str:
+    def missing_token_error(self, config: Config, repo: str | None = None) -> str:
         """Provisioning's failure when the credential is not set."""
-        return self.bound(config).missing_token_error
+        return self.bound(config, repo).missing_token_error
 
-    def doctor_check_name(self, config: Config) -> str:
+    def doctor_check_name(self, config: Config, repo: str | None = None) -> str:
         """The credential row's name: bare for the default backend, tagged
         with the backend otherwise so a reader sees *why* it is the row."""
-        token_env = self.token_env(config)
+        token_env = self.token_env(config, repo)
         if self.is_default:
             return token_env
         return f"{token_env} (agent backend: {self.name})"
 
-    def has_token(self, config: Config, env: dict[str, str]) -> bool:
-        return bool(env.get(self.token_env(config)))
+    def has_token(self, config: Config, env: dict[str, str], repo: str | None = None) -> bool:
+        return bool(env.get(self.token_env(config, repo)))
 
 
 COPILOT_BINDING = CredentialBinding(
@@ -226,9 +233,52 @@ CODEX = AgentBackend(
     binding=CODEX_BINDING,
 )
 
+
+def _openai_binding(config: Config, repo: str | None) -> CredentialBinding:
+    """The ``openai`` backend's credential path: the env var
+    ``[agent.openai] api_key_env`` names, bound to the host of the endpoint
+    ``base_url`` names — ``repo``'s ``[github.repos.openai]`` override
+    first, then the global block. Config validation has already required
+    and parsed the URL under ``backend = "openai"``; a config that selects
+    another backend has no endpoint to answer with, and says so."""
+    settings = config.openai_for(repo)
+    if settings.base_url is None:
+        raise ValueError(
+            '[agent.openai] base_url is not set — the "openai" backend has no endpoint '
+            "to bind its credential to"
+        )
+    endpoint = parse_endpoint(settings.base_url)
+    env, where = settings.api_key_env, endpoint.authority
+    return CredentialBinding(
+        token_env=env,
+        token_host=endpoint.policy_host,
+        token_hosts=(endpoint.policy_host,),
+        missing_token_detail=(
+            f"not set — export {env} (the variable [agent.openai] api_key_env names) "
+            f"for the endpoint at {where}, a placeholder value if the endpoint wants "
+            'no credential, or switch [agent] backend back to "copilot"'
+        ),
+        missing_token_error=(
+            f'{env} is not set on the host but [agent] backend = "openai" binds it to '
+            f"the endpoint at {where}. Export it (a placeholder value if the endpoint "
+            'wants no credential), or switch back to backend = "copilot".'
+        ),
+    )
+
+
+OPENAI = AgentBackend(
+    name="openai",
+    label="openai",
+    credential="an API key for the configured endpoint",
+    create_url="https://platform.openai.com/api-keys",
+    models_source="the endpoint's model listing",
+    binding=_openai_binding,
+)
+
 #: Every backend ``[agent] backend`` accepts, default first. The config
-#: Literal and ``daemon.discord_format.KNOWN_BACKENDS`` name the same set.
-BACKENDS: tuple[AgentBackend, ...] = (COPILOT, CLAUDE, CODEX)
+#: Literal, ``daemon.discord_format.KNOWN_BACKENDS`` and the worker
+#: protocol's ``AGENT_BACKEND_NAMES`` name the same set.
+BACKENDS: tuple[AgentBackend, ...] = (COPILOT, CLAUDE, CODEX, OPENAI)
 
 _BY_NAME = {backend.name: backend for backend in BACKENDS}
 

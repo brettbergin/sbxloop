@@ -11,14 +11,16 @@ import pytest
 from typer.testing import CliRunner
 
 from sbxloop import backends
-from sbxloop.backends import BACKENDS, CLAUDE, COPILOT, backend_for, backend_named
+from sbxloop.backends import BACKENDS, CLAUDE, CODEX, COPILOT, backend_for, backend_named
 from sbxloop.cli import models
 from sbxloop.cli.app import app
 from sbxloop.config import AgentConfig, Config, load_config
 from sbxloop.daemon.discord_format import KNOWN_BACKENDS
 from sbxloop.errors import SbxloopError
+from sbxloop.modelcatalog import ModelCatalog
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.secretstate import tracked_custom_secrets
+from sbxloop_worker.protocol import AGENT_BACKEND_NAMES
 from tests.conftest import FakeSbx
 
 runner = CliRunner()
@@ -42,6 +44,9 @@ class TestDescriptor:
         literal = AgentConfig.model_fields["backend"].annotation
         assert set(literal.__args__) == {b.name for b in BACKENDS}  # type: ignore[union-attr]
         assert tuple(b.name for b in BACKENDS) == KNOWN_BACKENDS
+        assert tuple(b.name for b in BACKENDS) == AGENT_BACKEND_NAMES
+        catalog = ModelCatalog.model_fields["backend"].annotation
+        assert set(catalog.__args__) == {b.name for b in BACKENDS}  # type: ignore[union-attr]
         assert BACKENDS[0] is COPILOT  # the default comes first
 
     def test_named_and_for_config(self, workdir: Path) -> None:
@@ -78,7 +83,7 @@ class TestDescriptor:
     def test_fixed_host_backends_answer_every_config_the_same(self) -> None:
         """The SDK-vendor backends bind to a constant host: which backend
         the config selects does not change what each one says of itself."""
-        for backend in BACKENDS:
+        for backend in (COPILOT, CLAUDE, CODEX):
             bindings = {
                 backend.bound(Config.model_validate({"agent": {"backend": name}}))
                 for name in ("copilot", "claude", "codex")

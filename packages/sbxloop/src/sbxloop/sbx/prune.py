@@ -223,7 +223,13 @@ def remove_run_sandbox_secrets(cli: SbxCLI, name: str, role: SandboxRole, config
             cli.secret_rm(service="github", sandbox=name)
         return
     for backend in BACKENDS:
-        env, host = backend.secret(config)
+        try:
+            env, host = backend.secret(config)
+        except ValueError:
+            # No endpoint to bind under this config (the openai backend
+            # while another is selected): provisioning under it could not
+            # have registered anything, so there is nothing to name.
+            continue
         with contextlib.suppress(SbxError):
             cli.secret_rm(host=host, env=env, sandbox=name)
 

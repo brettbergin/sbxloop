@@ -52,6 +52,7 @@ from typing import Literal, NamedTuple
 
 from sbxloop import backends, hostgit, toolchains
 from sbxloop.config import Config, CredentialConfig, RegistryConfig, RepoConfig, SandboxConfig
+from sbxloop.endpoint import Endpoint, parse_endpoint
 from sbxloop.engine.model import RunKind
 from sbxloop.errors import ConfigError, GithubOpsError, ProvisionError, SbxError
 from sbxloop.events import EventBus
@@ -94,6 +95,12 @@ from sbxloop.sbx.secretstate import (
     custom_rm_candidates,
     service_rm_candidates,
     set_secret_replacing,
+)
+from sbxloop_worker.protocol import (
+    OPENAI_BASE_URL_ENV,
+    OPENAI_KEY_NAME_ENV,
+    OPENAI_RETRIES_ENV,
+    OPENAI_TIMEOUT_ENV,
 )
 from sbxloop_worker.secrets import shell_sentinel_case, shell_token_case
 from sbxloop_worker.serviceops import CATALOGUE_ENV
@@ -349,7 +356,9 @@ def agent_policy_allows(
             # The repository's own GitHub (#623): github.com is in the
             # constant above; an Enterprise Server host is not.
             *config.github.allow_domains,
-            *backends.backend_for(config).token_hosts(config),
+            # The backend's credential path — a vendor API host, or the
+            # endpoint `[agent.openai]` (and `repo`'s override) names.
+            *backends.backend_for(config).token_hosts(config, repo),
             *baseline_allows((*PROMPT_ADVERTISED_DOMAINS, *installers), config.policy.deny),
             # Operator-declared hosts: a private registry the operator
             # configured is reachable like extra_allow_domains is, deny or
@@ -503,7 +512,7 @@ class Provisioner:
                 repo,
                 extra_domains=self._submodule_hosts(run_id, workspace, languages, repo),
             ),
-            secrets=self._agent_secret_specs(),
+            secrets=self._agent_secret_specs(repo=repo),
             persistent_env=self.agent_persistent_env(repo),
             files=self.agent_files(repo),
         )
@@ -639,7 +648,33 @@ class Provisioner:
             env["SBXLOOP_WORKER_BACKEND"] = self.agent_backend()
         if self.agent_backend() == "claude":
             env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"] = "1"
+        if self.agent_backend() == "openai":
+            # Where the worker's model calls go and how patient the client
+            # is: the endpoint (`repo`'s override first), not the key —
+            # that rides the secret path under the name given here.
+            settings = self.config.openai_for(repo)
+            env[OPENAI_BASE_URL_ENV] = self._endpoint(repo).url
+            env[OPENAI_KEY_NAME_ENV] = settings.api_key_env
+            env[OPENAI_TIMEOUT_ENV] = f"{settings.request_timeout_s:g}"
+            env[OPENAI_RETRIES_ENV] = str(settings.max_retries)
         return env
+
+    def _endpoint(self, repo: str | None = None) -> Endpoint:
+        """The parsed `[agent.openai]` endpoint for ``repo``; config
+        validation has already required it under the openai backend."""
+        base_url = self.config.openai_for(repo).base_url
+        assert base_url is not None, "config validation requires base_url under openai"
+        return parse_endpoint(base_url)
+
+    def _endpoint_hosts(self) -> dict[str, Endpoint]:
+        """Every endpoint host this config can bind the agent sandbox to
+        (the global block and each repository's override), by host — so a
+        refusal sbx gives a spec can be named after the endpoint in it."""
+        if self.agent_backend() != "openai":
+            return {}
+        endpoints = [self._endpoint(None)]
+        endpoints += [self._endpoint(entry.repo) for entry in self.config.github.repos]
+        return {endpoint.policy_host: endpoint for endpoint in endpoints}
 
     def agent_files(self, repo: str | None = None) -> dict[str, str]:
         """The client files for ``repo``'s credential-less registries (#680)
@@ -673,13 +708,15 @@ class Provisioner:
         values = {name: self.env[name] for name in names}
         return {**values, **registries.secret_env(regs, values)}
 
-    def _agent_secret_spec(self) -> SecretSpec:
-        env, host = self.backend().secret(self.config)
+    def _agent_secret_spec(self, repo: str | None = None) -> SecretSpec:
+        env, host = self.backend().secret(self.config, repo)
         return SecretSpec(kind="custom", host=host, env=env)
 
-    def _agent_secret_specs(self, roles: Sequence[str] | None = None) -> list[SecretSpec]:
+    def _agent_secret_specs(
+        self, roles: Sequence[str] | None = None, repo: str | None = None
+    ) -> list[SecretSpec]:
         """Only the inference credential belongs in the agent sandbox."""
-        return [self._agent_secret_spec()]
+        return [self._agent_secret_spec(repo)]
 
     def gh_credential(self, repo: str | None = None) -> GhCredential:
         """The credential the github sandbox authenticates with, scoped to
@@ -1973,7 +2010,27 @@ class Provisioner:
         # extra_allow_domains can name a host GITHUB_ALLOW_DOMAINS already
         # holds. sbx fails the whole call on a repeat, so no spec may reach
         # it with one.
-        self.cli.policy_allow(*dedupe_domains(spec.policy_allows), sandbox=spec.name)
+        domains = dedupe_domains(spec.policy_allows)
+        try:
+            self.cli.policy_allow(*domains, sandbox=spec.name)
+        except SbxError as exc:
+            # FIELD-UNVERIFIED whether sbx's network policy takes a
+            # single-label hostname or an address literal: when the batch
+            # sbx refused carries the configured model endpoint, say so —
+            # provisioning stops here naming the endpoint, never a sandbox
+            # that fails at its first model call with a bare connection
+            # error (the endpoint module records the shapes in question).
+            endpoint = next((e for h, e in self._endpoint_hosts().items() if h in domains), None)
+            if endpoint is None:
+                raise
+            raise ProvisionError(
+                f"sbx refused the network allow list for {spec.name}, which carries the "
+                f"configured model endpoint {endpoint.authority} ({endpoint.kind}): "
+                f"{' '.join(exc.stderr.split()) or exc}. If sbx's policy cannot express "
+                f"a {endpoint.kind} host, the endpoint cannot be reached from the agent "
+                "sandbox; name it by a dotted domain the policy accepts, or switch "
+                "[agent] backend."
+            ) from exc
 
     def _apply_secrets(
         self, spec: SandboxSpec, sandbox: Sandbox, token: str
@@ -2000,19 +2057,35 @@ class Provisioner:
                     )
             else:
                 assert secret.host is not None and secret.env is not None
-                registered = set_secret_replacing(
-                    f"custom {secret.env}@{secret.host} ({spec.name})",
-                    set_fn=partial(
-                        self.cli.secret_set_custom,
-                        host=secret.host,
-                        env=secret.env,
-                        value=token,
-                        sandbox=spec.name,
-                    ),
-                    rm_candidates=partial(
-                        custom_rm_candidates, self.cli, secret.host, secret.env, spec.name
-                    ),
-                )
+                try:
+                    registered = set_secret_replacing(
+                        f"custom {secret.env}@{secret.host} ({spec.name})",
+                        set_fn=partial(
+                            self.cli.secret_set_custom,
+                            host=secret.host,
+                            env=secret.env,
+                            value=token,
+                            sandbox=spec.name,
+                        ),
+                        rm_candidates=partial(
+                            custom_rm_candidates, self.cli, secret.host, secret.env, spec.name
+                        ),
+                    )
+                except SbxError as exc:
+                    # Same fail-closed naming as `_apply_policy`: a binding
+                    # sbx cannot express for the configured endpoint's host
+                    # shape stops provisioning by name.
+                    endpoint = self._endpoint_hosts().get(secret.host)
+                    if endpoint is None:
+                        raise
+                    raise ProvisionError(
+                        f"sbx refused to bind {secret.env} to the configured model endpoint "
+                        f"{endpoint.authority} ({endpoint.kind}) for {spec.name}: "
+                        f"{' '.join(exc.stderr.split()) or exc}. If sbx's custom secrets "
+                        f"cannot bind to a {endpoint.kind} host, the credential cannot "
+                        "reach the agent sandbox; name the endpoint by a dotted domain, "
+                        "or switch [agent] backend."
+                    ) from exc
                 if registered:
                     rollbacks.append(
                         partial(self._rm_custom, host=secret.host, env=secret.env, scope=spec.name)
