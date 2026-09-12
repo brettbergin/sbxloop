@@ -802,7 +802,9 @@ class TestBridge:
             assert control.sent[1] == result
             note = control.messages[min(control.messages)]
             assert note.content == "🛠 concierge: sbx_control(status) · sbx_control(queue)"
-            assert msg.reactions == ["⏳", "✅" if outcome == "reply" else "⚠"]
+            # The ⏳ is put on at routing time, which this test enters past;
+            # what it is about is that the closing mark implies the notes.
+            assert msg.reactions == ["✅" if outcome == "reply" else "⚠"]
 
         try:
             asyncio.run(exercise())
@@ -1374,6 +1376,73 @@ class TestBridge:
 def test_threading_sanity() -> None:
     # guard: the module must not require an event loop at import/construct time
     assert threading.current_thread() is threading.main_thread()
+
+
+class TestAckMarks:
+    """⏳ received → ✅ answered, in that order and while it still means
+    something. Service-agnostic, so it is covered once, here."""
+
+    def test_the_received_mark_lands_before_the_turn_runs(self, tmp_path: Path) -> None:
+        """The complaint this is about: on a slow turn the clock showed up
+        after the answer, or not until the answer, which tells the reader
+        nothing. It is put on at routing time now, so it is there while the
+        concierge is still thinking."""
+        concierge = FakeConcierge()
+        concierge.gate.clear()  # hold the turn open
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        bridge.start()
+        try:
+            control = client.channels[42]
+            msg = FakeMessage("<@777> what's running?", control, mentions=[BOT_USER], mid=900)
+            bridge._handle_message(msg)
+            assert wait_for(lambda: msg.reactions == ["⏳"])
+            assert control.sent == []  # nothing answered yet
+        finally:
+            concierge.gate.set()
+            bridge.close()
+
+    def test_a_later_turn_cannot_put_the_clock_back_after_the_answer(self, tmp_path: Path) -> None:
+        """Answering a clarifying question runs a second turn against the
+        *same* message. A ⏳ landing after that message's ✅ reads as a
+        fresh ask nobody is working on, so it is dropped."""
+        from sbxloop.daemon.chat import ACK_ANSWERED, ACK_RECEIVED
+
+        concierge = FakeConcierge()
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        bridge.start()
+        try:
+            control = client.channels[42]
+            msg = FakeMessage("<@777> what's running?", control, mentions=[BOT_USER], mid=900)
+            bridge._handle_message(msg)
+            assert wait_for(lambda: msg.reactions == ["⏳", "✅"])
+            inbound = bridge._inbound(msg)
+            assert inbound is not None
+            bridge._ack(inbound, ACK_RECEIVED)
+            assert not wait_for(lambda: len(msg.reactions) > 2, timeout=0.3)
+            # ...and the answered mark itself is still allowed through
+            bridge._ack(inbound, ACK_ANSWERED)
+            assert wait_for(lambda: msg.reactions == ["⏳", "✅", "✅"])
+        finally:
+            bridge.close()
+
+    def test_a_steer_a_finished_run_cannot_take_settles_its_clock(self, tmp_path: Path) -> None:
+        """Routing marks the message received before it knows whether the
+        run can still take it. A steer that is refused says so, rather than
+        leaving a clock for an answer that will never come."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge.start()
+        try:
+            item = WorkItem(item_id="inbox:a.md", source_key="a.md", title="Do A")
+            bridge.run_started(item, "r1", FakeEngine(), EventBus())  # type: ignore[arg-type]
+            assert wait_for(lambda: bridge.dstore.discord_thread("r1") is not None)
+            thread = client.channels[bridge.dstore.discord_thread("r1").thread_id]  # type: ignore[union-attr]
+            bridge.run_finished(item, RunReport("r1", "completed", "done"))
+            msg = steer_msg("too late?", thread)
+            bridge._handle_message(msg)
+            assert wait_for(lambda: any("has finished" in s for s in thread.sent))
+            assert wait_for(lambda: msg.reactions == ["⏳", "⚠"])
+        finally:
+            bridge.close()
 
 
 class TestRunWatches:

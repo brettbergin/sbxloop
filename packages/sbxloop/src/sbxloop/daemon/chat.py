@@ -130,6 +130,16 @@ REQUESTER_ID_CAP = 200
 WATCHERS_CAP = 200
 # The concierge's "🛠 …" tool-note line is edited at most this often.
 CONCIERGE_NOTE_EDIT_MIN_S = 1.5
+# The marks the bridge puts on a message addressed to it: received, then
+# answered or failed. A person reads them as a sequence, so they have to
+# *land* as one — see ``_ack``.
+ACK_RECEIVED = "⏳"
+ACK_ANSWERED = "✅"
+ACK_FAILED = "⚠"
+# Message id -> the last mark put on it, so a second turn against the same
+# message cannot put "received" back on after "answered". Bounded like the
+# other per-message maps.
+ACK_CAP = 200
 # How long an outstanding clarifying question stays answerable through the
 # registry. After that it is dropped; the question stays in the channel and
 # a typed answer is still handled as ordinary prose.
@@ -390,6 +400,8 @@ class ChatBridge(ABC):
         # One knob times the whole ask: the clickable choices, the typed
         # match window and the auto-file sweep expire together.
         self._question_ttl_s = float(config.concierge.clarify_ttl_s)
+        # Message id -> the last ack mark put on it (see ``_ack``).
+        self._acks: dict[str, str] = {}
 
     # -- transport seams (one implementation per service) -------------------------
 
@@ -761,6 +773,10 @@ class ChatBridge(ABC):
             is_run_thread=not msg.author_is_bot and self._is_run_thread(msg.channel_id),
             mention_re=self.mention_re,
         )
+        if route.kind in ("concierge", "steer"):
+            # Before the turn is even queued: "received" is only worth
+            # anything while the person is still looking at what they sent.
+            self._ack(msg, ACK_RECEIVED)
         if route.kind == "command":
             self._schedule(self._command(msg, route.text))
         elif route.kind == "concierge":
@@ -809,6 +825,9 @@ class ChatBridge(ABC):
                     f"run {code(run_id)} has finished; steering is no longer possible.",
                 )
             )
+            # Routing already put ⏳ on: settle it, or the message keeps a
+            # clock for a steer nothing will ever answer.
+            self._ack(msg, ACK_FAILED)
             return
         mid = engine.post_user_message(text)
         self.log.info(
@@ -821,7 +840,6 @@ class ChatBridge(ABC):
         )
         with self._lock:
             self._pending[mid] = _Pending(run_id, thread_id, msg.message_id)
-        self._schedule(self._react(msg.raw, "⏳"))
         self._schedule(self._post_steer_status(run_id, mid, msg.channel))
 
     # -- run watches (#335) -----------------------------------------------------------
@@ -1036,7 +1054,6 @@ class ChatBridge(ABC):
                 reply_to=msg.raw,
             )
             return
-        await self._react(msg.raw, "⏳")
         turn = _ConciergeTurn(msg)
         behind = self.concierge.pending
         if behind > 0:
@@ -1091,7 +1108,7 @@ class ChatBridge(ABC):
             # A closed concierge (shutdown race) or a lost future: say so, once.
             self.log.warning("chat.concierge_turn_failed", by=author, error=str(exc), exc_info=True)
             await finish_notes()
-            await self._react(msg.raw, "⚠")
+            await self._ack_now(msg, ACK_FAILED)
             await self._send(channel, f"⚠ concierge: {_one_line(str(exc), 300)}", reply_to=msg.raw)
             return
         await finish_notes()
@@ -1102,7 +1119,7 @@ class ChatBridge(ABC):
     ) -> None:
         channel = msg.channel
         if not reply.ok:
-            await self._react(msg.raw, "⚠")
+            await self._ack_now(msg, ACK_FAILED)
             await self._send(
                 channel, f"⚠ concierge: {reply.error or 'no answer'}", reply_to=msg.raw
             )
@@ -1123,7 +1140,7 @@ class ChatBridge(ABC):
             await self._post_choice_question(
                 msg, text, question, mention_users=asking and bool(mention)
             )
-            await self._react(msg.raw, "✅")
+            await self._ack_now(msg, ACK_ANSWERED)
             return
         first = True
         for chunk in split_markdown(text, self.chat.max_message_chars):
@@ -1134,7 +1151,7 @@ class ChatBridge(ABC):
                 mention_users=first and asking and bool(mention),
             )
             first = False
-        await self._react(msg.raw, "✅")
+        await self._ack_now(msg, ACK_ANSWERED)
 
     # -- clarifying questions with enumerable answers (#564) --------------------------
 
@@ -2246,7 +2263,8 @@ class ChatBridge(ABC):
             )
             if msg is None:
                 raise LookupError(f"message {pending.message_id} in {pending.thread_id}")
-            await self._add_reaction(msg, "✅")
+            self._mark_ack(pending.message_id, ACK_ANSWERED)
+            await self._add_reaction(msg, ACK_ANSWERED)
         except Exception:
             self.log.warning(
                 "chat.steer_react_failed",
@@ -2300,6 +2318,56 @@ class ChatBridge(ABC):
             await self._add_reaction(message, emoji)
         except Exception:
             self.log.debug("chat.react_failed", emoji=emoji, exc_info=True)
+
+    def _ack(self, msg: Inbound, emoji: str) -> None:
+        """Mark a message addressed to the bot: ⏳ received, ✅ answered,
+        ⚠ failed. Scheduled, never awaited.
+
+        The "received" mark is the whole answer to *is anything happening?*,
+        so it is put on at routing time and on its own task: inside the turn
+        it queues behind a store write and whatever else the loop is busy
+        with, and a clock that appears once the reply is already posted
+        tells the reader nothing they cannot see.
+        """
+        if msg.raw is None:  # a synthetic turn (clarify nudge) has no message
+            return
+        if not self._mark_ack(msg.message_id or "", emoji):
+            return
+        self._schedule(self._react(msg.raw, emoji))
+
+    async def _ack_now(self, msg: Inbound, emoji: str) -> None:
+        """``_ack`` for a mark the caller wants on the message before it
+        moves on: the answered/failed marks, which belong after the reply
+        they are about."""
+        if msg.raw is None:
+            return
+        if not self._mark_ack(msg.message_id or "", emoji):
+            return
+        await self._react(msg.raw, emoji)
+
+    def _mark_ack(self, message_id: str, emoji: str) -> bool:
+        """Record a message's ack state; False when this mark would put the
+        sequence back and must not be sent at all.
+
+        A message can be the subject of more than one turn — answering a
+        clarifying question runs another against the *same* message — and a
+        ⏳ landing after that message's ✅ reads as a fresh ask nobody is
+        working on. Once answered, a message is never marked received
+        again.
+        """
+        if not message_id:
+            return True
+        with self._lock:
+            if emoji == ACK_RECEIVED and self._acks.get(message_id) in (
+                ACK_ANSWERED,
+                ACK_FAILED,
+            ):
+                self.log.debug("chat.ack_out_of_order", message=message_id, emoji=emoji)
+                return False
+            self._acks[message_id] = emoji
+            while len(self._acks) > ACK_CAP:
+                self._acks.pop(next(iter(self._acks)))
+        return True
 
     def _agent_ident(self, run_id: str | None = None) -> AgentIdent:
         """The agent backend + model to show for a run. A run whose engine

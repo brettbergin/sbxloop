@@ -4,7 +4,13 @@ client, no network, aiohttp not required. The service-agnostic behaviour
 test_daemon_discord.py; this file covers the Mattermost seams: event
 normalisation and filtering, threads as the root post id, mention
 neutralisation at the send seam, reactions by name, the permalink thread
-pointer, the token check and the once-logged channel error."""
+pointer, the token check and the once-logged channel error.
+
+``TestTyping`` and ``TestSpentAffordances`` are the parity half: the three
+signals a Discord user gets from an interaction — received, still working,
+affordance spent — reaching a Mattermost one through the shapes that
+service actually has.
+"""
 
 from __future__ import annotations
 
@@ -22,6 +28,7 @@ from sbxloop.daemon.chat import build_bridge
 from sbxloop.daemon.chat_choices import Choice, ChoiceQuestion
 from sbxloop.daemon.discord_format import EmbedSpec
 from sbxloop.daemon.mattermost import (
+    EXPIRED_CLICK_NOTE,
     MattermostApiError,
     MattermostBridge,
     MattermostMessage,
@@ -57,6 +64,9 @@ class FakeMattermostClient:
         self.posts: list[dict[str, Any]] = []
         self.patches: list[tuple[str, dict[str, Any]]] = []
         self.reactions: list[tuple[str, str, str]] = []
+        self.unreactions: list[tuple[str, str, str]] = []
+        self.typing: list[tuple[str, str]] = []
+        self.fail_reaction: Exception | None = None
         self.lookups: list[str] = []
         self.users = {USER_ID: "ana"}
         self.connected = False
@@ -87,7 +97,15 @@ class FakeMattermostClient:
         return {"id": post_id}
 
     async def create_reaction(self, user_id: str, post_id: str, emoji_name: str) -> None:
+        if self.fail_reaction is not None:
+            raise self.fail_reaction
         self.reactions.append((user_id, post_id, emoji_name))
+
+    async def delete_reaction(self, user_id: str, post_id: str, emoji_name: str) -> None:
+        self.unreactions.append((user_id, post_id, emoji_name))
+
+    async def send_typing(self, channel_id: str, parent_id: str = "") -> None:
+        self.typing.append((channel_id, parent_id))
 
     async def upload_file(self, channel_id: str, name: str, content: bytes) -> str:
         if self.fail_upload:
@@ -626,4 +644,197 @@ class TestReactionGate:
         client.react(prompt_id, "white_check_mark")
         assert wait_for(lambda: bool(approved))
         assert approved[0][0] == "r1"
+        bridge.close()
+
+
+class TestTyping:
+    """Discord's typing indicator, in the shape Mattermost has for it.
+
+    The ⏳ ack says a message was *received*; a concierge turn that thinks
+    for a minute needs something that says the daemon is *still on it*, or
+    the human is left wondering whether their ask was picked up at all.
+    """
+
+    def test_a_concierge_turn_says_the_bot_is_typing(self, tmp_path: Path) -> None:
+        concierge = FakeConcierge()
+        concierge.gate.clear()  # hold the turn open so the beat has to run
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        try:
+            client.deliver(posted(f"@{BOT_NAME} what is running?"))
+            assert wait_for(lambda: bool(client.typing))
+            assert client.typing[0] == (CHANNEL, "")
+        finally:
+            concierge.gate.set()
+            bridge.close()
+
+    def test_the_indicator_stops_when_the_turn_answers(self, tmp_path: Path) -> None:
+        concierge = FakeConcierge()
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        try:
+            client.deliver(posted(f"@{BOT_NAME} what is running?"))
+            assert wait_for(lambda: bool(client.posts))
+            settled = len(client.typing)
+            assert not wait_for(lambda: len(client.typing) > settled, timeout=0.5)
+        finally:
+            bridge.close()
+
+    def test_a_typing_frame_the_service_refuses_does_not_fail_the_turn(
+        self, tmp_path: Path
+    ) -> None:
+        concierge = FakeConcierge()
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+
+        async def refuse(channel_id: str, parent_id: str = "") -> None:
+            raise MattermostApiError(500, "websocket gone")
+
+        client.send_typing = refuse  # type: ignore[assignment]
+        try:
+            client.deliver(posted(f"@{BOT_NAME} what is running?"))
+            assert wait_for(lambda: any("hello" in p["message"] for p in client.posts))
+        finally:
+            bridge.close()
+
+    def test_the_frame_carries_the_thread_when_the_ask_is_in_one(self, tmp_path: Path) -> None:
+        """A ``user_typing`` frame is scoped to a channel *and* a root post,
+        so the indicator shows where the person is actually looking."""
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            asyncio.run(bridge._send_typing(MattermostTarget(CHANNEL, root_id="r" * 26)))
+            assert client.typing == [(CHANNEL, "r" * 26)]
+        finally:
+            bridge.close()
+
+
+class TestRefusedReactions:
+    def test_a_refused_reaction_is_reported_once_with_the_emoji_name(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """An instance whose emoji set does not carry the name the bridge
+        reacts with costs a human the ack that says their ask was picked up
+        — and used to do it with nothing in the log. One warning per name
+        names the emoji and quotes what the server said."""
+        bridge, client, _ = make_bridge(tmp_path)
+        client.fail_reaction = MattermostApiError(400, "Invalid or missing emoji_name parameter")
+        with caplog.at_level(logging.WARNING):
+            for _ in range(3):
+                asyncio.run(bridge._add_reaction(MattermostMessage(CHANNEL, "p" * 26), "⏳"))
+        refused = [r for r in caplog.records if "reaction_refused" in r.getMessage()]
+        assert len(refused) == 1
+        fields = refused[0].msg
+        assert isinstance(fields, dict)
+        assert fields["emoji_name"] == "hourglass_flowing_sand"
+        assert fields["detail"] == "Invalid or missing emoji_name parameter"
+        bridge.close()
+
+    def test_a_refusal_that_is_not_a_400_still_raises(self, tmp_path: Path) -> None:
+        """A 403 is the bot missing a permission, not an emoji this server
+        does not know: the caller logs it with its own context."""
+        bridge, client, _ = make_bridge(tmp_path)
+        client.fail_reaction = MattermostApiError(403, "permission denied")
+        with pytest.raises(MattermostApiError):
+            asyncio.run(bridge._add_reaction(MattermostMessage(CHANNEL, "p" * 26), "⏳"))
+        bridge.close()
+
+    def test_each_emoji_is_reported_on_its_own(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        client.fail_reaction = MattermostApiError(400, "nope")
+        with caplog.at_level(logging.WARNING):
+            for emoji in ("⏳", "✅", "⏳"):
+                asyncio.run(bridge._add_reaction(MattermostMessage(CHANNEL, "p" * 26), emoji))
+        refused = [r for r in caplog.records if "reaction_refused" in r.getMessage()]
+        assert len(refused) == 2
+        bridge.close()
+
+
+class TestSpentAffordances:
+    """A seeded emoji is this bridge's button; one left on a settled prompt
+    is a button that can only fail. Discord clears its view and Slack its
+    blocks — these are the same act, in reactions."""
+
+    def test_an_answered_question_keeps_its_body_and_loses_its_digits(self, tmp_path: Path) -> None:
+        concierge = FakeConcierge()
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        question = ChoiceQuestion(
+            prompt="Which base?",
+            choices=[Choice(value="main", label="main"), Choice(value="dev", label="dev")],
+        )
+        asker = bridge._inbound(
+            json.loads(posted("@sbxloop which base?")["data"]["post"])  # type: ignore[arg-type]
+        )
+        assert asker is not None
+        posted_msg = asyncio.run(bridge._send_choices(MattermostTarget(CHANNEL), "", question))
+        assert posted_msg is not None
+        bridge._register_question(posted_msg.post_id, question, asker)
+        client.react(posted_msg.post_id, "two")
+        assert wait_for(lambda: bool(client.patches))
+        rewritten = client.patches[-1][1]["message"]
+        # the question is still readable above the answer, as on Discord
+        assert "Which base?" in rewritten
+        assert "_Answered: **dev** (by ana)._" in rewritten
+        assert wait_for(lambda: len(client.unreactions) == 2)
+        assert [r[2] for r in client.unreactions] == ["one", "two"]
+        bridge.close()
+
+    def test_a_resolved_gate_loses_its_approve_reaction(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        gate = make_gate("r1")
+        posted_msg = asyncio.run(bridge._send_gate(MattermostTarget(CHANNEL), "approve?", gate))
+        assert posted_msg is not None
+        asyncio.run(bridge._finalize_gate_message(posted_msg, "✅ approved by ana — merged"))
+        assert client.patches[-1][1]["message"] == "✅ approved by ana — merged"
+        assert client.unreactions == [(BOT_ID, posted_msg.post_id, "white_check_mark")]
+        # and the prompt no longer answers a reaction as a live gate
+        assert posted_msg.post_id not in bridge._gate_posts
+        bridge.close()
+
+    def test_a_stale_reaction_is_told_to_type_the_answer_once(self, tmp_path: Path) -> None:
+        """Discord and Slack answer a late click privately; a Mattermost bot
+        account has no ephemeral post, so the nudge goes in the thread under
+        the question — once, however many people try it."""
+        bridge, client, _ = make_bridge(tmp_path)
+        question = ChoiceQuestion(
+            prompt="Which base?",
+            choices=[Choice(value="main", label="main"), Choice(value="dev", label="dev")],
+        )
+        posted_msg = asyncio.run(bridge._send_choices(MattermostTarget(CHANNEL), "", question))
+        assert posted_msg is not None
+        # never registered: the same shape as a question the TTL dropped
+        client.react(posted_msg.post_id, "one")
+        assert wait_for(lambda: any(EXPIRED_CLICK_NOTE in p["message"] for p in client.posts))
+        nudge = next(p for p in client.posts if EXPIRED_CLICK_NOTE in p["message"])
+        assert nudge["root_id"] == posted_msg.post_id
+        client.react(posted_msg.post_id, "two", user="d" * 26)
+        assert not wait_for(
+            lambda: len([p for p in client.posts if EXPIRED_CLICK_NOTE in p["message"]]) > 1,
+            timeout=0.3,
+        )
+        bridge.close()
+
+    def test_a_reaction_on_a_post_we_never_seeded_says_nothing(self, tmp_path: Path) -> None:
+        """A digit on somebody's ordinary post is somebody's ordinary emoji,
+        not a misfired click."""
+        bridge, client, _ = make_bridge(tmp_path)
+        client.react("p" * 26, "one")
+        assert not wait_for(lambda: bool(client.posts), timeout=0.3)
+        bridge.close()
+
+
+class TestPostAttachmentCap:
+    def test_files_beyond_the_per_post_cap_are_named_not_dropped(self, tmp_path: Path) -> None:
+        """Mattermost takes five files on a post (Discord takes ten). The
+        sixth is named with its host path, the way an oversized one is."""
+        bridge, client, _ = make_bridge(tmp_path)
+        paths = []
+        for index in range(7):
+            artifact = tmp_path / f"part{index}.txt"
+            artifact.write_text("x")
+            paths.append(str(artifact))
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "done", files=paths))
+        assert len(client.uploads) == 5
+        assert len(client.posts[-1]["file_ids"]) == 5
+        body = client.posts[-1]["message"]
+        assert "part5.txt" in body and "part6.txt" in body
+        assert "part0.txt" not in body
         bridge.close()
