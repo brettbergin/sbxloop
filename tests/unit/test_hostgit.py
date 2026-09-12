@@ -677,6 +677,26 @@ class TestCloneExistingBranch:
         with Repo(target) as clone:
             assert clone.git.rev_parse(hostgit.CLONE_BASE_REF).strip() == sha
 
+    def test_the_branch_the_source_has_checked_out_lands_consistently(self, tmp_path: Path) -> None:
+        """A single-branch clone of the source carries the source's checked-out
+        branch as `origin/<name>` (its local state, not its remote-tracking
+        ref), and the clone starts on that branch already. `-B` onto it is a
+        no-move for the ref, and ref, HEAD and work tree must still agree —
+        a bare ref update on the checked-out branch would not touch the tree."""
+        _, checkout = make_upstream_and_clone(tmp_path)
+        (checkout / "local.txt").write_text("local\n")
+        git("add", ".", cwd=checkout)
+        git("commit", "-q", "-m", "local work on main", cwd=checkout)
+        local = hostgit.head_commit(checkout)
+        target = tmp_path / "run"
+        assert hostgit.clone_existing_branch(checkout, target, "main") == local
+        with Repo(target) as clone:
+            assert clone.active_branch.name == "main"
+            assert clone.head.commit.hexsha == local
+            assert clone.git.rev_parse(hostgit.CLONE_BASE_REF).strip() == local
+            assert not clone.is_dirty(untracked_files=True)
+        assert (target / "local.txt").read_text() == "local\n"
+
     def test_a_missing_branch_refuses_rather_than_falling_back(self, tmp_path: Path) -> None:
         """The failure that matters. Provisioning failing is recoverable;
         delivering a tree that never had the PR's work is not."""

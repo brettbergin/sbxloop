@@ -133,7 +133,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from git import Git, GitCommandError, InvalidGitRepositoryError, NoSuchPathError, Repo
+from git import Git, GitCommandError, InvalidGitRepositoryError, NoSuchPathError, Reference, Repo
 
 from sbxloop import gitcredentials
 from sbxloop.errors import DeliveryError, ProvisionError
@@ -369,6 +369,24 @@ def origin_matches_repo(path: Path, repo: str) -> bool | None:
     return origin == expected
 
 
+def _pin_base(clone: Repo) -> str:
+    """Pin the commit a fresh clone starts from under :data:`CLONE_BASE_REF`
+    and return its sha. A plain reference, not a branch: the agent must
+    never see it in ``git branch``."""
+    sha = clone.head.commit.hexsha
+    Reference.create(clone, CLONE_BASE_REF, sha)
+    return sha
+
+
+def _reset_branch(clone: Repo, branch: str, start: str) -> None:
+    """``git checkout -B <branch> <start>``: create or force ``branch`` onto
+    ``start`` and check it out. ``branch`` may be the one the clone already
+    has checked out (a ``--branch`` clone lands on it), and a ref update
+    alone would leave the work tree behind at the old commit — so the
+    checkout is forced, which on a fresh clone discards nothing."""
+    clone.create_head(branch, start, force=True).checkout(force=True)
+
+
 def clone_for_run(source: Path, target: Path, branch: str) -> str:
     """Clone ``source`` into ``target`` on a fresh ``branch``; return HEAD sha.
 
@@ -395,12 +413,10 @@ def clone_for_run(source: Path, target: Path, branch: str) -> str:
         with Repo.clone_from(
             str(source), str(target), env=_local_clone_env(), multi_options=list(CLONE_OPTIONS)
         ) as clone:
-            clone.git.checkout("-b", branch)
+            clone.create_head(branch).checkout()
             if upstream is not None:
-                clone.git.remote("set-url", "origin", upstream)
-            sha = clone.head.commit.hexsha
-            clone.git.update_ref(CLONE_BASE_REF, sha)
-            return sha
+                clone.remotes.origin.set_url(upstream)
+            return _pin_base(clone)
     except (GitCommandError, NoSuchPathError, OSError, ValueError) as exc:
         if target.exists() and not (target / ".git").is_dir():
             shutil.rmtree(target, ignore_errors=True)
@@ -452,12 +468,10 @@ def clone_from_remote(
             if existing:
                 # A fix round continuing its own pull request: start from what
                 # the remote branch actually has.
-                clone.git.checkout("-B", branch, f"origin/{branch}")
+                _reset_branch(clone, branch, f"origin/{branch}")
             else:
-                clone.git.checkout("-b", branch)
-            sha = clone.head.commit.hexsha
-            clone.git.update_ref(CLONE_BASE_REF, sha)
-            return sha
+                clone.create_head(branch).checkout()
+            return _pin_base(clone)
     except (GitCommandError, NoSuchPathError, OSError, ValueError) as exc:
         if target.exists() and not (target / ".git").is_dir():
             shutil.rmtree(target, ignore_errors=True)
@@ -610,12 +624,10 @@ def clone_existing_branch(source: Path, target: Path, branch: str) -> str:
                 # rather than mutating it; a local branch of that name on the
                 # source (a hand-made checkout) is the second place to look.
                 _fetch_branch_from_source(clone, source, branch)
-            clone.git.checkout("-B", branch, remote_ref)
+            _reset_branch(clone, branch, remote_ref)
             if upstream is not None:
-                clone.git.remote("set-url", "origin", upstream)
-            sha = clone.head.commit.hexsha
-            clone.git.update_ref(CLONE_BASE_REF, sha)
-            return sha
+                clone.remotes.origin.set_url(upstream)
+            return _pin_base(clone)
     except ProvisionError:
         # The clone itself succeeded — it is the branch that is missing — so
         # `.git` exists and the usual "only clean a half-clone" guard would
