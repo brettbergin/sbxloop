@@ -524,10 +524,6 @@ jobs:
         if: always() && steps.wheels.outputs.dist != ''
         run: rm -rf -- "${{ steps.wheels.outputs.dist }}"
 
-      - name: Clean up the workflow helper
-        if: always() && env.PIPELINE_DIR != ''
-        run: rm -rf -- "${PIPELINE_DIR}"
-
       - name: Report
         if: always() && steps.installed.outputs.changed == 'true'
         env:
@@ -560,3 +556,7 @@ jobs:
           # The helper survives an upgrade or rollback; the installed
           # notifier still reads sbxloop's config and secrets (#639).
           DEPLOY_NOTICE="${MSG}" "${VENV_PYTHON}" "${PIPELINE}" deploy-notify
+
+      - name: Clean up the workflow helper
+        if: always() && env.PIPELINE_DIR != ''
+        run: rm -rf -- "${PIPELINE_DIR}"

@@ -38,7 +38,7 @@ from sbxloop.log import get_logger
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.provision import agent_policy_allows
-from sbxloop.sbx.sandbox import BAKE_MANIFEST, SBXLOOP_DIR, Sandbox
+from sbxloop.sbx.sandbox import BAKE_MANIFEST, SBXLOOP_DIR, VENV_PYTHON, Sandbox
 from sbxloop.worker.client import WorkerClient
 
 log = get_logger(__name__)
@@ -141,6 +141,12 @@ def bake_template(
                 # a language that was not selected for this bake.
                 apt_packages=list(dict.fromkeys(["xz-utils", *config.sandbox.apt_packages])),
             )
+            if client.python != VENV_PYTHON:
+                raise BakeError(
+                    "baking requires an isolated worker virtualenv; install the base image's "
+                    "matching python3.X-venv package and retry (use --keep to inspect the "
+                    "scratch sandbox). The user-site fallback cannot be saved as a template"
+                )
 
             if cache_runtime and config.agent.backend == "copilot":
                 report("pre-caching the Copilot runtime")
@@ -166,7 +172,6 @@ def bake_template(
                 "baked_at": time.time(),
                 "languages": baked_languages,
             }
-            # The user-site install fallback never creates ~/.sbxloop.
             sandbox.mkdirs(SBXLOOP_DIR)
             sandbox.write_text(BAKE_MANIFEST, json.dumps(manifest))
 

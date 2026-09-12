@@ -578,6 +578,14 @@ timeout. Other apt errors return immediately. A toolchain installer is
 skipped when its pooled apt prerequisite install fails; the diagnostic
 distinguishes contention, permission, package and mirror failures.
 
+Worker venv repair probes the running sandbox `python3` and installs its
+matching `python3.X-venv` package, since the distro's `python3-venv`
+metapackage may target a different minor version. An unknown interpreter or
+failed apt repair is logged before ordinary provisioning falls back to a
+user-site install. `sbxloop bake` requires the isolated worker interpreter
+and refuses to save a template or bake record after that fallback, so a
+missing venv prerequisite cannot be persisted as a successful bake.
+
 ### Verify mode (#682)
 
 `Config.verify_mode_for(repo)` resolves `[sandbox] verify_mode` with the

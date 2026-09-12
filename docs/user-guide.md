@@ -466,6 +466,15 @@ return immediately. If a toolchain's apt prerequisites fail, its installer
 is skipped and the warning names the cause instead of attempting extraction
 with missing tools.
 
+The bake requires an isolated worker virtualenv. If the base image lacks
+`ensurepip`, installation probes its running `python3` and installs the
+matching `python3.X-venv` package (plus `python3-pip`) before retrying.
+If repair fails, bake stops without saving a template; `--keep` retains the
+scratch sandbox for inspection. Ordinary provisioning keeps the user-site
+fallback for unusual images and logs the repair failure. Re-bake and set
+`[sandbox] template` to the saved ref to avoid repeating installation on new
+sandboxes.
+
 #### Which models can I use?
 
 Wondering what to put in `model = "..."` (or `--model`)? Ask the configured
