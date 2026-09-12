@@ -184,9 +184,17 @@ jobs:
   # the cross-platform branches these guard are covered in the Linux shards
   # through injected seams, and the suite at large assumes a POSIX host.
   # Soft: native Windows is a diagnosable host, not a supported sandbox one
-  # (docs/user-guide.md, "Platform support"), so this reports rather than
-  # blocks. Keep it one job: the workflow's peak is near the 20-concurrent
-  # cap on the Free plan (see the pytest job's comment).
+  # (docs/user-guide.md, "Platform support"), and the suite at large assumes
+  # a POSIX host — an unrelated test that cannot even be *collected* on
+  # Windows would otherwise block every pull request, which is a cost the
+  # one supported platform should not pay. So this reports rather than
+  # blocks; read it, do not ignore it. Its first run paid for itself twice
+  # over: no tz database on Windows (hence the `tzdata` dependency) and an
+  # `OWNER RIGHTS` entry read as a stranger, neither of which a Linux runner
+  # can see. Promoting it to a required check is the maintainer's call once
+  # it has a run of green behind it.
+  # Keep it one job: the workflow's peak is near the 20-concurrent cap on
+  # the Free plan (see the pytest job's comment).
   windows-host:
     runs-on: windows-latest
     continue-on-error: true
