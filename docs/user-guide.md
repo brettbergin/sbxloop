@@ -289,7 +289,16 @@ totals; unavailable usage stays unknown and no price is inferred.
 Everything sbxloop puts on a host lives under one directory, the **home**:
 `~/.sbxloop` (`SBXLOOP_HOME` moves it). One command builds it — the
 interpreter, the launchers, Docker's `sbx`, the config and secrets files,
-and on Linux the systemd units:
+and on Linux the systemd units.
+
+The host brings what that command cannot: curl, tar, git and e2fsprogs
+(`mkfs.ext4`, for sandboxd's block driver). Git is a host dependency in its
+own right — sbxloop reads and clones checkouts on the host, and the git a
+sandbox carries is a separate one that does not stand in for it — so the
+installer checks for a usable git, along with curl and tar, before it
+downloads anything, and names what to install rather than failing later with
+a traceback. `GIT_PYTHON_GIT_EXECUTABLE`, if you set it, is the executable
+the check looks at, since it is the one sbxloop will use.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/brettbergin/sbxloop/main/scripts/install.sh | sh
