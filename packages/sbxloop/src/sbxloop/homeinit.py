@@ -9,7 +9,8 @@ One idempotent command builds everything a host needs under the home
 3. the interpreter: ``uv`` in ``bin/``, a uv-managed CPython under
    ``python/``, and ``venv/`` with ``sbxloop[discord,slack]`` and the
    worker pinned to this exact version (skipped when init already runs
-   from that venv);
+   from that venv) — every uv command pointed at the home's own
+   directories, never the ones the invoking user's environment names;
 4. Docker's ``sbx``, installed by its own installer with the home as
    ``PREFIX``, pinned to the series sbxloop is tested against and recorded
    in ``sbx/VERSION`` only once the installed executable reports it;
@@ -453,14 +454,14 @@ class HomeInit:
                 "pass --version X.Y.Z to say which release to install, or --wheels DIR"
             )
         uv = self._ensure_uv()
-        self.run([str(uv), "python", "install", PYTHON_SERIES])
+        self._uv_run([str(uv), "python", "install", PYTHON_SERIES])
         if not self.home.venv_python.exists():
-            self.run([str(uv), "venv", "--python", PYTHON_SERIES, str(self.home.venv)])
+            self._uv_run([str(uv), "venv", "--python", PYTHON_SERIES, str(self.home.venv)])
         spec = [f"sbxloop[{INSTALL_EXTRAS}]=={self.version}", f"sbxloop-worker=={self.version}"]
         argv = [str(uv), "pip", "install", "--python", str(self.home.venv_python)]
         if self.options.wheels is not None:
             argv += ["--find-links", str(self.options.wheels)]
-        self.run([*argv, *spec])
+        self._uv_run([*argv, *spec])
         self.report.done.append(f"venv (sbxloop {self.version})")
 
     def _uv_env(self) -> dict[str, str]:
@@ -471,6 +472,16 @@ class HomeInit:
             "UV_CACHE_DIR": str(self.home.cache / "uv"),
             "UV_PYTHON_INSTALL_DIR": str(self.home.python),
         }
+
+    def _uv_run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        """Every uv command that builds the home — the installer that puts uv
+        in ``bin/``, and each command that installer's uv then runs — under the
+        home's own directories. uv reads ``UV_PYTHON_INSTALL_DIR`` and
+        ``UV_CACHE_DIR`` from the environment and otherwise falls back to the
+        invoking user's, which would leave the managed interpreter and its
+        cache somewhere the home's launcher never looks: whatever the operator
+        inherited, the home being built is the one that wins."""
+        return self._run_env(argv, self._uv_env())
 
     def _ensure_uv(self) -> Path:
         """``bin/uv``: the home's own, downloaded with Astral's installer into
@@ -488,7 +499,7 @@ class HomeInit:
         with tempfile.TemporaryDirectory(dir=self.home.tmp) as scratch:
             script = Path(scratch) / "uv-install.sh"
             self.fetch(UV_INSTALLER_URL, script)
-            self._run_env(["sh", str(script)], self._uv_env())
+            self._uv_run(["sh", str(script)])
         if not uv.exists():
             raise InitError(f"the uv installer did not leave {uv} behind")
         return uv
