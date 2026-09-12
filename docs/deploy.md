@@ -83,8 +83,8 @@ On a host installed under a custom `SBXLOOP_HOME`, read `~/.sbxloop` above as th
 `sbxloop` itself already honours the variable, so only the two explicit `~/.sbxloop/…`
 paths change. `reset-failed` matters: `StartLimitBurst=5` per 600 s leaves a unit that
 crash-looped in `failed`, where a plain `restart` will not revive it. The daemon comes back
-unpaused (holds are in-memory), so re-take any hold you want to keep. Pin the version exactly — a
-downgrade is the same two commands with an older `X.Y.Z`. Then check it:
+unpaused (holds are in-memory), so re-take any hold you want to keep. Pin the version
+exactly — a downgrade is the same two commands with an older `X.Y.Z`. Then check it:
 
 ```bash
 systemctl --user is-active sbxloop-daemon

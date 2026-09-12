@@ -93,8 +93,7 @@ installed under a custom `SBXLOOP_HOME`, read `~/.sbxloop` above as that
 root — `sbxloop` reads the variable itself, so only the two explicit
 `~/.sbxloop/…` paths change. `reset-failed` matters: `StartLimitBurst=5` per
 600s leaves a unit that crash-looped in `failed`, where a plain `restart`
-will not revive it. The daemon comes back
-**unpaused** regardless — holds are in-memory only — so re-take any you want
+will not revive it. The daemon comes back **unpaused** regardless — holds are in-memory only — so re-take any you want
 to keep. A downgrade is the same commands with an older version, or
 `sbxloop backup restore <name>` for the config and state of a snapshot.
 
