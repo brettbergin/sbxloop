@@ -1159,18 +1159,41 @@ calls to probe capacity.
 Terminal inference failures cross the worker boundary as
 `ErrorInfo.provider` (`ProviderFailure`), before task JSON parsing. Claude
 uses `AssistantMessage.error`, `ResultMessage.is_error` and, when present,
-`api_error_status` and `RateLimitEvent.rate_limit_info`. Informational rate
+`api_error_status` and `RateLimitEvent.rate_limit_info`. Copilot reads
+`SessionErrorData` (`error_type`, `error_code`, `status_code`,
+`remediation`, `eligible_for_auto_switch`) from its event stream before
+`send_and_wait` collapses it into a generic exception, and takes retry
+timing from `AutoModeSwitchRequestedData.retry_after_seconds`; the switch
+itself is declined, so a throttle never moves a run onto another model.
+Per-call `ModelCallFailureData`, its internal quota snapshots and an
+app-set session credit cap (`SessionLimitsConfig.max_ai_credits`) are not
+session outcomes and park nothing. Informational rate
 events and errors followed by a successful response do not fail a job.
 Text classification is confined to error envelopes. Fixed diagnostic
 reasons keep provider account/credential prose out of the chronology;
 session identity, partial output and usage remain on the error result.
+
+A rejection an adapter cannot place is not classified: it stays an
+ordinary task failure, which stops the run without parking a credential
+that may not be limited. Authentication failures keep their own
+credential diagnostic rather than becoming a hold, and a limit is never
+diagnosed as authentication.
 
 `provider.ProviderRecovery` guards every agent `WorkerClient.submit`,
 including steering and the concierge. The `provider_holds` and
 `provider_jobs` tables commit the credential-scoped hold and interrupted
 job together. Each backend currently has one inference credential source
 per home, so its repositories and models share a hold. GitHub tokens do
-not define an inference scope. Other adapters can use the same contract.
+not define an inference scope. The contract is backend-neutral: the host
+branches on `ProviderFailure`, never on which adapter produced it.
+
+A resume the provider refused for capacity does not open a fresh session:
+opening one buys a second rejection and discards the resumable context,
+so the rejection is reported and the run parks instead. A session that is
+genuinely missing or expired still falls back to a fresh one, except
+under `require_resume`, where work only the original session holds parks
+for inspection rather than being re-derived by a session that would
+replay its side effects.
 
 Throttles and temporary unavailability allow three scheduled retries with
 exponential backoff and jitter, never earlier than supplied provider
@@ -1190,10 +1213,13 @@ messages are persisted. Rejected attempts' usage is accumulated into the
 eventual result.
 
 SDK envelopes were checked at the minimum supported version v0.2.149 and
-commit `6bbd3093147c2fadcd4b868599b8fb6d9db3d523`. The former v0.1.0 floor
+commit `6bbd3093147c2fadcd4b868599b8fb6d9db3d523`, and for Copilot against
+github-copilot-sdk 1.0.13 (the declared 1.0.8 floor carries the same
+fields). The former v0.1.0 floor
 lacked assistant errors and could not parse rate-limit events. Missing
 optional metadata stays unknown. Live provider
-timing and real sandbox session recovery are **field-unverified**.
+timing, the service payload inside a refused Copilot create/resume, and
+real sandbox session recovery are **field-unverified**.
 Synthetic adapter, serialization, fake-clock scheduling and CI sandbox
 tests cover the implementation.
 
