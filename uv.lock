@@ -1793,6 +1793,7 @@ provides-extras = ["codex", "copilot", "discord", "mattermost", "slack"]
 name = "sbxloop-worker"
 source = { editable = "packages/sbxloop-worker" }
 dependencies = [
+    { name = "gitpython" },
     { name = "pydantic" },
 ]
 
@@ -1811,6 +1812,7 @@ copilot = [
 requires-dist = [
     { name = "claude-agent-sdk", marker = "extra == 'claude'", specifier = ">=0.2.149" },
     { name = "github-copilot-sdk", marker = "extra == 'copilot'", specifier = ">=1.0.8" },
+    { name = "gitpython", specifier = ">=3.1.59" },
     { name = "openai-codex", marker = "extra == 'codex'", specifier = "==0.147.0" },
     { name = "pydantic", specifier = ">=2.7" },
 ]
