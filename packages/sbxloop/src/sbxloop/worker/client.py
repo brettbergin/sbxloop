@@ -23,6 +23,7 @@ import codecs
 import contextlib
 import json
 import queue
+import re
 import shlex
 import threading
 import time
@@ -306,9 +307,10 @@ class WorkerClient:
         (Debian/Ubuntu split ensurepip out). The ladder:
 
         1. ``python3 -m venv`` — the clean path.
-        2. On a venv/ensurepip failure: ``sudo -n apt-get install
-           python3-venv python3-pip`` (the template's agent user has sudo;
-           apt hosts are on the balanced allowlist), then retry the venv.
+        2. On a venv/ensurepip failure: probe the running ``python3`` and
+           install its matching ``python3.X-venv`` plus ``python3-pip``
+           with apt, then retry the venv. The distro's unversioned venv
+           package may target a different interpreter from the image's.
         3. Still no venv: **user-site fallback** — ``python3 -m pip install
            --user`` (adding ``--break-system-packages`` when pip reports an
            externally-managed environment), and the worker runs under the
@@ -952,18 +954,7 @@ class WorkerClient:
         if result.ok:
             return True
         output = f"{result.stdout} {result.stderr}".lower()
-        if "ensurepip" in output or "venv" in output:
-            # Self-heal: the official templates run Ubuntu with a sudo-capable
-            # agent user, and apt hosts are on the balanced allowlist.
-            self.sandbox.exec(
-                [
-                    "sh",
-                    "-c",
-                    "sudo -n apt-get update -q && "
-                    "sudo -n apt-get install -y -q python3-venv python3-pip",
-                ],
-                timeout=timeout,
-            )
+        if ("ensurepip" in output or "venv" in output) and self._repair_venv(timeout):
             result = self.sandbox.exec(venv_cmd, timeout=timeout)
             if result.ok:
                 return True
@@ -973,8 +964,50 @@ class WorkerClient:
             rc=result.returncode,
             output=_output_tail(result),
             action="falling back to a user-site install with the system python3",
+            hint="repair the base image's matching python3.X-venv package and re-run sbxloop bake",
         )
         return False
+
+    def _repair_venv(self, timeout: float) -> bool:
+        # Query the interpreter, never parse executable paths or the error's
+        # suggested command. A template may select a newer Python than apt's
+        # python3-venv metapackage serves.
+        probe = self.sandbox.exec(
+            [
+                "python3",
+                "-c",
+                "import sys; print('python%d.%d-venv' % sys.version_info[:2])",
+            ],
+            timeout=timeout,
+        )
+        package = probe.stdout.strip()
+        if not probe.ok or re.fullmatch(r"python3\.[0-9]+-venv", package) is None:
+            log.warning(
+                "worker.venv_repair_failed",
+                sandbox=self.sandbox.name,
+                reason="could not determine the running python3's matching venv package",
+                rc=probe.returncode,
+                output=_output_tail(probe),
+            )
+            return False
+        result = self.sandbox.exec(
+            [
+                "sh",
+                "-c",
+                "sudo -n apt-get update -q && "
+                f"sudo -n apt-get install -y -q {shlex.quote(package)} python3-pip",
+            ],
+            timeout=timeout,
+        )
+        if not result.ok:
+            log.warning(
+                "worker.venv_repair_failed",
+                sandbox=self.sandbox.name,
+                package=package,
+                rc=result.returncode,
+                output=_output_tail(result),
+            )
+        return result.ok
 
     def _pip_user_install(self, target: str, *, timeout: float, no_deps: bool) -> None:
         pip = ["python3", "-m", "pip", "install", "--quiet", "--user"]

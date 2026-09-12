@@ -571,6 +571,14 @@ mark once the profile has run, and a stream without the mark is kept whole; the
 first failure raises out of provisioning like an install failure, so
 `keep_on_failure` applies. The bake installs the global package list only.
 
+Worker venv repair probes the running sandbox `python3` and installs its
+matching `python3.X-venv` package, since the distro's `python3-venv`
+metapackage may target a different minor version. An unknown interpreter or
+failed apt repair is logged before ordinary provisioning falls back to a
+user-site install. `sbxloop bake` requires the isolated worker interpreter
+and refuses to save a template or bake record after that fallback, so a
+missing venv prerequisite cannot be persisted as a successful bake.
+
 ### Verify mode (#682)
 
 `Config.verify_mode_for(repo)` resolves `[sandbox] verify_mode` with the
