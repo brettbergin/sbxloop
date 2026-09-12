@@ -200,7 +200,11 @@ def _tracked_files() -> list[Path]:
     repository is a hard failure, never a fallback to walking the filesystem:
     the gate must not quietly check the wrong file set."""
     with Repo(ROOT) as repo:
-        return [ROOT / path for path, _stage in repo.index.entries]
+        # `ls-files -z` as bytes rather than `repo.index.entries`: GitPython
+        # decodes index paths strictly, and one filename that is not valid
+        # UTF-8 would fail the whole gate instead of being one more path.
+        listing: bytes = repo.git.ls_files("-z", stdout_as_string=False)
+    return [ROOT / part.decode("utf-8", "surrogateescape") for part in listing.split(b"\0") if part]
 
 
 def _personal_scope() -> list[Path]:

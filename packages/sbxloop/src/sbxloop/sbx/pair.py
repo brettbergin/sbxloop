@@ -23,6 +23,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from sbxloop.config import Config
 from sbxloop.log import get_logger
 from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.prune import remove_run_sandbox_secrets
@@ -46,8 +47,12 @@ class SandboxPair:
         mounted: bool = False,
         languages: LanguageResolution | None = None,
         service_workdir: str | None = None,
+        config: Config,
     ) -> None:
         self.run_id = run_id
+        # What the pair's secret registrations bind under (#617): removed
+        # at cleanup as the configured backend names them.
+        self.config = config
         self.agent = agent
         self.github = github
         self.service = service
@@ -113,7 +118,7 @@ class SandboxPair:
             except Exception:
                 log.warning("sandbox.remove_failed", sandbox=sandbox.name, exc_info=True)
             try:
-                remove_run_sandbox_secrets(sandbox.cli, sandbox.name, role)
+                remove_run_sandbox_secrets(sandbox.cli, sandbox.name, role, self.config)
             except Exception:
                 log.warning("sandbox.secrets_remove_failed", sandbox=sandbox.name, exc_info=True)
 

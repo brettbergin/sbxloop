@@ -22,6 +22,20 @@ PROTOCOL_VERSION = 1
 # they are kept to a conservative identifier alphabet.
 HOST_TOOL_NAME_RE = r"^[A-Za-z0-9_-]{1,64}$"
 
+#: The agent backends a worker can be asked to run, as the host names them
+#: (``[agent] backend``); the host's descriptor table names the same set.
+AGENT_BACKEND_NAMES: tuple[str, ...] = ("copilot", "claude", "codex", "openai")
+
+# The openai backend's endpoint settings travel to the worker as the agent
+# sandbox's plain environment, beside the ``SBXLOOP_WORKER_BACKEND``
+# selector, never as job fields: they are the sandbox's, not one job's. The
+# credential itself rides the secret path under the name
+# ``OPENAI_KEY_NAME_ENV`` points at.
+OPENAI_BASE_URL_ENV = "OPENAI_BASE_URL"
+OPENAI_KEY_NAME_ENV = "SBXLOOP_OPENAI_API_KEY_ENV"
+OPENAI_TIMEOUT_ENV = "SBXLOOP_OPENAI_REQUEST_TIMEOUT_S"
+OPENAI_RETRIES_ENV = "SBXLOOP_OPENAI_MAX_RETRIES"
+
 JobKind = Literal[
     "agent.session",
     "agent.rate_limits",
@@ -367,9 +381,7 @@ class JobRequest(ProtocolModel):
             ):
                 raise ValueError("agent.rate_limits must not carry executable or session fields")
             if set(self.params) != {"backend"} or self.params["backend"] not in (
-                "copilot",
-                "claude",
-                "codex",
+                AGENT_BACKEND_NAMES
             ):
                 raise ValueError("agent.rate_limits requires only the configured backend name")
             if not 0 < self.timeout_s <= 10:

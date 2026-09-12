@@ -72,9 +72,32 @@ secret_strategy = "proxy"
 # egress. "codex" runs the Python Codex SDK with its pinned CLI runtime and
 # needs OPENAI_API_KEY; provisioning allows api.openai.com. Codex uses
 # worker-controlled tools so read-only review and tool-call limits apply.
+# "openai" runs the openai Python client against the endpoint [agent.openai]
+# names — a self-hosted server or gateway speaking the OpenAI wire shape, or
+# the hosted API — with worker-controlled tools like codex; provisioning
+# allows that endpoint's host and binds the credential to it.
 # The chosen credential is injected into the agent sandbox
 # alone, and the top-level `model` names the model the chosen backend runs.
 # backend = "copilot"
+
+# [agent.openai]
+# The endpoint the "openai" backend runs against. Required when
+# backend = "openai": the OpenAI-compatible root including its version path.
+# A hostname on your network, an IPv4/IPv6 literal and an explicit port are
+# all accepted here (and only here — a plan still declares egress as dotted
+# domains); a malformed or missing URL fails config loading with the reason.
+# base_url = "http://vllm.internal:8000/v1"
+# The env var NAME holding the credential, never the key. It is registered
+# with sbx bound to the endpoint's host, so an endpoint wanting no credential
+# still needs a placeholder value in that variable.
+# api_key_env = "OPENAI_API_KEY"
+# Client patience, sized for a local box that may generate slowly: how long
+# one request may take, and how many times the client retries a failed one.
+# request_timeout_s = 600
+# max_retries = 2
+# A plain http:// base_url refuses to load unless this is set: the credential
+# would travel in cleartext, which is never done by accident.
+# allow_insecure_endpoint = false
 
 # [agent.models]
 # Omit a key to inherit top-level model. Explicit "auto" asks the backend
@@ -480,6 +503,14 @@ secret_strategy = "proxy"
 # operator_plan = "auto"
 # operator_execute = "auto"
 # operator_judge = "auto"
+# [github.repos.openai]
+# Sparse per-repository overrides over [agent.openai] for a repository whose
+# code must stay on a private endpoint; omit a key to inherit. The endpoint
+# only — api_key_env is one per host.
+# base_url = "http://private-vllm:8000/v1"
+# request_timeout_s = 900
+# max_retries = 2
+# allow_insecure_endpoint = true
 # [[github.repos]]
 # repo = "you/other-repo"
 # enabled = false              # registered but not polled

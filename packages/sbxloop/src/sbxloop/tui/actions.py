@@ -576,7 +576,7 @@ def remove_one_sandbox(deps: Deps, name: str, role: str | None) -> Action:
     def run() -> Outcome:
         try:
             if role in ("agent", "github", "service"):
-                remove_run_sandbox(deps.sbx(), name, role)  # type: ignore[arg-type]
+                remove_run_sandbox(deps.sbx(), name, role, deps.config)  # type: ignore[arg-type]
             else:
                 remove_sandbox(deps.sbx(), name)
         except SbxloopError as exc:
@@ -615,7 +615,7 @@ def prune_sandboxes(
             for v in orphans:
                 try:
                     if v.role in ("agent", "github", "service"):
-                        remove_run_sandbox(cli, v.name, v.role)  # type: ignore[arg-type]
+                        remove_run_sandbox(cli, v.name, v.role, deps.config)  # type: ignore[arg-type]
                     else:
                         remove_sandbox(cli, v.name)
                 except SbxloopError as exc:

@@ -98,9 +98,13 @@ def _looks_like_value(value: str) -> bool:
     value = value.strip()
     if not value:
         return False
-    return (
-        value[0] in "\"'[{" or value in ("true", "false") or value[0].isdigit() or value[0] == "-"
-    )
+    # A quoted string must close: `backend = "openai": the root …` inside a
+    # paragraph is prose that happens to start with a key.
+    if value[0] in "\"'":
+        return re.fullmatch(r'"[^"]*"|\'[^\']*\'', value) is not None
+    if value[0] in "[{":
+        return True  # an array or table, possibly continued on the next lines
+    return value in ("true", "false") or re.fullmatch(r"-?\d[\w.+:-]*", value) is not None
 
 
 @cache
