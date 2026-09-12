@@ -34,6 +34,9 @@ class Subject:
 @pytest.fixture(params=registered())
 def subject(request: pytest.FixtureRequest) -> Subject:
     backend = BACKENDS[request.param]
+    reason = backend.unavailable()
+    if reason is not None:
+        pytest.skip(reason)
     ops = backend.make()
     needs: set[str] = set()
     for marker in request.node.iter_markers("needs"):

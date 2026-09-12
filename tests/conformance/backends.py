@@ -7,6 +7,11 @@ that arranges the state a scenario needs in that backend's own terms: a
 red check with a log, a base branch's rules, an existing issue. A second
 backend registers itself here with its own fake and its own seeds; the
 scenarios do not change.
+
+A live forge (``tests/live``) registers the same way, under its own name,
+and says through ``unavailable`` why it cannot run here: not configured,
+configured but not answering, or answering with no backend yet to drive
+it. The suite skips with that reason; nothing about the gate changes.
 """
 
 from __future__ import annotations
@@ -18,6 +23,7 @@ from typing import Protocol
 from sbxloop.vcs.model import ChecksVerdict, FailedCheck
 from sbxloop.vcs.protocol import VcsOps
 from tests.fakes.fake_github import FakeGithub
+from tests.live.env import live_forge
 
 
 class Seeds(Protocol):
@@ -42,6 +48,10 @@ class Seeds(Protocol):
         ...
 
 
+def _always_available() -> str | None:
+    return None
+
+
 @dataclass(frozen=True)
 class Backend:
     kind: str
@@ -49,6 +59,8 @@ class Backend:
     base: str
     make: Callable[[], VcsOps]
     seeds: Callable[[VcsOps], Seeds]
+    # Why this entry cannot run here, or None when it can.
+    unavailable: Callable[[], str | None] = _always_available
 
 
 class _GithubSeeds:
@@ -91,8 +103,48 @@ def _github_seeds(ops: VcsOps) -> Seeds:
     return _GithubSeeds(ops)
 
 
+def _no_backend(kind: str) -> Callable[[], VcsOps]:
+    def make() -> VcsOps:
+        raise AssertionError(f"no backend implements kind {kind!r}")
+
+    return make
+
+
+def _no_seeds(ops: VcsOps) -> Seeds:
+    raise AssertionError("a live forge without a backend has no seeds")
+
+
+def _live_without_backend(kind: str) -> Callable[[], str | None]:
+    """A live forge the harness can reach but no backend can drive yet:
+    skip naming both facts, so the skip says the forge was there."""
+
+    def unavailable() -> str | None:
+        forge = live_forge(kind)
+        if isinstance(forge, str):
+            return forge
+        return f"live {kind} {forge.version} answers, but no backend implements kind {kind!r} yet"
+
+    return unavailable
+
+
 BACKENDS: dict[str, Backend] = {
     "github": Backend(kind="github", repo="o/r", base="main", make=_github, seeds=_github_seeds),
+    "gitlab-live": Backend(
+        kind="gitlab",
+        repo="acme/widgets",
+        base="main",
+        make=_no_backend("gitlab"),
+        seeds=_no_seeds,
+        unavailable=_live_without_backend("gitlab"),
+    ),
+    "gitea-live": Backend(
+        kind="gitea",
+        repo="acme/widgets",
+        base="main",
+        make=_no_backend("gitea"),
+        seeds=_no_seeds,
+        unavailable=_live_without_backend("gitea"),
+    ),
 }
 
 
