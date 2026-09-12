@@ -207,17 +207,29 @@ tar xzf actions-runner-linux-x64-<X>.tar.gz
   --token "$(gh api -X POST repos/<owner>/<repo>/actions/runners/registration-token --jq .token)" \
   --name <host> --labels <host> --work _work --unattended --replace
 
-cp contrib/systemd/github-runner.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now github-runner
-loginctl enable-linger "$USER"
+# render the unit for this runner directory, from anywhere — init enables it
+sbxloop init --systemd --no-sbx --runner "$HOME/actions-runner"
+systemctl --user start github-runner
 ```
 
 `self-hosted`, `Linux` and `X64` are added automatically; `--labels <host>` is the one
-`SBXLOOP_DEPLOY_HOST` must match. The runner is a *user* unit
-([contrib/systemd/github-runner.service](../contrib/systemd/github-runner.service)) rather
-than GitHub's `svc.sh` system unit: a system service has no `XDG_RUNTIME_DIR` or
-`DBUS_SESSION_BUS_ADDRESS`, so `systemctl --user restart sbxloop-daemon` fails there with
+`SBXLOOP_DEPLOY_HOST` must match.
+
+The unit is not a file to copy: the packaged template
+([contrib/systemd/github-runner.service](../contrib/systemd/github-runner.service)) carries
+an `@RUNNER@` placeholder where the runner directory goes, and `init --systemd --runner DIR`
+is what puts the absolute path in it, writes it into `~/.sbxloop/systemd/`, enables it from
+there and turns lingering on. So the command needs no source checkout — a wheel or
+`install.sh` installation has everything — and runs from any directory, including the runner
+directory itself. `--no-sbx` leaves an already-installed sandbox runtime alone; init only
+*enables* units, never starts them, which is why `start` is a separate line. Re-running init
+later without `--runner` leaves this unit where it is but stops refreshing it, so carry the
+flag on the host's init line — including the one in the upgrade sequence in
+[contrib/systemd/README.md](../contrib/systemd/README.md).
+
+The runner is a *user* unit rather than GitHub's `svc.sh` system unit: a system service has
+no `XDG_RUNTIME_DIR` or `DBUS_SESSION_BUS_ADDRESS`, so
+`systemctl --user restart sbxloop-daemon` fails there with
 "Failed to connect to bus". `KillMode=process` so stopping the runner never cuts off a
 deploy mid-restart. Confirm with `gh api repos/<owner>/<repo>/actions/runners --jq '.runners[].status'`.
 
