@@ -4,7 +4,7 @@ The full reference for setting up, running, and operating sbxloop.
 For a first run, start with the [README](../README.md).
 
 - [Quickstart](#quickstart)
-- [Agent backends](#agent-backends-copilot-claude-or-codex)
+- [Agent backends](#agent-backends-copilot-claude-codex-or-an-openai-compatible-endpoint)
 - [How a run works](#how-a-run-works)
 - [CLI reference](#cli-reference)
 - [Network access](#network-egress-least-privilege-by-plan)
@@ -22,11 +22,11 @@ For a first run, start with the [README](../README.md).
 
 Every run gets an isolated microVM agent sandbox — plus, when the GitHub integration is configured, a second github-ops sandbox, so no single environment ever holds both credentials:
 
-| Sandbox                 | Credential                                                                                                                                                                                             | Purpose                                                                                                                                                                                                                                    |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `sbxloop-<run>-agent`   | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission), `ANTHROPIC_API_KEY` for Claude, or `OPENAI_API_KEY` for Codex ([Agent backends](#agent-backends-copilot-claude-or-codex))    | Runs the configured agent SDK — [GitHub Copilot SDK](https://github.com/github/copilot-sdk) by default, the Claude Agent SDK or the Python Codex SDK. All model calls and tool executions happen inside this VM.                           |
-| `sbxloop-<run>-github`  | `GH_TOKEN` (fine-grained PAT with the permissions in [docs/permissions.md](permissions.md)) — or a GitHub App installation token, host-minted and auto-refreshed ([GitHub App auth](#github-app-auth)) | Performs the GitHub operations (branch, PR, review, CI polling, merge, issue labels) against the one configured repository. Only provisioned when `[github] repo` is set.                                                                  |
-| `sbxloop-<run>-service` | The `[[credentials]]` a run was granted by name — operator secrets, each bound to one host (#765)                                                                                                      | Makes the authenticated requests the agent asks for through its `call_service` tool, one fixed `service.http` op at a time, redacting the credential from what comes back. Only provisioned for a run granted a credential; none is today. |
+| Sandbox                 | Credential                                                                                                                                                                                                                                                                                                           | Purpose                                                                                                                                                                                                                                                              |
+| ----------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `sbxloop-<run>-agent`   | `COPILOT_GITHUB_TOKEN` (fine-grained PAT, *Copilot Requests* permission), `ANTHROPIC_API_KEY` for Claude, `OPENAI_API_KEY` for Codex, or the variable `[agent.openai] api_key_env` names for an OpenAI-compatible endpoint ([Agent backends](#agent-backends-copilot-claude-codex-or-an-openai-compatible-endpoint)) | Runs the configured agent SDK — [GitHub Copilot SDK](https://github.com/github/copilot-sdk) by default, the Claude Agent SDK, the Python Codex SDK, or the `openai` client against the endpoint you name. All model calls and tool executions happen inside this VM. |
+| `sbxloop-<run>-github`  | `GH_TOKEN` (fine-grained PAT with the permissions in [docs/permissions.md](permissions.md)) — or a GitHub App installation token, host-minted and auto-refreshed ([GitHub App auth](#github-app-auth))                                                                                                               | Performs the GitHub operations (branch, PR, review, CI polling, merge, issue labels) against the one configured repository. Only provisioned when `[github] repo` is set.                                                                                            |
+| `sbxloop-<run>-service` | The `[[credentials]]` a run was granted by name — operator secrets, each bound to one host (#765)                                                                                                                                                                                                                    | Makes the authenticated requests the agent asks for through its `call_service` tool, one fixed `service.http` op at a time, redacting the credential from what comes back. Only provisioned for a run granted a credential; none is today.                           |
 
 The rule behind the table: **the only key in an agent sandbox is its inference
 key.** Everything else that needs a secret happens in a separate sandbox that
@@ -47,7 +47,7 @@ interim hardening proposed in #592). Sandboxes are cattle: they are
 torn down at run end and re-provisioned on resume, while all durable state
 (workspace, SQLite checkpoints, event log) lives on the host.
 
-### Agent backends: Copilot, Claude or Codex
+### Agent backends: Copilot, Claude, Codex or an OpenAI-compatible endpoint
 
 The SDK that runs the agent personas is configurable (#533) — Copilot stays
 the default with unchanged behaviour:
@@ -130,6 +130,65 @@ enabled. The SDK/runtime pair is pinned because dynamic tool registration
 and native tool suppression use experimental protocol fields. See the
 [design and implementation plan](codex-backend.md) for the contract and
 the **field-unverified** live-sandbox checks.
+
+#### Pointing sbxloop at a self-hosted endpoint
+
+An operator who serves models themselves — vLLM, SGLang, TGI, llama.cpp,
+LiteLLM, or any other gateway speaking the OpenAI wire shape — or who wants
+the hosted API without a vendor harness, names the endpoint and selects the
+`openai` backend:
+
+```toml
+# sbxloop.toml
+[agent]
+backend = "openai"
+
+[agent.openai]
+base_url = "http://vllm.internal:8000/v1"   # the OpenAI-compatible root, version path included
+allow_insecure_endpoint = true              # plain http:// refuses to load without this
+# api_key_env = "OPENAI_API_KEY"            # the variable holding the key, never the key
+# request_timeout_s = 600                   # client patience, sized for a slow local box
+# max_retries = 2
+```
+
+The credential goes in the home's secrets file under whatever
+`api_key_env` names — a placeholder value if the endpoint wants none, since
+sbx binds the variable to the endpoint's host either way. Provisioning
+allows that host on the agent sandbox, binds the credential to it, and
+routes the worker to the URL; the key rides the secret path and never
+`sbx` argv. A hostname on your network, an IPv4 or IPv6 literal and an
+explicit port are all accepted here, and only here: a plan still declares
+egress as dotted domains, so the endpoint widens nothing a plan may ask
+for. A repository whose code must stay on a private endpoint pins its own
+under `[github.repos.openai]`; the rest keep the default.
+
+Set `model` to a model the endpoint serves; `"auto"` takes the first one
+the endpoint lists, which is the one a single-model box serves. Re-run
+`sbxloop bake` after switching, so the template carries the worker's
+`[openai]` extra.
+
+What `sbxloop doctor` will and will not tell you: its credential row names
+the configured variable and the endpoint it is bound to; its policy row
+asks sbx whether the endpoint's host is allowed; and its endpoint row
+reports whether the endpoint **answers from the host** — any HTTP answer
+counts, a 404 for the model listing included. That last row says exactly
+that and no more: whether the agent sandbox can reach a private endpoint
+the host can is a separate question doctor cannot answer, so the row does
+not imply it. If a run fails at its first model call with a connection
+error while doctor is green, the sandbox's route to the endpoint is where
+to look. Whether sbx's network policy accepts a bare hostname or an address
+literal is **field-unverified**; provisioning stops naming the endpoint if
+sbx refuses the allow or the binding, rather than leaving a sandbox to
+fail later.
+
+The backend runs the worker's own governed tools — the same read-only
+reviewers, tool-call ceiling and host-tool relay as codex — against
+`/v1/chat/completions`, with a session held as a transcript the worker
+keeps. Native MCP servers are refused by name; credentialed HTTP MCP works
+through host mediation as it does under codex. Token counts are reported
+and no cost is invented: a served endpoint has no price. See the
+[design and implementation plan](openai-backend.md) for the contract and
+what stays **field-unverified** until it runs on a CI runner.
 
 ### Agent models
 
@@ -2582,7 +2641,7 @@ The notable knobs:
 
 | Key                                                                                                | Default                                         | Meaning                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | -------------------------------------------------------------------------------------------------- | ----------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `[agent] backend`                                                                                  | `copilot`                                       | Agent SDK: `copilot`, `claude`, `codex` or `openai`. Codex uses `OPENAI_API_KEY` and the worker codex extra; `openai` runs the `openai` client against the endpoint `[agent.openai]` names; see [Agent backends](#agent-backends-copilot-claude-or-codex).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `[agent] backend`                                                                                  | `copilot`                                       | Agent SDK: `copilot`, `claude`, `codex` or `openai`. Codex uses `OPENAI_API_KEY` and the worker codex extra; `openai` runs the `openai` client against the endpoint `[agent.openai]` names; see [Agent backends](#agent-backends-copilot-claude-codex-or-an-openai-compatible-endpoint).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `model`                                                                                            | `auto`                                          | Default model id for the single `[agent] backend`; roles inherit it when unset. `--model` forces all run agents and survives resume; concierge is unchanged. See [Agent models](#agent-models).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `[agent.models] decompose` / `build` / `review` / `steer` / `reauthor_verify`                      | unset                                           | Independent code-agent model choices; inherit top-level `model`. Reread before each new phase.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `[agent.models] operator_plan` / `operator_execute` / `operator_judge`                             | unset                                           | Independent workload-agent model choices, with the same inheritance and live refresh.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
