@@ -46,7 +46,7 @@ from sbxloop.vcs.model import (
 )
 from sbxloop.vcs.protocol import Capability, VcsOps
 from sbxloop.worker.client import WorkerClient
-from sbxloop_worker.protocol import JobRequest
+from sbxloop_worker.protocol import JobRequest, TransportSpec
 
 log = get_logger(__name__)
 
@@ -527,6 +527,14 @@ def fold_review_threads(payload: Any) -> list[ReviewThread]:
     return threads
 
 
+def github_transport(api_url: str) -> TransportSpec:
+    """The descriptor every job to the GitHub backend carries (#1015):
+    GitHub's REST root from ``[github] api_url``, the token as a bearer,
+    lists paged by number, GitHub's ``Accept`` and API-version headers,
+    and the ``gh`` CLI allowed."""
+    return TransportSpec(api_url=api_url)
+
+
 class GithubOps:
     def __init__(
         self,
@@ -534,16 +542,23 @@ class GithubOps:
         run_id: str,
         *,
         timeout_s: float = 120.0,
+        transport: TransportSpec | None = None,
     ) -> None:
         self.client = client
         self.run_id = run_id
         self.timeout_s = timeout_s
+        # How the worker reaches the forge (#1015); None sends no
+        # descriptor and the worker serves the job as GitHub, from the
+        # API root the sandbox's environment names.
+        self.transport = transport
 
     def _op(self, op: str, params: dict[str, Any], *, timeout_s: float | None = None) -> Any:
+        if self.transport is not None:
+            params = {**params, "transport": self.transport.model_dump(mode="json")}
         job = JobRequest(
             job_id=new_job_id(),
             run_id=self.run_id,
-            kind="github.op",
+            kind="vcs.op",
             op=op,
             params=params,
             timeout_s=timeout_s if timeout_s is not None else self.timeout_s,

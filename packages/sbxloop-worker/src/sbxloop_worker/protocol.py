@@ -41,6 +41,9 @@ JobKind = Literal[
     "agent.rate_limits",
     "shell.check",
     "shell.batch",
+    "vcs.op",
+    # The spelling before the backends were named (#1015); accepted for
+    # one release, dispatched exactly as ``vcs.op``.
     "github.op",
     "service.http",
     "service.fetch",
@@ -48,6 +51,11 @@ JobKind = Literal[
     "git.merge",
 ]
 JobStatus = Literal["ok", "error", "timeout"]
+
+# The forge-operation job under either spelling.
+VCS_OP_KINDS: frozenset[str] = frozenset({"vcs.op", "github.op"})
+
+
 PermissionMode = Literal["auto", "read_only"]
 #: How an external MCP server is reached. The three transports both agent
 #: SDKs express, so one spec materialises onto either backend without the
@@ -167,6 +175,40 @@ class ProviderFailure(ProtocolModel):
     retry_at: float | None = Field(default=None, ge=0, le=253402300799, allow_inf_nan=False)
     reset_at: float | None = Field(default=None, ge=0, le=253402300799, allow_inf_nan=False)
     partial_progress: bool = False
+
+
+# How the forge's API wants to be spoken to (#1015). Names travel, values
+# never do: ``token_env`` names the variable the sandbox holds the token
+# in; the descriptor carries no credential.
+AuthStyle = Literal["bearer", "private-token", "token"]
+PaginationStyle = Literal["page", "link", "x-next-page"]
+
+
+class TransportSpec(ProtocolModel):
+    """What the worker's generic REST transport needs to reach a forge:
+    the API root, how the token rides (``Authorization: Bearer`` on
+    GitHub, ``PRIVATE-TOKEN`` on GitLab, ``Authorization: token`` on
+    Gitea), how a list pages (``?page=N`` on GitHub, the ``Link`` header,
+    or GitLab's ``X-Next-Page``), the ``Accept`` value and any API-version
+    header, and whether the ``gh`` CLI may serve the calls — a GitHub-only
+    optimisation. A job that carries none is served as GitHub was before
+    the descriptor existed."""
+
+    api_url: str | None = None
+    auth: AuthStyle = "bearer"
+    pagination: PaginationStyle = "page"
+    accept: str = "application/vnd.github+json"
+    api_version_header: str | None = "X-GitHub-Api-Version"
+    api_version: str | None = "2022-11-28"
+    token_env: list[str] = Field(default_factory=lambda: ["GH_TOKEN", "GITHUB_TOKEN"])
+    gh_cli: bool = True
+
+    @field_validator("api_url")
+    @classmethod
+    def _https_only(cls, value: str | None) -> str | None:
+        if value is not None and not value.startswith("https://"):
+            raise ValueError(f"transport api_url must be https, got {value!r}")
+        return value.rstrip("/") if value else value
 
 
 class ErrorInfo(ProtocolModel):
@@ -398,11 +440,11 @@ class JobRequest(ProtocolModel):
                 raise ValueError("shell.batch requires non-empty commands")
             if self.prompt is not None or self.argv is not None or self.op is not None:
                 raise ValueError("shell.batch must not set prompt, argv, or op")
-        elif self.kind == "github.op":
+        elif self.kind in VCS_OP_KINDS:
             if not self.op:
-                raise ValueError("github.op requires an op name")
+                raise ValueError(f"{self.kind} requires an op name")
             if self.prompt is not None or self.argv is not None or self.commands is not None:
-                raise ValueError("github.op must not set prompt, argv, or commands")
+                raise ValueError(f"{self.kind} must not set prompt, argv, or commands")
         elif self.kind == "service.http":
             missing = [k for k in ("credential", "method", "path") if not self.params.get(k)]
             if missing:

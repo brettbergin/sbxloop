@@ -201,6 +201,7 @@ from sbxloop.vcs.github.ops import (
     PostedFinding,
     ReviewComment,
     SubmittedReview,
+    github_transport,
     identities_match,
     user_identity,
 )
@@ -355,7 +356,7 @@ class LoopEngine:
         self.clock = clock
         # The seam a test uses to script GitHub: every github.op the run
         # makes goes through the ops this factory returns.
-        self._github_ops: GithubOpsFactory = github_ops or GithubOps
+        self._github_ops: GithubOpsFactory = github_ops or self._default_github_ops
         # Same seam for the service sandbox's ops (#765).
         self._service_ops: ServiceOpsFactory = service_ops or ServiceOps
         # In-process cancellation (Ctrl-C in the TUI): checked at the same
@@ -1447,6 +1448,11 @@ class LoopEngine:
             mounted=pair.mounted,
             **extra,
         )
+
+    def _default_github_ops(self, client: WorkerClient, run_id: str) -> GithubOps:
+        """The GitHub backend for a run, carrying the transport descriptor
+        derived from the configuration (#1015)."""
+        return GithubOps(client, run_id, transport=github_transport(self.config.github.api_url))
 
     def _ensure_delivery_repo(self, run_id: str, ops: VcsOps | None) -> bool | None:
         """Probe (and, when allowed, create) the delivery repo up front.

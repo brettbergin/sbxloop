@@ -26,7 +26,7 @@ from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import Sandbox
-from sbxloop.vcs.github.ops import GithubOps
+from sbxloop.vcs.github.ops import GithubOps, github_transport
 from sbxloop.worker.client import WorkerClient
 
 log = get_logger(__name__)
@@ -227,4 +227,6 @@ class DaemonGithub:
             sandbox=self.name,
             duration_s=round(time.monotonic() - started, 1),
         )
-        return GithubOps(clients[0], DAEMON_RUN_ID)
+        return GithubOps(
+            clients[0], DAEMON_RUN_ID, transport=github_transport(self.config.github.api_url)
+        )

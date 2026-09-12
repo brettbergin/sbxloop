@@ -842,7 +842,7 @@ class TestRestTransport:
     def test_requires_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("GH_TOKEN", raising=False)
         monkeypatch.delenv("GITHUB_TOKEN", raising=False)
-        with pytest.raises(GithubOpError, match="no GitHub token"):
+        with pytest.raises(GithubOpError, match="no API token"):
             RestTransport()
 
     def test_request_success(self, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -15,7 +15,7 @@ model, and the run lifecycle.
 ├──────────────────────────┬────────────────────────────────────────┤
 │ Worker transport         │ Version-control backend                │
 │ WorkerClient             │ vcs.protocol roles → vcs/github        │
-│ (stream / poll)          │ (GithubOps: typed github.op jobs)      │
+│ (stream / poll)          │ (GithubOps: typed vcs.op jobs)         │
 ├──────────────────────────┴────────────────────────────────────────┤
 │ Sandbox layer              SbxCLI → Sandbox → Provisioner → Pair  │
 ├───────────────────────────────────────────────────────────────────┤
@@ -115,7 +115,7 @@ each one into the box that needs it — never into the other.
 flowchart LR
     operator["operator<br/>chat, or a labelled issue"]
 
-    host["<b>Host — sbxloop daemon</b><br/>holds both token sources, injects each<br/>into one box only · harvests the agent's tree<br/>· speaks typed github.op jobs · mediates<br/>every hop, no VM can address another"]
+    host["<b>Host — sbxloop daemon</b><br/>holds both token sources, injects each<br/>into one box only · harvests the agent's tree<br/>· speaks typed vcs.op jobs · mediates<br/>every hop, no VM can address another"]
 
     subgraph green["Agent plane — the model runs here, and there is no GitHub token in it"]
         conc["concierge sandbox<br/>long-lived, chat's agent"]
@@ -157,7 +157,7 @@ Read three things off it:
 
 - **The agent side can never touch the repository.** It has no GitHub token
   and no route to one. Everything that reaches GitHub was harvested by the
-  host and re-spoken as a typed `github.op` job — a closed vocabulary, not a
+  host and re-spoken as a typed `vcs.op` job — a closed vocabulary, not a
   shell.
 - **The GitHub side can never be talked into anything.** It holds the token
   but runs no model and has no dev tools; it executes named ops and nothing
@@ -206,7 +206,7 @@ All traffic between them passes through the host.
 
 *Why it holds.* The model-driven side produces a tree and asks questions; the
 host harvests that tree and speaks to the credential-bearing side only in a
-closed vocabulary of typed jobs (`github.op`, `service.http`). Neither box has
+closed vocabulary of typed jobs (`vcs.op`, `service.http`). Neither box has
 an address for, or a route to, the other — the split is enforced by the same
 directionality invariant above. Stated as the property every design is held
 to: **the model's arbitrary commands never execute where a secret other than
@@ -294,7 +294,7 @@ credential:
 | credential | the configured agent credential only — `COPILOT_GITHUB_TOKEN` (`[agent] backend = "copilot"`, the default), `ANTHROPIC_API_KEY` (`"claude"`, #533), `OPENAI_API_KEY` (`"codex"`) or the variable `[agent.openai] api_key_env` names (`"openai"`) | `GH_TOKEN` only (a PAT, or a host-minted App installation token)                                                   |
 | injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows)                                                                          | built-in `github` service secret (PAT), or the in-VM env file carrying a host-minted App installation token (#568) |
 | network    | balanced policy + the backend's credential hosts (copilot's, a vendor API host, or the endpoint `[agent.openai]` names) + the `[github] api_url` hosts + plan-declared grants                                                                    | balanced policy + the `[github] api_url` hosts (+ the dotcom storage hosts when that is github.com)                |
-| runs       | agent SDK sessions (Copilot SDK, the Claude Agent SDK + Claude Code CLI, the Codex SDK, or the worker's own chat-completions loop with the openai backend), shell checks                                                                         | `github.op` jobs (gh CLI or REST)                                                                                  |
+| runs       | agent SDK sessions (Copilot SDK, the Claude Agent SDK + Claude Code CLI, the Codex SDK, or the worker's own chat-completions loop with the openai backend), shell checks                                                                         | `vcs.op` jobs (REST, or gh CLI on GitHub)                                                                          |
 
 A workload run's needs (#758) are held to a **profile** before any task
 runs. `[[workloads]]` declares each profile (`egress` patterns, the
