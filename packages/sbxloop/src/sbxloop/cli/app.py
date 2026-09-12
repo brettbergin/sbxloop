@@ -2404,6 +2404,7 @@ def daemon(
     from sbxloop.daemon.model import DaemonNotice, WorkItem
     from sbxloop.daemon.sources import (
         REPO_HEALTH_KEY,
+        ApiSource,
         ChatSource,
         CompositeSource,
         GitHubLabels,
@@ -2643,9 +2644,15 @@ def daemon(
         # queue; the composite routes each item back to where it came
         # from. The schedule source always rides: a schedule may be
         # created from chat while the daemon runs (#818).
-        source = CompositeSource(source, ChatSource() if chat_intake else None, ScheduleSource())
+        # The API source always rides too: an item the remote API admitted
+        # must route back to it whether or not the listener is up now.
+        source = CompositeSource(
+            source, ChatSource() if chat_intake else None, ScheduleSource(), ApiSource()
+        )
     else:
-        source = CompositeSource(None, ChatSource() if chat_intake else None, ScheduleSource())
+        source = CompositeSource(
+            None, ChatSource() if chat_intake else None, ScheduleSource(), ApiSource()
+        )
 
     # One line an operator can read back from the journal to know exactly
     # what this daemon is: its home, what it polls, and every guardrail.

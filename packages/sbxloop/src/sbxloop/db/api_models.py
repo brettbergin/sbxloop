@@ -27,6 +27,12 @@ carry their own prefix rather than ``daemon_``.
   family. ``api_token_revocations`` is the denylist of access-token ids
   (``jti``) revoked before they expired, pruned past their expiry.
 
+* ``api_public_ids`` maps the opaque id a client sees to the resource
+  behind it — a kind, the workspace, and the internal key (for a work
+  item the repository and the item id together, so two repositories'
+  issue numbers never alias). Assigned lazily on first read, stable
+  after.
+
 JSON lives in ``TEXT`` columns, serialised in Python, as everywhere else.
 """
 
@@ -132,3 +138,14 @@ class TokenRevocationRow(Base):
     client_id: Mapped[str] = mapped_column(Text, nullable=False)
     expires_at: Mapped[float] = mapped_column(REAL, nullable=False)
     revoked_at: Mapped[float] = mapped_column(REAL, nullable=False)
+
+
+class PublicIdRow(Base):
+    __tablename__ = "api_public_ids"
+    __table_args__ = (UniqueConstraint("kind", "workspace_id", "internal_key"),)
+
+    public_id: Mapped[str] = mapped_column(Text, primary_key=True)
+    kind: Mapped[str] = mapped_column(Text, nullable=False)
+    workspace_id: Mapped[str] = mapped_column(Text, nullable=False)
+    internal_key: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)

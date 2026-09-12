@@ -19,13 +19,23 @@ from __future__ import annotations
 
 import time
 from collections.abc import Callable
+from dataclasses import asdict
 from typing import Any, Literal, TypeVar
 
 from sbxloop.config import ScheduleConfig
+from sbxloop.daemon.controls.intake import (
+    AdmitRequest,
+    IssueAdmission,
+    admit_issue,
+    build_item,
+    target_key,
+    upsert,
+)
 from sbxloop.daemon.controls.operations import OperationRunner, OperationSpec, OperationStore
 from sbxloop.daemon.controls.principal import Capability, Principal
 from sbxloop.daemon.controls.protocol import ControlLoop
 from sbxloop.daemon.controls.results import (
+    AdmitOutcome,
     CancelOutcome,
     ControlError,
     GateOutcome,
@@ -121,6 +131,9 @@ class ControlService:
         principal: Principal,
         target_kind: str,
         target_key: str,
+        *,
+        idempotency: tuple[str, str] | None = None,
+        expected_revision: int | None = None,
         **request: Any,
     ) -> OperationSpec:
         return OperationSpec(
@@ -129,6 +142,8 @@ class ControlService:
             target_key=target_key,
             principal=principal,
             request=request,
+            idempotency=idempotency,
+            expected_revision=expected_revision,
         )
 
     # -- reads ----------------------------------------------------------------------
@@ -355,45 +370,145 @@ class ControlService:
 
     # -- items ----------------------------------------------------------------------
 
-    def abandon(self, principal: Principal, item_id: str, reason: str | None) -> ItemOutcome:
+    def admit(
+        self,
+        principal: Principal,
+        request: AdmitRequest,
+        *,
+        idempotency: tuple[str, str] | None = None,
+    ) -> AdmitOutcome:
+        """Admit work through its source's rules (#1036): an existing
+        issue, an inline workload, or a registered recipe. Recorded as
+        one ``item.admit`` operation against the item it queues, so a
+        replay under the same idempotency pair names the same row."""
+        require(principal, "items:create")
+        key = target_key(request)
+        loop: Any = self.loop
+
+        def apply(_: str | None) -> AdmitOutcome:
+            if isinstance(request, IssueAdmission):
+                item = admit_issue(loop, request)
+            else:
+                item = build_item(loop.config, request, item_id=key, requested_by=None)
+            stored, fresh = upsert(loop, item, by=principal.attribution())
+            return AdmitOutcome(item=stored, fresh=fresh)
+
+        spec = self._spec(
+            "item.admit",
+            principal,
+            "item",
+            key,
+            idempotency=idempotency,
+            **_request_fields(request),
+        )
+        return self._record(spec, apply)
+
+    def _check_item_revision(self, item_id: str, expected: int | None) -> None:
+        """``stale_revision`` when the item has moved past what the caller
+        acted on. Checked just before the transition rather than inside
+        it: the store's item transitions are conditional on state, so a
+        row that moved between the check and the write is refused by the
+        state it is actually in."""
+        if expected is None:
+            return
+        item = self.loop.dstore.get(item_id)
+        if item is None:
+            raise ControlError("unknown_target", f"unknown item {item_id}")
+        if item.revision != expected:
+            raise ControlError(
+                "stale_revision",
+                f"{item_id} is at revision {item.revision}, not {expected}",
+                revision=item.revision,
+            )
+
+    def abandon(
+        self,
+        principal: Principal,
+        item_id: str,
+        reason: str | None,
+        *,
+        expected_revision: int | None = None,
+        idempotency: tuple[str, str] | None = None,
+    ) -> ItemOutcome:
         require(principal, "runs:control")
         item_id = normalize_item_id(item_id)
 
         def apply(_: str | None) -> ItemOutcome:
+            self._check_item_revision(item_id, expected_revision)
             try:
                 item = self.loop.abandon_item(item_id, reason)
             except (KeyError, ValueError) as exc:
                 raise ControlError(_code_for(exc), _message(exc)) from exc
             return ItemOutcome(verb="abandon", item=item)
 
-        spec = self._spec("item.abandon", principal, "item", item_id, reason=reason)
+        spec = self._spec(
+            "item.abandon",
+            principal,
+            "item",
+            item_id,
+            idempotency=idempotency,
+            expected_revision=expected_revision,
+            reason=reason,
+        )
         return self._record(spec, apply)
 
-    def retry(self, principal: Principal, item_id: str) -> ItemOutcome:
+    def retry(
+        self,
+        principal: Principal,
+        item_id: str,
+        *,
+        expected_revision: int | None = None,
+        idempotency: tuple[str, str] | None = None,
+    ) -> ItemOutcome:
         require(principal, "runs:control")
         item_id = normalize_item_id(item_id)
 
         def apply(_: str | None) -> ItemOutcome:
+            self._check_item_revision(item_id, expected_revision)
             try:
                 item = self.loop.retry_item(item_id, principal.attribution())
             except (KeyError, ValueError) as exc:
                 raise ControlError(_code_for(exc), _message(exc)) from exc
             return ItemOutcome(verb="retry", item=item)
 
-        return self._record(self._spec("item.retry", principal, "item", item_id), apply)
+        spec = self._spec(
+            "item.retry",
+            principal,
+            "item",
+            item_id,
+            idempotency=idempotency,
+            expected_revision=expected_revision,
+        )
+        return self._record(spec, apply)
 
-    def requeue(self, principal: Principal, item_id: str) -> ItemOutcome:
+    def requeue(
+        self,
+        principal: Principal,
+        item_id: str,
+        *,
+        expected_revision: int | None = None,
+        idempotency: tuple[str, str] | None = None,
+    ) -> ItemOutcome:
         require(principal, "runs:control")
         item_id = normalize_item_id(item_id)
 
         def apply(_: str | None) -> ItemOutcome:
+            self._check_item_revision(item_id, expected_revision)
             try:
                 item = self.loop.requeue_item(item_id)
             except (KeyError, ValueError) as exc:
                 raise ControlError(_code_for(exc), _message(exc)) from exc
             return ItemOutcome(verb="requeue", item=item)
 
-        return self._record(self._spec("item.requeue", principal, "item", item_id), apply)
+        spec = self._spec(
+            "item.requeue",
+            principal,
+            "item",
+            item_id,
+            idempotency=idempotency,
+            expected_revision=expected_revision,
+        )
+        return self._record(spec, apply)
 
     # -- daemon ---------------------------------------------------------------------
 
@@ -475,6 +590,15 @@ class ControlService:
             self._spec("daemon.restart", principal, "daemon", "daemon", now=now),
             lambda _: RestartOutcome(supervisor=supervisor, now=now, after=after),
         )
+
+
+def _request_fields(request: AdmitRequest) -> dict[str, Any]:
+    """The request as the operation records it: its fields, and which form
+    it took — enough to fingerprint a replay and to show a reader what was
+    asked, never a secret."""
+    fields = asdict(request)
+    fields.pop("key", None)
+    return {"form": type(request).__name__.removesuffix("Admission").lower(), **fields}
 
 
 def _code_for(exc: BaseException) -> Any:

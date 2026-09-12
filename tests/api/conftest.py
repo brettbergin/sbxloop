@@ -70,11 +70,20 @@ class Api:
         return {"Authorization": f"Bearer {self.token(capabilities)['access_token']}"}
 
 
-def build(tmp_path: Path, *, ready: bool = True, **api_overrides: Any) -> Api:
+def build(
+    tmp_path: Path,
+    *,
+    ready: bool = True,
+    config: dict[str, Any] | None = None,
+    **api_overrides: Any,
+) -> Api:
+    """The API over a fresh daemon. ``config`` overrides top-level sections
+    (``github``, ``workloads``, …); ``api_overrides`` the ``[api]`` keys."""
     config = Config.model_validate(
         {
             "home": str(tmp_path / "state"),
             "github": {"repo": "o/r"},
+            **(config or {}),
             "api": {"enabled": True, **api_overrides},
         }
     )

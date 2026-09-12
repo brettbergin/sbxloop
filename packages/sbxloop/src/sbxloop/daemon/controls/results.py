@@ -44,6 +44,8 @@ ErrorCode = Literal[
     "unsupervised",
     # The daemon is not ready to take commands (recovery in progress).
     "daemon_not_ready",
+    # The source the action needs (the forge) could not be reached.
+    "source_unavailable",
 ]
 
 
@@ -172,3 +174,12 @@ class GateOutcome(Outcome):
 class ItemOutcome(Outcome):
     verb: Literal["abandon", "retry", "requeue"]
     item: WorkItem
+
+
+class AdmitOutcome(Outcome):
+    """Work admitted through its source's rules (#1036): the item as the
+    queue holds it, and whether this request created it — ``False`` when
+    the same request (or a poll) had already queued it."""
+
+    item: WorkItem
+    fresh: bool

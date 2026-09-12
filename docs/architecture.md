@@ -1390,11 +1390,12 @@ ask ─▶ PLAN (task DAG, needs declared) ─▶ grant needs against the profil
   name them. `publish = "hold"` parks the judged result `held`, and the
   release is a resume at the publishing stage — the daemon's publish gate,
   a *Release result* button in chat, `sbxloop resume` from the CLI.
-- **Intake.** Three sources, one item shape: a `[daemon] workload_label`
+- **Intake.** Four sources, one item shape: a `[daemon] workload_label`
   issue, a chat ask the concierge turns into a `chat:<message>` item
-  through its `start_workload` tool, and `[[schedules]]` ticks
+  through its `start_workload` tool, `[[schedules]]` ticks
   (`sched:<name>:<due minute>`) the daemon fires by itself on an `every`
-  or `cron` cadence. `sbxloop run --kind workload` is the same run from the
+  or `cron` cadence, and an ask a remote client admits through the API
+  as an `api:<key>` item (#1036). `sbxloop run --kind workload` is the same run from the
   CLI; `sbxloop init --preset workload` writes a config with one of each
   section, and `sbxloop doctor` lists the profiles, schedules and where
   the daemon would get its work. See [The daemon](#the-daemon) for the
@@ -1521,15 +1522,15 @@ cannot disagree with the home the process runs out of.
 ## Persistence and resume
 
 `~/.sbxloop/state/state.db` (the home's `state/`, see *The home* below) is one
-WAL-mode SQLite database holding **twenty-five** tables, and two stores read it
+WAL-mode SQLite database holding **twenty-six** tables, and two stores read it
 through separate connections. `StateStore` owns five — `runs`, `tasks`,
 `phase_attempts`, `reconciliations`, `events` — and `DaemonStore` the
 fifteen `daemon_*` ones (the queue, the run ledger, the resume budget,
 key/value state, run watches, requesters, prior attempts, chat threads,
 merge gates and their prompts, review holds, pending clarifications, the
-operator console's mailbox, the schedules and the pause holds) plus the five
+operator console's mailbox, the schedules and the pause holds) plus the six
 `api_*` tables behind the remote API (operations, the public chronology,
-clients, refresh tokens, revoked tokens).
+clients, refresh tokens, revoked tokens, public ids).
 
 Both are SQLAlchemy models under `sbxloop/db/` (#539), and Alembic owns the
 upgrade path — one revision chain for the whole file, applied when a store
@@ -2162,6 +2163,41 @@ narrows the live token at once, and a revoked client is refused on its next
 request. The signing key lives at `config/api-signing.key` (0600); a rotation
 keeps the previous key until its tokens expire. Authentication failures are
 limited per client id and per source address, apart from work admission.
+
+**Public ids and the read side (#1036).** A client never sees an issue
+number or an `owner/name` as an identifier. `api_public_ids` maps an opaque
+`itm_…` or `repo_…` to the resource behind it — for a work item the
+repository *and* the item id together, so two repositories' issue numbers
+never alias one id — assigned lazily the first time a resource is read and
+stable from then on; a run is `run_<run id>`, already random. Unknown ids
+of every kind answer the same `404`. `api/projections.py` builds every
+public shape on the executor from the stores' own records: items and runs
+page by keyset (`DaemonStore.page_items`, `StateStore.page_runs`) so a
+reader paging while the daemon works sees no gap and no repeat; the queue
+is `queued_in_order` with `dispatch_eligible_at` — the rule dispatch itself
+uses, not the prose helper's; `available_actions` is the eligibility
+module's answer for the resource as it stands, which the command that
+follows rechecks.
+
+**Intake (#1036).** `POST /v1/items` is one `ControlService.admit` and one
+`item.admit` operation, keyed by the client's `Idempotency-Key` under a
+scope of workspace, principal, method and route, so a retried request
+returns the operation it already has and a changed body under the same
+key is a conflict. `daemon/controls/intake.py` holds the rules and knows
+no HTTP. An **issue** is admitted by the GitHub source itself
+(`GitHubIssueSource.admit`, routed by repository through the multi-repo
+source): it reads the issue, refuses one that is closed, a pull request,
+already in progress or labelled for the other kind, and otherwise adds the
+queueing label a person would have — so the next poll finds the same
+issue and `upsert_new` converges on the row the API wrote. A **workload**
+is the concierge's `start_workload` shape under an `api:` id; a **tool**
+is a registered recipe with only the parameters `RECIPE_PARAMETERS` names
+for it, resolved by the recipe's own target rules. `ApiSource` rides the
+composite beside chat and schedules (always, so an admitted item routes
+back to it whether or not the listener is up): nothing to poll, every
+report a log line, and the store's repo-attribution passes skip `api:`
+rows as they skip `chat:` and `sched:` ones. Direct inline code admission
+is not offered: an issue is the code run's source contract.
 
 ### Repositories
 

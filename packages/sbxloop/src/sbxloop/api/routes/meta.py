@@ -14,7 +14,18 @@ from sbxloop.daemon.controls.principal import CAPABILITIES
 router = APIRouter(prefix="/v1", tags=["meta"])
 
 #: What this release serves; a later stage appends to it.
-FEATURES: tuple[str, ...] = ("status", "operations", "auth.client_credentials", "auth.refresh")
+FEATURES: tuple[str, ...] = (
+    "status",
+    "operations",
+    "auth.client_credentials",
+    "auth.refresh",
+    "items",
+    "queue",
+    "runs",
+    "intake.issue",
+    "intake.workload",
+    "intake.tool",
+)
 
 
 @router.get("/capabilities", response_model=Capabilities)

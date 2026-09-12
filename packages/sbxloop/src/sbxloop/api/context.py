@@ -21,6 +21,7 @@ from typing import Any, TypeVar
 from sbxloop.api.auth.keys import SigningKeys
 from sbxloop.api.auth.ratelimit import FailureLimiter
 from sbxloop.api.auth.store import ApiAuthStore
+from sbxloop.api.publicids import PublicIds
 from sbxloop.config import Config
 from sbxloop.daemon.controls.service import ControlService
 
@@ -59,10 +60,18 @@ class ApiContext:
         )
         self._semaphore: asyncio.Semaphore | None = None
         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
+        self._public_ids: PublicIds | None = None
 
     @property
     def api(self) -> Any:
         return self.config.api
+
+    @property
+    def public_ids(self) -> PublicIds:
+        """The public-id mapping over the daemon's store, built on first use."""
+        if self._public_ids is None:
+            self._public_ids = PublicIds(self.loop.dstore)
+        return self._public_ids
 
     def service(self) -> ControlService:
         """A service over the loop; one per request, since it collects the

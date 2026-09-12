@@ -17,7 +17,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from sbxloop import __version__
 from sbxloop.api import errors
 from sbxloop.api.context import ApiContext
-from sbxloop.api.routes import auth, health, meta, operations, status
+from sbxloop.api.routes import auth, catalog, health, items, meta, operations, runs, status
 
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
 
@@ -92,5 +92,8 @@ def create_app(ctx: ApiContext) -> FastAPI:
     app.include_router(meta.router)
     app.include_router(status.router)
     app.include_router(operations.router)
+    app.include_router(items.router)
+    app.include_router(runs.router)
+    app.include_router(catalog.router)
     app.include_router(auth.router)
     return app

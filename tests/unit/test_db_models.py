@@ -53,6 +53,7 @@ API_TABLES = (
     "api_clients",
     "api_refresh_tokens",
     "api_token_revocations",
+    "api_public_ids",
 )
 ALL_TABLES = ENGINE_TABLES + DAEMON_TABLES + API_TABLES
 

@@ -103,6 +103,7 @@ from sbxloop.errors import (
 from sbxloop.events import Event, EventBus
 from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs, workspace_pruned
 from sbxloop.ghids import (
+    is_api_id,
     is_chat_id,
     is_local_id,
     normalize_item_id,
@@ -3562,11 +3563,14 @@ class DaemonLoop:
         with the ask itself rather than waiting on a GitHub read.
         """
         if is_local_id(item.item_id):
-            # A chat ask (#760) or a schedule tick (#761): the ask is the
-            # whole ask, and there is no issue discussion to fetch.
+            # A chat ask (#760), a schedule tick (#761) or a remote API ask:
+            # the ask is the whole ask, and there is no issue discussion to
+            # fetch.
             if is_chat_id(item.item_id):
                 who = f"<@{item.requested_by}>" if item.requested_by else "an operator"
                 origin = f"a chat ask by {who}"
+            elif is_api_id(item.item_id):
+                origin = "a request admitted through the remote API"
             else:
                 name, due = parse_schedule_id(item.item_id)
                 origin = f"the schedule `{name}`, due {due}"

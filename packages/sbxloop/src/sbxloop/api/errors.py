@@ -36,6 +36,7 @@ CONTROL_STATUS: dict[str, int] = {
     "forbidden": 403,
     "unsupervised": 409,
     "daemon_not_ready": 503,
+    "source_unavailable": 503,
 }
 
 _TITLES: dict[int, str] = {

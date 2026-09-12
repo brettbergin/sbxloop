@@ -1670,6 +1670,19 @@ class TestWorkloadItems:
         assert store.drop_repoless() == 0
         assert store.get(tick) is not None
 
+    def test_api_asks_are_local_like_chat_asks(self, tmp_path: Path) -> None:
+        """#1036: an item the remote API admitted is the daemon's own — no
+        repository, no URL — and the repo passes leave it alone too."""
+        store = DaemonStore(tmp_path / "state.db")
+        ask = "api:r7x2k9"
+        store.upsert_new(item("x", item_id=ask, kind="workload", url=""), now=1.0)
+        store.upsert_new(item("4", item_id="gh:issue:4"), now=1.0)
+        assert store.backfill_repo("o/a") == 1
+        assert store.get(ask).repo is None  # type: ignore[union-attr]
+        assert store.attribute_repoless(["o/a", "o/b"]) == 0
+        assert store.drop_repoless() == 0
+        assert store.get(ask) is not None
+
     def test_schedules_live_in_the_store(self, tmp_path: Path) -> None:
         """#818: the schedule itself — profile, ask, cadence, zone, who made
         it — is a row, beside its state; a name is unique; removing one

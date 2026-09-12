@@ -1961,6 +1961,51 @@ chat, the console, the API) writes when it acts. The listener binds loopback by
 default; put your reverse proxy in front for TLS and list it in
 `trusted_proxies` ([deploy.md](deploy.md)).
 
+**Reading the work.** `GET /v1/items` (filter by `state`, `kind`,
+`repository_id`), `GET /v1/items/{id}` (the request, its origin, every run it
+had, who admitted it), `GET /v1/queue` (dispatch's own order — an interrupted
+run's resume first, then oldest first — with each entry's eligibility and
+whether a pause or the breaker holds the whole queue), `GET /v1/runs` (touched
+most recently first; filter by `state`, `kind`), `GET /v1/runs/{id}` and
+`/v1/runs/{id}/tasks`, and the catalog: `GET /v1/repositories`, `/v1/profiles`,
+`/v1/recipes`. Every collection pages by an opaque `cursor` bound to its
+filters (`limit` up to 200). A client sees opaque ids — `itm_…` for a work
+item, `run_<run id>` for a run, `repo_…` for a repository — never a bare issue
+number, so two repositories' issue 7 are two ids; the item's `origin` names the
+repository, the number, the URL and the id the daemon's own surfaces use
+(`gh:issue:7`). An unknown id of any kind is a plain `404 not_found`. Each
+read carries `available_actions` (what the daemon would accept for it right
+now) and a `revision` a command may pin with `expected_revision`.
+
+**Admitting work.** `POST /v1/items` (`items:create`; an `Idempotency-Key`
+header is required, and a replay under the same key answers with the same
+item and operation, a different body under it `409 idempotency_conflict`)
+takes one of three forms, each through the rules its source already applies:
+
+```json
+{"kind": "issue", "repository": "you/one", "number": 42, "run_kind": "code"}
+{"kind": "workload", "ask": "Summarise the week's incidents", "profile": "research", "sink": "issue"}
+{"kind": "tool", "recipe": "entrygraph", "parameters": {"repository": "you/one"}}
+```
+
+An **issue** must be open in a configured, enabled repository (by
+`repository` or `repository_id`): the daemon reads it and, when it does not
+already carry the queueing label for `run_kind` (`trigger_label`, or
+`workload_label` for a workload), adds that label exactly as a person would —
+so polling and the API converge on one item, and an issue already in progress
+or labelled for the other kind is refused by name rather than relabelled. A
+**workload** is the same ask the concierge's `start_workload` queues, under a
+`[[workloads]]` profile (the `[workload] default` when omitted; a sink the
+profile does not allow is refused) and an `api:` item id that the daemon
+reports to nobody but its own log and record. A **tool** names a registered
+recipe and only the parameters that recipe takes (`GET /v1/recipes` lists
+them) — never a command — and `[entrygraph] enabled = false` refuses the one
+recipe there is. The reply is `201` with the item and its `item.admit`
+operation, `200` when the same work was already queued. `POST /v1/items/{id}/retry`, `/requeue` and `/abandon` (`runs:control`; body
+`{"reason": …, "expected_revision": …}`, both optional) are the ctl verbs of
+the same names through the same service, each answered with the item as it
+stands and the operation that changed it.
+
 ## Artifacts
 
 Every job in a run executes in the run's **workspace** — a host directory

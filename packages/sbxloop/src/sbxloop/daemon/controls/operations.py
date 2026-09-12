@@ -53,6 +53,7 @@ EFFECTS: dict[str, str] = {
     "run.review_resume": "the review wait is re-armed",
     "run.grant_rounds": "the grant is recorded and the item re-admitted",
     "gate.approve": "the approval is recorded and the gate release committed",
+    "item.admit": "one item is durably admitted through its source's rules",
     "item.abandon": "the item is settled as abandoned and the source owed its report",
     "item.retry": "the item is re-queued with attempts reset",
     "item.requeue": "the item is unpinned and re-queued",

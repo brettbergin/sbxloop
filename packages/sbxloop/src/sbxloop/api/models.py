@@ -9,7 +9,7 @@ rechecks eligibility when the action arrives.
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -257,3 +257,210 @@ class Me(ApiModel):
     capabilities: list[Capability]
     workspace_id: str = WORKSPACE_ID
     token_expires_at: str
+
+
+# -- work items, runs, the queue (#1036) ------------------------------------------
+
+OriginKind = Literal["issue", "chat", "schedule", "api", "other"]
+
+
+class Origin(ApiModel):
+    """Where a work item came from. ``ref`` is the id the daemon's own
+    surfaces (ctl, chat, the console) know the item by."""
+
+    kind: OriginKind
+    repository_id: str | None = None
+    repository: str | None = None
+    number: int | None = None
+    url: str | None = None
+    ref: str
+
+
+class Item(ApiModel):
+    id: str
+    workspace_id: str = WORKSPACE_ID
+    kind: str
+    state: str
+    title: str
+    origin: Origin
+    profile: str | None = None
+    recipe: str | None = None
+    recipe_target: str | None = None
+    attempts: int = 0
+    run_id: str | None = None
+    last_error: str | None = None
+    pending_report: str | None = None
+    not_before: str | None = None
+    created_at: str
+    updated_at: str
+    revision: int = 0
+    available_actions: list[str] = Field(default_factory=list)
+
+
+class ItemDetail(Item):
+    body: str = ""
+    #: Every run the item was dispatched under, oldest first.
+    runs: list[str] = Field(default_factory=list)
+    #: Who admitted the item through a recorded operation, when one did.
+    admitted_by: Actor | None = None
+
+
+class PullRequest(ApiModel):
+    number: int | None = None
+    url: str | None = None
+    branch: str | None = None
+    head_sha: str | None = None
+    title: str | None = None
+
+
+class Rounds(ApiModel):
+    review: int = 0
+    ci: int = 0
+    granted: int = 0
+    #: Which budget the run ran out of (``review`` / ``ci``), or ``None``.
+    exhausted: str | None = None
+
+
+class PublishedOut(ApiModel):
+    sink: str
+    location: str
+    tasks: list[str] = Field(default_factory=list)
+    files: int = 0
+
+
+class GateSummary(ApiModel):
+    kind: str
+    state: str
+    revision: int = 0
+
+
+class Run(ApiModel):
+    id: str
+    workspace_id: str = WORKSPACE_ID
+    kind: str
+    state: str
+    stage: str | None = None
+    outcome: str
+    reason: str | None = None
+    item_id: str | None = None
+    created_at: str
+    updated_at: str
+    pull_request: PullRequest | None = None
+    rounds: Rounds = Field(default_factory=Rounds)
+    published: list[PublishedOut] = Field(default_factory=list)
+    gate: GateSummary | None = None
+    review_wait: str | None = None
+    revision: int = 0
+    available_actions: list[str] = Field(default_factory=list)
+
+
+class TaskOutputOut(ApiModel):
+    summary: str = ""
+    files: list[str] = Field(default_factory=list)
+
+
+class Task(ApiModel):
+    id: str
+    title: str
+    description: str = ""
+    state: str
+    depends_on: list[str] = Field(default_factory=list)
+    revisions: int = 0
+    replans: int = 0
+    verify_suspect: bool = False
+    verify_reauthors: int = 0
+    output: TaskOutputOut | None = None
+
+
+class QueueEntry(ApiModel):
+    position: int
+    item: Item
+    #: When dispatch's own rule lets the item go; ``None`` means now.
+    eligible_at: str | None = None
+    eligible: bool = True
+    reason: str | None = None
+
+
+class QueuePage(ApiModel):
+    """The queue in dispatch order, with what stands in its way."""
+
+    data: list[QueueEntry]
+    next_cursor: str | None = None
+    has_more: bool = False
+    observed_at: str
+    paused: bool = False
+    breaker_open: bool = False
+
+
+class Repository(ApiModel):
+    id: str
+    workspace_id: str = WORKSPACE_ID
+    repository: str
+    forge: str
+    enabled: bool = True
+    deliver_base: str | None = None
+    trigger_label: str
+    workload_label: str
+    health: RepoHealth | None = None
+
+
+class Profile(ApiModel):
+    id: str
+    name: str
+    description: str = ""
+    sinks: list[str] = Field(default_factory=list)
+    publish: str = "auto"
+    repo: bool = False
+    default: bool = False
+
+
+class Recipe(ApiModel):
+    id: str
+    name: str
+    parameters: list[str] = Field(default_factory=list)
+    enabled: bool = True
+
+
+# -- intake and item commands ------------------------------------------------------
+
+
+class IssueIntake(ApiModel):
+    kind: Literal["issue"]
+    #: The repository by its public id or its ``owner/name``; one of the two.
+    repository_id: str | None = None
+    repository: str | None = None
+    number: int = Field(ge=1)
+    run_kind: Literal["code", "workload"] = "code"
+
+
+class WorkloadIntake(ApiModel):
+    kind: Literal["workload"]
+    ask: str = Field(min_length=1, max_length=65536)
+    profile: str | None = None
+    sink: str | None = None
+
+
+class ToolIntake(ApiModel):
+    kind: Literal["tool"]
+    recipe: str = Field(min_length=1, max_length=64)
+    parameters: dict[str, str] = Field(default_factory=dict)
+
+
+IntakeRequest = Annotated[IssueIntake | WorkloadIntake | ToolIntake, Field(discriminator="kind")]
+
+
+class Admitted(ApiModel):
+    item: Item
+    operation: OperationOut
+    #: ``False`` when the same request (or a poll) had already queued it.
+    created: bool
+
+
+class ItemCommand(ApiModel):
+    reason: str | None = Field(default=None, max_length=2000)
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+class ItemCommandResult(ApiModel):
+    item: Item
+    operation: OperationOut
