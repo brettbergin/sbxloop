@@ -19,6 +19,9 @@ import textwrap
 from pathlib import Path
 
 import pytest
+import yaml
+
+from sbxloop.sbx.provision import gh_credential_status
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github" / "workflows" / "deploy.yml"
@@ -43,6 +46,46 @@ def _step(deploy: str, name: str) -> str:
     match = re.search(pattern, deploy, re.S)
     assert match, f"step {name!r} missing"
     return match.group(1)
+
+
+class TestWorkflowCredentials:
+    @pytest.mark.parametrize("mode", ["app", "pat"])
+    def test_host_commands_keep_the_hosts_credentials(self, deploy: str, mode: str) -> None:
+        workflow = yaml.safe_load(deploy)
+        job = workflow["jobs"]["deploy"]
+        host_env = (
+            {
+                "GITHUB_APP_ID": "123",
+                "GITHUB_APP_INSTALLATION_ID": "456",
+                "GITHUB_APP_PRIVATE_KEY": "-----BEGIN PRIVATE KEY-----\ntest-only",
+            }
+            if mode == "app"
+            else {"GH_TOKEN": "host-pat"}
+        )
+        host_steps = [step for step in job["steps"] if '"${SBXLOOP}"' in step.get("run", "")]
+        assert host_steps
+        for step in host_steps:
+            # Actions overlays workflow, job and step env on the host's env.
+            env = host_env | workflow.get("env", {}) | job.get("env", {}) | step.get("env", {})
+            status = gh_credential_status(env)
+            assert status.ok, f"{step['name']}: {status.detail}"
+            assert status.mode == mode, step["name"]
+            assert env.get("GH_TOKEN") == host_env.get("GH_TOKEN"), step["name"]
+
+    def test_github_steps_still_receive_the_actions_token(self, deploy: str) -> None:
+        workflow = yaml.safe_load(deploy)
+        job = workflow["jobs"]["deploy"]
+        steps = {step["name"]: step for step in job["steps"]}
+        for name in (
+            "Load the trusted workflow helper",
+            "Read the release result",
+            "Compare against what is installed",
+            "Refresh the target after draining",
+            "Fetch the release wheels",
+            "Record the deployment attempt",
+        ):
+            env = workflow.get("env", {}) | job.get("env", {}) | steps[name].get("env", {})
+            assert env["GH_TOKEN"] == "${{ github.token }}", name
 
 
 @pytest.mark.parametrize("fixture", ["deploy", "example"])
