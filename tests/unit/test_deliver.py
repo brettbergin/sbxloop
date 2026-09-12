@@ -28,9 +28,10 @@ from sbxloop.gh.ops import PrRef
 from tests.fakes.github_errors import github_error
 from tests.fakes.gitrepo import git
 from tests.fakes.gitserver import PrivateGitServer, bare_from
+from tests.fakes.ops_stub import OpsStub
 
 
-class StubOps:
+class StubOps(OpsStub):
     """Routes the git-data-API calls deliver_workspace makes; records all."""
 
     def __init__(self) -> None:

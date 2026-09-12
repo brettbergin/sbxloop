@@ -13,14 +13,14 @@ import re
 import threading
 import time
 from typing import Any
-from urllib.parse import urlencode, urlsplit
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from sbxloop.engine.review import Followup
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import GithubOps
+from sbxloop.gh.ops import GithubOps, MalformedResponse
 from sbxloop_worker.protocol import HostToolCall, HostToolResponse, HostToolSpec
 
 TOOL_NAME = "lookup_followup"
@@ -144,11 +144,12 @@ class IssueLookup:
         issues: dict[int, IssueEvidence] = {}
         for terms in queries:
             query = f"repo:{self.repo} is:issue in:title,body {terms}"
-            path = "/search/issues?" + urlencode({"q": query, "per_page": MAX_RESULTS})
-            data = self.ops.raw("GET", path)
+            try:
+                data = self.ops.issue_search(query, per_page=MAX_RESULTS)
+            except MalformedResponse as exc:
+                raise LookupUnavailable("issue search was incomplete; narrow the search") from exc
             if (
-                not isinstance(data, dict)
-                or data.get("incomplete_results") is not False
+                data.get("incomplete_results") is not False
                 or type(data.get("total_count")) is not int
                 or not isinstance(data.get("items"), list)
                 or data["total_count"] != len(data["items"])
@@ -249,9 +250,7 @@ class IssueLookup:
         if matched is None:
             raise LookupUnavailable("the cited existing issue was not in the lookup")
         # Search can lag closure or deletion: verify the cited issue directly.
-        live = issue_evidence(
-            self.ops.raw("GET", f"/repos/{self.repo}/issues/{matched.number}"), self.repo
-        )
+        live = issue_evidence(self.ops.issue_get(self.repo, matched.number), self.repo)
         if live != matched:
             raise LookupUnavailable("the cited issue changed after review; needs triage")
         if followup.decision == "tracked":

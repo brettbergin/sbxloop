@@ -180,7 +180,7 @@ class TestApprove:
         assert gate is not None and h.dstore.claim_merge_gate(run_id)
         h.loop._complete_landing(gate, "Discord user `brett`")
         assert fake.merges
-        assert any("`flaky` — already red on base123" in c for c in fake.issue_comments)
+        assert any("`flaky` — already red on base123" in c for c in fake.issue_comments_posted)
         assert any(p.endswith("/branches/release/2/protection") for _, p, _ in fake.raw_calls)
 
     def test_approve_without_a_pr_base_asks_the_repository(self, tmp_path: Path) -> None:
@@ -209,7 +209,7 @@ class TestApprove:
         assert gate is not None and h.dstore.claim_merge_gate(run_id)
         h.loop._complete_landing(gate, "Discord user `brett`")
         assert fake.merges
-        assert any("bots do not dismiss their reviews" in c for c in fake.issue_comments)
+        assert any("bots do not dismiss their reviews" in c for c in fake.issue_comments_posted)
 
     def test_approve_merge_spawns_and_answers(self, tmp_path: Path) -> None:
         h, _fake, _run_id = self.approve_ready(tmp_path)

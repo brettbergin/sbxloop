@@ -58,7 +58,6 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
-from urllib.parse import quote
 
 from pydantic import ValidationError
 
@@ -189,12 +188,11 @@ from sbxloop.gh.ops import (
     FailedCheck,
     GithubOps,
     Identity,
+    MalformedResponse,
     PostedFinding,
     ReviewComment,
     SubmittedReview,
     identities_match,
-    raw_lookup,
-    raw_pages,
     user_identity,
 )
 from sbxloop.gh.permissions import workflows_write_granted
@@ -1607,7 +1605,10 @@ class LoopEngine:
         permissions problem that would report as "unrelated history".
         A miss is told apart by asking for the base ref itself.
         """
-        data = raw_lookup(ops, "GET", f"/repos/{repo}/compare/{base}...{branch}")
+        try:
+            data = ops.compare_lookup(repo, base, branch)
+        except MalformedResponse:
+            return f"GitHub's comparison with {base} had no usable shape"
         if data is None:
             if ops.ref_lookup(repo, f"heads/{base}") is None:
                 return (
@@ -1615,8 +1616,6 @@ class LoopEngine:
                     "origin, or the token cannot see it"
                 )
             return f"the branch has no merge base with {base} (unrelated history)"
-        if not isinstance(data, dict):
-            return f"GitHub's comparison with {base} had no usable shape"
         merge_base = data.get("merge_base_commit")
         if isinstance(merge_base, dict) and merge_base.get("sha"):
             return None
@@ -1627,12 +1626,9 @@ class LoopEngine:
         """The open pull request for ``branch``, or None when there is none
         to reattach to (it was closed or merged, so the restart opens a
         fresh one on the same branch)."""
-        owner = repo.split("/", 1)[0]
-        pulls = ops.raw("GET", f"/repos/{repo}/pulls?state=open&head={owner}:{branch}")
-        if isinstance(pulls, list):
-            for pull in pulls:
-                if isinstance(pull, dict) and pull.get("number"):
-                    return int(pull["number"])
+        for pull in ops.pr_list_open(repo, head=branch):
+            if isinstance(pull, dict) and pull.get("number"):
+                return int(pull["number"])
         if recorded is None:
             return None
         data = ops.pr_get(repo, recorded)
@@ -2815,7 +2811,7 @@ class LoopEngine:
         label = sinks.result_label(self.config.workload.result_label)
         try:
             ensure_label(p.ops, repo, label)
-            p.ops.raw("POST", f"/repos/{repo}/issues/{pr.number}/labels", {"labels": [label.name]})
+            p.ops.issue_labels_add(repo, pr.number, [label.name])
         except GithubOpsError:
             # The result is delivered; a label it could not carry is not a
             # reason to fail the run (the same rule as `_label_pr`).
@@ -3179,7 +3175,7 @@ class LoopEngine:
         if not labels or p.ops is None or p.repo is None:
             return
         try:
-            p.ops.raw("POST", f"/repos/{p.repo}/issues/{number}/labels", {"labels": labels})
+            p.ops.issue_labels_add(p.repo, number, labels)
         except GithubOpsError:
             log.warning(
                 "deliver.pr_labels_failed", run=p.run_id, pr=number, labels=labels, exc_info=True
@@ -3820,7 +3816,7 @@ class LoopEngine:
         assert ops is not None and repo is not None
         stamp = f"<!-- sbxloop:review-record run={run_id} -->"
         try:
-            existing = raw_pages(ops, f"/repos/{repo}/issues/{number}/comments")
+            existing = ops.issue_comments(repo, number)
         except GithubOpsError:
             existing = []
         for entry in existing:
@@ -4469,13 +4465,10 @@ class LoopEngine:
         out: dict[str, str] = {}
         data: list[Any] = []
         for page in range(1, 101):
-            chunk = ops.raw(
-                "GET",
-                f"/repos/{repo}/issues?labels={quote(label, safe='')}&state=all"
-                f"&per_page=100&page={page}",
-            )
-            if not isinstance(chunk, list):
-                raise LookupUnavailable("follow-up listing was malformed")
+            try:
+                chunk = ops.issues_list(repo, labels=[label], state="all", page=page)
+            except MalformedResponse as exc:
+                raise LookupUnavailable("follow-up listing was malformed") from exc
             data.extend(chunk)
             if len(chunk) < 100:
                 break

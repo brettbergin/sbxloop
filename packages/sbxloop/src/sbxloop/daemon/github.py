@@ -156,7 +156,7 @@ class DaemonGithub:
 
     def health_check(self) -> bool:
         try:
-            self.ops().raw("GET", "/rate_limit")
+            self.ops().rate_limit()
             return True
         except (GithubOpsError, WorkerError, SbxError) as exc:
             log.warning("github_sandbox.unhealthy", sandbox=self.name, error=str(exc))

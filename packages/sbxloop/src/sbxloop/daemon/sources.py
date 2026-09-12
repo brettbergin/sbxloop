@@ -35,7 +35,6 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
-from urllib.parse import quote
 
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.engine.model import RunKind
@@ -45,8 +44,6 @@ from sbxloop.gh.ops import (
     GithubOps,
     Identity,
     identities_match,
-    raw_lookup,
-    raw_pages,
     user_identity,
 )
 from sbxloop.ghids import is_chat_id, is_schedule_id, issue_item_id, try_parse_gh_id
@@ -295,7 +292,7 @@ class GitHubIssueSource:
 
     def _add_labels(self, ops: GithubOps, number: str, labels: Sequence[str]) -> None:
         try:
-            ops.raw("POST", f"{self._issue_path(number)}/labels", {"labels": list(labels)})
+            ops.issue_labels_add(self.repo, number, labels)
         except GithubOpsError as exc:
             raise self._label_error(exc, number, "add", labels) from exc
 
@@ -303,7 +300,7 @@ class GitHubIssueSource:
         # Already absent is fine (404 on the label resource) — and, since
         # #558, not a failed job either: the miss travels as data.
         try:
-            raw_lookup(ops, "DELETE", f"{self._issue_path(number)}/labels/{quote(label, safe='')}")
+            ops.issue_label_remove(self.repo, number, label)
         except GithubOpsError as exc:
             raise self._label_error(exc, number, "remove", [label]) from exc
 
@@ -370,7 +367,7 @@ class GitHubIssueSource:
         number = item.source_key
         ops = self._ops()
         try:
-            rows = list(raw_pages(ops, f"{self._issue_path(number)}/comments"))
+            rows = ops.issue_comments(self.repo, number)
         except (GithubOpsError, WorkerError, SbxError) as exc:
             log.warning("github.comments_failed", repo=self.repo, issue=number, error=str(exc))
             self._failed(exc)
@@ -416,11 +413,11 @@ class GitHubIssueSource:
         linked: list[LinkedIssue] = []
         for ref in wanted[:limit]:
             try:
-                row = ops.raw("GET", self._issue_path(str(ref)))
+                row = ops.issue_get(self.repo, ref)
             except (GithubOpsError, WorkerError, SbxError) as exc:
                 log.debug("github.linked_issue_skipped", repo=self.repo, issue=ref, error=str(exc))
                 continue
-            if not isinstance(row, dict) or not row.get("title"):
+            if not row.get("title"):
                 continue
             body = HIDDEN_MARKER_RE.sub("", str(row.get("body") or ""))
             excerpt = " ".join(body.split())
@@ -561,13 +558,13 @@ class GitHubIssueSource:
         log.debug("github.claim_start", item=item.item_id, repo=self.repo, trigger=trigger)
         try:
             ops = self._ops()
-            issue = ops.raw("GET", self._issue_path(number))
-            if not isinstance(issue, dict) or issue.get("state") != "open":
+            issue = ops.issue_get(self.repo, number)
+            if issue.get("state") != "open":
                 log.info(
                     "github.claim_declined",
                     item=item.item_id,
                     reason="issue no longer open",
-                    state=issue.get("state") if isinstance(issue, dict) else None,
+                    state=issue.get("state"),
                 )
                 return False
             names = {
@@ -677,7 +674,7 @@ class GitHubIssueSource:
         counts) if the issue's events do not show one."""
         trigger = trigger or self.labels.trigger
         latest = ""
-        for event in raw_pages(ops, f"{self._issue_path(number)}/events"):
+        for event in ops.issue_events(self.repo, number):
             if not isinstance(event, dict) or event.get("event") != "labeled":
                 continue
             label = event.get("label")
@@ -739,7 +736,7 @@ class GitHubIssueSource:
         rows for :meth:`_stale`, which needs to see what came after."""
         claims: list[ClaimComment] = []
         rows: list[dict[str, Any]] = []
-        for comment in raw_pages(ops, f"{self._issue_path(number)}/comments"):
+        for comment in ops.issue_comments(self.repo, number):
             if not isinstance(comment, dict):
                 continue
             rows.append(comment)
@@ -812,11 +809,9 @@ class GitHubIssueSource:
                 # Also look outside the cycle window: a claim from before a
                 # re-trigger is still ours, just no longer relevant.
                 return False
-            issue = ops.raw("GET", self._issue_path(number))
+            issue = ops.issue_get(self.repo, number)
             names = {
-                label.get("name")
-                for label in (issue.get("labels") if isinstance(issue, dict) else []) or []
-                if isinstance(label, dict)
+                label.get("name") for label in issue.get("labels") or [] if isinstance(label, dict)
             }
             if self.labels.in_progress not in names:
                 self._add_labels(ops, number, [self.labels.in_progress, *self.extra_labels])
@@ -837,7 +832,7 @@ class GitHubIssueSource:
             return
         self._guard(
             "claim comment removal",
-            lambda ops: ops.raw("DELETE", f"/repos/{self.repo}/issues/comments/{comment_id}"),
+            lambda ops: ops.issue_comment_delete(self.repo, comment_id),
         )
 
     def report_started(self, item: WorkItem, run_id: str) -> None:
@@ -868,7 +863,7 @@ class GitHubIssueSource:
             # Blind PATCH, no state pre-read: the PR body's `Closes #N` may
             # have closed the issue already, and re-closing a closed issue
             # is a no-op success.
-            ops.raw("PATCH", self._issue_path(n), {"state": "closed", "state_reason": "completed"})
+            ops.issue_close(self.repo, n, reason="completed")
             return True
 
         return bool(self._guard("merge report", go))
@@ -948,7 +943,7 @@ class GitHubIssueSource:
             self._comment(ops, n, _completed_body(report))
             self._remove_label(ops, n, self.labels.in_progress)
             self._add_label(ops, n, self.labels.completed)
-            ops.raw("PATCH", self._issue_path(n), {"state": "closed", "state_reason": "completed"})
+            ops.issue_close(self.repo, n, reason="completed")
             return True
 
         return bool(self._guard("completed report", go))

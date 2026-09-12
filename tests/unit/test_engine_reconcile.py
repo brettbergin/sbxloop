@@ -162,8 +162,8 @@ class TestReconcileRound:
         assert out.body_only == 2
         assert out.replied == 0
         assert gh.replies == []
-        assert len(gh.issue_comments) == 1
-        text = gh.issue_comments[0]
+        assert len(gh.issue_comments_posted) == 1
+        text = gh.issue_comments_posted[0]
         assert text.startswith("## Reconciliation — round 2")
         assert "- `a.py:1` — **addressed** — rewrote it" in text
         assert out.comment_url
@@ -302,7 +302,7 @@ class TestIdempotency:
         )
         run()
         again = run(done={BODY_COMMENT_KEY: "posted"})
-        assert len(gh.issue_comments) == 1
+        assert len(gh.issue_comments_posted) == 1
         assert again.comment_url is None
 
     def test_unreadable_threads_do_not_stop_the_replies(self) -> None:
@@ -348,7 +348,7 @@ class TestIdempotency:
             record=recorder(records),
         )
         assert (out.replied, out.resolved, out.body_only) == (1, 1, 0)
-        assert gh.issue_comments == []
+        assert gh.issue_comments_posted == []
         assert len(gh.replies) == 1
         assert gh.replies[0][1].startswith("**addressed in 0123456789ab**: took the lock")
         assert records == [("a.py:1", "addressed", True)]

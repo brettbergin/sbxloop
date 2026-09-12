@@ -27,6 +27,7 @@ from sbxloop.paths import SbxloopHome
 from sbxloop_worker.protocol import Event as ProtocolEvent
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import FakeGithub
+from tests.fakes.ops_stub import OpsStub
 from tests.fakes.rawdb import exec_raw
 
 runner = CliRunner()
@@ -3263,7 +3264,7 @@ class TestDoctorRepoChecks:
 
         seen: dict[str, object] = {}
 
-        class FakeOps:
+        class FakeOps(OpsStub):
             def repo_lookup(self, repo: str) -> dict[str, object]:
                 seen["looked_up"] = repo
                 return {"permissions": {"push": True}}
@@ -3353,7 +3354,7 @@ class TestDoctorProbeCost:
                 raise RuntimeError("microVM would not boot")
             box = self
 
-            class Ops:
+            class Ops(OpsStub):
                 def repo_lookup(self, repo: str) -> dict[str, Any]:
                     box.lookups.append(repo)
                     return {"permissions": {"push": True, "pull": True}}
@@ -3613,7 +3614,7 @@ class TestDoctorBranchProtection:
                 pass
 
             def ops(self) -> Any:
-                class Ops:
+                class Ops(OpsStub):
                     def repo_lookup(self, repo: str) -> dict[str, Any]:
                         return {"default_branch": "main"}
 
@@ -3697,7 +3698,7 @@ class TestDoctorBranchProtection:
                 pass
 
             def ops(self) -> Any:
-                class Ops:
+                class Ops(OpsStub):
                     def repo_lookup(self, repo: str) -> dict[str, Any]:
                         return {
                             "default_branch": "main",
@@ -3740,7 +3741,7 @@ class TestDoctorBranchProtection:
                 pass
 
             def ops(self) -> Any:
-                class Ops:
+                class Ops(OpsStub):
                     def repo_lookup(self, repo: str) -> dict[str, Any]:
                         return {"has_issues": False}
 
@@ -3809,11 +3810,11 @@ class TestDoctorBranchProtection:
         from sbxloop.config import Config
         from sbxloop.errors import GithubOpsError
 
-        class Ops:
+        class Ops(OpsStub):
             def __init__(self, protection: Any, rules: Any) -> None:
                 self.protection, self.rules = protection, rules
 
-            def raw(self, method: str, path: str) -> Any:
+            def raw(self, method: str, path: str, body: Any = None) -> Any:
                 answer = self.protection if path.endswith("/protection") else self.rules
                 if isinstance(answer, Exception):
                     raise answer
@@ -3939,7 +3940,7 @@ class TestDoctorPermissions:
         asked: list[str] = []
         listing = self.ONE_WORKFLOW if workflows is None else workflows
 
-        class Ops:
+        class Ops(OpsStub):
             def repo_lookup(self, repo: str) -> dict[str, Any]:
                 return {
                     "default_branch": "main",

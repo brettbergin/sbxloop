@@ -149,7 +149,7 @@ class TestTwoRoundRunIsReconciledOnThePr:
         self, run: tuple[Harness, FakeGithub, LoopEngine, RunResult]
     ) -> None:
         _, fake, _, result = run
-        (comment,) = fake.issue_comments
+        (comment,) = fake.issue_comments_posted
         assert comment.startswith("## Reconciliation — round 1")
         assert "commit2" in comment
         assert "docs/greeting.md" in comment
@@ -267,7 +267,7 @@ class TestTwoRoundRunIsReconciledOnThePr:
             [
                 *(f"REVIEW {body}" for _, body, _ in fake.reviews),
                 *(f"THREAD {c.body}" for t in fake.threads for c in t.comments),
-                *(f"COMMENT {c}" for c in fake.issue_comments),
+                *(f"COMMENT {c}" for c in fake.issue_comments_posted),
             ]
         )
         # The anchored finding: raised, addressed in a named commit, confirmed.

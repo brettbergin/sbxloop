@@ -40,6 +40,7 @@ from sbxloop.gh.labels import lifecycle_specs, missing_labels
 from sbxloop.gh.ops import GithubOps
 from sbxloop.gh.permissions import (
     NEEDS,
+    READ_PROBES,
     Need,
     missing_from_app,
     missing_from_scopes,
@@ -617,34 +618,15 @@ def _missing_from_push_bit(data: dict[str, object]) -> tuple[Need, ...]:
     return tuple(n for n in NEEDS if n.level == "write" and n.required)
 
 
-# The read a fine-grained PAT is asked to prove each permission with
-# (#696): GitHub answers 401/403 when the permission is not on the token,
-# and anything else — 200, an empty list, 404 on an empty repository, 422
-# — means the permission is there. ``{repo}`` and ``{base}`` are filled in;
-# a probe naming ``{base}`` is skipped when the repository has no base yet.
-_READ_PROBES: tuple[tuple[str, str], ...] = (
-    ("contents", "/repos/{repo}/commits?per_page=1&sha={base}"),
-    ("issues", "/repos/{repo}/issues?per_page=1"),
-    ("pull_requests", "/repos/{repo}/pulls?per_page=1"),
-    ("checks", "/repos/{repo}/commits/{base}/check-runs?per_page=1"),
-    ("actions", "/repos/{repo}/actions/runs?per_page=1"),
-)
-
-
 def _missing_from_probes(ops: GithubOps, repo: str, base: str) -> tuple[Need, ...]:
     """The needs a fine-grained PAT fails a read for. A permission the
     token lacks entirely fails its read; a read-only grant on a write need
     is the push bit's business (:func:`_missing_from_push_bit`)."""
     by_permission = {n.permission: n for n in NEEDS}
     missing: list[Need] = []
-    for permission, template in _READ_PROBES:
-        if "{base}" in template and not base:
-            continue
-        try:
-            ops.raw("GET", template.format(repo=repo, base=base))
-        except GithubOpsError as exc:
-            if exc.http_status in (401, 403):
-                missing.append(by_permission[permission])
+    for permission in READ_PROBES:
+        if ops.permission_probe(permission, repo, base) is False:
+            missing.append(by_permission[permission])
     return tuple(missing)
 
 
@@ -688,21 +670,17 @@ def _ci_summary(ops: GithubOps, repo: str, base: str) -> RepoCi | None:
     ``base`` (#696); None when they could not be listed (actions:read
     missing is reported as a permission, not here)."""
     try:
-        listing = ops.raw("GET", f"/repos/{repo}/actions/workflows?per_page=100")
+        workflows = ops.workflows_list(repo)
     except GithubOpsError:
-        return None
-    workflows = listing.get("workflows") if isinstance(listing, dict) else None
-    if not isinstance(workflows, list):
         return None
     active = sum(1 for w in workflows if isinstance(w, dict) and w.get("state") == "active")
     latest: str | None = None
     if active and base:
         try:
-            runs = ops.raw("GET", f"/repos/{repo}/actions/runs?branch={base}&per_page=1")
+            listed = ops.workflow_runs(repo, branch=base, per_page=1)
         except GithubOpsError:
-            runs = None
-        listed = runs.get("workflow_runs") if isinstance(runs, dict) else None
-        if isinstance(listed, list) and listed and isinstance(listed[0], dict):
+            listed = []
+        if listed and isinstance(listed[0], dict):
             run = listed[0]
             outcome = str(run.get("conclusion") or run.get("status") or "unknown")
             latest = f"{run.get('name') or 'workflow'} {outcome}"

@@ -464,7 +464,7 @@ class TestFakeGithubModelsThreads:
         assert gh.resolved == [thread.node_id]
 
         gh.pr_issue_comment("o/r", 7, "Reconciliation — round 1")
-        assert gh.issue_comments == ["Reconciliation — round 1"]
+        assert gh.issue_comments_posted == ["Reconciliation — round 1"]
 
     def test_thread_comment_is_typed(self) -> None:
         comment = ThreadComment(1, "someone", "body")

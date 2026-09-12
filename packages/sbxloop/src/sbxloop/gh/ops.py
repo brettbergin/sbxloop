@@ -10,11 +10,13 @@ from __future__ import annotations
 import time
 from collections.abc import Sequence
 from typing import Any, Literal, NamedTuple
+from urllib.parse import quote, urlencode
 
 from pydantic import BaseModel
 
 from sbxloop.config import MergeMethod
 from sbxloop.errors import GithubOpsError
+from sbxloop.gh.permissions import READ_PROBES
 from sbxloop.gh.review_locations import right_side_ranges
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
@@ -309,6 +311,18 @@ class PaginationError(GithubOpsError):
     with a next page the query does not fetch). The read is incomplete
     and must be treated as unread, never as "what we saw is all there
     is"."""
+
+
+class MalformedResponse(GithubOpsError):
+    """GitHub answered, but not in the shape the operation is defined to
+    return — a list where an object was due, an object without the field
+    the caller exists to read. Never a miss and never a refusal: those
+    carry a status. A caller that can do nothing with the answer treats
+    it as unread."""
+
+    def __init__(self, what: str, data: Any) -> None:
+        super().__init__(f"{what} returned a malformed result: {data!r}")
+        self.data = data
 
 
 def raw_lookup(
@@ -1702,6 +1716,255 @@ class GithubOps:
     def search_issues(self, query: str, per_page: int = 30) -> list[dict[str, Any]]:
         data = self._op("search.issues", {"query": query, "per_page": per_page})
         return data if isinstance(data, list) else []
+
+    # -- named operations over the generic transport ------------------------
+    #
+    # Everything below the review block is one REST call (or one paged
+    # walk) with its path, verb and body fixed here, so no other module
+    # spells a GitHub path. Each returns the shape its callers read and
+    # raises :class:`MalformedResponse` when GitHub's answer is not that
+    # shape; a status GitHub reports still arrives as a plain
+    # :class:`GithubOpsError` with ``http_status`` set.
+
+    @staticmethod
+    def _dict(what: str, data: Any) -> dict[str, Any]:
+        if not isinstance(data, dict):
+            raise MalformedResponse(what, data)
+        return data
+
+    @staticmethod
+    def _list(what: str, data: Any) -> list[Any]:
+        if not isinstance(data, list):
+            raise MalformedResponse(what, data)
+        return data
+
+    def rate_limit(self) -> dict[str, Any]:
+        """The credential's rate-limit budget (``GET /rate_limit``) — the
+        cheapest authenticated read there is, which is why the daemon's
+        health check makes it."""
+        return self._dict("GET /rate_limit", self.raw("GET", "/rate_limit"))
+
+    def authenticated_user(self) -> dict[str, Any]:
+        """The credential's own account (``GET /user``): its ``login`` and
+        ``type``. A GitHub App installation token gets 403 here."""
+        return self._dict("GET /user", self.raw("GET", "/user"))
+
+    def repo_create(
+        self, repo: str, *, private: bool = True, for_user: bool = False
+    ) -> dict[str, Any]:
+        """Create ``owner/name`` with an initial commit, under the
+        credential's own account (``for_user``) or the ``owner``
+        organization; the repository payload GitHub answers with."""
+        owner, name = repo.split("/", 1)
+        body = {"name": name, "private": private, "auto_init": True}
+        path = "/user/repos" if for_user else f"/orgs/{owner}/repos"
+        return self._dict(f"POST {path}", self.raw("POST", path, body))
+
+    def compare_lookup(self, repo: str, base: str, head: str) -> dict[str, Any] | None:
+        """GitHub's comparison of ``base`` with ``head`` (its
+        ``merge_base_commit`` among other things), or None when GitHub
+        answers 404 — unrelated histories, or a base the token cannot
+        see; the caller tells those apart."""
+        data = self.raw_lookup("GET", f"/repos/{repo}/compare/{base}...{head}")
+        if data is None:
+            return None
+        return self._dict(f"GET /repos/{repo}/compare", data)
+
+    # -- issues ---------------------------------------------------------------
+
+    def issue_get(self, repo: str, number: int | str) -> dict[str, Any]:
+        """The issue (or pull request, which the issues API also serves):
+        state, labels, title, body."""
+        path = f"/repos/{repo}/issues/{number}"
+        return self._dict(f"GET {path}", self.raw("GET", path))
+
+    def issue_comments(self, repo: str, number: int | str) -> list[Any]:
+        """Every comment on the issue, oldest first, across every page."""
+        return raw_pages(self, f"/repos/{repo}/issues/{number}/comments")
+
+    def issue_events(self, repo: str, number: int | str) -> list[Any]:
+        """The issue's timeline events (labeled, closed, ...), across every
+        page."""
+        return raw_pages(self, f"/repos/{repo}/issues/{number}/events")
+
+    def issues_list(
+        self,
+        repo: str,
+        *,
+        state: str = "open",
+        labels: Sequence[str] = (),
+        per_page: int = PAGE_SIZE,
+        page: int = 1,
+        sort: str = "",
+        direction: str = "",
+    ) -> list[Any]:
+        """One page of the repository's issues — pull requests included, as
+        the endpoint lists them — filtered by ``state`` (``open``,
+        ``closed``, ``all``) and, when given, ``labels`` (all of them)."""
+        query = f"state={state}&per_page={per_page}"
+        if sort:
+            query += f"&sort={sort}"
+        if direction:
+            query += f"&direction={direction}"
+        if labels:
+            query += f"&labels={quote(','.join(labels), safe='')}"
+        query += f"&page={page}"
+        path = f"/repos/{repo}/issues?{query}"
+        return self._list(f"GET /repos/{repo}/issues", self.raw("GET", path))
+
+    def issue_search(self, query: str, *, per_page: int) -> dict[str, Any]:
+        """The search API's answer to ``query``: ``items``, ``total_count``
+        and ``incomplete_results`` — the caller judges whether the answer
+        is whole."""
+        path = "/search/issues?" + urlencode({"q": query, "per_page": per_page})
+        return self._dict("GET /search/issues", self.raw("GET", path))
+
+    def issue_labels_add(self, repo: str, number: int | str, labels: Sequence[str]) -> None:
+        """Put ``labels`` on the issue or pull request (existing ones stay)."""
+        self.raw("POST", f"/repos/{repo}/issues/{number}/labels", {"labels": list(labels)})
+
+    def issue_label_remove(self, repo: str, number: int | str, label: str) -> None:
+        """Take ``label`` off the issue; one that is not there is a success,
+        not a failed job (#558)."""
+        self.raw_lookup("DELETE", f"/repos/{repo}/issues/{number}/labels/{quote(label, safe='')}")
+
+    def issue_close(self, repo: str, number: int | str, *, reason: str = "completed") -> None:
+        """Close the issue with ``reason`` (``completed``, ``not_planned``);
+        closing a closed issue is a no-op success."""
+        self.raw(
+            "PATCH",
+            f"/repos/{repo}/issues/{number}",
+            {"state": "closed", "state_reason": reason},
+        )
+
+    def issue_comment_delete(self, repo: str, comment_id: int) -> None:
+        """Delete one issue comment by its id."""
+        self.raw("DELETE", f"/repos/{repo}/issues/comments/{comment_id}")
+
+    # -- pull requests -------------------------------------------------------
+
+    def pr_list_open(self, repo: str, *, head: str) -> list[Any]:
+        """The open pull requests whose head is the branch ``head`` of
+        ``repo``'s owner — none, or the one a re-delivery refreshes."""
+        owner = repo.split("/", 1)[0]
+        data = self.raw("GET", f"/repos/{repo}/pulls?state=open&head={owner}:{head}")
+        return data if isinstance(data, list) else []
+
+    def pr_update(
+        self, repo: str, number: int, *, title: str | None = None, body: str | None = None
+    ) -> dict[str, Any]:
+        """Change the pull request's title and/or body; the PR as it now is."""
+        fields: dict[str, Any] = {}
+        if title is not None:
+            fields["title"] = title
+        if body is not None:
+            fields["body"] = body
+        path = f"/repos/{repo}/pulls/{number}"
+        return self._dict(f"PATCH {path}", self.raw("PATCH", path, fields))
+
+    def pr_files(self, repo: str, number: int) -> list[Any]:
+        """The files the pull request changes, with their patches, across
+        every page."""
+        return raw_pages(self, f"/repos/{repo}/pulls/{number}/files")
+
+    def pr_reviews(self, repo: str, number: int) -> list[Any]:
+        """Every review submitted on the pull request, across every page."""
+        return raw_pages(self, f"/repos/{repo}/pulls/{number}/reviews")
+
+    def pr_review_comments(self, repo: str, number: int) -> list[Any]:
+        """Every inline review comment on the pull request, across every
+        page."""
+        return raw_pages(self, f"/repos/{repo}/pulls/{number}/comments")
+
+    def check_runs(self, repo: str, sha: str) -> list[Any]:
+        """The check runs reported on ``sha``, across every page — the
+        entries :func:`fold_check_runs` folds."""
+        return raw_pages(self, f"/repos/{repo}/commits/{sha}/check-runs", key="check_runs")
+
+    # -- the git data API (a commit without a checkout) ---------------------
+
+    def commit_get(self, repo: str, sha: str) -> dict[str, Any]:
+        """The commit object behind ``sha``: its ``tree``, parents, message."""
+        path = f"/repos/{repo}/git/commits/{sha}"
+        return self._dict(f"GET {path}", self.raw("GET", path))
+
+    def tree_create(
+        self, repo: str, *, base_tree: str, entries: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Create a tree from ``entries`` on top of ``base_tree``; the tree
+        object, whose ``sha`` the caller commits."""
+        path = f"/repos/{repo}/git/trees"
+        return self._dict(
+            f"POST {path}", self.raw("POST", path, {"base_tree": base_tree, "tree": entries})
+        )
+
+    def commit_create(
+        self, repo: str, *, message: str, tree: str, parents: list[str]
+    ) -> dict[str, Any]:
+        """Create a commit of ``tree`` with ``parents``; the commit object."""
+        path = f"/repos/{repo}/git/commits"
+        return self._dict(
+            f"POST {path}",
+            self.raw("POST", path, {"message": message, "tree": tree, "parents": parents}),
+        )
+
+    def ref_create(self, repo: str, ref: str, sha: str) -> None:
+        """Create ``refs/heads/...`` (the full ref) at ``sha``. A ref that
+        already exists is GitHub's 422, raised for the caller to read."""
+        self.raw("POST", f"/repos/{repo}/git/refs", {"ref": ref, "sha": sha})
+
+    def ref_force_update(self, repo: str, branch: str, sha: str) -> None:
+        """Move ``branch`` to ``sha``, discarding whatever it pointed at."""
+        self.raw("PATCH", f"/repos/{repo}/git/refs/heads/{branch}", {"sha": sha, "force": True})
+
+    def contents_put(
+        self, repo: str, path: str, *, message: str, content_b64: str, branch: str
+    ) -> dict[str, Any]:
+        """Create or replace one file on ``branch`` through the contents API
+        — the one write that works on a repository with no commit yet."""
+        target = f"/repos/{repo}/contents/{path}"
+        return self._dict(
+            f"PUT {target}",
+            self.raw("PUT", target, {"message": message, "content": content_b64, "branch": branch}),
+        )
+
+    # -- what a credential may do, and what the repository runs --------------
+
+    def permission_probe(self, permission: str, repo: str, base: str) -> bool | None:
+        """Whether a fine-grained token can make :data:`READ_PROBES`'s read
+        for ``permission`` (#696): False on 401/403, True on any other
+        answer (an empty list, a 404 on an empty repository, a 422 all mean
+        the permission is there), None when the probe needs a ``base`` the
+        repository does not have yet."""
+        template = READ_PROBES[permission]
+        if "{base}" in template and not base:
+            return None
+        try:
+            self.raw("GET", template.format(repo=repo, base=base))
+        except GithubOpsError as exc:
+            if exc.http_status in (401, 403):
+                return False
+        return True
+
+    def workflows_list(self, repo: str) -> list[Any]:
+        """The repository's Actions workflows (``state`` says whether each
+        is active); the first hundred."""
+        data = self.raw("GET", f"/repos/{repo}/actions/workflows?per_page=100")
+        workflows = data.get("workflows") if isinstance(data, dict) else None
+        return self._list(f"GET /repos/{repo}/actions/workflows", workflows)
+
+    def workflow_runs(self, repo: str, *, branch: str, per_page: int = 1) -> list[Any]:
+        """The latest Actions runs on ``branch``, newest first."""
+        data = self.raw("GET", f"/repos/{repo}/actions/runs?branch={branch}&per_page={per_page}")
+        runs = data.get("workflow_runs") if isinstance(data, dict) else None
+        return self._list(f"GET /repos/{repo}/actions/runs", runs)
+
+    # -- the generic transport ------------------------------------------------
+    #
+    # Private to this package: every path GitHub is asked for is spelt in a
+    # named operation above (or in ``gh/protection.py`` / ``gh/labels.py``),
+    # never by a caller. ``tests/unit/test_gh_raw_is_private.py`` holds the
+    # line.
 
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         params: dict[str, Any] = {"method": method, "path": path}

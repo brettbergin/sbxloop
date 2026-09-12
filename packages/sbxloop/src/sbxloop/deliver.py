@@ -79,7 +79,7 @@ from sbxloop.errors import (
     EmptyDeliveryError,
     GithubOpsError,
 )
-from sbxloop.gh.ops import GithubOps, PrRef
+from sbxloop.gh.ops import GithubOps, MalformedResponse, PrRef
 from sbxloop.gh.permissions import WORKFLOWS_NEED, workflow_paths
 from sbxloop.ids import branch_name as branch_name  # re-export; shared with hostgit isolation
 from sbxloop.log import get_logger
@@ -329,9 +329,9 @@ def ensure_repository(
             "--create-repo (config: [github] create_repo = true) to have "
             "sbxloop create it"
         )
-    owner, name = repo.split("/", 1)
+    owner = repo.split("/", 1)[0]
     try:
-        user = ops.raw("GET", "/user")
+        user = ops.authenticated_user()
     except GithubOpsError as exc:
         # ``GET /user`` needs a user token — a GitHub App installation
         # token gets 403 "Resource not accessible by integration" (#581).
@@ -346,12 +346,8 @@ def ensure_repository(
             hint="creating via the organization route",
         )
         user = {}
-    login = str(user.get("login", "")) if isinstance(user, dict) else ""
-    body = {"name": name, "private": not public, "auto_init": True}
-    if login.lower() == owner.lower():
-        made = ops.raw("POST", "/user/repos", body)
-    else:
-        made = ops.raw("POST", f"/orgs/{owner}/repos", body)
+    login = str(user.get("login", ""))
+    made = ops.repo_create(repo, private=not public, for_user=login.lower() == owner.lower())
     return RepositoryProbe(created=True, has_issues=_has_issues(made), url=_html_url(made))
 
 
@@ -524,7 +520,7 @@ def deliver_workspace(
     ]
     try:
         tree = _sha(
-            ops.raw("POST", f"/repos/{repo}/git/trees", {"base_tree": base_tree, "tree": entries}),
+            ops.tree_create(repo, base_tree=base_tree, entries=entries),
             f"tree for {repo}",
         )
     except GithubOpsError as exc:
@@ -542,14 +538,11 @@ def deliver_workspace(
             raise _refuse_workflow_delivery(touched, known=False, cause=exc) from exc
         raise
     commit = _sha(
-        ops.raw(
-            "POST",
-            f"/repos/{repo}/git/commits",
-            {
-                "message": commit_message or _commit_message(run_id, outcome),
-                "tree": tree,
-                "parents": [parent or base_sha],
-            },
+        ops.commit_create(
+            repo,
+            message=commit_message or _commit_message(run_id, outcome),
+            tree=tree,
+            parents=[parent or base_sha],
         ),
         f"commit for {repo}",
     )
@@ -672,7 +665,7 @@ def _point_branch(
         _force_move(ops, repo, branch, commit, run_id=run_id, round_no=round_no, previous=previous)
         return
     try:
-        ops.raw("POST", f"/repos/{repo}/git/refs", {"ref": f"refs/heads/{branch}", "sha": commit})
+        ops.ref_create(repo, f"refs/heads/{branch}", commit)
     except GithubOpsError as exc:
         if _is_ref_refusal(exc):
             # A 422 that is not "already exists" is the repository refusing
@@ -717,17 +710,13 @@ def _force_move(
     if hint is not None:
         fields["hint"] = hint
     log.info("deliver.branch_force_moved", **fields)
-    ops.raw("PATCH", f"/repos/{repo}/git/refs/heads/{branch}", {"sha": commit, "force": True})
+    ops.ref_force_update(repo, branch, commit)
 
 
 def _find_open_pr(ops: GithubOps, repo: str, branch: str) -> PrRef | None:
     """The open PR whose head is ``branch`` — a re-delivery's earlier PR,
     which the force-moved branch has just refreshed."""
-    owner = repo.split("/", 1)[0]
-    pulls = ops.raw("GET", f"/repos/{repo}/pulls?state=open&head={owner}:{branch}")
-    if not isinstance(pulls, list):
-        return None
-    for pull in pulls:
+    for pull in ops.pr_list_open(repo, head=branch):
         if isinstance(pull, dict) and pull.get("number"):
             return PrRef(number=int(pull["number"]), url=str(pull.get("html_url", "")))
     return None
@@ -894,14 +883,12 @@ def _bootstrap_empty_repo(
     workspace ships its own.
     """
     readme = f"# {repo.split('/', 1)[1]}\n\nInitialized by sbxloop run {run_id}.\n"
-    ops.raw(
-        "PUT",
-        f"/repos/{repo}/contents/README.md",
-        {
-            "message": f"sbxloop run {run_id}: initialize repository\n\nOutcome: {outcome}",
-            "content": base64.b64encode(readme.encode()).decode(),
-            "branch": base,
-        },
+    ops.contents_put(
+        repo,
+        "README.md",
+        message=f"sbxloop run {run_id}: initialize repository\n\nOutcome: {outcome}",
+        content_b64=base64.b64encode(readme.encode()).decode(),
+        branch=base,
     )
 
 
@@ -913,10 +900,9 @@ def _base_commit_sha(ops: GithubOps, repo: str, base: str) -> str | None:
 
 
 def _commit_tree_sha(ops: GithubOps, repo: str, commit_sha: str) -> str:
-    commit = ops.raw("GET", f"/repos/{repo}/git/commits/{commit_sha}")
     try:
-        return str(commit["tree"]["sha"])
-    except (TypeError, KeyError) as exc:
+        return str(ops.commit_get(repo, commit_sha)["tree"]["sha"])
+    except (TypeError, KeyError, MalformedResponse) as exc:
         raise DeliveryError(f"cannot read base commit {commit_sha} of {repo}") from exc
 
 
@@ -999,7 +985,7 @@ def _retitle(
     if not wanted or not current or current == wanted:
         return  # no current title = GitHub did not say; nothing to compare
     try:
-        ops.raw("PATCH", f"/repos/{repo}/pulls/{number}", {"title": wanted})
+        ops.pr_update(repo, number, title=wanted)
     except GithubOpsError:
         log.warning("deliver.title_unchanged", run=run_id, repo=repo, pr=number, exc_info=True)
         return
@@ -1149,7 +1135,7 @@ def _rebody(ops: GithubOps, repo: str, number: int, *, body: str, run_id: str) -
     effort, like the retitle: a refused edit must not fail a delivery
     that landed."""
     try:
-        ops.raw("PATCH", f"/repos/{repo}/pulls/{number}", {"body": body})
+        ops.pr_update(repo, number, body=body)
     except GithubOpsError:
         log.warning("deliver.body_unchanged", run=run_id, repo=repo, pr=number, exc_info=True)
         return

@@ -50,7 +50,6 @@ from sbxloop.gh.ops import (
     identities_match,
     is_bot_user,
     logins_match,
-    raw_pages,
     user_identity,
     user_kind,
 )
@@ -307,8 +306,8 @@ def resolve_identity(
     if bot_login:
         return LoopIdentity(bot_login, True)
     try:
-        user = ops.raw("GET", "/user")
-        login = str(user.get("login", "")) if isinstance(user, dict) else ""
+        user = ops.authenticated_user()
+        login = str(user.get("login", ""))
         if login:
             return LoopIdentity(login, user_kind(user))
     except GithubOpsError as exc:
@@ -327,11 +326,11 @@ def resolve_identity(
     if pr_number is None or not pr_author_is_loop:
         return UNKNOWN_IDENTITY
     try:
-        user = ops.pr_get(repo, pr_number).get("user")
+        author = ops.pr_get(repo, pr_number).get("user")
     except GithubOpsError:
         log.warning("land.login_pr_author_lookup_failed", repo=repo, pr=pr_number, exc_info=True)
         return UNKNOWN_IDENTITY
-    login, kind = user_identity(user)
+    login, kind = user_identity(author)
     return LoopIdentity(login, kind) if login else UNKNOWN_IDENTITY
 
 
@@ -361,7 +360,7 @@ def human_objection(
     """Whether a reviewer other than the loop's own identity has a standing
     ``CHANGES_REQUESTED`` on the PR. The loop's own reviews are excluded
     rather than trusted: our verdict lives in the run, not on GitHub."""
-    payload = raw_pages(ops, f"/repos/{repo}/pulls/{number}/reviews")
+    payload = ops.pr_reviews(repo, number)
     others = [
         review
         for review in payload
@@ -393,7 +392,7 @@ def human_objections(
     def bot(entry: dict[str, Any]) -> bool:
         return is_bot_user(entry.get("user"))
 
-    payload = raw_pages(ops, f"/repos/{repo}/pulls/{number}/reviews")
+    payload = ops.pr_reviews(repo, number)
     latest: dict[str, dict[str, Any]] = {}
     for review in payload:
         if not isinstance(review, dict):
@@ -422,7 +421,7 @@ def human_objections(
                 is_bot=bot(review),
             )
         )
-    comments = raw_pages(ops, f"/repos/{repo}/pulls/{number}/comments")
+    comments = ops.pr_review_comments(repo, number)
     for comment in comments:
         if not isinstance(comment, dict):
             continue

@@ -40,7 +40,6 @@ from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
-from urllib.parse import quote
 
 from sbxloop.agentmodels import ModelSelection, model_for_phase, refreshed_models
 from sbxloop.cli.tui import format_event
@@ -85,6 +84,7 @@ from sbxloop.errors import (
     WorkerTimeoutError,
 )
 from sbxloop.events import EventBus
+from sbxloop.gh.ops import MalformedResponse
 from sbxloop.ghids import chat_item_id, issue_item_id, normalize_item_id
 from sbxloop.ids import new_job_id, new_run_id
 from sbxloop.log import get_logger
@@ -103,7 +103,6 @@ if TYPE_CHECKING:
     from sbxloop.daemon.github import DaemonGithub
     from sbxloop.daemon.loop import DaemonLoop
     from sbxloop.daemon.model import RunReport, WorkItem
-    from sbxloop.gh.ops import GithubOps
 
 log = get_logger(__name__)
 
@@ -2046,6 +2045,7 @@ class Concierge:
         repo, repo_error = self._resolve_repo(args)
         if repo_error is not None:
             return repo_error
+        assert repo is not None
         what = str(args.get("what", ""))
         number = args.get("number")
         path = args.get("path")
@@ -2058,21 +2058,17 @@ class Concierge:
             return f"number must be an integer, got {number!r}"
         try:
             if what == "pr":
-                data = self.github.call(lambda ops: ops.raw("GET", f"/repos/{repo}/pulls/{n}"))
+                data = self.github.call(lambda ops: ops.pr_get(repo, n))
                 return _pr_summary(data)
             if what in ("pr_files", "pr_diff"):
-                files = self.github.call(
-                    lambda ops: ops.raw("GET", f"/repos/{repo}/pulls/{n}/files?per_page=100")
-                )
+                files = self.github.call(lambda ops: ops.pr_files(repo, n))
                 return _pr_files(files, with_patch=what == "pr_diff")
             if what == "issue":
-                data = self.github.call(lambda ops: ops.raw("GET", f"/repos/{repo}/issues/{n}"))
+                data = self.github.call(lambda ops: ops.issue_get(repo, n))
                 return _issue_summary(data)
             if what == "issue_comments":
-                data = self.github.call(
-                    lambda ops: ops.raw("GET", f"/repos/{repo}/issues/{n}/comments?per_page=50")
-                )
-                return _issue_comments(data)
+                comments = self.github.call(lambda ops: ops.issue_comments(repo, n))
+                return _issue_comments(comments[:50])
             if what == "file":
                 if not path:
                     return "file needs path"
@@ -2099,14 +2095,15 @@ class Concierge:
             return f"number must be an integer, got {number!r}"
 
         missing = f"PR #{n} does not exist in {repo}"
+        assert repo is not None
         try:
-            pr = self.github.call(lambda ops: ops.raw("GET", f"/repos/{repo}/pulls/{n}"))
+            pr = self.github.call(lambda ops: ops.pr_get(repo, n))
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             text = str(exc).lower()
             if "404" in text or "not found" in text:
                 return missing
             return f"reading PR #{n} failed: {_one_line(str(exc), 300)}"
-        if not isinstance(pr, dict) or not pr.get("number"):
+        if not pr.get("number"):
             return missing
 
         head = pr.get("head") or {}
@@ -2115,12 +2112,8 @@ class Concierge:
         try:
             checks: Any = {}
             if sha:
-                checks = self.github.call(
-                    lambda ops: ops.raw("GET", f"/repos/{repo}/commits/{sha}/check-runs")
-                )
-            reviews = self.github.call(
-                lambda ops: ops.raw("GET", f"/repos/{repo}/pulls/{n}/reviews?per_page=100")
-            )
+                checks = self.github.call(lambda ops: ops.check_runs(repo, sha))
+            reviews = self.github.call(lambda ops: ops.pr_reviews(repo, n))
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             return f"reading PR #{n} failed: {_one_line(str(exc), 300)}"
 
@@ -2209,21 +2202,28 @@ class Concierge:
         repo, repo_error = self._resolve_repo(args)
         if repo_error is not None:
             return repo_error
+        assert repo is not None
         lifecycle = self.config.labels_for(repo)
         limit = _int_arg(args, "limit", 20, 1, 50)
         label = str(args.get("label") or "").strip()
         include_all = bool(args.get("all"))
         state = "all" if include_all else "open"
         openness = "open+closed" if include_all else "open"
-        query = f"state={state}&per_page={limit}&sort=updated&direction=desc"
-        if label:
-            query += f"&labels={quote(label, safe='')}"
         try:
-            data = self.github.call(lambda ops: ops.raw("GET", f"/repos/{repo}/issues?{query}"))
+            data = self.github.call(
+                lambda ops: ops.issues_list(
+                    repo,
+                    state=state,
+                    per_page=limit,
+                    sort="updated",
+                    direction="desc",
+                    labels=[label] if label else (),
+                )
+            )
+        except MalformedResponse as exc:
+            return json.dumps(exc.data, default=str)[:2000]
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             return f"listing issues failed: {_one_line(str(exc), 300)}"
-        if not isinstance(data, list):
-            return json.dumps(data, default=str)[:2000]
         issues = [d for d in data if isinstance(d, dict) and "pull_request" not in d]
         queued_arg = args.get("queued")
         state_arg = str(args.get("state") or "").strip().lower()
@@ -2312,13 +2312,10 @@ class Concierge:
         number = _issue_number(args)
         if number <= 0:
             return "number is required"
+        assert repo is not None
         trigger = self.config.labels_for(repo).trigger
         try:
-            self.github.call(
-                lambda ops: ops.raw(
-                    "POST", f"/repos/{repo}/issues/{number}/labels", {"labels": [trigger]}
-                )
-            )
+            self.github.call(lambda ops: ops.issue_labels_add(repo, number, [trigger]))
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             return f"labelling #{number} failed: {_one_line(str(exc), 300)}"
         log.info("concierge.issue_labelled_for_run", number=number, by=by, label=trigger)
@@ -2386,13 +2383,12 @@ class Concierge:
             )
         comment = str(args.get("comment", "")).strip()
         lifecycle = self.config.labels_for(repo)
-        path = f"/repos/{repo}/issues/{number}"
         try:
-            data = self.github.call(lambda ops: ops.raw("GET", path))
+            data = self.github.call(lambda ops: ops.issue_get(repo, number))
+        except MalformedResponse as exc:
+            return f"#{number} did not come back as an issue: {_one_line(str(exc.data), 200)}"
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             return f"reading #{number} failed, so it was not closed: {_one_line(str(exc), 300)}"
-        if not isinstance(data, dict):
-            return f"#{number} did not come back as an issue: {_one_line(str(data), 200)}"
         if "pull_request" in data:
             return f"#{number} is a pull request, not an issue — close_issue only closes issues."
         title = _one_line(str(data.get("title") or ""), 100)
@@ -2426,7 +2422,9 @@ class Concierge:
             # Removing it before the close also shuts the claim window: a poll
             # landing mid-sequence declines on either signal (sources.claim).
             try:
-                self.github.call(lambda ops: _remove_label(ops, path, lifecycle.trigger))
+                self.github.call(
+                    lambda ops: ops.issue_label_remove(repo, number, lifecycle.trigger)
+                )
             except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
                 notes.append(
                     f"could NOT remove `{lifecycle.trigger}` ({_one_line(str(exc), 120)}) — "
@@ -2435,9 +2433,7 @@ class Concierge:
             else:
                 notes.append(f"removed `{lifecycle.trigger}`")
         try:
-            self.github.call(
-                lambda ops: ops.raw("PATCH", path, {"state": "closed", "state_reason": reason})
-            )
+            self.github.call(lambda ops: ops.issue_close(repo, number, reason=reason))
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             done = f" (already done: {', '.join(notes)})" if notes else ""
             return f"closing #{number} failed: {_one_line(str(exc), 300)}{done}"
@@ -2522,16 +2518,6 @@ def _state_list(raw: Any) -> list[str]:
         if name in _ISSUE_STATES and name not in out:
             out.append(name)
     return out
-
-
-def _remove_label(ops: GithubOps, issue_path: str, label: str) -> None:
-    """DELETE a label, treating "it was not there" (404 on the label
-    resource) as success — same tolerance as ``GitHubIssueSource``. Swallowed
-    inside the ``DaemonGithub.call`` lambda so a 404 never looks like a dead
-    sandbox and triggers its drop-and-retry."""
-    from sbxloop.gh.ops import raw_lookup
-
-    raw_lookup(ops, "DELETE", f"{issue_path}/labels/{quote(label, safe='')}")
 
 
 def _work_item_note(item: WorkItem | None) -> str:

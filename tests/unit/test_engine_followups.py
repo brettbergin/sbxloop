@@ -419,7 +419,7 @@ class TestIssuesDisabled:
         assert fake.issues_created == []
         # Nothing was even attempted: no label ensure, no issue list.
         assert not any(path.endswith("/labels") for _m, path, _b in fake.raw_calls)
-        (listed,) = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+        (listed,) = [c for c in fake.issue_comments_posted if c.startswith("## Follow-ups")]
         assert "Not filed as issues (Issues are disabled on this repository)" in listed
         assert "- [ ] **the greeting is not documented**" in listed
         (event,) = self._followup_events(harness)
@@ -444,7 +444,7 @@ class TestIssuesDisabled:
         result = self._run(harness, fake)
         assert result.state == "merged"
         assert fake.issues_created == []
-        (listed,) = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+        (listed,) = [c for c in fake.issue_comments_posted if c.startswith("## Follow-ups")]
         assert "Issues are disabled on this repository" in listed
         (event,) = self._followup_events(harness)
         assert event.data["mode"] == "comment" and event.data["reason"] == "issues_disabled"
@@ -511,7 +511,7 @@ def test_unchecked_followup_and_deferral_stay_on_the_pr(harness: Harness) -> Non
     result = harness.pipeline(fake).start("ship hello")
     assert result.state == "merged"
     assert fake.issues_created == []
-    (comment,) = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+    (comment,) = [c for c in fake.issue_comments_posted if c.startswith("## Follow-ups")]
     assert "no completed issue lookup" in comment
     assert "the greeting is not documented" in comment
     (event,) = [e for e in harness.events if e.type == HostEventTypes.RUN_FOLLOWUPS]
@@ -536,7 +536,7 @@ def test_semantic_duplicate_links_a_human_issue_without_creating_one(harness: Ha
     assert result.state == "merged"
     assert FOLLOWUP_A["title"] not in [t for t, _, _ in fake.issues_created]
     assert len(fake.issues_created) == 2
-    (comment,) = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+    (comment,) = [c for c in fake.issue_comments_posted if c.startswith("## Follow-ups")]
     assert "https://github.com/o/r/issues/12" in comment
 
 
@@ -550,7 +550,7 @@ def test_failed_lookup_leaves_notes_without_changing_the_merge(
     harness.script(followup_script())
     result = harness.pipeline(fake).start("ship hello")
     assert result.state == "merged" and fake.issues_created == []
-    assert any("Not filed — issue lookup needs triage" in c for c in fake.issue_comments)
+    assert any("Not filed — issue lookup needs triage" in c for c in fake.issue_comments_posted)
     assert fake.labels_created == []
 
 

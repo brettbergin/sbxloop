@@ -34,6 +34,7 @@ from sbxloop.engine.model import (
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import RunCancelledError, SbxError, StateError, WorkerError
 from sbxloop.events import Event, EventBus
+from tests.fakes.ops_stub import OpsStub
 from tests.fakes.rawdb import backdate, query_raw
 from tests.unit.test_hostgit import (
     git as git_cmd,
@@ -628,7 +629,7 @@ class TestOutcomeContext:
             def gh_bot_login(self, repo: str | None = None) -> str | None:
                 return self.login
 
-        class Ops:
+        class Ops(OpsStub):
             def raw(self, method: str, path: str, body: Any = None) -> Any:
                 raise WorkerError("sandbox gone")
 

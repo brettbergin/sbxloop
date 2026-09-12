@@ -41,6 +41,7 @@ from sbxloop_worker.protocol import (
     JobResult,
 )
 from tests.fakes.github_errors import github_error
+from tests.fakes.ops_stub import OpsStub
 from tests.unit.test_daemon_discord import FakeLoop
 
 # One scripted "model": a list of host-tool calls to make, then the text
@@ -111,7 +112,7 @@ class FakeHost:
         self.closed = True
 
 
-class FakeGithub:
+class FakeGithub(OpsStub):
     """Stands in for both ``DaemonGithub`` and the ``GithubOps`` it hands to
     the lambda. ``paths`` is the raw-REST path log the read tests index into;
     ``calls`` is the full ordered write ledger (comments included) the

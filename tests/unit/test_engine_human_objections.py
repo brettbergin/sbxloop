@@ -120,7 +120,7 @@ class TestReplies:
         assert outcome.body_only == 1
         assert gh.replies == []
         assert gh.resolved == []
-        text = gh.issue_comments[0]
+        text = gh.issue_comments_posted[0]
         assert "review feedback" in text
         assert "`@alice` — **unanswered**" in text
 
