@@ -113,6 +113,7 @@ def bake_template(
         spec = SandboxSpec(
             name=name,
             role="agent",
+            resources=config.sandbox_resources_for("agent"),
             workspace=Path(scratch),
             template=base_template,
             # Same allows a run's agent sandbox gets, so the wheel deps, the

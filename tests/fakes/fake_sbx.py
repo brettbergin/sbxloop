@@ -196,6 +196,8 @@ def cmd_create(root: Path, args: list[str]) -> int:
 
     name = None
     template = None
+    cpus = 0
+    memory = None
     rest: list[str] = []
     i = 0
     while i < len(args):
@@ -210,6 +212,12 @@ def cmd_create(root: Path, args: list[str]) -> int:
             template = args[i]
         elif arg.startswith("--template="):
             template = arg.split("=", 1)[1]
+        elif arg == "--cpus":
+            i += 1
+            cpus = int(args[i])
+        elif arg == "--memory":
+            i += 1
+            memory = args[i]
         else:
             rest.append(arg)
         i += 1
@@ -239,7 +247,14 @@ def cmd_create(root: Path, args: list[str]) -> int:
         if (fs / "workspace").is_symlink():
             (fs / "workspace").unlink()
         (fs / "workspace").symlink_to(workspace)
-    meta = {"agent": agent, "workspace": workspace, "template": template, "status": "running"}
+    meta = {
+        "agent": agent,
+        "workspace": workspace,
+        "template": template,
+        "status": "running",
+        "cpus": cpus,
+        "memory": memory,
+    }
     (path / "meta.json").write_text(json.dumps(meta))
     return 0
 
