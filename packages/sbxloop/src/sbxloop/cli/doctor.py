@@ -44,6 +44,7 @@ from sbxloop.sbx.conformance import ConformanceReport, run_conformance
 from sbxloop.sbx.provision import gh_credential_status
 from sbxloop.sbx.prune import count_orphans
 from sbxloop.vcs.github.labels import lifecycle_specs, missing_labels
+from sbxloop.vcs.github.ops import GithubOps
 from sbxloop.vcs.github.permissions import (
     NEEDS,
     READ_PROBES,
@@ -52,7 +53,7 @@ from sbxloop.vcs.github.permissions import (
     missing_from_scopes,
     split_required,
 )
-from sbxloop.vcs.protocol import VcsOps
+from sbxloop.vcs.protocol import Capability, VcsOps
 from sbxloop.worker.wheel import resolve_worker_wheel
 from sbxloop_worker.backends.copilot import (
     SDK_PERMISSION_KINDS,
@@ -157,6 +158,11 @@ class RepoProbe:
     # Whether the repository has Issues enabled (#631): the daemon polls
     # issues for work, and follow-ups are filed as issues. None = unknown.
     issues_enabled: bool | None = None
+    # What kind of credential the github box holds for this repository
+    # (#1009): a host-minted App installation token, or a classic or
+    # fine-grained PAT that lives until someone revokes it. Empty = not
+    # determined.
+    credential: str = ""
 
 
 def _repo_token_status(entry: RepoConfig, env: dict[str, str]) -> tuple[bool, str]:
@@ -244,6 +250,37 @@ def _count_orphans(cli: SbxCLI, state_db: Path) -> int:
         return count_orphans(cli, store)
 
 
+def vcs_backend_checks(config: Config) -> list[Check]:
+    """One row per forge an enabled repository lives on (#1009), naming
+    each capability's state — ``supported``, ``unsupported``, ``unknown``
+    — so a run never meets an UNKNOWN the doctor did not show first. A
+    kind the configuration names but no backend answers is a failing row:
+    the run would fail closed at its first operation, and this says so
+    before it starts."""
+    rows: list[Check] = []
+    for kind in config.vcs_kinds():
+        name = f"vcs backend {kind}"
+        if kind != "github":
+            rows.append(
+                Check(
+                    name,
+                    False,
+                    f'[vcs] kind = "{kind}" names a backend that is not implemented yet; '
+                    'only "github" answers a run today',
+                )
+            )
+            continue
+        report = GithubOps.CAPABILITIES
+        by_state: dict[str, list[str]] = {}
+        for capability, state in report.items():
+            by_state.setdefault(str(state), []).append(capability)
+        parts = [f"{state}: {', '.join(names)}" for state, names in by_state.items()]
+        if Capability.UNKNOWN in report.values():
+            parts.append("(signed API commits depend on the credential: a GitHub App's are)")
+        rows.append(Check(name, True, "; ".join(parts), hard=False))
+    return rows
+
+
 def repo_checks(
     config: Config,
     env: dict[str, str],
@@ -329,6 +366,8 @@ def repo_checks(
             rows.append(Check(name, False, "; ".join(notes)))
             continue
         notes.append(result.detail or "reachable, token has the required permissions")
+        if result.credential:
+            notes.append(f"credential: {result.credential}")
         merge_note, merge_row = _merge_method_status(name, config, result.merge_methods)
         notes.append(merge_note)
         rows.append(Check(name, True, "; ".join(notes)))
@@ -635,16 +674,21 @@ def _credential_needs(
     repo: str,
     base: str,
     data: dict[str, Any],
-) -> tuple[tuple[Need, ...], tuple[Need, ...], str]:
-    """``(required, optional, source)`` — what the credential lacks of
-    :data:`NEEDS`, judged from whichever source describes it (#696): the
-    App installation's grant, a classic PAT's scopes, or — a fine-grained
-    PAT, which reports neither — the push bit plus one read per permission.
+) -> tuple[tuple[Need, ...], tuple[Need, ...], str, str]:
+    """``(required, optional, source, credential)`` — what the credential
+    lacks of :data:`NEEDS`, judged from whichever source describes it
+    (#696): the App installation's grant, a classic PAT's scopes, or — a
+    fine-grained PAT, which reports neither — the push bit plus one read
+    per permission. ``credential`` names the kind of token that is, and
+    how long it lives (#1009): an App token is host-minted and expires
+    within the hour; a PAT lives until it is revoked, and GitHub does not
+    let the token read its own expiry.
     """
     if app_permissions is not None:
         # The installation's grant is the whole story: it is not a user.
         missing = missing_from_app(app_permissions)
         source = "the App installation's permissions"
+        credential = "GitHub App installation token (host-minted, expires within the hour)"
     else:
         # A PAT is capped twice: by what the token was granted, and by what
         # its user may do on this repository (the payload's push bit).
@@ -655,13 +699,15 @@ def _credential_needs(
                 *_missing_from_push_bit(data),
             )
             source = f"the classic PAT's scopes {', '.join(scopes) or '(none)'}"
+            credential = "classic PAT (long-lived; its expiry is not readable by the token)"
         else:
             found = (*_missing_from_push_bit(data), *_missing_from_probes(ops, repo, base))
             source = "a fine-grained PAT, asked endpoint by endpoint; workflows:write unverifiable"
+            credential = "fine-grained PAT (long-lived; its expiry is not readable by the token)"
         lacking = {n.permission for n in found}
         missing = tuple(n for n in NEEDS if n.permission in lacking)
     required, optional = split_required(missing)
-    return required, optional, source
+    return required, optional, source, credential
 
 
 def _ci_summary(ops: VcsOps, repo: str, base: str) -> RepoCi | None:
@@ -775,7 +821,7 @@ def sandbox_repo_probe(
                 reachable=False, detail="not found with this token", creatable=creatable
             )
         base = entry.deliver_base or str(data.get("default_branch") or "")
-        required, optional, source = _credential_needs(
+        required, optional, source, credential = _credential_needs(
             ops, box.provisioner.gh_app_permissions(entry.repo), entry.repo, base, data
         )
         has_issues = data.get("has_issues")
@@ -807,6 +853,7 @@ def sandbox_repo_probe(
             merge_methods=allowed_merge_methods(data),
             missing_labels=_missing_repo_labels(ops, config, entry),
             issues_enabled=has_issues if isinstance(has_issues, bool) else None,
+            credential=credential,
         )
 
     return probe
@@ -1319,6 +1366,10 @@ def collect_checks(
                     "JWTs; install openssl or switch to a PAT",
                 )
             )
+        # One row per forge the repositories live on (#1009): what the
+        # backend can do, so an UNKNOWN is visible before a run hits it, or
+        # that no backend answers the configured kind yet.
+        checks.extend(vcs_backend_checks(config))
         # One row per configured repository: a repo whose credentials or
         # probe fail must not hide the verdict for the others.
         report("checking configured repositories")

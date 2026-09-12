@@ -151,6 +151,7 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
         "mcp",
         "credentials",
         "registries",
+        "vcs",
         "github.repos.token_env",
         "telemetry.dsn_env",
     ]

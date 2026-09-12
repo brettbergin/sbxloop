@@ -91,6 +91,12 @@ forge-neutral modules under `sbxloop/vcs/`; a backend package beside them
   outside `vcs/`. Without that rule the roles are decorative — callers
   route around them the moment something is missing.
 
+`[vcs] kind` (and a `[[github.repos]]` entry's own `kind`) names the forge;
+`Config.vcs_kind_for` resolves it per repository and `sbxloop doctor` prints
+one `vcs backend <kind>` row per forge with each capability's state, or a
+failing row for a kind no backend answers yet. `[github]` stays the section
+a repository is declared in and reads as `kind = "github"`.
+
 The decision logic sits above the roles and knows no forge: the baseline
 comparison in `engine/checks.py` takes a folded verdict, not a payload; the
 wait/hold machine in `engine/landing.py` and the review round in
