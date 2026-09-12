@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import tarfile
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
@@ -37,10 +38,13 @@ runner = CliRunner()
 class FakeRun:
     """Records argv; answers success unless told to fail. Side effects a
     real command would have (uv creating the venv, Docker's installer
-    laying sbx out) are simulated so later steps see them."""
+    laying sbx out) are simulated so later steps see them — including the
+    installed executable answering ``sbx version`` with the version whose
+    installer wrote it, which is how a leftover binary gives itself away."""
 
-    def __init__(self, home: SbxloopHome) -> None:
+    def __init__(self, home: SbxloopHome, sbx_version: str = SBX_VERSION) -> None:
         self.home = home
+        self.sbx_version = sbx_version
         self.calls: list[list[str]] = []
         self.fail: dict[str, int] = {}
 
@@ -58,12 +62,21 @@ class FakeRun:
             # Docker's installer, honouring PREFIX from the environment; it
             # needs mkfs.ext4 on PATH, which Debian keeps under /usr/sbin.
             assert os.environ["PATH"].startswith("/usr/sbin:/sbin:")
-            prefix = Path(os.environ["PREFIX"])
-            (prefix / "bin").mkdir(parents=True, exist_ok=True)
-            (prefix / "bin" / "sbx").write_text("#!sbx\n")
+            self.install_sbx(Path(os.environ["PREFIX"]), self.sbx_version)
+        if argv[0] == str(self.home.sbx_binary) and argv[1:] == ["version"]:
+            # The real CLI reports the build that is on disk, not the one
+            # that was asked for.
+            return subprocess.CompletedProcess(argv, 0, Path(argv[0]).read_text(), "")
         if argv[0] == "sh" and argv[1].endswith("uv-install.sh"):
             self.home.uv.write_text("#!uv\n")
         return subprocess.CompletedProcess(argv, 0, "", "")
+
+    @staticmethod
+    def install_sbx(prefix: Path, version: str) -> None:
+        (prefix / "bin").mkdir(parents=True, exist_ok=True)
+        binary = prefix / "bin" / "sbx"
+        binary.write_text(f"#!sbx\nsbx version {version}\n")
+        binary.chmod(0o755)
 
 
 class FakeFetch:
@@ -103,12 +116,29 @@ class FakeFetch:
             target.write_text("#!/bin/sh\n")  # the uv installer
 
 
+def installer_fails(
+    run: FakeRun, *, stderr: str, code: int = 1, wrote: bool = True
+) -> Callable[[Any], subprocess.CompletedProcess[str]]:
+    """A runner whose ``install.sh`` fails — after laying the binaries down
+    (``wrote``, the shape of a step that needs root) or before touching
+    anything. Every other command still runs."""
+
+    def failing(argv: Any) -> subprocess.CompletedProcess[str]:
+        if str(argv[0]).endswith("install.sh"):
+            if wrote:
+                run(argv)
+            raise subprocess.CalledProcessError(code, [str(a) for a in argv], stderr=stderr)
+        return run(argv)
+
+    return failing
+
+
 def make(
     tmp_path: Path, **overrides: Any
 ) -> tuple[SbxloopHome, HomeInit, FakeRun, FakeFetch, list[str]]:
     home = SbxloopHome(tmp_path / "home")
-    run, fetch, said = FakeRun(home), FakeFetch(), []
     options = InitOptions(**{"version": "1.2.3", **overrides})
+    run, fetch, said = FakeRun(home, options.sbx_version), FakeFetch(), []
     init = HomeInit(
         home,
         options,
@@ -250,37 +280,89 @@ class TestLayout:
 
     def test_sbx_installer_failing_after_the_binary_landed_is_a_note(self, tmp_path: Path) -> None:
         """Docker's installer copies the binaries, then tries /etc/apparmor.d —
-        root's business; the unprivileged run still leaves a working sbx."""
+        root's business; the unprivileged run still leaves the executable it
+        was asked for, and the note says the backend is not ready."""
         home, init, run, _, _ = make(tmp_path)
-
-        original = run.__call__
-
-        def flaky(argv: Any) -> subprocess.CompletedProcess[str]:
-            result = original(argv)
-            if str(argv[0]).endswith("install.sh"):
-                raise subprocess.CalledProcessError(
-                    1, list(argv), stderr="apparmor: permission denied"
-                )
-            return result
-
-        init.run = flaky  # type: ignore[assignment]
+        init.run = installer_fails(run, stderr="apparmor: permission denied")  # type: ignore[assignment]
         report = init.execute()
         assert home.sbx_binary.exists()
-        assert any("AppArmor" in n for n in report.notes)
+        assert home.sbx_version_file.read_text().strip() == SBX_VERSION
+        note = next(n for n in report.notes if "AppArmor" in n)
+        assert "cannot start yet" in note and str(home.sbx_prefix) in note
 
     def test_sbx_installer_failing_outright_is_an_error(self, tmp_path: Path) -> None:
         _, init, run, _, _ = make(tmp_path)
         run.fail["sbx"] = 1  # no such prefix; the install.sh call fails before writing
-        original = run.__call__
-
-        def failing(argv: Any) -> subprocess.CompletedProcess[str]:
-            if str(argv[0]).endswith("install.sh"):
-                raise subprocess.CalledProcessError(2, list(argv), stderr="mkfs.ext4 not found")
-            return original(argv)
-
-        init.run = failing  # type: ignore[assignment]
+        init.run = installer_fails(run, stderr="mkfs.ext4 not found", code=2)  # type: ignore[assignment]
         with pytest.raises(InitError, match=r"mkfs\.ext4"):
             init.execute()
+
+
+class TestSbxInstall:
+    """A recorded sbx version has to mean an sbx that was installed: an
+    executable left behind by an earlier release is not proof of one."""
+
+    def test_a_failed_upgrade_never_advances_the_marker(self, tmp_path: Path) -> None:
+        """The installer refuses before touching anything (Debian keeps
+        mkfs.ext4 off a non-root PATH); the previous release's executable is
+        still there, and it is not the release that was asked for."""
+        home, first, *_ = make(tmp_path)
+        first.execute()
+        assert home.sbx_version_file.read_text().strip() == SBX_VERSION
+
+        _, upgrade, run, _, _ = make(tmp_path, sbx_version="0.39.0")
+        upgrade.run = installer_fails(run, stderr="mkfs.ext4 not found", code=2, wrote=False)  # type: ignore[assignment]
+        with pytest.raises(InitError, match=r"exit 2.*mkfs\.ext4"):
+            upgrade.execute()
+        assert home.sbx_binary.exists()  # the old one, untouched
+        assert not home.sbx_version_file.exists()  # nothing claims an install
+
+    def test_an_unrelated_failure_after_the_binary_landed_is_an_error(self, tmp_path: Path) -> None:
+        """A copy that got as far as the executable and then broke is a
+        half-installed sbx, not the AppArmor step."""
+        home, init, run, _, _ = make(tmp_path)
+        init.run = installer_fails(run, stderr="cp: cannot stat 'sandboxd': no such file")  # type: ignore[assignment]
+        with pytest.raises(InitError, match="cannot stat"):
+            init.execute()
+        assert not home.sbx_version_file.exists()
+
+    def test_an_installer_that_left_the_old_executable_is_an_error(self, tmp_path: Path) -> None:
+        """Exit 0 is not enough either: what the prefix reports has to be the
+        release that was asked for."""
+        home, first, *_ = make(tmp_path)
+        first.execute()
+        _, upgrade, run, _, _ = make(tmp_path, sbx_version="0.39.0")
+        run.sbx_version = SBX_VERSION  # the installer copied nothing new
+        with pytest.raises(InitError, match=f"reporting {SBX_VERSION}"):
+            upgrade.execute()
+        assert not home.sbx_version_file.exists()
+
+    def test_an_executable_that_reports_nothing_is_an_error(self, tmp_path: Path) -> None:
+        home, init, run, _, _ = make(tmp_path)
+        original = run.__call__
+
+        def mute(argv: Any) -> subprocess.CompletedProcess[str]:
+            result = original(argv)
+            if list(argv)[1:] == ["version"]:
+                return subprocess.CompletedProcess([str(a) for a in argv], 0, "", "")
+            return result
+
+        init.run = mute  # type: ignore[assignment]
+        with pytest.raises(InitError, match="reported no version"):
+            init.execute()
+        assert not home.sbx_version_file.exists()
+
+    def test_a_failed_install_is_retried_by_the_next_init(self, tmp_path: Path) -> None:
+        home, init, run, _, _ = make(tmp_path)
+        init.run = installer_fails(run, stderr="cp: cannot stat 'sandboxd'", wrote=False)  # type: ignore[assignment]
+        with pytest.raises(InitError):
+            init.execute()
+
+        _, retry, run2, _, _ = make(tmp_path)
+        report = retry.execute()
+        assert [c for c in run2.calls if c[0].endswith("install.sh")]  # not skipped
+        assert home.sbx_version_file.read_text().strip() == SBX_VERSION
+        assert any(d.startswith(f"sbx {SBX_VERSION}") for d in report.done)
 
     def test_no_asset_for_this_platform_is_an_error(self, tmp_path: Path) -> None:
         _, init, *_ = make(tmp_path)

@@ -614,6 +614,17 @@ named per state dir (`sbxloop-daemon-github-<digest>`,
   no locks or I/O, keeping it off the hot path, and it stores the line the
   stderr handler already rendered and redacted.
 
+Because both names are stable, both boxes are removed and re-created under
+the *same* name, and `sbx rm` returns when the sandbox backend has accepted
+the teardown rather than when it has finished it. A create issued into that
+window is lost to the old box's reaper part-way through provisioning — the
+create succeeds and the first `exec` after it answers "sandbox not found",
+costing a whole retry cycle (and, for the concierge, a minute and a half of
+chat answering nothing, which reads as a dead bridge). So `SbxCLI.rm` is not
+done until `sbx ls` stops listing the name, and fails closed if it never
+does; the concierge's stale-box replacement propagates that failure rather
+than creating over an unconfirmed teardown.
+
 The credential split holds for both: the host never holds a PAT in a
 process that also talks to a model, and neither box holds both tokens.
 

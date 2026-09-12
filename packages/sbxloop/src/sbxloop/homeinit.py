@@ -11,7 +11,8 @@ One idempotent command builds everything a host needs under the home
    worker pinned to this exact version (skipped when init already runs
    from that venv);
 4. Docker's ``sbx``, installed by its own installer with the home as
-   ``PREFIX``, pinned to the series sbxloop is tested against;
+   ``PREFIX``, pinned to the series sbxloop is tested against and recorded
+   in ``sbx/VERSION`` only once the installed executable reports it;
 5. ``config/sbxloop.toml`` from the packaged template and
    ``config/secrets.env`` (0600) from the packaged example — never
    overwritten unless asked;
@@ -47,6 +48,7 @@ import sbxloop
 from sbxloop.errors import SbxloopError
 from sbxloop.log import get_logger
 from sbxloop.paths import SbxloopHome
+from sbxloop.sbx.parse import parse_version
 
 log = get_logger(__name__)
 
@@ -295,6 +297,15 @@ def render_unit(name: str, home: SbxloopHome, *, runner_dir: Path | None = None)
     return "\n".join(_render_unit_line(line, values) for line in template(name).split("\n"))
 
 
+def _apparmor_only_failure(detail: str) -> bool:
+    """Whether an installer failure is the one outcome an unprivileged run is
+    expected to hit: the AppArmor profile it drops into ``/etc`` is root's to
+    write, and it is the installer's last step. The detail has to say so —
+    a failure that named nothing, or named anything else, is not this one."""
+    lowered = detail.lower()
+    return "apparmor" in lowered
+
+
 def sbx_asset_name_matches(name: str, *, system: str, machine: str) -> bool:
     """Whether a docker/sbx-releases asset is the tarball for this host."""
     if not name.endswith(".tar.gz"):
@@ -482,14 +493,16 @@ class HomeInit:
             raise InitError(f"the uv installer did not leave {uv} behind")
         return uv
 
-    def _run_env(self, argv: Sequence[str], env: Mapping[str, str]) -> None:
+    def _run_env(
+        self, argv: Sequence[str], env: Mapping[str, str]
+    ) -> subprocess.CompletedProcess[str]:
         """Run with an explicit environment through the same seam as ``run``:
         the values ride on the process environment for the call's duration
         so a fake runner sees the same argv a real one would."""
         saved = {k: os.environ.get(k) for k in env}
         os.environ.update(env)
         try:
-            self.run(argv)
+            return self.run(argv)
         finally:
             for key, value in saved.items():
                 if value is None:
@@ -532,19 +545,76 @@ class HomeInit:
                 "PREFIX": str(self.home.sbx_prefix),
                 "PATH": "/usr/sbin:/sbin:" + self.env.get("PATH", "/usr/bin:/bin"),
             }
+            partial: str | None = None
             try:
                 self._run_env([str(installer)], env)
             except subprocess.CalledProcessError as exc:
-                if not self.home.sbx_binary.exists():
+                detail = (exc.stderr or exc.stdout or "").strip() or "no output"
+                if not _apparmor_only_failure(detail):
+                    # Anything else is a failed install, whatever is lying
+                    # around under the prefix: an executable left by an
+                    # earlier release is not proof this one landed.
+                    self._forget_sbx(wanted)
                     raise InitError(
-                        f"sbx install failed (exit {exc.returncode}): {exc.stderr or exc.stdout}"
+                        f"sbx install failed (exit {exc.returncode}): {detail}"
                     ) from exc
-                self.report.notes.append(
-                    "sbx installed; its AppArmor profile was not (needs root): "
-                    f"sudo PREFIX={self.home.sbx_prefix} {installer.name} from the release tarball"
+                partial = (
+                    "sbx binaries installed; its AppArmor profile was not (that step needs "
+                    f"root), so the sandbox backend cannot start yet: sudo PREFIX="
+                    f"{self.home.sbx_prefix} {installer.name} from the release tarball"
                 )
+            self._verify_sbx(wanted, env)
         self.home.sbx_version_file.write_text(wanted + "\n")
-        self.report.done.append(f"sbx {wanted}")
+        if partial is None:
+            self.report.done.append(f"sbx {wanted}")
+        else:
+            self.report.notes.append(partial)
+            self.report.done.append(f"sbx {wanted} (AppArmor profile pending)")
+
+    def _verify_sbx(self, wanted: str, env: Mapping[str, str]) -> None:
+        """What the prefix must hold before ``sbx/VERSION`` may claim *wanted*:
+        an executable, and that executable reporting the version asked for.
+        Anything this cannot establish — a missing component, an executable
+        that will not answer, output with no version in it — is a failed
+        install, never a marker."""
+        problem = self._sbx_problem(wanted, env)
+        if problem is None:
+            return
+        self._forget_sbx(wanted)
+        raise InitError(problem)
+
+    def _sbx_problem(self, wanted: str, env: Mapping[str, str]) -> str | None:
+        binary = self.home.sbx_binary
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            return f"sbx {wanted} install left no executable at {binary}"
+        try:
+            result = self._run_env([str(binary), "version"], env)
+        except (subprocess.CalledProcessError, OSError) as exc:
+            return f"sbx {wanted} install left {binary}, but `sbx version` failed: {exc}"
+        output = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+        reported = parse_version(output)
+        if reported is None:
+            return (
+                f"sbx {wanted} install left {binary}, but `sbx version` reported no version: "
+                f"{output or 'no output'}"
+            )
+        if reported != wanted.lstrip("v"):
+            return (
+                f"sbx {wanted} install left {binary} reporting {reported}: the install did not "
+                "replace the executable"
+            )
+        return None
+
+    def _forget_sbx(self, wanted: str) -> None:
+        """Drop ``sbx/VERSION`` after a failed install: whatever is under the
+        prefix now, no later init may skip the repair as done."""
+        stale = self._installed_sbx_version()
+        self.home.sbx_version_file.unlink(missing_ok=True)
+        if stale is not None and stale != wanted:
+            self.report.notes.append(
+                f"the failed sbx {wanted} install cleared the marker for sbx {stale}; "
+                "the next init reinstalls"
+            )
 
     @staticmethod
     def _find_installer(unpacked: Path) -> Path:

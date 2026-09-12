@@ -250,8 +250,12 @@ class DaemonAgent:
             self._mcp_client = clients[0]
         return self._mcp_client
 
-    def remove(self) -> None:
-        """Delete the sandbox (explicit: reprovision, operator cleanup)."""
+    def remove(self, *, strict: bool = False) -> None:
+        """Delete the sandbox (explicit: reprovision, operator cleanup).
+
+        ``strict`` propagates a teardown sbx would not confirm, for the one
+        caller that is about to create the same name again (#952).
+        """
         self._close_mcp()
         sandbox, self._sandbox, self._client = self._sandbox, None, None
         if sandbox is None:
@@ -260,6 +264,8 @@ class DaemonAgent:
             sandbox.rm()
             log.info("concierge_sandbox.removed", sandbox=self.name)
         except SbxError:
+            if strict:
+                raise
             log.debug("concierge_sandbox.remove_failed", sandbox=self.name, exc_info=True)
 
     def exists(self) -> bool:
@@ -309,6 +315,7 @@ class DaemonAgent:
 
     def _ensure(self) -> WorkerClient:
         started = time.monotonic()
+        stale = False
         if self.exists():
             sandbox = Sandbox(self.sbx, self.name)
             client = self._make_client(sandbox)
@@ -328,7 +335,7 @@ class DaemonAgent:
                 backend=self.config.agent.backend,
                 action="worker or agent backend does not match this host; re-provisioning",
             )
-            self.remove()
+            stale = True
 
         clients: list[WorkerClient] = []
 
@@ -343,13 +350,20 @@ class DaemonAgent:
                 )
             clients.append(client)
 
-        log.info(
-            "concierge_sandbox.provision_start",
-            sandbox=self.name,
-            workspace=str(self.workspace),
-            install_workers=self.install_workers,
-        )
         try:
+            if stale:
+                # Strict, and before provision_start: the name is about to be
+                # re-created, and `sbx rm` returning is not the teardown
+                # finishing. Creating into that window costs the new sandbox
+                # (reaped mid-install) plus a whole retry cycle of chat
+                # silence (#952), so an unconfirmed teardown stops here.
+                self.remove(strict=True)
+            log.info(
+                "concierge_sandbox.provision_start",
+                sandbox=self.name,
+                workspace=str(self.workspace),
+                install_workers=self.install_workers,
+            )
             sandbox = self.provisioner.ensure_agent_only(
                 self.name, self.workspace, post_create=install, run_id=CONCIERGE_RUN_ID
             )

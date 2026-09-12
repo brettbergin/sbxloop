@@ -54,7 +54,13 @@ from sbxloop import backends, hostgit, toolchains
 from sbxloop.config import Config, CredentialConfig, RegistryConfig, RepoConfig, SandboxConfig
 from sbxloop.endpoint import Endpoint, parse_endpoint
 from sbxloop.engine.model import RunKind
-from sbxloop.errors import ConfigError, GithubOpsError, ProvisionError, SbxError
+from sbxloop.errors import (
+    ConfigError,
+    GithubOpsError,
+    ProvisionError,
+    SbxError,
+    SbxNotFoundError,
+)
 from sbxloop.events import EventBus
 from sbxloop.gh.appauth import (
     APP_ID_ENV,
@@ -1669,6 +1675,12 @@ class Provisioner:
             for sandbox in created:
                 try:
                     sandbox.rm()
+                except SbxNotFoundError:
+                    # Nothing left to clean up. A sandbox that vanished under
+                    # the attempt is the usual reason the attempt failed at
+                    # all (#952) — saying "cleanup failed" on top of that
+                    # sends the reader after a second, imaginary fault.
+                    log.debug("sandbox.rollback_already_gone", run=run_id, sandbox=sandbox.name)
                 except SbxError:
                     log.warning(
                         "sandbox.rollback_remove_failed",
@@ -1992,6 +2004,8 @@ class Provisioner:
             if created is not None:
                 try:
                     created.rm()
+                except SbxNotFoundError:
+                    log.debug("sandbox.rollback_already_gone", sandbox=name)
                 except SbxError:
                     log.warning("sandbox.rollback_remove_failed", sandbox=name, exc_info=True)
             for rm in registered_secret_rms:
