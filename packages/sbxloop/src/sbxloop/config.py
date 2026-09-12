@@ -875,6 +875,12 @@ def _check_label_set(labels: Sequence[str], where: str) -> None:
 VcsKind = Literal["github", "gitlab", "gitea"]
 VCS_KINDS: tuple[VcsKind, ...] = get_args(VcsKind)
 
+# The variable the forge token lives in when `[vcs] token_env` names none:
+# a name, never a value, and only for the forges whose credential is one
+# token. GitHub has no entry — its credential is the GH_TOKEN/GITHUB_TOKEN
+# pair or the App installation, resolved by the provisioner.
+FORGE_TOKEN_ENVS: dict[str, str] = {"gitlab": "GITLAB_TOKEN", "gitea": "GITEA_TOKEN"}
+
 
 def _check_vcs_kind(value: object, key: str) -> VcsKind:
     if value not in VCS_KINDS:
@@ -904,18 +910,34 @@ class VcsConfig(_ConfigModel):
     ``kind`` is the daemon-wide default; a ``[[github.repos]]`` entry may
     name its own. ``api_url`` is the forge's API root; for ``github`` it is
     the same setting as ``[github] api_url``, and the two must agree when
-    both are set. ``[github]`` remains the section a repository is
-    declared in: it reads as ``[vcs] kind = "github"``, and the loader
-    says so once when no ``[vcs]`` section names the forge.
+    both are set. ``token_env`` names the host variable the forge token is
+    read from — ``GITLAB_TOKEN`` / ``GITEA_TOKEN`` by default for those
+    kinds; for GitHub the credential is the ``GH_TOKEN``/``GITHUB_TOKEN``
+    pair or the App installation, so the key is only read for a
+    ``[[github.repos]]`` entry's own ``token_env`` there. ``[github]`` remains
+    the section a repository is declared in: it reads as ``[vcs] kind =
+    "github"``, and the loader says so once when no ``[vcs]`` section names
+    the forge.
     """
 
     kind: VcsKind = "github"
     api_url: str | None = None
+    token_env: str | None = None
 
     @field_validator("kind", mode="before")
     @classmethod
     def _check_kind(cls, value: object) -> VcsKind:
         return _check_vcs_kind(value, "vcs.kind")
+
+    @field_validator("token_env")
+    @classmethod
+    def _check_token_env(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", value):
+            raise ValueError(f"vcs.token_env must be an environment variable name, got {value!r}")
+        return value
 
     @field_validator("api_url")
     @classmethod
@@ -2681,6 +2703,20 @@ class Config(_ConfigModel):
         if entry is not None and entry.kind is not None:
             return entry.kind
         return self.vcs.kind
+
+    def vcs_token_env_for(self, repo: str | None = None) -> str | None:
+        """The host variable ``repo``'s forge token is read from: the
+        entry's own ``token_env``, else ``[vcs] token_env``, else the
+        forge's default (:data:`FORGE_TOKEN_ENVS`). ``None`` for a GitHub
+        repository with no explicit name — its credential is the ambient
+        ``GH_TOKEN``/``GITHUB_TOKEN`` pair or the App installation."""
+        entry = self.github.find_repo(repo)
+        if entry is not None and entry.token_env:
+            return entry.token_env
+        kind = self.vcs_kind_for(repo)
+        if kind == "github":
+            return None
+        return self.vcs.token_env or FORGE_TOKEN_ENVS[kind]
 
     def vcs_kinds(self) -> tuple[VcsKind, ...]:
         """Every forge an enabled repository lives on, in first-seen order

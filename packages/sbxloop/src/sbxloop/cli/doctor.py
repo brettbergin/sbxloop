@@ -165,11 +165,18 @@ class RepoProbe:
     credential: str = ""
 
 
-def _repo_token_status(entry: RepoConfig, env: dict[str, str]) -> tuple[bool, str]:
+def _repo_token_status(
+    entry: RepoConfig, env: dict[str, str], *, config: Config | None = None
+) -> tuple[bool, str]:
     """Whether this repository has a usable credential, and which — a PAT
     (its own ``token_env`` or the daemon-wide GH_TOKEN) or the GitHub App
-    installation (#568)."""
-    status = gh_credential_status(env, token_env=entry.token_env)
+    installation (#568). A repository on another forge (#1009) has one
+    token, in the variable ``[vcs] token_env`` or the forge's default
+    names; the row says which and whether it is set."""
+    token_env = entry.token_env
+    if config is not None and config.vcs_kind_for(entry.repo) != "github":
+        token_env = config.vcs_token_env_for(entry.repo)
+    status = gh_credential_status(env, token_env=token_env)
     return status.ok, status.detail
 
 
@@ -306,7 +313,7 @@ def repo_checks(
                 Check(name, True, "disabled in sbxloop.toml — not polled, not run", hard=False)
             )
             continue
-        token_ok, token_detail = _repo_token_status(entry, env)
+        token_ok, token_detail = _repo_token_status(entry, env, config=config)
         base = effective.deliver_base or "(repo default)"
         notes = [token_detail, f"base {base}"]
         state = (health or {}).get(entry.repo.casefold())
