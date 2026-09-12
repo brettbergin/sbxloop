@@ -1387,6 +1387,18 @@ leftover of the layouts the home replaced. `sbxloop init` builds it (`homeinit.p
 `init --migrate` moves a pre-home installation into it (`homemigrate.py`), and
 `sbxloop backup` snapshots what it cannot regenerate (`backup.py`).
 
+What the home cannot install is the *host*. `hostprep.py` answers one question per
+capability — can this account do this, on this host, right now — from probes that change
+nothing: the virtualisation device (`/dev/kvm`, opened rather than inferred from a group
+list), the sandbox backend's `mkfs.ext4`, a reachable `systemctl --user`, and lingering for
+the service account. Each answer is `ready`, `missing`, `denied`, `unknown` or not
+applicable, with what was observed, the remedy, and whether that remedy is an
+administrator's. `unknown` is never readable as ready, which is the point: an unattended
+deployment may not be told its daemon persists on the strength of a `loginctl enable-linger` that merely exited 0. `init` uses it to note an unprepared device, to refuse
+the sbx install without `mkfs.ext4`, to refuse `--systemd` where no user manager answers,
+and to read lingering back before recording it; `doctor` shows the same capabilities as
+rows, scoped to the platform and to the mode the home was installed in.
+
 The shape is the same on every host; two details are the **host's** operating
 system, never the sandbox guest's (a guest is Linux whatever the host is, and
 `/home/agent` and friends are constants elsewhere). `SbxloopHome.os_name`

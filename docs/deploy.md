@@ -59,6 +59,48 @@ assumes:
 There is no working directory: every `sbxloop` command answers the same from anywhere.
 Installing both chat extras makes `[chat] backend` a config change, not a reinstall.
 
+## Host preparation, before the first unattended start
+
+The install above puts everything under a directory the service account owns and needs no
+root. Getting the *host* ready is a separate one-time job, and on Linux most of it is an
+administrator's. sbxloop reports each item and performs none of them — it joins no group,
+installs no package, starts no sandbox and elevates nothing:
+
+| Capability                         | Who                       | How it fails when missing                                                   |
+| ---------------------------------- | ------------------------- | --------------------------------------------------------------------------- |
+| `/dev/kvm` exists                  | administrator             | an `init` note and a `doctor` row; every sandbox boot fails later           |
+| `/dev/kvm` openable by the account | administrator             | same row, different diagnosis — the usual cause is the `kvm` group          |
+| `mkfs.ext4` (e2fsprogs)            | administrator             | `sbxloop init` refuses the sbx step by name, before downloading it          |
+| sbx's AppArmor profile in `/etc`   | administrator             | `init` notes it and finishes; the sandbox backend will not start            |
+| a reachable `systemctl --user`     | log in as the account     | `sbxloop init --systemd` refuses rather than enabling dead units            |
+| lingering for the account          | account, or administrator | `init` reports persistence as **not confirmed**; the daemon stops at logout |
+
+Two of these decide whether a deployment is unattended at all, so they are checked before
+the units are written rather than discovered at the first logout:
+
+- **The user service manager.** `systemctl --user` needs this account's own systemd
+  manager and its `$XDG_RUNTIME_DIR`. A session that has neither — a bare `su`, a
+  container, a CI step — takes every call with a bus error, and units "enabled" into a
+  manager that was never reached are not a service. `init --systemd` fails there by name;
+  log in as the account on the console or over ssh, or install with `--no-systemd` and
+  start `sbxloop daemon` under whatever supervisor the host does use.
+- **Lingering.** `loginctl enable-linger <account>` is what keeps user services running
+  after logout. It can be refused outright (polkit does not always let an account enable
+  its own) and it can be taken on a host where lingering still reads off, so `init` reads
+  the state back from `loginctl` afterwards. Anything it cannot read is reported as *not
+  confirmed* — never as set up. Check it any time with:
+
+```bash
+loginctl show-user "$USER" --property=Linger    # Linger=yes, or it is not unattended
+sbxloop doctor                                  # the same, as a row, with everything else
+```
+
+`sbxloop doctor` shows the whole set on demand. The rows are diagnoses, not gates: they say
+what is wrong and who has to fix it, and the sbx rows below them are what actually fail when
+a sandbox cannot boot. Off Linux, and in a `--no-systemd` install, the rows that do not
+apply are not shown, so a supported mode is never judged against a capability it never
+wanted.
+
 ## Upgrading by hand
 
 Two commands as the service user, once the daemon is idle:

@@ -49,6 +49,7 @@ import sbxloop
 from sbxloop.errors import SbxloopError
 from sbxloop.hostfiles import create_private, make_private
 from sbxloop.hostos import WSL2_GUIDE
+from sbxloop.hostprep import SBIN_PATH, HostPrep
 from sbxloop.log import get_logger
 from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.parse import parse_version
@@ -348,6 +349,7 @@ class HomeInit:
         sys_prefix: Path | None = None,
         say: Printer | None = None,
         user_units: Path | None = None,
+        prep: HostPrep | None = None,
     ) -> None:
         self.home = home
         self.options = options
@@ -360,6 +362,12 @@ class HomeInit:
         self.say = say or (lambda _line: None)
         home_dir = self.env.get("HOME") or str(Path.home())
         self.user_units = user_units or Path(home_dir) / ".config" / "systemd" / "user"
+        # Host preparation is probed, never performed: init installs into a
+        # directory this account owns and leaves the administrator's tasks
+        # (the kvm device, e2fsprogs, lingering) to the administrator. Its
+        # own `run` raises on a non-zero exit, which a probe must not, so
+        # the prep keeps its own runner.
+        self.prep = prep or HostPrep(system=self.system, env=self.env)
         self.report = InitReport(home)
 
     # -- the plan ---------------------------------------------------------------
@@ -367,8 +375,12 @@ class HomeInit:
     def plan(self) -> list[tuple[str, str]]:
         home = self.home
         steps: list[tuple[str, str]] = [
+            ("preflight", "check this host's sandbox prerequisites (nothing is changed)"),
             ("tree", f"create the layout under {home.root}"),
-            ("launchers", f"write {home.launcher} and {home.sbx_launcher}"),
+            (
+                "launchers",
+                f"write {home.launcher}" + ("" if home.windows else f" and {home.sbx_launcher}"),
+            ),
         ]
         if self._venv_is_current():
             steps.append(("venv", f"keep {home.venv} (init runs from it)"))
@@ -411,6 +423,7 @@ class HomeInit:
             for step, what in self.plan():
                 self.say(f"would {step}: {what}")
             return self.report
+        self._preflight()
         self._tree()
         self._launchers()
         self._venv()
@@ -421,6 +434,27 @@ class HomeInit:
             self._systemd()
         self._record()
         return self.report
+
+    def _preflight(self) -> None:
+        """What this host must already be able to do, named before anything
+        is installed.
+
+        The device is a *note*, not a stop: an operator may reasonably lay
+        the home out while an administrator is still enabling virtualisation,
+        and everything but the sandbox works meanwhile. ``mkfs.ext4`` is not,
+        because the step that needs it is in this command: Docker's installer
+        refuses outright without it, and refusing here instead names the
+        package to install rather than surfacing the installer's own message
+        after a download.
+        """
+        device = self.prep.kvm()
+        if device.applicable and not device.ready:
+            self.report.notes.append(f"host preparation needed — {device.name}: {device.message}")
+        if not self.options.sbx:
+            return
+        tools = self.prep.filesystem_tools()
+        if tools.applicable and not tools.ready:
+            raise InitError(f"this host cannot install the sandbox backend — {tools.message}")
 
     def _tree(self) -> None:
         self.home.ensure_tree()
@@ -589,7 +623,9 @@ class HomeInit:
             env = {
                 **self.env,
                 "PREFIX": str(self.home.sbx_prefix),
-                "PATH": "/usr/sbin:/sbin:" + self.env.get("PATH", "/usr/bin:/bin"),
+                "PATH": os.pathsep.join(
+                    [*SBIN_PATH, self.env.get("PATH", "/usr/bin:/bin")],
+                ),
             }
             partial: str | None = None
             try:
@@ -711,6 +747,18 @@ class HomeInit:
         if self.system != "Linux":
             self.report.notes.append("systemd units skipped: not Linux")
             return
+        # Asked before a unit is written. `systemctl --user` against a
+        # session that has no manager takes every call with a bus error, and
+        # a home whose units were "enabled" into a manager that was never
+        # reached is not a service — it is a directory of files that look
+        # like one. --systemd is an explicit request, so this fails the
+        # command rather than degrading it silently.
+        manager = self.prep.user_manager()
+        if not manager.ready:
+            raise InitError(
+                "--systemd was requested, but this host's per-user service manager is not "
+                f"usable — {manager.message}"
+            )
         self.user_units.mkdir(parents=True, exist_ok=True)
         for name in self.unit_names:
             rendered = render_unit(name, self.home, runner_dir=self.options.runner_dir)
@@ -727,13 +775,37 @@ class HomeInit:
         self.run(
             ["systemctl", "--user", "enable", *(str(self.home.unit(n)) for n in self.unit_names)]
         )
-        user = self.env.get("USER") or self.env.get("LOGNAME") or ""
-        if user:
-            try:
-                self.run(["loginctl", "enable-linger", user])
-            except (OSError, subprocess.CalledProcessError) as exc:
-                self.report.notes.append(f"loginctl enable-linger {user} failed: {exc}")
         self.report.done.append("systemd (" + ", ".join(self.unit_names) + ")")
+        self._lingering()
+
+    def _lingering(self) -> None:
+        """Persistence past logout — claimed only once it has been read back.
+
+        ``loginctl enable-linger`` is refused outright where polkit does not
+        let an account enable its own, and a host can take the command and
+        still read lingering as off. Either way the operator has to know: a
+        daemon that dies at logout is not unattended. So the state is read
+        from ``loginctl`` after the attempt, and anything that could not be
+        read stays a note — never a ``done`` line saying persistence is set
+        up.
+        """
+        user = self.env.get("USER") or self.env.get("LOGNAME") or ""
+        if not user:
+            self.report.notes.append(
+                "unattended persistence is not confirmed: this session names no account "
+                "($USER and $LOGNAME are both unset), so there was nothing to enable "
+                "lingering for; run `loginctl enable-linger` for the service account by name"
+            )
+            return
+        try:
+            self.run(["loginctl", "enable-linger", user])
+        except (OSError, subprocess.CalledProcessError) as exc:
+            self.report.notes.append(f"loginctl enable-linger {user} failed: {exc}")
+        state = self.prep.lingering(user)
+        if state.ready:
+            self.report.done.append(f"lingering ({user})")
+        else:
+            self.report.notes.append(f"unattended persistence is not confirmed — {state.message}")
 
     # -- record -------------------------------------------------------------------
 

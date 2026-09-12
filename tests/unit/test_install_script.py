@@ -55,6 +55,14 @@ class Host:
         — what a host that fails the preflight must never have run."""
         return [line for line in self.invocations if not line.startswith("git ")]
 
+    def uname(self, system: str) -> None:
+        """Say this host is *system*, so the Linux-only host-preparation
+        branch can be exercised on any runner."""
+        target = self.path / "uname"
+        target.unlink(missing_ok=True)
+        target.write_text(f'#!/bin/sh\nprintf "%s\\n" "{system}"\n')
+        target.chmod(0o755)
+
     def fake(self, name: str, *, exit_code: int = 0, on_path: bool = True) -> Path:
         """An executable that records its argv and exits ``exit_code``."""
         target = (self.path if on_path else self.root / "elsewhere") / name
@@ -182,6 +190,64 @@ def test_git_is_a_declared_prerequisite() -> None:
     quickstart = (ROOT / "docs" / "user-guide.md").read_text()
     assert "curl, tar, git" in quickstart
     assert "curl, tar, git" in (ROOT / "README.md").read_text()
+
+
+class TestHostPreparation:
+    """The sandbox backend's Linux prerequisites (#898).
+
+    These are not the script's own: it can install a whole home without
+    them, and the remedies — enabling virtualisation, granting the device,
+    installing a package — are an administrator's. So they are reported
+    early and never performed, and `sbxloop init` is what refuses the one
+    step that cannot work without them.
+    """
+
+    def test_the_header_separates_installation_from_host_preparation(self) -> None:
+        header = INSTALL.read_text().split("set -eu", 1)[0]
+
+        assert "installation prerequisites" in header
+        assert "host preparation" in header
+        assert "/dev/kvm" in header and "e2fsprogs" in header
+        assert "elevates a privilege" in header
+
+    def test_a_linux_host_is_told_what_it_is_missing_without_being_stopped(
+        self, installable: Host
+    ) -> None:
+        installable.uname("Linux")
+
+        result = installable.run()
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "sbxloop init --systemd" in "\n".join(installable.invocations)
+        # Whichever this runner is, the advisory and the host agree.
+        assert ("/dev/kvm does not exist" in result.stderr) is not Path("/dev/kvm").exists()
+
+    def test_a_missing_device_names_an_administrator_task_never_a_command_to_run(
+        self, installable: Host
+    ) -> None:
+        installable.uname("Linux")
+
+        result = installable.run()
+
+        for line in result.stderr.splitlines():
+            if "host preparation needed" not in line:
+                continue
+            assert "an administrator" in line
+            assert "sudo" not in line and "usermod" not in line
+
+    def test_nothing_linux_specific_is_said_on_a_host_it_does_not_apply_to(
+        self, installable: Host
+    ) -> None:
+        """macOS brings its own virtualisation and has neither /dev/kvm nor
+        mkfs.ext4; a prerequisite check that fired there would fault a
+        supported host."""
+        installable.uname("Darwin")
+
+        result = installable.run()
+
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert "host preparation needed" not in result.stderr
+        assert "sbxloop init --systemd" in "\n".join(installable.invocations)
 
 
 @pytest.mark.slow

@@ -91,6 +91,24 @@ it reads and clones checkouts on the host, and the git inside a sandbox does not
 for it — so the installer checks for a usable one before it downloads anything and tells
 you what to install if there is none.
 
+**Installing and preparing the host are two different jobs.** Everything sbxloop installs
+lands under `~/.sbxloop`, a directory your account already owns; nothing in the install
+needs root. Preparing the host is separate, one-time, and partly an administrator's:
+
+| One-time host preparation (Linux)   | Who                      | Why                                                            |
+| ----------------------------------- | ------------------------ | -------------------------------------------------------------- |
+| `/dev/kvm` present                  | administrator            | every sandbox is a microVM; without the device none boots      |
+| `/dev/kvm` openable by your account | administrator            | Docker's Linux setup adds the account to the `kvm` group       |
+| e2fsprogs installed                 | administrator            | the sandbox backend formats its block devices with `mkfs.ext4` |
+| sbx's AppArmor profile installed    | administrator            | the last step of Docker's installer writes into `/etc`         |
+| `loginctl enable-linger $USER`      | you, or an administrator | only for an unattended daemon: user services stop at logout    |
+
+The installer reports each of these and changes none of them — it joins no group, installs
+no package, and elevates nothing. `sbxloop doctor` shows the same rows at any time, and
+`sbxloop init` refuses by name the one step that cannot work without them. On macOS none of
+them apply: the platform brings its own virtualisation, and an interactive install needs no
+service manager at all (`sbxloop init --no-systemd`).
+
 ### Install and initialize
 
 On macOS or Linux:
