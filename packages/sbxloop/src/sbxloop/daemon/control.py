@@ -30,8 +30,11 @@ import time
 import uuid
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any, NamedTuple, get_args
+from typing import Any, Literal, NamedTuple, cast, get_args
 
+from sbxloop.daemon.controls.principal import Principal
+from sbxloop.daemon.controls.results import ControlError
+from sbxloop.daemon.controls.service import ControlService
 from sbxloop.daemon.discord_format import _one_line, code, items_lines, queue_lines
 from sbxloop.daemon.holds import OPERATOR_HOLD
 from sbxloop.ghids import normalize_item_id
@@ -223,6 +226,7 @@ def dispatch(
     by: str | None = None,
     via: str = "ctl",
     max_chars: int | None = None,
+    principal: Principal | None = None,
 ) -> CommandReply:
     """Run one operator command against the daemon loop.
 
@@ -234,6 +238,14 @@ def dispatch(
     ``max_chars`` is the carrying message's limit, for replies that must
     fit it newest-first (``log``).
 
+    The surfaces that call this — the ``ctl`` queue on the host, a chat
+    channel the operator restricted, the local console, the concierge —
+    are trusted completely, so ``by`` becomes a fully capable
+    :class:`Principal` unless the caller hands one over. A surface with
+    an authority model of its own never comes through here: it calls
+    :class:`~sbxloop.daemon.controls.service.ControlService` with the
+    principal it authenticated.
+
     Every command leaves a host-side record — who asked for what, over
     which channel, and whether it was accepted — so a cancel or abandon
     seen on the source can always be traced back in the journal.
@@ -241,7 +253,9 @@ def dispatch(
     words = cmd.split()
     word = words[0].lower() if words else ""
     args = words[1:]
-    reply = _dispatch(loop, word, args, prefix=prefix, by=by, max_chars=max_chars)
+    if principal is None:
+        principal = Principal.trusted(by, via)
+    reply = _dispatch(loop, word, args, prefix=prefix, principal=principal, max_chars=max_chars)
     if word == "log":
         # Not traced: the trace would land in the very buffer `log` reads,
         # and a console polling it would evict real records with echoes.
@@ -308,7 +322,7 @@ def _schedule_add_args(name: str, args: list[str]) -> Any:
         return f"schedules add failed: {first.removeprefix('Value error, ')}"
 
 
-def _schedules(loop: Any, args: list[str], by: str | None) -> CommandReply:
+def _schedules(service: ControlService, args: list[str], principal: Principal) -> CommandReply:
     """`schedules` lists every stored schedule with its state; `schedules
     add` creates one (#818), `remove` deletes one, `pause` / `resume`
     park one and release it (#761). A daemon `pause` holds everything;
@@ -322,30 +336,23 @@ def _schedules(loop: Any, args: list[str], by: str | None) -> CommandReply:
             if isinstance(spec, str):
                 return CommandReply(spec, ok=False)
             try:
-                return CommandReply(loop.add_schedule(spec, by, source="ctl"))
-            except ValueError as exc:
-                return CommandReply(f"schedules add failed: {exc}", ok=False)
+                return CommandReply(service.add_schedule(principal, spec, source="ctl").message)
+            except ControlError as exc:
+                return CommandReply(f"schedules add failed: {exc.message}", ok=False)
         if verb not in ("pause", "resume", "remove") or len(args) != 2:
             return CommandReply(_SCHEDULES_USAGE, ok=False)
+        control = cast(Literal["pause", "resume", "remove"], verb)
         try:
-            if verb == "pause":
-                text = loop.pause_schedule(args[1], by)
-            elif verb == "resume":
-                text = loop.resume_schedule(args[1], by)
-            else:
-                text = loop.remove_schedule(args[1], by)
-        except ValueError as exc:
-            return CommandReply(
-                f"schedules {verb} failed: {exc.args[0] if exc.args else exc}", ok=False
-            )
-        return CommandReply(text)
-    rows = loop.schedules()
+            return CommandReply(service.schedule_control(principal, control, args[1]).message)
+        except ControlError as exc:
+            return CommandReply(f"schedules {verb} failed: {exc.message}", ok=False)
+    rows = service.schedules(principal).rows
     if not rows:
         return CommandReply(
             "no schedules — create one from chat (the concierge's `create_schedule`) or with "
             "`schedules add <name> --profile P --every 1h --ask TEXT`."
         )
-    return CommandReply("\n".join(schedule_line(row, loop.clock()) for row in rows))
+    return CommandReply("\n".join(schedule_line(row, service.loop.clock()) for row in rows))
 
 
 def schedule_line(row: dict[str, Any], now: float) -> str:
@@ -398,11 +405,35 @@ def _dispatch(
     args: list[str],
     *,
     prefix: str,
-    by: str | None,
+    principal: Principal,
     max_chars: int | None = None,
 ) -> CommandReply:
+    """Parse one verb's arguments, act through the typed service, render
+    the sentence. Every string here is the prose edge: nothing below the
+    service composes one, and nothing above parses one."""
+    service = ControlService(loop)
+    try:
+        return _dispatch_verb(
+            service, word, args, prefix=prefix, principal=principal, max_chars=max_chars
+        )
+    except ControlError as exc:
+        # A refusal this layer introduced (a principal without the
+        # capability, a daemon not ready); the loop's own refusals are
+        # rendered verb by verb below, as they always were.
+        return CommandReply(f"{word} refused: {exc.message}", ok=False)
+
+
+def _dispatch_verb(
+    service: ControlService,
+    word: str,
+    args: list[str],
+    *,
+    prefix: str,
+    principal: Principal,
+    max_chars: int | None,
+) -> CommandReply:
     if word == "status":
-        s = loop.status()
+        s = service.status(principal).status
         cur = s["current"]
         claiming = s.get("claiming")
         # A claim in progress is reported as current too, so a reader never
@@ -456,41 +487,49 @@ def _dispatch(
         if err is not None:
             return err
         try:
-            holds = loop.pause(hold or OPERATOR_HOLD, by=by)
-        except ValueError as exc:
-            return CommandReply(str(exc), ok=False)
+            paused = service.pause(principal, hold)
+        except ControlError as exc:
+            if exc.code != "invalid_argument":
+                raise
+            return CommandReply(exc.message, ok=False)
         return CommandReply(
-            f"paused (hold {code(hold or OPERATOR_HOLD)}) — the current run finishes; "
-            f"nothing new is claimed. holds: {', '.join(holds)}"
+            f"paused (hold {code(paused.hold)}) — the current run finishes; "
+            f"nothing new is claimed. holds: {', '.join(paused.holds)}"
         )
     if word in ("resume", "unpause"):
         if len(args) == 1 and not args[0].startswith("-"):
             # `resume <item|run>`: a PR waiting for a review (#675) — check
             # it now, or re-arm a wait that paused. Not the daemon's holds.
             try:
-                return CommandReply(loop.resume_review(args[0], by))
-            except ValueError as exc:
-                return CommandReply(f"resume failed: {exc.args[0] if exc.args else exc}", ok=False)
+                return CommandReply(service.resume_review(principal, args[0]).message)
+            except ControlError as exc:
+                if exc.code != "not_eligible":
+                    raise
+                return CommandReply(f"resume failed: {exc.message}", ok=False)
         hold, err = _hold_arg(args, word, prefix, allow_all=True)
         if err is not None:
             return err
         try:
-            holds = loop.unpause(None if hold == "--all" else (hold or OPERATOR_HOLD), by=by)
-        except ValueError as exc:
-            return CommandReply(str(exc), ok=False)
-        if holds:
+            released = service.release(principal, hold, everything=hold == "--all")
+        except ControlError as exc:
+            if exc.code != "invalid_argument":
+                raise
+            return CommandReply(exc.message, ok=False)
+        if released.holds:
             return CommandReply(
                 f"released {code('every hold' if hold == '--all' else hold or OPERATOR_HOLD)}; "
-                f"still paused by {', '.join(code(h) for h in holds)} "
+                f"still paused by {', '.join(code(h) for h in released.holds)} "
                 f"(`{prefix} resume --hold <name>` or `{prefix} resume --all`)."
             )
         return CommandReply("resumed.")
     if word == "cancel":
         if len(args) == 1 and not args[0].startswith("-"):
             try:
-                return CommandReply(loop.cancel_provider(args[0], by))
-            except ValueError as exc:
-                return CommandReply(str(exc), ok=False)
+                return CommandReply(service.cancel_provider(principal, args[0]).message or "")
+            except ControlError as exc:
+                if exc.code != "not_eligible":
+                    raise
+                return CommandReply(exc.message, ok=False)
         # Attributed to the operator: the item is settled as cancelled (no
         # retry, no breaker count) unless --retry asks for a fresh run.
         unknown = [a for a in args if a != "--retry"]
@@ -503,8 +542,12 @@ def _dispatch(
                 ok=False,
             )
         retry = "--retry" in args
-        if not loop.cancel_current(by, retry=retry):
-            return CommandReply("nothing is running.", ok=False)
+        try:
+            service.cancel_current(principal, retry=retry)
+        except ControlError as exc:
+            if exc.code != "not_eligible":
+                raise
+            return CommandReply(exc.message, ok=False)
         if retry:
             return CommandReply(
                 "cancel requested — honored at the next task boundary; the item will be "
@@ -515,29 +558,36 @@ def _dispatch(
             "cancelled (no retry) and the run stays resumable."
         )
     if word == "queue":
-        return CommandReply(queue_lines(loop.dstore.queued()))
+        return CommandReply(queue_lines(service.queue(principal).items))
     if word == "items":
-        return CommandReply(items_lines(loop.dstore.items()))
+        return CommandReply(items_lines(service.items(principal).items))
     if word == "grant-rounds":
-        return _grant_rounds(loop, args, by)
+        return _grant_rounds(service, args, principal)
     if word == "resume-repo":
         if len(args) != 1:
             return CommandReply("usage: resume-repo <owner/name>", ok=False)
         try:
-            health = loop.resume_repo(args[0], by)
-        except (KeyError, ValueError) as exc:
-            return CommandReply(f"resume-repo failed: {exc.args[0] if exc.args else exc}", ok=False)
-        return CommandReply(f"polling {code(health['repo'])} again from the next tick.")
+            resumed = service.resume_repo(principal, args[0])
+        except ControlError as exc:
+            if exc.code not in ("unknown_target", "not_eligible"):
+                raise
+            return CommandReply(f"resume-repo failed: {exc.message}", ok=False)
+        return CommandReply(f"polling {code(resumed.repo)} again from the next tick.")
     if word == "schedules":
-        return _schedules(loop, args, by)
+        return _schedules(service, args, principal)
     if word == "log":
         parsed = _log_args(args)
         if isinstance(parsed, str):
             return CommandReply(parsed, ok=False)
         tail, level, grep = parsed
-        text = format_log_tail(tail=tail, level=level, grep=grep, max_chars=max_chars)
-        if text.startswith("unknown log level"):
-            return CommandReply(text, ok=False)
+        try:
+            text = service.log_tail(
+                principal, tail=tail, level=level, grep=grep, max_chars=max_chars
+            ).text
+        except ControlError as exc:
+            if exc.code != "invalid_argument":
+                raise
+            return CommandReply(exc.message, ok=False)
         return CommandReply(text, preformatted=True)
     if word == "stop":
         if args:
@@ -552,7 +602,7 @@ def _dispatch(
             "Under a service manager that restarts it (the shipped unit does, after 30 s) "
             "this is a restart that drops in-memory holds — `pause` keeps it off work "
             "for good.",
-            after=loop.request_stop,
+            after=service.stop(principal).after,
         )
     if word == "restart":
         # A `stop` the supervisor undoes (#969): the same courtesy exit, a
@@ -563,14 +613,12 @@ def _dispatch(
             return CommandReply(
                 "usage: restart [--now] — `--now` cancels the current run first", ok=False
             )
-        # Lazily: the loop imports nothing from here, and this module must
-        # not pull the whole loop in for one sentence.
-        from sbxloop.daemon.loop import UNSUPERVISED_REFUSAL
-
-        supervisor = loop.supervisor()
-        if supervisor is None:
-            return CommandReply(f"restart refused: {UNSUPERVISED_REFUSAL}.", ok=False)
-        who = by or "operator"
+        try:
+            restart = service.restart(principal, now=now)
+        except ControlError as exc:
+            if exc.code != "unsupervised":
+                raise
+            return CommandReply(f"restart refused: {exc.message}.", ok=False)
         head = (
             "restarting now: the current run is cancelled (resumable — the next start "
             "recovers it) and the daemon exits; "
@@ -580,10 +628,10 @@ def _dispatch(
         )
         return CommandReply(
             head
-            + ("systemd" if supervisor == "systemd" else "its supervisor")
+            + ("systemd" if restart.supervisor == "systemd" else "its supervisor")
             + " starts it again and it says so here when it is back. In-memory holds do "
             "not survive — `pause` first if it should stay off work.",
-            after=lambda: loop.request_restart(by=who, reason="operator restart", now=now),
+            after=restart.after,
         )
     if word in ("merge", "approve", "release"):
         # The opt-in merge gate's approval ([landing] merge_gate), or a
@@ -594,27 +642,30 @@ def _dispatch(
         if len(args) != 1:
             return CommandReply(f"usage: `{prefix} {word} <item|run>`", ok=False)
         try:
-            text = loop.approve_merge(args[0], by=by)
-        except (KeyError, ValueError) as exc:
-            return CommandReply(f"{word} failed: {exc.args[0] if exc.args else exc}", ok=False)
-        return CommandReply(text)
+            return CommandReply(service.approve_gate(principal, args[0]).message)
+        except ControlError as exc:
+            if exc.code not in ("unknown_target", "not_eligible"):
+                raise
+            return CommandReply(f"{word} failed: {exc.message}", ok=False)
     if word in ITEM_COMMANDS:
-        return _item_command(loop, word, args, by)
+        return _item_command(service, word, args, principal)
     return CommandReply(usage(prefix), ok=False, known=False)
 
 
-def _grant_rounds(loop: Any, args: list[str], by: str | None) -> CommandReply:
+def _grant_rounds(service: ControlService, args: list[str], principal: Principal) -> CommandReply:
     """``grant-rounds <run> <n>`` (#523): more fix rounds for a run that
     exhausted its budget, resumed on its own PR right away."""
     if len(args) != 2 or not args[1].isdigit() or int(args[1]) < 1:
         return CommandReply("usage: grant-rounds <run_id> <rounds ≥ 1>", ok=False)
     run_id, rounds = args[0], int(args[1])
     try:
-        item = loop.grant_rounds(run_id, rounds, by)
-    except (KeyError, ValueError) as exc:
-        return CommandReply(f"grant-rounds failed: {exc.args[0] if exc.args else exc}", ok=False)
+        granted = service.grant_rounds(principal, run_id, rounds)
+    except ControlError as exc:
+        if exc.code not in ("unknown_target", "not_eligible"):
+            raise
+        return CommandReply(f"grant-rounds failed: {exc.message}", ok=False)
     return CommandReply(
-        f"granted {code(run_id)} {rounds} more fix round(s); {code(item.item_id)} resumes it "
+        f"granted {code(run_id)} {rounds} more fix round(s); {code(granted.item_id)} resumes it "
         "on its own PR at the next tick."
     )
 
@@ -640,7 +691,9 @@ def _hold_arg(
     )
 
 
-def _item_command(loop: Any, word: str, args: list[str], by: str | None) -> CommandReply:
+def _item_command(
+    service: ControlService, word: str, args: list[str], principal: Principal
+) -> CommandReply:
     """``abandon|retry|requeue <item_id> [reason…]``. Item ids are the
     daemon's own (``gh:issue:12``, ``inbox:x.md``); the legacy bare
     ``gh:12`` spelling is normalised to the typed form before the lookup, so
@@ -654,19 +707,21 @@ def _item_command(loop: Any, word: str, args: list[str], by: str | None) -> Comm
     item_id = normalize_item_id(args[0])
     try:
         if word == "abandon":
-            item = loop.abandon_item(item_id, " ".join(args[1:]) or None)
+            item = service.abandon(principal, item_id, " ".join(args[1:]) or None).item
             return CommandReply(
                 f"{code(item_id)} abandoned"
                 + (f" (its run {code(item.run_id)} will not resume)" if item.run_id else "")
                 + "."
             )
         if word == "retry":
-            loop.retry_item(item_id, by)
+            service.retry(principal, item_id)
             return CommandReply(f"{code(item_id)} re-queued with attempts reset (fresh plan).")
-        loop.requeue_item(item_id)
+        service.requeue(principal, item_id)
         return CommandReply(f"{code(item_id)} re-queued; its next dispatch starts a fresh run.")
-    except (KeyError, ValueError) as exc:
-        return CommandReply(f"{word} failed: {exc.args[0] if exc.args else exc}", ok=False)
+    except ControlError as exc:
+        if exc.code not in ("unknown_target", "not_eligible"):
+            raise
+        return CommandReply(f"{word} failed: {exc.message}", ok=False)
 
 
 def plain(text: str) -> str:

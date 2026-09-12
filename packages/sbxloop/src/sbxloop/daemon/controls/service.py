@@ -1,0 +1,276 @@
+"""The typed control service every surface shares.
+
+One method per operator verb. Each takes the :class:`Principal` first,
+checks the capability the verb needs, hands the loop the principal's
+attribution as the ``by`` it always took, and returns a typed outcome.
+Refusals the loop raises as ``ValueError`` / ``KeyError`` come back as
+:class:`ControlError` with the loop's sentence intact, so the prose edge
+renders exactly what it rendered before this layer existed.
+
+No sentence is composed here except for refusals this layer introduces
+(a principal without the capability). The loop's own prose replies —
+``resume_review``, ``approve_merge``, the schedule verbs — ride inside
+the outcome as ``message`` until the loop grows structured results of
+its own; a JSON surface exposes the structured fields and may show the
+message, but never parses it.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Literal
+
+from sbxloop.config import ScheduleConfig
+from sbxloop.daemon.controls.principal import Capability, Principal
+from sbxloop.daemon.controls.protocol import ControlLoop
+from sbxloop.daemon.controls.results import (
+    CancelOutcome,
+    ControlError,
+    GateOutcome,
+    GrantRoundsOutcome,
+    ItemOutcome,
+    ItemsOutcome,
+    LogTailOutcome,
+    PauseOutcome,
+    QueueOutcome,
+    ReleaseOutcome,
+    RepoResumeOutcome,
+    RestartOutcome,
+    ReviewResumeOutcome,
+    ScheduleListOutcome,
+    ScheduleOutcome,
+    StatusOutcome,
+    StopOutcome,
+)
+from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
+from sbxloop.ghids import normalize_item_id
+
+
+def _message(exc: BaseException) -> str:
+    """The loop's sentence, as the prose edge always showed it."""
+    return str(exc.args[0]) if exc.args else str(exc)
+
+
+def _hold(hold: str | None) -> str:
+    """The operator's hold when unnamed; a named one validated here so a
+    bad name never reaches the loop (which validates again, harmlessly)."""
+    try:
+        return hold_name(hold or OPERATOR_HOLD)
+    except ValueError as exc:
+        raise ControlError("invalid_argument", str(exc)) from exc
+
+
+def require(principal: Principal, capability: Capability) -> None:
+    if not principal.can(capability):
+        raise ControlError(
+            "forbidden",
+            f"{principal.id} (via {principal.via}) lacks {capability}",
+            capability=capability,
+        )
+
+
+class ControlService:
+    """Typed controls over a :class:`~sbxloop.daemon.controls.protocol.ControlLoop`."""
+
+    def __init__(self, loop: ControlLoop) -> None:
+        self.loop = loop
+
+    # -- reads ----------------------------------------------------------------------
+
+    def status(self, principal: Principal) -> StatusOutcome:
+        require(principal, "runs:read")
+        return StatusOutcome(status=self.loop.status())
+
+    def queue(self, principal: Principal) -> QueueOutcome:
+        require(principal, "runs:read")
+        return QueueOutcome(items=list(self.loop.dstore.queued()))
+
+    def items(self, principal: Principal) -> ItemsOutcome:
+        require(principal, "runs:read")
+        return ItemsOutcome(items=list(self.loop.dstore.items()))
+
+    def schedules(self, principal: Principal) -> ScheduleListOutcome:
+        require(principal, "runs:read")
+        return ScheduleListOutcome(rows=list(self.loop.schedules()))
+
+    def log_tail(
+        self,
+        principal: Principal,
+        *,
+        tail: int,
+        level: str | None,
+        grep: str | None,
+        max_chars: int | None,
+    ) -> LogTailOutcome:
+        require(principal, "diagnostics:read")
+        # Lazily: the log tail renderer lives with the prose edge.
+        from sbxloop.daemon.control import format_log_tail
+
+        text = format_log_tail(tail=tail, level=level, grep=grep, max_chars=max_chars)
+        if text.startswith("unknown log level"):
+            raise ControlError("invalid_argument", text)
+        return LogTailOutcome(text=text)
+
+    # -- holds ----------------------------------------------------------------------
+
+    def pause(self, principal: Principal, hold: str | None = None) -> PauseOutcome:
+        require(principal, "daemon:manage")
+        name = _hold(hold)
+        try:
+            holds = self.loop.pause(name, by=principal.attribution())
+        except ValueError as exc:
+            raise ControlError("invalid_argument", str(exc)) from exc
+        return PauseOutcome(hold=name, holds=list(holds))
+
+    def release(
+        self, principal: Principal, hold: str | None = None, *, everything: bool = False
+    ) -> ReleaseOutcome:
+        """Release one hold (the operator's when unnamed), or every hold."""
+        require(principal, "daemon:manage")
+        name = None if everything else _hold(hold)
+        try:
+            holds = self.loop.unpause(name, by=principal.attribution())
+        except ValueError as exc:
+            raise ControlError("invalid_argument", str(exc)) from exc
+        return ReleaseOutcome(hold=name, holds=list(holds))
+
+    # -- runs -----------------------------------------------------------------------
+
+    def resume_review(self, principal: Principal, target: str) -> ReviewResumeOutcome:
+        require(principal, "runs:control")
+        try:
+            message = self.loop.resume_review(target, principal.attribution())
+        except ValueError as exc:
+            raise ControlError("not_eligible", _message(exc)) from exc
+        return ReviewResumeOutcome(target=target, message=message)
+
+    def cancel_current(self, principal: Principal, *, retry: bool = False) -> CancelOutcome:
+        """Cancel the run in flight. Refused when nothing is running."""
+        require(principal, "runs:control")
+        if not self.loop.cancel_current(principal.attribution(), retry=retry):
+            raise ControlError("not_eligible", "nothing is running.")
+        return CancelOutcome(mode="current", retry=retry)
+
+    def cancel_provider(self, principal: Principal, target: str) -> CancelOutcome:
+        """Cancel a run parked on a provider outage."""
+        require(principal, "runs:control")
+        try:
+            message = self.loop.cancel_provider(target, principal.attribution())
+        except ValueError as exc:
+            raise ControlError("not_eligible", str(exc)) from exc
+        return CancelOutcome(mode="provider", target=target, message=message)
+
+    def grant_rounds(self, principal: Principal, run_id: str, rounds: int) -> GrantRoundsOutcome:
+        require(principal, "budgets:grant")
+        if rounds < 1:
+            raise ControlError("invalid_argument", f"rounds must be at least 1, not {rounds}")
+        try:
+            item = self.loop.grant_rounds(run_id, rounds, principal.attribution())
+        except (KeyError, ValueError) as exc:
+            raise ControlError(_code_for(exc), _message(exc)) from exc
+        return GrantRoundsOutcome(run_id=run_id, rounds=rounds, item_id=item.item_id)
+
+    # -- gates ----------------------------------------------------------------------
+
+    def approve_gate(self, principal: Principal, target: str) -> GateOutcome:
+        """Approve a parked merge, or release a held workload result."""
+        require(principal, "gates:approve")
+        try:
+            message = self.loop.approve_merge(target, by=principal.attribution())
+        except (KeyError, ValueError) as exc:
+            raise ControlError(_code_for(exc), _message(exc)) from exc
+        return GateOutcome(target=target, message=message)
+
+    # -- items ----------------------------------------------------------------------
+
+    def abandon(self, principal: Principal, item_id: str, reason: str | None) -> ItemOutcome:
+        require(principal, "runs:control")
+        item_id = normalize_item_id(item_id)
+        try:
+            item = self.loop.abandon_item(item_id, reason)
+        except (KeyError, ValueError) as exc:
+            raise ControlError(_code_for(exc), _message(exc)) from exc
+        return ItemOutcome(verb="abandon", item=item)
+
+    def retry(self, principal: Principal, item_id: str) -> ItemOutcome:
+        require(principal, "runs:control")
+        item_id = normalize_item_id(item_id)
+        try:
+            item = self.loop.retry_item(item_id, principal.attribution())
+        except (KeyError, ValueError) as exc:
+            raise ControlError(_code_for(exc), _message(exc)) from exc
+        return ItemOutcome(verb="retry", item=item)
+
+    def requeue(self, principal: Principal, item_id: str) -> ItemOutcome:
+        require(principal, "runs:control")
+        item_id = normalize_item_id(item_id)
+        try:
+            item = self.loop.requeue_item(item_id)
+        except (KeyError, ValueError) as exc:
+            raise ControlError(_code_for(exc), _message(exc)) from exc
+        return ItemOutcome(verb="requeue", item=item)
+
+    # -- daemon ---------------------------------------------------------------------
+
+    def resume_repo(self, principal: Principal, repo: str) -> RepoResumeOutcome:
+        require(principal, "daemon:manage")
+        try:
+            health = self.loop.resume_repo(repo, principal.attribution())
+        except (KeyError, ValueError) as exc:
+            raise ControlError(_code_for(exc), _message(exc)) from exc
+        return RepoResumeOutcome(repo=str(health.get("repo", repo)), health=dict(health))
+
+    def add_schedule(
+        self, principal: Principal, spec: ScheduleConfig, *, source: str
+    ) -> ScheduleOutcome:
+        require(principal, "daemon:manage")
+        try:
+            message = self.loop.add_schedule(spec, principal.attribution(), source=source)
+        except ValueError as exc:
+            raise ControlError("invalid_argument", str(exc)) from exc
+        return ScheduleOutcome(verb="add", name=spec.name, message=message)
+
+    def schedule_control(
+        self, principal: Principal, verb: Literal["pause", "resume", "remove"], name: str
+    ) -> ScheduleOutcome:
+        """``pause`` / ``resume`` / ``remove`` one schedule."""
+        require(principal, "daemon:manage")
+        try:
+            if verb == "pause":
+                message = self.loop.pause_schedule(name, principal.attribution())
+            elif verb == "resume":
+                message = self.loop.resume_schedule(name, principal.attribution())
+            else:
+                message = self.loop.remove_schedule(name, principal.attribution())
+        except ValueError as exc:
+            raise ControlError("unknown_target", _message(exc)) from exc
+        return ScheduleOutcome(verb=verb, name=name, message=message)
+
+    def stop(self, principal: Principal) -> StopOutcome:
+        """Graceful stop: the effect runs when the caller fires ``after``."""
+        require(principal, "daemon:manage")
+        return StopOutcome(after=self.loop.request_stop)
+
+    def restart(self, principal: Principal, *, now: bool = False) -> RestartOutcome:
+        """Courtesy exit under a supervisor that starts the daemon again;
+        refused by name when nothing would."""
+        require(principal, "daemon:manage")
+        # Lazily: the loop imports nothing from here, and this module must
+        # not pull the whole loop in for one sentence.
+        from sbxloop.daemon.loop import UNSUPERVISED_REFUSAL
+
+        supervisor = self.loop.supervisor()
+        if supervisor is None:
+            raise ControlError("unsupervised", UNSUPERVISED_REFUSAL)
+        who = principal.attribution() or "operator"
+        loop = self.loop
+
+        def after() -> None:
+            loop.request_restart(by=who, reason="operator restart", now=now)
+
+        return RestartOutcome(supervisor=supervisor, now=now, after=after)
+
+
+def _code_for(exc: BaseException) -> Any:
+    """``KeyError`` names a target the daemon does not know; ``ValueError``
+    a target that is not in a state the action applies to."""
+    return "unknown_target" if isinstance(exc, KeyError) else "not_eligible"

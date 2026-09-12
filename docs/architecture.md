@@ -2021,6 +2021,50 @@ default). Model keys apply live (`refreshed_models`); everything else at
 the next start, which is why the restart is part of the write rather than
 advice after it.
 
+### Typed controls
+
+Every operator verb — `!sbx` in chat, `sbxloop daemon ctl`, the console,
+the concierge's `sbx_control` tool — used to land in one prose dispatcher
+(`daemon/control.py::_dispatch`) that called the loop and composed a
+sentence, taking a free-form `by` string for the source-facing attribution.
+A surface that speaks JSON cannot parse a sentence to learn whether a
+command succeeded, and a free-form `by` is not an identity. The controls
+package (`daemon/controls/`) is the layer beneath that dispatcher, and the
+remote API spike's first delivery stage (`docs/spikes/remote-api.md`).
+
+`ControlService` has one method per verb. Each takes a `Principal` first —
+who is asking (`kind`, `id`, `display`, the surface it came `via`) and the
+capabilities it holds (`runs:read`, `runs:control`, `gates:approve`,
+`daemon:manage`, …) — checks the capability the verb needs, hands the loop
+the principal's attribution as the `by` it always took, and returns a typed
+outcome (`PauseOutcome`, `CancelOutcome`, `ItemOutcome`, …). A refusal is a
+`ControlError` with a stable code (`unknown_target`, `not_eligible`,
+`unsupported_for_kind`, `capability_unknown`, `forbidden`, `unsupervised`,
+…) and the loop's own sentence kept verbatim, so the prose edge renders
+exactly what it rendered before the layer existed. The loop's prose replies
+(`resume_review`, `approve_merge`, the schedule verbs) ride inside the
+outcome as `message` until the loop grows structured results of its own; a
+JSON surface exposes the structured fields and never parses the message.
+
+The attribution is derived from the principal, never the reverse: the
+surfaces that exist today are trusted completely, as they always were, and
+`dispatch` builds them a `Principal.trusted(by, via)` holding every
+capability with the legacy string byte-for-byte. A principal with fewer
+capabilities can only come from a surface that authenticated it, and such
+a surface calls the service directly — it never goes through the prose
+dispatcher.
+
+`controls/eligibility.py` is the pure function a surface can answer
+*before* asking: given a run's kind and state, its item's state, the gate
+or review hold parked on it and the backend's answer about the forge,
+`available_actions` says which controls apply and `check` refuses the rest
+by name. It is stricter than the loop, not looser: a fixed `tool` recipe
+never has `steer`, `grant_rounds` or `gate_approve` (no agent to steer, no
+fix rounds, no gate); an action that acts on the forge is refused with
+`capability_unknown` when the backend could not tell whether it can — a
+"could not tell" is a refusal, never a guess. The loop keeps its own
+refusals (it holds the locks); the two agree by test.
+
 ### Repositories
 
 One daemon may tend several repositories. They are declared as an array of
