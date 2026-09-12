@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
@@ -44,12 +45,15 @@ from urllib.parse import quote
 from sbxloop.agentmodels import ModelSelection, model_for_phase, refreshed_models
 from sbxloop.cli.tui import format_event
 from sbxloop.config import SINK_NAMES, BridgeBackend, Config, ScheduleConfig
+from sbxloop.configedit import ConfigEditError, ConfigEditor
+from sbxloop.daemon import configview
 from sbxloop.daemon.chat_choices import (
     ChoiceQuestion,
     PendingFiling,
     parse_choice_question,
     parse_pending_filing,
 )
+from sbxloop.daemon.configpolicy import never_from_chat
 from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX, dispatch, format_log_tail, plain
 from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.model import WorkItem
@@ -997,6 +1001,33 @@ class Concierge:
                 ),
                 self._tool_delete_schedule,
             ),
+            HostTool(
+                HostToolSpec(
+                    name="config_keys",
+                    description=(
+                        "The daemon's configuration as it is resolved right now, read from "
+                        "the operator's config file with every other layer applied — never "
+                        "from memory. No arguments: the sections with how many keys each "
+                        "has and how many the operator's file sets. `prefix` (a section "
+                        "like `daemon`, or one key like `daemon.max_runs_per_day`): one "
+                        "card per key — its value, which layer set it, what it accepts "
+                        "(type, choices, bounds), whether a change applies live or at the "
+                        "daemon's next start, whether chat may never change it, and what "
+                        "it is for. `grep`: keys whose name or description contains the "
+                        "text. `repo` (owner/name) addresses one configured repository's "
+                        "own settings, with `prefix` relative to it. Read-only: it "
+                        "changes nothing."
+                    ),
+                    parameters=_schema(
+                        {
+                            "prefix": {"type": "string"},
+                            "grep": {"type": "string"},
+                            "repo": {"type": "string"},
+                        }
+                    ),
+                ),
+                self._tool_config_keys,
+            ),
         ]
         if self.config.github.repo_list():
             tools.append(
@@ -1787,6 +1818,55 @@ class Concierge:
             f"{text} `schedules` lists it; `schedules pause {spec.name}` parks it; "
             "`delete_schedule` removes it."
         )
+
+    # -- configuration (#970) ------------------------------------------------------
+
+    def _config_editor(self) -> ConfigEditor:
+        """The operator's file as it is on disk now — not this process's copy
+        of it, which may predate an edit made on the host or the console."""
+        return ConfigEditor(self.config.paths, os.environ)
+
+    def _repo_prefix(self, args: dict[str, Any]) -> tuple[str | None, str | None]:
+        """``repo`` resolved to the editor's path for that entry
+        (``github.repos[N]``), joined with ``prefix`` when one was given."""
+        selector = str(args.get("repo") or "").strip()
+        prefix = str(args.get("prefix") or "").strip().strip(".")
+        if not selector:
+            return prefix or None, None
+        entry = self.config.github.find_repo(selector)
+        if entry is None:
+            known = ", ".join(r.repo for r in self.config.github.repo_list()) or "(none)"
+            return None, f"unknown repository {selector!r} — configured repositories: {known}"
+        index = next(
+            i
+            for i, candidate in enumerate(self.config.github.repo_list())
+            if candidate.repo.casefold() == entry.repo.casefold()
+        )
+        base = f"github.repos[{index}]"
+        return (f"{base}.{prefix}" if prefix else base), None
+
+    def _tool_config_keys(self, args: dict[str, Any], by: str) -> str:
+        prefix, error = self._repo_prefix(args)
+        if error is not None:
+            return error
+        grep = str(args.get("grep") or "").strip() or None
+        try:
+            rows = self._config_editor().resolved()
+        except (ConfigEditError, SbxloopError) as exc:
+            return f"the configuration could not be read: {_one_line(str(exc), 300)}"
+        if prefix is None and grep is None:
+            return configview.sections(rows)
+        cards = [
+            configview.card(row, refusal=never_from_chat)
+            for row in rows
+            if configview.matches(row, prefix=prefix, grep=grep)
+        ]
+        if not cards:
+            what = f"no key under `{prefix}`" if prefix else f"no key mentions {grep!r}"
+            if prefix and grep:
+                what += f" mentions {grep!r}"
+            return f"{what} — call with no arguments for the sections"
+        return configview.bounded(cards, self.config.concierge.max_tool_result_chars)
 
     def _tool_delete_schedule(self, args: dict[str, Any], by: str) -> str:
         name = str(args.get("name") or "").strip()
