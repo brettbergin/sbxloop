@@ -58,11 +58,12 @@ the default with unchanged behaviour:
 backend = "claude"   # default: "copilot"
 ```
 
-| backend   | host credential (agent sandbox only)                                         | in-sandbox runtime                                                                                                                         |
-| --------- | ---------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ |
-| `copilot` | `COPILOT_GITHUB_TOKEN` (PAT, *Copilot Requests*)                             | `github-copilot-sdk` (worker `[copilot]` extra; wheels bundle the Copilot CLI)                                                             |
-| `claude`  | `ANTHROPIC_API_KEY` ([console](https://console.anthropic.com/settings/keys)) | `claude-agent-sdk` (worker `[claude]` extra) + the Claude Code CLI, which provisioning installs (Node + `@anthropic-ai/claude-code`)       |
-| `codex`   | `OPENAI_API_KEY` ([API keys](https://platform.openai.com/api-keys))          | Python `openai-codex==0.147.0` (worker `[codex]` extra), including its matching Codex CLI runtime and Code Mode helper; no Node dependency |
+| backend   | host credential (agent sandbox only)                                                                                  | in-sandbox runtime                                                                                                                                                                             |
+| --------- | --------------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `copilot` | `COPILOT_GITHUB_TOKEN` (PAT, *Copilot Requests*)                                                                      | `github-copilot-sdk` (worker `[copilot]` extra; wheels bundle the Copilot CLI)                                                                                                                 |
+| `claude`  | `ANTHROPIC_API_KEY` ([console](https://console.anthropic.com/settings/keys))                                          | `claude-agent-sdk` (worker `[claude]` extra) + the Claude Code CLI, which provisioning installs (Node + `@anthropic-ai/claude-code`)                                                           |
+| `codex`   | `OPENAI_API_KEY` ([API keys](https://platform.openai.com/api-keys))                                                   | Python `openai-codex==0.147.0` (worker `[codex]` extra), including its matching Codex CLI runtime and Code Mode helper; no Node dependency                                                     |
+| `openai`  | the variable `[agent.openai] api_key_env` names (`OPENAI_API_KEY` by default), bound to the endpoint `base_url` names | Python `openai` client (worker `[openai]` extra) driving `/v1/chat/completions` on a self-hosted server, a gateway or the hosted API, with the worker's own governed tools; no Node dependency |
 
 The run protocol is shared across backends: the top-level `model` key supplies
 the default model (`"auto"` lets the backend pick). Each agent can override it
