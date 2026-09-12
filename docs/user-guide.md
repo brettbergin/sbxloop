@@ -1670,7 +1670,14 @@ chronology is the shape it already wants. Reactions use the standard emoji
 names. Mattermost has no allowed-mentions control, so agent prose is passed
 through a mention guard — a zero-width space parks every `@name` that would
 resolve, leaving it readable and inert — which is why a run's prose can
-never ping `@channel`. Replying on Mattermost means posting in a thread
+never ping `@channel`. **Link previews** are off the same way. Discord and
+Slack each have a per-message switch; Mattermost's `EnableLinkPreviews` is
+server-wide, and a chronology carrying a PR, an issue and a CI link would
+otherwise grow a website card under each one. But the server picks what to
+embed from the *first autolink* in a post, and a markdown link is never an
+autolink — so every bare URL goes out written as a link to itself: same
+text, same click, no card. (Angle brackets would not do it: `<url>` is an
+autolink too, which is why Discord's trick is not the one used here.) Replying on Mattermost means posting in a thread
 rather than answering one message, so — as on Slack — the concierge and
 steering are @mention-only (`@your-bot` in the control channel or in a
 run's thread), and people can talk to each other in a run's thread without

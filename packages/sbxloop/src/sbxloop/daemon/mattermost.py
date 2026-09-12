@@ -37,6 +37,13 @@ How Mattermost's shapes map onto the bridge's:
   what run watches persist), and :meth:`mention_user` resolves that id back
   to a handle through a cache, so attribution reads ``Mattermost user
   `ana``` like the others.
+* Link previews are the other thing the send seam owes a run's thread.
+  Mattermost picks what to embed from the *first autolink* in a post, so a
+  chronology full of PR, issue and CI links grows a website card under
+  every one of them; ``defuse_unfurls`` writes each bare URL as a markdown
+  link to itself, which the server's scan never visits. A post carrying a
+  card needs none of this — the server stops at the attachment — but it
+  costs nothing to be consistent.
 * Discord's *interactions* have analogs here, and the bridge owes a human
   the same three signals it gets there: **something received it** (the ⏳
   ack reaction), **something is still working on it** (a ``user_typing``
@@ -80,6 +87,7 @@ from sbxloop.daemon.mattermost_format import (
     CHOICE_EMOJI,
     EMOJI_NAMES,
     GATE_EMOJI,
+    defuse_unfurls,
     embed_attachment,
     neutralize_mentions,
     thread_permalink,
@@ -874,12 +882,19 @@ class MattermostBridge(ChatBridge):
         return ids, notes
 
     def _body(self, text: str, embed: EmbedSpec | None, *, mention_users: bool = False) -> str:
-        """The post text: clipped and mention-safe. ``embed`` reaches here
-        only when cards are off (``[mattermost] embeds = false``), in which
-        case it is rendered into the text as its plain twin."""
+        """The post text: clipped, mention-safe and preview-free. ``embed``
+        reaches here only when cards are off (``[mattermost] embeds =
+        false``), in which case it is rendered into the text as its plain
+        twin.
+
+        Both guards run after the clip, as the other bridges' do: each adds
+        a few characters, and Mattermost's real ceiling is the server's
+        (16383 by default), far above the shared ``max_message_chars``.
+        """
         limit = self.mattermost.max_message_chars
         parts = [part for part in (text, embed.as_text() if embed is not None else "") if part]
         body = _clip("\n\n".join(parts), limit)
+        body = defuse_unfurls(body)
         return body if mention_users else neutralize_mentions(body)
 
     def _report_channel_error(self, exc: Exception) -> bool:

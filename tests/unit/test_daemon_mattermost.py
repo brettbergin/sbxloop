@@ -1022,3 +1022,73 @@ class TestMentionHandles:
             assert client.lookups == []
         finally:
             bridge.close()
+
+
+class TestLinkPreviews:
+    """Mattermost embeds under a post are chosen from the *first autolink*
+    in its message, so a chronology of PR, issue and CI links grows a
+    website card under every one. A markdown link is never a candidate."""
+
+    def test_a_bare_url_becomes_a_link_to_itself(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "PR https://git/pull/7 is green"))
+        assert client.posts[-1]["message"] == (
+            "PR [https://git/pull/7](https://git/pull/7) is green"
+        )
+        bridge.close()
+
+    def test_an_angle_bracketed_url_is_defused_too(self, tmp_path: Path) -> None:
+        """CommonMark makes `<url>` an autolink, so Discord's suppression
+        trick would still unfurl here — it is the wrong one to copy."""
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "🔀 PR #7 <https://git/pull/7>"))
+        assert client.posts[-1]["message"] == "🔀 PR #7 [https://git/pull/7](https://git/pull/7)"
+        bridge.close()
+
+    def test_a_markdown_link_is_left_exactly_as_it_is(self, tmp_path: Path) -> None:
+        """A link inside a link corrupts both."""
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "see [PR #7](https://git/pull/7)"))
+        assert client.posts[-1]["message"] == "see [PR #7](https://git/pull/7)"
+        bridge.close()
+
+    def test_sentence_punctuation_stays_outside_the_link(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "merged at https://git/c/abc."))
+        assert client.posts[-1]["message"] == "merged at [https://git/c/abc](https://git/c/abc)."
+        bridge.close()
+
+    def test_a_url_in_a_code_span_is_left_alone(self, tmp_path: Path) -> None:
+        """Nothing in a code span is a link to Mattermost either, and
+        rewriting one would corrupt what the agent is quoting."""
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "run `curl https://git/pull/7`"))
+        assert client.posts[-1]["message"] == "run `curl https://git/pull/7`"
+        bridge.close()
+
+    def test_an_edit_defuses_the_same_way(self, tmp_path: Path) -> None:
+        """A status line edited in place must not grow a card on the edit."""
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(bridge._edit(MattermostMessage(CHANNEL, "p" * 26), "done https://git/pull/7"))
+        assert client.patches[-1][1]["message"] == ("done [https://git/pull/7](https://git/pull/7)")
+        bridge.close()
+
+    def test_several_links_in_one_post_are_all_defused(self, tmp_path: Path) -> None:
+        """Only the first autolink is embedded, but which one is first is
+        not this seam's business to reason about."""
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "https://a/1 then https://b/2"))
+        assert client.posts[-1]["message"] == (
+            "[https://a/1](https://a/1) then [https://b/2](https://b/2)"
+        )
+        bridge.close()
+
+    def test_an_intentional_ping_still_gets_its_links_defused(self, tmp_path: Path) -> None:
+        """Mention safety and preview safety are separate axes: a watch
+        notice pings people *and* carries the PR link."""
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(
+            bridge._send(MattermostTarget(CHANNEL), "@ana https://git/pull/7", mention_users=True)
+        )
+        assert client.posts[-1]["message"] == "@ana [https://git/pull/7](https://git/pull/7)"
+        bridge.close()
