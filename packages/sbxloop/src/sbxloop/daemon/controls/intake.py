@@ -87,8 +87,14 @@ def target_key(request: AdmitRequest) -> str:
         return f"{request.repository}#{request.number}"
     if isinstance(request, WorkloadAdmission):
         return api_item_id(request.key or new_run_id())
+    # The recipe rides the id: a name that is not registered is refused
+    # here, before an id is built from it — a free string is never a key.
+    name = request.recipe.strip()
+    if name not in RECIPES:
+        known = ", ".join(sorted(RECIPES)) or "none"
+        raise ControlError("unknown_target", f"unknown recipe {name!r} (registered: {known})")
     suffix = hashlib.sha256(_tool_target_text(request).encode()).hexdigest()[:12]
-    return api_item_id(f"{request.key or new_run_id()}:{request.recipe}:{suffix}")
+    return api_item_id(f"{request.key or new_run_id()}:{name}:{suffix}")
 
 
 def _tool_target_text(request: ToolAdmission) -> str:

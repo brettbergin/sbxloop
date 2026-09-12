@@ -2136,6 +2136,16 @@ never guessed `succeeded`, and a timeout is never evidence.
 
 ### The remote API listener
 
+The operator's and integrator's reference is [docs/api.md](api.md); the
+contract of record is the OpenAPI document the listener publishes, kept
+byte-for-byte at [docs/openapi.json](openapi.json) by
+`tests/api/test_openapi_snapshot.py` and regenerated with
+`sbxloop api openapi --snapshot --write docs/openapi.json`. The remote loop
+is proved end to end by `tests/api/conformance/` — every scenario through
+the public contract alone — and the isolation claim by
+`tests/unit/test_api_isolation.py` plus the `api-host-unreachable`
+conformance probe `doctor --deep` runs in a live sandbox.
+
 `sbxloop.api` is the one package that imports FastAPI, lazily: an install
 without the `sbxloop[api]` extra imports it fine and learns by name what it
 lacks when `[api] enabled = true` asks for the listener. `ApiServer` runs

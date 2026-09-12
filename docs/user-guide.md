@@ -10,6 +10,7 @@ For a first run, start with the [README](../README.md).
 - [Network access](#network-egress-least-privilege-by-plan)
 - [Working with a checkout](#working-against-an-existing-checkout)
 - [Daemon and chat](#the-daemon-an-always-on-outer-loop)
+- [The remote API](#the-remote-api) ([reference](api.md))
 - [Artifacts](#artifacts)
 - [GitHub integration](#github-integration)
 - [Troubleshooting](#debugging-failed-runs)
@@ -1934,6 +1935,11 @@ skips straight to ✅. The bridge puts the ⏳ on a second time about a second
 and a half later, which the server re-broadcasts and your client keeps.
 
 ### The remote API
+
+[docs/api.md](api.md) is the reference: installation, clients and tokens,
+the endpoint catalog, the operation and idempotency contract, the streams,
+every error code, the limits, the isolation guarantee and the recovery
+procedures. This section is the walk-through.
 
 With `[api] enabled = true` (and the `sbxloop[api]` extra installed) the daemon
 also serves a remote operations API in-process: REST under `/v1`, OpenAPI at

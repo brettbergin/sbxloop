@@ -170,3 +170,36 @@ def key_show() -> None:
     console.print(f"kid: {keys.current.kid}")
     if keys.previous is not None:
         console.print(f"previous: {keys.previous.kid}")
+
+
+@api_app.command("openapi")
+def openapi(
+    write: Annotated[
+        str | None,
+        typer.Option("--write", help="Write the document here instead of printing it."),
+    ] = None,
+    snapshot: Annotated[
+        bool,
+        typer.Option(
+            "--snapshot",
+            help="Replace the build's version with a constant, as the committed contract is.",
+        ),
+    ] = False,
+) -> None:
+    """The remote API's OpenAPI document, as the listener publishes it —
+    without a running daemon. ``--snapshot`` is what ``docs/openapi.json``
+    holds; the contract test compares the two."""
+    if not api_available():
+        console.print(MISSING_EXTRA, markup=False, style="red")
+        raise typer.Exit(code=1)
+    import json
+    from pathlib import Path
+
+    from sbxloop.api.app import openapi_document
+
+    text = json.dumps(openapi_document(snapshot=snapshot), indent=2, sort_keys=True) + "\n"
+    if write is None:
+        typer.echo(text, nl=False)
+        return
+    Path(write).write_text(text)
+    console.print(f"wrote {write}", markup=False)

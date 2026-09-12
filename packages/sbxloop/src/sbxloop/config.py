@@ -297,6 +297,21 @@ class OpenAIEndpointOverride(_ConfigModel):
         return base.model_copy(update=self.model_dump(exclude_none=True))
 
 
+#: Names that resolve to the host from inside a sandbox: a loopback name,
+#: the container runtimes' host aliases, and the `.internal`/`.localhost`
+#: zones they live in. Never grantable to a sandbox.
+_HOST_ALIASES = frozenset({"localhost", "host.docker.internal", "gateway.docker.internal"})
+
+
+def _names_the_host(domain: str) -> bool:
+    bare = domain.removeprefix("*.")
+    return (
+        bare in _HOST_ALIASES
+        or bare.endswith((".localhost", ".internal"))
+        or (domain.startswith("*.") and bare in ("localhost", "internal"))
+    )
+
+
 class SandboxConfig(_ConfigModel):
     """Sandbox provisioning: which template, where the workspace lives, what
     egress every run gets, and which language toolchains the agent sandbox is
@@ -438,6 +453,25 @@ class SandboxConfig(_ConfigModel):
     # the evidence it sees for such a suite (`verify.services_detected`)
     # and changes nothing on its own.
     verify_mode: VerifyMode = "full"
+
+    @field_validator("extra_allow_domains")
+    @classmethod
+    def _check_extra_allow_domains(cls, value: list[str]) -> list[str]:
+        """A domain, or a `*.domain` wildcard: never a bare address, never
+        a name for the host itself, never `*` — this list is handed to the
+        agent sandbox's network policy as it is, and the host's own
+        listener (the remote API among it) must stay out of reach of
+        every sandbox by construction (#1041)."""
+        from sbxloop.policy import valid_pattern
+
+        value = [d.strip().lower() for d in value]
+        bad = [d for d in value if not valid_pattern(d) or _names_the_host(d)]
+        if bad:
+            raise ValueError(
+                f"sandbox.extra_allow_domains {bad}: use a domain or a *.domain wildcard — "
+                "never an address, a loopback name, a host alias or a bare *"
+            )
+        return value
 
     @field_validator("env")
     @classmethod

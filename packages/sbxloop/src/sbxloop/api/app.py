@@ -8,8 +8,10 @@ are off — a remote client reads the contract, not a page.
 
 from __future__ import annotations
 
+import json
 import uuid
 from collections.abc import Awaitable, Callable
+from typing import Any
 
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
@@ -33,8 +35,28 @@ from sbxloop.api.routes import (
     status,
     usage,
 )
+from sbxloop.config import ApiConfig
 
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+
+#: The version the committed contract snapshot carries: the document is
+#: compared without the build's own version string.
+SNAPSHOT_VERSION = "snapshot"
+
+
+def openapi_document(config: ApiConfig | None = None, *, snapshot: bool = False) -> dict[str, Any]:
+    """The contract the listener publishes at ``/v1/openapi.json``, built
+    without a daemon: the routes and models are static, and only the
+    body-size and CORS middleware read the config. ``snapshot`` replaces
+    the build's version with a constant so two builds compare equal."""
+    from types import SimpleNamespace
+
+    stand_in = SimpleNamespace(api=config or ApiConfig())
+    document = create_app(stand_in).openapi()  # type: ignore[arg-type]
+    if snapshot:
+        document = json.loads(json.dumps(document))
+        document["info"]["version"] = SNAPSHOT_VERSION
+    return document
 
 
 def create_app(ctx: ApiContext) -> FastAPI:
