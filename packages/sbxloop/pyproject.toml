@@ -49,6 +49,13 @@ dependencies = [
     # an unattended daemon still migrates itself (#539).
     "sqlalchemy>=2.0",
     "alembic>=1.13",
+    # `zoneinfo` reads the *system* tz database, and Windows ships none, so
+    # `ZoneInfo("UTC")` raises there. `daemon.run_cap_timezone` defaults to
+    # "UTC" and is validated on every `load_config()`, so without this every
+    # command on a native Windows host — `doctor` and `config` included —
+    # fails with "must be a valid IANA timezone, got 'UTC'". The marker keeps
+    # it off the hosts that already have a database of their own.
+    "tzdata; sys_platform == 'win32'",
 ]
 
 [project.optional-dependencies]

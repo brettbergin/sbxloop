@@ -37,11 +37,17 @@ def _shard(spec: str) -> tuple[int, int]:
 def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
     """Every test on the fake sbx is process-bound: each ``sbx`` call is
     ``sh`` → interpreter → the fake, and a pipeline test makes ~50 of them
-    plus real worker launches. Those ~740 tests are 94% of the suite's
-    duration, so they carry the ``slow`` marker automatically and the commit
-    gate (``make test-fast`` / ``-m "not slow"``) runs the other ~3900 in
-    under two minutes. CI still runs everything, the slow half spread over
-    runners with ``--shard`` (#750).
+    plus real worker launches. Those ~950 tests carry the ``slow`` marker
+    automatically, so the commit gate (``make test-fast`` / ``-m "not slow"``)
+    runs the other ~5700 without them — about three minutes on four cores.
+    CI still runs everything, both halves spread over runners with ``--shard``
+    (#750).
+
+    This hook is ``tryfirst`` so the marker lands before pytest's own ``-m``
+    filter sees the item. That also means ``--shard`` cuts the whole
+    collection and a ``-m`` selection falls out of the slice afterwards, so
+    the two compose in either order: ``-m slow --shard 1/3`` and
+    ``-m "not slow" --shard 1/2`` each partition their half exactly.
 
     Sharding hashes the node id (crc32, not the salted ``hash``) so a slice
     is the same on every runner and every push; a class is not kept together

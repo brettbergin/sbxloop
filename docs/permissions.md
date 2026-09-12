@@ -3,7 +3,7 @@
 What the credential in the github-ops sandbox must be allowed to do, and
 the feature that first needs each permission. This is the table
 `sbxloop doctor` checks a repository's token against (#696); it lives in
-code as `sbxloop.gh.permissions.NEEDS`, and the README and `.env.example`
+code as `sbxloop.vcs.github.permissions.NEEDS`, and the README and `.env.example`
 point here rather than restating it.
 
 | Permission    | Level | Classic PAT scope | Needed for                                                                                                                                                                                                                                      |

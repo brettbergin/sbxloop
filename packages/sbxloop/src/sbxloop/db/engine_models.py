@@ -27,7 +27,7 @@ Two shapes are worth knowing before reading further:
 
 from __future__ import annotations
 
-from sqlalchemy import REAL, Index, Integer, Text
+from sqlalchemy import REAL, Index, Integer, Text, text as sql_text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sbxloop.db.base import Base
@@ -75,15 +75,17 @@ class Run(Base):
     # store reads them — never rewritten, so an older version still reads
     # its own rows.
     state: Mapped[str] = mapped_column(Text, nullable=False)
-    config_json: Mapped[str] = mapped_column(Text, nullable=False, server_default="'{}'")
+    config_json: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'{}'"))
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
     updated_at: Mapped[float] = mapped_column(REAL, nullable=False)
 
     # Host workspace, and whether it was live-mounted into the agent VM.
     workspace: Mapped[str | None] = mapped_column(Text)
-    mounted: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    mounted: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
     kept_reason: Mapped[str | None] = mapped_column(Text)
-    user_guidance: Mapped[str] = mapped_column(Text, nullable=False, server_default="'[]'")
+    user_guidance: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=sql_text("'[]'")
+    )
     reason: Mapped[str | None] = mapped_column(Text)
 
     # Pipeline bookkeeping. `stage` is the last non-terminal state, so a
@@ -98,21 +100,27 @@ class Run(Base):
 
     # Fix-round budgets spent, and the head an update-branch was asked for
     # so a later poll can tell one still in flight from one that landed.
-    review_rounds: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-    ci_rounds: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-    update_attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    review_rounds: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sql_text("0")
+    )
+    ci_rounds: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
+    update_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sql_text("0")
+    )
     update_head: Mapped[str | None] = mapped_column(Text)
     last_verdict: Mapped[str | None] = mapped_column(Text)
     exhausted: Mapped[str | None] = mapped_column(Text)
-    granted_rounds: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    granted_rounds: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sql_text("0")
+    )
 
     pr_title: Mapped[str | None] = mapped_column(Text)
-    credentials: Mapped[str] = mapped_column(Text, nullable=False, server_default="'[]'")
+    credentials: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'[]'"))
     # Every run before the workload kind was a developer run, which is why
     # the default is the migration: a legacy row reads back as `code`.
-    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="'code'")
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'code'"))
     # Where a workload's result went; nothing published before it existed.
-    published: Mapped[str] = mapped_column(Text, nullable=False, server_default="'[]'")
+    published: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'[]'"))
 
 
 class Task(Base):
@@ -125,15 +133,27 @@ class Task(Base):
     order_idx: Mapped[int] = mapped_column(Integer, nullable=False)
     state: Mapped[str] = mapped_column(Text, nullable=False)
     spec_json: Mapped[str] = mapped_column(Text, nullable=False)
-    revisions: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-    replans: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-    last_feedback: Mapped[str] = mapped_column(Text, nullable=False, server_default="''")
+    revisions: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
+    replans: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
+    last_feedback: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("''"))
     session_id: Mapped[str | None] = mapped_column(Text)
-    verify_fingerprints: Mapped[str] = mapped_column(Text, nullable=False, server_default="'[]'")
-    verify_suspect: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-    verify_reauthors: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    verify_fingerprints: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=sql_text("'[]'")
+    )
+    verify_suspect: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sql_text("0")
+    )
     # A workload task's TaskOutput; NULL for every code task.
     output_json: Mapped[str | None] = mapped_column(Text)
+    # Declared after `output_json` and with a *quoted* zero because that is
+    # what is on disk: revision 0004 added this column with Alembic's
+    # `server_default="0"`, which renders as `DEFAULT '0'`, and it was added
+    # by `ALTER TABLE` after `output_json` already existed. The additive-only
+    # contract rules out rewriting that revision, so the model describes the
+    # deployed shape rather than the tidier one.
+    verify_reauthors: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sql_text("'0'")
+    )
 
 
 class PhaseAttempt(Base):
@@ -147,7 +167,12 @@ class PhaseAttempt(Base):
     __tablename__ = "phase_attempts"
     # Every read but one filters on `run_id` and orders by `id` descending;
     # without this each was a scan of every attempt ever recorded.
-    __table_args__ = (Index("idx_phase_attempts_lookup", "run_id", "task_id", "phase", "id"),)
+    # AUTOINCREMENT on disk (the baseline wrote it): ids are never reused,
+    # which readers that track a high-water mark rely on.
+    __table_args__ = (
+        Index("idx_phase_attempts_lookup", "run_id", "task_id", "phase", "id"),
+        {"sqlite_autoincrement": True},
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, nullable=True)
     run_id: Mapped[str] = mapped_column(Text, nullable=False)
@@ -179,13 +204,13 @@ class Reconciliation(Base):
     round: Mapped[int] = mapped_column(Integer, primary_key=True)
     anchor: Mapped[str] = mapped_column(Text, primary_key=True)
     status: Mapped[str] = mapped_column(Text, nullable=False)
-    resolved: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    resolved: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
     ts: Mapped[float] = mapped_column(REAL, nullable=False)
     # Which of the six concerns this row is, said out loud rather than
     # encoded in the sign of `round`. Not part of the key: `round` still
     # carries the sentinel, because the release before this one reads it
     # and a rollback restarts that release against this database.
-    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="'review'")
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'review'"))
 
 
 class EventRow(Base):
@@ -198,11 +223,16 @@ class EventRow(Base):
     """
 
     __tablename__ = "events"
-    __table_args__ = (Index("idx_events_run", "run_id", "seq"),)
+    # AUTOINCREMENT on disk (the baseline wrote it): ids are never reused,
+    # which readers that track a high-water mark rely on.
+    __table_args__ = (
+        Index("idx_events_run", "run_id", "seq"),
+        {"sqlite_autoincrement": True},
+    )
 
     seq: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, nullable=True)
     run_id: Mapped[str] = mapped_column(Text, nullable=False)
     ts: Mapped[float] = mapped_column(REAL, nullable=False)
     type: Mapped[str] = mapped_column(Text, nullable=False)
     job_id: Mapped[str | None] = mapped_column(Text)
-    data_json: Mapped[str] = mapped_column(Text, nullable=False, server_default="'{}'")
+    data_json: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'{}'"))

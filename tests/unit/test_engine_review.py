@@ -28,7 +28,7 @@ from sbxloop.engine.review import (
     split_test,
     unanswered_findings,
 )
-from sbxloop.gh.ops import FailedCheck, ReviewComment
+from sbxloop.vcs.github.ops import FailedCheck, ReviewComment
 
 
 def finding(

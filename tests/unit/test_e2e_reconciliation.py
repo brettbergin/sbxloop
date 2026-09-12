@@ -149,7 +149,7 @@ class TestTwoRoundRunIsReconciledOnThePr:
         self, run: tuple[Harness, FakeGithub, LoopEngine, RunResult]
     ) -> None:
         _, fake, _, result = run
-        (comment,) = fake.issue_comments
+        (comment,) = fake.issue_comments_posted
         assert comment.startswith("## Reconciliation — round 1")
         assert "commit2" in comment
         assert "docs/greeting.md" in comment
@@ -218,7 +218,7 @@ class TestTwoRoundRunIsReconciledOnThePr:
             (1, "docs/greeting.md:0", True),
         ]
         assert posted[0].comment_id == fake.threads[0].root_comment_id
-        assert posted[0].thread_node_id == fake.threads[0].node_id
+        assert posted[0].thread_id == fake.threads[0].thread_id
         assert statuses["hello.txt:1"] == "addressed"
         assert json.loads(rows[-1].output_json or "{}")["reconciled"] == [
             {
@@ -267,7 +267,7 @@ class TestTwoRoundRunIsReconciledOnThePr:
             [
                 *(f"REVIEW {body}" for _, body, _ in fake.reviews),
                 *(f"THREAD {c.body}" for t in fake.threads for c in t.comments),
-                *(f"COMMENT {c}" for c in fake.issue_comments),
+                *(f"COMMENT {c}" for c in fake.issue_comments_posted),
             ]
         )
         # The anchored finding: raised, addressed in a named commit, confirmed.
@@ -376,12 +376,12 @@ class TestHumanCommentThreadDoesNotStrandTheRun:
 
     @pytest.fixture
     def run(self, harness: Harness) -> tuple[Harness, FakeGithub, RunResult]:
-        from sbxloop.gh.ops import ReviewThread, ThreadComment
+        from sbxloop.vcs.github.ops import ReviewThread, ThreadComment
 
         fake = FakeGithub()
         fake.threads = [
             ReviewThread(
-                node_id="PRRT_H1",
+                thread_id="PRRT_H1",
                 is_resolved=False,
                 path="hello.txt",
                 line=1,
@@ -401,7 +401,7 @@ class TestHumanCommentThreadDoesNotStrandTheRun:
         self, run: tuple[Harness, FakeGithub, RunResult]
     ) -> None:
         _, fake, _ = run
-        (thread,) = [t for t in fake.threads if t.node_id == "PRRT_H1"]
+        (thread,) = [t for t in fake.threads if t.thread_id == "PRRT_H1"]
         replies = [c for c in thread.comments[1:] if c.login == fake.user_login]
         assert replies and "does not hold up the merge" in replies[0].body
         assert not thread.is_resolved

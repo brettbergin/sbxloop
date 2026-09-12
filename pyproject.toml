@@ -44,6 +44,11 @@ select = [
     "PTH",    # pathlib
     "T20",    # no stray prints in library code
 ]
+[tool.ruff.lint.isort]
+# A module that re-exports its neighbours' names (`X as X`) keeps them in
+# one import block rather than one block per name.
+combine-as-imports = true
+
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["T20"]
 "packages/*/tests/**" = ["T20"]
@@ -100,6 +105,16 @@ markers = [
     # by hand on real-git (lfs, submodules) and packaging tests. The commit
     # gate is `-m "not slow"`; CI runs both halves.
     "slow: process-bound tests (fake sbx, real workers, real git, builds)",
+    # A conformance scenario's declared capabilities (tests/conformance): a
+    # backend that reports one UNSUPPORTED skips the scenario with the
+    # capability named; one that reports UNKNOWN fails it.
+    "needs(*capabilities): the vcs capabilities a conformance scenario relies on",
+    # The host-portability rows whose facts only the platform itself can
+    # settle (a venv's real entry points, what chmod does on Windows). CI
+    # runs `-m windows_host` on a Windows runner as well as in the Linux
+    # shards, where most of them skip; the cross-platform branches they
+    # guard are covered on every host through injected seams.
+    "windows_host: host behaviour a native Windows runner has to confirm",
 ]
 # Coverage is CI's job (`make test-cov`): tracing costs ~15% wall on full
 # runs, and --cov-fail-under in addopts makes every partial run (single
@@ -120,8 +135,10 @@ addopts = [
 [tool.coverage.run]
 branch = true
 omit = [
-    # Exercised only by the real-sbx e2e workflow: requires the Copilot SDK
-    # runtime and a Copilot subscription.
+    # A real session requires the Copilot SDK runtime and a subscription, so
+    # the e2e workflow is what exercises this module end to end. Its decision
+    # logic is unit-tested (backends/copilot_errors.py is not omitted, and
+    # the fake-SDK tests drive the session path) but not counted here.
     "*/sbxloop_worker/backends/copilot.py",
 ]
 

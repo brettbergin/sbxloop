@@ -289,7 +289,46 @@ totals; unavailable usage stays unknown and no price is inferred.
 Everything sbxloop puts on a host lives under one directory, the **home**:
 `~/.sbxloop` (`SBXLOOP_HOME` moves it). One command builds it — the
 interpreter, the launchers, Docker's `sbx`, the config and secrets files,
-and on Linux the systemd units:
+and on Linux the systemd units. A home whose path holds spaces or a `%` is
+fine; one holding a quote or a backslash is not, because systemd refuses
+those in the executable of a unit, and `init --systemd` says so rather than
+writing a unit that cannot start.
+
+The host brings what that command cannot: curl, tar, git and e2fsprogs
+(`mkfs.ext4`, for sandboxd's block driver). Git is a host dependency in its
+own right — sbxloop reads and clones checkouts on the host, and the git a
+sandbox carries is a separate one that does not stand in for it — so the
+installer checks for a usable git, along with curl and tar, before it
+downloads anything, and names what to install rather than failing later with
+a traceback. `GIT_PYTHON_GIT_EXECUTABLE`, if you set it, is the executable
+the check looks at, since it is the one sbxloop will use.
+
+### Installation and host preparation are different jobs
+
+Everything sbxloop installs lands under the home, which the invoking account
+already owns — no step of the install needs root. What the *host* has to be
+able to do is separate, one-time, and on Linux partly an administrator's:
+
+| Capability                         | Who does it               | Without it                                                        |
+| ---------------------------------- | ------------------------- | ----------------------------------------------------------------- |
+| `/dev/kvm` exists                  | administrator             | no sandbox boots: a sandbox is a microVM                          |
+| `/dev/kvm` openable by the account | administrator             | same, and the usual cause — Docker documents the `kvm` group      |
+| `mkfs.ext4` (e2fsprogs)            | administrator             | Docker's sbx installer refuses to run, so `init` refuses too      |
+| sbx's AppArmor profile in `/etc`   | administrator             | the sandbox backend cannot start; `init` says so and carries on   |
+| a reachable `systemctl --user`     | log in as the account     | `init --systemd` refuses rather than writing units nothing runs   |
+| `loginctl enable-linger <account>` | account, or administrator | the daemon stops at logout — unattended persistence is not set up |
+
+None of this is done for you: no check joins a group, installs a package,
+starts a sandbox, or elevates a privilege. Each is *reported* instead —
+`sbxloop init` notes what it found, `sbxloop doctor` shows the same rows at
+any time, and the access checks ask the kernel whether this account can open
+the device rather than reading a group list (a group added in the current
+shell does not reach a running process until the next login).
+
+Only the relevant checks apply. On macOS, which brings its own
+virtualisation, none of the Linux rows appear at all; a `--no-systemd`
+install is never judged against a service manager it did not ask for; and a
+`--no-sbx` install is never judged against `mkfs.ext4`.
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/brettbergin/sbxloop/main/scripts/install.sh | sh
@@ -427,6 +466,30 @@ test suite inside the distribution. Native Windows is refused by name:
 naming the WSL2 path before writing any state, and `sbxloop doctor`'s
 first row (`host`) says the same. The read-only commands still answer so
 the refusal can be diagnosed from the host itself.
+
+What a **native Windows** host does support, precisely, is that diagnosis
+— and nothing beyond it:
+
+- **The home resolves from `USERPROFILE`.** A Windows session need not set
+  a Unix `HOME`, so the home, `config\sbxloop.toml` and `config\secrets.env`
+  are all found from `%USERPROFILE%\.sbxloop` (or `%HOMEDRIVE%%HOMEPATH%`).
+  `SBXLOOP_HOME` overrides it as it does anywhere, spaces in the path and
+  all. `doctor`, `config` and `logs` therefore read the same home the
+  process runs out of, which is what makes the refusal legible.
+- **`sbxloop init` writes a `bin\sbxloop.cmd`, not a shell script**, and
+  points it at `venv\Scripts\sbxloop.exe`. It writes no `bin\sbx`
+  wrapper: there is no native Windows `sbx` for one to stand in front of,
+  and `init` says so in its notes.
+- **Secrets are private by ACL, not by mode.** `chmod 600` does nothing on
+  Windows — a file written that way still reports `0666` — so
+  `config\secrets.env` is restricted with `icacls` and doctor's
+  `secrets file` row reads the ACL back. A host whose ACL could not be
+  read **fails** that row saying so, rather than passing a file it could
+  not vouch for.
+- **`sbxloop init --sbx` is not supported.** The sbx installer and its
+  release assets are POSIX (`install.sh`, `.tar.gz`); installing the
+  sandbox runtime natively is the WSL2 path above. The agent backends
+  themselves are not the constraint here — the sandbox layer is.
 
 ## How a run works
 
@@ -1119,13 +1182,19 @@ sbxloop init --stdout --preset playwright
 ```
 
 For an existing installation, merge the generated `[sandbox]` settings and
-`[[mcp]]` entry into the home's `config/sbxloop.toml`. Keep any existing
+`[[mcp]]` entries into the home's `config/sbxloop.toml`. Keep any existing
 languages and append the setup commands to the existing list; a repository's
 `setup_commands` override replaces that list and must include the browser
 installation too. The preset selects `[agent] backend = "copilot"`; change
 it to `"claude"` to use the Claude Agent SDK and configure that backend's
 inference credential as usual. Native MCP is not supported by the Codex
 backend.
+
+The preset also gives builders [Context7](https://github.com/upstash/context7)
+for current library documentation and code examples. It uses the hosted
+HTTP server at `https://mcp.context7.com/mcp`, with no installation or API
+key required; anonymous access has lower rate limits. Its `hosts` entry
+allows the endpoint through the existing network policy.
 
 The preset installs `@playwright/mcp@0.0.80` into
 `$HOME/.sbxloop/playwright-mcp` inside the **agent sandbox**, then invokes
@@ -1138,7 +1207,7 @@ The MCP command uses that installed copy, with `--browser chromium`,
 profile. See the [Playwright MCP options](https://github.com/microsoft/playwright-mcp#configuration)
 and [browser installation guide](https://playwright.dev/docs/browsers#install-browsers).
 
-Only the builder receives the server. It can start the target's development
+Only the builder receives Playwright. It can start the target's development
 server in the sandbox, navigate to its loopback address, inspect pages and
 console errors, and exercise the UI. Ask it to save screenshots and other
 evidence inside the workspace so they survive harvest. The declared hosts
@@ -1328,11 +1397,13 @@ running item's pinned run so its next dispatch starts over (attempts and
 backoff kept). The same controls are `!sbx items|abandon|retry|requeue` on
 Discord.
 
-`<item>` is a work item id. GitHub items are **typed** —
+`<item>` is a work item id. Forge items are **typed** —
 `gh:issue:<number>` for the issue a run was claimed from, `gh:pr:<number>`
 for a pull request referenced as a work-item resource — and the untyped
 legacy form `gh:<number>` is still accepted everywhere as an alias for
 `gh:issue:<number>`, so old commands, checkpoints and watches keep working.
+The prefix names the forge: `gh:` is GitHub, and the same grammar reads
+under `gl:` (GitLab) and `gt:` (Gitea) for the backends to come.
 Everything sbxloop prints uses the typed form. See
 [Work item ids](architecture.md#work-item-ids) for the full grammar.
 
@@ -1826,6 +1897,15 @@ in run summaries, `sbxloop artifacts`, and the delivery PR body — never
 silently truncated.
 
 ## GitHub integration
+
+GitHub is the first of the version-control backends. `[vcs] kind` names the
+forge a repository lives on (`github` today; `gitlab` and `gitea` load
+ahead of their backends and `sbxloop doctor` says they are not implemented
+yet), and `sbxloop doctor` prints one `vcs backend <kind>` row per forge
+naming what the backend can do — `supported`, `unsupported` or `unknown`
+per capability — and, on each repository's row, the kind of credential its
+github box holds and how long it lives. Everything below is the GitHub
+backend.
 
 sbxloop has **no** GitHub capability until you name at least one repository
 it may work with — either per run on the command line:
@@ -2722,6 +2802,9 @@ The notable knobs:
 | `[policy] allow` / `deny`                                                                          | `[]`                                                                                            | Bounds for task-declared egress.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `[github] repo`                                                                                    | unset                                                                                           | The GitHub integration gate: with a repository every run delivers, reviews and merges. `deliver_base`, `create_repo`, `create_public`, `pr_title_template`, `commit_message_template`, `branch_prefix`, `bot_login` beside it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `[github] api_url`                                                                                 | api.github.com                                                                                  | The GitHub REST root — GitHub Enterprise Server: `https://ghe.example.com/api/v3`. One source of truth for the REST transport, App auth, `gh` (`GH_HOST`) and both sandboxes' network allows; a `GH_HOST` in the daemon's environment that names another host is refused at config load. FIELD-UNVERIFIED on GHES.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `[vcs] kind`                                                                                       | `github`                                                                                        | The version-control backend the repositories live on (#1009): `github`, `gitlab` or `gitea`. Only `github` answers a run today; the other two load and `sbxloop doctor` reports them as not yet implemented. Anything else is refused at load, naming the three. A `[[github.repos]]` entry may set its own `kind`. Locked from the concierge by default.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `[vcs] api_url`                                                                                    | unset                                                                                           | The forge's API root. For `github` it is the same setting as `[github] api_url`: a `[vcs]` value fills it, and two different values are refused at load.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `[[github.repos]] kind`                                                                            | unset                                                                                           | The forge this one repository lives on; unset uses `[vcs] kind`. One daemon may tend repositories on more than one forge once their backends exist.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `[landing]`                                                                                        | see above                                                                                       | `deliver_draft`, `max_review_rounds`, `max_ci_rounds`, `retry_rounds`, `followups`, `followup_label`, `max_followups_per_run`, `ci_poll_interval_s`, `ci_settle_s`, `ci_timeout_s`, `merge_method`, `delete_branch_on_merge`, `merge_update_attempts`, `required_checks`, `ignore_checks`, `ignore_reviewers`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `[artifacts] exclude`                                                                              | see above                                                                                       | Path components dropped from listings, harvest and delivery (replaces the default, does not add to it).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `[budgets]`                                                                                        | see above                                                                                       | `max_revisions_per_task`, `max_replans_per_task`, `max_verify_reauthors_per_task`, `max_tasks`, `max_wall_clock_s`, `per_job_timeout_s`, `max_tool_calls_per_phase`, `max_parallel_tasks`, `repo_context_max_chars`, `outcome_max_chars`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |

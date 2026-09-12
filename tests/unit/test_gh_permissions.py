@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import ClassVar
 
-from sbxloop.gh.permissions import (
+from sbxloop.vcs.github.permissions import (
     NEEDS,
     WORKFLOWS_DIR,
     missing_from_app,

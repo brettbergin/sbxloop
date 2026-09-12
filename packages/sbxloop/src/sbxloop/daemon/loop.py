@@ -34,8 +34,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager, suppress
-from datetime import datetime, timedelta
-from datetime import time as dtime
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, NamedTuple, Protocol, cast
 from zoneinfo import ZoneInfo

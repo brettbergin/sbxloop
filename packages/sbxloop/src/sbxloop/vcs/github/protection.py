@@ -32,117 +32,9 @@ from typing import Any, NamedTuple
 
 from sbxloop.errors import GithubOpsError
 from sbxloop.log import get_logger
+from sbxloop.vcs.model import BaseRequirements as BaseRequirements
 
 log = get_logger(__name__)
-
-
-class BaseRequirements(NamedTuple):
-    """The merge requirements of one base branch.
-
-    ``required_contexts`` are the check names (check-run ``name`` / status
-    ``context``, the shared namespace of #610) the base requires green, or
-    ``None`` when a source could not be read — an unknown half can hide a
-    requirement, so "some of them" is not an answer. An empty tuple is a
-    real answer: both sources read, nothing declared.
-
-    ``approvals_required`` is the number of approving reviews the base
-    wants (the larger of the two sources). A positive count from either
-    source is conclusive; ``0`` needs both sources read; ``None`` otherwise.
-    :attr:`requires_reviews` is the same answer as a bool, for the callers
-    that predate the count.
-
-    ``source`` names where the contexts came from — ``protection``,
-    ``rulesets``, ``protection+rulesets``, ``none`` (both read, nothing
-    declared) or ``unknown`` — so an event or a doctor row can say so.
-
-    The flags are what either source is *known* to require (#673); a flag
-    is never conclusively off while ``source`` is ``unknown``.
-    ``last_push_approval`` is fatal by construction: the loop is always
-    the last pusher, so no approval can ever satisfy it.
-    ``required_deployments`` names the environments a deployment must
-    succeed in before the merge. ``merge_queue`` is not a blocker: the
-    landing enqueues the pull request instead of merging it (#676).
-
-    ``unread`` names the sources that could not be read (``protection``,
-    ``rulesets``), so a reason or a doctor row can say which — and why:
-    classic protection needs admin.
-    """
-
-    required_contexts: tuple[str, ...] | None
-    approvals_required: int | None
-    source: str
-    code_owner_review: bool = False
-    last_push_approval: bool = False
-    dismiss_stale_reviews: bool = False
-    conversation_resolution: bool = False
-    linear_history: bool = False
-    signed_commits: bool = False
-    merge_queue: bool = False
-    required_deployments: tuple[str, ...] = ()
-    unread: tuple[str, ...] = ()
-
-    @property
-    def requires_reviews(self) -> bool | None:
-        """Whether an approving review is required; ``None`` when unknown."""
-        return None if self.approvals_required is None else self.approvals_required > 0
-
-    def blockers(
-        self,
-        *,
-        can_approve: bool = False,
-        can_sign: bool = False,
-        merge_method: str | None = None,
-    ) -> list[str]:
-        """Why this base cannot be landed by the loop as it is configured,
-        one reason per rule, in the order a reader would fix them.
-
-        ``can_approve`` says an approving review will come from somewhere
-        (a person on GitHub the loop waits for, #675), which covers the
-        code-owner review too; ``can_sign`` that the loop's
-        commits arrive signed — GitHub signs commits created through its
-        API only when the credential is a GitHub App; ``merge_method`` is
-        the configured way to merge, so a linear-history rule blocks only
-        a merge commit. Rules the loop satisfies on its own — conversation
-        resolution (it resolves the threads it answers), stale-review
-        dismissal and a merge queue (it enqueues, #676) — are not blockers.
-        """
-        out: list[str] = []
-        if self.last_push_approval:
-            out.append(
-                "the base requires approval of the last push (require_last_push_approval), "
-                "and the loop is always the last pusher — no approval can ever satisfy it"
-            )
-        if self.approvals_required and not can_approve:
-            count = (
-                "an approving review"
-                if self.approvals_required == 1
-                else f"{self.approvals_required} approving reviews"
-            )
-            out.append(
-                f"the base requires {count}, which the loop cannot give its own pull request"
-            )
-        if self.code_owner_review and not can_approve:
-            out.append(
-                "the base requires a review from a code owner (CODEOWNERS), which the loop "
-                "cannot give its own pull request"
-            )
-        if self.signed_commits and not can_sign:
-            out.append(
-                "the base requires signed commits; GitHub signs commits the loop creates "
-                "through its API only when it authenticates as a GitHub App"
-            )
-        if self.linear_history and merge_method == "merge":
-            out.append(
-                'the base requires a linear history and `[landing] merge_method = "merge"` '
-                "would add a merge commit; use squash or rebase"
-            )
-        if self.required_deployments:
-            envs = ", ".join(self.required_deployments)
-            out.append(
-                f"the base requires a successful deployment to {envs} before merging, which "
-                "the loop does not run"
-            )
-        return out
 
 
 UNKNOWN = BaseRequirements(None, None, "unknown")
@@ -229,7 +121,7 @@ def _pool(a: BaseRequirements, b: BaseRequirements) -> tuple[Any, ...]:
 
 
 def _read_classic(ops: Any, repo: str, base: str) -> _Reading:
-    from sbxloop.gh.ops import raw_lookup
+    from sbxloop.vcs.github.ops import raw_lookup
 
     try:
         protection = raw_lookup(ops, "GET", f"/repos/{repo}/branches/{base}/protection")

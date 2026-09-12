@@ -1,13 +1,16 @@
-"""GitHub operations executed inside the github-ops sandbox.
+"""Forge operations executed inside the github-ops sandbox.
 
-Every operation is expressed as a GitHub REST call and executed through one
-of two transports:
+Every operation is expressed as a REST call and executed through one of two
+transports:
 
-- **gh CLI** (preferred when present): ``gh api`` — inherits `GH_TOKEN`
-  handling, retries, and pagination behavior from gh.
-- **urllib REST** (mandatory fallback): the sandbox `shell` template does not
-  guarantee gh, so a pure-stdlib client using ``GH_TOKEN``/``GITHUB_TOKEN``
-  directly is required, not optional polish.
+- **urllib REST** (the universal one): a pure-stdlib client that speaks to
+  whatever forge the job's :class:`~sbxloop_worker.protocol.TransportSpec`
+  describes — API root, how the token rides, how lists page (#1015). The
+  token is read from the variable the descriptor names; the descriptor
+  itself carries no credential.
+- **gh CLI** (a GitHub-only optimisation, preferred when present and the
+  descriptor allows it): ``gh api`` — inherits ``GH_TOKEN`` handling and
+  retries from gh.
 
 The op registry maps stable sbxloop op names (``issue.create``, ...) to
 request builders + response shapers, so both transports produce identical
@@ -28,6 +31,8 @@ import urllib.request
 from collections.abc import Callable
 from http.client import HTTPMessage
 from typing import IO, Any, Protocol
+
+from sbxloop_worker.protocol import TransportSpec
 
 API_ROOT = "https://api.github.com"
 # The host exports this (with a matching GH_HOST for gh) when the configured
@@ -82,6 +87,13 @@ def parse_gh_http_status(stderr: str) -> int | None:
 class Transport(Protocol):
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> JsonValue: ...
 
+    def request_with_headers(
+        self, method: str, path: str, body: dict[str, Any] | None = None
+    ) -> tuple[JsonValue, dict[str, str]]:
+        """Like :meth:`request`, with the response headers (lower-cased
+        names) — what a ``Link`` or ``X-Next-Page`` pager reads."""
+        ...
+
     def request_text(self, method: str, path: str) -> str:
         """Like :meth:`request`, for endpoints that answer with a text body
         (Actions job logs) rather than JSON."""
@@ -97,6 +109,25 @@ class Transport(Protocol):
 def api_root() -> str:
     """The REST root the stdlib transport prefixes bare paths with."""
     return os.environ.get(API_URL_ENV, "").strip().rstrip("/") or API_ROOT
+
+
+GITHUB = TransportSpec()
+
+
+def transport_spec(params: dict[str, Any]) -> TransportSpec:
+    """The descriptor a job carries under ``params["transport"]``, or the
+    GitHub one a job from before the descriptor existed implies."""
+    raw = params.get("transport")
+    if raw is None:
+        return GITHUB
+    if isinstance(raw, TransportSpec):
+        return raw
+    if not isinstance(raw, dict):
+        raise GithubOpError(f"transport must be an object, got {type(raw).__name__}")
+    try:
+        return TransportSpec.model_validate(raw)
+    except ValueError as exc:
+        raise GithubOpError(f"transport descriptor rejected: {exc}") from exc
 
 
 class GhCliTransport:
@@ -164,6 +195,18 @@ class GhCliTransport:
         # body, separated by a blank line.
         return parse_http_headers(self._run(method, path, include_headers=True))
 
+    def request_with_headers(
+        self, method: str, path: str, body: dict[str, Any] | None = None
+    ) -> tuple[JsonValue, dict[str, str]]:
+        raw = self._run(method, path, body, include_headers=True)
+        headers = parse_http_headers(raw)
+        text = raw.replace("\r\n", "\n").split("\n\n", 1)[1] if headers else raw
+        parsed: JsonValue = json.loads(text) if text.strip() else {}
+        return parsed, headers
+
+    # gh speaks GitHub only, whose lists page by number.
+    pagination = "page"
+
 
 def parse_http_headers(raw: str) -> dict[str, str]:
     """The header block of an ``--include`` response as ``{lower-name:
@@ -206,38 +249,74 @@ _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 
 
 class RestTransport:
-    """Pure-stdlib GitHub REST client using the injected token."""
+    """Pure-stdlib REST client for whatever forge ``spec`` describes,
+    using the token the sandbox holds under the variable the spec names."""
 
-    def __init__(self, token: str | None = None, *, api_url: str | None = None) -> None:
-        self.token = token or os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    def __init__(
+        self,
+        token: str | None = None,
+        *,
+        api_url: str | None = None,
+        spec: TransportSpec | None = None,
+    ) -> None:
+        self.spec = spec or GITHUB
+        self.pagination = self.spec.pagination
+        self.token = token or next(
+            (os.environ[name] for name in self.spec.token_env if os.environ.get(name)), None
+        )
         if not self.token:
-            raise GithubOpError(
-                "no GitHub token available: GH_TOKEN/GITHUB_TOKEN are not set and gh is absent"
-            )
-        self.api_url = (api_url or api_root()).rstrip("/")
+            names = "/".join(self.spec.token_env)
+            raise GithubOpError(f"no API token available: {names} are not set and gh is absent")
+        self.api_url = (api_url or self.spec.api_url or api_root()).rstrip("/")
 
-    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> JsonValue:
+    def _headers(self) -> dict[str, str]:
+        """The request headers the descriptor asks for: how the token
+        rides, what to accept, which API version to name."""
+        headers: dict[str, str] = {"Accept": self.spec.accept, "User-Agent": USER_AGENT}
+        if self.spec.auth == "bearer":
+            headers["Authorization"] = f"Bearer {self.token}"
+        elif self.spec.auth == "token":
+            headers["Authorization"] = f"token {self.token}"
+        else:
+            headers["PRIVATE-TOKEN"] = str(self.token)
+        if self.spec.api_version_header and self.spec.api_version:
+            headers[self.spec.api_version_header] = self.spec.api_version
+        return headers
+
+    def _url(self, path: str) -> str:
         url = path if path.startswith("http") else f"{self.api_url}{path}"
-        # The bearer token rides on every request: never let it travel over
+        # The token rides on every request: never let it travel over
         # anything but HTTPS (also rules out file:// and custom schemes).
         if not url.startswith("https://"):
-            raise GithubOpError(f"refusing non-HTTPS GitHub API URL: {url}")
+            raise GithubOpError(f"refusing non-HTTPS API URL: {url}")
+        return url
+
+    def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> JsonValue:
+        parsed, _ = self.request_with_headers(method, path, body)
+        return parsed
+
+    def request_with_headers(
+        self, method: str, path: str, body: dict[str, Any] | None = None
+    ) -> tuple[JsonValue, dict[str, str]]:
+        url = self._url(path)
         data = json.dumps(body).encode() if body is not None else None
         request = urllib.request.Request(
             url,
             data=data,
             method=method,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": API_VERSION,
-                "User-Agent": "sbxloop-worker",
-                **({"Content-Type": "application/json"} if data else {}),
-            },
+            headers={**self._headers(), **({"Content-Type": "application/json"} if data else {})},
         )
         try:
             with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310 - https enforced above
                 raw = response.read().decode()
+                # A response always carries headers; a test's bare stream
+                # may not, and a pager that needs them asks for a style.
+                message = getattr(response, "headers", None)
+                headers = (
+                    {name.lower(): value for name, value in message.items()}
+                    if message is not None
+                    else {}
+                )
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")[:2000]
             raise GithubOpError(
@@ -246,24 +325,13 @@ class RestTransport:
         except urllib.error.URLError as exc:
             raise GithubOpError(f"{method} {url} failed: {exc.reason}") from exc
         if not raw.strip():
-            return {}
+            return {}, headers
         parsed: JsonValue = json.loads(raw)
-        return parsed
+        return parsed, headers
 
     def request_headers(self, method: str, path: str) -> dict[str, str]:
-        url = path if path.startswith("http") else f"{self.api_url}{path}"
-        if not url.startswith("https://"):
-            raise GithubOpError(f"refusing non-HTTPS GitHub API URL: {url}")
-        request = urllib.request.Request(
-            url,
-            method=method,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": API_VERSION,
-                "User-Agent": USER_AGENT,
-            },
-        )
+        url = self._url(path)
+        request = urllib.request.Request(url, method=method, headers=self._headers())
         try:
             with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310 - https enforced above
                 return {name.lower(): value for name, value in response.headers.items()}
@@ -276,20 +344,9 @@ class RestTransport:
             raise GithubOpError(f"{method} {url} failed: {exc.reason}") from exc
 
     def request_text(self, method: str, path: str) -> str:
-        url = path if path.startswith("http") else f"{self.api_url}{path}"
-        if not url.startswith("https://"):
-            raise GithubOpError(f"refusing non-HTTPS GitHub API URL: {url}")
+        url = self._url(path)
         opener = urllib.request.build_opener(_NoRedirect)
-        request = urllib.request.Request(
-            url,
-            method=method,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "application/vnd.github+json",
-                "X-GitHub-Api-Version": API_VERSION,
-                "User-Agent": USER_AGENT,
-            },
-        )
+        request = urllib.request.Request(url, method=method, headers=self._headers())
         body, location = self._open_text(opener, request)
         if location is None:
             return body
@@ -331,10 +388,13 @@ class RestTransport:
             raise GithubOpError(f"{method} {url} failed: {exc.reason}") from exc
 
 
-def select_transport() -> Transport:
-    if shutil.which("gh"):
+def select_transport(spec: TransportSpec | None = None) -> Transport:
+    """The transport for ``spec``: ``gh`` when the descriptor allows it and
+    the binary is present (GitHub only), else the stdlib client."""
+    spec = spec or GITHUB
+    if spec.gh_cli and shutil.which("gh"):
         return GhCliTransport()
-    return RestTransport()
+    return RestTransport(spec=spec)
 
 
 # -- op registry -------------------------------------------------------------
@@ -596,18 +656,47 @@ _PAGE_SIZE = 100
 _MAX_PAGES = 10
 
 
+_LINK_NEXT = re.compile(r'<([^>]+)>\s*;\s*rel="next"')
+
+
+def _next_link(headers: dict[str, str]) -> str | None:
+    """The ``rel="next"`` URL of a ``Link`` header, if any."""
+    match = _LINK_NEXT.search(headers.get("link", ""))
+    return match.group(1) if match else None
+
+
 def _list_pages(t: Transport, path: str, key: str) -> list[Any]:
     """Every entry of ``key`` across the pages of an enveloped list
-    endpoint; refuses a list longer than ``_MAX_PAGES`` full pages rather
-    than returning a prefix of it."""
+    endpoint, walked the way the transport's forge pages (#1015): by
+    number (``page``), by the ``Link`` header's ``rel="next"`` URL
+    (``link``), or by GitLab's ``X-Next-Page`` (``x-next-page``). Refuses
+    a list longer than ``_MAX_PAGES`` full pages rather than returning a
+    prefix of it."""
+    style = getattr(t, "pagination", "page")
     rows: list[Any] = []
-    for page in range(1, _MAX_PAGES + 1):
-        data = t.request("GET", f"{path}?per_page={_PAGE_SIZE}&page={page}")
+    target: str | None = f"{path}?per_page={_PAGE_SIZE}&page=1"
+    for _ in range(_MAX_PAGES):
+        assert target is not None
+        if style == "page":
+            data = t.request("GET", target)
+            headers: dict[str, str] = {}
+        else:
+            data, headers = t.request_with_headers("GET", target)
         entries = data.get(key) if isinstance(data, dict) else None
         if not isinstance(entries, list):
             return rows
         rows.extend(entries)
-        if len(entries) < _PAGE_SIZE:
+        if style == "page":
+            if len(entries) < _PAGE_SIZE:
+                return rows
+            page = int(target.rsplit("page=", 1)[1]) + 1
+            target = f"{path}?per_page={_PAGE_SIZE}&page={page}"
+        elif style == "link":
+            target = _next_link(headers)
+        else:
+            next_page = headers.get("x-next-page", "").strip()
+            target = f"{path}?per_page={_PAGE_SIZE}&page={next_page}" if next_page else None
+        if target is None:
             return rows
     raise GithubOpError(f"GET {path} has more than {_MAX_PAGES * _PAGE_SIZE} entries")
 
@@ -794,11 +883,18 @@ def execute_op(
     transport: Transport | None = None,
     progress: ProgressFn | None = None,
 ) -> JsonValue:
+    """Run ``op`` with ``params``. The descriptor under ``params["transport"]``
+    (#1015) picks and configures the transport when the caller supplied
+    none; it is not an op parameter and is stripped before the op sees
+    them."""
+    spec = transport_spec(params)
+    params = {k: v for k, v in params.items() if k != "transport"}
+    chosen = transport or select_transport(spec)
     progress_impl = PROGRESS_OPS.get(op)
     if progress_impl is not None:
-        return progress_impl(transport or select_transport(), params, progress)
+        return progress_impl(chosen, params, progress)
     impl = OPS.get(op)
     if impl is None:
         known = ", ".join(sorted({**OPS, **PROGRESS_OPS}))
         raise GithubOpError(f"unknown github op {op!r}; known: {known}")
-    return impl(transport or select_transport(), params)
+    return impl(chosen, params)

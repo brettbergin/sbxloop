@@ -20,7 +20,7 @@ from sbxloop.tui.widgets.band import Segment, legend, paint, widths
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop_worker.protocol import Usage
 from tests.fakes.rawdb import exec_raw
-from tests.unit.tui.conftest import drive, make_app
+from tests.unit.tui.conftest import drive, make_app, until
 
 DAY = 86400.0
 
@@ -108,6 +108,8 @@ def test_every_page_states_its_finding_then_draws(seeded: SbxloopHome) -> None:
     async def scenario() -> None:
         app = make_app(seeded)
         async with app.run_test(size=(140, 45)) as pilot:
+            # Not `until` on the screen: the page's worker fills it after mount,
+            # and every assertion below reads what the worker wrote.
             await pilot.pause(2.0)
             assert isinstance(app.screen, OverviewScreen)
 
@@ -177,7 +179,7 @@ def test_o_opens_the_costliest_run(seeded: SbxloopHome) -> None:
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause(2.0)
             await pilot.press("o")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, RunDetailScreen))
             assert isinstance(app.screen, RunDetailScreen)
             assert app.screen.run_id == "r_costly"
 
@@ -216,7 +218,7 @@ def test_the_two_rails_sit_beside_each_other(seeded: SbxloopHome) -> None:
     async def scenario() -> None:
         app = make_app(seeded)
         async with app.run_test(size=(150, 30)) as pilot:
-            await pilot.pause(2.0)
+            await until(pilot, lambda: isinstance(app.screen, OverviewScreen))
             screen = app.screen
             assert isinstance(screen, OverviewScreen)
             console_rail = screen.query_one("#navrail", NavRail).region
@@ -243,7 +245,7 @@ def test_a_narrow_terminal_drops_the_page_rail_and_keeps_the_page(seeded: Sbxloo
     async def scenario() -> None:
         app = make_app(seeded)
         async with app.run_test(size=(70, 24)) as pilot:
-            await pilot.pause(2.0)
+            await until(pilot, lambda: isinstance(app.screen, OverviewScreen))
             screen = app.screen
             assert isinstance(screen, OverviewScreen)
             assert screen.has_class("-narrow")

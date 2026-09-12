@@ -25,6 +25,7 @@ from sbxloop.daemon.agentbox import (
 from sbxloop.errors import DaemonError, WorkerError
 from sbxloop.events import Event, EventBus
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.worker.client import WorkerClient
 from tests.conftest import FakeSbx
 
 # Both agent credentials: provisioning takes the one [agent] backend names,
@@ -211,6 +212,48 @@ class TestLifecycle:
         second.client()
         assert created_names(fake_sbx) == [first.name]
         assert [e.type for e in events] == ["sandbox.reused"]
+
+    def test_reprovision_waits_out_the_stale_box_teardown(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`sbx rm` returns once the backend accepts the teardown, not once it
+        has finished. Re-creating the same name into that window loses the new
+        sandbox to the old one's reaper part-way through provisioning; the
+        concierge then answers nothing for a minute and a half while it
+        retries, which reads from chat as a dead bridge (#952)."""
+        monkeypatch.setattr("sbxloop.sbx.cli.RM_SETTLE_POLL_S", 0.01)
+        first = make_agent(fake_sbx, tmp_path, monkeypatch)
+        first.client()
+        first.close()
+        # The reuse gate refuses the box; the install is not what is under
+        # test, so it is a no-op and the re-provision runs to completion.
+        monkeypatch.setattr(DaemonAgent, "_is_reusable", lambda self, client: False)
+        monkeypatch.setattr(WorkerClient, "install", lambda self, **kwargs: None)
+        fake_sbx.linger_removals(3)
+
+        agent = make_agent(fake_sbx, tmp_path, monkeypatch, install_workers=True)
+        client = agent.client()
+
+        assert client.sandbox.name == agent.name
+        assert created_names(fake_sbx) == [first.name, agent.name]
+
+    def test_reprovision_stops_when_the_teardown_is_unconfirmed(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Fail closed: a teardown sbx will not confirm must not be followed
+        by a create of the same name."""
+        monkeypatch.setattr("sbxloop.sbx.cli.RM_SETTLE_POLL_S", 0.01)
+        monkeypatch.setattr("sbxloop.sbx.cli.RM_SETTLE_TIMEOUT_S", 0.05)
+        first = make_agent(fake_sbx, tmp_path, monkeypatch)
+        first.client()
+        first.close()
+        monkeypatch.setattr(DaemonAgent, "_is_reusable", lambda self, client: False)
+        fake_sbx.linger_removals(10_000)
+
+        agent = make_agent(fake_sbx, tmp_path, monkeypatch, install_workers=True)
+        with pytest.raises(DaemonError, match="still lists it"):
+            agent.client()
+        assert created_names(fake_sbx) == [first.name]
 
     def test_remove_deletes_the_sandbox(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

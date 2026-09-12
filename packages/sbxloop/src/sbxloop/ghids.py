@@ -1,10 +1,13 @@
-"""Typed GitHub resource identifiers: ``gh:issue:<n>`` and ``gh:pr:<n>``.
+"""Typed forge resource identifiers: ``gh:issue:<n>`` and ``gh:pr:<n>``.
 
-This module owns the whole grammar of GitHub work-item ids. Nothing else in
+This module owns the whole grammar of forge work-item ids. Nothing else in
 the codebase should slice ``gh:`` strings by hand.
 
-Ids may be repo-qualified — ``gh:<owner>/<name>:<kind>:<n>`` — so one daemon
-can tend several repositories without item ids colliding.
+The prefix names the forge — ``gh:`` GitHub, ``gl:`` GitLab, ``gt:`` Gitea
+(:data:`FORGE_PREFIXES`) — so one daemon can tend repositories on more than
+one and the ids never collide; ``gh`` is the default everywhere a forge is
+not named. Ids may be repo-qualified — ``gh:<owner>/<name>:<kind>:<n>`` —
+so one daemon can tend several repositories without item ids colliding.
 
 Rendering is strict — every id this module produces carries its kind. Parsing
 is lenient — the legacy bare form ``gh:<n>`` is accepted and normalised to
@@ -27,7 +30,10 @@ from typing import Literal, get_args
 
 GhKind = Literal["issue", "pr"]
 
-GH_PREFIX = "gh:"
+# The forge each id prefix names. ``gh`` is the historical and default one.
+FORGE_PREFIXES: dict[str, str] = {"gh": "gh:", "gl": "gl:", "gt": "gt:"}
+GH_PREFIX = FORGE_PREFIXES["gh"]
+DEFAULT_FORGE = "gh"
 CHAT_PREFIX = "chat:"
 SCHED_PREFIX = "sched:"
 
@@ -43,7 +49,7 @@ def is_repo_slug(value: str) -> bool:
 
 @dataclass(frozen=True, slots=True)
 class GhId:
-    """A parsed GitHub resource id."""
+    """A parsed forge resource id."""
 
     kind: GhKind
     number: int
@@ -51,6 +57,8 @@ class GhId:
     # ``None`` means an id minted before multi-repo support, or one whose
     # repository is implied by the daemon's sole configured repo.
     repo: str | None = None
+    # Which forge holds the resource — a key of :data:`FORGE_PREFIXES`.
+    forge: str = DEFAULT_FORGE
 
     def __str__(self) -> str:
         return self.item_id
@@ -58,34 +66,40 @@ class GhId:
     @property
     def item_id(self) -> str:
         """The canonical string form, repo-qualified when a repo is known."""
-        return format_gh_id(self.kind, self.number, repo=self.repo)
+        return format_gh_id(self.kind, self.number, repo=self.repo, forge=self.forge)
 
 
-def format_gh_id(kind: GhKind, number: int, repo: str | None = None) -> str:
-    """Render the canonical id for a GitHub resource.
+def format_gh_id(
+    kind: GhKind, number: int, repo: str | None = None, *, forge: str = DEFAULT_FORGE
+) -> str:
+    """Render the canonical id for a forge resource.
 
     With ``repo`` the id is repo-qualified (``gh:<owner>/<name>:<kind>:<n>``);
     without it the historical typed form ``gh:<kind>:<n>`` is produced.
+    ``forge`` picks the prefix (:data:`FORGE_PREFIXES`).
     """
     if kind not in _KINDS:
         raise ValueError(f"unknown GitHub id kind: {kind!r}")
     if number < 1:
         raise ValueError(f"GitHub id number must be positive, got {number!r}")
+    prefix = FORGE_PREFIXES.get(forge)
+    if prefix is None:
+        raise ValueError(f"unknown forge: {forge!r}")
     if repo is None:
-        return f"{GH_PREFIX}{kind}:{number}"
+        return f"{prefix}{kind}:{number}"
     if not is_repo_slug(repo):
         raise ValueError(f"malformed repository slug: {repo!r}")
-    return f"{GH_PREFIX}{repo}:{kind}:{number}"
+    return f"{prefix}{repo}:{kind}:{number}"
 
 
-def issue_item_id(number: int, repo: str | None = None) -> str:
-    """The work item id for a GitHub issue."""
-    return format_gh_id("issue", number, repo=repo)
+def issue_item_id(number: int, repo: str | None = None, *, forge: str = DEFAULT_FORGE) -> str:
+    """The work item id for an issue."""
+    return format_gh_id("issue", number, repo=repo, forge=forge)
 
 
-def pr_item_id(number: int, repo: str | None = None) -> str:
-    """The id for a GitHub pull request referenced as a work-item resource."""
-    return format_gh_id("pr", number, repo=repo)
+def pr_item_id(number: int, repo: str | None = None, *, forge: str = DEFAULT_FORGE) -> str:
+    """The id for a pull request referenced as a work-item resource."""
+    return format_gh_id("pr", number, repo=repo, forge=forge)
 
 
 def chat_item_id(key: str) -> str:
@@ -133,20 +147,29 @@ def is_local_id(value: str) -> bool:
 
 
 def is_gh_id(value: str) -> bool:
-    """True when ``value`` is a well-formed GitHub id (typed or legacy)."""
+    """True when ``value`` is a well-formed forge id (typed or legacy)."""
     return try_parse_gh_id(value) is not None
 
 
+def _forge_of(value: str) -> str | None:
+    """The forge whose prefix ``value`` carries, or None."""
+    for forge, prefix in FORGE_PREFIXES.items():
+        if value.startswith(prefix):
+            return forge
+    return None
+
+
 def has_gh_prefix(value: str) -> bool:
-    """True when ``value`` claims to be a GitHub id, well-formed or not."""
-    return value.startswith(GH_PREFIX)
+    """True when ``value`` claims to be a forge id, well-formed or not."""
+    return _forge_of(value) is not None
 
 
 def parse_gh_id(value: str) -> GhId:
-    """Parse a typed or legacy GitHub id, raising ``ValueError`` if malformed."""
-    if not value.startswith(GH_PREFIX):
+    """Parse a typed or legacy forge id, raising ``ValueError`` if malformed."""
+    forge = _forge_of(value)
+    if forge is None:
         raise ValueError(f"not a GitHub id: {value!r}")
-    rest = value[len(GH_PREFIX) :]
+    rest = value[len(FORGE_PREFIXES[forge]) :]
     repo: str | None = None
     head, sep, tail = rest.partition(":")
     if sep and "/" in head:
@@ -173,7 +196,7 @@ def parse_gh_id(value: str) -> GhId:
     number = int(number_text)
     if number < 1:
         raise ValueError(f"GitHub id number must be positive: {value!r}")
-    return GhId(kind=kind, number=number, repo=repo)
+    return GhId(kind=kind, number=number, repo=repo, forge=forge)
 
 
 def try_parse_gh_id(value: str) -> GhId | None:
@@ -199,6 +222,8 @@ def normalize_item_id(value: str) -> str:
 
 __all__ = [
     "CHAT_PREFIX",
+    "DEFAULT_FORGE",
+    "FORGE_PREFIXES",
     "GH_PREFIX",
     "SCHED_PREFIX",
     "GhId",

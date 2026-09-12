@@ -14,8 +14,7 @@ from textual.widgets import Input, OptionList, Select, TabbedContent, TabPane, T
 from sbxloop.backends import backend_named
 from sbxloop.cli.policyview import policy_view
 from sbxloop.config import Config
-from sbxloop.configedit import keys as configkeys
-from sbxloop.configedit import toml as configtoml
+from sbxloop.configedit import keys as configkeys, toml as configtoml
 from sbxloop.configedit.edit import (
     FILE_LAYER,
     config_path,
@@ -31,7 +30,7 @@ from sbxloop.tui.screens.modals import ConfirmScreen, TextPromptScreen
 from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop.tui.widgets.tables import ConsoleTable
 from tests.unit.test_modelcatalog import row
-from tests.unit.tui.conftest import FakeCtl, FakeRunner, drive, live_status, make_app
+from tests.unit.tui.conftest import FakeCtl, FakeRunner, drive, live_status, make_app, until
 
 REFRESH: dict[str, Any] = {"refresh_s": 3.0}
 
@@ -54,7 +53,7 @@ def test_model_setting_opens_a_picker(seeded: SbxloopHome, hermetic: None) -> No
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
             screen.edit_key("agent.models.build")
@@ -138,7 +137,7 @@ def test_config_screen_resolves_filters_and_shows_the_policy(
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
             table = app.screen.query_one("#resolved", ConsoleTable)
             row = table.get_row_at(table.get_row_index("daemon.poll_interval_s"))
@@ -191,7 +190,7 @@ def test_config_screen_shows_the_workload_profiles(seeded: SbxloopHome, hermetic
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
             text = app.screen.query_one("#workloads", TextPanel).content_text
             assert "research (default)" in text and "reads the web" in text
@@ -216,7 +215,7 @@ def test_the_console_has_no_file_editor(seeded: SbxloopHome, hermetic: None) -> 
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
             assert [pane.id for pane in screen.query(TabPane)] == [
@@ -247,7 +246,7 @@ def test_a_save_that_cannot_be_written_offers_no_restart(
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
 
@@ -258,7 +257,7 @@ def test_a_save_that_cannot_be_written_offers_no_restart(
                 mp.setattr("sbxloop.tui.actions.save_text", refuse)
                 _open_key(screen, "daemon.poll_interval_s")
                 await pilot.press("enter")
-                await pilot.pause(0.5)
+                await until(pilot, lambda: isinstance(app.screen, ValueScreen))
                 assert isinstance(app.screen, ValueScreen)
                 app.screen.query_one("#value-text", Input).value = "8.0"
                 await pilot.press("enter")
@@ -276,12 +275,12 @@ def test_a_saved_key_keeps_a_backup(seeded: SbxloopHome, hermetic: None) -> None
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
             _open_key(screen, "daemon.poll_interval_s")
             await pilot.press("enter")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
             app.screen.query_one("#value-text", Input).value = "9.0"
             await pilot.press("enter")
@@ -291,7 +290,7 @@ def test_a_saved_key_keeps_a_backup(seeded: SbxloopHome, hermetic: None) -> None
             assert len(backups) == 1 and "7.0" in backups[0].read_text()
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("n")
-            await pilot.pause(1.0)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
             table = app.screen.query_one("#resolved", ConsoleTable)
             assert str(table.get_row_at(table.get_row_index("daemon.poll_interval_s"))[1]) == "9"
@@ -318,7 +317,7 @@ def test_the_editor_is_the_homes_config_wherever_the_console_ran(
         )
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(2.0)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
             assert screen.path == seeded.config_toml
@@ -345,7 +344,7 @@ def test_a_sbxloop_toml_in_the_home_is_named_as_shadowing(
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(2.0)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
             status = screen.query_one("#file-status", TextPanel).content_text
@@ -353,7 +352,7 @@ def test_a_sbxloop_toml_in_the_home_is_named_as_shadowing(
             # And an edit to a key it holds is written, then flagged.
             _open_key(screen, "daemon.poll_interval_s")
             await pilot.press("enter")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
             app.screen.query_one("#value-text", Input).value = "5.0"
             await pilot.press("enter")
@@ -361,7 +360,7 @@ def test_a_sbxloop_toml_in_the_home_is_named_as_shadowing(
             assert "poll_interval_s = 5.0" in _config_text(seeded)
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("n")
-            await pilot.pause(1.0)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
             assert "sets it too and wins" in app.screen.last_verdict
             assert "99.0" in app.screen.last_verdict
@@ -497,12 +496,12 @@ def test_model_edit_applies_without_offering_restart(seeded: SbxloopHome, hermet
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
             _open_key(screen, "agent.models.build")
             await pilot.press("enter")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
             app.screen.query_one("#model-filter", Input).value = "second"
             await pilot.press("enter")
@@ -522,14 +521,14 @@ def test_a_key_is_edited_from_the_resolved_view(seeded: SbxloopHome, hermetic: N
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
 
             # A number: Enter opens the key, Enter applies it.
             _open_key(screen, "daemon.poll_interval_s")
             await pilot.press("enter")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
             assert app.screen.spec.kind == "float"
             app.screen.query_one("#value-text", Input).value = "9.0"
@@ -540,7 +539,7 @@ def test_a_key_is_edited_from_the_resolved_view(seeded: SbxloopHome, hermetic: N
             assert "poll_interval_s = 9.0" in saved
             assert isinstance(app.screen, ConfirmScreen), "the restart is offered"
             await pilot.press("n")
-            await pilot.pause(1.0)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
             table = app.screen.query_one("#resolved", ConsoleTable)
             assert str(table.get_row_at(table.get_row_index("daemon.poll_interval_s"))[1]) == "9"
@@ -548,11 +547,11 @@ def test_a_key_is_edited_from_the_resolved_view(seeded: SbxloopHome, hermetic: N
             # A value the loader refuses is named and never written.
             _open_key(app.screen, "daemon.poll_interval_s")
             await pilot.press("e")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
             app.screen.query_one("#value-text", Input).value = "-1"
             await pilot.press("enter")
-            await pilot.pause(2.0)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
             assert app.screen.last_verdict.startswith("daemon.poll_interval_s: draft refused")
             assert "poll_interval_s = 9.0" in _config_text(seeded)
@@ -560,7 +559,7 @@ def test_a_key_is_edited_from_the_resolved_view(seeded: SbxloopHome, hermetic: N
             # A bool is two choices, applied as soon as one is picked.
             _open_key(app.screen, "keep_sandboxes")
             await pilot.press("enter")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
             assert app.screen.spec.choices == ("true", "false")
             app.screen.query_one("#value-choice", Select).value = "true"
@@ -582,7 +581,7 @@ def test_a_repo_entry_is_addressable_key_by_key(seeded: SbxloopHome, hermetic: N
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
             assert screen.flat["github.repos[1].repo"] == "o/s"
@@ -602,7 +601,7 @@ def test_a_repo_entry_is_addressable_key_by_key(seeded: SbxloopHome, hermetic: N
 
             _open_key(screen, "github.repos[1].deliver_base")
             await pilot.press("enter")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
             app.screen.query_one("#value-text", Input).value = "develop"
             await pilot.press("enter")
@@ -622,7 +621,7 @@ def test_unsetting_a_key_says_what_answers_instead(seeded: SbxloopHome, hermetic
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
             _open_key(screen, "sandbox.template")
@@ -634,7 +633,7 @@ def test_unsetting_a_key_says_what_answers_instead(seeded: SbxloopHome, hermetic
             assert "template" not in _config_text(seeded)
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("n")
-            await pilot.pause(1.0)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
             assert "unset here; it now comes from its default" in app.screen.last_verdict
 
@@ -653,12 +652,12 @@ def test_a_key_the_environment_also_sets_is_written_and_flagged(
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
             _open_key(screen, "daemon.poll_interval_s")
             await pilot.press("enter")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
             app.screen.query_one("#value-text", Input).value = "9.0"
             await pilot.press("enter")
@@ -666,7 +665,7 @@ def test_a_key_the_environment_also_sets_is_written_and_flagged(
             assert "poll_interval_s = 9.0" in _config_text(seeded)
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("n")
-            await pilot.pause(1.0)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
             assert "env sets it too and wins" in app.screen.last_verdict
             assert "5.0" in app.screen.last_verdict
@@ -683,16 +682,16 @@ def test_a_key_can_be_added_by_path(seeded: SbxloopHome, hermetic: None) -> None
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
             screen.query_one("#resolved", ConsoleTable).focus()
             await pilot.press("a")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, TextPromptScreen))
             assert isinstance(app.screen, TextPromptScreen)
             app.screen.query_one("#text", Input).value = "sandbox.env.RAILS_ENV"
             await pilot.press("enter")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
             assert not app.screen.in_file
             app.screen.query_one("#value-text", Input).value = "test"
@@ -701,7 +700,7 @@ def test_a_key_can_be_added_by_path(seeded: SbxloopHome, hermetic: None) -> None
             assert 'RAILS_ENV = "test"' in _config_text(seeded)
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("n")
-            await pilot.pause(1.0)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
             assert app.screen.flat["sandbox.env.RAILS_ENV"] == "test"
 
@@ -715,7 +714,7 @@ def test_read_only_console_cannot_edit_a_key(seeded: SbxloopHome, hermetic: None
         app = make_app(seeded, read_only=True, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
             _open_key(screen, "daemon.poll_interval_s")
@@ -723,7 +722,7 @@ def test_read_only_console_cannot_edit_a_key(seeded: SbxloopHome, hermetic: None
             await pilot.pause(0.5)
             assert isinstance(app.screen, ConfigScreen), "no dialog for a console that cannot write"
             await pilot.press("a")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
             assert _config_text(seeded) == "[daemon]\npoll_interval_s = 7.0\n"
 
@@ -739,7 +738,7 @@ def test_a_key_the_environment_owns_is_refused(seeded: SbxloopHome, hermetic: No
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
             _open_key(screen, "home")
@@ -774,14 +773,14 @@ def test_an_edit_shows_up_in_the_resolved_view_at_once(
         )
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(2.0)
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
             assert screen.flat["model"] == "claude-sonnet-5"
 
             _open_key(screen, "model")
             await pilot.press("enter")
-            await pilot.pause(0.5)
+            await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
             app.screen.query_one("#model-filter", Input).value = "claude-haiku-4-5-20251001"
             await pilot.press("enter")

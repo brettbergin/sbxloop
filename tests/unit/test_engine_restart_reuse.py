@@ -22,6 +22,7 @@ import pytest
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import FakeGithub
 from tests.fakes.gitrepo import git
+from tests.fakes.ops_stub import OpsStub
 from tests.unit.test_engine import (
     FILES_BUILD,
     REVIEW_OK,
@@ -135,7 +136,7 @@ class TestFallback:
 
         from sbxloop.engine.engine import LoopEngine
 
-        class Ops:
+        class Ops(OpsStub):
             def __init__(self, compare: Any, base_sha: str | None) -> None:
                 self.compare, self.base_sha = compare, base_sha
                 self.refs: list[str] = []

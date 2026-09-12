@@ -38,6 +38,70 @@
 
 ### Fixed
 
+- **The automated upgrade now deploys to the home the host was installed
+  under.** An operator can put the whole sbxloop home anywhere with
+  `SBXLOOP_HOME`, but the reusable deploy workflow opened by writing
+  `SBXLOOP_HOME=$HOME/.sbxloop` into the job environment and derived the
+  launcher, the venv interpreter, uv and its caches from that same fixed
+  root. On a relocated host every step then addressed a directory that
+  either did not exist — the version check failed before anything was
+  installed — or, worse, was a second stale installation: the backup, the
+  install, `doctor`, the health check and the rollback all pointed away from
+  the daemon actually running.
+
+  The job now resolves the root **once**, in its first step, and derives
+  every path from it. A host tells the job where its home is through the
+  runner unit `sbxloop init --systemd --runner DIR` renders, which now
+  carries `Environment=SBXLOOP_HOME=` for the home it was built against, or
+  through the repository variable `SBXLOOP_HOME`, which wins over the
+  runner's environment. With neither set the default is unchanged,
+  `$HOME/.sbxloop`, so a default install needs no edits. A `~/` root expands
+  against the service user the way the loader does, a root holding spaces
+  survives as itself, and a root that is relative or holds a newline fails
+  the job before the host is touched rather than resolving differently in
+  every step.
+
+- **A failed sbx installation is no longer recorded as the installed
+  version.** `sbxloop init` treated *any* installer failure that left an
+  executable under the prefix as the one outcome an unprivileged run is
+  expected to hit — the AppArmor profile that needs root — and then wrote
+  the requested version into `sbx/VERSION`. An upgrade whose installer
+  refused before it copied anything (Debian keeps `mkfs.ext4` off a non-root
+  PATH) therefore reported success on the strength of the *previous*
+  release's binary, and the next init skipped the repair because the marker
+  said the version was installed.
+
+  The AppArmor outcome is now recognised only when the failure says so, and
+  its note says the sandbox backend cannot start until an administrator
+  installs the profile rather than reporting a finished install. Every other
+  failure keeps its own exit code and output, whatever is lying around under
+  the prefix. `sbx/VERSION` is written only after the executable is there,
+  is executable, and answers `sbx version` with the version that was asked
+  for; a failed install clears the marker, so a later init reinstalls
+  instead of skipping.
+
+- **The installer now tells a host without git what it is missing, before it
+  downloads anything.** `scripts/install.sh` checked `curl` and `tar`, then
+  fetched uv, a CPython and every package, and handed over to `sbxloop init`
+  — which imports sbxloop, which imports GitPython, which resolves the git
+  executable at *import* time. A host with no usable git therefore failed at
+  the last step of a bootstrap that had already written the home, with
+  `ImportError: Bad git executable.` and a traceback through a third-party
+  package: nothing an operator could read as "install git". Git is a host
+  dependency in its own right — sbxloop reads and clones checkouts on the
+  host — and the git a sandbox carries is a separate one that does not stand
+  in for it, so installing it in a VM never fixed this.
+
+  Git is now a declared prerequisite alongside `curl` and `tar`, checked
+  before the first mkdir or download and reported with advice for the host's
+  own OS. A git that is present but cannot run (`git --version` fails) is
+  caught too, rather than passing a `command -v` and failing later.
+  `GIT_PYTHON_GIT_EXECUTABLE` is what gets checked when it is set, since it
+  is the executable GitPython will use: an explicitly configured working git
+  passes with nothing on `PATH`, and one pointed at nothing fails even with a
+  usable git on `PATH`. Nothing is installed on the operator's behalf and no
+  privileged command is run.
+
 - **The ⏳ "received" mark now shows up for the person who asked, on
   Mattermost.** It was already on the server — the bot reacts within
   milliseconds of a post — but the asker's own web/desktop app never

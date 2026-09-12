@@ -34,7 +34,7 @@ from sbxloop.engine.landing import (
     resolve_merge_method,
 )
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import ChecksVerdict, FailedCheck, MergeOutcome, QueueEntry, QueueState
+from sbxloop.vcs.github.ops import ChecksVerdict, FailedCheck, MergeOutcome, QueueEntry, QueueState
 from tests.fakes.fake_github import (
     BLOCKED_405,
     GREEN,
@@ -817,7 +817,7 @@ class TestLandAgainstTheBase:
         fake.checks = [red("flaky", passed=("ci",))]
         lp = Landing(fake)
         assert lp.run(policy_for=lp.against_base()) == Landed("merge0001", by_human=False)
-        assert fake.issue_comments == [
+        assert fake.issue_comments_posted == [
             "Merged with checks still red that this pull request did not cause:\n"
             "\n"
             "- `flaky` — already red on base123, the commit this PR is built on"
@@ -837,7 +837,7 @@ class TestLandAgainstTheBase:
         lp.rec.on_tick.append(lambda n: fake._move_head("commit1"))
         assert isinstance(lp.run(policy_for=lp.against_base()), Landed)
         assert len(fake.merges) == 2
-        assert len(fake.issue_comments) == 1
+        assert len(fake.issue_comments_posted) == 1
 
     def test_a_refused_comment_does_not_stop_the_merge(self) -> None:
         fake = FakeGithub()
@@ -861,7 +861,7 @@ class TestLandAgainstTheBase:
         assert outcome.why == "1 check(s) failed: ci; already red on the base: flaky"
         assert [c.name for c in outcome.failed_checks] == ["ci"]
         assert outcome.checks is not None and outcome.checks.preexisting == ("flaky",)
-        assert fake.issue_comments == []
+        assert fake.issue_comments_posted == []
 
     def test_a_required_check_red_on_the_base_is_still_fixed(self) -> None:
         fake = FakeGithub()
@@ -886,7 +886,7 @@ class TestLandAgainstTheBase:
 
         second = lp.run(policy_for=lp.against_base(advisory_spent={"lint"}))
         assert isinstance(second, Landed)
-        assert fake.issue_comments == [
+        assert fake.issue_comments_posted == [
             "Merged with checks still red that this pull request did not cause:\n"
             "\n"
             "- `lint` — went red on this PR but is not required by the base branch; "
@@ -917,7 +917,7 @@ class TestLandAgainstTheBase:
         fake.checks = [red("codecov/patch", passed=("ci",))]
         lp = Landing(fake, ignore_checks=["codecov/*"])
         assert isinstance(lp.run(policy_for=lp.against_base()), Landed)
-        assert fake.issue_comments == []
+        assert fake.issue_comments_posted == []
         (checks,) = [d for t, d in lp.rec.events if t == "landing.checks"]
         assert checks["ignored"] == ["codecov/patch"]
 
@@ -926,7 +926,7 @@ class TestLandAgainstTheBase:
         lp = Landing(fake)
         assert isinstance(lp.run(policy_for=lp.against_base()), Landed)
         assert [t for t, _ in lp.rec.events if t == "landing.checks"] == []
-        assert fake.issue_comments == []
+        assert fake.issue_comments_posted == []
 
 
 BOT = "coderabbitai[bot]"
@@ -960,8 +960,8 @@ class TestBotReviewers:
         lp = Landing(fake)
         assert isinstance(lp.run(bot_round_spent=True), Landed)
         assert fake.merges == [(7, "squash", "commit0")]
-        assert len(fake.issue_comments) == 1
-        comment = fake.issue_comments[0]
+        assert len(fake.issue_comments_posted) == 1
+        comment = fake.issue_comments_posted[0]
         assert f"`{BOT}`" in comment
         assert "bots do not dismiss their reviews" in comment
         assert [d for t, d in lp.rec.events if t == "land.bot_standing"] == [
@@ -991,7 +991,7 @@ class TestBotReviewers:
         lp = Landing(fake)
         assert isinstance(lp.run(bot_round_spent=True), Landed)
         assert lp.rec.waits == ["ci", "ci"]
-        assert len(fake.issue_comments) == 1
+        assert len(fake.issue_comments_posted) == 1
         assert len([t for t, _ in lp.rec.events if t == "land.bot_standing"]) == 1
 
     def test_a_refused_bot_comment_does_not_stop_the_merge(self) -> None:
@@ -1250,7 +1250,7 @@ class TestBlockedWithGreenChecks:
         assert isinstance(Landing(fake).run(), Landed)
 
     def test_the_reason_names_what_is_known(self) -> None:
-        from sbxloop.gh.protection import BaseRequirements
+        from sbxloop.vcs.github.protection import BaseRequirements
 
         reviews = BaseRequirements((), 1, "protection")
         assert "requires an approving review" in blocked_reason(reviews, cfg())
@@ -1280,7 +1280,7 @@ class TestBlockedWithGreenChecks:
         line; the fatal last-push rule comes first. (The merge-gate hint that
         used to follow a review rule is gone with #675: a review wait is a
         wait, not something to configure around.)"""
-        from sbxloop.gh.protection import BaseRequirements
+        from sbxloop.vcs.github.protection import BaseRequirements
 
         rules = BaseRequirements(
             (),
@@ -1351,9 +1351,7 @@ class TestBlockedWithGreenChecks:
         assert outcome.approvals_have == 0 and outcome.approvals_required == 1
 
 
-QUEUED = QueueState(
-    merged=False, closed=False, entry=QueueEntry("MQE_1", "AWAITING_CHECKS", 1, "queue0")
-)
+QUEUED = QueueState(merged=False, closed=False, entry=QueueEntry("MQE_1", "testing", 1, "queue0"))
 QUEUE_MERGED = QueueState(merged=True, closed=False, entry=None, merge_sha="queued0001")
 NOT_QUEUED = QueueState(merged=False, closed=False, entry=None)
 

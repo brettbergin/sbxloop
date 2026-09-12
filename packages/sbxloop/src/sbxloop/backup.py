@@ -31,6 +31,7 @@ from pathlib import Path
 
 import sbxloop
 from sbxloop.errors import SbxloopError
+from sbxloop.hostfiles import make_private
 from sbxloop.log import get_logger
 from sbxloop.paths import SbxloopHome
 
@@ -145,7 +146,7 @@ def create_backup(
     # Secrets stay private in the snapshot too.
     for rel, dst in copied:
         if rel.endswith(("secrets.env", ".pem", ".env")):
-            dst.chmod(0o600)
+            make_private(dst, os_name=home.os_name)
     lines = [f"{_sha256(dst)}  {dst.stat().st_size:>10}  {rel}" for rel, dst in copied]
     (target / MANIFEST).write_text("\n".join(lines) + ("\n" if lines else ""))
     total = sum(dst.stat().st_size for _rel, dst in copied)
@@ -228,7 +229,7 @@ def restore_backup(home: SbxloopHome, name: str, *, daemon_live: bool = False) -
         else:
             shutil.copy2(src, dst)
         if rel.name.endswith(("secrets.env", ".pem")):
-            dst.chmod(0o600)
+            make_private(dst, os_name=home.os_name)
         restored.append(str(rel))
     log.info("backup.restored", path=str(info.path), files=len(restored))
     return restored

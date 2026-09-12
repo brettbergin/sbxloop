@@ -23,8 +23,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 from sbxloop.config import load_config_with_sources
-from sbxloop.configedit import keys as configkeys
-from sbxloop.configedit import toml as configtoml
+from sbxloop.configedit import keys as configkeys, toml as configtoml
 from sbxloop.configedit.docs import doc_for
 from sbxloop.configedit.edit import (
     FILE_LAYER,

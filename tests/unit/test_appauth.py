@@ -14,7 +14,7 @@ from typing import Any
 import pytest
 
 from sbxloop.errors import GithubOpsError, ProvisionError
-from sbxloop.gh.appauth import (
+from sbxloop.vcs.github.appauth import (
     APP_ID_ENV,
     APP_INSTALLATION_ID_ENV,
     APP_KEY_ENV,
@@ -249,7 +249,7 @@ class TestMint:
         lines = [
             r.getMessage()
             for r in caplog.records
-            if r.name == "sbxloop.gh.appauth" and "app_token_minted" in r.getMessage()
+            if r.name == "sbxloop.vcs.github.appauth" and "app_token_minted" in r.getMessage()
         ]
         assert len(lines) == 1
         assert "'expires_at': '2026-09-04T21:53:40+00:00'" in lines[0]

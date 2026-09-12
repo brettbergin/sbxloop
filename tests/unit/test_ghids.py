@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from sbxloop.ghids import (
+    FORGE_PREFIXES,
     GhId,
     chat_item_id,
     format_gh_id,
@@ -111,3 +112,41 @@ def test_chat_ids_are_keyed_by_the_message() -> None:
     for bad in ("", "  ", "a b"):
         with pytest.raises(ValueError, match="malformed chat item key"):
             chat_item_id(bad)
+
+
+class TestForgePrefixes:
+    """#1012: the grammar names the forge. ``gh:`` stays the default and the
+    only one with a legacy bare form in the wild, but every form parses
+    and renders under ``gl:`` and ``gt:`` too."""
+
+    def test_the_three_forges(self) -> None:
+        assert FORGE_PREFIXES == {"gh": "gh:", "gl": "gl:", "gt": "gt:"}
+
+    @pytest.mark.parametrize("forge", ["gh", "gl", "gt"])
+    def test_every_form_round_trips_under_every_forge(self, forge: str) -> None:
+        typed = format_gh_id("issue", 12, forge=forge)
+        qualified = format_gh_id("pr", 7, repo="o/r", forge=forge)
+        assert typed == f"{forge}:issue:12" and qualified == f"{forge}:o/r:pr:7"
+        assert parse_gh_id(typed) == GhId("issue", 12, forge=forge)
+        assert parse_gh_id(qualified) == GhId("pr", 7, "o/r", forge=forge)
+        assert parse_gh_id(typed).item_id == typed
+        assert parse_gh_id(qualified).item_id == qualified
+        assert issue_item_id(12, forge=forge) == typed
+        assert pr_item_id(7, "o/r", forge=forge) == qualified
+        assert is_gh_id(typed) and has_gh_prefix(f"{forge}:junk")
+
+    @pytest.mark.parametrize("forge", ["gh", "gl", "gt"])
+    def test_the_legacy_bare_form_normalises_under_every_forge(self, forge: str) -> None:
+        assert normalize_item_id(f"{forge}:1234") == f"{forge}:issue:1234"
+        assert parse_gh_id(f"{forge}:1234").forge == forge
+
+    def test_the_default_forge_is_github(self) -> None:
+        assert GhId("issue", 1).forge == "gh"
+        assert format_gh_id("issue", 1) == "gh:issue:1"
+        assert parse_gh_id("gh:issue:1") == GhId("issue", 1)
+
+    def test_an_unknown_forge_is_refused(self) -> None:
+        with pytest.raises(ValueError, match="unknown forge"):
+            format_gh_id("issue", 1, forge="bb")
+        assert try_parse_gh_id("bb:issue:1") is None
+        assert has_gh_prefix("bb:issue:1") is False

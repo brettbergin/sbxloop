@@ -192,8 +192,17 @@ class TestDispatch:
     def test_log_fits_a_message_newest_first(self, tmp_path: Path) -> None:
         """A chat message is head-clipped by its transport: the tail must
         drop its oldest lines to fit, never its newest."""
-        from sbxloop.log import get_logger
+        from sbxloop.log import configure_logging, get_logger, log_buffer
 
+        # Own the buffer rather than inherit it. Both the ring buffer and the
+        # level its handler admits are process-global, so what this test reads
+        # is decided by whichever other tests happened to share its xdist
+        # worker — one of them leaving the level at WARNING is enough to admit
+        # none of the probes below and read back an empty buffer. Which tests
+        # share a worker changes with every re-slicing of the suite, so this
+        # states what it needs instead of depending on the draw.
+        configure_logging("DEBUG")
+        log_buffer().clear()
         logger = get_logger("sbxloop.test.ctl")
         for n in range(40):
             logger.info("ctl.fit_probe", n=n, pad="x" * 80)

@@ -24,6 +24,15 @@ log = get_logger(__name__)
 # clock, and nothing else in the journal would.
 SLOW_CALL_S = 60.0
 
+# `sbx rm` returns once the backend has *accepted* the teardown, not once it
+# has finished it. Creating the same name into that window loses the new
+# sandbox to the old one's reaper part-way through provisioning — the create
+# succeeds and the first exec after it answers "sandbox not found" (#952).
+# So a removal is not done until sbx stops listing the name; a caller about
+# to re-create a stable name (the daemon's boxes) depends on that.
+RM_SETTLE_TIMEOUT_S = 30.0
+RM_SETTLE_POLL_S = 0.5
+
 _NOT_FOUND_MARKERS = ("not found", "no such sandbox", "does not exist", "unknown sandbox")
 
 # Stderr shapes meaning sbx itself failed to run the command (daemon
@@ -272,11 +281,37 @@ class SbxCLI:
     def stop(self, name: str) -> None:
         self.run("stop", name)
 
-    def rm(self, name: str, *, force: bool = True) -> None:
+    def rm(self, name: str, *, force: bool = True, settle: bool = True) -> None:
+        """Remove a sandbox and, by default, wait for the teardown to land.
+
+        ``settle`` is what makes remove-then-create-the-same-name safe; pass
+        ``False`` only where nothing will reuse the name.
+        """
         args = ["rm"]
         if force:
             args.append("--force")
         self.run(*args, name)
+        if settle:
+            self.wait_gone(name)
+
+    def wait_gone(self, name: str, *, timeout: float | None = None) -> None:
+        """Block until ``sbx ls`` stops listing ``name``.
+
+        Fails closed on "could not tell": a name still listed at the deadline
+        raises rather than letting the caller create over a teardown that is
+        still in flight. Inventory, not a not-found exception, proves absence
+        — the same reasoning as ``DaemonGithub.remove_stale``.
+        """
+        timeout = RM_SETTLE_TIMEOUT_S if timeout is None else timeout
+        deadline = time.monotonic() + timeout
+        while any(info.name == name for info in self.ls()):
+            if time.monotonic() >= deadline:
+                raise SbxError(
+                    f"sandbox {name!r} was removed but sbx still lists it "
+                    f"{timeout:.0f}s later; its teardown has not finished",
+                    argv=redacted_argv(self.argv("ls")),
+                )
+            time.sleep(RM_SETTLE_POLL_S)
 
     def version(self, *, timeout: float | None = None) -> str | None:
         """The CLI's semver, or None when the output carries none.

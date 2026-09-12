@@ -214,6 +214,10 @@ class TestLabelProbeEmitsNoErrorEvent:
         result_path = tmp_path / f"{op}-result.json"
 
         class Missing:
+            def __init__(self, spec: Any = None) -> None:
+                # Stands in for ``select_transport(spec)`` (#1015).
+                self.spec = spec
+
             def request(self, method: str, path: str, body: Any = None) -> Any:
                 raise GithubOpError(
                     f"gh api GET {path} failed (rc=1): Not Found (HTTP 404)", http_status=404

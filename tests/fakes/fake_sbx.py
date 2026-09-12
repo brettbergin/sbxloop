@@ -18,17 +18,23 @@ sandboxes, 2 for usage errors.
 
 from __future__ import annotations
 
-import contextlib
 import fcntl
 import json
 import os
 import re
-import shutil
-import signal
-import subprocess
 import sys
 import time
 from pathlib import Path
+
+# The suite execs this file tens of thousands of times, once per `sbx` call,
+# so its import graph is paid on every one of them and is a real share of the
+# `slow` half's wall clock. Only what every invocation needs is imported at
+# module scope; `contextlib`, `shutil`, `signal` and `subprocess` — and what
+# they drag in behind them — are imported inside the handlers that use them,
+# none of which is on the common path.
+#
+# `re` stays: `json` imports it (via `json.decoder`) and every invocation
+# writes `invocations.jsonl`, so deferring it would buy nothing.
 
 VERSION_OUTPUT = "sbx version 0.38.0\n"
 
@@ -92,6 +98,18 @@ def sandbox_dir(root: Path, name: str) -> Path:
     return root / "sandboxes" / name
 
 
+def rm_linger(root: Path) -> int:
+    """How many further ``ls`` calls a removed sandbox keeps being listed for.
+
+    Real ``sbx rm`` returns once the backend accepts the teardown, not once
+    it has finished: the name stays taken for a while afterwards (#952). Zero
+    (the default) keeps removal instant, which is what every other test
+    wants.
+    """
+    path = root / "rm_linger"
+    return int(path.read_text().strip()) if path.is_file() else 0
+
+
 def require_sandbox(root: Path, name: str) -> Path:
     path = sandbox_dir(root, name)
     if not (path / "meta.json").is_file():
@@ -106,9 +124,10 @@ def require_sandbox(root: Path, name: str) -> Path:
 # paths in worker argv (this broke CI once — keep it narrow). /workspace is
 # the fake's model of the sbx workspace mount (a symlink to the real host
 # workspace dir, created by cmd_create).
-_SANDBOX_ROOTS = re.compile(
+_SANDBOX_ROOTS_PATTERN = (
     r"(^|[\s='\"(:])(/(?:home/agent|etc/sandbox|tmp/sbxloop|workspace)(?=[/._\-\s]|$))"
 )
+_SANDBOX_ROOTS = re.compile(_SANDBOX_ROOTS_PATTERN)
 
 
 def rewrite_abs(fs: Path, arg: str) -> str:
@@ -145,6 +164,8 @@ def template_dir(root: Path, ref: str) -> Path:
 def cmd_template(root: Path, args: list[str]) -> int:
     """Model `sbx template save/ls`: save snapshots a sandbox's fs so a
     later `create --template <ref>` starts from that filesystem."""
+    import shutil
+
     if args[:1] == ["save"]:
         if len(args) != 3:
             print("usage: sbx template save SANDBOX REF", file=sys.stderr)
@@ -171,6 +192,8 @@ def cmd_template(root: Path, args: list[str]) -> int:
 
 
 def cmd_create(root: Path, args: list[str]) -> int:
+    import shutil
+
     name = None
     template = None
     rest: list[str] = []
@@ -234,6 +257,10 @@ def fake_pkill(fs: Path, args: list[str]) -> int:
     exec always qualify, because absolute-path rewriting embeds the fs path
     in their argv).
     """
+    import contextlib
+    import signal
+    import subprocess
+
     pattern = args[-1] if args else ""
     try:
         regex = re.compile(pattern)
@@ -257,6 +284,8 @@ def fake_pkill(fs: Path, args: list[str]) -> int:
 
 
 def cmd_exec(root: Path, args: list[str], stdin: str = "") -> int:
+    import subprocess
+
     args = [a for a in args if a not in ("-it", "-i", "-t")]
     if not args:
         print("usage: sbx exec SANDBOX CMD...", file=sys.stderr)
@@ -333,6 +362,8 @@ def parse_remote(root: Path, ref: str) -> Path | None:
 
 
 def cmd_cp(root: Path, args: list[str]) -> int:
+    import shutil
+
     if len(args) != 2:
         print("usage: sbx cp SRC DST", file=sys.stderr)
         return 2
@@ -364,6 +395,21 @@ def cmd_ls(root: Path) -> int:
             if not meta_path.is_file():
                 continue
             meta = json.loads(meta_path.read_text())
+            remaining = int(meta.get("removing", 0))
+            if remaining:
+                # A teardown in flight (see cmd_rm): still listed, one call
+                # closer to gone.
+                remaining -= 1
+                if remaining <= 0:
+                    # Inside the branch, not at the top of `cmd_ls`: a
+                    # teardown finishing is the rare case, and `ls` is one of
+                    # the calls this module's import budget is kept small for.
+                    import shutil
+
+                    shutil.rmtree(path)
+                    continue
+                meta["removing"] = remaining
+                meta_path.write_text(json.dumps(meta))
             rows.append(
                 (
                     path.name,
@@ -396,11 +442,21 @@ def cmd_stop(root: Path, args: list[str]) -> int:
 
 
 def cmd_rm(root: Path, args: list[str]) -> int:
+    import shutil
+
     names = [a for a in args if not a.startswith("-")]
     if len(names) != 1:
         print("usage: sbx rm [--force] SANDBOX", file=sys.stderr)
         return 2
     path = require_sandbox(root, names[0])
+    linger = rm_linger(root)
+    if linger > 0:
+        # Accepted, not finished: the sandbox stays in the inventory (and the
+        # name stays taken) until `ls` has been asked `linger` more times.
+        meta = json.loads((path / "meta.json").read_text())
+        meta["removing"] = linger
+        (path / "meta.json").write_text(json.dumps(meta))
+        return 0
     shutil.rmtree(path)
     return 0
 

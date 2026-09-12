@@ -13,7 +13,7 @@ from typing import Any, ClassVar
 import pytest
 
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import (
+from sbxloop.vcs.github.ops import (
     GithubOps,
     PaginationError,
     PostedFinding,
@@ -369,7 +369,7 @@ class TestReviewThreadListing:
 
         assert len(threads) == 1
         thread = threads[0]
-        assert thread.node_id == "PRRT_1"
+        assert thread.thread_id == "PRRT_1"
         assert thread.anchor == "a.py:10"
         assert thread.root_comment_id == 101
         assert thread.is_resolved is False
@@ -397,7 +397,7 @@ class TestReviewThreadListing:
             {"isResolved": True},  # no id
             "nonsense",  # type: ignore[arg-type]
         )
-        assert [t.node_id for t in fold_review_threads(payload)] == ["PRRT_1"]
+        assert [t.thread_id for t in fold_review_threads(payload)] == ["PRRT_1"]
 
     def test_fold_of_nonsense_is_empty(self) -> None:
         assert fold_review_threads(None) == []
@@ -459,12 +459,12 @@ class TestFakeGithubModelsThreads:
         thread = gh.pr_review_threads("o/r", 7)[0]
         assert thread.has_reply_from(gh.user_login) is True
 
-        assert gh.resolve_review_thread(thread.node_id) is True
+        assert gh.resolve_review_thread(thread.thread_id) is True
         assert gh.pr_review_threads("o/r", 7)[0].is_resolved is True
-        assert gh.resolved == [thread.node_id]
+        assert gh.resolved == [thread.thread_id]
 
         gh.pr_issue_comment("o/r", 7, "Reconciliation — round 1")
-        assert gh.issue_comments == ["Reconciliation — round 1"]
+        assert gh.issue_comments_posted == ["Reconciliation — round 1"]
 
     def test_thread_comment_is_typed(self) -> None:
         comment = ThreadComment(1, "someone", "body")

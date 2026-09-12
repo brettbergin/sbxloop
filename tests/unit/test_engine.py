@@ -43,9 +43,9 @@ from sbxloop.errors import (
     WorkerError,
 )
 from sbxloop.events import Event, EventBus, HostEventTypes
-from sbxloop.gh.ops import ChecksVerdict, FailedCheck, GithubOps
 from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.vcs.github.ops import ChecksVerdict, FailedCheck, GithubOps
 from sbxloop.verifylint import project_gate
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import (
@@ -1790,7 +1790,7 @@ class TestPipeline:
         assert body.startswith("**addressed in commit2**: say hello, not hi")
         assert f"sbxloop:reconciled run={result.run_id} round=1" in body
         assert fake.resolved and all(t.is_resolved for t in fake.threads)
-        assert fake.issue_comments == []
+        assert fake.issue_comments_posted == []
 
         (event,) = self._events(harness, HostEventTypes.REVIEW_RECONCILED)
         assert event.data["round"] == 1
@@ -1842,10 +1842,10 @@ class TestPipeline:
             reopened.close()
         assert [(p.round, p.anchor, p.body_only) for p in posted] == [(1, "hello.txt:1", False)]
         (only,) = posted
-        assert only.comment_id is not None and only.thread_node_id is not None
-        assert (only.comment_id, only.thread_node_id) == (
+        assert only.comment_id is not None and only.thread_id is not None
+        assert (only.comment_id, only.thread_id) == (
             fake.threads[0].root_comment_id,
-            fake.threads[0].node_id,
+            fake.threads[0].thread_id,
         )
 
     def test_delivery_opens_one_draft_pr_and_refreshes_it(self, harness: Harness) -> None:
@@ -1883,7 +1883,7 @@ class TestPipeline:
         harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
         result = harness.pipeline(fake).start("ship hello")
         assert result.state == "merged", result.reason
-        assert any("sbxloop:review-record" in c for c in fake.issue_comments)
+        assert any("sbxloop:review-record" in c for c in fake.issue_comments_posted)
         (verdict,) = self._events(harness, HostEventTypes.REVIEW_VERDICT)
         assert verdict.data["verdict"] == "approve" and verdict.data["url"] == ""
 
@@ -1905,10 +1905,12 @@ class TestPipeline:
         assert [(b["path"], b["line"], b["commit_id"]) for b in posts] == [
             ("hello.txt", 1, "commit1")
         ]
-        assert len(fake.issue_comments) >= 2
-        assert fake.issue_comments[0].startswith("**Review verdict: changes requested** (round 1)")
-        assert "Findings without a thread" not in fake.issue_comments[0]
-        assert fake.issue_comments[-1].startswith("**Review verdict: approve** (round 2)")
+        assert len(fake.issue_comments_posted) >= 2
+        assert fake.issue_comments_posted[0].startswith(
+            "**Review verdict: changes requested** (round 1)"
+        )
+        assert "Findings without a thread" not in fake.issue_comments_posted[0]
+        assert fake.issue_comments_posted[-1].startswith("**Review verdict: approve** (round 2)")
         # The thread was reconciled like any review-created one.
         (thread,) = [t for t in fake.threads if t.anchor == "hello.txt:1"]
         assert thread.is_resolved and thread.has_reply_from(fake.user_login)
@@ -1927,7 +1929,7 @@ class TestPipeline:
         assert fake.threads == [], "the refused anchor opened no thread"
         assert (
             "Findings without a thread of their own:\n- `hello.txt:1` [major]"
-            in (fake.issue_comments[0])
+            in (fake.issue_comments_posted[0])
         )
         rows = [r for r in harness_rows(harness, result.run_id) if r.phase == "review"]
         posted = json.loads(rows[0].output_json or "{}")["posted"]
@@ -2061,7 +2063,7 @@ class TestPipeline:
         assert "The fix round deferred" in fake.issues_created[2][1]
         assert fake.labels_created == ["sbxloop:follow-up"]
         # The PR gets one pointer comment listing them.
-        pointer = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+        pointer = [c for c in fake.issue_comments_posted if c.startswith("## Follow-ups")]
         assert len(pointer) == 1 and "issues/901" in pointer[0] and "issues/903" in pointer[0]
         (event,) = self._events(harness, HostEventTypes.RUN_FOLLOWUPS)
         assert event.data["mode"] == "issues" and len(event.data["filed"]) == 3
@@ -2124,7 +2126,7 @@ class TestPipeline:
         harness.script(self._followup_script())
         result = harness.pipeline(fake, landing={"followups": "comment"}).start("ship hello")
         assert result.state == "merged" and fake.issues_created == []
-        (listed,) = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+        (listed,) = [c for c in fake.issue_comments_posted if c.startswith("## Follow-ups")]
         assert (
             "Not filed as issues" in listed and "- [ ] **the greeting is not documented**" in listed
         )
@@ -2136,7 +2138,7 @@ class TestPipeline:
         harness.script(self._followup_script())
         result = harness.pipeline(fake, landing={"followups": "off"}).start("ship hello")
         assert result.state == "merged" and fake.issues_created == []
-        assert not any(c.startswith("## Follow-ups") for c in fake.issue_comments)
+        assert not any(c.startswith("## Follow-ups") for c in fake.issue_comments_posted)
         assert self._events(harness, HostEventTypes.RUN_FOLLOWUPS) == []
 
     def test_the_cap_bounds_what_is_filed(self, harness: Harness) -> None:
@@ -2319,7 +2321,7 @@ class TestPipeline:
         assert result.state == "merged"
         assert [t.spec.id for t in result.tasks] == ["t1"], "no fix round for the base's red"
         assert self._events(harness, HostEventTypes.FIX_ROUND) == []
-        assert any("`flaky` — already red on base123" in c for c in fake.issue_comments)
+        assert any("`flaky` — already red on base123" in c for c in fake.issue_comments_posted)
         (checks,) = self._events(harness, HostEventTypes.LANDING_CHECKS)
         assert checks.data["preexisting"] == ["flaky"] and checks.data["state"] == "green"
 
@@ -2341,7 +2343,8 @@ class TestPipeline:
         assert run.ci_rounds == 1, "one round, not max_ci_rounds"
         assert engine.store.advisory_rounds(result.run_id) == frozenset({"lint"})
         assert any(
-            "`lint` — went red on this PR but is not required" in c for c in fake.issue_comments
+            "`lint` — went red on this PR but is not required" in c
+            for c in fake.issue_comments_posted
         )
 
     def test_an_advisory_regression_with_no_round_left_is_merged_over(
@@ -2356,7 +2359,7 @@ class TestPipeline:
         assert result.state == "merged"
         assert [t.spec.id for t in result.tasks] == ["t1"]
         assert engine.store.advisory_rounds(result.run_id) == frozenset({"lint"})
-        assert len(fake.issue_comments) >= 1
+        assert len(fake.issue_comments_posted) >= 1
 
     def test_a_non_admin_token_gates_only_on_what_the_pr_says_is_required(
         self, harness: Harness
@@ -2381,7 +2384,8 @@ class TestPipeline:
         assert status.data["regressions"] == ["lint"], "red, but the PR's own and not gating"
         assert status.data["pending"] == [], "the advisory `docs` is not waited on"
         assert any(
-            "`lint` — went red on this PR but is not required" in c for c in fake.issue_comments
+            "`lint` — went red on this PR but is not required" in c
+            for c in fake.issue_comments_posted
         )
 
     def test_a_non_admin_token_without_a_rollup_gates_on_everything(self, harness: Harness) -> None:
@@ -2518,7 +2522,7 @@ class TestPipeline:
         """#676: the loop never PUTs a merge on a merge-queue base. The
         queue's removal for a red check on its own commit is one CI round
         with that check named; the fix is re-enqueued and the queue merges."""
-        from sbxloop.gh.ops import QueueEntry, QueueState
+        from sbxloop.vcs.github.ops import QueueEntry, QueueState
 
         fake = FakeGithub()
         fake.rules = [{"type": "merge_queue", "parameters": {"merge_method": "SQUASH"}}]
@@ -2603,7 +2607,7 @@ class TestPipeline:
     def test_a_queue_removal_past_the_ci_budget_fails_naming_the_check(
         self, harness: Harness
     ) -> None:
-        from sbxloop.gh.ops import QueueEntry, QueueState
+        from sbxloop.vcs.github.ops import QueueEntry, QueueState
 
         fake = FakeGithub()
         fake.rules = [{"type": "merge_queue"}]
@@ -2866,8 +2870,8 @@ class TestPipeline:
             (91, "**addressed in commit2**: says hello now")
         ]
         assert fake.merges, "a bot's standing review is not a block"
-        assert any("bots do not dismiss their reviews" in c for c in fake.issue_comments)
-        assert any("`coderabbitai[bot]`" in c for c in fake.issue_comments)
+        assert any("bots do not dismiss their reviews" in c for c in fake.issue_comments_posted)
+        assert any("`coderabbitai[bot]`" in c for c in fake.issue_comments_posted)
 
     def test_a_bot_with_no_ci_round_left_is_merged_over_without_a_round(
         self, harness: Harness
@@ -2883,7 +2887,7 @@ class TestPipeline:
         assert [t.spec.id for t in result.tasks] == ["t1"]
         assert self._events(harness, HostEventTypes.FIX_ROUND) == []
         assert engine.store.bot_round_spent(result.run_id)
-        assert any("bots do not dismiss their reviews" in c for c in fake.issue_comments)
+        assert any("bots do not dismiss their reviews" in c for c in fake.issue_comments_posted)
 
     def test_a_bot_round_spends_a_ci_round_not_a_review_round(self, harness: Harness) -> None:
         fake = FakeGithub()
@@ -3431,7 +3435,7 @@ class TestReviewPostFallback:
         assert result.state == "merged"
         fake.assert_no_failed_jobs()
         assert [t.anchor for t in fake.threads] == ["hello.txt:1"]
-        bodies = fake.issue_comments if self_review else [b for _, b, _ in fake.reviews]
+        bodies = fake.issue_comments_posted if self_review else [b for _, b, _ in fake.reviews]
         assert f"`{anchor}` [nit] outside nit" in bodies[0]
         assert "valid nit" not in bodies[0]
         records = engine.store.posted_findings(result.run_id)
@@ -3461,7 +3465,7 @@ class TestReviewPostFallback:
         harness.script([taskgraph(task("t1")), FILES_BUILD, review("approve", "reviewed", nit)])
         engine = harness.pipeline(fake)
         result = engine.start("write hello.txt")
-        bodies = fake.issue_comments if self_review else [b for _, b, _ in fake.reviews]
+        bodies = fake.issue_comments_posted if self_review else [b for _, b, _ in fake.reviews]
         assert "`hello.txt:1` [nit] keep this nit" in bodies[0]
         assert fake.threads == []
         assert not any(status == 422 for _, _, _, status in fake.failed_jobs)
@@ -3500,7 +3504,8 @@ class TestReviewPostFallback:
         (record,) = engine.store.posted_findings(result.run_id)
         assert record.anchor == "unchanged.txt:42" and record.body_only
         assert any(
-            "unchanged.txt:42" in body and "addressed" in body for body in fake.issue_comments
+            "unchanged.txt:42" in body and "addressed" in body
+            for body in fake.issue_comments_posted
         )
 
     def test_a_review_refused_for_its_anchors_is_reposted_in_the_body(
@@ -3696,11 +3701,11 @@ class TestAppIdentityLanding:
     from the credential itself, and landing never classifies with ""."""
 
     def _loop_thread(self, fake: FakeGithub) -> None:
-        from sbxloop.gh.ops import ReviewThread, ThreadComment
+        from sbxloop.vcs.github.ops import ReviewThread, ThreadComment
 
         fake.threads = [
             ReviewThread(
-                node_id="PRRT_1",
+                thread_id="PRRT_1",
                 is_resolved=True,
                 path="a.py",
                 line=1,
@@ -3760,8 +3765,8 @@ class TestAppIdentityLanding:
         """#622 acceptance: the loop is the App `sbxloop[bot]`; a person
         whose login is `sbxloop` opens a thread — theirs, acknowledged as
         a human's; the App's own resolved thread is its own."""
-        from sbxloop.gh.ops import ReviewThread, ThreadComment
         from sbxloop.sbx.provision import Provisioner
+        from sbxloop.vcs.github.ops import ReviewThread, ThreadComment
 
         fake = FakeGithub()
         fake.user_login = "sbxloop"
@@ -3772,14 +3777,14 @@ class TestAppIdentityLanding:
         )
         fake.threads = [
             ReviewThread(
-                node_id="PRRT_1",
+                thread_id="PRRT_1",
                 is_resolved=True,
                 path="a.py",
                 line=1,
                 comments=(ThreadComment(1, "sbxloop", "[minor] naming", is_bot=True),),
             ),
             ReviewThread(
-                node_id="PRRT_2",
+                thread_id="PRRT_2",
                 is_resolved=False,
                 path="b.py",
                 line=2,
@@ -3806,7 +3811,7 @@ class TestReviewRecordRepost:
         harness.script([taskgraph(task("t1")), FILES_BUILD, REVIEW_OK])
         result = harness.pipeline(fake).start("land it")
         assert result.state == "merged", result.reason
-        records = [c for c in fake.issue_comments if "sbxloop:review-record" in c]
+        records = [c for c in fake.issue_comments_posted if "sbxloop:review-record" in c]
         assert len(records) == 1
         assert "Review verdict: approve" in records[0]
 

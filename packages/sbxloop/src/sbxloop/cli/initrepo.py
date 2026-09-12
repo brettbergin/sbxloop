@@ -18,9 +18,9 @@ from rich.table import Table
 
 from sbxloop.config import Config, _valid_repo
 from sbxloop.events import EventBus
-from sbxloop.gh.labels import EnsureResult, LabelSpec, ensure_label, lifecycle_specs
 from sbxloop.log import get_logger
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.vcs.github.labels import EnsureResult, LabelSpec, ensure_label, lifecycle_specs
 
 log = get_logger(__name__)
 

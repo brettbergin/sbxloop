@@ -7,7 +7,7 @@ from typing import Any, NamedTuple
 import pytest
 
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import (
+from sbxloop.vcs.github.ops import (
     MAX_PAGES,
     FailedCheck,
     GithubOps,
@@ -17,7 +17,7 @@ from sbxloop.gh.ops import (
     fold_review_verdicts,
     raw_pages,
 )
-from sbxloop_worker.protocol import ErrorInfo, JobRequest, JobResult
+from sbxloop_worker.protocol import ErrorInfo, JobRequest, JobResult, TransportSpec
 from tests.fakes.github_errors import worker_error
 
 
@@ -69,7 +69,7 @@ class TestGithubOpsFacade:
         ref = ops.issue_create("o/r", "Title", body="Body", labels=["sbxloop"])
         assert ref == IssueRef(number=5, url="https://x/5")
         job = client.jobs[0]
-        assert job.kind == "github.op"
+        assert job.kind == "vcs.op"
         assert job.run_id == "r1"
         assert job.params["labels"] == ["sbxloop"]
 
@@ -697,3 +697,45 @@ class TestLanding:
         ops, _ = make_ops({"raw.api": "FAIL"})
         with pytest.raises(GithubOpsError):
             ops.branch_delete("o/r", "sbxloop/r42")
+
+
+class TestTransportDescriptor:
+    """#1015: every job the GitHub backend submits says how the worker
+    reaches the forge — and says it with names, never a token value."""
+
+    def test_a_backend_built_with_a_descriptor_sends_it_on_every_job(self) -> None:
+        from sbxloop.vcs.github.ops import github_transport
+
+        client = StubWorkerClient({"repo.get": {"default_branch": "main"}})
+        ops = GithubOps(client, "r1", transport=github_transport("https://ghe.example.com/api/v3"))
+        ops.repo_get("o/r")
+        (job,) = client.jobs
+        assert job.kind == "vcs.op"
+        descriptor = job.params["transport"]
+        assert descriptor["api_url"] == "https://ghe.example.com/api/v3"
+        assert descriptor["auth"] == "bearer" and descriptor["pagination"] == "page"
+        assert descriptor["token_env"] == ["GH_TOKEN", "GITHUB_TOKEN"]
+        assert descriptor["gh_cli"] is True
+        # Names travel (the variables the sandbox holds the token in); no
+        # field carries a credential value.
+        assert "token" not in descriptor
+        assert set(descriptor) == set(TransportSpec.model_fields)
+        assert job.params["repo"] == "o/r", "the op's own params are untouched"
+
+    def test_a_backend_built_without_one_sends_none(self) -> None:
+        client = StubWorkerClient({"repo.get": {"default_branch": "main"}})
+        GithubOps(client, "r1").repo_get("o/r")
+        (job,) = client.jobs
+        assert job.kind == "vcs.op" and "transport" not in job.params
+
+    def test_the_daemon_and_the_engine_derive_it_from_the_configuration(self) -> None:
+        from sbxloop.config import Config
+        from sbxloop.engine.engine import LoopEngine
+        from sbxloop.vcs.github.ops import github_transport
+
+        config = Config.model_validate(
+            {"github": {"repo": "o/r", "api_url": "https://ghe.example.com/api/v3"}}
+        )
+        spec = github_transport(config.github.api_url)
+        assert spec.api_url == "https://ghe.example.com/api/v3"
+        assert LoopEngine._default_github_ops.__doc__, "the engine's default factory carries it"

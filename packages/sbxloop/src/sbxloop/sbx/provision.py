@@ -9,7 +9,7 @@ The credential split is enforced here:
 - **github sandbox** gets only ``GH_TOKEN`` — either the operator's PAT
   (via sbx's built-in ``github`` secret service, as before), or a
   host-minted GitHub App installation token (#568; see
-  :mod:`sbxloop.gh.appauth`). It is provisioned only when the GitHub
+  :mod:`sbxloop.vcs.github.appauth`). It is provisioned only when the GitHub
   integration is configured (``[github].repo``); otherwise runs have no
   GitHub capability and no GitHub credential is required.
 
@@ -54,16 +54,14 @@ from sbxloop import backends, hostgit, toolchains
 from sbxloop.config import Config, CredentialConfig, RegistryConfig, RepoConfig, SandboxConfig
 from sbxloop.endpoint import Endpoint, parse_endpoint
 from sbxloop.engine.model import RunKind
-from sbxloop.errors import ConfigError, GithubOpsError, ProvisionError, SbxError
-from sbxloop.events import EventBus
-from sbxloop.gh.appauth import (
-    APP_ID_ENV,
-    APP_INSTALLATION_ID_ENV,
-    APP_KEY_ENV,
-    APP_KEY_PATH_ENV,
-    AppTokenSource,
-    app_credentials,
+from sbxloop.errors import (
+    ConfigError,
+    GithubOpsError,
+    ProvisionError,
+    SbxError,
+    SbxNotFoundError,
 )
+from sbxloop.events import EventBus
 from sbxloop.hostgit import exclude_from_git
 from sbxloop.ids import branch_name
 from sbxloop.log import get_logger
@@ -95,6 +93,14 @@ from sbxloop.sbx.secretstate import (
     custom_rm_candidates,
     service_rm_candidates,
     set_secret_replacing,
+)
+from sbxloop.vcs.github.appauth import (
+    APP_ID_ENV,
+    APP_INSTALLATION_ID_ENV,
+    APP_KEY_ENV,
+    APP_KEY_PATH_ENV,
+    AppTokenSource,
+    app_credentials,
 )
 from sbxloop_worker.protocol import (
     OPENAI_BASE_URL_ENV,
@@ -1669,6 +1675,12 @@ class Provisioner:
             for sandbox in created:
                 try:
                     sandbox.rm()
+                except SbxNotFoundError:
+                    # Nothing left to clean up. A sandbox that vanished under
+                    # the attempt is the usual reason the attempt failed at
+                    # all (#952) — saying "cleanup failed" on top of that
+                    # sends the reader after a second, imaginary fault.
+                    log.debug("sandbox.rollback_already_gone", run=run_id, sandbox=sandbox.name)
                 except SbxError:
                     log.warning(
                         "sandbox.rollback_remove_failed",
@@ -1992,6 +2004,8 @@ class Provisioner:
             if created is not None:
                 try:
                     created.rm()
+                except SbxNotFoundError:
+                    log.debug("sandbox.rollback_already_gone", sandbox=name)
                 except SbxError:
                     log.warning("sandbox.rollback_remove_failed", sandbox=name, exc_info=True)
             for rm in registered_secret_rms:

@@ -17,8 +17,8 @@ from typing import Literal
 
 from sbxloop.config import LABEL_KINDS, LabelSet
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import GithubOps, raw_pages
 from sbxloop.log import get_logger
+from sbxloop.vcs.protocol import IssueOps
 
 log = get_logger(__name__)
 
@@ -58,7 +58,7 @@ def lifecycle_specs(labels: LabelSet, followup: str | None = None) -> list[Label
     return specs
 
 
-def ensure_label(ops: GithubOps, repo: str, spec: LabelSpec) -> EnsureResult:
+def ensure_label(ops: IssueOps, repo: str, spec: LabelSpec) -> EnsureResult:
     """Make sure ``repo`` carries ``spec``; say whether it was created,
     already there, or could not be made.
 
@@ -85,11 +85,7 @@ def ensure_label(ops: GithubOps, repo: str, spec: LabelSpec) -> EnsureResult:
         log.debug("github.label_present", repo=repo, label=spec.name)
         return "present"
     try:
-        ops.raw(
-            "POST",
-            f"/repos/{repo}/labels",
-            {"name": spec.name, "color": spec.color, "description": spec.description},
-        )
+        ops.label_create(repo, name=spec.name, color=spec.color, description=spec.description)
     except GithubOpsError as exc:
         text = str(exc)
         exists = "already_exists" in text or "already exists" in text
@@ -102,12 +98,12 @@ def ensure_label(ops: GithubOps, repo: str, spec: LabelSpec) -> EnsureResult:
     return "created"
 
 
-def missing_labels(ops: GithubOps, repo: str, specs: list[LabelSpec]) -> list[str]:
+def missing_labels(ops: IssueOps, repo: str, specs: list[LabelSpec]) -> list[str]:
     """The names in ``specs`` that ``repo`` does not carry (the doctor's
     drift row). Names compare case-insensitively, as GitHub does."""
     present = {
         str(label.get("name") or "").casefold()
-        for label in raw_pages(ops, f"/repos/{repo}/labels")
+        for label in ops.labels_list(repo)
         if isinstance(label, dict)
     }
     return [spec.name for spec in specs if spec.name.casefold() not in present]

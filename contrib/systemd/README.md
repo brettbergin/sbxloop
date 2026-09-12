@@ -11,11 +11,14 @@ builds it.
    curl -fsSL https://raw.githubusercontent.com/brettbergin/sbxloop/main/scripts/install.sh | sh
    ```
 
-   That puts `uv`, a CPython and the `sbxloop[discord,slack]` venv under
-   the home, then runs `sbxloop init --systemd`, which writes the
-   launchers (`~/.sbxloop/bin/sbxloop`, `~/.sbxloop/bin/sbx`), installs
-   Docker's `sbx` under `~/.sbxloop/sbx`, writes `config/sbxloop.toml` and
-   a 0600 `config/secrets.env`, renders the units into `~/.sbxloop/systemd`
+   The host needs curl, tar and git already installed — the script checks
+   all three before it downloads anything, git included: sbxloop cannot
+   start without one. That puts `uv`, a CPython and the
+   `sbxloop[discord,slack]` venv under the home, then runs
+   `sbxloop init --systemd`, which writes the launchers
+   (`~/.sbxloop/bin/sbxloop`, `~/.sbxloop/bin/sbx`), installs Docker's
+   `sbx` under `~/.sbxloop/sbx`, writes `config/sbxloop.toml` and a 0600
+   `config/secrets.env`, renders the units into `~/.sbxloop/systemd`
    and enables them (never starts them), and turns lingering on so user
    units outlive the login. Put `~/.sbxloop/bin` on your `PATH`. Already
    have sbxloop installed some other way? `sbxloop init --systemd` from
@@ -85,10 +88,12 @@ sbxloop init --systemd --no-sbx
 systemctl --user reset-failed sbxloop-daemon && systemctl --user restart sbxloop-daemon
 ```
 
-Every command runs from any directory: the home is the home. `reset-failed`
-matters: `StartLimitBurst=5` per 600s leaves a unit that crash-looped in
-`failed`, where a plain `restart` will not revive it. The daemon comes back
-**unpaused** regardless — holds are in-memory only — so re-take any you want
+Every command runs from any directory: the home is the home. On a host
+installed under a custom `SBXLOOP_HOME`, read `~/.sbxloop` above as that
+root — `sbxloop` reads the variable itself, so only the two explicit
+`~/.sbxloop/…` paths change. `reset-failed` matters: `StartLimitBurst=5` per
+600s leaves a unit that crash-looped in `failed`, where a plain `restart`
+will not revive it. The daemon comes back **unpaused** regardless — holds are in-memory only — so re-take any you want
 to keep. A downgrade is the same commands with an older version, or
 `sbxloop backup restore <name>` for the config and state of a snapshot.
 
@@ -120,6 +125,12 @@ brings the backend up first.
 `github-runner.service` is **only needed for the automated upgrade above**.
 It runs a GitHub Actions runner as the *same user*, which is what lets a
 workflow do `systemctl --user restart sbxloop-daemon`;
-`sbxloop init --systemd --runner ~/actions-runner` renders it. Skip it if
-you upgrade by hand. All three are user units, so `loginctl enable-linger`
-(which init does) covers them.
+`sbxloop init --systemd --runner ~/actions-runner` renders it — with that
+directory's absolute path in `WorkingDirectory=` and `ExecStart=`, and
+`SBXLOOP_HOME` set to the home it was rendered against, so a job on that
+runner upgrades the installation that is there rather than assuming the
+default. That is why the template is never copied by hand. Carry
+`--runner DIR` on every later init on that host, the upgrade one above
+included, or the unit stops being refreshed. Skip all of it if you upgrade
+by hand. All three are user units, so `loginctl enable-linger` (which init
+does) covers them.
