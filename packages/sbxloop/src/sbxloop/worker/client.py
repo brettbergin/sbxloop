@@ -161,10 +161,39 @@ def _toolchain_probe(selected: Sequence[toolchains.Toolchain]) -> str:
 log = get_logger(__name__)
 
 
-def _output_tail(result: ExecResult, limit: int = 2000) -> str:
+# Echoed to both streams by a setup command's script once the login shell has
+# read its profile, so what the image prints on login can be told from what the
+# command produced. A target's sandbox image is free to announce itself — a
+# version manager, a banner, an MOTD — and none of that is the operator's
+# command talking, least of all in the error it failed with, where a long
+# enough banner pushed the real message out of the tail.
+SETUP_MARK = "sbxloop-setup-begin"
+
+
+def _after_mark(text: str, mark: str) -> str:
+    """What a stream carried after ``mark``'s own line.
+
+    The first occurrence, not the last. The profile runs before the mark is
+    echoed, so the first one is always the script's own — which leaves a
+    command that echoes the token itself with all of its output.
+    """
+    _profile, separator, rest = text.partition(f"{mark}\n")
+    return rest if separator else text
+
+
+def _output_tail(result: ExecResult, limit: int = 2000, *, mark: str | None = None) -> str:
     """Combined stderr+stdout tail: sbx exec surfaces some in-sandbox errors
-    on stdout, so stderr alone can be empty exactly when it matters."""
-    combined = "\n".join(part.strip() for part in (result.stderr, result.stdout) if part.strip())
+    on stdout, so stderr alone can be empty exactly when it matters.
+
+    ``mark`` names a token the script echoes to both streams once the login
+    profile has run; everything before it is the profile's and is dropped. A
+    stream without the mark is kept whole — the script never reached the echo,
+    so whatever is there is the diagnostic.
+    """
+    stderr, stdout = result.stderr, result.stdout
+    if mark is not None:
+        stderr, stdout = _after_mark(stderr, mark), _after_mark(stdout, mark)
+    combined = "\n".join(part.strip() for part in (stderr, stdout) if part.strip())
     return combined[-limit:] if combined else "(no output)"
 
 
@@ -806,24 +835,35 @@ class WorkerClient:
         output tail become one ``sandbox.setup`` event; the first non-zero
         exit stops the sequence and fails provisioning naming the command,
         because the project would not build for the agent either.
+
+        The tail is the command's own output: whatever the image prints on
+        login is cut at ``SETUP_MARK``, so a banner cannot crowd out the
+        message a failing command ended the run with.
         """
         for command in commands:
             started = time.monotonic()
             payload = self._env_payload()
             script = f"cd {shlex.quote(cwd)} && {command}"
+            # First in the login shell's script, and ahead of the environment:
+            # the profile has run by the time the mark is echoed, so it divides
+            # the image's own output from everything sbxloop and the operator
+            # then do — an env file that fails to source still has its say.
+            mark = f"echo {SETUP_MARK}; echo {SETUP_MARK} >&2; "
             if payload is None:
                 # The env file is what the worker process loads at startup;
                 # a template without one (no secrets, proxy delivery) runs
                 # the command in the profile's environment alone.
-                inner = shlex.join(["sh", "-lc", f"[ -f {ENV_FILE} ] && . {ENV_FILE}; {script}"])
+                inner = shlex.join(
+                    ["sh", "-lc", f"{mark}[ -f {ENV_FILE} ] && . {ENV_FILE}; {script}"]
+                )
                 cmd = ["sh", "-c", f"exec {inner}"]
             else:
                 inner = shlex.join(
-                    ["sh", "-lc", f'eval "${JOB_ENV_VAR}"; unset {JOB_ENV_VAR}; {script}']
+                    ["sh", "-lc", f'{mark}eval "${JOB_ENV_VAR}"; unset {JOB_ENV_VAR}; {script}']
                 )
                 cmd = ["sh", "-c", f'{JOB_ENV_VAR}="$(cat)" exec {inner}']
             result = self.sandbox.exec(cmd, timeout=timeout, stdin=payload)
-            tail = _output_tail(result)
+            tail = _output_tail(result, mark=SETUP_MARK)
             if payload is not None:
                 tail = _scrub(tail, self._secret_values(payload))
             duration = round(time.monotonic() - started, 1)

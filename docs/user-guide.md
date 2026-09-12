@@ -1165,8 +1165,11 @@ the in-VM env file) and under the
 run's egress policy as already applied — a command that needs a host the
 allowlist lacks fails here, not in a phase. Every command's exit code,
 duration and output tail is a `sandbox.setup` event (delivered secret values
-scrubbed); the first non-zero exit ends the run at provisioning with the
-command in the error, and `keep_on_failure` keeps the sandbox for `sbxloop shell`. A `[[github.repos]]` entry may carry its own `apt_packages` or
+scrubbed). The tail is the command's own output: an image that announces
+itself on login — a version manager, a banner, an MOTD — has that dropped, so
+a banner cannot crowd the command out of the tail, while a launch that fails
+before the command runs keeps everything it printed. The first non-zero exit
+ends the run at provisioning with the command in the error, and `keep_on_failure` keeps the sandbox for `sbxloop shell`. A `[[github.repos]]` entry may carry its own `apt_packages` or
 `setup_commands`, which replaces the top-level list; a per-repo package list
 is paid at that repository's provision, since the bake reads the global list
 only.
