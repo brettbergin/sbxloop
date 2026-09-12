@@ -65,6 +65,7 @@ from sbxloop.db.daemon_models import (
     DaemonRunRow,
     DaemonStateRow,
     GatePromptRow,
+    HoldRow,
     LocalMessageRow,
     MergeGateRow,
     PendingClarificationRow,
@@ -476,6 +477,8 @@ class MergeGate(NamedTuple):
     resolved_by: str | None
     detail: str | None
     kind: str = "merge"  # merge | publish
+    #: Bumped on every write; what an `expected_revision` is checked against.
+    revision: int = 0
 
 
 class ReviewHold(NamedTuple):
@@ -500,6 +503,32 @@ class ReviewHold(NamedTuple):
     resolved_at: float | None
     resolved_by: str | None
     detail: str | None
+    #: Bumped on every write; what an `expected_revision` is checked against.
+    revision: int = 0
+
+
+class HoldRecord(NamedTuple):
+    """One named pause hold and whose it is (revision 0010)."""
+
+    name: str
+    owner_id: str | None
+    owner_display: str | None
+    via: str
+    reason: str
+    created_at: float
+    operation_id: str | None
+
+
+def _row_to_pause_hold(row: HoldRow) -> HoldRecord:
+    return HoldRecord(
+        name=str(row.name),
+        owner_id=None if row.owner_id is None else str(row.owner_id),
+        owner_display=None if row.owner_display is None else str(row.owner_display),
+        via=str(row.via or ""),
+        reason=str(row.reason or ""),
+        created_at=float(row.created_at),
+        operation_id=None if row.operation_id is None else str(row.operation_id),
+    )
 
 
 def _row_to_hold(row: ReviewHoldRow) -> ReviewHold:
@@ -528,6 +557,7 @@ def _row_to_hold(row: ReviewHoldRow) -> ReviewHold:
         resolved_at=row.resolved_at,
         resolved_by=row.resolved_by,
         detail=row.detail,
+        revision=int(row.revision or 0),
     )
 
 
@@ -588,6 +618,7 @@ def _row_to_gate(row: MergeGateRow) -> MergeGate:
         resolved_by=row.resolved_by,
         detail=row.detail,
         kind=str(row.kind or "merge"),
+        revision=int(row.revision or 0),
     )
 
 
@@ -817,6 +848,7 @@ def _row_to_item(row: WorkItemRow) -> WorkItem:
         profile=row.profile,
         recipe=row.recipe,
         recipe_target=row.recipe_target,
+        revision=int(row.revision or 0),
     )
 
 
@@ -3291,6 +3323,81 @@ class DaemonStore:
         log.info("store.review_hold_resolved", run=run_id, state=state, by=by)
 
     # -- circuit breaker ---------------------------------------------------------
+
+    # -- pause holds (revision 0010) --------------------------------------------
+
+    def holds(self) -> list[HoldRecord]:
+        """Every standing hold, by name."""
+        with self._read() as session:
+            return [
+                _row_to_pause_hold(row)
+                for row in session.scalars(select(HoldRow).order_by(HoldRow.name.asc()))
+            ]
+
+    def take_hold(
+        self,
+        name: str,
+        now: float,
+        *,
+        owner_id: str | None = None,
+        owner_display: str | None = None,
+        via: str = "",
+        reason: str = "",
+        operation_id: str | None = None,
+    ) -> bool:
+        """Record a hold. Idempotent per name: ``True`` when it is new, so
+        the caller narrates the transition once."""
+        with self._write() as session:
+            result = session.execute(
+                insert(HoldRow)
+                .prefix_with("OR IGNORE")
+                .values(
+                    name=name,
+                    owner_id=owner_id,
+                    owner_display=owner_display,
+                    via=via,
+                    reason=reason,
+                    created_at=now,
+                    operation_id=operation_id,
+                )
+            )
+            return _rowcount(result) == 1
+
+    def release_hold(self, name: str | None) -> list[str]:
+        """Release one hold (``None``: every hold). Returns what was released."""
+        with self._write() as session:
+            stmt = select(HoldRow.name)
+            if name is not None:
+                stmt = stmt.where(HoldRow.name == name)
+            released = sorted(str(n) for n in session.scalars(stmt))
+            if released:
+                session.execute(delete(HoldRow).where(HoldRow.name.in_(released)))
+            return released
+
+    def admit_resume(self, item_id: str, run_id: str, now: float) -> WorkItem:
+        """An operator's resume of a pinned run: the item goes back to the
+        queue with the run kept, eligible at once, and the next tick resumes
+        it through the same gates a fresh dispatch faces — never a second
+        engine. A compare-and-set on the pin: ``KeyError`` when the item no
+        longer carries the run or is not settled."""
+        stored = item_id
+        item_id = normalize_item_id(item_id)
+        with self._write() as session:
+            result = session.execute(
+                update(WorkItemRow)
+                .where(
+                    _id_where(stored),
+                    WorkItemRow.run_id == run_id,
+                    WorkItemRow.state.in_(("queued", "cancelled", "failed")),
+                )
+                .values(state="queued", not_before=None, updated_at=now)
+            )
+            if _rowcount(result) != 1:
+                raise KeyError(f"{item_id} does not carry run {run_id} in a resumable state")
+            row = session.scalars(select(WorkItemRow).where(_id_where(stored))).one()
+            fresh = _row_to_item(row)
+        log.info("store.resume_admitted", item=item_id, run=run_id)
+        return fresh
 
     def breaker(self) -> tuple[float | None, int]:
         """(opened_at, consecutive_failures) as last persisted. Kept in the

@@ -241,24 +241,6 @@ jobs:
           # from this sbxloop release's default.
           "${SBXLOOP}" init --systemd --no-sbx
 
-      - name: Snapshot the holds to restore
-        id: state
-        if: steps.installed.outputs.changed == 'true'
-        run: |
-          set -euo pipefail
-          # Holds are in-memory, so the restart drops every one of them.
-          # Read them now — an operator who paused during the wait must
-          # still be paused afterwards. Ours is dropped: the restart
-          # releases it.
-          status="$("${SBXLOOP}" daemon ctl status --json --timeout 30 || true)"
-          holds="$(jq -r '.holds // [] | .[]' <<<"${status}" 2>/dev/null | tr '\n' ' ' || true)"
-          keep=""
-          for h in ${holds}; do
-            [ "${h}" = "${HOLD}" ] && continue
-            keep="${keep} ${h}"
-          done
-          echo "holds=${keep# }" >> "$GITHUB_OUTPUT"
-
       - name: Restart the daemon
         if: steps.installed.outputs.changed == 'true'
         run: |
@@ -320,19 +302,10 @@ jobs:
             exit 1
           fi
 
-      - name: Restore the other holds
-        if: always() && steps.installed.outputs.changed == 'true' && steps.state.outcome == 'success'
-        env:
-          HOLDS: ${{ steps.state.outputs.holds }}
-        run: |
-          set -euo pipefail
-          for h in ${HOLDS}; do
-            "${SBXLOOP}" daemon ctl pause --hold "${h}" --timeout 60 \
-              || echo "::warning::could not restore hold ${h}"
-          done
-
       - name: Release the deploy hold
-        # Whatever happened, our hold must not outlive the job.
+        # Whatever happened, our hold must not outlive the job. Holds survive the restart,
+        # so a job that dies after it would otherwise leave the daemon paused
+        # until someone notices.
         if: always() && steps.hold.outcome == 'success'
         run: |
           set -euo pipefail

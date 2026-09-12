@@ -28,6 +28,9 @@ ErrorCode = Literal[
     # A race lost: the effect already happened or is happening.
     "already_terminal",
     "already_in_progress",
+    # The caller acted on a superseded state: its ``expected_revision``
+    # is not the row's current one.
+    "stale_revision",
     # The run kind never supports this control (a fixed tool recipe has
     # no steering, no fix rounds, no gate).
     "unsupported_for_kind",
@@ -76,6 +79,8 @@ class StatusOutcome(Outcome):
 class PauseOutcome(Outcome):
     hold: str
     holds: list[str]
+    #: ``False`` when the hold already stood (idempotent per name).
+    fresh: bool = True
 
 
 class ReleaseOutcome(Outcome):
@@ -95,11 +100,20 @@ class ReviewResumeOutcome(Outcome):
 class CancelOutcome(Outcome):
     #: ``current``: the run in flight was asked to stop at its next
     #: boundary. ``provider``: a run parked on a provider outage was
-    #: settled without ever touching a sandbox.
-    mode: Literal["current", "provider"]
+    #: settled without ever touching a sandbox. ``queued``: a run pinned
+    #: to a queued item, waiting to be resumed, was settled instead.
+    mode: Literal["current", "provider", "queued"]
     retry: bool = False
     target: str | None = None
     message: str | None = None
+
+
+class ResumeOutcome(Outcome):
+    """A pinned run admitted to the daemon's queue for resume: the next
+    tick resumes it through the same gates a fresh dispatch faces."""
+
+    run_id: str
+    item_id: str
 
 
 class QueueOutcome(Outcome):

@@ -49,6 +49,7 @@ EFFECTS: dict[str, str] = {
     "daemon.release": "the hold is released",
     "run.cancel": "the run reaches the cancelled state",
     "run.cancel_provider": "the parked run is settled as cancelled",
+    "run.resume": "the run is admitted to the queue and resumes at the next tick",
     "run.review_resume": "the review wait is re-armed",
     "run.grant_rounds": "the grant is recorded and the item re-admitted",
     "gate.approve": "the approval is recorded and the gate release committed",
@@ -522,6 +523,16 @@ def _judge(
         if gate.state == "approving":
             return "reconciling", None, "the gate is still being completed"
         return "failed", "not_eligible", f"gate is {gate.state}"
+    if op.action == "run.resume":
+        item_id = loop.dstore.item_for_run(op.target_key)
+        item = loop.dstore.get(item_id) if item_id else None
+        if (
+            item is not None
+            and item.run_id == op.target_key
+            and item.state in ("queued", "running", "done")
+        ):
+            return "succeeded", None, None
+        return "failed", "interrupted_before_effect", "the run was not admitted"
     if op.action in ("item.abandon", "item.retry", "item.requeue"):
         item = loop.dstore.get(op.target_key)
         if item is None:

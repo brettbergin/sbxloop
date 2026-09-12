@@ -45,6 +45,7 @@ DAEMON_TABLES = (
     "daemon_pending_clarifications",
     "daemon_local_messages",
     "daemon_schedules",
+    "daemon_holds",
 )
 API_TABLES = (
     "api_operations",

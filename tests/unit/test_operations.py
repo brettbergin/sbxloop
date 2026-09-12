@@ -137,7 +137,12 @@ class TestRunner:
         stored = floop.operations.get(outcome.operation_id)
         assert stored is not None and stored.state == "succeeded"
         assert stored.claimed_generation == "g_test"
-        assert stored.result == {"operation_id": None, "hold": "operator", "holds": ["x"]}
+        assert stored.result == {
+            "operation_id": None,
+            "hold": "operator",
+            "holds": ["x"],
+            "fresh": True,
+        }
 
     def test_a_refusal_finishes_the_record_failed_and_is_re_raised(
         self, floop: RecordingLoop
@@ -218,7 +223,12 @@ class TestEverySurfaceRecords:
         assert op.id == reply.operation_id and op.state == "succeeded"
         assert op.action == "daemon.pause" and op.target_key == "deploy-1"
         assert op.actor["via"] == "ctl" and op.actor["display"] == "brett via ctl"
-        assert op.result == {"operation_id": None, "hold": "deploy-1", "holds": ["deploy-1"]}
+        assert op.result == {
+            "operation_id": None,
+            "hold": "deploy-1",
+            "holds": ["deploy-1"],
+            "fresh": True,
+        }
 
     def test_reads_leave_no_record(self, floop: RecordingLoop) -> None:
         for cmd in ("status", "queue", "items"):

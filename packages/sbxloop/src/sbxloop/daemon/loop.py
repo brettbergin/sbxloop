@@ -41,12 +41,14 @@ from zoneinfo import ZoneInfo
 
 from sbxloop import __version__, hostgit
 from sbxloop.config import Config, GithubConfig, SandboxConfig, ScheduleConfig
+from sbxloop.daemon.controls.eligibility import Subject, check as check_eligibility
 from sbxloop.daemon.controls.generation import (
     GENERATION_KEY,
     GENERATION_STARTED_KEY,
     new_generation_id,
 )
 from sbxloop.daemon.controls.operations import OperationStore, reconcile_operations
+from sbxloop.daemon.controls.results import CancelOutcome, ControlError, ResumeOutcome
 from sbxloop.daemon.github import DaemonGithub
 from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
 from sbxloop.daemon.logsink import event_log_subscriber
@@ -99,7 +101,7 @@ from sbxloop.errors import (
     StateError,
 )
 from sbxloop.events import Event, EventBus
-from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs
+from sbxloop.gc import DAY_S, format_bytes, prune_run_dirs, workspace_pruned
 from sbxloop.ghids import (
     is_chat_id,
     is_local_id,
@@ -334,9 +336,11 @@ class DaemonLoop:
         self._landing_threads: list[threading.Thread] = []
         # Pause is a set of named holds (#534): an operator's `pause` and a
         # deploy's `pause --hold deploy-<id>` coexist, and each side releases
-        # only its own. The daemon idles while any hold stands.
-        self._holds: set[str] = set()
+        # only its own. The daemon idles while any hold stands. The set
+        # lives in the store (revision 0010) and survives a restart; this
+        # is its write-through cache, loaded before anything can ask.
         self._holds_lock = threading.Lock()
+        self._holds: set[str] = {h.name for h in self.dstore.holds()}
         self._current: RunHandle | None = None
         self._current_lock = threading.Lock()
         # Every mutating control leaves a durable record here before it
@@ -389,14 +393,32 @@ class DaemonLoop:
         with self._holds_lock:
             return sorted(self._holds)
 
-    def pause(self, hold: str = OPERATOR_HOLD, *, by: str | None = None) -> list[str]:
+    def pause(
+        self,
+        hold: str = OPERATOR_HOLD,
+        *,
+        by: str | None = None,
+        via: str = "",
+        reason: str = "",
+        operation_id: str | None = None,
+    ) -> list[str]:
         """Take a named pause hold. Idempotent per name. Returns the holds
-        standing afterwards. The change is narrated once per transition —
-        a deploy's hold and an operator's pause both show up in the
-        chronology, so a paused daemon always says who is holding it."""
+        standing afterwards. The hold is persisted before it is narrated
+        and survives a restart; ``by``/``via`` say whose it is. The change
+        is narrated once per transition — a deploy's hold and an operator's
+        pause both show up in the chronology, so a paused daemon always
+        says who is holding it."""
         hold = hold_name(hold)
         with self._holds_lock:
-            fresh = hold not in self._holds
+            fresh = self.dstore.take_hold(
+                hold,
+                self.clock(),
+                owner_id=by,
+                owner_display=by,
+                via=via,
+                reason=reason,
+                operation_id=operation_id,
+            )
             self._holds.add(hold)
             holds = sorted(self._holds)
         if fresh:
@@ -415,12 +437,12 @@ class DaemonLoop:
         it). Returns the holds still standing; the daemon resumes claiming
         only when that is empty."""
         with self._holds_lock:
+            if hold is not None:
+                hold = hold_name(hold)
+            released = self.dstore.release_hold(hold)
             if hold is None:
-                released = sorted(self._holds)
                 self._holds.clear()
             else:
-                hold = hold_name(hold)
-                released = [hold] if hold in self._holds else []
                 self._holds.discard(hold)
             holds = sorted(self._holds)
         if released:
@@ -434,6 +456,20 @@ class DaemonLoop:
                 holds=holds,
             )
         return holds
+
+    def hold_details(self) -> list[dict[str, Any]]:
+        """Every standing hold with its owner, for a status that says whose
+        it is rather than just that one stands."""
+        return [
+            {
+                "name": h.name,
+                "owner": h.owner_display,
+                "via": h.via,
+                "reason": h.reason,
+                "created_at": h.created_at,
+            }
+            for h in self.dstore.holds()
+        ]
 
     def request_stop(self) -> None:
         """Operator ``stop``: claim nothing new, finish the run in flight
@@ -576,31 +612,203 @@ class DaemonLoop:
         retry: bool = False,
         operation_id: str | None = None,
     ) -> bool:
-        """Operator cancel of the in-flight run. The engine stops at its next
-        boundary and the item settles as *cancelled* — no retry, no breaker
-        count — unless ``retry`` asks for a fresh run. Recorded under the
-        current lock so the request can never be attributed to a later run.
-        ``operation_id`` is the durable record the settle step finishes."""
+        """Operator cancel of the in-flight run — the bare ``cancel``. The
+        run is resolved under the current lock and cancelled by identity
+        (:meth:`cancel_run`), so the request can never be attributed to a
+        later run. ``False`` when nothing is running."""
         with self._current_lock:
             handle = self._current
-            if handle is None:
+        if handle is None:
+            return False
+        try:
+            self.cancel_run(handle.run_id, by=requester, retry=retry, operation_id=operation_id)
+        except ControlError as exc:
+            if exc.code in ("already_terminal", "not_eligible", "unknown_target"):
+                # The run finished between the two looks: nothing is running.
                 return False
-            previous, self._cancel_request = (
-                self._cancel_request,
-                CancelRequest(handle.run_id, requester or "operator", retry, operation_id),
-            )
-        if previous is not None and previous.operation_id is not None:
-            # Superseded before it was honoured: the later request carries
-            # the same effect, and the earlier record must not claim it.
-            self.operations.finish(
-                previous.operation_id,
-                self.clock(),
-                state="failed",
-                error_code="superseded",
-                error_detail=f"replaced by a later cancel of {handle.run_id}",
-            )
-        handle.engine.request_cancel()
+            raise
         return True
+
+    def cancel_run(
+        self,
+        run_id: str,
+        *,
+        by: str | None = None,
+        retry: bool = False,
+        expected_revision: int | None = None,
+        operation_id: str | None = None,
+    ) -> CancelOutcome:
+        """Cancel one specific run, whatever state the daemon holds it in.
+
+        The run in flight is asked to stop at its next boundary (the item
+        settles as *cancelled* — no retry, no breaker count — unless
+        ``retry`` asks for a fresh run); a run parked on a provider outage
+        or pinned to a queued item awaiting resume is settled here, without
+        touching a sandbox. Refused by name for a run that is terminal
+        (``already_terminal``, with the state it reached), unknown, or not
+        this daemon's to cancel. ``expected_revision`` is checked against
+        the run row under the same lock as the request is recorded, so a
+        cancel meant for an earlier state of the run is ``stale_revision``
+        rather than applied. ``operation_id`` is the durable record the
+        settle step finishes."""
+        with self._current_lock:
+            handle = self._current
+            if handle is not None and handle.run_id == run_id:
+                self._check_revision(run_id, expected_revision)
+                previous, self._cancel_request = (
+                    self._cancel_request,
+                    CancelRequest(run_id, by or "operator", retry, operation_id),
+                )
+            else:
+                handle = None
+        if handle is not None:
+            if previous is not None and previous.operation_id is not None:
+                # Superseded before it was honoured: the later request
+                # carries the same effect, and the earlier record must not
+                # claim it.
+                self.operations.finish(
+                    previous.operation_id,
+                    self.clock(),
+                    state="failed",
+                    error_code="superseded",
+                    error_detail=f"replaced by a later cancel of {run_id}",
+                )
+            handle.engine.request_cancel()
+            return CancelOutcome(mode="current", retry=retry, target=run_id)
+        self._check_revision(run_id, expected_revision)
+        provider = self._provider_item(run_id)
+        if provider is not None:
+            message = self.cancel_provider(run_id, by)
+            return CancelOutcome(mode="provider", target=run_id, message=message)
+        try:
+            record = self.store.get_run(run_id)
+        except SbxloopError as exc:
+            raise ControlError("unknown_target", f"unknown run {run_id}") from exc
+        item_id = self.dstore.item_for_run(run_id)
+        item = self.dstore.get(item_id) if item_id else None
+        pinned = item is not None and item.run_id == run_id
+        pending_resume = pinned and item is not None and item.state == "queued"
+        if record.state in TERMINAL_RUN_STATES and not pending_resume:
+            # Finished, not merely settled with a resume pending: the
+            # honest answer names the state it reached.
+            raise ControlError("already_terminal", f"run {run_id} is {record.state}")
+        check_eligibility(
+            "cancel",
+            Subject(
+                run_kind=record.kind,
+                run_state=record.state,
+                item_state=item.state if item else None,
+                pinned=pinned,
+            ),
+        )
+        if not pending_resume or item is None:
+            raise ControlError(
+                "not_eligible", f"run {run_id} is {record.state} but not in this daemon's hands"
+            )
+        # A pending resume: settling the run is what stops it, the same
+        # way a provider-held run is settled.
+        now = self.clock()
+        reason = f"cancelled by {by or 'operator'} before its resume"
+        self.dstore.mark_cancelled(item.item_id, reason, now)
+        self.store.set_run_state(run_id, "cancelled")
+        self.store.set_run_reason(run_id, reason)
+        self.store.append_event(Event.now("run.cancelled", run_id, reason=reason))
+        self._notice(
+            "run.cancelled",
+            f"⏹ {item.item_id} {reason}; `resume-run {run_id}` would continue it, "
+            f"`retry {item.item_id}` reruns it fresh",
+            item=item.item_id,
+            run=run_id,
+            by=by or "operator",
+            requeued=False,
+        )
+        return CancelOutcome(mode="queued", target=run_id, message=reason)
+
+    def _check_revision(self, run_id: str, expected: int | None) -> None:
+        if expected is None:
+            return
+        try:
+            current = self.store.get_run(run_id).revision
+        except SbxloopError as exc:
+            raise ControlError("unknown_target", f"unknown run {run_id}") from exc
+        if current != expected:
+            raise ControlError(
+                "stale_revision",
+                f"run {run_id} is at revision {current}, not {expected}",
+                revision=current,
+            )
+
+    def resume_run(
+        self,
+        run_id: str,
+        *,
+        by: str | None = None,
+        expected_revision: int | None = None,
+    ) -> ResumeOutcome:
+        """An operator's resume of a persisted run, admitted to this
+        daemon's queue: the next tick resumes it through the breaker, the
+        daily cap, the holds and the per-item resume budget, exactly as an
+        interrupted run recovered at start is. Never a second engine — the
+        CLI's ``sbxloop resume`` is for a run no daemon owns. Refused by
+        name when the run is in flight, finished, unpinned, past its resume
+        budget, exhausted, or its workspace was pruned."""
+        with self._current_lock:
+            handle = self._current
+        if handle is not None and handle.run_id == run_id:
+            raise ControlError("not_eligible", f"run {run_id} is in flight")
+        self._check_revision(run_id, expected_revision)
+        try:
+            record = self.store.get_run(run_id)
+        except SbxloopError as exc:
+            raise ControlError("unknown_target", f"unknown run {run_id}") from exc
+        item_id = self.dstore.item_for_run(run_id)
+        item = self.dstore.get(item_id) if item_id else None
+        pinned = item is not None and item.run_id == run_id
+        check_eligibility(
+            "resume",
+            Subject(
+                run_kind=record.kind,
+                run_state=record.state,
+                item_state=item.state if item else None,
+                pinned=pinned,
+            ),
+        )
+        assert item is not None  # nosec B101 - eligibility refused the unpinned case
+        if workspace_pruned(self.store, run_id):
+            raise ControlError(
+                "not_eligible",
+                f"run {run_id}: its workspace was removed by gc; it cannot be resumed — "
+                f"`retry {item.item_id}` starts a new run",
+            )
+        if record.exhausted is not None and record.granted_rounds == 0:
+            raise ControlError(
+                "not_eligible",
+                f"run {run_id} exhausted its {record.exhausted} fix rounds; "
+                f"`grant-rounds {run_id} N` resumes it with more",
+            )
+        resumes = self.dstore.resumes_for_item(item.item_id)
+        budget = self.config.daemon.max_resumes_per_item
+        if resumes >= budget:
+            raise ControlError(
+                "not_eligible",
+                f"{item.item_id} spent its resume budget ({resumes} of {budget}, "
+                f"`[daemon] max_resumes_per_item`); `retry {item.item_id}` runs it again "
+                "from scratch",
+            )
+        now = self.clock()
+        try:
+            fresh = self.dstore.admit_resume(item.item_id, run_id, now)
+        except KeyError as exc:
+            raise ControlError("not_eligible", str(exc.args[0])) from exc
+        who = by or "operator"
+        self._notice(
+            "run.resume_requested",
+            f"{who} asked to resume {run_id}; {fresh.item_id} continues it at the next tick",
+            item=fresh.item_id,
+            run=run_id,
+            by=who,
+        )
+        return ResumeOutcome(run_id=run_id, item_id=fresh.item_id)
 
     def _take_cancel(self, run_id: str) -> CancelRequest | None:
         """The cancel request for ``run_id``, consumed. Any other pending
@@ -984,6 +1192,7 @@ class DaemonLoop:
             "consecutive_failures": self._consecutive_failures,
             "paused": self.paused,
             "holds": self.holds,
+            "hold_details": self.hold_details(),
             # The claim in progress, if any: not yet a run, but not idle
             # either — a restart here orphans the issue (#530).
             "claiming": self._claiming,
@@ -3684,6 +3893,20 @@ class DaemonLoop:
         self.generation = new_generation_id()
         self.dstore.set_value(GENERATION_KEY, self.generation)
         self.dstore.set_value(GENERATION_STARTED_KEY, repr(self.clock()))
+        with self._holds_lock:
+            restored = self.dstore.holds()
+            self._holds = {h.name for h in restored}
+        if restored:
+            self._notice(
+                "daemon.holds_restored",
+                "still paused by "
+                + ", ".join(
+                    h.name + (f" ({h.owner_display})" if h.owner_display else "") for h in restored
+                )
+                + " — the holds survived the restart; `resume --hold <name>` releases one, "
+                "`resume --all` every one",
+                holds=[h.name for h in restored],
+            )
         self._settle_half_claims()
         self._reconcile_gates()
         self._reconcile_review_holds()

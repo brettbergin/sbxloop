@@ -697,6 +697,7 @@ class StateStore:
             published=[
                 Published.model_validate(entry) for entry in json.loads(row.published or "[]")
             ],
+            revision=int(row.revision or 0),
         )
 
     def non_terminal_runs(self) -> list[RunRecord]:

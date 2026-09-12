@@ -1521,13 +1521,14 @@ cannot disagree with the home the process runs out of.
 ## Persistence and resume
 
 `~/.sbxloop/state/state.db` (the home's `state/`, see *The home* below) is one
-WAL-mode SQLite database holding **nineteen** tables, and two stores read it
+WAL-mode SQLite database holding **twenty-two** tables, and two stores read it
 through separate connections. `StateStore` owns five — `runs`, `tasks`,
 `phase_attempts`, `reconciliations`, `events` — and `DaemonStore` the
-fourteen `daemon_*` ones (the queue, the run ledger, the resume budget,
+fifteen `daemon_*` ones (the queue, the run ledger, the resume budget,
 key/value state, run watches, requesters, prior attempts, chat threads,
 merge gates and their prompts, review holds, pending clarifications, the
-operator console's mailbox and the schedules).
+operator console's mailbox, the schedules and the pause holds) plus the two
+`api_*` tables behind the operations record.
 
 Both are SQLAlchemy models under `sbxloop/db/` (#539), and Alembic owns the
 upgrade path — one revision chain for the whole file, applied when a store
@@ -1574,6 +1575,29 @@ persisting — a crash and a `kill -9` look identical to the store — and
    is idempotent: the branch is force-moved and the open PR reused; a
    review that never committed its verdict runs again). A phase whose
    result was never committed re-runs from its start; nothing is replayed.
+
+**Two resumes, one owner.** `sbxloop resume <run>` builds an engine in the
+calling process and continues the run there; `sbxloop daemon ctl resume <item|run>`
+re-arms a *review wait*. A run the daemon dispatched has a third path, and it
+is the only right one while a daemon owns it: `resume-run <run>` (ctl, chat,
+the remote API) admits the pinned run to the daemon's queue
+(`DaemonStore.admit_resume`, a compare-and-set on the pin) and the next tick
+resumes it through the breaker, the daily cap, the holds and the per-item
+resume budget, exactly as an interrupted run recovered at start is — never a
+second engine beside the daemon's. `DaemonLoop.resume_run` refuses by name
+what cannot be resumed (in flight, finished, unpinned, past its resume
+budget, exhausted, workspace pruned), and the CLI's `resume` refuses a
+daemon-owned run and points at it, `--force` being the override for a daemon
+that is not coming back. `cancel-run <run>` is the same idea for cancellation:
+one run by identity, wherever the daemon holds it — in flight (the engine
+stops at its next boundary), parked on a provider outage, or pinned to a
+queued item awaiting resume — with `expected_revision` checked under the same
+lock as the request is recorded, so a cancel meant for an earlier state is
+`stale_revision` rather than applied. `runs`, `daemon_work_items`,
+`daemon_merge_gates` and `daemon_review_holds` carry that `revision`, bumped by
+a trigger on every write whichever release wrote it (`db/revisions.py`,
+revision 0010). Pause holds are persisted in `daemon_holds` with their owner and
+survive a restart; `recover()` says which ones still stand.
 
 ### Model policy at phase boundaries
 

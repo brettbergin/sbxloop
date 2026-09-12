@@ -23,8 +23,9 @@ pause hold, waits for the daemon to be idle, and only then installs and restarts
   never timed into the window between the claim comment landing and the claim being
   persisted.
 - `holds` is the set of named pause holds; `paused` is whether any stand. Holds are
-  in-memory only: **every restart comes back unpaused**, so an operator's hold has to be
-  snapshotted before the restart and re-taken after it.
+  persisted: **a restart comes back with every hold still standing**, and `hold_details`
+  says whose each one is. A hold ends only when its owner releases it or an operator runs
+  `resume --all`.
 - `source_failures` counts consecutive failed discovery polls, independently of failed
   runs. `source_retry_in_s` gives the remaining polling backoff. A successful poll resets
   both; plain status and the chat status card warn while polling is failing.
@@ -125,7 +126,8 @@ On a host installed under a custom `SBXLOOP_HOME`, read `~/.sbxloop` above as th
 `sbxloop` itself already honours the variable, so only the two explicit `~/.sbxloop/…`
 paths change. `reset-failed` matters: `StartLimitBurst=5` per 600 s leaves a unit that
 crash-looped in `failed`, where a plain `restart` will not revive it. The daemon comes back
-unpaused (holds are in-memory), so re-take any hold you want to keep. Pin the version
+with the `upgrade` hold still standing, so release it (`ctl resume --hold upgrade`) once
+the checks below pass. Pin the version
 exactly — a downgrade is the same two commands with an older `X.Y.Z`. Then check it:
 
 ```bash
@@ -149,9 +151,9 @@ schedule / workflow_dispatch → self-hosted runner on the daemon host
                                 ├─ take a named pause hold (deploy-<run id>)
                                 ├─ wait — no cap — for the in-flight run to finish
                                 ├─ snapshot, then install the exact version into the home's venv
-                                ├─ snapshot the operator's holds; restart the unit
+                                ├─ restart the unit (the standing holds survive it)
                                 ├─ health check, or roll back to the previous version
-                                └─ restore the other holds; release its own; tell the control channel
+                                └─ release its own hold; tell the control channel
 ```
 
 Step by step:
@@ -167,17 +169,17 @@ Step by step:
 3. **Snapshots** (`sbxloop backup`) and **upgrades** with both distributions pinned to the
    same version, then re-runs `sbxloop init --systemd --no-sbx` so the launchers and units
    match while preserving the installed sandbox runtime. Rollback also preserves sbx.
-4. **Restarts** after `systemctl --user reset-failed`, having first snapshotted the standing
-   holds — immediately before the restart, not at the start of the job, so an operator who
-   paused *during* the wait is still paused afterwards.
+4. **Restarts** after `systemctl --user reset-failed`. Holds are persisted, so an operator
+   who paused before the deploy or *during* its wait is still paused afterwards without
+   the pipeline doing anything.
 5. **Health-checks**: unit active, `--version` matches, `sbxloop doctor` exits 0, the daemon
    answers `ctl status --json`, then a 45 s settle to prove it is not crash-looping.
 6. **Rolls back** to the previously installed version on any failed check, restarts, and
    fails the job. Rollback only runs once the upgrade step has — a failure before that
    changed nothing on the host, and a rollback restart would be the needless restart this
    whole procedure exists to avoid.
-7. **Restores the other holds** (after a rollback too — whatever version is live, operator
-   intent survives), **releases its own** on `always()`, and **reports** with
+7. **Releases its own hold** on `always()` — it survives the restart, so a job that died
+   after restarting would otherwise leave the daemon paused — and **reports** with
    `sbxloop daemon notify`, including how long it waited and whether a failure happened
    before anything was installed.
 
@@ -187,7 +189,7 @@ An sbxloop deployment or rollback leaves sbx unchanged. Upgrade that runtime sep
 with an explicit version, using `sbxloop init --sbx-version X.Y.Z` after checking
 compatibility on a CI runner. Take a named hold and drain the current run first, then stop
 `sbxloop-daemon` followed by `sbx-sandboxd` before installing. Restart the sandbox backend
-before the sbxloop daemon, check health, and restore any holds that should remain.
+before the sbxloop daemon, check health, and release the hold you took.
 
 Before the first start of the new runtime, keep a matching backup of the old binaries and
 the stopped sandbox state, configuration and credentials. `sbxloop backup` does not include

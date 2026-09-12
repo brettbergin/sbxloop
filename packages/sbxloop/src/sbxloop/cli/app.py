@@ -956,10 +956,31 @@ def resume(
             help="Give a run that exhausted its fix rounds this many more before resuming.",
         ),
     ] = 0,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Resume here even though a daemon owns the run (the daemon is down).",
+        ),
+    ] = False,
 ) -> None:
-    """Resume an unfinished run (fresh sandboxes, persisted state and config)."""
+    """Resume an unfinished run (fresh sandboxes, persisted state and config).
+
+    A run the daemon dispatched is the daemon's to resume: `sbxloop daemon
+    ctl resume-run <run>` queues it there, so one engine owns it. This
+    command resumes it in this process instead only with `--force`, for a
+    daemon that is not coming back.
+    """
     _require_supported_host()
     config = _run_config()
+    owner = _daemon_item_for(config, run_id)
+    if owner is not None and not force:
+        console.print(
+            f"[bold red]resume refused:[/] run {run_id} belongs to the daemon's work item "
+            f"{owner} — `sbxloop daemon ctl resume-run {run_id}` resumes it under the daemon; "
+            "`--force` resumes it here anyway (only when the daemon is down)."
+        )
+        raise typer.Exit(2)
     engine = LoopEngine(config)
     try:
         if grant_rounds:
@@ -973,6 +994,26 @@ def resume(
         raise typer.Exit(2) from exc
     # engine.config is the run's rehydrated config, which is what drove the run.
     _finish(result, engine.config)
+
+
+def _daemon_item_for(config: Config, run_id: str) -> str | None:
+    """The daemon work item a run is pinned to, or ``None`` when no daemon
+    ledger knows it — a home with no daemon database has none."""
+    path = config.paths.state_db
+    if not path.exists():
+        return None
+    try:
+        dstore = DaemonStore(path, readonly=True)
+    except SbxloopError:
+        return None
+    try:
+        item_id = dstore.item_for_run(run_id)
+        if item_id is None:
+            return None
+        item = dstore.get(item_id)
+        return item_id if item is not None and item.run_id == run_id else None
+    finally:
+        dstore.close()
 
 
 @app.command()

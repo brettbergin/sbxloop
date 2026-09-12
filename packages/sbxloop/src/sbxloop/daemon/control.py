@@ -51,6 +51,8 @@ COMMANDS: tuple[str, ...] = (
     "pause [--hold NAME]",
     "resume [<item|run>|--hold NAME|--all]",
     "cancel [<item|run>|--retry]",
+    "cancel-run <run> [--retry]",
+    "resume-run <run>",
     "queue",
     "items",
     "abandon <item> [reason]",
@@ -567,18 +569,52 @@ def _dispatch_verb(
         return CommandReply(queue_lines(service.queue(principal).items))
     if word == "items":
         return CommandReply(items_lines(service.items(principal).items))
+    if word == "cancel-run":
+        # One specific run, wherever the daemon holds it (#1034): in flight,
+        # parked on a provider outage, or pinned to a queued item awaiting
+        # its resume. Never "the current run" — that is bare `cancel`.
+        unknown = [a for a in args[1:] if a != "--retry"]
+        if len(args) < 1 or args[0].startswith("-") or unknown:
+            return CommandReply(f"usage: `{prefix} cancel-run <run> [--retry]`", ok=False)
+        try:
+            cancelled = service.cancel_run(principal, args[0], retry="--retry" in args)
+        except ControlError as exc:
+            if exc.code not in ("unknown_target", "not_eligible", "already_terminal"):
+                raise
+            return CommandReply(f"cancel-run failed: {exc.message}", ok=False)
+        if cancelled.mode == "current":
+            return CommandReply(
+                f"cancel requested for {code(args[0])} — honored at the next task boundary"
+                + ("; the item will be re-queued and run again fresh." if cancelled.retry else ".")
+            )
+        return CommandReply(cancelled.message or f"{code(args[0])} cancelled.")
+    if word == "resume-run":
+        # The daemon's own resume of a persisted run (#1034): admitted to
+        # the queue, resumed by the next tick through every gate a fresh
+        # dispatch faces. `resume <item|run>` re-arms a review wait instead.
+        if len(args) != 1 or args[0].startswith("-"):
+            return CommandReply(f"usage: `{prefix} resume-run <run>`", ok=False)
+        try:
+            resumed = service.resume_run(principal, args[0])
+        except ControlError as exc:
+            if exc.code not in ("unknown_target", "not_eligible", "unsupported_for_kind"):
+                raise
+            return CommandReply(f"resume-run failed: {exc.message}", ok=False)
+        return CommandReply(
+            f"{code(resumed.run_id)} queued to resume for {code(resumed.item_id)} at the next tick."
+        )
     if word == "grant-rounds":
         return _grant_rounds(service, args, principal)
     if word == "resume-repo":
         if len(args) != 1:
             return CommandReply("usage: resume-repo <owner/name>", ok=False)
         try:
-            resumed = service.resume_repo(principal, args[0])
+            polled = service.resume_repo(principal, args[0])
         except ControlError as exc:
             if exc.code not in ("unknown_target", "not_eligible"):
                 raise
             return CommandReply(f"resume-repo failed: {exc.message}", ok=False)
-        return CommandReply(f"polling {code(resumed.repo)} again from the next tick.")
+        return CommandReply(f"polling {code(polled.repo)} again from the next tick.")
     if word == "schedules":
         return _schedules(service, args, principal)
     if word == "log":
@@ -606,8 +642,8 @@ def _dispatch_verb(
             "stopping: nothing new is claimed; the daemon exits once the current run and "
             "any landing it is completing finish (`cancel` first to stop that run now). "
             "Under a service manager that restarts it (the shipped unit does, after 30 s) "
-            "this is a restart that drops in-memory holds — `pause` keeps it off work "
-            "for good.",
+            "this is a restart; the holds standing now still stand when it is back "
+            "(`pause` keeps it off work for good).",
             after=service.stop(principal).after,
         )
     if word == "restart":
@@ -635,8 +671,8 @@ def _dispatch_verb(
         return CommandReply(
             head
             + ("systemd" if restart.supervisor == "systemd" else "its supervisor")
-            + " starts it again and it says so here when it is back. In-memory holds do "
-            "not survive — `pause` first if it should stay off work.",
+            + " starts it again and it says so here when it is back. The holds standing now "
+            "still stand then — `pause` first if it should come back off work.",
             after=restart.after,
         )
     if word in ("merge", "approve", "release"):

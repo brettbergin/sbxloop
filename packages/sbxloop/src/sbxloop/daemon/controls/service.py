@@ -39,6 +39,7 @@ from sbxloop.daemon.controls.results import (
     ReleaseOutcome,
     RepoResumeOutcome,
     RestartOutcome,
+    ResumeOutcome,
     ReviewResumeOutcome,
     ScheduleListOutcome,
     ScheduleOutcome,
@@ -172,12 +173,17 @@ class ControlService:
         require(principal, "daemon:manage")
         name = _hold(hold)
 
-        def apply(_: str | None) -> PauseOutcome:
+        def apply(op_id: str | None) -> PauseOutcome:
+            before = set(self.loop.holds)
+            extra: dict[str, Any] = {}
+            if self.runner is not None:
+                # A loop that keeps holds durably records whose it is.
+                extra = {"via": principal.via, "operation_id": op_id}
             try:
-                holds = self.loop.pause(name, by=principal.attribution())
+                holds = self.loop.pause(name, by=principal.attribution(), **extra)
             except ValueError as exc:
                 raise ControlError("invalid_argument", str(exc)) from exc
-            return PauseOutcome(hold=name, holds=list(holds))
+            return PauseOutcome(hold=name, holds=list(holds), fresh=name not in before)
 
         return self._record(self._spec("daemon.pause", principal, "hold", name), apply)
 
@@ -252,6 +258,70 @@ class ControlService:
             return CancelOutcome(mode="provider", target=target, message=message)
 
         return self._record(self._spec("run.cancel_provider", principal, "target", target), apply)
+
+    def cancel_run(
+        self,
+        principal: Principal,
+        run_id: str,
+        *,
+        retry: bool = False,
+        expected_revision: int | None = None,
+    ) -> CancelOutcome:
+        """Cancel one run by identity, whatever state the daemon holds it
+        in; ``expected_revision`` refuses a cancel meant for an earlier
+        state of the run."""
+        require(principal, "runs:control")
+
+        def apply(op_id: str | None) -> CancelOutcome:
+            return self.loop.cancel_run(
+                run_id,
+                by=principal.attribution(),
+                retry=retry,
+                expected_revision=expected_revision,
+                operation_id=op_id,
+            )
+
+        spec = OperationSpec(
+            action="run.cancel",
+            target_kind="run",
+            target_key=run_id,
+            principal=principal,
+            request={"retry": retry},
+            expected_revision=expected_revision,
+            deferred=True,
+        )
+        outcome = self._record(spec, apply)
+        if outcome.mode != "current" and outcome.operation_id is not None and self.runner:
+            # Settled here and now, not at a run boundary: the record is
+            # finished at once rather than by the settle step.
+            self.runner.store.finish(
+                outcome.operation_id,
+                self.runner.clock(),
+                state="succeeded",
+                result=outcome.model_dump(mode="json"),
+            )
+        return outcome
+
+    def resume_run(
+        self, principal: Principal, run_id: str, *, expected_revision: int | None = None
+    ) -> ResumeOutcome:
+        """Admit a persisted run to the daemon's queue for resume."""
+        require(principal, "runs:control")
+
+        def apply(_: str | None) -> ResumeOutcome:
+            return self.loop.resume_run(
+                run_id, by=principal.attribution(), expected_revision=expected_revision
+            )
+
+        spec = OperationSpec(
+            action="run.resume",
+            target_kind="run",
+            target_key=run_id,
+            principal=principal,
+            request={},
+            expected_revision=expected_revision,
+        )
+        return self._record(spec, apply)
 
     def grant_rounds(self, principal: Principal, run_id: str, rounds: int) -> GrantRoundsOutcome:
         require(principal, "budgets:grant")
