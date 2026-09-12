@@ -66,6 +66,7 @@ def script_install(
         stdout="".join(f"{name}\n" for name in missing or []),
     )
     fake_sbx.script(f"exec {BOX} sh -c sudo -n apt-get", returncode=0)
+    fake_sbx.script(f'exec {BOX} sh -c for p in "$@"', stdout="")
     fake_sbx.script(f"exec {BOX} python3 -m venv", returncode=0)
     fake_sbx.script(f"exec {BOX} /home/agent/.sbxloop/venv/bin/pip", returncode=0)
     fake_sbx.script(f"exec {BOX} {VENV_PY} -c", stdout=f"{sbxloop.__version__}\n")
@@ -74,6 +75,28 @@ def script_install(
 
 
 class TestBakeHappyPath:
+    @pytest.mark.parametrize("apt_rc", [0, 100])
+    def test_xz_is_required_even_without_javascript(
+        self,
+        cli: SbxCLI,
+        config: Config,
+        fake_sbx: FakeSbx,
+        apt_rc: int,
+    ) -> None:
+        fake_sbx.script(f'exec {BOX} sh -c for p in "$@"', stdout="xz-utils\n")
+        fake_sbx.script(f"exec {BOX} sh -c sudo -n apt-get", returncode=apt_rc)
+        script_install(fake_sbx)
+        if apt_rc:
+            with pytest.raises(BakeError, match="xz-utils"):
+                bake_template(cli, config, name=BOX)
+            assert fake_sbx.invocations("template") == []
+        else:
+            bake_template(cli, config, name=BOX)
+            assert any(
+                "apt-get install -y -q xz-utils" in " ".join(c)
+                for c in fake_sbx.invocations("exec")
+            )
+
     def test_bake_saves_template_and_records(
         self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx
     ) -> None:

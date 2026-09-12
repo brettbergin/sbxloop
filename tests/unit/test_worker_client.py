@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -113,6 +115,118 @@ def agent_job(**overrides: object) -> JobRequest:
     }
     base.update(overrides)
     return JobRequest.model_validate(base)
+
+
+class TestAptContention:
+    @pytest.mark.parametrize(
+        "lock_error",
+        [
+            "E: Could not get lock /var/lib/apt/lists/lock. It is held by process 311 (apt-get)",
+            "E: Could not get lock /var/lib/dpkg/lock-frontend - open "
+            "(11: Resource temporarily unavailable)",
+            "E: Unable to acquire the dpkg frontend lock (/var/lib/dpkg/lock-frontend), "
+            "is another process using it?",
+        ],
+    )
+    def test_retries_lock_before_node_installer(
+        self,
+        sandbox: Sandbox,
+        fake_sbx: FakeSbx,
+        monkeypatch: pytest.MonkeyPatch,
+        lock_error: str,
+    ) -> None:
+        sleeps: list[float] = []
+        monkeypatch.setattr(
+            "sbxloop.worker.client.time",
+            SimpleNamespace(monotonic=time.monotonic, sleep=sleeps.append),
+        )
+        workspace = Path(__file__).parents[1] / "fixtures" / "ecosystems" / "node-npm"
+        resolved = toolchains.resolve_languages((), workspace)
+        node = toolchains.resolve(resolved.languages, resolved.versions)[0]
+        fake_sbx.script(
+            "exec boxa sh -c sudo -n apt-get", returncode=100, stderr=lock_error, once=True
+        )
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        fake_sbx.script(f"exec boxa sh -c {node.install_script}", returncode=0)
+        make_client(sandbox, EventBus())._provision_toolchains([node], 120)
+        calls = fake_sbx.invocations("exec")
+        assert len(calls) == 3
+        assert "xz-utils" in calls[0][-1]
+        assert calls[0] == calls[1]
+        assert calls[2][-1] == node.install_script
+        assert sleeps == [5.0]
+
+    @pytest.mark.parametrize(
+        ("error", "attempts", "hint"),
+        [
+            (
+                "E: Could not get lock /var/lib/apt/lists/lock. "
+                "It is held by process 311 (apt-get)",
+                13,
+                "another apt/dpkg process",
+            ),
+            (
+                "E: Failed to fetch http://archive.ubuntu.com/ubuntu/ Temporary failure resolving",
+                1,
+                "network policy",
+            ),
+            ("E: Unable to locate package missing-package", 1, "package name"),
+            (
+                "E: Could not open lock file /var/lib/dpkg/lock-frontend - open "
+                "(13: Permission denied)",
+                1,
+                "permissions",
+            ),
+        ],
+    )
+    def test_failed_prerequisites_skip_installer_and_explain_cause(
+        self,
+        sandbox: Sandbox,
+        fake_sbx: FakeSbx,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        error: str,
+        attempts: int,
+        hint: str,
+    ) -> None:
+        monkeypatch.setattr(
+            "sbxloop.worker.client.time",
+            SimpleNamespace(monotonic=time.monotonic, sleep=lambda _: None),
+        )
+        node = toolchains.resolve(["javascript"])[0]
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=100, stderr=error)
+        # Script the installer even though it must never run: a regression
+        # must not download or install tools on the test host.
+        fake_sbx.script(f"exec boxa sh -c {node.install_script}", returncode=0)
+        with caplog.at_level("WARNING"):
+            make_client(sandbox, EventBus())._provision_toolchains([node], 120)
+        calls = fake_sbx.invocations("exec")
+        assert len(calls) == attempts
+        assert all("apt-get" in c[-1] for c in calls)
+        assert hint in caplog.text
+        assert "skipped" in caplog.text
+
+    def test_short_timeout_does_not_start_another_attempt(
+        self,
+        sandbox: Sandbox,
+        fake_sbx: FakeSbx,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        sleeps: list[float] = []
+        monkeypatch.setattr(
+            "sbxloop.worker.client.time",
+            SimpleNamespace(monotonic=time.monotonic, sleep=sleeps.append),
+        )
+        fake_sbx.script(
+            "exec boxa sh -c sudo -n apt-get",
+            returncode=100,
+            stderr="Could not get lock /var/lib/apt/lists/lock. It is held by process 311",
+        )
+        node = toolchains.resolve(["javascript"])[0]
+        fake_sbx.script(f"exec boxa sh -c {node.install_script}", returncode=0)
+        make_client(sandbox, EventBus())._provision_toolchains([node], 1)
+        assert len(fake_sbx.invocations("exec")) == 1
+        assert sleeps == []
 
 
 class TestStreamTransport:

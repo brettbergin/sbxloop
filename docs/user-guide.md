@@ -457,6 +457,15 @@ say — keeps the baked worker and provisions the missing toolchain on top, and
 the `sandbox.prebaked` event and `sbxloop doctor` both say so, so you know
 when a re-bake would stop paying for that per provision.
 
+Baked templates also require `xz-utils`, even when JavaScript is not selected,
+so later toolchain top-ups can extract `.tar.xz` archives. A bake fails if
+that package cannot be installed; existing templates need a re-bake to gain it.
+Provisioning retries confirmed apt/dpkg lock contention up to twelve times,
+five seconds apart, within the original install timeout. Other apt errors
+return immediately. If a toolchain's apt prerequisites fail, its installer
+is skipped and the warning names the cause instead of attempting extraction
+with missing tools.
+
 #### Which models can I use?
 
 Wondering what to put in `model = "..."` (or `--model`)? Ask the configured
