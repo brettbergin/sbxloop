@@ -68,6 +68,38 @@ def test_codex_selection_is_documented_in_the_shipped_examples() -> None:
     assert "#OPENAI_API_KEY=" in secrets.read_text()
 
 
+def test_openai_endpoint_selection_is_documented_in_the_shipped_examples() -> None:
+    """The three places every knob lands: the model, the example config and
+    the user guide's knob table — plus the secrets template, since the
+    credential's variable is what an operator fills in."""
+    config = Config.model_validate(
+        {"agent": {"backend": "openai", "openai": {"base_url": "https://models.example/v1"}}}
+    )
+    assert config.agent.backend == "openai"
+    assert config.agent.openai.api_key_env == "OPENAI_API_KEY"
+    for key in (
+        "# [agent.openai]",
+        "# base_url = ",
+        "# api_key_env = ",
+        "# request_timeout_s = ",
+        "# max_retries = ",
+        "# allow_insecure_endpoint = ",
+        "# [github.repos.openai]",
+    ):
+        assert key in DEFAULT_CONFIG_TOML, key
+    guide = (REPO_ROOT / "docs" / "user-guide.md").read_text()
+    for key in (
+        "`[agent.openai] base_url`",
+        "`[agent.openai] api_key_env`",
+        "`[agent.openai] request_timeout_s` / `max_retries`",
+        "`[agent.openai] allow_insecure_endpoint`",
+        "`[github.repos.openai] base_url`",
+    ):
+        assert key in guide, key
+    secrets = REPO_ROOT / "packages/sbxloop/src/sbxloop/data/secrets.env.example"
+    assert '[agent] backend = "openai"' in secrets.read_text()
+
+
 def test_every_chat_backend_credential_is_in_the_secrets_example() -> None:
     """A bridge's token has to appear in the file an operator actually fills
     in. Generic over the descriptor set, so a fourth service cannot land with
@@ -448,8 +480,12 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             doc: dict[str, Any] = {"github": {"repos": [{"repo": "you/your-repo", **parsed}]}}
         elif section == "github.repos.agent_models":
             doc = {"github": {"repos": [{"repo": "you/your-repo", "agent_models": parsed}]}}
+        elif section == "github.repos.openai":
+            doc = {"github": {"repos": [{"repo": "you/your-repo", "openai": parsed}]}}
         elif section == "agent.models":
             doc = {"agent": {"models": parsed}}
+        elif section == "agent.openai":
+            doc = {"agent": {"openai": parsed}}
         elif section == "github":
             # `[github]` needs a repository before any other key is meaningful.
             doc = {"github": {"repo": "you/your-repo", **parsed}}

@@ -14,8 +14,8 @@ from sbxloop import modelcatalog
 from sbxloop.backends import backend_named
 from sbxloop.cli.models import ModelRow
 from sbxloop.config import Config
+from sbxloop.configedit.keys import is_model_key
 from sbxloop.paths import SbxloopHome
-from sbxloop.tui.configkeys import is_model_key
 
 
 def row(id: str = "selected", name: str = "Selected model") -> ModelRow:
@@ -79,7 +79,7 @@ def test_refresh_uses_backend_listing_and_keeps_old_cache_on_failure(tmp_path, m
     home, backend = SbxloopHome(tmp_path), backend_named("codex")
     calls = []
 
-    def discover(actual, timeout_s):
+    def discover(actual, timeout_s, config=None):
         calls.append((actual.name, timeout_s))
         return [row()]
 

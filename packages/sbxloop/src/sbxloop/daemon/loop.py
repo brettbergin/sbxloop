@@ -3836,7 +3836,7 @@ class DaemonLoop:
         for role in roles:
             name = sandbox_name(run_id, role)
             try:
-                remove_run_sandbox(self.sbx, name, role)
+                remove_run_sandbox(self.sbx, name, role, self.config)
                 self._notice(
                     "recovery.stale_sandbox_removed",
                     f"recovery: removed stale sandbox {name} (and its secrets)",
@@ -3848,7 +3848,7 @@ class DaemonLoop:
                 # No such sandbox — the common case — but a secret may
                 # still linger from a rollback race; clearing it is cheap.
                 log.debug("recovery.no_stale_sandbox", run=run_id, sandbox=name, role=role)
-                remove_run_sandbox_secrets(self.sbx, name, role)
+                remove_run_sandbox_secrets(self.sbx, name, role, self.config)
 
     def _any_credentialed_registries(self) -> bool:
         """Whether any repo this daemon runs for fetches through a service

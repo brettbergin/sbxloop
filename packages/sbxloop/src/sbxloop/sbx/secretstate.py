@@ -40,6 +40,7 @@ from sbxloop.backends import (
     backend_for,
 )
 from sbxloop.config import Config
+from sbxloop.endpoint import host_kind
 from sbxloop.errors import SbxError, SecretStateError
 from sbxloop.log import get_logger
 from sbxloop.sbx.cli import SbxCLI
@@ -70,8 +71,6 @@ _SCOPE_RE = re.compile(r'in scope "?([A-Za-z0-9._-]+)"?')
 # Spellings sbx uses for the global scope in errors and listings.
 _GLOBAL_SCOPE_NAMES = ("global", "-g")
 
-_DOMAIN_RE = re.compile(r"(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}")
-
 Source = Literal["ls", "probe"]
 
 RmCandidates = Callable[[str], list[Callable[[], bool]]]
@@ -82,11 +81,19 @@ def tracked_custom_secrets(config: Config) -> list[tuple[str, str]]:
 
     Exactly the configured agent backend's credential (#617): the Copilot
     token by default, the Anthropic key under ``[agent] backend =
-    "claude"``. Config declares no additional custom secrets (the github
-    sandbox uses sbx's built-in ``github`` service secret, which is never
-    managed here).
+    "claude"``, the endpoint-bound key under ``"openai"`` — once per
+    distinct binding, since a repository's own endpoint override binds the
+    same credential to another host. Config declares no additional custom
+    secrets (the github sandbox uses sbx's built-in ``github`` service
+    secret, which is never managed here).
     """
-    return [backend_for(config).secret]
+    backend = backend_for(config)
+    secrets: list[tuple[str, str]] = []
+    for repo in (None, *(entry.repo for entry in config.github.repos)):
+        secret = backend.secret(config, repo)
+        if secret not in secrets:
+            secrets.append(secret)
+    return secrets
 
 
 def parsed_scope(stderr: str) -> str | None:
@@ -215,21 +222,36 @@ class CustomSecretState(BaseModel):
     detail: str = ""
 
 
-def parse_secret_ls_entry(raw: str, env: str) -> tuple[str | None, list[str]] | None:
+def _host_token(token: str, expected: str | None) -> bool:
+    """Whether a listing token is a host binding: a dotted domain or an
+    address literal on its own shape, and a single-label hostname only when
+    it is the one the caller expects — any other bare word on the line is a
+    column, not a host."""
+    kind = host_kind(token.strip("[]"))
+    if kind in ("domain", "ipv4", "ipv6"):
+        return True
+    return kind == "hostname" and expected is not None and token.lower() == expected.lower()
+
+
+def parse_secret_ls_entry(
+    raw: str, env: str, *, host: str | None = None
+) -> tuple[str | None, list[str]] | None:
     """Best-effort (scope, hosts) for ``env`` from ``sbx secret ls`` output.
 
     The listing format is unverified across sbx builds, so parsing is
-    token-based on whichever line names the env var: domain-shaped tokens
-    are host bindings, a ``sbxloop-*`` token is the owning sandbox scope,
-    and a global spelling maps to "global". Returns None when no line
-    mentions the env (which is NOT proof of absence — the build's listing
-    may simply omit custom secrets; callers corroborate with the probe).
+    token-based on whichever line names the env var: host-shaped tokens
+    (a domain, an address literal, or the ``host`` the caller expects when
+    that is a bare hostname) are host bindings, a ``sbxloop-*`` token is
+    the owning sandbox scope, and a global spelling maps to "global".
+    Returns None when no line mentions the env (which is NOT proof of
+    absence — the build's listing may simply omit custom secrets; callers
+    corroborate with the probe).
     """
     for line in raw.splitlines():
         if not re.search(rf"(?<![A-Za-z0-9_]){re.escape(env)}(?![A-Za-z0-9_])", line):
             continue
         tokens = line.replace(",", " ").split()
-        hosts = [t for t in tokens if _DOMAIN_RE.fullmatch(t)]
+        hosts = [t.strip("[]") for t in tokens if _host_token(t, host)]
         scope = next((t for t in tokens if t.startswith(SANDBOX_SCOPE_PREFIX)), None)
         if scope is None and any(t.lower() in _GLOBAL_SCOPE_NAMES for t in tokens):
             scope = "global"
@@ -281,7 +303,7 @@ def inspect_custom_secret(
     """Current registration state for ``env``: listing first, probe fallback."""
     listing = cli.secret_ls()
     if listing.ok:
-        entry = parse_secret_ls_entry(listing.stdout, env)
+        entry = parse_secret_ls_entry(listing.stdout, env, host=host)
         if entry is not None:
             scope, hosts = entry
             return CustomSecretState(env=env, exists=True, scope=scope, hosts=hosts, source="ls")
@@ -555,7 +577,7 @@ def rotate_registrations(
                 "(`sbxloop sandbox rm --all`, or the console's Sandboxes screen)",
             )
         )
-    token_env = backend_for(config).token_env
+    token_env = backend_for(config).token_env(config)
     lines.append(
         (
             "warn",

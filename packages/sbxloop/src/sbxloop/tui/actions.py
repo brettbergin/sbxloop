@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Literal
 
 from sbxloop.config import TUI_CONTROL_CHANNEL, Config
+from sbxloop.configedit.edit import save_text
 from sbxloop.daemon.control import plain
 from sbxloop.daemon.mailbox import MailboxClient
 from sbxloop.daemon.store import DaemonStore, apply_item_verb
@@ -35,7 +36,6 @@ from sbxloop.sbx.prune import (
     remove_sandbox,
 )
 from sbxloop.sbx.secretstate import clean_secrets, rotate_registrations, secrets_context
-from sbxloop.tui.configedit import save_text
 from sbxloop.tui.data import CtlClient, DaemonSnapshot, probe_daemon
 from sbxloop.tui.runner import ChildHandle, CommandRunner, sbxloop_argv
 from sbxloop.tui.system import unit_argv
@@ -576,7 +576,7 @@ def remove_one_sandbox(deps: Deps, name: str, role: str | None) -> Action:
     def run() -> Outcome:
         try:
             if role in ("agent", "github", "service"):
-                remove_run_sandbox(deps.sbx(), name, role)  # type: ignore[arg-type]
+                remove_run_sandbox(deps.sbx(), name, role, deps.config)  # type: ignore[arg-type]
             else:
                 remove_sandbox(deps.sbx(), name)
         except SbxloopError as exc:
@@ -615,7 +615,7 @@ def prune_sandboxes(
             for v in orphans:
                 try:
                     if v.role in ("agent", "github", "service"):
-                        remove_run_sandbox(cli, v.name, v.role)  # type: ignore[arg-type]
+                        remove_run_sandbox(cli, v.name, v.role, deps.config)  # type: ignore[arg-type]
                     else:
                         remove_sandbox(cli, v.name)
                 except SbxloopError as exc:
