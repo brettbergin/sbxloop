@@ -9,9 +9,12 @@ Auth: the SDK auto-detects ``COPILOT_GITHUB_TOKEN``, which the sbxloop
 provisioner injects into the agent sandbox (proxy-bound to the Copilot API
 hosts under the default secret strategy).
 
-This module is exercised by the real-sbx e2e workflow rather than unit
-tests (it needs the SDK runtime + a Copilot subscription), and is excluded
-from unit coverage accordingly.
+A real session needs the SDK runtime and a Copilot subscription, so the
+module is exercised end to end by the real-sbx e2e workflow and excluded
+from unit coverage. Its decision logic is not: the extraction helpers here
+and the classifier in ``copilot_errors`` are unit-tested against SDK-shaped
+stand-ins, and ``tests/test_backend_copilot.py`` drives the session path
+itself against a fake ``copilot`` package.
 """
 
 from __future__ import annotations
@@ -23,10 +26,18 @@ import os
 import shutil
 import time
 from collections import Counter
+from collections.abc import Callable
 from typing import Any, get_args
 
 from sbxloop_worker._json import extract_json
 from sbxloop_worker.backends import BackendResult, BackendUnavailableError, EmitFn
+from sbxloop_worker.backends.copilot_errors import (
+    ProviderFailed,
+    failure_from_error_event,
+    failure_from_exception,
+    resume_recovery_failure,
+    seconds,
+)
 from sbxloop_worker.hosttools import HostToolTimeout, request_tool, safe_call_id
 from sbxloop_worker.mcp import server_configs
 from sbxloop_worker.protocol import (
@@ -34,6 +45,7 @@ from sbxloop_worker.protocol import (
     HostToolCall,
     HostToolSpec,
     JobRequest,
+    ProviderFailure,
     SessionHealth,
     Usage,
 )
@@ -561,6 +573,59 @@ def available_tool_count(data: Any) -> int | None:
     return value if isinstance(value, int) else None
 
 
+class ProviderState:
+    """Provider-limit signals seen during one session, folded once at the end.
+
+    The SDK reports a rejection across several events that arrive in no
+    guaranteed order (the error itself, and the auto-mode-switch request
+    that carries its retry timing), and ``send_and_wait`` raises a generic
+    exception once the error is terminal. Signals are therefore recorded as
+    they arrive and classified only when the session is over — the final
+    outcome, never a telemetry event.
+
+    Two SDK events deliberately record nothing here, because neither says
+    the credential is out of capacity. ``ModelCallFailureData`` reports one
+    model call, which the SDK may retry on its own — as do the internal
+    quota snapshots it carries, a zero remaining percentage included.
+    ``SessionLimitsExhaustedRequestedData`` reports an app-set per-session
+    credit cap (``SessionLimitsConfig.max_ai_credits``), which is a caller's
+    own budget rather than an account limit. An assistant message means the
+    SDK produced real output, which clears any error recorded before it.
+    """
+
+    def __init__(self) -> None:
+        self.error: Any = None
+        self.retry_after_s: float | None = None
+        self.saw_output = False
+
+    def record_error(self, data: Any) -> None:
+        self.error = data
+
+    def record_output(self) -> None:
+        self.saw_output = True
+        self.error = None
+
+    def record_auto_switch(self, data: Any) -> None:
+        """Retry timing from an auto-mode-switch request.
+
+        The request itself is declined: with no handler registered the SDK
+        answers "no" (field-verified against github-copilot-sdk 1.0.13),
+        so a throttle never silently moves the run onto another model.
+        Only its timing is kept.
+        """
+        delay = seconds(getattr(data, "retry_after_seconds", None))
+        if delay is not None:
+            self.retry_after_s = delay
+
+    def failure(self, *, now: Callable[[], float] | None = None) -> ProviderFailure | None:
+        if self.error is None:
+            return None
+        failure = failure_from_error_event(self.error, retry_after_s=self.retry_after_s, now=now)
+        if failure is None:
+            return None
+        return failure.model_copy(update={"partial_progress": self.saw_output})
+
+
 class CopilotBackend:
     name = "copilot"
 
@@ -585,10 +650,14 @@ class CopilotBackend:
         self._guard_bundled_ripgrep(emit)
         try:
             return asyncio.run(self._run(job, emit))
+        except BackendUnavailableError:
+            raise
         except Exception as exc:
             # Auth failures surface as opaque SDK errors ("Session was not
             # created with authentication info..."); say what the token
             # environment actually looks like from inside the sandbox.
+            # Only what reaches here: a classified provider limit already
+            # returned a result, so throttling never collects auth advice.
             raise RuntimeError(f"{exc} | {_auth_diagnostic()}") from exc
 
     @staticmethod
@@ -628,11 +697,19 @@ class CopilotBackend:
         # Completions correlate to their start by id (not by comparing
         # command text), which also yields a per-call duration.
         tool_calls = ToolCallRegistry()
+        provider = ProviderState()
 
         def on_event(event: Any) -> None:
             nonlocal usage, turns, model_slug
             data = getattr(event, "data", None)
             type_name = type(data).__name__ if data is not None else type(event).__name__
+            if type_name == "SessionErrorData":
+                # Captured before send_and_wait collapses it into a generic
+                # exception, which keeps only the message text. Every other
+                # failure-shaped event is telemetry (see ProviderState).
+                provider.record_error(data)
+            elif type_name == "AutoModeSwitchRequestedData":
+                provider.record_auto_switch(data)
             if type_name == "AssistantMessageDeltaData":
                 emit(
                     EventTypes.AGENT_MESSAGE_DELTA,
@@ -642,6 +719,8 @@ class CopilotBackend:
                 content = getattr(data, "content", "") or ""
                 if content:
                     final_text.append(content)
+                    # Real output after an error means the SDK recovered.
+                    provider.record_output()
                 emit(
                     EventTypes.AGENT_MESSAGE,
                     content=content,
@@ -696,24 +775,57 @@ class CopilotBackend:
                     payload["available_tools"] = tools
                 emit(EventTypes.AGENT_USAGE, **payload)
 
-        async with CopilotClient() as client:
-            session = await self._open_session(
-                client, job, emit=emit, tracker=tracker, governor=governor
+        def result(
+            text: str = "",
+            *,
+            session_id: str | None = None,
+            failure: ProviderFailure | None = None,
+        ) -> BackendResult:
+            # Accumulated usage and session identity ride back on a failure
+            # too: recovery continues this run, and the spend already
+            # incurred is not forgotten because the provider said no.
+            return BackendResult(
+                output_text=text,
+                output_json=(
+                    extract_json(text) if job.expect == "json" and failure is None else None
+                ),
+                session_id=session_id,
+                usage=usage.merged(Usage(backend=BACKEND_NAME)) if usage != Usage() else None,
+                turns=turns or None,
+                health=tracker.health(governor),
+                failure=failure,
             )
+
+        async with CopilotClient() as client:
+            try:
+                session = await self._open_session(
+                    client, job, emit=emit, tracker=tracker, governor=governor
+                )
+            except ProviderFailed as held:
+                # A throttled or parked session was never opened, so there
+                # is no session to close and nothing was spent here.
+                return result(session_id=job.resume_session_id, failure=held.failure)
             try:
                 session.on(on_event)
                 assert job.prompt is not None
-                response = await session.send_and_wait(job.prompt, timeout=job.timeout_s)
+                try:
+                    response = await session.send_and_wait(job.prompt, timeout=job.timeout_s)
+                except TimeoutError:
+                    raise
+                except Exception:
+                    # send_and_wait raises a generic exception for a terminal
+                    # session error; the envelope behind it was captured as
+                    # it arrived. Anything it cannot place stays a task
+                    # failure rather than becoming a guessed provider hold.
+                    failure = provider.failure()
+                    if failure is None:
+                        raise
+                    return result(session_id=self._session_id(session), failure=failure)
                 text = self._response_text(response) or "\n".join(final_text)
-                output_json = extract_json(text) if job.expect == "json" else None
-                session_id = getattr(session, "session_id", None) or getattr(session, "id", None)
-                return BackendResult(
-                    output_text=text,
-                    output_json=output_json,
-                    session_id=session_id,
-                    usage=usage.merged(Usage(backend=BACKEND_NAME)) if usage != Usage() else None,
-                    turns=turns or None,
-                    health=tracker.health(governor),
+                # An idle finish still carries its error when one was
+                # recorded and no output followed it.
+                return result(
+                    text, session_id=self._session_id(session), failure=provider.failure()
                 )
             finally:
                 await self._close_session(session)
@@ -833,9 +945,35 @@ class CopilotBackend:
             # is events): the host sees it for free, because a fresh session
             # comes back with a different id than the one it asked to
             # resume, which is what `phase.resume_missed` keys on.
-            with contextlib.suppress(Exception):
+            try:
                 return await client.resume_session(job.resume_session_id, **kwargs)
-        return await client.create_session(**kwargs)
+            except Exception as exc:
+                # A provider that refused the resume for capacity would
+                # refuse the fresh session too, so opening one buys a
+                # second rejection and throws the resumable context away.
+                failure = failure_from_exception(exc)
+                if failure is not None:
+                    raise ProviderFailed(failure) from exc
+                # Work only the original session holds must be inspected,
+                # never re-derived by a session that would replay its side
+                # effects.
+                if job.require_resume:
+                    raise ProviderFailed(resume_recovery_failure()) from exc
+        try:
+            return await client.create_session(**kwargs)
+        except TypeError:
+            # An unsupported kwarg, retried by the caller without it.
+            raise
+        except Exception as exc:
+            failure = failure_from_exception(exc)
+            if failure is None:
+                raise
+            raise ProviderFailed(failure) from exc
+
+    @staticmethod
+    def _session_id(session: Any) -> str | None:
+        value = getattr(session, "session_id", None) or getattr(session, "id", None)
+        return value if isinstance(value, str) else None
 
     def _permission_handler(
         self,
