@@ -123,11 +123,10 @@ from __future__ import annotations
 
 import contextlib
 import os
-import re
 import shutil
-import subprocess
 import tempfile
 from collections.abc import Iterator, Sequence
+from configparser import Error as ConfigError
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -137,8 +136,10 @@ from git import (
     Git,
     GitCommandError,
     GitCommandNotFound,
+    GitConfigParser,
     InvalidGitRepositoryError,
     NoSuchPathError,
+    Reference,
     Repo,
 )
 
@@ -253,41 +254,30 @@ def is_tracked(repo_root: Path, path: Path) -> bool | None:
 
     None when git is unavailable or the probe fails, so the caller decides
     what "could not tell" means for it. The checkout may be one a sandbox
-    agent has written to, so its config is untrusted: ``core.fsmonitor``
-    (a hook git would run) is forced off on the command line, and inherited
-    ``GIT_*`` variables are dropped so they cannot point git elsewhere.
-    ``ls-files`` never executes anything else.
+    agent has written to, so its config is untrusted: the index is read
+    through :func:`sbxloop.safegit.read_repo`, whose private metadata
+    snapshot carries none of the checkout's config, hooks or drivers, and
+    answered from the typed index rather than a subprocess exit status.
     """
-    git = find_git()
-    if git is None:
+    if find_git() is None:
         return None
     try:
         relative = path.resolve().relative_to(repo_root.resolve())
     except ValueError:
         return False
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     try:
-        proc = subprocess.run(  # nosec B603 - list argv, git binary, no shell
-            [git, "-c", "core.fsmonitor=false", "ls-files", "--error-unmatch", "--", str(relative)],
-            cwd=repo_root,
-            env=env,
-            capture_output=True,
-            check=False,
-        )
-    except OSError:
+        with read_repo(repo_root) as repo:
+            return any(path == relative.as_posix() for _mode, path in _index_entries(repo))
+    except (
+        InvalidGitRepositoryError,
+        NoSuchPathError,
+        GitCommandError,
+        ProvisionError,
+        ValueError,
+        OSError,
+    ):
         log.debug("git.is_tracked_probe_failed", root=str(repo_root), exc_info=True)
         return None
-    if proc.returncode == 0:
-        return True
-    if proc.returncode == 1:
-        return False
-    log.debug(
-        "git.is_tracked_probe_failed",
-        root=str(repo_root),
-        rc=proc.returncode,
-        stderr=proc.stderr.decode("utf-8", "replace")[-400:],
-    )
-    return None
 
 
 def head_commit(repo_path: Path) -> str | None:
@@ -314,7 +304,7 @@ def is_dirty(repo_path: Path, *, ignore: Sequence[str] = ()) -> bool:
             pathspecs = [f":!{name}" for name in ignore]
             output = _dirty_listing(repo, pathspecs)
             return bool(output.strip()) or any(
-                submodule_is_dirty(repo_path / path) for path in _gitlinks(repo, pathspecs)
+                submodule_is_dirty(repo_path / path) for path in _gitlinks(repo, ignore)
             )
     except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError) as exc:
         raise ProvisionError(f"git status failed in {repo_path}: {exc}") from exc
@@ -394,6 +384,24 @@ def origin_matches_repo(path: Path, repo: str) -> bool | None:
     return origin == expected
 
 
+def _pin_base(clone: Repo) -> str:
+    """Pin the commit a fresh clone starts from under :data:`CLONE_BASE_REF`
+    and return its sha. A plain reference, not a branch: the agent must
+    never see it in ``git branch``."""
+    sha = clone.head.commit.hexsha
+    Reference.create(clone, CLONE_BASE_REF, sha)
+    return sha
+
+
+def _reset_branch(clone: Repo, branch: str, start: str) -> None:
+    """``git checkout -B <branch> <start>``: create or force ``branch`` onto
+    ``start`` and check it out. ``branch`` may be the one the clone already
+    has checked out (a ``--branch`` clone lands on it), and a ref update
+    alone would leave the work tree behind at the old commit — so the
+    checkout is forced, which on a fresh clone discards nothing."""
+    clone.create_head(branch, start, force=True).checkout(force=True)
+
+
 def clone_for_run(source: Path, target: Path, branch: str) -> str:
     """Clone ``source`` into ``target`` on a fresh ``branch``; return HEAD sha.
 
@@ -420,12 +428,10 @@ def clone_for_run(source: Path, target: Path, branch: str) -> str:
         with Repo.clone_from(
             str(source), str(target), env=_local_clone_env(), multi_options=list(CLONE_OPTIONS)
         ) as clone:
-            clone.git.checkout("-b", branch)
+            clone.create_head(branch).checkout()
             if upstream is not None:
-                clone.git.remote("set-url", "origin", upstream)
-            sha = clone.head.commit.hexsha
-            clone.git.update_ref(CLONE_BASE_REF, sha)
-            return sha
+                clone.remotes.origin.set_url(upstream)
+            return _pin_base(clone)
     except (GitCommandError, NoSuchPathError, OSError, ValueError) as exc:
         if target.exists() and not (target / ".git").is_dir():
             shutil.rmtree(target, ignore_errors=True)
@@ -477,12 +483,10 @@ def clone_from_remote(
             if existing:
                 # A fix round continuing its own pull request: start from what
                 # the remote branch actually has.
-                clone.git.checkout("-B", branch, f"origin/{branch}")
+                _reset_branch(clone, branch, f"origin/{branch}")
             else:
-                clone.git.checkout("-b", branch)
-            sha = clone.head.commit.hexsha
-            clone.git.update_ref(CLONE_BASE_REF, sha)
-            return sha
+                clone.create_head(branch).checkout()
+            return _pin_base(clone)
     except (GitCommandError, NoSuchPathError, OSError, ValueError) as exc:
         if target.exists() and not (target / ".git").is_dir():
             shutil.rmtree(target, ignore_errors=True)
@@ -635,12 +639,10 @@ def clone_existing_branch(source: Path, target: Path, branch: str) -> str:
                 # rather than mutating it; a local branch of that name on the
                 # source (a hand-made checkout) is the second place to look.
                 _fetch_branch_from_source(clone, source, branch)
-            clone.git.checkout("-B", branch, remote_ref)
+            _reset_branch(clone, branch, remote_ref)
             if upstream is not None:
-                clone.git.remote("set-url", "origin", upstream)
-            sha = clone.head.commit.hexsha
-            clone.git.update_ref(CLONE_BASE_REF, sha)
-            return sha
+                clone.remotes.origin.set_url(upstream)
+            return _pin_base(clone)
     except ProvisionError:
         # The clone itself succeeded — it is the branch that is missing — so
         # `.git` exists and the usual "only clean a half-clone" guard would
@@ -657,39 +659,30 @@ def clone_existing_branch(source: Path, target: Path, branch: str) -> str:
         ) from exc
 
 
-_SUBMODULE_CONFIG_RE = re.compile(r"^submodule\.(.+)\.(path|url) (.*)$")
-
-
 def list_submodules(repo_path: Path) -> list[Submodule]:
     """The submodules ``repo_path``'s ``.gitmodules`` declares, in file
     order; empty when there is no such file. A checkout is not needed —
-    the file is read with ``git config -f`` — so this also answers for a
-    workspace whose submodules were never populated."""
+    the file itself is parsed, as ``git config -f`` would — so this also
+    answers for a workspace whose submodules were never populated (which
+    is why ``Repo.submodules`` is not used: it reads gitlinks from HEAD).
+    Includes are never followed: the file is repository content."""
     modules = repo_path / ".gitmodules"
     if not modules.is_file():
         return []
     try:
-        with Repo(repo_path) as repo:
-            listing = repo.git.config(
-                "-f", str(modules), "--get-regexp", r"^submodule\..*\.(path|url)$"
-            )
-    except GitCommandError as exc:
-        if exc.status == 1:
-            return []  # no matching keys
-        raise ProvisionError(f"reading {modules} failed: {_describe(exc)}") from exc
-    except (InvalidGitRepositoryError, NoSuchPathError, ValueError) as exc:
+        with GitConfigParser(str(modules), read_only=True, merge_includes=False) as config:
+            found = [
+                Submodule(
+                    name=section[len('submodule "') : -1],
+                    path=str(config.get_value(section, "path", "")).strip(),
+                    url=str(config.get_value(section, "url", "")).strip(),
+                )
+                for section in config.sections()
+                if section.startswith('submodule "') and section.endswith('"')
+            ]
+    except (ConfigError, OSError, ValueError) as exc:
         raise ProvisionError(f"reading {modules} failed: {exc}") from exc
-    found: dict[str, dict[str, str]] = {}
-    for line in listing.splitlines():
-        match = _SUBMODULE_CONFIG_RE.match(line)
-        if match:
-            name, key, value = match.groups()
-            found.setdefault(name, {})[key] = value.strip()
-    return [
-        Submodule(name=name, path=entry["path"], url=entry.get("url", ""))
-        for name, entry in found.items()
-        if entry.get("path")
-    ]
+    return [sub for sub in found if sub.path]
 
 
 def populate_submodules(
@@ -772,8 +765,10 @@ def populate_submodules(
 
 
 def _is_gitlink_in_index(clone: Path, path: str) -> bool:
-    entry: str = Repo(clone).git.ls_files("--stage", "--", path)
-    return entry.startswith(f"{GITLINK_MODE} ")
+    with Repo(clone) as repo:
+        return any(
+            mode == GITLINK_MODE and entry == path for mode, entry in _index_entries(repo, path)
+        )
 
 
 def _submodule_update(
@@ -826,8 +821,12 @@ def _discard_half_populated(clone: Path, path: str) -> None:
         name = next((s.name for s in list_submodules(clone) if s.path == path), path)
         store = Path(repo.git_dir) / "modules" / name
         shutil.rmtree(store, ignore_errors=True)
-        with contextlib.suppress(GitCommandError):
-            repo.git.config("--unset", f"submodule.{name}.url")
+        # The entry may not exist: an `-c` override answers `submodule init`
+        # without writing one, and `--unset` tolerated that.
+        with repo.config_writer() as config:
+            section = f'submodule "{name}"'
+            if config.has_section(section):
+                config.remove_option(section, "url")
 
 
 def submodule_hosts(repo_path: Path) -> list[str]:
@@ -1090,9 +1089,15 @@ def fetch_tags(
     try:
         with Repo(clone) as repo:
             if source is not None and tag_count(source):
+                # A filesystem path, not a configured remote: there is no
+                # `Remote` to fetch through, so this one stays a passthrough.
                 repo.git.fetch("--tags", str(source), env=_local_clone_env())
                 return TagFetch(tag_count(clone), "local")
-            repo.git.fetch("--tags", "origin", env=_clone_env(token, credential_url=credential_url))
+            # The credential lives in the environment for exactly this
+            # fetch: `custom_environment` restores the `Git` instance's
+            # environment on exit, and nothing here writes `.git/config`.
+            with repo.git.custom_environment(**_clone_env(token, credential_url=credential_url)):
+                repo.remotes.origin.fetch(tags=True)
             return TagFetch(tag_count(clone), "remote")
     except (GitCommandError, InvalidGitRepositoryError, NoSuchPathError, OSError) as exc:
         raise ProvisionError(
@@ -1104,8 +1109,7 @@ def fetch_tags(
 def tag_count(repo_path: Path) -> int:
     """How many tags ``repo_path`` holds."""
     with Repo(repo_path) as repo:
-        listing: str = repo.git.tag("--list")
-    return len(listing.split()) if listing else 0
+        return len(repo.tags)
 
 
 def gitignored_files(root: Path) -> frozenset[str] | None:
@@ -1147,37 +1151,35 @@ def gitignored_files(root: Path) -> frozenset[str] | None:
     resolves ``GIT_WORK_TREE`` against its cwd -- which is ``root`` -- so
     a relative value would point at ``root/root`` and ignore nothing.
     """
-    git = find_git()
-    if git is None:
+    if find_git() is None:
         return None
     root = root.absolute()
-    argv = [
-        git,
-        "-c",
-        "core.fsmonitor=false",
-        "ls-files",
-        "--others",
-        "--ignored",
-        "--exclude-per-directory=.gitignore",
-        "-z",
-    ]
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     if (root / ".git").exists():
         try:
-            return _ls_files(argv, root, env)
-        except (subprocess.CalledProcessError, OSError):
+            with read_repo(root) as repo:
+                return _ls_files(repo.git)
+        except (
+            InvalidGitRepositoryError,
+            NoSuchPathError,
+            GitCommandError,
+            ProvisionError,
+            ValueError,
+            OSError,
+        ):
             # Not a usable repo (a bare `.git` marker, corrupt HEAD, …):
             # fall through to the self-contained probe.
             log.debug("gitignore.in_place_probe_failed", root=str(root), exc_info=True)
     try:
         with tempfile.TemporaryDirectory(prefix="sbxloop-gitignore-") as tmp:
-            subprocess.run(  # nosec B603 - list argv, git binary, no shell
-                [git, "init", "-q", tmp], check=True, capture_output=True, env=env
+            Repo.init(tmp).close()
+            git = Git(str(root))
+            git.update_environment(
+                **{k: None for k in os.environ if k.startswith("GIT_")},
+                GIT_DIR=str(Path(tmp) / ".git"),
+                GIT_WORK_TREE=str(root),
             )
-            env["GIT_DIR"] = str(Path(tmp) / ".git")
-            env["GIT_WORK_TREE"] = str(root)
-            return _ls_files(argv, root, env)
-    except (subprocess.CalledProcessError, OSError):
+            return _ls_files(git)
+    except (GitCommandError, OSError):
         log.warning(
             "gitignore.probe_failed",
             root=str(root),
@@ -1187,13 +1189,18 @@ def gitignored_files(root: Path) -> frozenset[str] | None:
         return None
 
 
-def _ls_files(argv: Sequence[str], cwd: Path, env: dict[str, str]) -> frozenset[str]:
-    proc = subprocess.run(  # nosec B603 - list argv, git binary, no shell
-        list(argv), cwd=cwd, env=env, check=True, capture_output=True
+def _ls_files(git: Git) -> frozenset[str]:
+    """``git ls-files --others --ignored`` under in-tree rules only, as bytes:
+    a path git cannot decode is still a path, and must not drop out of the
+    listing on the way through a str."""
+    out: bytes = git.ls_files(
+        "--others",
+        "--ignored",
+        "--exclude-per-directory=.gitignore",
+        "-z",
+        stdout_as_string=False,
     )
-    return frozenset(
-        part.decode("utf-8", "surrogateescape") for part in proc.stdout.split(b"\0") if part
-    )
+    return frozenset(part.decode("utf-8", "surrogateescape") for part in out.split(b"\0") if part)
 
 
 def resolve_diff_base(repo_path: Path, remote_base_sha: str | None) -> str | None:
@@ -1228,10 +1235,14 @@ def resolve_diff_base(repo_path: Path, remote_base_sha: str | None) -> str | Non
 
 
 def _merge_base(repo: Repo, ref: str, head: str) -> str | None:
+    """The merge base of ``ref`` and ``head``, or None: unrelated histories
+    are a legitimate answer (an empty list), and so is a ``ref`` the
+    checkout does not have (``origin/HEAD`` on a pinned clone)."""
     try:
-        return str(repo.git.merge_base(ref, head)).strip() or None
-    except GitCommandError:
+        bases = repo.merge_base(ref, head)
+    except (GitCommandError, ValueError):
         return None
+    return bases[0].hexsha if bases else None
 
 
 def changes_since(
@@ -1342,9 +1353,30 @@ def submodule_is_dirty(sub: Path) -> bool:
         return False
 
 
-def _gitlinks(repo: Repo, pathspecs: Sequence[str] = ()) -> list[str]:
-    entries = repo.git.ls_files("--stage", "-z", "--", *pathspecs).split("\0")
-    return [entry.partition("\t")[2] for entry in entries if entry.startswith(GITLINK_MODE + " ")]
+def _index_entries(repo: Repo, *pathspecs: str) -> list[tuple[str, str]]:
+    """``(mode, path)`` for every index entry, from ``ls-files --stage -z``
+    read as bytes. Not ``repo.index.entries``: GitPython decodes entry
+    paths strictly, and one filename git could not decode as UTF-8 would
+    turn a whole repository's index into a ``UnicodeDecodeError``. Here such
+    a name is still a path (``surrogateescape``)."""
+    out: bytes = repo.git.ls_files("--stage", "-z", "--", *pathspecs, stdout_as_string=False)
+    entries: list[tuple[str, str]] = []
+    for record in out.split(b"\0"):
+        if not record:
+            continue
+        meta, _tab, path = record.partition(b"\t")
+        entries.append((meta.split(b" ", 1)[0].decode(), path.decode("utf-8", "surrogateescape")))
+    return entries
+
+
+def _gitlinks(repo: Repo, ignore: Sequence[str] = ()) -> list[str]:
+    """Paths of the gitlinks in the index, skipping any top-level entry named
+    in ``ignore`` (the ``:!<name>`` exclusion the status listing applies)."""
+    return [
+        path
+        for mode, path in _index_entries(repo)
+        if mode == GITLINK_MODE and path.split("/", 1)[0] not in ignore
+    ]
 
 
 def _dirty_listing(repo: Repo, pathspecs: Sequence[str] = ()) -> str:
@@ -1364,10 +1396,19 @@ def _commit_is_published(sub: Path, sha: str) -> bool:
     word: the gitlink is delivered rather than second-guessed."""
     try:
         with read_repo(sub) as repo:
-            listing = repo.git.for_each_ref(
-                f"--contains={sha}", "refs/remotes", "refs/tags", "--format=%(refname)"
-            )
-            return bool(listing.strip())
+            published = [
+                ref.object.hexsha
+                for ref in repo.refs
+                if str(ref.path).startswith(("refs/remotes/", "refs/tags/"))
+            ]
+            # `sha` minus everything the remote refs and tags reach: empty
+            # exactly when one of them contains it. One walk, not one
+            # ancestry query per ref.
+            # GitPython annotates one rev; rev-list takes many and the
+            # wrapper passes a list straight through.
+            revs = [sha, *(f"^{oid}" for oid in published)]
+            unreached = repo.iter_commits(rev=revs)  # type: ignore[arg-type]
+            return next(unreached, None) is None
     except (InvalidGitRepositoryError, NoSuchPathError, GitCommandError, ValueError):
         return True
 
@@ -1400,6 +1441,10 @@ def diff_text(repo_path: Path, remote_base_sha: str | None) -> str | None:
             body = repo.git.diff(
                 "--ignore-submodules=dirty", "--no-ext-diff", "--no-textconv", "--no-color", base
             )
+            # Not `repo.untracked_files`: GitPython answers that with
+            # `git status`, which recurses into submodules and would run a
+            # nested checkout's fsmonitor hook on the host. `ls-files` does
+            # not descend.
             untracked = [
                 path
                 for path in repo.git.ls_files("--others", "--exclude-standard", "-z").split("\0")
@@ -1451,7 +1496,7 @@ def _fetch_branch_from_source(clone: Repo, source: Path, branch: str) -> None:
     last: GitCommandError | None = None
     for src_ref in (f"refs/remotes/origin/{branch}", f"refs/heads/{branch}"):
         try:
-            clone.git.fetch("origin", f"{src_ref}:refs/remotes/origin/{branch}")
+            clone.remotes.origin.fetch(f"{src_ref}:refs/remotes/origin/{branch}")
             return
         except GitCommandError as exc:
             last = exc
@@ -1581,7 +1626,7 @@ def base_bundle(
     """
     try:
         with read_repo(workspace) as repo:
-            known = repo.git.for_each_ref("--format=%(objectname)").splitlines()
+            known = [ref.object.hexsha for ref in repo.refs]
             if repo.head.is_valid():
                 known.append(repo.head.commit.hexsha)
             ref = "refs/sbxloop/fetched-base"
@@ -1592,10 +1637,10 @@ def base_bundle(
                 f"+refs/heads/{base_branch}:{ref}",
                 env=_clone_env(token, credential_url=repo_url),
             )
-            sha = str(repo.git.rev_parse("--verify", ref)).strip()
+            sha = repo.commit(ref).hexsha
             exclusions = [f"^{oid}" for oid in sorted(set(known))]
-            missing = repo.git.rev_list("--count", ref, *exclusions).strip()
-            if missing == "0":
+            missing = repo.iter_commits(rev=[ref, *exclusions])  # type: ignore[arg-type]
+            if next(missing, None) is None:
                 yield sha, None
             else:
                 bundle = Path(repo.git_dir).parent / "base.bundle"
