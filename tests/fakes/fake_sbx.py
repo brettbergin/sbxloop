@@ -18,17 +18,23 @@ sandboxes, 2 for usage errors.
 
 from __future__ import annotations
 
-import contextlib
 import fcntl
 import json
 import os
 import re
-import shutil
-import signal
-import subprocess
 import sys
 import time
 from pathlib import Path
+
+# The suite execs this file tens of thousands of times, once per `sbx` call,
+# so its import graph is paid on every one of them and is a real share of the
+# `slow` half's wall clock. Only what every invocation needs is imported at
+# module scope; `contextlib`, `shutil`, `signal` and `subprocess` — and what
+# they drag in behind them — are imported inside the handlers that use them,
+# none of which is on the common path.
+#
+# `re` stays: `json` imports it (via `json.decoder`) and every invocation
+# writes `invocations.jsonl`, so deferring it would buy nothing.
 
 VERSION_OUTPUT = "sbx version 0.38.0\n"
 
@@ -118,9 +124,10 @@ def require_sandbox(root: Path, name: str) -> Path:
 # paths in worker argv (this broke CI once — keep it narrow). /workspace is
 # the fake's model of the sbx workspace mount (a symlink to the real host
 # workspace dir, created by cmd_create).
-_SANDBOX_ROOTS = re.compile(
+_SANDBOX_ROOTS_PATTERN = (
     r"(^|[\s='\"(:])(/(?:home/agent|etc/sandbox|tmp/sbxloop|workspace)(?=[/._\-\s]|$))"
 )
+_SANDBOX_ROOTS = re.compile(_SANDBOX_ROOTS_PATTERN)
 
 
 def rewrite_abs(fs: Path, arg: str) -> str:
@@ -157,6 +164,8 @@ def template_dir(root: Path, ref: str) -> Path:
 def cmd_template(root: Path, args: list[str]) -> int:
     """Model `sbx template save/ls`: save snapshots a sandbox's fs so a
     later `create --template <ref>` starts from that filesystem."""
+    import shutil
+
     if args[:1] == ["save"]:
         if len(args) != 3:
             print("usage: sbx template save SANDBOX REF", file=sys.stderr)
@@ -183,6 +192,8 @@ def cmd_template(root: Path, args: list[str]) -> int:
 
 
 def cmd_create(root: Path, args: list[str]) -> int:
+    import shutil
+
     name = None
     template = None
     rest: list[str] = []
@@ -246,6 +257,10 @@ def fake_pkill(fs: Path, args: list[str]) -> int:
     exec always qualify, because absolute-path rewriting embeds the fs path
     in their argv).
     """
+    import contextlib
+    import signal
+    import subprocess
+
     pattern = args[-1] if args else ""
     try:
         regex = re.compile(pattern)
@@ -269,6 +284,8 @@ def fake_pkill(fs: Path, args: list[str]) -> int:
 
 
 def cmd_exec(root: Path, args: list[str], stdin: str = "") -> int:
+    import subprocess
+
     args = [a for a in args if a not in ("-it", "-i", "-t")]
     if not args:
         print("usage: sbx exec SANDBOX CMD...", file=sys.stderr)
@@ -345,6 +362,8 @@ def parse_remote(root: Path, ref: str) -> Path | None:
 
 
 def cmd_cp(root: Path, args: list[str]) -> int:
+    import shutil
+
     if len(args) != 2:
         print("usage: sbx cp SRC DST", file=sys.stderr)
         return 2
@@ -382,6 +401,11 @@ def cmd_ls(root: Path) -> int:
                 # closer to gone.
                 remaining -= 1
                 if remaining <= 0:
+                    # Inside the branch, not at the top of `cmd_ls`: a
+                    # teardown finishing is the rare case, and `ls` is one of
+                    # the calls this module's import budget is kept small for.
+                    import shutil
+
                     shutil.rmtree(path)
                     continue
                 meta["removing"] = remaining
@@ -418,6 +442,8 @@ def cmd_stop(root: Path, args: list[str]) -> int:
 
 
 def cmd_rm(root: Path, args: list[str]) -> int:
+    import shutil
+
     names = [a for a in args if not a.startswith("-")]
     if len(names) != 1:
         print("usage: sbx rm [--force] SANDBOX", file=sys.stderr)

@@ -29,6 +29,7 @@ from tests.unit.tui.conftest import (
     drive,
     live_status,
     make_app,
+    until,
 )
 
 REFRESH: dict[str, Any] = {"refresh_s": 3.0}
@@ -58,7 +59,7 @@ def test_sandboxes_screen_classifies_and_prunes_behind_a_typed_word(seeded: Sbxl
         app = make_app(seeded, sbx=sbx, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("5")
-            await pilot.pause(1.0)
+            await until(pilot, lambda: isinstance(app.screen, SandboxesScreen))
             assert isinstance(app.screen, SandboxesScreen)
             table = app.screen.query_one("#sandboxes", ConsoleTable)
             assert table.row_count == 3, "non-sbxloop sandboxes are never listed"
@@ -70,12 +71,12 @@ def test_sandboxes_screen_classifies_and_prunes_behind_a_typed_word(seeded: Sbxl
             assert "1 orphan(s)" in summary
             # P asks for the word; a wrong word is refused, the right one prunes.
             await pilot.press("P")
-            await pilot.pause(0.3)
+            await until(pilot, lambda: isinstance(app.screen, TypedConfirmScreen))
             assert isinstance(app.screen, TypedConfirmScreen)
             box = app.screen.query_one("#typed", Input)
             box.value = "nope"
             await pilot.press("enter")
-            await pilot.pause(0.3)
+            await until(pilot, lambda: isinstance(app.screen, TypedConfirmScreen))
             assert isinstance(app.screen, TypedConfirmScreen)
             box.value = "prune"
             await pilot.press("enter")
@@ -86,7 +87,7 @@ def test_sandboxes_screen_classifies_and_prunes_behind_a_typed_word(seeded: Sbxl
             table = app.screen.query_one("#sandboxes", ConsoleTable)
             table.move_cursor(row=table.get_row_index("sbxloop-r_live-agent"))
             await pilot.press("x")
-            await pilot.pause(0.3)
+            await until(pilot, lambda: isinstance(app.screen, TypedConfirmScreen))
             assert isinstance(app.screen, TypedConfirmScreen)
             app.screen.query_one("#typed", Input).value = "sbxloop-r_live-agent"
             await pilot.press("enter")
@@ -118,7 +119,7 @@ def test_daemon_screen_shows_the_unit_streams_the_journal_and_drives_the_verbs(
         app = make_app(seeded, ctl=ctl, runner=runner, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("6")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, DaemonScreen))
             assert isinstance(app.screen, DaemonScreen)
             process = app.screen.query_one("#process", TextPanel).content_text
             assert "active (running)" in process and "pid 4242" in process
@@ -134,14 +135,14 @@ def test_daemon_screen_shows_the_unit_streams_the_journal_and_drives_the_verbs(
             assert app.screen.min_level == "warning"
             # p pauses after a y/n; the daemon hears the ctl verb.
             await pilot.press("p")
-            await pilot.pause(0.3)
+            await until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("y")
             await pilot.pause(1.0)
             assert "pause" in ctl.commands
             # B restarts the unit only under its typed name.
             await pilot.press("B")
-            await pilot.pause(0.3)
+            await until(pilot, lambda: isinstance(app.screen, TypedConfirmScreen))
             assert isinstance(app.screen, TypedConfirmScreen)
             app.screen.query_one("#typed", Input).value = "sbxloop-daemon"
             await pilot.press("enter")
@@ -149,7 +150,7 @@ def test_daemon_screen_shows_the_unit_streams_the_journal_and_drives_the_verbs(
             assert ("systemctl", "--user", "restart", "sbxloop-daemon") in runner.calls
             # D is refused while a daemon answers.
             await pilot.press("D")
-            await pilot.pause(0.3)
+            await until(pilot, lambda: isinstance(app.screen, DaemonScreen))
             assert isinstance(app.screen, DaemonScreen)
             assert runner.spawned == []
             # The palette's twin runs the same screen action: refused too.
@@ -157,7 +158,7 @@ def test_daemon_screen_shows_the_unit_streams_the_journal_and_drives_the_verbs(
             await pilot.press("1")
             await pilot.pause(0.3)
             spawn.invoke(app)
-            await pilot.pause(1.0)
+            await until(pilot, lambda: isinstance(app.screen, DaemonScreen))
             assert isinstance(app.screen, DaemonScreen)
             assert runner.spawned == []
 
@@ -184,18 +185,18 @@ def test_daemon_screen_spawns_a_daemon_when_there_is_no_unit_and_asks_on_quit(
             await pilot.pause(0.3)
             assert runner.calls[-1][:3] == ("systemctl", "--user", "show"), "S is refused"
             await pilot.press("D")
-            await pilot.pause(0.3)
+            await until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("y")
             await pilot.pause(1.5)
             assert runner.spawned and runner.spawned[0][0][-1] == "daemon"
             assert "daemon" in app.deps.children.alive()
             # The journal pane now tails the child's log.
-            await pilot.pause(1.0)
+            await until(pilot, lambda: isinstance(app.screen, DaemonScreen))
             assert isinstance(app.screen, DaemonScreen)
             assert app.screen._stream_argv is not None and app.screen._stream_argv[0] == "tail"
             await pilot.press("q")
-            await pilot.pause(0.3)
+            await until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("y")
             await pilot.pause(0.5)
@@ -213,11 +214,15 @@ def test_run_verbs_go_through_confirmations_and_ctl(seeded: SbxloopHome) -> None
         # records what would have run.
         app.suspend = contextlib.nullcontext  # type: ignore[assignment, method-assign]
         async with app.run_test(size=(160, 50)) as pilot:
+            # Not `until` on the screen: a worker fills this page after mount and
+            # the assertions below read what it wrote.
             await pilot.pause(1.5)
             assert isinstance(app.screen, RunDetailScreen)
             header = app.screen.query_one("#header", TextPanel).content_text
             assert "c cancel" in header and "C cancel+retry" in header and "s shell" in header
             await pilot.press("c")
+            # Not `until` on the screen: a worker fills this page after mount and
+            # the assertions below read what it wrote.
             await pilot.pause(0.3)
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("n")
@@ -229,10 +234,14 @@ def test_run_verbs_go_through_confirmations_and_ctl(seeded: SbxloopHome) -> None
             await pilot.pause(1.0)
             assert "cancel --retry" in ctl.commands
             await pilot.press("plus")
+            # Not `until` on the screen: a worker fills this page after mount and
+            # the assertions below read what it wrote.
             await pilot.pause(0.3)
             assert isinstance(app.screen, TextPromptScreen)
             app.screen.query_one("#text", Input).value = "2"
             await pilot.press("enter")
+            # Not `until` on the screen: a worker fills this page after mount and
+            # the assertions below read what it wrote.
             await pilot.pause(0.3)
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("y")
@@ -285,13 +294,13 @@ def test_queue_verbs_use_ctl_when_live_and_the_row_when_down(seeded: SbxloopHome
             table.focus()
             table.move_cursor(row=table.get_row_index("gh:issue:44"))
             await pilot.press("t")
-            await pilot.pause(0.3)
+            await until(pilot, lambda: isinstance(app.screen, ConfirmScreen))
             assert isinstance(app.screen, ConfirmScreen)
             await pilot.press("y")
             await pilot.pause(1.0)
             assert "retry gh:issue:44" in ctl.commands
             await pilot.press("n")
-            await pilot.pause(0.3)
+            await until(pilot, lambda: isinstance(app.screen, TextPromptScreen))
             assert isinstance(app.screen, TextPromptScreen)
             app.screen.query_one("#text", Input).value = "the export spinner never stops"
             await pilot.press("enter")

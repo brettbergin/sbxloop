@@ -542,3 +542,108 @@ class TestTheBaselineIsFrozen:
                 assert compare_metadata(MigrationContext.configure(conn_), Base.metadata) == []
         finally:
             engine.dispose()
+
+
+def _from_metadata(path: Path) -> None:
+    """Build the file from ``Base.metadata`` alone, the way ``create_all``
+    does for anyone who reaches for the models instead of the revisions."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    engine = open_engine(path)
+    try:
+        Base.metadata.create_all(engine)
+    finally:
+        engine.dispose()
+
+
+class TestTheModelsDescribeTheDeployedSchema:
+    """``base.py`` says ``Base.metadata`` is the single source of truth for
+    the schema. It has to actually be one: ``alembic revision --autogenerate``
+    compares against it, and anything that builds a database from it —
+    ``create_all`` in a test, a future shortcut for a fresh file — gets
+    whatever it says.
+
+    So this compares a database built from the metadata against one built by
+    running every revision, which is what is on disk. They agreed only after
+    the models were corrected; see the commit that added this class."""
+
+    def test_the_two_paths_produce_the_same_objects(self, tmp_path: Path) -> None:
+        """By name, not by DDL text. ``_ddl`` compares statements verbatim,
+        which is the right test for two hand-written paths but not for this
+        pair: revision 0001 carries hand-written SQL and ``create_all``
+        generates its own, so the text differs by whitespace while the schema
+        does not. What the objects actually are is asserted below."""
+        built, replayed = tmp_path / "built" / "state.db", tmp_path / "replayed" / "state.db"
+        _via_alembic(built)
+        _from_metadata(replayed)
+        assert set(_ddl(built)) == set(_ddl(replayed))
+
+    def test_the_two_paths_agree_on_column_order_and_defaults(self, tmp_path: Path) -> None:
+        """``_ddl`` compares statements, which a reordered ``ALTER TABLE``
+        column or a differently quoted default would slip past on a table
+        Alembic rebuilt. Ask SQLite what it actually stored."""
+        built, replayed = tmp_path / "built" / "state.db", tmp_path / "replayed" / "state.db"
+        _via_alembic(built)
+        _from_metadata(replayed)
+
+        def columns(path: Path) -> dict[str, list[tuple[object, ...]]]:
+            conn = sqlite3.connect(path)
+            try:
+                names = [
+                    row[0]
+                    for row in conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' "
+                        "AND name NOT LIKE 'sqlite_%' AND name != 'alembic_version'"
+                    )
+                ]
+                return {
+                    table: [tuple(row[1:]) for row in conn.execute(f"PRAGMA table_info({table})")]
+                    for table in sorted(names)
+                }
+            finally:
+                conn.close()
+
+        assert columns(built) == columns(replayed)
+
+    def test_a_migrated_database_matches_the_metadata(self, tmp_path: Path) -> None:
+        """Alembic's own comparison, which is what autogenerate would use."""
+        path = tmp_path / "state.db"
+        _via_alembic(path)
+        engine = open_engine(path)
+        try:
+            assert current_revision(engine) == head_revision()
+            with engine.connect() as conn:
+                assert compare_metadata(MigrationContext.configure(conn), Base.metadata) == []
+        finally:
+            engine.dispose()
+
+    def test_a_legacy_database_upgrades_to_match_the_metadata_too(self, tmp_path: Path) -> None:
+        """A file written by a released version has tables but no
+        ``alembic_version``. It upgrades in place, and has to land on the
+        same shape the models describe."""
+        path = tmp_path / "state.db"
+        _via_stores(path)
+        engine = open_engine(path)
+        try:
+            ensure_schema(engine)
+            assert current_revision(engine) == head_revision()
+            with engine.connect() as conn:
+                assert compare_metadata(MigrationContext.configure(conn), Base.metadata) == []
+        finally:
+            engine.dispose()
+
+    def test_a_fresh_database_keeps_working_through_the_stores(self, tmp_path: Path) -> None:
+        """A schema that only compares equal is not the claim being made."""
+        path = tmp_path / "state.db"
+        store = StateStore(path)
+        try:
+            store.create_run("r1", "an outcome")
+            store.append_event(Event.now("run.start", "r1", outcome="an outcome"))
+            assert [row.run_id for row in store.list_runs()] == ["r1"]
+        finally:
+            store.close()
+        daemon = DaemonStore(path)
+        try:
+            assert daemon.queued() == []
+            assert daemon.get("gh:issue:1") is None
+        finally:
+            daemon.close()
