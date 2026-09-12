@@ -526,15 +526,36 @@ class DaemonLoop:
                 age_s=round(age, 1) if age != float("inf") else None,
             )
             return
+        text = f"restarted by {who}: {reason} — up again {age:.0f}s after the request"
+        key = marker.get("key")
+        if isinstance(key, str) and key:
+            # A config change (#971): the process that actually read the file
+            # says whether the value is what it now sees, or which layer
+            # still wins — the same judgement the write made, re-made here.
+            text = f"restarted to apply {reason} (by {who}) — {self._config_in_effect(key)}"
         self._notice(
             "daemon.restarted",
-            f"restarted by {who}: {reason} — up again {age:.0f}s after the request",
+            text,
             by=who,
             reason=reason,
             mode=marker.get("mode"),
             after_s=round(age, 1),
             **extra,
         )
+
+    def _config_in_effect(self, key: str) -> str:
+        from sbxloop.configedit import ConfigEditError, ConfigEditor
+        from sbxloop.configedit.edit import FILE_LAYER
+
+        try:
+            row = ConfigEditor(self.config.paths, os.environ).describe(key)
+        except (ConfigEditError, SbxloopError) as exc:
+            return f"could not re-read `{key}`: {exc}"
+        if row.source == FILE_LAYER:
+            return "now in effect"
+        if row.source == "unset":
+            return f"`{key}` is not a setting this daemon knows"
+        return f"written, but {row.source} sets `{row.display}` and wins"
 
     def cancel_current(self, requester: str | None = None, *, retry: bool = False) -> bool:
         """Operator cancel of the in-flight run. The engine stops at its next

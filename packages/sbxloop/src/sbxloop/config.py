@@ -2038,6 +2038,18 @@ class ChatConfig(_ConfigModel):
     backend: ChatBackend | None = None
 
 
+#: What `[concierge] config_locked` says when the operator says nothing:
+#: egress, tool grants and every credential *name* (values never live here).
+DEFAULT_CONFIG_LOCKED: tuple[str, ...] = (
+    "policy",
+    "mcp",
+    "credentials",
+    "registries",
+    "github.repos.token_env",
+    "telemetry.dsn_env",
+)
+
+
 class ConciergeConfig(_ConfigModel):
     """The control channel's agent: an LLM session that answers @mentions
     in the chat control channel, operates the daemon (every ``!sbx``
@@ -2076,6 +2088,18 @@ class ConciergeConfig(_ConfigModel):
     # its stated assumption — no goal is ever silently dropped. Also the
     # clickable-choice TTL, so buttons and the auto-file expire in step.
     clarify_ttl_s: float = Field(default=900.0, ge=60, le=86400)
+    # The configuration tools (#971): `config_keys` reads any key of the
+    # operator's config/sbxloop.toml as it is on disk; `set_config` changes
+    # one on the person's explicit yes and restarts the daemon to apply it.
+    # False removes both from the roster. The chat sections, this gate and
+    # the lock list below are never changed from chat whatever this says.
+    edit_config: bool = True
+    # Dotted prefixes chat may read but not change — egress, tool grants and
+    # credential names by default, because widening those from a chat
+    # mention is a different weight of act than raising a cap. A prefix
+    # covers everything under it; `*` matches one segment; indices are not
+    # segments. Remove one here, on the host, to allow it from chat.
+    config_locked: list[str] = Field(default_factory=lambda: list(DEFAULT_CONFIG_LOCKED))
 
 
 class EntrygraphConfig(_ConfigModel):

@@ -823,6 +823,14 @@ secret_strategy = "proxy"
 # clarify_ttl_s = 900              # a filing-blocking clarifying question waits this
 #                                  # long (also the clickable-choice TTL); then the
 #                                  # issue files on the concierge's stated assumption
+# edit_config = true               # the config tools: read any key (config_keys), change
+#                                  # one on your explicit yes and restart to apply it
+#                                  # (set_config); false removes both. The chat sections
+#                                  # and this gate are never changed from chat regardless
+# config_locked = ["policy", "mcp", "credentials", "registries", "github.repos.token_env", "telemetry.dsn_env"]
+#                                  # dotted prefixes chat may read but not change — egress,
+#                                  # tool grants and credential names by default (`*` is
+#                                  # one segment); remove one here to allow it from chat
 
 # [entrygraph]
 # The fixed repository-analysis workload the concierge can queue
