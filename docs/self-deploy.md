@@ -76,7 +76,9 @@ health; reports and history use that final version.
   describes; the tokens live in `~/.sbxloop/config/secrets.env` (mode 0600; shape: the
   repo-root [`.env.example`](../.env.example)), read by sbxloop itself. The job never
   reads that file (#639): `ctl status --json`, `backup` and `daemon notify` go through the
-  launcher, from whatever directory the runner happens to be in.
+  launcher, from whatever directory the runner happens to be in. Deploy notices use
+  `--channel` to land in `#sbxloop-deploys`; the daemon's normal control traffic remains in
+  `#sbxloop`.
 
 ## The host
 

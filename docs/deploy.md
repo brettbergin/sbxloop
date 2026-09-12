@@ -257,13 +257,15 @@ a custom `SBXLOOP_HOME` needs the job to be told, and there are two ways:
 
 ### `sbxloop daemon notify`
 
-Posts one message to the control channel through the configured `[chat] backend`, from the
-host and without the daemon — so a script can say "rollback also failed" while the daemon
-is down. It reads the channel from the home's `sbxloop.toml` and the bot token from the
-environment (`DISCORD_BOT_TOKEN`, `SLACK_BOT_TOKEN` or `MATTERMOST_BOT_TOKEN`, from the home's `secrets.env`), so
-the workflow never sources a secrets file or parses the config itself. The text is the
-chat's Markdown; on Slack it is re-dialected the way the bridge does it. Link previews and
-pings are suppressed. A headless daemon (no chat backend) cannot notify, and says so.
+Posts one message through the configured `[chat] backend`, from the host and without the
+daemon — so a script can say "rollback also failed" while the daemon is down. By default it
+reads the control channel from the home's `sbxloop.toml`; `--channel <id>` can route a
+purpose-specific notice elsewhere through the same backend. It reads the bot token from the
+environment (`DISCORD_BOT_TOKEN`, `SLACK_BOT_TOKEN` or `MATTERMOST_BOT_TOKEN`, from the home's
+`secrets.env`), so the workflow never sources a secrets file or parses the config itself.
+The text is the chat's Markdown; on Slack it is re-dialected the way the bridge does it.
+Link previews and pings are suppressed. A headless daemon (no chat backend) cannot notify,
+and says so.
 
 ### The runner
 

@@ -315,6 +315,18 @@ class TestStructuredControl:
             # A chat outage must not fail (or roll back) a deploy.
             assert "continue-on-error: true" in step, name
 
+    def test_self_deploy_notices_use_the_deploy_channel(self, deploy: str) -> None:
+        channel_id = "4shafe93rpnkzqcdqnso7cmbzc"
+        assert f"DEPLOY_CHANNEL: {channel_id}" in deploy
+        assert "8f4oqymuufrb8pzpwyuqjz718r" not in deploy
+        notices = re.findall(r"\"\$\{SBXLOOP\}\" daemon notify[^\n]+", deploy)
+        assert len(notices) == 3
+        assert all('--channel "${DEPLOY_CHANNEL}"' in notice for notice in notices)
+
+    def test_generic_deploy_notices_keep_using_the_control_channel(self, example: str) -> None:
+        assert "DEPLOY_CHANNEL" not in example
+        assert "daemon notify --channel" not in example
+
 
 def _script(text: str, name: str) -> str:
     """One step's shell body, dedented and ready to run under bash."""
