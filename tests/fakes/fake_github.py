@@ -1,4 +1,4 @@
-"""A scripted stand-in for :class:`sbxloop.gh.ops.GithubOps`.
+"""A scripted stand-in for :class:`sbxloop.vcs.github.ops.GithubOps`.
 
 The engine's ``github_ops`` seam accepts a factory returning any GithubOps;
 this one answers every call the pipeline makes from in-memory state and
@@ -50,7 +50,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote
 
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import (
+from sbxloop.vcs.github.ops import (
     ChecksVerdict,
     FailedCheck,
     GithubOps,

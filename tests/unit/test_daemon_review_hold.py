@@ -21,7 +21,7 @@ import pytest
 from sbxloop.config import Config
 from sbxloop.daemon.control import dispatch
 from sbxloop.daemon.store import DaemonStore
-from sbxloop.gh.ops import GithubOpsError
+from sbxloop.vcs.github.ops import GithubOpsError
 from tests.fakes.fake_github import BLOCKED_405, FakeGithub, human_review
 from tests.unit.test_daemon_loop import PR_URL, Harness, RecordingFrontend, gh_item
 from tests.unit.test_daemon_merge_gate import FakeDaemonGithub

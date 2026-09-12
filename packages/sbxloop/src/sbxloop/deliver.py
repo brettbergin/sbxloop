@@ -1,6 +1,6 @@
 """Deliver a completed run's artifacts as a GitHub pull request.
 
-Everything goes through the :class:`GithubOps` facade, i.e. runs as
+Everything goes through the :class:`VcsOps` facade, i.e. runs as
 ``github.op`` jobs inside the github-ops sandbox — the only environment
 holding ``GH_TOKEN``; the credential split is preserved. Files are committed
 atomically through the git data API (blobs → tree → commit → ref) rather
@@ -27,7 +27,7 @@ arrive non-executable and a symlinked config de-linked, because the
 snapshot wrote ``100644`` for everything. ``FILE_MODE`` remains only for
 deletions, where the mode is a formality.
 
-Scaffold status: this is a real, unit-tested code path (stubbed GithubOps),
+Scaffold status: this is a real, unit-tested code path (stubbed VcsOps),
 but per the project pattern — unverified external behaviors get a seam and
 an e2e check, never a confident default — it is NOT field-proven until the
 real-sbx e2e workflow exercises it. Known e2e-validation items (each marker
@@ -79,10 +79,11 @@ from sbxloop.errors import (
     EmptyDeliveryError,
     GithubOpsError,
 )
-from sbxloop.gh.ops import GithubOps, MalformedResponse, PrRef
-from sbxloop.gh.permissions import WORKFLOWS_NEED, workflow_paths
 from sbxloop.ids import branch_name as branch_name  # re-export; shared with hostgit isolation
 from sbxloop.log import get_logger
+from sbxloop.vcs.github.ops import MalformedResponse, PrRef
+from sbxloop.vcs.github.permissions import WORKFLOWS_NEED, workflow_paths
+from sbxloop.vcs.protocol import VcsOps
 
 log = get_logger(__name__)
 
@@ -306,7 +307,7 @@ def _has_issues(data: object) -> bool | None:
 
 
 def ensure_repository(
-    ops: GithubOps, repo: str, *, create: bool = False, public: bool = False
+    ops: VcsOps, repo: str, *, create: bool = False, public: bool = False
 ) -> RepositoryProbe:
     """Probe the delivery repository; create it when explicitly allowed.
 
@@ -375,7 +376,7 @@ class DeliveryPlan:
 
 
 def deliver_workspace(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     *,
     run_id: str,
@@ -634,7 +635,7 @@ def deliver_workspace(
 
 
 def _point_branch(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     branch: str,
     commit: str,
@@ -691,7 +692,7 @@ def _point_branch(
 
 
 def _force_move(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     branch: str,
     commit: str,
@@ -713,7 +714,7 @@ def _force_move(
     ops.ref_force_update(repo, branch, commit)
 
 
-def _find_open_pr(ops: GithubOps, repo: str, branch: str) -> PrRef | None:
+def _find_open_pr(ops: VcsOps, repo: str, branch: str) -> PrRef | None:
     """The open PR whose head is ``branch`` — a re-delivery's earlier PR,
     which the force-moved branch has just refreshed."""
     for pull in ops.pr_list_open(repo, head=branch):
@@ -872,9 +873,7 @@ def _without_lfs_changes(
     return kept
 
 
-def _bootstrap_empty_repo(
-    ops: GithubOps, repo: str, base: str, *, run_id: str, outcome: str
-) -> None:
+def _bootstrap_empty_repo(ops: VcsOps, repo: str, base: str, *, run_id: str, outcome: str) -> None:
     """Give an empty repository its initial commit on ``base``.
 
     The contents API is the one endpoint that works with no ref to build
@@ -892,14 +891,14 @@ def _bootstrap_empty_repo(
     )
 
 
-def _base_commit_sha(ops: GithubOps, repo: str, base: str) -> str | None:
+def _base_commit_sha(ops: VcsOps, repo: str, base: str) -> str | None:
     """The commit sha behind ``base``, or None when there is no such ref
     (missing branch or empty repository) — a state delivery bootstraps
     around, so it arrives as data, not as an exception."""
     return ops.ref_lookup(repo, f"heads/{base}")
 
 
-def _commit_tree_sha(ops: GithubOps, repo: str, commit_sha: str) -> str:
+def _commit_tree_sha(ops: VcsOps, repo: str, commit_sha: str) -> str:
     try:
         return str(ops.commit_get(repo, commit_sha)["tree"]["sha"])
     except (TypeError, KeyError, MalformedResponse) as exc:
@@ -907,7 +906,7 @@ def _commit_tree_sha(ops: GithubOps, repo: str, commit_sha: str) -> str:
 
 
 def _create_blobs(
-    ops: GithubOps, repo: str, uploads: dict[str, bytes], *, run_id: str | None = None
+    ops: VcsOps, repo: str, uploads: dict[str, bytes], *, run_id: str | None = None
 ) -> dict[str, str]:
     """Create all blobs via batched worker jobs; returns relative path -> sha."""
     shas: dict[str, str] = {}
@@ -977,7 +976,7 @@ def render_naming(template: str, *, title: str | None, outcome: str, run_id: str
 
 
 def _retitle(
-    ops: GithubOps, repo: str, number: int, *, current: str, wanted: str, run_id: str
+    ops: VcsOps, repo: str, number: int, *, current: str, wanted: str, run_id: str
 ) -> None:
     """Rename the open PR when a re-delivery wants a different title —
     the model retitled it in a fix round, or the template changed. Best
@@ -1129,7 +1128,7 @@ def _body(
     return summary + footer
 
 
-def _rebody(ops: GithubOps, repo: str, number: int, *, body: str, run_id: str) -> None:
+def _rebody(ops: VcsOps, repo: str, number: int, *, body: str, run_id: str) -> None:
     """Replace the open PR's description when a fix round authored one
     (#678) — a check that judges the body is otherwise incurable. Best
     effort, like the retitle: a refused edit must not fail a delivery

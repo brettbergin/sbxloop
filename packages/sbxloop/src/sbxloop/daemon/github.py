@@ -21,12 +21,12 @@ from typing import TypeVar
 from sbxloop.config import Config
 from sbxloop.errors import DaemonError, GithubOpsError, SbxError, SbxloopError, WorkerError
 from sbxloop.events import EventBus
-from sbxloop.gh.ops import GithubOps
 from sbxloop.log import get_logger
 from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import Sandbox
+from sbxloop.vcs.github.ops import GithubOps
 from sbxloop.worker.client import WorkerClient
 
 log = get_logger(__name__)

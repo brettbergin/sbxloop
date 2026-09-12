@@ -1,6 +1,6 @@
 """Landing a pull request: the CI wait and the merge, as pure decision loops.
 
-Both functions here take a :class:`GithubOps` and a ``tick`` callback and
+Both functions here take a :class:`VcsOps` and a ``tick`` callback and
 return a decision; they hold no engine state and run no agent, which is
 what makes them unit-testable against a scripted GitHub. The engine owns
 what happens *between* polls — draining chat, honouring cancellation,
@@ -40,9 +40,9 @@ from sbxloop.engine.checks import (
 )
 from sbxloop.engine.model import FixKind
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import (
+from sbxloop.log import get_logger
+from sbxloop.vcs.github.ops import (
     FailedCheck,
-    GithubOps,
     Identity,
     PaginationError,
     ReviewThread,
@@ -53,8 +53,8 @@ from sbxloop.gh.ops import (
     user_identity,
     user_kind,
 )
-from sbxloop.gh.protection import BaseRequirements
-from sbxloop.log import get_logger
+from sbxloop.vcs.github.protection import BaseRequirements
+from sbxloop.vcs.protocol import VcsOps
 
 log = get_logger(__name__)
 
@@ -198,7 +198,7 @@ class UpdateState:
 
 
 def poll_checks(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     head_sha: str,
     *,
@@ -279,7 +279,7 @@ UNKNOWN_IDENTITY = LoopIdentity("")
 
 
 def resolve_identity(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     pr_number: int | None,
     *,
@@ -335,7 +335,7 @@ def resolve_identity(
 
 
 def resolve_login(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     pr_number: int | None,
     *,
@@ -355,7 +355,7 @@ def resolve_login(
 
 
 def human_objection(
-    ops: GithubOps, repo: str, number: int, *, login: str, is_bot: bool | None = None
+    ops: VcsOps, repo: str, number: int, *, login: str, is_bot: bool | None = None
 ) -> bool:
     """Whether a reviewer other than the loop's own identity has a standing
     ``CHANGES_REQUESTED`` on the PR. The loop's own reviews are excluded
@@ -371,7 +371,7 @@ def human_objection(
 
 
 def human_objections(
-    ops: GithubOps, repo: str, number: int, *, login: str, is_bot: bool | None = None
+    ops: VcsOps, repo: str, number: int, *, login: str, is_bot: bool | None = None
 ) -> list[HumanObjection]:
     """The standing human objections on a PR, one entry per thing to answer.
 
@@ -516,7 +516,7 @@ def _bot_thread(thread: ReviewThread, ignore: Sequence[str]) -> bool:
 
 
 def _read_threads(
-    ops: GithubOps, repo: str, number: int, *, tick: Tick
+    ops: VcsOps, repo: str, number: int, *, tick: Tick
 ) -> list[ReviewThread] | Blocked:
     """The PR's inline threads, retried through transient failures.
 
@@ -550,7 +550,7 @@ def _read_threads(
 
 
 def _reconciliation_block(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     number: int,
     *,
@@ -623,7 +623,7 @@ def _reconciliation_block(
 
 
 def land(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     number: int,
     *,
@@ -1030,7 +1030,7 @@ def names_merge_queue(detail: str) -> bool:
 
 
 def _through_queue(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     number: int,
     *,
@@ -1179,7 +1179,7 @@ def resolve_merge_method(
     return configured, "as configured"
 
 
-def _repo_payload(ops: GithubOps, repo: str) -> dict[str, Any] | None:
+def _repo_payload(ops: VcsOps, repo: str) -> dict[str, Any] | None:
     try:
         return ops.repo_get(repo)
     except GithubOpsError:
@@ -1188,7 +1188,7 @@ def _repo_payload(ops: GithubOps, repo: str) -> dict[str, Any] | None:
 
 
 def refused_by_base(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     number: int,
     requirements: BaseRequirements,
@@ -1307,7 +1307,7 @@ def bot_review_comment(reviewers: Sequence[str]) -> str:
     )
 
 
-def _say(ops: GithubOps, repo: str, number: int, body: str) -> None:
+def _say(ops: VcsOps, repo: str, number: int, body: str) -> None:
     """A best-effort PR comment: a refusal must not stop a merge every bar
     has cleared."""
     try:
@@ -1316,7 +1316,7 @@ def _say(ops: GithubOps, repo: str, number: int, body: str) -> None:
         log.warning("land.comment_unposted", repo=repo, pr=number, exc_info=True)
 
 
-def _undraft(ops: GithubOps, node_id: str | None) -> bool:
+def _undraft(ops: VcsOps, node_id: str | None) -> bool:
     if not node_id:
         return False
     try:

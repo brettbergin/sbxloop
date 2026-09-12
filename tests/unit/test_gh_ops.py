@@ -7,7 +7,7 @@ from typing import Any, NamedTuple
 import pytest
 
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import (
+from sbxloop.vcs.github.ops import (
     MAX_PAGES,
     FailedCheck,
     GithubOps,

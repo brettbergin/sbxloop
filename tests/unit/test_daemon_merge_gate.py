@@ -18,7 +18,7 @@ import pytest
 from sbxloop.config import Config
 from sbxloop.daemon.control import dispatch
 from sbxloop.daemon.model import WorkItem
-from sbxloop.gh.ops import ChecksVerdict
+from sbxloop.vcs.github.ops import ChecksVerdict
 from tests.fakes.fake_github import BLOCKED_405, FakeGithub, human_review
 from tests.unit.test_daemon_loop import (
     PR_URL,

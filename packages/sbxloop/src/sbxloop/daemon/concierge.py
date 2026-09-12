@@ -84,11 +84,11 @@ from sbxloop.errors import (
     WorkerTimeoutError,
 )
 from sbxloop.events import EventBus
-from sbxloop.gh.ops import MalformedResponse
 from sbxloop.ghids import chat_item_id, issue_item_id, normalize_item_id
 from sbxloop.ids import new_job_id, new_run_id
 from sbxloop.log import get_logger
 from sbxloop.provider import ProviderHeldError, ProviderHold, ProviderRecovery
+from sbxloop.vcs.github.ops import MalformedResponse
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import (
     HostToolCall,

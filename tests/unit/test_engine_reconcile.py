@@ -26,7 +26,7 @@ from sbxloop.engine.reconcile import (
 from sbxloop.engine.review import Reconciliation
 from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import ReviewComment
+from sbxloop.vcs.github.ops import ReviewComment
 from tests.fakes.fake_github import FakeGithub
 
 REPO = "o/r"

@@ -13,7 +13,7 @@ merge decision need, and it has two halves:
   tell" must not read as "not our fault".
 
 * **Does it gate?** The base's protection and rulesets say which contexts
-  must be green (:mod:`sbxloop.gh.protection`); the rest are advisory.
+  must be green (:mod:`sbxloop.vcs.github.protection`); the rest are advisory.
   When those cannot be read — classic protection is admin-only, and an
   organization bot is rarely admin — the pull request's own rollup says
   which of its checks GitHub holds the merge for (#674). A base that
@@ -36,9 +36,10 @@ from typing import Any, NamedTuple
 
 from sbxloop.config import LandingConfig
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import CheckState, ChecksVerdict, GithubOps, approval_summary
-from sbxloop.gh.protection import BaseRequirements, read_base_requirements, with_pr_rollup
 from sbxloop.log import get_logger
+from sbxloop.vcs.github.ops import CheckState, ChecksVerdict, approval_summary
+from sbxloop.vcs.github.protection import BaseRequirements, with_pr_rollup
+from sbxloop.vcs.protocol import VcsOps
 
 log = get_logger(__name__)
 
@@ -212,7 +213,7 @@ def no_policy(head: str) -> CheckPolicy:
 
 
 def read_check_policy(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     base: str,
     head: str,
@@ -228,7 +229,7 @@ def read_check_policy(
     cannot fold, leaves ``baseline`` None — and every red the PR's.
     """
     if requirements is None:
-        requirements = read_base_requirements(ops, repo, base)
+        requirements = ops.base_requirements(repo, base)
     baseline_sha: str | None = None
     baseline: ChecksVerdict | None = None
     try:
@@ -256,7 +257,7 @@ def read_check_policy(
 
 
 def check_policy_reader(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     base: str,
     *,
@@ -280,7 +281,7 @@ def check_policy_reader(
     def policy_for(head: str) -> CheckPolicy:
         nonlocal requirements
         if requirements is None:
-            requirements = read_base_requirements(ops, repo, base)
+            requirements = ops.base_requirements(repo, base)
         if head not in policies:
             policies[head] = read_check_policy(
                 ops,

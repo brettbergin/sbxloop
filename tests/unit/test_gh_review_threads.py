@@ -13,7 +13,7 @@ from typing import Any, ClassVar
 import pytest
 
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import (
+from sbxloop.vcs.github.ops import (
     GithubOps,
     PaginationError,
     PostedFinding,

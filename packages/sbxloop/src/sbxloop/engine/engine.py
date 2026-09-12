@@ -183,8 +183,17 @@ from sbxloop.errors import (
 )
 from sbxloop.events import EventBus, Hook, HostEventTypes
 from sbxloop.gc import workspace_pruned
-from sbxloop.gh.labels import FOLLOWUP_DESCRIPTOR, LabelSpec, ensure_label
-from sbxloop.gh.ops import (
+from sbxloop.ids import branch_name, new_job_id, new_message_id, new_run_id
+from sbxloop.log import get_logger
+from sbxloop.policy import EgressGranter, egress_rejection
+from sbxloop.provider import ProviderHeldError, ProviderRecovery
+from sbxloop.sbx import registries
+from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.pair import SandboxPair
+from sbxloop.sbx.provision import ContinueBranch, Provisioner
+from sbxloop.sbx.sandbox import SBXLOOP_DIR
+from sbxloop.vcs.github.labels import FOLLOWUP_DESCRIPTOR, LabelSpec, ensure_label
+from sbxloop.vcs.github.ops import (
     FailedCheck,
     GithubOps,
     Identity,
@@ -195,23 +204,15 @@ from sbxloop.gh.ops import (
     identities_match,
     user_identity,
 )
-from sbxloop.gh.permissions import workflows_write_granted
-from sbxloop.ids import branch_name, new_job_id, new_message_id, new_run_id
-from sbxloop.log import get_logger
-from sbxloop.policy import EgressGranter, egress_rejection
-from sbxloop.provider import ProviderHeldError, ProviderRecovery
-from sbxloop.sbx import registries
-from sbxloop.sbx.cli import SbxCLI
-from sbxloop.sbx.pair import SandboxPair
-from sbxloop.sbx.provision import ContinueBranch, Provisioner
-from sbxloop.sbx.sandbox import SBXLOOP_DIR
+from sbxloop.vcs.github.permissions import workflows_write_granted
+from sbxloop.vcs.protocol import VcsOps
 from sbxloop.verifylint import services_evidence
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import JobRequest
 
 log = get_logger(__name__)
 
-GithubOpsFactory = Callable[[WorkerClient, str], GithubOps]
+GithubOpsFactory = Callable[[WorkerClient, str], VcsOps]
 ServiceOpsFactory = Callable[..., ServiceOps]  # ServiceOps.__init__'s signature
 
 
@@ -254,7 +255,7 @@ class Pipeline:
     deadline: float
     # None when the run has no repository: the pipeline then ends after
     # the gate, `completed`.
-    ops: GithubOps | None
+    ops: VcsOps | None
     repo: str | None
     # Which stage list drives the run (#755): the developer pipeline for
     # `code`, plan → execute → judge → publish for `workload`.
@@ -1447,7 +1448,7 @@ class LoopEngine:
             **extra,
         )
 
-    def _ensure_delivery_repo(self, run_id: str, ops: GithubOps | None) -> bool | None:
+    def _ensure_delivery_repo(self, run_id: str, ops: VcsOps | None) -> bool | None:
         """Probe (and, when allowed, create) the delivery repo up front.
 
         Runs right after worker install so a missing or typo'd repository
@@ -1594,7 +1595,7 @@ class LoopEngine:
         )
 
     @staticmethod
-    def _merge_base_problem(ops: GithubOps, repo: str, base: str, branch: str) -> str | None:
+    def _merge_base_problem(ops: VcsOps, repo: str, base: str, branch: str) -> str | None:
         """Why ``branch`` cannot be continued on ``base`` — None when the
         two share history, the test for "this branch is still about this
         repository's current line of work".
@@ -1622,7 +1623,7 @@ class LoopEngine:
         return f"GitHub's comparison with {base} named no merge base"
 
     @staticmethod
-    def _prior_open_pr(ops: GithubOps, repo: str, branch: str, recorded: int | None) -> int | None:
+    def _prior_open_pr(ops: VcsOps, repo: str, branch: str, recorded: int | None) -> int | None:
         """The open pull request for ``branch``, or None when there is none
         to reattach to (it was closed or merged, so the restart opens a
         fresh one on the same branch)."""
@@ -4458,7 +4459,7 @@ class LoopEngine:
         return out
 
     @staticmethod
-    def _filed_on_repo(ops: GithubOps, repo: str, label: str, run_id: str) -> dict[str, str]:
+    def _filed_on_repo(ops: VcsOps, repo: str, label: str, run_id: str) -> dict[str, str]:
         """Follow-ups across runs, by key; this run wins for crash recovery.
         Read from the
         label's issue list, which unlike search is not eventually consistent."""
@@ -4494,10 +4495,10 @@ class LoopEngine:
         return out
 
     @staticmethod
-    def _ensure_label(ops: GithubOps, repo: str, label: str) -> None:
+    def _ensure_label(ops: VcsOps, repo: str, label: str) -> None:
         """Make sure the repository carries the follow-up label (best-effort:
         a refusal must not stop the filing — GitHub accepts an issue whose
-        label it cannot find). See :func:`sbxloop.gh.labels.ensure_label`;
+        label it cannot find). See :func:`sbxloop.vcs.github.labels.ensure_label`;
         ``sbxloop init-repo`` creates this and the lifecycle labels up front
         (#630)."""
         ensure_label(ops, repo, LabelSpec(label, *FOLLOWUP_DESCRIPTOR))

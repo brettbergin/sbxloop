@@ -31,7 +31,7 @@ from sbxloop.engine.landing import (
 )
 from sbxloop.engine.reconcile import acknowledge_human_threads
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import PaginationError, ReviewThread, ThreadComment, identities_match
+from sbxloop.vcs.github.ops import PaginationError, ReviewThread, ThreadComment, identities_match
 from tests.fakes.fake_github import FakeGithub, human_review
 
 REPO = "o/r"
@@ -617,7 +617,7 @@ class TestBotSuffixIdentity:
     "human review threads have no reply"."""
 
     def test_logins_match_folds_the_suffix_and_case(self) -> None:
-        from sbxloop.gh.ops import logins_match
+        from sbxloop.vcs.github.ops import logins_match
 
         assert logins_match("sbxloop[bot]", "sbxloop")
         assert logins_match("sbxloop", "sbxloop[bot]")

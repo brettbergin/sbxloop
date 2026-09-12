@@ -19,7 +19,7 @@ from sbxloop.daemon.sources import (
 )
 from sbxloop.engine.model import Published
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import IssueRef
+from sbxloop.vcs.github.ops import IssueRef
 from tests.fakes.ops_stub import OpsStub
 
 LABELS = GitHubLabels("sbxloop:run", "sbxloop:in-progress", "sbxloop:failed")

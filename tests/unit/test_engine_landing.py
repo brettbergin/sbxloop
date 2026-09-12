@@ -34,7 +34,7 @@ from sbxloop.engine.landing import (
     resolve_merge_method,
 )
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import ChecksVerdict, FailedCheck, MergeOutcome, QueueEntry, QueueState
+from sbxloop.vcs.github.ops import ChecksVerdict, FailedCheck, MergeOutcome, QueueEntry, QueueState
 from tests.fakes.fake_github import (
     BLOCKED_405,
     GREEN,
@@ -1250,7 +1250,7 @@ class TestBlockedWithGreenChecks:
         assert isinstance(Landing(fake).run(), Landed)
 
     def test_the_reason_names_what_is_known(self) -> None:
-        from sbxloop.gh.protection import BaseRequirements
+        from sbxloop.vcs.github.protection import BaseRequirements
 
         reviews = BaseRequirements((), 1, "protection")
         assert "requires an approving review" in blocked_reason(reviews, cfg())
@@ -1280,7 +1280,7 @@ class TestBlockedWithGreenChecks:
         line; the fatal last-push rule comes first. (The merge-gate hint that
         used to follow a review rule is gone with #675: a review wait is a
         wait, not something to configure around.)"""
-        from sbxloop.gh.protection import BaseRequirements
+        from sbxloop.vcs.github.protection import BaseRequirements
 
         rules = BaseRequirements(
             (),

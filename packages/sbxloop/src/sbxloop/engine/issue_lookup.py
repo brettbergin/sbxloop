@@ -20,7 +20,8 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from sbxloop.engine.review import Followup
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import GithubOps, MalformedResponse
+from sbxloop.vcs.github.ops import MalformedResponse
+from sbxloop.vcs.protocol import IssueOps
 from sbxloop_worker.protocol import HostToolCall, HostToolResponse, HostToolSpec
 
 TOOL_NAME = "lookup_followup"
@@ -109,7 +110,7 @@ def issue_evidence(data: Any, repo: str) -> IssueEvidence:
 
 
 class IssueLookup:
-    def __init__(self, ops: GithubOps, repo: str, run_id: str, store: StateStore) -> None:
+    def __init__(self, ops: IssueOps, repo: str, run_id: str, store: StateStore) -> None:
         self.ops, self.repo, self.run_id, self.store = ops, repo, run_id, store
         self.calls = 0
         self._lock = threading.Lock()

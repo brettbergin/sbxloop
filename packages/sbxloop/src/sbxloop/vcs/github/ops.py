@@ -9,121 +9,82 @@ from __future__ import annotations
 
 import time
 from collections.abc import Sequence
-from typing import Any, Literal, NamedTuple
+from typing import Any, ClassVar
 from urllib.parse import quote, urlencode
-
-from pydantic import BaseModel
 
 from sbxloop.config import MergeMethod
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.permissions import READ_PROBES
-from sbxloop.gh.review_locations import right_side_ranges
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
+from sbxloop.vcs.github.permissions import READ_PROBES
+from sbxloop.vcs.github.protection import read_base_requirements
+from sbxloop.vcs.github.review_locations import right_side_ranges
+from sbxloop.vcs.model import BaseRequirements
+from sbxloop.vcs.model import (
+    CheckState as CheckState,
+)
+from sbxloop.vcs.model import (
+    ChecksVerdict as ChecksVerdict,
+)
+from sbxloop.vcs.model import (
+    FailedCheck as FailedCheck,
+)
+from sbxloop.vcs.model import (
+    Identity as Identity,
+)
+from sbxloop.vcs.model import (
+    IssueRef as IssueRef,
+)
+from sbxloop.vcs.model import (
+    MergeOutcome as MergeOutcome,
+)
+from sbxloop.vcs.model import (
+    PostedFinding as PostedFinding,
+)
+from sbxloop.vcs.model import (
+    PrRef as PrRef,
+)
+from sbxloop.vcs.model import (
+    QueueEntry as QueueEntry,
+)
+from sbxloop.vcs.model import (
+    QueueState as QueueState,
+)
+from sbxloop.vcs.model import (
+    ReviewComment as ReviewComment,
+)
+from sbxloop.vcs.model import (
+    ReviewEvent as ReviewEvent,
+)
+from sbxloop.vcs.model import (
+    ReviewThread as ReviewThread,
+)
+from sbxloop.vcs.model import (
+    ReviewVerdict as ReviewVerdict,
+)
+from sbxloop.vcs.model import (
+    SubmittedReview as SubmittedReview,
+)
+from sbxloop.vcs.model import (
+    ThreadComment as ThreadComment,
+)
+from sbxloop.vcs.model import (
+    approval_summary as approval_summary,
+)
+from sbxloop.vcs.model import (
+    identities_match as identities_match,
+)
+from sbxloop.vcs.model import (
+    logins_match as logins_match,
+)
+from sbxloop.vcs.model import (
+    normalize_login as normalize_login,
+)
+from sbxloop.vcs.protocol import Capability, VcsOps
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import JobRequest
 
 log = get_logger(__name__)
-
-
-class IssueRef(BaseModel):
-    number: int
-    url: str
-
-
-class PrRef(BaseModel):
-    number: int
-    url: str
-
-
-# What a review says about a PR. REQUEST_CHANGES/APPROVE are the ones that
-# carry weight: under branch protection they gate the merge, so "the review
-# was accepted" becomes a state GitHub enforces rather than one sbxloop only
-# tracks. COMMENT is the degraded mode for an identity the repo will not
-# accept as a reviewer.
-ReviewEvent = Literal["APPROVE", "REQUEST_CHANGES", "COMMENT"]
-
-# Folded verdict of a head commit's check runs.
-CheckState = Literal["pending", "red", "green"]
-
-
-class MergeOutcome(NamedTuple):
-    """The result of asking GitHub to merge a PR.
-
-    ``blocked`` is the one refusal that is an *answer* rather than an error:
-    GitHub says 405 for every "this PR is not mergeable right now" — a draft,
-    a failing required check, a protection rule wanting an approval this
-    identity cannot give. None of those is fixable by retrying, so the caller
-    hands the PR to a human instead of spinning.
-
-    ``stale`` is 409: the head moved between the poll that decided to merge
-    and the merge itself. That is a race, not a refusal, and the next poll
-    re-decides against the new head.
-    """
-
-    merged: bool
-    sha: str
-    reason: str
-    blocked: bool = False
-    stale: bool = False
-
-
-class QueueEntry(NamedTuple):
-    """The pull request's place in its base's merge queue (#676), as the
-    enqueue mutation and the queue read describe it. ``state`` is
-    GitHub's ``MergeQueueEntryState`` (QUEUED, AWAITING_CHECKS, MERGEABLE,
-    UNMERGEABLE, LOCKED); ``head`` is the commit the queue is testing for
-    this entry — the queue's own merge-group commit, not the PR's head —
-    which is where its checks report."""
-
-    id: str
-    state: str
-    position: int | None = None
-    head: str = ""
-
-
-class QueueState(NamedTuple):
-    """What the merge queue has done with the pull request so far (#676):
-    whether it is merged or closed, its live entry when it is queued, and
-    the queue's removals — ``removals`` counts every removed-from-queue
-    event on the PR's timeline (a caller compares against the count it
-    saw when it enqueued) and ``removed_reason`` is the latest one's
-    reason as GitHub words it."""
-
-    merged: bool
-    closed: bool
-    entry: QueueEntry | None
-    removals: int = 0
-    removed_reason: str = ""
-    merge_sha: str = ""
-
-
-class ReviewComment(BaseModel):
-    """One inline comment, anchored to a line of the PR's diff."""
-
-    path: str
-    line: int
-    body: str
-    # RIGHT is the post-change side; a comment on a deleted line needs LEFT.
-    side: Literal["LEFT", "RIGHT"] = "RIGHT"
-
-
-class PostedFinding(NamedTuple):
-    """Where one review finding actually landed on the PR.
-
-    ``anchor`` is the ``path:line`` key the engine carries across rounds.
-    ``comment_id`` is the REST id of the inline comment that anchors the
-    finding's thread — ``None`` when the finding was posted in the review
-    body instead (anchor refused by GitHub, cap overflow, or no line at
-    all), which is exactly the case a later reconciliation pass must fall
-    back to a plain PR comment for. ``thread_node_id`` is the GraphQL node
-    id of that comment's review thread, needed to resolve it; ``None`` when
-    there is no inline comment or the lookup could not answer.
-    """
-
-    anchor: str
-    comment_id: int | None = None
-    thread_node_id: str | None = None
 
 
 def _typename_kind(typename: Any) -> bool | None:
@@ -133,50 +94,6 @@ def _typename_kind(typename: Any) -> bool | None:
     if not typename:
         return None
     return str(typename) == "Bot"
-
-
-def normalize_login(login: str) -> str:
-    """One canonical form for a GitHub identity.
-
-    GraphQL reports an App actor as its bare slug (``sbxloop``) while REST
-    attributes the same actor as ``sbxloop[bot]`` — the two spellings must
-    compare equal, or the loop misreads its own review threads as a
-    human's (field failure r9t8hnv33: fully reconciled PRs ended blocked
-    on "human review threads have no reply", with the loop ack-replying to
-    its own findings). Logins are case-insensitive on GitHub, so casefold
-    too.
-    """
-    return login.removesuffix("[bot]").casefold()
-
-
-# A GitHub identity as the loop compares them: the login and whether the
-# account is a GitHub App — True (App), False (user), or None when the
-# payload it was read from does not say.
-Identity = tuple[str, bool | None]
-
-
-def identities_match(a: Identity, b: Identity) -> bool:
-    """Whether two identities are the same account (#622).
-
-    The logins must match under :func:`normalize_login` **and**, when both
-    sides know whether they are an App, that must agree: the suffix fold
-    makes a human ``foo`` and an App ``foo[bot]`` spell the same, and
-    GitHub lets both exist — so the kind, read from the payload
-    (``user.type`` on REST, ``author.__typename`` on GraphQL), is what
-    tells them apart. Either side not knowing its kind matches on the
-    login alone, so nothing regresses where the type is not reported.
-    Two empty logins never match: an unknown identity equals nobody.
-    """
-    (login_a, bot_a), (login_b, bot_b) = a, b
-    if not login_a or not login_b or normalize_login(login_a) != normalize_login(login_b):
-        return False
-    return bot_a is None or bot_b is None or bot_a == bot_b
-
-
-def logins_match(a: str, b: str) -> bool:
-    """Whether two login spellings name the same identity, kinds unknown.
-    Two empty logins never match: an unknown identity equals nobody."""
-    return identities_match((a, None), (b, None))
 
 
 def is_bot_user(user: Any) -> bool:
@@ -201,94 +118,6 @@ def user_identity(user: Any) -> Identity:
     """A REST ``user`` object as an :data:`Identity`."""
     login = str(user.get("login") or "") if isinstance(user, dict) else ""
     return login, user_kind(user)
-
-
-class ThreadComment(NamedTuple):
-    """One comment inside a review thread."""
-
-    comment_id: int | None
-    login: str
-    body: str
-    # Whether the author is a GitHub App (GraphQL ``author.__typename ==
-    # "Bot"``); None when the payload named no type (#622).
-    is_bot: bool | None = None
-
-    @property
-    def identity(self) -> Identity:
-        return self.login, self.is_bot
-
-
-class ReviewThread(NamedTuple):
-    """An inline review thread as it stands on the PR right now.
-
-    Read for idempotency: a reconciliation pass skips a thread that already
-    carries its own reply.
-    """
-
-    node_id: str
-    is_resolved: bool
-    path: str
-    line: int | None
-    comments: tuple[ThreadComment, ...] = ()
-
-    @property
-    def anchor(self) -> str:
-        return f"{self.path}:{self.line}" if self.line is not None else self.path
-
-    @property
-    def root_comment_id(self) -> int | None:
-        return self.comments[0].comment_id if self.comments else None
-
-    @property
-    def opened_by_bot(self) -> bool:
-        return bool(self.comments) and bool(self.comments[0].is_bot)
-
-    def has_reply_from(self, login: str, is_bot: bool | None = None) -> bool:
-        return any(identities_match(c.identity, (login, is_bot)) for c in self.comments[1:])
-
-    def has_reply_marked(self, marker: str, login: str, is_bot: bool | None = None) -> bool:
-        """Whether the loop's own reply carrying ``marker`` is on the thread.
-
-        The marker must sit in a comment the loop authored (#618): GitHub's
-        quote-reply copies a body verbatim, marker and all, so a human's
-        quoted reply would otherwise read as the loop's and the thread —
-        and their feedback in it — would be skipped forever.
-        """
-        return any(
-            marker in c.body and identities_match(c.identity, (login, is_bot))
-            for c in self.comments[1:]
-        )
-
-
-class SubmittedReview(NamedTuple):
-    """A posted review: its url, and the event GitHub actually accepted.
-
-    ``event`` is not necessarily the one requested — see
-    :meth:`GithubOps.pr_review_create`.
-
-    ``review_id`` and ``posted`` are the thread identity a later round needs
-    to reply on a finding rather than restate it in a fresh review body.
-    """
-
-    url: str
-    event: ReviewEvent
-    review_id: int | None = None
-    posted: tuple[PostedFinding, ...] = ()
-
-    @property
-    def gates_merge(self) -> bool:
-        """Whether this review can hold the merge. A COMMENT cannot."""
-        return self.event in ("APPROVE", "REQUEST_CHANGES")
-
-    @property
-    def inline(self) -> tuple[PostedFinding, ...]:
-        """Findings that got their own thread."""
-        return tuple(p for p in self.posted if p.comment_id is not None)
-
-    @property
-    def body_only(self) -> tuple[PostedFinding, ...]:
-        """Findings that ended up in the review body, with no thread."""
-        return tuple(p for p in self.posted if p.comment_id is None)
 
 
 # -- reading lists -------------------------------------------------------------
@@ -377,70 +206,6 @@ def raw_pages(ops: GithubOps, path: str, *, key: str | None = None) -> list[Any]
     )
 
 
-class ChecksVerdict(NamedTuple):
-    """Every check run and commit status on a head commit, folded to one
-    answer.
-
-    ``pending`` is deliberately distinct from ``green``: a PR whose checks
-    have not reported yet has not passed, and reading "no failures so far"
-    as success is exactly how a red PR gets settled as done.
-
-    Check runs (the Checks API — GitHub Actions and most modern apps) and
-    commit statuses (the older Status API — Jenkins, Buildkite, Travis,
-    CircleCI's default, Codecov, many org bots) are two namespaces GitHub
-    keeps separate and the merge box shows together; the verdict merges
-    them the same way (#610). Names are the check-run ``name`` or the
-    status ``context``, untagged, so a required-context list from branch
-    protection (which names both kinds the same way) can be matched
-    against them.
-    """
-
-    state: CheckState
-    total: int
-    pending: tuple[str, ...]
-    failed: tuple[str, ...]
-    # The names that passed, so a required context that has not reported
-    # at all can be told from one that reported green (#611).
-    passed: tuple[str, ...] = ()
-    # Check runs concluded `action_required` (#612): a workflow waiting for
-    # a maintainer to approve it — the fork-PR / first-time-contributor
-    # gate on GitHub Actions. Not red (no commit fixes it) and not going
-    # to finish on its own (waiting is not an answer either): the state is
-    # `pending`, and the callers that poll return on it at once.
-    needs_approval: tuple[str, ...] = ()
-
-    @property
-    def names(self) -> tuple[str, ...]:
-        return (*self.failed, *self.pending, *self.passed, *self.needs_approval)
-
-    def merge(self, other: ChecksVerdict) -> ChecksVerdict:
-        """Both verdicts as one: red beats pending beats green, names and
-        counts pooled."""
-        pending = (*self.pending, *other.pending)
-        failed = (*self.failed, *other.failed)
-        passed = (*self.passed, *other.passed)
-        approval = (*self.needs_approval, *other.needs_approval)
-        state: CheckState = "red" if failed else ("pending" if pending or approval else "green")
-        return ChecksVerdict(state, self.total + other.total, pending, failed, passed, approval)
-
-    def summary(self) -> str:
-        if self.state == "green":
-            return f"all {self.total} check(s) passed"
-        if self.state == "pending":
-            if self.needs_approval:
-                return approval_summary(self.needs_approval)
-            return f"{len(self.pending)} of {self.total} check(s) still running"
-        return f"{len(self.failed)} of {self.total} check(s) failed: {', '.join(self.failed)}"
-
-
-class ReviewVerdict(NamedTuple):
-    """One reviewer's standing verdict on a pull request (#675)."""
-
-    login: str
-    state: str  # APPROVED | CHANGES_REQUESTED
-    is_bot: bool
-
-
 def fold_review_verdicts(
     payload: Any, *, exclude: Identity | None = None
 ) -> tuple[ReviewVerdict, ...]:
@@ -468,34 +233,6 @@ def fold_review_verdicts(
         ReviewVerdict(login, state, is_bot)
         for login, (state, is_bot) in latest.items()
         if state != "DISMISSED"
-    )
-
-
-class FailedCheck(NamedTuple):
-    """One red check run or commit status, with the text that explains it.
-
-    ``excerpt`` is the job log (head+tail clipped) for a GitHub Actions
-    check, the check's own title/summary/text for another check run, or
-    the one-line ``description`` a commit status carries — what a fix round
-    reads to learn *why* the build is red, not just that it is. ``url`` is
-    the check's ``details_url`` / the status's ``target_url``: when the
-    excerpt is empty (a status, or logs the token cannot read) it is the
-    only lead the brief has (#629).
-    """
-
-    name: str
-    conclusion: str
-    excerpt: str
-    url: str
-
-
-def approval_summary(names: Sequence[str]) -> str:
-    """Why a run cannot proceed on ``action_required`` checks (#612)."""
-    listed = ", ".join(names)
-    return (
-        f"check {listed} needs a maintainer to approve the workflow run"
-        if len(names) == 1
-        else f"checks {listed} need a maintainer to approve their workflow runs"
     )
 
 
@@ -1819,6 +1556,19 @@ class GithubOps:
         path = "/search/issues?" + urlencode({"q": query, "per_page": per_page})
         return self._dict("GET /search/issues", self.raw("GET", path))
 
+    def label_create(self, repo: str, *, name: str, color: str, description: str) -> dict[str, Any]:
+        """Create a repository label; one that exists is GitHub's 422,
+        raised for the caller to read."""
+        path = f"/repos/{repo}/labels"
+        return self._dict(
+            f"POST {path}",
+            self.raw("POST", path, {"name": name, "color": color, "description": description}),
+        )
+
+    def labels_list(self, repo: str) -> list[Any]:
+        """Every label the repository carries, across every page."""
+        return raw_pages(self, f"/repos/{repo}/labels")
+
     def issue_labels_add(self, repo: str, number: int | str, labels: Sequence[str]) -> None:
         """Put ``labels`` on the issue or pull request (existing ones stay)."""
         self.raw("POST", f"/repos/{repo}/issues/{number}/labels", {"labels": list(labels)})
@@ -1959,6 +1709,38 @@ class GithubOps:
         runs = data.get("workflow_runs") if isinstance(data, dict) else None
         return self._list(f"GET /repos/{repo}/actions/runs", runs)
 
+    def base_requirements(self, repo: str, base: str) -> BaseRequirements:
+        """What ``base`` requires before a merge, read from classic
+        protection and rulesets (:func:`read_base_requirements`); never
+        raises — an unreadable source leaves its half ``unknown``."""
+        return read_base_requirements(self, repo, base)
+
+    # -- what this backend can do --------------------------------------------
+
+    # GitHub does everything the roles rely on. The one it cannot answer
+    # for itself: commits created through the API arrive signed only when
+    # the credential is a GitHub App, and the credential's kind is the
+    # provisioner's knowledge, not the transport's — so it is UNKNOWN here
+    # and the doctor, which knows the credential, says.
+    CAPABILITIES: ClassVar[dict[str, Capability]] = {
+        "merge_queue": Capability.SUPPORTED,
+        "review_threads": Capability.SUPPORTED,
+        "draft_changes": Capability.SUPPORTED,
+        "request_changes_review": Capability.SUPPORTED,
+        "short_lived_token": Capability.SUPPORTED,
+        "remote_commit": Capability.SUPPORTED,
+        "required_checks_introspection": Capability.SUPPORTED,
+        "bot_identity": Capability.SUPPORTED,
+        "signed_api_commits": Capability.UNKNOWN,
+    }
+
+    def capabilities(self) -> dict[str, Capability]:
+        """One :class:`Capability` per name in
+        :data:`sbxloop.vcs.protocol.CAPABILITIES`. A ``merge_queue`` here
+        means the forge has one; whether *this* base uses it is
+        :attr:`~sbxloop.vcs.model.BaseRequirements.merge_queue`."""
+        return dict(self.CAPABILITIES)
+
     # -- the generic transport ------------------------------------------------
     #
     # Private to this package: every path GitHub is asked for is spelt in a
@@ -2038,3 +1820,11 @@ class GithubOps:
                 raise GithubOpsError(f"blobs.create_many returned a malformed entry: {blob!r}")
             shas[str(blob["path"])] = str(blob["sha"])
         return shas
+
+
+def _implements(ops: GithubOps) -> VcsOps:
+    """The type checker's proof that :class:`GithubOps` satisfies every role
+    in :mod:`sbxloop.vcs.protocol`: a signature that drifts from its role
+    fails here, in ``mypy``, before a consumer annotated with the role can
+    be handed something that does not answer it."""
+    return ops

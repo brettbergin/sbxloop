@@ -27,6 +27,7 @@ from tests.conftest import FakeSbx
 from tests.fakes.fake_github import FakeGithub
 from tests.fakes.followups import with_lookups
 from tests.fakes.github_errors import github_error
+from tests.fakes.ops_stub import OpsStub
 from tests.unit.test_engine import (
     FILES_BUILD,
     FINDING,
@@ -223,7 +224,7 @@ class TestRendering:
         assert "Not filed as issues (Issues are disabled here)" in downgraded
 
 
-class FakeOps:
+class FakeOps(OpsStub):
     """Just enough of GithubOps to watch the label calls (#556): the probe
     goes through ``label_lookup`` (a 404 already turned into None by the
     worker op), the creation through ``raw``."""

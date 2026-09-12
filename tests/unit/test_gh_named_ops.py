@@ -14,8 +14,8 @@ from typing import Any
 import pytest
 
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import MalformedResponse, PaginationError
-from sbxloop.gh.permissions import READ_PROBES
+from sbxloop.vcs.github.ops import MalformedResponse, PaginationError
+from sbxloop.vcs.github.permissions import READ_PROBES
 from tests.fakes.fake_github import FakeGithub
 from tests.fakes.github_errors import github_error
 

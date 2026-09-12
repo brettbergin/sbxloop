@@ -9,7 +9,13 @@ from typing import Any
 import pytest
 
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import GithubOps, QueueEntry, QueueState, fold_queue_entry, fold_queue_state
+from sbxloop.vcs.github.ops import (
+    GithubOps,
+    QueueEntry,
+    QueueState,
+    fold_queue_entry,
+    fold_queue_state,
+)
 from tests.unit.test_gh_review_threads import PR, REPO, RawOps
 
 

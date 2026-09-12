@@ -43,9 +43,9 @@ from sbxloop.errors import (
     WorkerError,
 )
 from sbxloop.events import Event, EventBus, HostEventTypes
-from sbxloop.gh.ops import ChecksVerdict, FailedCheck, GithubOps
 from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.vcs.github.ops import ChecksVerdict, FailedCheck, GithubOps
 from sbxloop.verifylint import project_gate
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import (
@@ -2522,7 +2522,7 @@ class TestPipeline:
         """#676: the loop never PUTs a merge on a merge-queue base. The
         queue's removal for a red check on its own commit is one CI round
         with that check named; the fix is re-enqueued and the queue merges."""
-        from sbxloop.gh.ops import QueueEntry, QueueState
+        from sbxloop.vcs.github.ops import QueueEntry, QueueState
 
         fake = FakeGithub()
         fake.rules = [{"type": "merge_queue", "parameters": {"merge_method": "SQUASH"}}]
@@ -2607,7 +2607,7 @@ class TestPipeline:
     def test_a_queue_removal_past_the_ci_budget_fails_naming_the_check(
         self, harness: Harness
     ) -> None:
-        from sbxloop.gh.ops import QueueEntry, QueueState
+        from sbxloop.vcs.github.ops import QueueEntry, QueueState
 
         fake = FakeGithub()
         fake.rules = [{"type": "merge_queue"}]
@@ -3701,7 +3701,7 @@ class TestAppIdentityLanding:
     from the credential itself, and landing never classifies with ""."""
 
     def _loop_thread(self, fake: FakeGithub) -> None:
-        from sbxloop.gh.ops import ReviewThread, ThreadComment
+        from sbxloop.vcs.github.ops import ReviewThread, ThreadComment
 
         fake.threads = [
             ReviewThread(
@@ -3765,8 +3765,8 @@ class TestAppIdentityLanding:
         """#622 acceptance: the loop is the App `sbxloop[bot]`; a person
         whose login is `sbxloop` opens a thread — theirs, acknowledged as
         a human's; the App's own resolved thread is its own."""
-        from sbxloop.gh.ops import ReviewThread, ThreadComment
         from sbxloop.sbx.provision import Provisioner
+        from sbxloop.vcs.github.ops import ReviewThread, ThreadComment
 
         fake = FakeGithub()
         fake.user_login = "sbxloop"

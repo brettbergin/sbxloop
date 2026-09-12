@@ -16,7 +16,7 @@ from pathlib import PurePosixPath
 
 from sbxloop.config import SinkName
 from sbxloop.engine.model import Published, TaskOutput, TaskRecord, workload_summary
-from sbxloop.gh.labels import LabelSpec
+from sbxloop.vcs.github.labels import LabelSpec
 
 # The sink a task publishes to when its plan named none.
 DEFAULT_SINK: SinkName = "chat"

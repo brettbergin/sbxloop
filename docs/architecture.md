@@ -13,9 +13,9 @@ model, and the run lifecycle.
 │ Engine                     LoopEngine + PhaseRunner + StateStore  │
 │                            (state machine, budgets, checkpoints)  │
 ├──────────────────────────┬────────────────────────────────────────┤
-│ Worker transport         │ GitHub ops facade                      │
-│ WorkerClient             │ GithubOps (typed github.op jobs) +     │
-│ (stream / poll)          │ engine.landing / engine.review         │
+│ Worker transport         │ Version-control backend                │
+│ WorkerClient             │ vcs.protocol roles → vcs/github        │
+│ (stream / poll)          │ (GithubOps: typed github.op jobs)      │
 ├──────────────────────────┴────────────────────────────────────────┤
 │ Sandbox layer              SbxCLI → Sandbox → Provisioner → Pair  │
 ├───────────────────────────────────────────────────────────────────┤
@@ -34,6 +34,58 @@ Two distributions ship from this repo in lockstep versions:
   provisioned with no dependency on PyPI availability of sbxloop itself.
   `github-copilot-sdk` sits behind the worker's `[copilot]` extra, so the
   host never installs the Copilot runtime.
+
+## Version-control backends
+
+The host never talks to a forge directly: every read and write is a named
+operation on a backend object, and the operation runs inside the sandbox
+that holds the credential (the [credential split](#the-credential-split-in-one-picture)).
+What those operations are, and what they answer in, is fixed in two
+forge-neutral modules under `sbxloop/vcs/`; a backend package beside them
+(`vcs/github/` today) implements them against its own API.
+
+- **`vcs/protocol.py` — the roles.** Six role protocols plus one for the
+  commit path, because they have different consumers and different
+  capability profiles across forges: `RepoOps` (the repository, its
+  branches and files), `IssueOps` (issues, comments, labels, search),
+  `ChangeOps` (the pull request and its landing), `ReviewOps` (reviews,
+  inline threads, replies, resolution), `ChecksOps` (what CI reports and
+  what the change requires of it), `PolicyOps` (the credential and the
+  base's rules) and `ContentOps` (a commit built remotely, with no local
+  checkout — the least portable role). `VcsOps` is all of them at once. A
+  consumer annotates the role it needs, or `VcsOps`; never a backend. The
+  GitHub backend's `_implements` function is the type checker's proof that
+  it answers every role, and `tests/unit/test_vcs_protocol.py` holds that
+  every public operation on it belongs to exactly one.
+- **`vcs/model.py` — the shared types.** An issue or change reference, a
+  folded `ChecksVerdict`, a `ReviewThread`, the base's `BaseRequirements`:
+  the shapes the engine, the daemon and the doctor read. They carry no path,
+  no payload and no transport; a backend maps its API into them.
+- **Capabilities are three-state, never a boolean.** A backend reports each
+  of `vcs.protocol.CAPABILITIES` (a merge queue, resolvable review threads,
+  draft changes, a request-changes review the forge enforces, a
+  host-minted short-lived token, a remote commit, required-checks
+  introspection, a bot-identity signal, signed API commits) as `SUPPORTED`,
+  `UNSUPPORTED` or `UNKNOWN`. `UNSUPPORTED` is a real answer and a design
+  input — a forge with no merge queue lands by merging directly. `UNKNOWN`
+  is a halt: the backend could not decide, and the caller names what it
+  needed and stops, the same fail-closed rule `BaseRequirements.source`
+  already follows. GitHub reports everything `SUPPORTED` except signed API
+  commits, which depend on the credential (a GitHub App's arrive signed, a
+  PAT's do not) and so are the doctor's to answer, not the transport's.
+- **The generic transport is private to the backend package.** `GithubOps.raw`,
+  `raw_lookup` and the `raw_pages` walker spell a path by hand, and fifty
+  such sites had accumulated across the host before #1010 named them. If
+  engine or daemon code needs a path, it needs a named operation on a
+  role; `tests/unit/test_vcs_raw_is_private.py` refuses a new one anywhere
+  outside `vcs/`. Without that rule the roles are decorative — callers
+  route around them the moment something is missing.
+
+The decision logic sits above the roles and knows no forge: the baseline
+comparison in `engine/checks.py` takes a folded verdict, not a payload; the
+wait/hold machine in `engine/landing.py` and the review round in
+`engine/review.py` read the shared types; the agent prompts never mention
+the forge at all, because the agent never touches it — the host does.
 
 ## The credential split, in one picture
 
@@ -2009,7 +2061,7 @@ these paths. Migration for an existing single-repo daemon: move
 verdicts. The host never holds the PAT, so that check is made from a
 short-lived github-ops sandbox per repository, provisioned with exactly that
 repository's credentials. The token is judged against the permission table
-in `sbxloop.gh.permissions` (`docs/permissions.md`, #696) from whichever
+in `sbxloop.vcs.github.permissions` (`docs/permissions.md`, #696) from whichever
 source describes it — the App installation's grant carried on the minted
 token, a classic PAT's `X-OAuth-Scopes` (the worker's `token.scopes` op), or
 for a fine-grained PAT one read per permission plus the repository payload's

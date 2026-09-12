@@ -18,7 +18,7 @@ fix round's re-delivery and the next review:
 * every reply carries a machine-readable marker naming the run and round,
   so a resume between posting a reply and recording it does not double-post.
 
-It talks to GitHub through :class:`~sbxloop.gh.ops.GithubOps` and to the
+It talks to GitHub through :class:`~sbxloop.vcs.github.ops.ReviewOps` and to the
 store through two small callbacks, which is what makes it testable with a
 fake ops object and no database.
 """
@@ -29,8 +29,9 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 from ..errors import GithubOpsError
-from ..gh.ops import GithubOps, ReviewThread, identities_match
 from ..log import get_logger
+from ..vcs.github.ops import ReviewThread, identities_match
+from ..vcs.protocol import ReviewOps
 from .review import (
     BLOCKING_SEVERITIES,
     CarriedVerdict,
@@ -161,7 +162,7 @@ def _anchor_index(threads: Sequence[ReviewThread]) -> dict[str, ReviewThread]:
 
 
 def reconcile_round(
-    ops: GithubOps,
+    ops: ReviewOps,
     repo: str,
     number: int,
     *,
@@ -336,7 +337,7 @@ class ConfirmOutcome(NamedTuple):
 
 
 def post_confirmations(
-    ops: GithubOps,
+    ops: ReviewOps,
     repo: str,
     number: int,
     *,
@@ -527,7 +528,7 @@ class HumanRecorder(Protocol):
 
 
 def reconcile_human(
-    ops: GithubOps,
+    ops: ReviewOps,
     repo: str,
     number: int,
     *,
@@ -696,7 +697,7 @@ class NotedOutcome(NamedTuple):
 
 
 def note_nonblocking(
-    ops: GithubOps,
+    ops: ReviewOps,
     repo: str,
     number: int,
     *,
@@ -826,7 +827,7 @@ def ack_body(*, run_id: str) -> str:
 
 
 def acknowledge_human_threads(
-    ops: GithubOps,
+    ops: ReviewOps,
     repo: str,
     number: int,
     *,

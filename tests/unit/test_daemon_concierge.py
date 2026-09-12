@@ -162,7 +162,7 @@ class FakeGithub(OpsStub):
     def issue_create(
         self, repo: str, title: str, body: str = "", labels: list[str] | None = None
     ) -> Any:
-        from sbxloop.gh.ops import IssueRef
+        from sbxloop.vcs.github.ops import IssueRef
 
         self.created = getattr(self, "created", [])
         self.created.append((repo, title, body, labels))
@@ -1975,7 +1975,7 @@ class TestDaemonLogTool:
         for level, logger, line in [
             ("INFO", "sbxloop.daemon.loop", "daemon.idle queued=0 sbxq"),
             ("WARNING", "sbxloop.daemon.loop", "breaker open failures=3 sbxq"),
-            ("ERROR", "sbxloop.gh.poll", "github.poll_failed status=502 sbxq"),
+            ("ERROR", "sbxloop.vcs.github.poll", "github.poll_failed status=502 sbxq"),
         ]:
             log_buffer().append(LogRecordLine("2026-01-01T00:00:00+00:00", level, logger, line))
 
@@ -2077,7 +2077,7 @@ class TestDaemonLogTool:
         log.debug("daemon.tick", marker="sbxq")
         log.info("daemon.idle", queued=0, marker="sbxq")
         log.warning("breaker.open", failures=3, marker="sbxq")
-        get_logger("sbxloop.gh.poll").error("github.poll_failed", status=502, marker="sbxq")
+        get_logger("sbxloop.vcs.github.poll").error("github.poll_failed", status=502, marker="sbxq")
 
     def test_real_log_records_reach_the_tool(self, tmp_path: Path, _logging: Any) -> None:
         self._emit()

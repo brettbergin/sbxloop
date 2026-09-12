@@ -53,7 +53,7 @@ class TestRawLookupIsNotAFailedJob:
         assert fake.failed_job_paths == ["raw"]
 
     def test_the_helper_falls_back_for_a_stand_in_without_the_method(self) -> None:
-        from sbxloop.gh.ops import raw_lookup
+        from sbxloop.vcs.github.ops import raw_lookup
 
         class Bare:
             def raw(self, method: str, path: str, body: Any = None) -> Any:

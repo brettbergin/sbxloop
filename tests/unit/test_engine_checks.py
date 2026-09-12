@@ -12,8 +12,8 @@ from sbxloop.engine.checks import (
     read_check_policy,
 )
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import ChecksVerdict
-from sbxloop.gh.protection import BaseRequirements
+from sbxloop.vcs.github.ops import ChecksVerdict
+from sbxloop.vcs.github.protection import BaseRequirements
 from tests.fakes.fake_github import GREEN, NO_CHECKS, FakeGithub
 
 

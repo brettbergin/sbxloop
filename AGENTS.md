@@ -78,7 +78,12 @@ Each of these has broken a real run when violated.
   - `engine/` — one run: `engine.py` (stage machine), `phases.py`,
     `landing.py`, `review.py`, `checks.py`, `model.py`; `prompts/*.md` are
     what the agent is told.
-  - `gh/` — GitHub REST/GraphQL ops, base-branch protection, App auth.
+  - `vcs/` — the version-control backends: `protocol.py` (the role
+    protocols and the capability states every backend answers to),
+    `model.py` (the shared, forge-neutral types), `github/` (GitHub
+    REST/GraphQL ops, base-branch protection, App auth). The generic
+    transport is private to a backend package; every path lives in a
+    named operation.
   - `sbx/` — sandbox pair provisioning, baking, conformance probes.
   - `toolchains.py`, `verifylint.py`, `policy.py`, `deliver.py`,
     `hostgit.py`, `hostprep.py`, `config.py` — toolchain series, gate

@@ -36,17 +36,6 @@ from sbxloop.endpoint import parse_endpoint
 from sbxloop.engine.landing import allowed_merge_methods, resolve_merge_method
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError, StateError
-from sbxloop.gh.labels import lifecycle_specs, missing_labels
-from sbxloop.gh.ops import GithubOps
-from sbxloop.gh.permissions import (
-    NEEDS,
-    READ_PROBES,
-    Need,
-    missing_from_app,
-    missing_from_scopes,
-    split_required,
-)
-from sbxloop.gh.protection import read_base_requirements
 from sbxloop.hostfiles import privacy
 from sbxloop.paths import SbxloopHome, describe, legacy_paths
 from sbxloop.sbx.bake import load_bake_record
@@ -54,6 +43,16 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import ConformanceReport, run_conformance
 from sbxloop.sbx.provision import gh_credential_status
 from sbxloop.sbx.prune import count_orphans
+from sbxloop.vcs.github.labels import lifecycle_specs, missing_labels
+from sbxloop.vcs.github.permissions import (
+    NEEDS,
+    READ_PROBES,
+    Need,
+    missing_from_app,
+    missing_from_scopes,
+    split_required,
+)
+from sbxloop.vcs.protocol import VcsOps
 from sbxloop.worker.wheel import resolve_worker_wheel
 from sbxloop_worker.backends.copilot import (
     SDK_PERMISSION_KINDS,
@@ -618,7 +617,7 @@ def _missing_from_push_bit(data: dict[str, object]) -> tuple[Need, ...]:
     return tuple(n for n in NEEDS if n.level == "write" and n.required)
 
 
-def _missing_from_probes(ops: GithubOps, repo: str, base: str) -> tuple[Need, ...]:
+def _missing_from_probes(ops: VcsOps, repo: str, base: str) -> tuple[Need, ...]:
     """The needs a fine-grained PAT fails a read for. A permission the
     token lacks entirely fails its read; a read-only grant on a write need
     is the push bit's business (:func:`_missing_from_push_bit`)."""
@@ -631,7 +630,7 @@ def _missing_from_probes(ops: GithubOps, repo: str, base: str) -> tuple[Need, ..
 
 
 def _credential_needs(
-    ops: GithubOps,
+    ops: VcsOps,
     app_permissions: Mapping[str, str] | None,
     repo: str,
     base: str,
@@ -665,7 +664,7 @@ def _credential_needs(
     return required, optional, source
 
 
-def _ci_summary(ops: GithubOps, repo: str, base: str) -> RepoCi | None:
+def _ci_summary(ops: VcsOps, repo: str, base: str) -> RepoCi | None:
     """The repository's active Actions workflows and its latest run on
     ``base`` (#696); None when they could not be listed (actions:read
     missing is reported as a permission, not here)."""
@@ -688,7 +687,7 @@ def _ci_summary(ops: GithubOps, repo: str, base: str) -> RepoCi | None:
 
 
 def _base_blockers(
-    ops: GithubOps, repo: str, base: str, config: Config, *, can_sign: bool
+    ops: VcsOps, repo: str, base: str, config: Config, *, can_sign: bool
 ) -> tuple[tuple[str, ...] | None, tuple[str, ...]]:
     """The rules of ``base`` the loop cannot satisfy (#673).
 
@@ -697,7 +696,7 @@ def _base_blockers(
     signed commits or a required deployment refuse a merge the same way
     (HTTP 405, the run ends blocked); a merge queue is not one — the loop
     enqueues (#676). Read by
-    :func:`sbxloop.gh.protection.read_base_requirements` — the same reading
+    :func:`sbxloop.vcs.github.protection.read_base_requirements` — the same reading
     the landing gate uses for required checks (#611) — and judged by the
     same :func:`sbxloop.engine.landing.base_blockers` the run would report.
     ``None`` when GitHub would not say (a token without admin on classic
@@ -706,7 +705,7 @@ def _base_blockers(
     """
     from sbxloop.engine.landing import base_blockers
 
-    requirements = read_base_requirements(ops, repo, base)
+    requirements = ops.base_requirements(repo, base)
     if requirements.source == "unknown" and not requirements.blockers():
         return None, requirements.unread
     return base_blockers(requirements, config.landing, can_sign=can_sign), requirements.unread
@@ -813,9 +812,7 @@ def sandbox_repo_probe(
     return probe
 
 
-def _missing_repo_labels(
-    ops: GithubOps, config: Config, entry: RepoConfig
-) -> tuple[str, ...] | None:
+def _missing_repo_labels(ops: VcsOps, config: Config, entry: RepoConfig) -> tuple[str, ...] | None:
     """The sbxloop labels ``entry`` does not carry (#630); None when the
     list could not be read (a token without issue read, a 5xx) — that is
     "unknown", not "all present"."""

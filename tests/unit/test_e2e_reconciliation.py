@@ -376,7 +376,7 @@ class TestHumanCommentThreadDoesNotStrandTheRun:
 
     @pytest.fixture
     def run(self, harness: Harness) -> tuple[Harness, FakeGithub, RunResult]:
-        from sbxloop.gh.ops import ReviewThread, ThreadComment
+        from sbxloop.vcs.github.ops import ReviewThread, ThreadComment
 
         fake = FakeGithub()
         fake.threads = [

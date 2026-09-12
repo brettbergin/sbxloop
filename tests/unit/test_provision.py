@@ -1342,7 +1342,7 @@ class TestGithubAppAuth:
         """Never mint over the network in unit tests."""
         import time as _time
 
-        from sbxloop.gh import appauth
+        from sbxloop.vcs.github import appauth
 
         minted: list[str] = []
 
@@ -1435,7 +1435,7 @@ class TestGithubAppAuth:
     ) -> None:
         import time as _time
 
-        from sbxloop.gh.appauth import InstallationToken
+        from sbxloop.vcs.github.appauth import InstallationToken
 
         minted = self.stub_mint(monkeypatch)
         provisioner = make_provisioner(fake_sbx, tmp_path, env=self.APP_ENV)
@@ -1734,7 +1734,7 @@ class TestBotLoginResolution:
     def test_app_mode_answers_the_bot_login(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from sbxloop.gh import appauth
+        from sbxloop.vcs.github import appauth
 
         monkeypatch.setattr(appauth, "fetch_app_slug", lambda creds, **kw: "sbxloop-app")
         provisioner = make_provisioner(fake_sbx, tmp_path, env=TestGithubAppAuth.APP_ENV)
@@ -1746,7 +1746,7 @@ class TestBotLoginResolution:
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from sbxloop.errors import GithubOpsError
-        from sbxloop.gh import appauth
+        from sbxloop.vcs.github import appauth
 
         def boom(creds: object, **kw: object) -> str:
             raise GithubOpsError("nope")
@@ -1790,7 +1790,7 @@ class TestAppPermissionsResolution:
     def test_app_mode_reports_the_mint_permissions(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from sbxloop.gh import appauth
+        from sbxloop.vcs.github import appauth
 
         minted: list[int] = []
 
@@ -1810,7 +1810,7 @@ class TestAppPermissionsResolution:
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from sbxloop.errors import GithubOpsError
-        from sbxloop.gh import appauth
+        from sbxloop.vcs.github import appauth
 
         def boom(creds: object, **kwargs: object) -> appauth.InstallationToken:
             raise GithubOpsError("refused")
