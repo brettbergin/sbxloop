@@ -1445,6 +1445,11 @@ def collect_checks(
                     f"{token_env} present"
                     if has_token
                     else f"{token_env} not set (mentions will fail)"
+                )
+                + (
+                    f"; config edits: on ({len(config.concierge.config_locked)} prefix(es) locked)"
+                    if config.concierge.edit_config
+                    else "; config edits: off"
                 ),
                 hard=False,
             )

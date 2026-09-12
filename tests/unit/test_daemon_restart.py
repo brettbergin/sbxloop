@@ -139,3 +139,44 @@ class TestComingBack:
         h.loop.run_forever()
         assert not any("restart" in n.kind for n in h.loop.frontend.notices)  # type: ignore[union-attr]
         assert h.dstore.get_value(RESTART_MARKER_KEY) is None
+
+
+class TestConfigChangeReport:
+    """A restart that carried a config change (#971): the process that comes
+    back re-reads the key and says whether it is what it sees."""
+
+    def _restarted(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **env: str) -> str:
+        monkeypatch.setenv("INVOCATION_ID", "abc123")
+        for name, value in env.items():
+            monkeypatch.setenv(name, value)
+        before = _harness(tmp_path)
+        path = before.config.paths.config_toml
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("[daemon]\nmax_runs_per_day = 20\n")
+        before.loop.request_restart(
+            by="brett",
+            reason="set daemon.max_runs_per_day = 20",
+            key="daemon.max_runs_per_day",
+            value=20,
+        )
+        after = _harness(tmp_path)
+        after.clock.t = before.clock.t + 3.0
+        after.loop.request_stop()
+        after.loop.run_forever()
+        (notice,) = [n for n in after.loop.frontend.notices if n.kind == "daemon.restarted"]  # type: ignore[union-attr]
+        return notice.text
+
+    def test_now_in_effect(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("SBXLOOP_DAEMON__MAX_RUNS_PER_DAY", raising=False)
+        assert self._restarted(tmp_path, monkeypatch) == (
+            "restarted to apply set daemon.max_runs_per_day = 20 (by brett) — now in effect"
+        )
+
+    def test_another_layer_still_wins(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        text = self._restarted(tmp_path, monkeypatch, SBXLOOP_DAEMON__MAX_RUNS_PER_DAY="24")
+        assert text == (
+            "restarted to apply set daemon.max_runs_per_day = 20 (by brett) — written, but "
+            "env sets `24` and wins"
+        )

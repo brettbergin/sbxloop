@@ -376,7 +376,19 @@ def test_concierge_prompt_carries_contract() -> None:
     # triage's other half: a reply is direct, a close never is
     assert "`comment_on_issue`" in text and "`close_issue`" in text
     assert "pass **their own words** as `confirmation`" in text
-    assert "The one exception is\n  `close_issue`" in text
+    assert "The two exceptions are\n  `close_issue`" in text and "and\n  `set_config`" in text
+    # a configuration change: the card first, the four choices, one call, never on silence
+    assert "**A request to change a setting**" in text
+    for label in (
+        "**Set and restart now**",
+        "**Set and restart after the current\n  run**",
+        "**Set only**",
+        "**Cancel**",
+    ):
+        assert label in text, label
+    assert "First `config_keys` on that key, always" in text
+    assert "ONE `set_config` call\n  quoting their words as `confirmation`" in text
+    assert "`sbx-pending` to a `close_issue` or `set_config` confirmation" in text
     # the configured repositories reach the model, with their per-repo facts
     assert "owner/repo — enabled, base main" in text and "`list_repos`" in text
     # drift: the concierge reports versions, a human does the upgrading
