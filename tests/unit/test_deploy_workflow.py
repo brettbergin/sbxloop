@@ -273,6 +273,152 @@ class TestStructuredControl:
             assert "continue-on-error: true" in step, name
 
 
+def _script(text: str, name: str) -> str:
+    """One step's shell body, dedented and ready to run under bash."""
+    return textwrap.dedent(_step(text, name).split("        run: |\n", 1)[1])
+
+
+def _resolve(
+    text: str,
+    tmp_path: Path,
+    *,
+    home: str,
+    override: str | None = None,
+    variable: str = "",
+) -> subprocess.CompletedProcess[str]:
+    """Run the isolated `Resolve host paths` snippet with a given host
+    environment. `override` is the runner process's own SBXLOOP_HOME (unset
+    when None); `variable` is the repository variable the step reads."""
+    github_env = tmp_path / "github_env"
+    github_env.write_text("")
+    env = {
+        "PATH": os.environ["PATH"],
+        "HOME": home,
+        "GITHUB_ENV": str(github_env),
+        "SBXLOOP_HOME_VAR": variable,
+    }
+    if override is not None:
+        env["SBXLOOP_HOME"] = override
+    return subprocess.run(
+        ["bash", "-c", _script(text, "Resolve host paths")],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+
+
+def _resolved(result: subprocess.CompletedProcess[str], github_env: Path) -> dict[str, str]:
+    assert result.returncode == 0, result.stderr or result.stdout
+    written: dict[str, str] = {}
+    for line in github_env.read_text().splitlines():
+        key, _, value = line.partition("=")
+        written[key] = value
+    return written
+
+
+#: Every path the job addresses, and where it sits under the home.
+_DERIVED = {
+    "SBXLOOP": "bin/sbxloop",
+    "VENV_SBXLOOP": "venv/bin/sbxloop",
+    "VENV_PYTHON": "venv/bin/python",
+    "UV": "bin/uv",
+    "UV_CACHE_DIR": "cache/uv",
+    "UV_PYTHON_INSTALL_DIR": "python",
+}
+
+
+@pytest.mark.parametrize("fixture", ["deploy", "example"])
+class TestHomeOverride:
+    """#895: an operator may install under a custom `SBXLOOP_HOME`. The job
+    resolves that root once and derives every path from it, so the version
+    check, backup, install, health check and rollback all address the
+    installation that is actually there."""
+
+    def test_no_override_resolves_to_the_documented_default(
+        self, fixture: str, request: pytest.FixtureRequest, tmp_path: Path
+    ) -> None:
+        home = tmp_path / "user"
+        result = _resolve(request.getfixturevalue(fixture), tmp_path, home=str(home))
+        written = _resolved(result, tmp_path / "github_env")
+        assert written["SBXLOOP_HOME"] == f"{home}/.sbxloop"
+        for key, tail in _DERIVED.items():
+            assert written[key] == f"{home}/.sbxloop/{tail}", key
+
+    def test_a_custom_absolute_root_survives_resolution(
+        self, fixture: str, request: pytest.FixtureRequest, tmp_path: Path
+    ) -> None:
+        custom = tmp_path / "srv" / "sbxloop"
+        result = _resolve(
+            request.getfixturevalue(fixture),
+            tmp_path,
+            home=str(tmp_path / "user"),
+            override=str(custom),
+        )
+        written = _resolved(result, tmp_path / "github_env")
+        assert written["SBXLOOP_HOME"] == str(custom)
+        for key, tail in _DERIVED.items():
+            assert written[key] == f"{custom}/{tail}", key
+
+    def test_a_root_containing_spaces_is_preserved(
+        self, fixture: str, request: pytest.FixtureRequest, tmp_path: Path
+    ) -> None:
+        custom = tmp_path / "two words" / "sbxloop home"
+        result = _resolve(
+            request.getfixturevalue(fixture),
+            tmp_path,
+            home=str(tmp_path / "user"),
+            override=str(custom),
+        )
+        written = _resolved(result, tmp_path / "github_env")
+        assert written["SBXLOOP_HOME"] == str(custom)
+        assert written["SBXLOOP"] == f"{custom}/bin/sbxloop"
+
+    def test_the_repository_variable_carries_the_home_to_the_runner(
+        self, fixture: str, request: pytest.FixtureRequest, tmp_path: Path
+    ) -> None:
+        """A runner whose own environment says nothing still deploys to the
+        chosen home when the repository variable names it."""
+        custom = tmp_path / "srv" / "sbxloop"
+        result = _resolve(
+            request.getfixturevalue(fixture),
+            tmp_path,
+            home=str(tmp_path / "user"),
+            variable=str(custom),
+        )
+        written = _resolved(result, tmp_path / "github_env")
+        assert written["SBXLOOP_HOME"] == str(custom)
+        assert written["VENV_PYTHON"] == f"{custom}/venv/bin/python"
+
+    def test_a_tilde_root_expands_against_the_service_user(
+        self, fixture: str, request: pytest.FixtureRequest, tmp_path: Path
+    ) -> None:
+        """`SBXLOOP_HOME=~/elsewhere` is what the secrets example shows, and
+        the loader expands it against HOME — so the job must too, rather
+        than reject a literal `~` as relative."""
+        home = tmp_path / "user"
+        result = _resolve(
+            request.getfixturevalue(fixture), tmp_path, home=str(home), override="~/elsewhere"
+        )
+        written = _resolved(result, tmp_path / "github_env")
+        assert written["SBXLOOP_HOME"] == f"{home}/elsewhere"
+
+    @pytest.mark.parametrize("bad", ["relative/home", "./home", "/srv/two\nlines"])
+    def test_a_root_it_cannot_address_stops_before_anything_is_touched(
+        self, fixture: str, request: pytest.FixtureRequest, tmp_path: Path, bad: str
+    ) -> None:
+        """Fail closed: a relative root is a different directory in every
+        step, and a newline would silently corrupt GITHUB_ENV."""
+        result = _resolve(
+            request.getfixturevalue(fixture),
+            tmp_path,
+            home=str(tmp_path / "user"),
+            override=bad,
+        )
+        assert result.returncode != 0, result.stdout
+        assert "::error::" in result.stdout
+        assert (tmp_path / "github_env").read_text() == ""
+
+
 class TestHostAgnostic:
     """#640: the host is one repository variable; nothing names a machine,
     a user or a home directory."""
@@ -291,7 +437,12 @@ class TestHostAgnostic:
         assert "/home/" not in text
         assert "bergs" not in text
         assert "ssh " not in text
-        assert "${HOME}/.sbxloop/bin/sbxloop" in _step(text, "Resolve host paths")
+        resolve = _step(text, "Resolve host paths")
+        # The launcher is derived from the resolved home, and the only home
+        # spelled out is the default the resolution falls back to.
+        assert 'echo "SBXLOOP=${root}/bin/sbxloop"' in resolve
+        assert 'root="${HOME}/.sbxloop"' in resolve
+        assert ".sbxloop/bin" not in resolve
         assert "WORKDIR" not in text and 'cd "${' not in text  # the home is the home
         assert "needs a human" in _step(text, "Roll back")
         assert "${HOST} needs a human" in _step(text, "Roll back")

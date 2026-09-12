@@ -28,6 +28,10 @@ KillMode=process
 KillSignal=SIGTERM
 TimeoutStopSec=300
 Environment=PYTHONUNBUFFERED=1
+# Every job on this runner inherits the home it was installed under, so the
+# upgrade workflow addresses this installation rather than assuming the
+# default ~/.sbxloop. A workflow may still override it (docs/deploy.md).
+Environment=SBXLOOP_HOME=@HOME@
 
 [Install]
 WantedBy=default.target
