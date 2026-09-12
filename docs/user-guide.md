@@ -2006,6 +2006,25 @@ operation, `200` when the same work was already queued. `POST /v1/items/{id}/ret
 the same names through the same service, each answered with the item as it
 stands and the operation that changed it.
 
+**Following the work.** Every public event — the daemon's notices, a run's
+start and finish, its engine chronology (every persisted event, `worker.stdout`
+included; filter with `type_prefix`), gate transitions, and every operation any
+surface recorded — lands in one durable, ordered chronology with an id
+(`evt_<n>`) that is also the cursor. `GET /v1/status` reports its `watermark`;
+`GET /v1/events?after=evt_<n>` (or `/v1/runs/{id}/events`) pages what came
+after it, so a client that reads a snapshot and then subscribes from its
+watermark sees no gap and no repeat. `GET /v1/events/stream` is the same
+cursor space as server-sent events: resume with `Last-Event-ID`, ignore the
+`: ping` comments, and reconnect from the last id when the stream closes (it
+does when the daemon stops or the token is revoked; it says why in a
+`stream.closed` frame). `/v1/ws` multiplexes the same events and the same
+typed commands on one WebSocket — a bearer token in the `Authorization` header
+or an `auth{token}` first frame (never the query string), `subscribe{after, run_id, type_prefix}`, and `command{id, action, target, params, idempotency_key, expected_revision}` for `item.admit`, `item.retry`,
+`item.requeue` and `item.abandon`, answered by `reply{id, ok, result | problem}` with the same body and the same idempotency the REST route has.
+History is kept for `[api] replay_retention_s`; a cursor below what remains is
+`410 cursor_expired` with a pointer to the snapshot, never a silent skip. Live
+streams are bounded by `[api] max_stream_clients`.
+
 ## Artifacts
 
 Every job in a run executes in the run's **workspace** — a host directory

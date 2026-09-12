@@ -18,6 +18,7 @@ import threading
 from typing import Any
 
 from sbxloop.api.context import ApiContext
+from sbxloop.api.projector import Projector
 from sbxloop.config import ApiConfig
 from sbxloop.log import get_logger
 
@@ -49,6 +50,15 @@ class ApiServer:
         )
         self._thread: threading.Thread | None = None
         self._failed: BaseException | None = None
+        # The projection thread rides with the listener: it keeps the
+        # public chronology current for the streams and prunes history.
+        if ctx.projector is None:
+            ctx.projector = Projector(
+                ctx.chronology,
+                ctx.hub,
+                clock=ctx.clock,
+                retention_s=float(config.replay_retention_s),
+            )
         # uvicorn's loggers are noisy at INFO; the daemon narrates the start.
         for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
             logging.getLogger(name).setLevel(logging.WARNING)
@@ -60,6 +70,7 @@ class ApiServer:
             if self._failed is not None:
                 raise RuntimeError(f"the API listener did not start: {self._failed}")
             raise RuntimeError("the API listener did not start within 10 s")
+        self.ctx.projector.start()
         log.info("api.started", bind=self.config.bind, port=self.port)
 
     def _run(self) -> None:
@@ -92,6 +103,9 @@ class ApiServer:
 
     def close(self) -> None:
         self.ctx.stopping.set()
+        self.ctx.hub.notify()
+        if self.ctx.projector is not None:
+            self.ctx.projector.stop()
         self._uv.should_exit = True
         if self._thread is not None:
             self._thread.join(timeout=GRACEFUL_SHUTDOWN_S + 5)

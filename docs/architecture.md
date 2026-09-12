@@ -2199,6 +2199,30 @@ report a log line, and the store's repo-attribution passes skip `api:`
 rows as they skip `chat:` and `sched:` ones. Direct inline code admission
 is not offered: an issue is the code run's source contract.
 
+**The public chronology (#1037).** `api_events` is one durable cursor space
+(`seq`, never reused) that every transport replays from: the operation
+transitions the operation store writes in the same transaction as the
+operation, the daemon's notices, run lifecycle and gate transitions
+(`api/frontend.py`, an *observer* on the fan-out frontend — it hears the
+Frontend calls and nothing else), and a *projection* of the engine's own
+`events` table: `api/chronology.py` copies each engine event past a
+watermark into a thin row carrying `source_seq`, and moves the watermark
+(`daemon_state`) in the same transaction, so a crash between the two leaves
+nothing half-projected and a re-run copies each event once; delivery joins
+back to the engine row for the data, so the run's chronology is referenced,
+never duplicated. A read projects before it reads, which makes the
+projection consistent from the reader's side; the projector thread
+(`api/projector.py`, woken by the engine's bus through a subscriber that
+only sets an event) exists for the streams' latency and the retention
+prune. `GET /v1/status` reports the high-water mark; `/v1/events`,
+`/v1/runs/{id}/events`, the SSE stream and the WebSocket all read by `seq`
+from the store when the hub (`api/stream.py`, a thread-safe "something
+changed") says there may be more — a stream's whole state is a cursor, so
+a slow client blocks nobody and a dropped one resumes where it was. Pruned
+history is refused as `cursor_expired` from the highest `seq` ever pruned,
+never skipped past. The WebSocket's commands go through `api/commands.py`,
+the same functions the REST routes call, with the same idempotency scope.
+
 ### Repositories
 
 One daemon may tend several repositories. They are declared as an array of

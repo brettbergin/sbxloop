@@ -21,7 +21,9 @@ from typing import Any, TypeVar
 from sbxloop.api.auth.keys import SigningKeys
 from sbxloop.api.auth.ratelimit import FailureLimiter
 from sbxloop.api.auth.store import ApiAuthStore
+from sbxloop.api.chronology import Chronology
 from sbxloop.api.publicids import PublicIds
+from sbxloop.api.stream import StreamHub
 from sbxloop.config import Config
 from sbxloop.daemon.controls.service import ControlService
 
@@ -61,6 +63,13 @@ class ApiContext:
         self._semaphore: asyncio.Semaphore | None = None
         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
         self._public_ids: PublicIds | None = None
+        self._chronology: Chronology | None = None
+        #: Wakes every live stream; the projector, the frontend and the
+        #: routes raise it from their own threads.
+        self.hub = StreamHub()
+        #: The projection thread, when the listener runs one (the daemon);
+        #: a test drives the chronology directly.
+        self.projector: Any = None
 
     @property
     def api(self) -> Any:
@@ -72,6 +81,13 @@ class ApiContext:
         if self._public_ids is None:
             self._public_ids = PublicIds(self.loop.dstore)
         return self._public_ids
+
+    @property
+    def chronology(self) -> Chronology:
+        """The public chronology over the daemon's store, built on first use."""
+        if self._chronology is None:
+            self._chronology = Chronology(self.loop.dstore)
+        return self._chronology
 
     def service(self) -> ControlService:
         """A service over the loop; one per request, since it collects the
@@ -97,4 +113,6 @@ class ApiContext:
 
     def close(self) -> None:
         self.stopping.set()
+        # Every live stream sees `stopping` on its next wake and ends.
+        self.hub.notify()
         self.executor.shutdown(wait=False, cancel_futures=True)

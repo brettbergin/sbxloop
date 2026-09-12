@@ -21,6 +21,7 @@ from sbxloop.api.app import create_app
 from sbxloop.api.auth.keys import SigningKeys, load_or_create
 from sbxloop.api.auth.store import ApiAuthStore, Client
 from sbxloop.api.context import ApiContext
+from sbxloop.api.frontend import ApiFrontend
 from sbxloop.config import Config
 from sbxloop.daemon.controls.principal import ALL_CAPABILITIES, Capability
 from tests.unit.test_daemon_loop import Harness
@@ -91,6 +92,9 @@ def build(
     keys = load_or_create(config.paths)
     auth = ApiAuthStore(harness.dstore)
     ctx = ApiContext(config, loop=harness.loop, auth=auth, keys=keys, clock=harness.clock)
+    # The chronology observes the loop as it does in the daemon; no
+    # projector thread — a read projects on demand.
+    harness.loop.frontend = ApiFrontend(ctx.chronology, ctx.hub, None, clock=harness.clock)
     if ready:
         harness.loop.recover()
         ctx.ready.set()

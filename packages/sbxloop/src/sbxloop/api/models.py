@@ -464,3 +464,27 @@ class ItemCommand(ApiModel):
 class ItemCommandResult(ApiModel):
     item: Item
     operation: OperationOut
+
+
+# -- the public chronology (#1037) -------------------------------------------------
+
+
+class EventOut(ApiModel):
+    """One public event. ``id`` is the replay cursor (``evt_<seq>``);
+    ``native_seq`` is the engine's own sequence when the event is a
+    projection of the run's chronology; ``actor`` is absent where nothing
+    truthful can be said."""
+
+    id: str
+    schema_version: int = 1
+    type: str
+    occurred_at: str
+    recorded_at: str
+    workspace_id: str = WORKSPACE_ID
+    run_id: str | None = None
+    item_id: str | None = None
+    operation_id: str | None = None
+    actor: Actor | None = None
+    causation_id: str | None = None
+    native_seq: int | None = None
+    data: dict[str, Any] = Field(default_factory=dict)

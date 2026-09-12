@@ -21,7 +21,8 @@ class TestStatus:
         ]
         assert body["generation"] == api.loop.generation and body["current"] is None
         assert body["observed_at"].endswith("Z") and body["workspace_id"] == "local"
-        assert body["watermark"] is None
+        # The pause was recorded as an operation: the chronology has a mark.
+        assert isinstance(body["watermark"], int) and body["watermark"] >= 1
         # Nothing about the host leaks: no pid, no cwd, no paths.
         assert not {"pid", "cwd", "started_at"} & set(body)
 

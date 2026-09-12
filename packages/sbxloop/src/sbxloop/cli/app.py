@@ -2809,7 +2809,7 @@ def daemon(
     ctl = ControlServer(loop, config.paths)
     api_server = None
     if config.api.enabled and not once:
-        api_server = _start_api(config, loop)
+        api_server = _start_api(config, loop, frontend)
     cleanup_registry.install_handlers()
     cleanup_registry.set_quiesce(loop.quiesce)
     stop_reason = "finished"
@@ -2965,14 +2965,17 @@ def _home() -> SbxloopHome:
     return load_config().paths
 
 
-def _start_api(config: Config, loop: Any) -> Any:
+def _start_api(config: Config, loop: Any, frontend: Any) -> Any:
     """The remote API listener beside the daemon: built over the daemon's
     own stores, started before recovery (liveness answers at once), told
-    it is ready after the control queue is."""
+    it is ready after the control queue is. Its chronology observes the
+    daemon's frontend so notices, run lifecycle and gates reach the
+    public event stream."""
     from sbxloop.api.app import create_app
     from sbxloop.api.auth.keys import load_or_create
     from sbxloop.api.auth.store import ApiAuthStore
     from sbxloop.api.context import ApiContext
+    from sbxloop.api.frontend import ApiFrontend
     from sbxloop.api.server import ApiServer
 
     ctx = ApiContext(
@@ -2983,6 +2986,7 @@ def _start_api(config: Config, loop: Any) -> Any:
         clock=loop.clock,
     )
     server = ApiServer(create_app(ctx), config.api, ctx=ctx)
+    frontend.add_observer(ApiFrontend(ctx.chronology, ctx.hub, ctx.projector, clock=ctx.clock))
     server.start()
     return server
 

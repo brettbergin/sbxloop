@@ -23,4 +23,12 @@ async def ready(response: Response, ctx: ApiContext = Depends(get_ctx)) -> Readi
     is_ready = ctx.ready.is_set() and not ctx.stopping.is_set()
     if not is_ready:
         response.status_code = 503
-    return Readiness(ready=is_ready, generation=ctx.generation())
+    lag = await ctx.call(_lag, ctx) if is_ready else None
+    return Readiness(ready=is_ready, generation=ctx.generation(), projection_lag=lag)
+
+
+def _lag(ctx: ApiContext) -> int | None:
+    try:
+        return ctx.chronology.lag()
+    except Exception:
+        return None

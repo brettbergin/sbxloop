@@ -25,6 +25,9 @@ FEATURES: tuple[str, ...] = (
     "intake.issue",
     "intake.workload",
     "intake.tool",
+    "events",
+    "events.stream",
+    "ws",
 )
 
 

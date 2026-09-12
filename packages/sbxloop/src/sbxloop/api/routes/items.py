@@ -8,47 +8,27 @@ from typing import Annotated, Any, Literal, get_args
 from fastapi import APIRouter, Depends, Query, Request, Response
 
 from sbxloop.api.auth.deps import Authenticated, get_ctx, ready_daemon, require
-from sbxloop.api.commands import Replayed, idempotency, replayed_problem, run_command
+from sbxloop.api.commands import admit, idempotency, item_command
 from sbxloop.api.context import PAGE_DEFAULT, PAGE_MAX, ApiContext
 from sbxloop.api.errors import Problem
 from sbxloop.api.models import (
     Admitted,
     IntakeRequest,
-    IssueIntake,
     Item,
     ItemCommand,
     ItemCommandResult,
     ItemDetail,
-    OperationOut,
     QueuePage,
-    ToolIntake,
-    WorkloadIntake,
     rfc3339,
 )
 from sbxloop.api.pagination import Page, decode_cursor, encode_cursor
-from sbxloop.api.projections import Views, not_found
-from sbxloop.daemon.controls.intake import (
-    AdmitRequest,
-    IssueAdmission,
-    ToolAdmission,
-    WorkloadAdmission,
-)
-from sbxloop.daemon.controls.operations import Operation
-from sbxloop.daemon.controls.results import AdmitOutcome, ItemOutcome
+from sbxloop.api.projections import Views
 from sbxloop.daemon.model import ItemState, WorkItem
 
 router = APIRouter(prefix="/v1", tags=["items"])
 
 ITEM_STATES: tuple[str, ...] = get_args(ItemState)
 RUN_KINDS: tuple[str, ...] = ("code", "workload", "tool")
-
-
-def _operation(ctx: ApiContext, op_id: str | None) -> Operation:
-    store = getattr(ctx.loop, "operations", None)
-    op: Operation | None = store.get(op_id) if store is not None and op_id else None
-    if op is None:
-        raise Problem(503, "daemon_not_ready", "the daemon keeps no operation record")
-    return op
 
 
 @router.get("/items", response_model=Page[Item])
@@ -143,25 +123,6 @@ async def queue(
 # -- intake ----------------------------------------------------------------------
 
 
-def _admission(ctx: ApiContext, body: IssueIntake | WorkloadIntake | ToolIntake) -> AdmitRequest:
-    """The service's request for the route's body; a public repository id
-    is resolved here, on the executor."""
-    if isinstance(body, IssueIntake):
-        if (body.repository_id is None) == (body.repository is None):
-            raise Problem(
-                422, "invalid_request", "name the repository by `repository_id` or `repository`"
-            )
-        repo = body.repository
-        if body.repository_id is not None:
-            repo = Views(ctx).repository_by_public_id(body.repository_id).repo
-        assert repo is not None  # nosec B101 - one of the two was given
-        run_kind: Literal["code", "workload"] = body.run_kind
-        return IssueAdmission(repository=repo, number=body.number, run_kind=run_kind)
-    if isinstance(body, WorkloadIntake):
-        return WorkloadAdmission(ask=body.ask, profile=body.profile, sink=body.sink)
-    return ToolAdmission(recipe=body.recipe, parameters=dict(body.parameters))
-
-
 @router.post("/items", response_model=Admitted, status_code=201)
 async def admit_item(
     body: IntakeRequest,
@@ -177,42 +138,11 @@ async def admit_item(
     ``Idempotency-Key`` is required; a replay answers with the same item
     and operation. ``201`` when the item was created, ``200`` when it was
     already queued."""
-    principal = auth.principal
-    pair = idempotency(request, principal, "/v1/items", required=True)
-    service = ctx.service()
-
-    def apply() -> AdmitOutcome:
-        return service.admit(principal, _admission(ctx, body), idempotency=pair)
-
-    try:
-        outcome = await run_command(ctx, apply)
-    except Replayed as replay:
-        existing = replay.operation
-        problem = replayed_problem(existing)
-        if problem is not None:
-            raise problem from replay
-        result = existing.result or {}
-        item_id = str((result.get("item") or {}).get("item_id") or "")
-
-        def reread() -> tuple[Item, Operation]:
-            views = Views(ctx)
-            item = views.dstore.get(item_id) if item_id else None
-            if item is None:
-                raise not_found()
-            return views.item(item), existing
-
-        view, op = await ctx.call(reread)
-        response.status_code = 200
-        response.headers["Location"] = f"/v1/items/{view.id}"
-        return Admitted(item=view, operation=OperationOut.from_operation(op), created=False)
-
-    def project() -> tuple[Item, Operation]:
-        return Views(ctx).item(outcome.item), _operation(ctx, outcome.operation_id)
-
-    view, op = await ctx.call(project)
-    response.status_code = 201 if outcome.fresh else 200
-    response.headers["Location"] = f"/v1/items/{view.id}"
-    return Admitted(item=view, operation=OperationOut.from_operation(op), created=outcome.fresh)
+    pair = idempotency(request, auth.principal, "/v1/items", required=True)
+    admitted = await admit(ctx, auth, body, pair)
+    response.status_code = 201 if admitted.created else 200
+    response.headers["Location"] = f"/v1/items/{admitted.item.id}"
+    return admitted
 
 
 # -- item commands ---------------------------------------------------------------
@@ -226,57 +156,8 @@ async def _item_command(
     ctx: ApiContext,
     auth: Authenticated,
 ) -> ItemCommandResult:
-    principal = auth.principal
-    pair = idempotency(request, principal, f"/v1/items/{public_id}/{verb}", required=False)
-    command = body or ItemCommand()
-    service = ctx.service()
-
-    def apply() -> ItemOutcome:
-        views = Views(ctx)
-        item = views.item_by_public_id(public_id)
-        if verb == "abandon":
-            return service.abandon(
-                principal,
-                item.item_id,
-                command.reason,
-                expected_revision=command.expected_revision,
-                idempotency=pair,
-            )
-        if verb == "retry":
-            return service.retry(
-                principal,
-                item.item_id,
-                expected_revision=command.expected_revision,
-                idempotency=pair,
-            )
-        return service.requeue(
-            principal, item.item_id, expected_revision=command.expected_revision, idempotency=pair
-        )
-
-    try:
-        outcome = await run_command(ctx, apply)
-    except Replayed as replay:
-        existing = replay.operation
-        problem = replayed_problem(existing)
-        if problem is not None:
-            raise problem from replay
-
-        def reread() -> ItemCommandResult:
-            views = Views(ctx)
-            return ItemCommandResult(
-                item=views.item(views.item_by_public_id(public_id)),
-                operation=OperationOut.from_operation(existing),
-            )
-
-        return await ctx.call(reread)
-
-    def project() -> ItemCommandResult:
-        return ItemCommandResult(
-            item=Views(ctx).item(outcome.item),
-            operation=OperationOut.from_operation(_operation(ctx, outcome.operation_id)),
-        )
-
-    return await ctx.call(project)
+    pair = idempotency(request, auth.principal, f"/v1/items/{public_id}/{verb}", required=False)
+    return await item_command(ctx, auth, verb, public_id, body, pair)
 
 
 @router.post("/items/{item_id}/retry", response_model=ItemCommandResult)

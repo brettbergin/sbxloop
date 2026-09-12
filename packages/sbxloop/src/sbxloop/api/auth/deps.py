@@ -27,6 +27,9 @@ class Authenticated:
     principal: Principal
     claims: AccessClaims
     client: Client
+    #: The bearer token as presented: a long-lived stream re-verifies it
+    #: on a schedule and closes when it no longer stands.
+    token: str = ""
 
 
 def _bearer(request: Request) -> str:
@@ -66,7 +69,14 @@ def _resolve(ctx: ApiContext, token: str) -> Authenticated:
         capabilities=capabilities,
         workspace_id=claims.workspace_id,
     )
-    return Authenticated(principal=principal, claims=claims, client=client)
+    return Authenticated(principal=principal, claims=claims, client=client, token=token)
+
+
+def resolve_token(ctx: ApiContext, token: str) -> Authenticated:
+    """The principal behind a raw bearer token — for a transport that
+    carries it outside the request headers (a WebSocket's first frame, a
+    stream's periodic re-check). Raises the same problems ``current`` does."""
+    return _resolve(ctx, token)
 
 
 async def current(request: Request, ctx: ApiContext = Depends(get_ctx)) -> Authenticated:  # noqa: B008
