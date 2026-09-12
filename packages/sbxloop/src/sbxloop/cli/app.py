@@ -1501,6 +1501,7 @@ def secrets_rotate(
                 env=token_env,
                 workspace=workspace,
                 template=config.sandbox.template,
+                resources=config.sandbox_resources_for("service"),
             )
             if visible is True:
                 console.print(

@@ -234,6 +234,26 @@ for the transport-level statement of the same rules.
 
 ## The security primitive: one run = two sandboxes (three, with credentials)
 
+All creation paths pass explicit CPU and memory allocations through
+`SandboxSpec.resources` to `SbxCLI.create`. The run agent defaults to 6 CPUs
+and 12 GiB (also used by bake), the concierge to 2 CPUs and 4 GiB, and each
+GitHub/service helper to 1 CPU and 2 GiB. Diagnostics use the service
+allocation. These are per-VM limits, not an aggregate host scheduler.
+`Config.sandbox_resources_for` resolves operator settings and sparse
+per-repository run-agent overrides. Zero CPU and automatic memory are
+invalid; creation never retries without the limits.
+On resume, CPU/memory settings and repository allocation overrides come
+from the current operator config, while other run rules stay pinned to the
+snapshot. The ordinary config-drift event explains this exception.
+
+Provisioning writes the requested allocation to a host receipt under
+`SbxloopHome.sandbox_allocations`, paired with a random nonce in the VM.
+Before reusing a run pair or concierge VM, it checks both the requested
+allocation and the nonce. Unknown or changed allocations fail closed before
+mutating the existing VMs; operators preserve any needed state and recreate
+them. This is creation provenance, not telemetry or independent verification
+of the backend's resource enforcement.
+
 Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pair`
 — and a run granted `[[credentials]]`, or whose repository has a credentialed
 `[[registries]]` entry, a third, the *service* sandbox (#765, #766),
