@@ -658,3 +658,125 @@ class UsageWindow(ApiModel):
     total: UsageTotals
     spend: None = None
     spend_basis: str
+
+
+# -- diagnostics and administration (#1040) -----------------------------------------
+
+
+class LogRecord(ApiModel):
+    timestamp: str
+    level: str
+    logger: str
+    message: str
+
+
+class LogTail(ApiModel):
+    """The daemon's most recent log records, oldest first, redacted."""
+
+    records: list[LogRecord]
+    #: Lines the ring buffer holds in all; ``tail`` is what was asked for.
+    buffer_size: int
+    tail: int
+    level: str | None = None
+    grep: str | None = None
+    observed_at: str
+
+
+class ConfigurationEntry(ApiModel):
+    key: str
+    value: Any = None
+    #: The layer that answers for the key now (``home config``, ``env``,
+    #: ``default``…); ``None`` when the loader could not say.
+    source: str | None = None
+    #: ``live`` when a change applies before the next agent phase;
+    #: ``restart`` when the daemon reads it at start.
+    applies: Literal["live", "restart"]
+    #: The file resolves to a different value than the daemon runs on: an
+    #: edit that waits for a restart.
+    pending: bool = False
+    #: Why the daemon's own tools may not change it, when they may not.
+    locked: str | None = None
+    doc: str | None = None
+
+
+class Configuration(ApiModel):
+    """The allowlisted effective configuration: never a secret value,
+    never a host path; ``sections`` says what is readable at all."""
+
+    workspace_id: str = WORKSPACE_ID
+    observed_at: str
+    sections: list[str]
+    entries: list[ConfigurationEntry]
+
+
+class HoldRequest(ApiModel):
+    name: str = Field(min_length=1, max_length=64)
+    reason: str = Field(default="", max_length=500)
+
+
+class HoldResult(ApiModel):
+    hold: str | None = None
+    #: Every hold standing after the change.
+    holds: list[Hold]
+    created: bool = False
+    operation: OperationOut
+
+
+class DaemonCommandResult(ApiModel):
+    """A stop or restart accepted: the effect follows the reply, so a
+    client that sees this body has a durable record, not a process exit."""
+
+    accepted: Literal[True] = True
+    action: Literal["stop", "restart"]
+    #: The generation that accepted the request; a restart shows a new one
+    #: on ``/health/ready`` once the daemon is back and ready.
+    generation: str | None = None
+    supervisor: str | None = None
+    now: bool = False
+    #: The run that finishes (or, ``now``, is cancelled) before the exit.
+    current: CurrentRun | None = None
+    operation: OperationOut
+
+
+class RestartRequest(ApiModel):
+    now: bool = False
+
+
+class RepositoryResult(ApiModel):
+    repository: Repository
+    operation: OperationOut
+
+
+class Schedule(ApiModel):
+    id: str
+    workspace_id: str = WORKSPACE_ID
+    name: str
+    cadence: str
+    timezone: str
+    profile: str
+    ask: str
+    source: str
+    created_by: str | None = None
+    created_at: str | None = None
+    last_due: str | None = None
+    last_fired_at: str | None = None
+    last_item: str | None = None
+    next_due: str | None = None
+    paused: bool = False
+    paused_by: str | None = None
+    available_actions: list[str] = Field(default_factory=list)
+
+
+class ScheduleCreate(ApiModel):
+    name: str
+    profile: str
+    ask: str
+    every: str | None = None
+    cron: str | None = None
+    timezone: str | None = None
+
+
+class ScheduleResult(ApiModel):
+    schedule: Schedule | None = None
+    message: str
+    operation: OperationOut

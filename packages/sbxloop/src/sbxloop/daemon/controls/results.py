@@ -46,6 +46,9 @@ ErrorCode = Literal[
     "daemon_not_ready",
     # The source the action needs (the forge) could not be reached.
     "source_unavailable",
+    # The hold belongs to another principal and the caller did not claim
+    # administrative authority over it.
+    "hold_owned",
 ]
 
 
@@ -81,6 +84,7 @@ class StatusOutcome(Outcome):
 class PauseOutcome(Outcome):
     hold: str
     holds: list[str]
+    reason: str = ""
     #: ``False`` when the hold already stood (idempotent per name).
     fresh: bool = True
 
@@ -149,6 +153,13 @@ class ScheduleOutcome(Outcome):
 
 class LogTailOutcome(Outcome):
     text: str
+
+
+class LogRecordsOutcome(Outcome):
+    """The daemon's recent log records, structured: newest last."""
+
+    records: list[dict[str, Any]]
+    buffer_size: int
 
 
 class StopOutcome(Outcome):

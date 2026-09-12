@@ -402,19 +402,22 @@ class DaemonLoop:
         via: str = "",
         reason: str = "",
         operation_id: str | None = None,
+        owner_id: str | None = None,
     ) -> list[str]:
         """Take a named pause hold. Idempotent per name. Returns the holds
         standing afterwards. The hold is persisted before it is narrated
         and survives a restart; ``by``/``via`` say whose it is. The change
         is narrated once per transition — a deploy's hold and an operator's
         pause both show up in the chronology, so a paused daemon always
-        says who is holding it."""
+        says who is holding it. ``owner_id`` is the principal's stable id
+        when the surface has one (``by`` is the display); a release that
+        checks ownership compares against it."""
         hold = hold_name(hold)
         with self._holds_lock:
             fresh = self.dstore.take_hold(
                 hold,
                 self.clock(),
-                owner_id=by,
+                owner_id=owner_id or by,
                 owner_display=by,
                 via=via,
                 reason=reason,

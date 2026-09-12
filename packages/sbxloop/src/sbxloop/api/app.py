@@ -18,10 +18,12 @@ from sbxloop import __version__
 from sbxloop.api import errors, ws
 from sbxloop.api.context import ApiContext
 from sbxloop.api.routes import (
+    admin,
     artifacts,
     auth,
     catalog,
     control,
+    diagnostics,
     events,
     health,
     items,
@@ -111,6 +113,8 @@ def create_app(ctx: ApiContext) -> FastAPI:
     app.include_router(control.router)
     app.include_router(artifacts.router)
     app.include_router(usage.router)
+    app.include_router(admin.router)
+    app.include_router(diagnostics.router)
     app.include_router(events.router)
     app.include_router(ws.router)
     app.include_router(auth.router)

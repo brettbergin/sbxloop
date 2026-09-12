@@ -42,6 +42,7 @@ from sbxloop.daemon.controls.results import (
     GrantRoundsOutcome,
     ItemOutcome,
     ItemsOutcome,
+    LogRecordsOutcome,
     LogTailOutcome,
     Outcome,
     PauseOutcome,
@@ -184,9 +185,48 @@ class ControlService:
             raise ControlError("invalid_argument", text)
         return LogTailOutcome(text=text)
 
+    def log_records(
+        self, principal: Principal, *, tail: int, level: str | None, grep: str | None
+    ) -> LogRecordsOutcome:
+        """The same ring buffer as ``log_tail``, as records rather than a
+        rendered block: for a surface that shapes its own lines."""
+        require(principal, "diagnostics:read")
+        from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX
+        from sbxloop.log import log_buffer
+
+        tail = max(1, min(LOG_TAIL_MAX, tail))
+        level = (level or "").strip().upper() or None
+        buffer = log_buffer()
+        try:
+            records = buffer.tail(tail, level=level, grep=grep or None)
+        except ValueError as exc:
+            raise ControlError(
+                "invalid_argument",
+                f"unknown log level {level!r} — use one of {', '.join(LOG_LEVELS)}",
+            ) from exc
+        return LogRecordsOutcome(
+            records=[
+                {
+                    "timestamp": r.timestamp,
+                    "level": r.level,
+                    "logger": r.logger,
+                    "message": r.line,
+                }
+                for r in records
+            ],
+            buffer_size=len(buffer),
+        )
+
     # -- holds ----------------------------------------------------------------------
 
-    def pause(self, principal: Principal, hold: str | None = None) -> PauseOutcome:
+    def pause(
+        self,
+        principal: Principal,
+        hold: str | None = None,
+        *,
+        reason: str = "",
+        idempotency: tuple[str, str] | None = None,
+    ) -> PauseOutcome:
         require(principal, "daemon:manage")
         name = _hold(hold)
 
@@ -195,31 +235,86 @@ class ControlService:
             extra: dict[str, Any] = {}
             if self.runner is not None:
                 # A loop that keeps holds durably records whose it is.
-                extra = {"via": principal.via, "operation_id": op_id}
+                extra = {
+                    "via": principal.via,
+                    "operation_id": op_id,
+                    "reason": reason,
+                    "owner_id": principal.id,
+                }
             try:
                 holds = self.loop.pause(name, by=principal.attribution(), **extra)
             except ValueError as exc:
                 raise ControlError("invalid_argument", str(exc)) from exc
-            return PauseOutcome(hold=name, holds=list(holds), fresh=name not in before)
+            return PauseOutcome(
+                hold=name, holds=list(holds), fresh=name not in before, reason=reason
+            )
 
-        return self._record(self._spec("daemon.pause", principal, "hold", name), apply)
+        # The hold's name rides the request: two holds taken under one
+        # idempotency key on the one route are a conflict, not a replay.
+        spec = self._spec(
+            "daemon.pause",
+            principal,
+            "hold",
+            name,
+            idempotency=idempotency,
+            hold=name,
+            reason=reason,
+        )
+        return self._record(spec, apply)
 
     def release(
-        self, principal: Principal, hold: str | None = None, *, everything: bool = False
+        self,
+        principal: Principal,
+        hold: str | None = None,
+        *,
+        everything: bool = False,
+        only_own: bool = False,
+        idempotency: tuple[str, str] | None = None,
     ) -> ReleaseOutcome:
-        """Release one hold (the operator's when unnamed), or every hold."""
+        """Release one hold (the operator's when unnamed), or every hold.
+        ``only_own`` refuses a hold another principal took — the remote
+        contract's default, where releasing one person's hold must never
+        release someone else's; the prose surfaces keep the operator's
+        override."""
         require(principal, "daemon:manage")
         name = None if everything else _hold(hold)
 
         def apply(_: str | None) -> ReleaseOutcome:
+            if only_own and name is not None:
+                self._check_hold_owner(name, principal)
             try:
                 holds = self.loop.unpause(name, by=principal.attribution())
             except ValueError as exc:
                 raise ControlError("invalid_argument", str(exc)) from exc
             return ReleaseOutcome(hold=name, holds=list(holds))
 
-        spec = self._spec("daemon.release", principal, "hold", name or "*", everything=everything)
+        spec = self._spec(
+            "daemon.release",
+            principal,
+            "hold",
+            name or "*",
+            idempotency=idempotency,
+            everything=everything,
+        )
         return self._record(spec, apply)
+
+    def _check_hold_owner(self, name: str, principal: Principal) -> None:
+        """A hold with a recorded owner is released by that owner; another
+        principal must say it is overriding (``only_own=False``)."""
+        for hold in self.loop.dstore.holds():
+            if hold.name != name:
+                continue
+            if hold.owner_id and hold.owner_id != principal.id:
+                raise ControlError(
+                    "hold_owned",
+                    f"hold {name!r} belongs to {hold.owner_display or hold.owner_id}"
+                    + (f" (via {hold.via})" if hold.via else "")
+                    + "; release it with force to override",
+                    hold=name,
+                    owner=hold.owner_display or hold.owner_id,
+                    via=hold.via,
+                )
+            return
 
     # -- runs -----------------------------------------------------------------------
 
@@ -647,7 +742,9 @@ class ControlService:
 
     # -- daemon ---------------------------------------------------------------------
 
-    def resume_repo(self, principal: Principal, repo: str) -> RepoResumeOutcome:
+    def resume_repo(
+        self, principal: Principal, repo: str, *, idempotency: tuple[str, str] | None = None
+    ) -> RepoResumeOutcome:
         require(principal, "daemon:manage")
 
         def apply(_: str | None) -> RepoResumeOutcome:
@@ -657,10 +754,16 @@ class ControlService:
                 raise ControlError(_code_for(exc), _message(exc)) from exc
             return RepoResumeOutcome(repo=str(health.get("repo", repo)), health=dict(health))
 
-        return self._record(self._spec("repo.resume", principal, "repo", repo), apply)
+        spec = self._spec("repo.resume", principal, "repo", repo, idempotency=idempotency)
+        return self._record(spec, apply)
 
     def add_schedule(
-        self, principal: Principal, spec: ScheduleConfig, *, source: str
+        self,
+        principal: Principal,
+        spec: ScheduleConfig,
+        *,
+        source: str,
+        idempotency: tuple[str, str] | None = None,
     ) -> ScheduleOutcome:
         require(principal, "daemon:manage")
 
@@ -672,12 +775,23 @@ class ControlService:
             return ScheduleOutcome(verb="add", name=spec.name, message=message)
 
         record = self._spec(
-            "schedule.add", principal, "schedule", spec.name, source=source, **spec.model_dump()
+            "schedule.add",
+            principal,
+            "schedule",
+            spec.name,
+            idempotency=idempotency,
+            source=source,
+            **spec.model_dump(),
         )
         return self._record(record, apply)
 
     def schedule_control(
-        self, principal: Principal, verb: Literal["pause", "resume", "remove"], name: str
+        self,
+        principal: Principal,
+        verb: Literal["pause", "resume", "remove"],
+        name: str,
+        *,
+        idempotency: tuple[str, str] | None = None,
     ) -> ScheduleOutcome:
         """``pause`` / ``resume`` / ``remove`` one schedule."""
         require(principal, "daemon:manage")
@@ -694,17 +808,26 @@ class ControlService:
                 raise ControlError("unknown_target", _message(exc)) from exc
             return ScheduleOutcome(verb=verb, name=name, message=message)
 
-        return self._record(self._spec(f"schedule.{verb}", principal, "schedule", name), apply)
+        spec = self._spec(f"schedule.{verb}", principal, "schedule", name, idempotency=idempotency)
+        return self._record(spec, apply)
 
-    def stop(self, principal: Principal) -> StopOutcome:
+    def stop(
+        self, principal: Principal, *, idempotency: tuple[str, str] | None = None
+    ) -> StopOutcome:
         """Graceful stop: the effect runs when the caller fires ``after``."""
         require(principal, "daemon:manage")
         return self._record(
-            self._spec("daemon.stop", principal, "daemon", "daemon"),
+            self._spec("daemon.stop", principal, "daemon", "daemon", idempotency=idempotency),
             lambda _: StopOutcome(after=self.loop.request_stop),
         )
 
-    def restart(self, principal: Principal, *, now: bool = False) -> RestartOutcome:
+    def restart(
+        self,
+        principal: Principal,
+        *,
+        now: bool = False,
+        idempotency: tuple[str, str] | None = None,
+    ) -> RestartOutcome:
         """Courtesy exit under a supervisor that starts the daemon again;
         refused by name when nothing would."""
         require(principal, "daemon:manage")
@@ -721,9 +844,11 @@ class ControlService:
         def after() -> None:
             loop.request_restart(by=who, reason="operator restart", now=now)
 
+        spec = self._spec(
+            "daemon.restart", principal, "daemon", "daemon", idempotency=idempotency, now=now
+        )
         return self._record(
-            self._spec("daemon.restart", principal, "daemon", "daemon", now=now),
-            lambda _: RestartOutcome(supervisor=supervisor, now=now, after=after),
+            spec, lambda _: RestartOutcome(supervisor=supervisor, now=now, after=after)
         )
 
 

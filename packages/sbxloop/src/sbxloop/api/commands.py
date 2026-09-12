@@ -524,10 +524,13 @@ async def dispatch(
     params: dict[str, Any],
     idempotency_key: str | None,
     expected_revision: int | None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], Callable[[], None] | None]:
     """A typed command frame (the WebSocket's), routed to the same function
-    the REST route calls; the result as the REST body would be."""
-    spec = ACTIONS.get(action)
+    the REST route calls; the result as the REST body would be, and the
+    effect a stop or restart defers until the reply is on its way."""
+    from sbxloop.api.admin import ADMIN_ACTIONS, run_admin
+
+    spec = ACTIONS.get(action) or ADMIN_ACTIONS.get(action)
     if spec is None:
         raise Problem(422, "unknown_action", f"no such action {action!r}")
     capability, route = spec
@@ -535,6 +538,11 @@ async def dispatch(
         raise Problem(
             403, "forbidden", f"{auth.principal.id} lacks {capability}", capability=capability
         )
+    if action in ADMIN_ACTIONS:
+        pair = idempotency_pair(
+            auth.principal, idempotency_key, route.replace("{id}", target or ""), required=False
+        )
+        return await run_admin(ctx, auth, action=action, target=target, params=params, pair=pair)
     if action == "item.admit":
         from pydantic import TypeAdapter, ValidationError
 
@@ -551,7 +559,7 @@ async def dispatch(
             ) from exc
         pair = idempotency_pair(auth.principal, idempotency_key, route, required=True)
         admitted = await admit(ctx, auth, body, pair)
-        return admitted.model_dump(mode="json")
+        return admitted.model_dump(mode="json"), None
     if not target:
         raise Problem(422, "invalid_request", f"{action} needs a target")
     pair = idempotency_pair(
@@ -563,8 +571,11 @@ async def dispatch(
         if action.startswith("item."):
             verb: ItemVerb = action.removeprefix("item.")  # type: ignore[assignment]
             command = ItemCommand(reason=params.get("reason"), expected_revision=expected_revision)
-            return (await item_command(ctx, auth, verb, target, command, pair)).model_dump(
-                mode="json"
+            return (
+                (await item_command(ctx, auth, verb, target, command, pair)).model_dump(
+                    mode="json"
+                ),
+                None,
             )
         if action == "run.steer":
             request = SteerRequest(
@@ -572,12 +583,15 @@ async def dispatch(
                 source_refs=list(params.get("source_refs") or []),
                 expected_revision=expected_revision,
             )
-            return (await steer(ctx, auth, target, request, pair)).model_dump(mode="json")
+            return (await steer(ctx, auth, target, request, pair)).model_dump(mode="json"), None
         if action == "gate.approve":
             if expected_revision is None:
                 raise Problem(422, "invalid_request", "gate.approve needs expected_revision")
             approval = GateApproval(expected_revision=expected_revision)
-            return (await approve_gate(ctx, auth, target, approval, pair)).model_dump(mode="json")
+            return (
+                (await approve_gate(ctx, auth, target, approval, pair)).model_dump(mode="json"),
+                None,
+            )
         run_verb_name: RunVerb = action.removeprefix("run.")  # type: ignore[assignment]
         run_body: RunCommand | RoundGrant
         if run_verb_name == "grant_rounds":
@@ -590,8 +604,11 @@ async def dispatch(
                 retry=bool(params.get("retry", False)),
                 expected_revision=expected_revision,
             )
-        return (await run_verb(ctx, auth, run_verb_name, target, run_body, pair)).model_dump(
-            mode="json"
+        return (
+            (await run_verb(ctx, auth, run_verb_name, target, run_body, pair)).model_dump(
+                mode="json"
+            ),
+            None,
         )
     except ValidationError as exc:
         raise Problem(

@@ -142,6 +142,7 @@ class TestRunner:
             "hold": "operator",
             "holds": ["x"],
             "fresh": True,
+            "reason": "",
         }
 
     def test_a_refusal_finishes_the_record_failed_and_is_re_raised(
@@ -228,6 +229,7 @@ class TestEverySurfaceRecords:
             "hold": "deploy-1",
             "holds": ["deploy-1"],
             "fresh": True,
+            "reason": "",
         }
 
     def test_reads_leave_no_record(self, floop: RecordingLoop) -> None:

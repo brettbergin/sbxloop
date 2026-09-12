@@ -242,6 +242,7 @@ class TestCapabilities:
                 lambda s: s.log_tail(READER, tail=5, level=None, grep=None, max_chars=None),
                 "diagnostics:read",
             ),
+            (lambda s: s.log_records(READER, tail=5, level=None, grep=None), "diagnostics:read"),
         ],
     )
     def test_mutations_need_their_capability(
@@ -278,3 +279,75 @@ class TestProseEdge:
         assert reply == CommandReply("pause refused: cli_r (via api) lacks daemon:manage", ok=False)
         assert floop.hold_calls == []
         assert dispatch(floop, "status", principal=READER).ok
+
+
+class TestHoldOwnership:
+    """A hold with a recorded owner is released by that owner; another
+    principal releases it only by saying so (#1040). The prose surfaces
+    never ask: the operator's override stands there."""
+
+    OWNER = Principal(
+        kind="client",
+        id="cli_a",
+        display="deployer",
+        via="api",
+        capabilities=frozenset({"daemon:manage"}),
+    )
+    OTHER = Principal(
+        kind="client",
+        id="cli_b",
+        display="someone",
+        via="api",
+        capabilities=frozenset({"daemon:manage"}),
+    )
+
+    def test_another_principals_hold_is_refused_by_name(
+        self, service: ControlService, floop: ServiceLoop
+    ) -> None:
+        floop.dstore.take_hold(
+            "deploy-1", 1.0, owner_id="cli_a", owner_display="deployer", via="api"
+        )
+        with pytest.raises(ControlError) as excinfo:
+            service.release(self.OTHER, "deploy-1", only_own=True)
+        assert excinfo.value.code == "hold_owned"
+        assert excinfo.value.detail == {"hold": "deploy-1", "owner": "deployer", "via": "api"}
+        assert "belongs to deployer (via api)" in excinfo.value.message
+        assert floop.hold_calls == []
+        # The owner, an override, and the prose default all release it.
+        assert service.release(self.OWNER, "deploy-1", only_own=True).hold == "deploy-1"
+        assert service.release(self.OTHER, "deploy-1", only_own=False).hold == "deploy-1"
+        assert service.release(OPERATOR, "deploy-1").hold == "deploy-1"
+        assert [c[0] for c in floop.hold_calls] == ["unpause"] * 3
+
+    def test_an_unowned_hold_is_anyones(self, service: ControlService, floop: ServiceLoop) -> None:
+        floop.dstore.take_hold("legacy", 1.0)
+        assert service.release(self.OTHER, "legacy", only_own=True).hold == "legacy"
+
+
+class TestLogRecords:
+    def test_records_are_the_buffers_newest_last(
+        self, service: ControlService, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop import log as logmod
+        from sbxloop.log import LogBuffer, LogRecordLine
+
+        buffer = LogBuffer()
+        for i in range(3):
+            buffer.append(LogRecordLine(f"t{i}", "INFO" if i else "DEBUG", "x", f"line {i}"))
+        monkeypatch.setattr(logmod, "_LOG_BUFFER", buffer)
+        got = service.log_records(OPERATOR, tail=2, level="info", grep=None)
+        assert got.buffer_size == 3
+        assert [r["message"] for r in got.records] == ["line 1", "line 2"]
+        assert got.records[0] == {
+            "timestamp": "t1",
+            "level": "INFO",
+            "logger": "x",
+            "message": "line 1",
+        }
+        assert (
+            service.log_records(OPERATOR, tail=5, level=None, grep="line 0").records[0]["level"]
+            == "DEBUG"
+        )
+        with pytest.raises(ControlError) as excinfo:
+            service.log_records(OPERATOR, tail=5, level="LOUD", grep=None)
+        assert excinfo.value.code == "invalid_argument" and "LOUD" in excinfo.value.message

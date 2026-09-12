@@ -19,6 +19,7 @@ from sbxloop.api.models import (
     Actor,
     Gate,
     GateSummary,
+    Hold,
     Item,
     ItemDetail,
     Origin,
@@ -32,6 +33,7 @@ from sbxloop.api.models import (
     Repository,
     Rounds,
     Run,
+    Schedule,
     Steering,
     Task,
     TaskOutputOut,
@@ -478,3 +480,54 @@ class Views:
             )
             for name in sorted(RECIPES)
         ]
+
+
+# -- administration (#1040) -----------------------------------------------------------
+
+
+def hold_view(hold: Any) -> Hold:
+    """A standing hold as the status shows it, from the store's record."""
+    return Hold(
+        name=str(hold.name),
+        owner=hold.owner_display,
+        via=str(hold.via or ""),
+        reason=str(hold.reason or ""),
+        created_at=rfc3339(hold.created_at),
+    )
+
+
+def holds_view(loop: Any) -> list[Hold]:
+    return [hold_view(h) for h in loop.dstore.holds()]
+
+
+def schedule_view(row: dict[str, Any]) -> Schedule:
+    paused = bool(row.get("paused_by"))
+    return Schedule(
+        id=str(row["name"]),
+        name=str(row["name"]),
+        cadence=str(row.get("cadence") or ""),
+        timezone=str(row.get("timezone") or ""),
+        profile=str(row.get("profile") or ""),
+        ask=str(row.get("ask") or ""),
+        source=str(row.get("source") or ""),
+        created_by=row.get("created_by"),
+        created_at=rfc3339(row.get("created_at")),
+        last_due=rfc3339(row.get("last_due")),
+        last_fired_at=rfc3339(row.get("last_fired_at")),
+        last_item=row.get("last_item"),
+        next_due=rfc3339(row.get("next_due")),
+        paused=paused,
+        paused_by=row.get("paused_by"),
+        available_actions=["resume", "remove"] if paused else ["pause", "remove"],
+    )
+
+
+def schedules_view(loop: Any) -> list[Schedule]:
+    return [schedule_view(row) for row in loop.schedules()]
+
+
+def schedule_by_name(loop: Any, name: str) -> Schedule:
+    for row in loop.schedules():
+        if str(row.get("name")) == name:
+            return schedule_view(row)
+    raise not_found()

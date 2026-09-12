@@ -36,6 +36,7 @@ from sbxloop.api.errors import Problem
 from sbxloop.api.projections import Views
 from sbxloop.api.replay import cursor_after, read_after
 from sbxloop.daemon.controls.principal import WORKSPACE_ID
+from sbxloop.daemon.controls.results import ControlError
 
 router = APIRouter(prefix="/v1", tags=["events"])
 
@@ -150,7 +151,7 @@ class _Session:
             )
             return
         try:
-            result = await dispatch(
+            result, after = await dispatch(
                 self.ctx,
                 self.auth,
                 action=str(frame.get("action") or ""),
@@ -159,12 +160,18 @@ class _Session:
                 idempotency_key=frame.get("idempotency_key"),
                 expected_revision=frame.get("expected_revision"),
             )
-        except Problem as exc:
+        except (Problem, ControlError) as exc:
+            # A service refusal answers as the REST route would: the same
+            # problem body, on the reply — never a closed socket.
+            problem = exc if isinstance(exc, Problem) else Problem.from_control(exc)
             await self.send(
-                {"type": "reply", "id": command_id, "ok": False, "problem": _problem(exc)}
+                {"type": "reply", "id": command_id, "ok": False, "problem": _problem(problem)}
             )
             return
         await self.send({"type": "reply", "id": command_id, "ok": True, "result": result})
+        if after is not None:
+            # A stop or restart takes effect once the reply is on its way.
+            after()
 
     # -- the subscription --------------------------------------------------------
 

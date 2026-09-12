@@ -2267,6 +2267,38 @@ reported, and `spend` is `null` by construction with the basis stated —
 telemetry, not an invoice. A window folds every run touched in it from the
 samples' own timestamps and is at most 31 days wide.
 
+**Diagnostics and administration (#1040).** `api/diagnostics.py` reads the
+same in-process log ring `ctl log` and the concierge read
+(`ControlService.log_records`, bounded by `LOG_TAIL_MAX`) and masks every
+credential shape it knows before a line leaves the host — the upstream rule
+that secrets never reach the log still holds; this is the belt over it. The
+configuration read is the daemon's own loaded `Config`, flattened, filtered
+to an allowlist of sections and with every key segment that names a host
+location or could carry a credential dropped by name (`_env` suffixes name
+variables and stay); provenance comes from running the loader again for
+the home (`load_config_with_sources`) so each key says which layer answers
+for it now, whether a change applies live (`applies_for`) and what keeps
+the daemon's tools from changing it (`configpolicy`), and `pending` marks a
+key the file on disk now resolves differently from what the daemon runs on
+— a loader that cannot read the file leaves provenance `None` rather than
+guessed. Administration (`api/admin.py`) is the service's own verbs: a hold
+taken through the API carries the principal's id as its owner
+(`DaemonLoop.pause(owner_id=)`), and `ControlService.release(only_own=True)`
+— the remote default — refuses another principal's hold as `hold_owned`
+unless the caller forces the override, while the prose surfaces keep the
+operator's unconditional release. A stop or restart is recorded before it
+acts: the service returns the effect as `after`, the route sends the reply
+and fires it as a background task (the WebSocket after its reply frame), the
+chronology carries `daemon.stop_requested` / `daemon.restart_requested` so a
+stream can reconnect to the next generation, and the operation closes with
+the effect — acceptance is the durable fact, the exit is observed through
+readiness, and the restart reuses the loop's supervisor check and marker
+unchanged. Schedules and a suspended repository's resume go through the
+same service verbs ctl and chat use, each an operation. Not published, by
+design: configuration writes, repository registration, backup and restore,
+garbage collection and sandbox deletion — each needs its own attribution,
+conflict and active-run story before it has a remote adapter.
+
 ### Repositories
 
 One daemon may tend several repositories. They are declared as an array of

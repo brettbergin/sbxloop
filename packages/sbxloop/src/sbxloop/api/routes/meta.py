@@ -33,6 +33,12 @@ FEATURES: tuple[str, ...] = (
     "gates",
     "artifacts",
     "usage",
+    "diagnostics.logs",
+    "diagnostics.configuration",
+    "daemon.holds",
+    "daemon.lifecycle",
+    "repositories.resume",
+    "schedules",
 )
 
 

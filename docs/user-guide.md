@@ -2069,6 +2069,48 @@ unknowns kept as `null` and `recorded: false` when nothing was reported, which
 is not zero. `spend` is always `null`, and `spend_basis` says why: no backend
 reports a charge in a known unit, and a token total is not a bill.
 
+**Diagnostics and administration.** `GET /v1/logs` (`diagnostics:read`;
+`tail` up to 500, `level`, `grep` as a plain substring) is the daemon's
+in-process log ring — the same lines `ctl log` shows — as records, with
+anything shaped like a credential (a bearer token, a JWT, a client secret, a
+forge token, a `password=` value) masked before it leaves the host.
+`GET /v1/configuration` is the configuration this daemon runs on, restricted
+to the sections a remote operator may read (`sections` lists them; the
+listener's own `[api]`, the chat backends and every key naming a host path or
+a credential are left out by design, and an environment variable's *name*
+travels while its value never does), each key with the layer it comes from
+(`source`), whether a change applies `live` or at the next `restart`,
+`pending` when the file on disk now says something else, and `locked` with
+the reason the daemon's own tools may not change it. `GET /v1/daemon/holds`
+lists the holds standing with whose each is; `POST /v1/daemon/holds`
+(`daemon:manage`; `{"name": …, "reason": …}`) takes one attributed to your
+client — nothing new is claimed while it stands, the run in flight is not
+touched, it survives a restart and no disconnect releases it — and
+`DELETE /v1/daemon/holds/{name}` releases yours; another client's is
+`409 hold_owned` unless `?force=true` says you are overriding, which the
+operation records. `POST /v1/daemon/stop` answers `202` the moment the stop
+is durably accepted: nothing new is claimed, the run and landing in flight
+finish, then the process exits and this listener with it — streams hear
+`daemon.stop_requested` and then `closing`, and a poll of the operation may
+find the connection refused; under a service manager that restarts the
+daemon this is a restart, and the holds standing now still stand when it is
+back. `POST /v1/daemon/restart` (`{"now": true}` cancels the run in flight
+first; it is resumable) is that stop under a supervisor that starts the
+daemon again, refused as `409 unsupervised` when nothing would — the reply
+carries the generation that accepted it, and the daemon is back when
+`/health/ready` reports a new one; starting a daemon that is not running is
+the supervisor's job, never the API's. `POST /v1/repositories/{id}/resume`
+polls a suspended or backing-off repository again now. `GET /v1/schedules`
+and `/v1/schedules/{name}` show every schedule with its cadence, last and next
+due and who paused it; `POST /v1/schedules/{name}/pause` and `/resume`,
+`POST /v1/schedules` (a declared profile, a free name, exactly one of `every`
+/ `cron`) and `DELETE /v1/schedules/{name}` are the concierge's own schedule
+tools over HTTP, live from the next tick. Every one of these is a `command`
+on the WebSocket too (`daemon.hold`, `daemon.release`, `daemon.stop`,
+`daemon.restart`, `repository.resume`, `schedule.*`). Not offered remotely, by
+design: configuration writes, repository registration, backup and restore,
+garbage collection and sandbox deletion stay on the host's own CLI.
+
 ## Artifacts
 
 Every job in a run executes in the run's **workspace** — a host directory
