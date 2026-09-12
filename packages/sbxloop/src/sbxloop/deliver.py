@@ -273,8 +273,10 @@ def _is_pr_collision(exc: GithubOpsError) -> bool:
     an open PR. GitHub's answer is HTTP 422 "A pull request already exists
     for owner:branch" — but the `gh` transport used to hand back only
     "Validation Failed (HTTP 422)" (field run r8tzse1qa, #387), so the
-    status alone is the test and the caller confirms with a lookup."""
-    return exc.http_status == 422 or "HTTP 422" in str(exc)
+    status alone is the test and the caller confirms with a lookup. GitLab
+    answers the same collision with HTTP 409 ("Another open merge request
+    already exists for this source branch", #1018), confirmed the same way."""
+    return exc.http_status in (409, 422) or "HTTP 422" in str(exc)
 
 
 class RepositoryProbe(NamedTuple):

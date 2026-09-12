@@ -214,7 +214,45 @@ def _live_gitlab() -> VcsOps:
     forge = _live_gitlab_forge()
     spec = gitlab_transport(forge.api_url)
     client = LocalWorkerClient(spec, forge.get("GITLAB_TOKEN"), ca_file=forge.ca_file)
+    _reset_live_branch(forge, CHANGE_BRANCH)
     return GitlabOps(client, "live", transport=spec)  # type: ignore[arg-type]
+
+
+# The branch every change scenario opens its change from; the live entry
+# cuts it fresh per backend build and the live seeds put statuses on its
+# head, the change's head.
+CHANGE_BRANCH = "sbxloop/r1"
+
+
+def _reset_live_branch(forge: LiveForge, branch: str) -> None:
+    """The change scenarios open a merge request from ``branch`` and never
+    close it (the fake forgets everything per test). On a live forge the
+    last run's request would refuse the next (409), so the branch starts
+    every backend build fresh: its open requests closed, the branch cut
+    again from the base with one commit to diff."""
+    from urllib.parse import quote
+
+    dev = forge.client("GITLAB_TOKEN", "Developer")
+    project = f"/projects/{quote(forge.repo, safe='')}"
+    for change in (
+        dev.get(
+            f"{project}/merge_requests", query={"state": "opened", "source_branch": branch}
+        ).data
+        or []
+    ):
+        dev.put(f"{project}/merge_requests/{change['iid']}", {"state_event": "close"})
+    dev.delete(f"{project}/repository/branches/{quote(branch, safe='')}", check=False)
+    dev.post(
+        f"{project}/repository/commits",
+        {
+            "branch": branch,
+            "start_branch": "main",
+            "commit_message": "sbxloop conformance: one change to review",
+            "actions": [
+                {"action": "create", "file_path": "a.py", "content": "x = 1\ny = 2\nz = 3\n"}
+            ],
+        },
+    )
 
 
 class _LiveGitlabSeeds:
@@ -222,14 +260,14 @@ class _LiveGitlabSeeds:
     already protected ``main`` and set "pipeline must succeed" as the
     administrator (``tests/live/seed_gitlab.py``); a Developer cannot
     change those, so ``base_rules`` reports what stands. Statuses go on
-    the base's head, the only commit a read scenario knows."""
+    the change branch's head, the head of the change the scenario opens."""
 
     def __init__(self, ops: VcsOps, forge: LiveForge) -> None:
         self.ops = ops
         self.forge = forge
 
     def _head(self) -> str:
-        sha = self.ops.ref_lookup(self.forge.repo, "heads/main")
+        sha = self.ops.ref_lookup(self.forge.repo, f"heads/{CHANGE_BRANCH}")
         assert sha
         return sha
 

@@ -517,9 +517,9 @@ class TestNotImplementedRoles:
     @pytest.mark.parametrize(
         ("role", "call"),
         [
-            ("ChangeOps", lambda ops: ops.pr_create(REPO, "main", "b", "t")),
-            ("ChangeOps", lambda ops: ops.pr_get(REPO, 1)),
-            ("ReviewOps", lambda ops: ops.pr_review_threads(REPO, 1)),
+            ("ChangeOps", lambda ops: ops.pr_merge(REPO, 1)),
+            ("ChangeOps", lambda ops: ops.pr_ready_for_review("1!1")),
+            ("ContentOps", lambda ops: ops.commit_get(REPO, "base123")),
             (
                 "ContentOps",
                 lambda ops: ops.contents_put(REPO, "a", message="m", content_b64="", branch="b"),
@@ -532,4 +532,4 @@ class TestNotImplementedRoles:
         assert info.value.kind == "gitlab" and info.value.role == role
         assert f"{role}.{info.value.operation}" in str(info.value)
         assert isinstance(info.value, GithubOpsError)
-        assert set(GitlabOps.UNIMPLEMENTED_ROLES) == {"ChangeOps", "ReviewOps", "ContentOps"}
+        assert f"{role}.{info.value.operation}" in GitlabOps.UNIMPLEMENTED_OPERATIONS

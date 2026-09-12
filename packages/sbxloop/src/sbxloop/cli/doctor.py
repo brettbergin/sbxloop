@@ -267,7 +267,7 @@ def vcs_backend_checks(config: Config) -> list[Check]:
         BACKENDS,
         capabilities_for,
         capability_note,
-        unimplemented_roles,
+        unimplemented_operations,
     )
 
     rows: list[Check] = []
@@ -304,11 +304,11 @@ def vcs_backend_checks(config: Config) -> list[Check]:
                 )
             )
             continue
-        missing = unimplemented_roles(kind)
+        missing = unimplemented_operations(kind)
         if missing:
             parts.append(
                 f"not implemented yet: {', '.join(missing)} — a run on this forge stops at "
-                "their first operation, naming it"
+                "the first of them, naming it"
             )
         rows.append(Check(name, True, "; ".join(parts), hard=False))
     return rows

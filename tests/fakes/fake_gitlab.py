@@ -67,6 +67,8 @@ class FakeGitlab(GitlabOps):
         self._projects = {}
         self._note_issue = {}
         self._bots = {}
+        self._note_discussion = {}
+        self._mr_urls = {}
         self.repo = repo
         self.user_login = "sbxloop-bot"
         self.user_id = 2
@@ -126,6 +128,35 @@ class FakeGitlab(GitlabOps):
         self.notes_deleted: list[tuple[int, int]] = []
         self.statuses_posted: list[tuple[str, dict[str, Any]]] = []
         self.deleted_branches: list[str] = []
+        # Merge requests (#1018): by iid; their discussions by iid; the
+        # diff every seeded request carries unless told otherwise.
+        self.merge_requests: dict[int, dict[str, Any]] = {}
+        self.discussions: dict[int, list[dict[str, Any]]] = {}
+        self.default_diffs: list[dict[str, Any]] = [
+            {
+                "old_path": "hello.txt",
+                "new_path": "hello.txt",
+                "diff": "@@ -1,3 +1,3 @@\n-hi\n+hello\n second\n third\n",
+                "new_file": False,
+                "renamed_file": False,
+                "deleted_file": False,
+            }
+        ]
+        # GitLab has not computed the diff yet: diff_refs is null.
+        self.diff_refs_pending = False
+        # Whether the token may approve (a Premium rule against the author
+        # approving answers 401).
+        self.approve_ok = True
+        # Anchors GitLab refuses a position for (a line outside the diff).
+        self.refuse_positions: set[str] = set()
+        self.mr_created: list[dict[str, Any]] = []
+        self.mr_updates: list[tuple[int, dict[str, Any]]] = []
+        self.mr_notes_posted: list[tuple[int, str]] = []
+        self.discussions_posted: list[tuple[int, str, str]] = []
+        self.replies: list[tuple[int, str, str]] = []
+        self.resolved: list[tuple[str, bool]] = []
+        self.approvals_posted: list[tuple[int, dict[str, Any]]] = []
+        self._discussion_seq = 0
         self.head_sha = "commit0"
         self._note_id = 0
         self._status_id = 100
@@ -341,6 +372,297 @@ class FakeGitlab(GitlabOps):
         for name in verdict.needs_approval:
             self.seed_status(sha, name, "manual")
 
+    # -- merge requests (#1018) ---------------------------------------------------
+
+    def _mr_payload(self, mr: dict[str, Any]) -> dict[str, Any]:
+        iid = mr["iid"]
+        refs = (
+            None
+            if self.diff_refs_pending
+            else {
+                "base_sha": "base123",
+                "start_sha": "base123",
+                "head_sha": mr["sha"],
+            }
+        )
+        return {
+            "id": 200 + iid,
+            "iid": iid,
+            "project_id": PROJECT_ID,
+            "title": mr["title"],
+            "description": mr.get("description"),
+            "state": mr["state"],
+            "draft": mr["title"].startswith("Draft:"),
+            "source_branch": mr["source_branch"],
+            "target_branch": mr["target_branch"],
+            "sha": mr["sha"],
+            "merge_commit_sha": mr.get("merge_commit_sha"),
+            "squash_commit_sha": None,
+            "author": self._user(mr.get("author_id", self.user_id)),
+            "reviewers": [self._user(r["user_id"]) for r in mr.get("reviewers", [])],
+            "detailed_merge_status": mr.get("detailed_merge_status", "mergeable"),
+            "blocking_discussions_resolved": all(
+                not n.get("resolvable") or n.get("resolved")
+                for d in self.discussions.get(iid, [])
+                for n in d["notes"][:1]
+            ),
+            "diff_refs": refs,
+            "web_url": f"{self.web_url}/-/merge_requests/{iid}",
+            "created_at": mr.get("created_at", "2026-09-12T21:20:41.723Z"),
+            "updated_at": mr.get("updated_at", "2026-09-12T21:20:42.705Z"),
+        }
+
+    def seed_mr(
+        self,
+        iid: int,
+        *,
+        source_branch: str = "sbxloop/r1",
+        title: str = "sbxloop: ship it",
+        head_sha: str | None = None,
+        state: str = "opened",
+        author_id: int | None = None,
+        detailed_merge_status: str = "mergeable",
+        diffs: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        sha = head_sha or self.branches.get(source_branch) or self.head_sha
+        self.branches.setdefault(source_branch, sha)
+        self.merge_requests[iid] = {
+            "iid": iid,
+            "title": title,
+            "description": "",
+            "state": state,
+            "source_branch": source_branch,
+            "target_branch": "main",
+            "sha": sha,
+            "author_id": author_id if author_id is not None else self.user_id,
+            "reviewers": [],
+            "approvals": [],
+            "detailed_merge_status": detailed_merge_status,
+            "diffs": diffs if diffs is not None else list(self.default_diffs),
+        }
+        return self.merge_requests[iid]
+
+    def seed_discussion(
+        self,
+        iid: int,
+        path: str,
+        line: int | None,
+        body: str,
+        *,
+        author_id: int | None = None,
+        created_at: str = "2026-09-12T21:20:46.092Z",
+    ) -> tuple[str, int]:
+        """A diff discussion on the merge request (a plain note when ``line``
+        is None); ``(discussion id, root note id)``."""
+        self._note_id += 1
+        self._discussion_seq += 1
+        discussion_id = f"{self._discussion_seq:040x}"
+        note: dict[str, Any] = {
+            "id": self._note_id,
+            "type": "DiffNote" if line is not None else None,
+            "body": body,
+            "author": self._user(author_id if author_id is not None else self.user_id),
+            "created_at": created_at,
+            "updated_at": created_at,
+            "system": False,
+            "resolvable": line is not None,
+            "resolved": False,
+        }
+        if line is not None:
+            note["position"] = {
+                "base_sha": "base123",
+                "start_sha": "base123",
+                "head_sha": self.merge_requests[iid]["sha"],
+                "old_path": path,
+                "new_path": path,
+                "position_type": "text",
+                "old_line": None,
+                "new_line": line,
+            }
+        self.discussions.setdefault(iid, []).append(
+            {"id": discussion_id, "individual_note": line is None, "notes": [note]}
+        )
+        return discussion_id, self._note_id
+
+    def seed_reviewer_state(self, iid: int, user_id: int, state: str) -> None:
+        reviewers = self.merge_requests[iid]["reviewers"]
+        reviewers[:] = [r for r in reviewers if r["user_id"] != user_id]
+        reviewers.append({"user_id": user_id, "state": state})
+
+    def seed_approval(self, iid: int, user_id: int) -> None:
+        approvals = self.merge_requests[iid]["approvals"]
+        if user_id not in approvals:
+            approvals.append(user_id)
+
+    def _mr_routes(
+        self, method: str, path: str, rest: str, params: dict[str, list[str]], body: Any
+    ) -> Any:
+        """The merge-request endpoints; ``None`` when ``rest`` is not one."""
+        if rest == "/merge_requests" and method == "POST":
+            assert body is not None
+            self._maybe_fail("pr_create")
+            source = str(body["source_branch"])
+            if any(
+                m["state"] == "opened" and m["source_branch"] == source
+                for m in self.merge_requests.values()
+            ):
+                raise self._failed(
+                    method,
+                    path,
+                    409,
+                    '{"message":["Another open merge request already exists '
+                    'for this source branch"]}',
+                )
+            iid = max(self.merge_requests, default=0) + 1
+            self.mr_created.append(dict(body))
+            mr = self.seed_mr(iid, source_branch=source, title=str(body["title"]))
+            mr["target_branch"] = str(body.get("target_branch") or "main")
+            mr["description"] = str(body.get("description") or "")
+            return self._mr_payload(mr)
+        if rest == "/merge_requests" and method == "GET":
+            state = params.get("state", [""])[0]
+            source = params.get("source_branch", [""])[0]
+            rows = [
+                m
+                for m in self.merge_requests.values()
+                if (not state or m["state"] == state)
+                and (not source or m["source_branch"] == source)
+            ]
+            return [self._mr_payload(m) for m in rows]
+        match = re.fullmatch(r"/merge_requests/(\d+)(/.*)?", rest)
+        if match is None:
+            return None
+        iid, tail = int(match.group(1)), match.group(2) or ""
+        mr = self.merge_requests.get(iid)
+        if mr is None:
+            raise self._failed(method, path, 404, "404 Not found")
+        if tail == "" and method == "GET":
+            self._maybe_fail("pr_get")
+            return self._mr_payload(mr)
+        if tail == "" and method == "PUT":
+            assert body is not None
+            self.mr_updates.append((iid, dict(body)))
+            if "title" in body:
+                mr["title"] = str(body["title"])
+            if "description" in body:
+                mr["description"] = str(body["description"])
+            if body.get("state_event") == "close":
+                mr["state"] = "closed"
+            return self._mr_payload(mr)
+        if tail == "/diffs":
+            per_page = int(params.get("per_page", ["20"])[0])
+            page = int(params.get("page", ["1"])[0])
+            self._maybe_fail("pr_files")
+            return [dict(d) for d in mr["diffs"][(page - 1) * per_page : page * per_page]]
+        if tail == "/notes" and method == "POST":
+            assert body is not None
+            self._maybe_fail("pr_issue_comment")
+            self._note_id += 1
+            self.mr_notes_posted.append((iid, str(body["body"])))
+            note = {
+                "id": self._note_id,
+                "type": None,
+                "body": str(body["body"]),
+                "author": self._user(self.user_id),
+                "created_at": "2026-09-12T21:31:48.478Z",
+                "system": False,
+            }
+            self.discussions.setdefault(iid, []).append(
+                {"id": f"{self._note_id:040x}", "individual_note": True, "notes": [note]}
+            )
+            return dict(note)
+        if tail == "/discussions" and method == "GET":
+            self._maybe_fail("pr_review_threads")
+            per_page = int(params.get("per_page", ["20"])[0])
+            page = int(params.get("page", ["1"])[0])
+            rows = self.discussions.get(iid, [])
+            return [
+                {**d, "notes": [dict(n) for n in d["notes"]]}
+                for d in rows[(page - 1) * per_page : page * per_page]
+            ]
+        if tail == "/discussions" and method == "POST":
+            assert body is not None
+            position = body.get("position") or {}
+            line = position.get("new_line") or position.get("old_line")
+            anchor = f"{position.get('new_path')}:{line}"
+            self.discussions_posted.append((iid, anchor, str(body["body"])))
+            if anchor in self.refuse_positions or str(position.get("head_sha")) != mr["sha"]:
+                raise self._failed(
+                    method,
+                    path,
+                    400,
+                    '{"message":"400 Bad request - Note {:line_code=>[\\"can\'t be blank\\"]}"}',
+                )
+            discussion_id, _ = self.seed_discussion(
+                iid, str(position.get("new_path")), int(line), str(body["body"])
+            )
+            found = next(d for d in self.discussions[iid] if d["id"] == discussion_id)
+            return {**found, "notes": [dict(n) for n in found["notes"]]}
+        if match_note := re.fullmatch(r"/discussions/([0-9a-f]+)/notes", tail):
+            assert body is not None
+            discussion_id = match_note.group(1)
+            found = next(
+                (d for d in self.discussions.get(iid, []) if d["id"] == discussion_id), None
+            )
+            if found is None:
+                raise self._failed(method, path, 404, "404 Discussion Not Found")
+            self._note_id += 1
+            self.replies.append((iid, discussion_id, str(body["body"])))
+            root = found["notes"][0]
+            note = {
+                "id": self._note_id,
+                "type": root.get("type"),
+                "body": str(body["body"]),
+                "author": self._user(self.user_id),
+                "created_at": "2026-09-12T21:32:00.000Z",
+                "system": False,
+                "resolvable": bool(root.get("resolvable")),
+                "resolved": bool(root.get("resolved")),
+                "position": dict(root["position"]) if root.get("position") else None,
+            }
+            found["notes"].append(note)
+            return dict(note)
+        if match_discussion := re.fullmatch(r"/discussions/([0-9a-f]+)", tail):
+            assert body is not None and method == "PUT"
+            discussion_id = match_discussion.group(1)
+            found = next(
+                (d for d in self.discussions.get(iid, []) if d["id"] == discussion_id), None
+            )
+            if found is None:
+                raise self._failed(method, path, 404, "404 Discussion Not Found")
+            self.resolved.append((discussion_id, bool(body["resolved"])))
+            for note in found["notes"]:
+                if note.get("resolvable"):
+                    note["resolved"] = bool(body["resolved"])
+            if body["resolved"]:
+                return {"id": discussion_id, "notes": [dict(n) for n in found["notes"]]}
+            return {"id": discussion_id}
+        if tail == "/approvals":
+            return {
+                "approved": bool(mr["approvals"]),
+                "user_has_approved": self.user_id in mr["approvals"],
+                "user_can_approve": self.approve_ok,
+                "approved_by": [
+                    {"user": self._user(uid), "approved_at": "2026-09-12T21:31:57.388Z"}
+                    for uid in mr["approvals"]
+                ],
+            }
+        if tail == "/reviewers":
+            return [
+                {"user": self._user(r["user_id"]), "state": r["state"]} for r in mr["reviewers"]
+            ]
+        if tail == "/approve" and method == "POST":
+            self.approvals_posted.append((iid, dict(body or {})))
+            if not self.approve_ok:
+                raise self._failed(method, path, 401, "401 Unauthorized")
+            if body and body.get("sha") and body["sha"] != mr["sha"]:
+                raise self._failed(
+                    method, path, 409, "409 SHA does not match HEAD of source branch"
+                )
+            self.seed_approval(iid, self.user_id)
+            return {"approved": True, "user_has_approved": True}
+        raise AssertionError(f"FakeGitlab: unexpected merge request call {method} {path}")
+
     # -- the transport ---------------------------------------------------------
 
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
@@ -448,7 +770,7 @@ class FakeGitlab(GitlabOps):
                 "encoding": "base64",
                 "content": base64.b64encode(content).decode(),
             }
-        if rest in ("/repository/tree", "/merge_requests") or (
+        if rest == "/repository/tree" or (
             rest == "/pipelines" and method == "GET" and "ref" not in params
         ):
             self._maybe_fail("permission_probe")
@@ -536,6 +858,8 @@ class FakeGitlab(GitlabOps):
             ]
             per_page = int(params.get("per_page", ["20"])[0])
             return [self._issue_payload(i) for i in rows[:per_page]]
+        if rest.startswith("/merge_requests"):
+            return self._mr_routes(method, path, rest, params, body)
         if match := re.fullmatch(r"/issues/(\d+)(/.*)?", rest):
             iid, tail = int(match.group(1)), match.group(2) or ""
             issue = self.issues.get(iid)

@@ -57,7 +57,8 @@ class TestBackendRows:
         assert "supported: review_threads" in row.detail
         assert "unsupported: request_changes_review" in row.detail
         assert "unknown: merge_queue" in row.detail and "merge trains" in row.detail
-        assert "not implemented yet: ChangeOps, ReviewOps, ContentOps" in row.detail
+        assert "not implemented yet: ChangeOps.pr_request_reviewers" in row.detail
+        assert "ContentOps.contents_put" in row.detail and "ReviewOps" not in row.detail
 
     def test_a_forge_without_an_api_root_fails_its_row(self) -> None:
         (row,) = vcs_backend_checks(cfg(vcs={"kind": "gitlab"}, github={"repo": "o/r"}))

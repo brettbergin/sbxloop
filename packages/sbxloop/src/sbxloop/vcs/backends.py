@@ -46,7 +46,7 @@ class BackendClass(Protocol):
     """What the registry knows about a backend class without building one."""
 
     CAPABILITIES: Mapping[str, Capability]
-    UNIMPLEMENTED_ROLES: tuple[str, ...]
+    UNIMPLEMENTED_OPERATIONS: tuple[str, ...]
     CAPABILITY_NOTE: str
 
 
@@ -110,12 +110,18 @@ def capabilities_for(kind: str) -> Mapping[str, Capability] | None:
     return dict(cls.CAPABILITIES) if cls is not None else None
 
 
-def unimplemented_roles(kind: str) -> tuple[str, ...]:
-    """The roles ``kind``'s backend raises
+def unimplemented_operations(kind: str) -> tuple[str, ...]:
+    """The operations, as ``Role.operation``, that ``kind``'s backend raises
     :class:`~sbxloop.errors.RoleNotImplemented` for; empty for a complete
     backend and for a kind with none."""
     cls = BACKENDS.get(kind)
-    return tuple(getattr(cls, "UNIMPLEMENTED_ROLES", ())) if cls is not None else ()
+    return tuple(getattr(cls, "UNIMPLEMENTED_OPERATIONS", ())) if cls is not None else ()
+
+
+def unimplemented_roles(kind: str) -> tuple[str, ...]:
+    """The roles with at least one operation ``kind``'s backend has not
+    landed, in first-seen order."""
+    return tuple(dict.fromkeys(op.split(".", 1)[0] for op in unimplemented_operations(kind)))
 
 
 def capability_note(kind: str) -> str:

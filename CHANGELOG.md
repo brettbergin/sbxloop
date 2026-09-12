@@ -15,6 +15,16 @@
   suite runs the read scenarios against a GitLab fake and, with the live
   harness, against a real GitLab CE.
 
+- **GitLab review threads and merge requests.** The GitLab backend opens
+  and reads merge requests and answers the review role: each inline
+  finding is a discussion anchored on the diff, a reply is a note on it,
+  resolving it is the discussion's own flag, and the loop's opaque thread
+  id addresses it again. Approvals and reviewer states fold into the
+  standing verdicts the landing reads; a reviewer's bot flag is looked up
+  once per user, so one-round-for-bots holds unchanged. A request-changes
+  review degrades to a comment with the finding count, because the free
+  tier records a requested change without holding the merge for it.
+
 - **Playwright MCP setup for Copilot and Claude builders.**
   `sbxloop init --preset playwright` configures Node, a pinned MCP package,
   its matching headless Chromium installation, download hosts and builder

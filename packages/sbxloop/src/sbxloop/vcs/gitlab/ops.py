@@ -13,12 +13,11 @@ Field-verified against GitLab CE 19.3.2 (#1016) where a docstring says
 so. Everything else is GitLab's documented API, labelled
 **field-unverified** where it is load-bearing.
 
-The roles that write — :class:`~sbxloop.vcs.protocol.ChangeOps`,
-:class:`~sbxloop.vcs.protocol.ReviewOps` and
-:class:`~sbxloop.vcs.protocol.ContentOps` — raise
-:class:`~sbxloop.errors.RoleNotImplemented` here; they land in the
-issues that follow #1017, and until then a run on a GitLab repository
-fails closed at its first write, naming the operation.
+The operations that have not landed yet — the landing half of
+:class:`~sbxloop.vcs.protocol.ChangeOps` (#1019) and
+:class:`~sbxloop.vcs.protocol.ContentOps` (#1020) — raise
+:class:`~sbxloop.errors.RoleNotImplemented` here, so a run on a GitLab
+repository fails closed at the first of them, naming the operation.
 """
 
 from __future__ import annotations
@@ -31,8 +30,41 @@ from urllib.parse import quote, urlencode
 from sbxloop.config import MergeMethod
 from sbxloop.errors import GithubOpsError, RoleNotImplemented
 from sbxloop.log import get_logger
+from sbxloop.vcs.github.ops import fold_review_verdicts, fold_reviews, user_identity
+from sbxloop.vcs.github.review_locations import right_side_ranges
+from sbxloop.vcs.gitlab.changes import (
+    change_record,
+    file_record,
+    parse_thread_id,
+    review_comment_records,
+    review_records,
+    review_thread,
+    thread_id_for,
+)
 from sbxloop.vcs.gitlab.permissions import READ_PROBES
 from sbxloop.vcs.gitlab.protection import read_base_requirements
+from sbxloop.vcs.gitlab.records import (
+    APPROVAL_STATUSES as APPROVAL_STATUSES,
+    DEVELOPER as DEVELOPER,
+    MAINTAINER as MAINTAINER,
+    OWNER as OWNER,
+    PASSING_STATUSES as PASSING_STATUSES,
+    PENDING_STATUSES as PENDING_STATUSES,
+    RED_STATUSES as RED_STATUSES,
+    access_level as access_level,
+    check_run_record as check_run_record,
+    fold_statuses as fold_statuses,
+    iso_utc as iso_utc,
+    issue_record as issue_record,
+    issue_state as issue_state,
+    label_event_record as label_event_record,
+    label_record as label_record,
+    labels_record as labels_record,
+    latest_statuses as latest_statuses,
+    note_record as note_record,
+    repo_record as repo_record,
+    user_record as user_record,
+)
 from sbxloop.vcs.jobs import JobBackend
 from sbxloop.vcs.model import (
     BaseRequirements,
@@ -51,6 +83,7 @@ from sbxloop.vcs.model import (
     ReviewThread,
     ReviewVerdict,
     SubmittedReview,
+    identities_match,
 )
 from sbxloop.vcs.protocol import Capability, VcsOps
 from sbxloop.vcs.query import parse_issue_query
@@ -81,268 +114,6 @@ def gitlab_transport(api_url: str, *, token_env: str = SANDBOX_TOKEN_ENV) -> Tra
         token_env=[token_env],
         gh_cli=False,
     )
-
-
-# -- folds -----------------------------------------------------------------
-#
-# GitLab's payloads into the loop's records. Each is a pure function of
-# one payload, so a test can pin it against a captured shape.
-
-
-def iso_utc(value: Any) -> str:
-    """A GitLab timestamp (``2026-09-12T21:31:48.478Z``) in the one form the
-    daemon's claim protocol parses and compares, ``%Y-%m-%dT%H:%M:%SZ``:
-    fractional seconds dropped, a ``+00:00`` offset spelt ``Z``. Anything
-    that is not a UTC timestamp is passed through unchanged."""
-    if not isinstance(value, str):
-        return ""
-    text = value.strip()
-    if text.endswith("+00:00"):
-        text = text[: -len("+00:00")] + "Z"
-    if text.endswith("Z") and "." in text:
-        head, _, _ = text[:-1].partition(".")
-        text = head + "Z"
-    return text
-
-
-def issue_state(payload: Mapping[str, Any]) -> str:
-    """GitLab's ``opened``/``closed``/``locked`` as the loop's ``open``/``closed``."""
-    state = str(payload.get("state") or "")
-    return "closed" if state == "closed" else "open"
-
-
-def user_record(user: Any) -> dict[str, Any]:
-    """A GitLab ``author``/``user`` object as the loop's ``user``: the login
-    and the id. No ``type``: the bot flag is not on an author object
-    (field-verified, #1016 V3) and is looked up per user when a role
-    needs it, so the kind stays ``None`` — unknown — rather than a guess."""
-    if not isinstance(user, dict):
-        return {"login": ""}
-    record: dict[str, Any] = {"login": str(user.get("username") or "")}
-    if isinstance(user.get("id"), int):
-        record["id"] = user["id"]
-    return record
-
-
-def labels_record(labels: Any) -> list[dict[str, str]]:
-    """GitLab's list of label names as the loop's ``labels[].name``."""
-    if not isinstance(labels, list):
-        return []
-    return [{"name": str(name)} for name in labels if isinstance(name, str) and name]
-
-
-def issue_record(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """A GitLab issue as the loop's issue record. ``number`` is the
-    project-scoped ``iid``, the number a person sees and types. There is
-    no ``pull_request`` key, ever: GitLab issues are never merge requests
-    (the consumers test the key's presence, #631). ``state_reason`` is
-    ``None``: GitLab records no reason for a close."""
-    return {
-        "number": int(payload.get("iid") or 0),
-        "id": payload.get("id"),
-        "title": str(payload.get("title") or ""),
-        "body": str(payload.get("description") or ""),
-        "state": issue_state(payload),
-        "state_reason": None,
-        "html_url": str(payload.get("web_url") or ""),
-        "labels": labels_record(payload.get("labels")),
-        "user": user_record(payload.get("author")),
-        "comments": int(payload.get("user_notes_count") or 0),
-        "created_at": iso_utc(payload.get("created_at")),
-        "updated_at": iso_utc(payload.get("updated_at")),
-    }
-
-
-def note_record(payload: Mapping[str, Any], *, issue_url: str = "") -> dict[str, Any]:
-    """A GitLab note as the loop's comment record."""
-    note_id = payload.get("id")
-    return {
-        "id": int(note_id) if isinstance(note_id, int) else 0,
-        "body": str(payload.get("body") or ""),
-        "user": user_record(payload.get("author")),
-        "created_at": iso_utc(payload.get("created_at")),
-        "html_url": f"{issue_url}#note_{note_id}" if issue_url and note_id is not None else "",
-    }
-
-
-def label_event_record(payload: Mapping[str, Any]) -> dict[str, Any] | None:
-    """A GitLab resource label event as the loop's issue event: ``labeled``
-    for ``add``, ``unlabeled`` for ``remove``; anything else is not an
-    event the loop reads."""
-    action = str(payload.get("action") or "")
-    event = {"add": "labeled", "remove": "unlabeled"}.get(action)
-    label = payload.get("label")
-    if event is None or not isinstance(label, dict):
-        return None
-    return {
-        "event": event,
-        "label": {"name": str(label.get("name") or "")},
-        "actor": user_record(payload.get("user")),
-        "created_at": iso_utc(payload.get("created_at")),
-    }
-
-
-# GitLab access levels: 10 guest, 15 planner, 20 reporter, 30 developer,
-# 40 maintainer, 50 owner. A Developer pushes (to unprotected branches)
-# and opens merge requests, which is the loop's write level.
-DEVELOPER = 30
-MAINTAINER = 40
-OWNER = 50
-
-
-def access_level(payload: Mapping[str, Any]) -> int:
-    """The token's highest access level on the project, from the
-    ``permissions`` block a project read carries (field-verified, #1016
-    V2: ``project_access.access_level`` for a Developer)."""
-    permissions = payload.get("permissions")
-    if not isinstance(permissions, dict):
-        return 0
-    levels = []
-    for key in ("project_access", "group_access"):
-        access = permissions.get(key)
-        if isinstance(access, dict) and isinstance(access.get("access_level"), int):
-            levels.append(int(access["access_level"]))
-    return max(levels, default=0)
-
-
-def repo_record(payload: Mapping[str, Any]) -> dict[str, Any]:
-    """A GitLab project as the loop's repository record.
-
-    The merge-method flags are what the landing's ``allowed_merge_methods``
-    reads: squash is allowed unless the project's ``squash_option`` is
-    ``never``; a merge commit is allowed under GitLab's ``merge`` and
-    ``rebase_merge`` methods; ``rebase`` (a fast-forward, no merge commit)
-    is what GitLab's ``ff`` method does. ``permissions`` is the token's
-    effective access as the doctor reads it (``push`` from Developer up).
-    """
-    merge_method = str(payload.get("merge_method") or "merge")
-    squash = str(payload.get("squash_option") or "default_off")
-    level = access_level(payload)
-    issues = payload.get("issues_enabled")
-    if not isinstance(issues, bool):
-        issues = str(payload.get("issues_access_level") or "") not in ("disabled",)
-    return {
-        "id": payload.get("id"),
-        "name": str(payload.get("path") or payload.get("name") or ""),
-        "full_name": str(payload.get("path_with_namespace") or ""),
-        "html_url": str(payload.get("web_url") or ""),
-        "default_branch": payload.get("default_branch"),
-        "private": str(payload.get("visibility") or "private") != "public",
-        "has_issues": issues,
-        "allow_squash_merge": squash != "never",
-        "allow_merge_commit": merge_method in ("merge", "rebase_merge"),
-        "allow_rebase_merge": merge_method == "ff",
-        "permissions": {
-            "admin": level >= OWNER,
-            "maintain": level >= MAINTAINER,
-            "push": level >= DEVELOPER,
-            "pull": level > 0,
-        },
-    }
-
-
-def label_record(payload: Mapping[str, Any]) -> dict[str, Any]:
-    color = str(payload.get("color") or "")
-    return {
-        "id": payload.get("id"),
-        "name": str(payload.get("name") or ""),
-        "color": color.removeprefix("#"),
-        "description": str(payload.get("description") or ""),
-    }
-
-
-# A commit status on GitLab is a CI job or an external status, and its
-# ``status`` is a job status. ``success`` passes; ``failed`` and
-# ``canceled`` are red; ``skipped`` is not a red build (the same reading
-# as GitHub's ``skipped`` conclusion); ``manual`` is a job waiting for a
-# person to start it — like an unapproved workflow, neither red nor
-# going to finish on its own — and everything that is still moving is
-# pending. An unknown status fails closed as red. Field-verified on CE
-# 19.3 (#1016 V2): ``running`` and ``success`` and ``failed`` as posted.
-PASSING_STATUSES = frozenset({"success", "skipped"})
-PENDING_STATUSES = frozenset(
-    {"pending", "running", "created", "waiting_for_resource", "preparing", "scheduled"}
-)
-APPROVAL_STATUSES = frozenset({"manual"})
-RED_STATUSES = frozenset({"failed", "canceled", "cancelled"})
-
-
-def latest_statuses(rows: Sequence[Any]) -> list[dict[str, Any]]:
-    """One entry per status name: the commit's statuses list every
-    pipeline that ran on the sha, oldest first, and a retried job appears
-    twice. The newest (highest id) wins, as GitLab's own merge check
-    reads it."""
-    latest: dict[str, dict[str, Any]] = {}
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        name = str(row.get("name") or "status")
-        previous = latest.get(name)
-        if previous is None or int(row.get("id") or 0) >= int(previous.get("id") or 0):
-            latest[name] = row
-    return list(latest.values())
-
-
-def fold_statuses(rows: Sequence[Any]) -> ChecksVerdict:
-    """``GET /projects/:id/repository/commits/:sha/statuses`` folded to a
-    verdict. A head with no statuses at all reads as ``green``: a project
-    without CI must not deadlock the loop waiting for a report that will
-    never come. A job GitLab lets fail (``allow_failure``) is not red:
-    the pipeline passes with a warning and the merge is not held."""
-    pending: list[str] = []
-    failed: list[str] = []
-    passed: list[str] = []
-    approval: list[str] = []
-    entries = latest_statuses(rows)
-    for row in entries:
-        name = str(row.get("name") or "status")
-        status = str(row.get("status") or "").lower()
-        if status in PASSING_STATUSES:
-            passed.append(name)
-        elif status in PENDING_STATUSES:
-            pending.append(name)
-        elif status in APPROVAL_STATUSES:
-            approval.append(name)
-        elif status in RED_STATUSES and row.get("allow_failure") is True:
-            passed.append(name)
-        else:
-            failed.append(name)
-    total = len(entries)
-    if failed:
-        return ChecksVerdict(
-            "red", total, tuple(pending), tuple(failed), tuple(passed), tuple(approval)
-        )
-    if pending or approval:
-        return ChecksVerdict("pending", total, tuple(pending), (), tuple(passed), tuple(approval))
-    return ChecksVerdict("green", total, (), (), tuple(passed))
-
-
-def check_run_record(row: Mapping[str, Any]) -> dict[str, Any]:
-    """A commit status as the loop's check-run row (name, status,
-    conclusion, url) — what the concierge summarises."""
-    status = str(row.get("status") or "").lower()
-    finished = status not in PENDING_STATUSES
-    conclusion: str | None
-    if not finished:
-        conclusion = None
-    elif status in PASSING_STATUSES:
-        conclusion = "success" if status == "success" else "skipped"
-    elif status in APPROVAL_STATUSES:
-        conclusion = "action_required"
-    elif status in RED_STATUSES and row.get("allow_failure") is True:
-        conclusion = "neutral"
-    elif status in RED_STATUSES:
-        conclusion = "failure" if status == "failed" else "cancelled"
-    else:
-        conclusion = status or "failure"
-    return {
-        "id": row.get("id"),
-        "name": str(row.get("name") or "status"),
-        "status": "completed" if finished else "in_progress",
-        "conclusion": conclusion,
-        "html_url": str(row.get("target_url") or ""),
-        "description": str(row.get("description") or ""),
-    }
 
 
 def _clip_head_tail(text: str, head: int, tail: int) -> str:
@@ -391,9 +162,24 @@ class GitlabOps(JobBackend):
     CAPABILITY_NOTE: ClassVar[str] = (
         "merge trains are a paid tier and a per-project setting; the landing asks the project"
     )
-    #: The roles this backend does not answer yet; every operation on them
-    #: raises :class:`RoleNotImplemented`, and the doctor lists them.
-    UNIMPLEMENTED_ROLES: ClassVar[tuple[str, ...]] = ("ChangeOps", "ReviewOps", "ContentOps")
+    #: The operations this backend does not answer yet, as ``Role.operation``;
+    #: each raises :class:`RoleNotImplemented`, and the doctor lists them.
+    #: The landing half of ``ChangeOps`` is #1019, ``ContentOps`` is #1020.
+    UNIMPLEMENTED_OPERATIONS: ClassVar[tuple[str, ...]] = (
+        "ChangeOps.pr_request_reviewers",
+        "ChangeOps.pr_ready_for_review",
+        "ChangeOps.pr_update_branch",
+        "ChangeOps.pr_merge",
+        "ChangeOps.pr_enqueue",
+        "ChangeOps.pr_queue_state",
+        "ContentOps.blobs_create_many",
+        "ContentOps.commit_get",
+        "ContentOps.tree_create",
+        "ContentOps.commit_create",
+        "ContentOps.ref_create",
+        "ContentOps.ref_force_update",
+        "ContentOps.contents_put",
+    )
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -406,6 +192,11 @@ class GitlabOps(JobBackend):
         self._note_issue: dict[int, int] = {}
         # The bot flag per user id (#1016 V3), one lookup per user per object.
         self._bots: dict[int, bool | None] = {}
+        # Which discussion a merge-request note belongs to, and each merge
+        # request's web address (#1018): learnt from the reads and writes
+        # this object made, so a reply and a url need no second read.
+        self._note_discussion: dict[tuple[str, int, int], str] = {}
+        self._mr_urls: dict[tuple[str, int], str] = {}
 
     # -- paths ------------------------------------------------------------------
 
@@ -928,7 +719,47 @@ class GitlabOps(JobBackend):
         self._bots[user_id] = bot if isinstance(bot, bool) else None
         return self._bots[user_id]
 
-    # -- ChangeOps (not implemented yet; #1019) --------------------------------
+    # -- merge requests -----------------------------------------------------
+
+    def _mr_path(self, repo: str, number: int) -> str:
+        return f"{self._project(repo)}/merge_requests/{number}"
+
+    def _merge_request(self, repo: str, number: int) -> dict[str, Any]:
+        """The merge request's payload, fresh: its head sha and
+        ``diff_refs`` move with every push, so nothing here is cached."""
+        path = self._mr_path(repo, number)
+        payload = self._dict(f"GET {path}", self.raw("GET", path))
+        web_url = payload.get("web_url")
+        if isinstance(web_url, str) and web_url:
+            self._mr_urls[(repo, number)] = web_url
+        return payload
+
+    def _mr_url(self, repo: str, number: int) -> str:
+        if (repo, number) not in self._mr_urls:
+            self._merge_request(repo, number)
+        return self._mr_urls.get((repo, number), "")
+
+    def _diff_refs(self, repo: str, number: int) -> dict[str, str]:
+        """The three shas an inline position needs (``base_sha``,
+        ``start_sha``, ``head_sha``). GitLab fills them once it has
+        computed the diff, shortly after the merge request is opened
+        (field-verified, #1016 V1); until then they are ``None`` and no
+        inline comment can be anchored."""
+        refs = self._merge_request(repo, number).get("diff_refs")
+        refs = refs if isinstance(refs, dict) else {}
+        out = {k: str(refs.get(k) or "") for k in ("base_sha", "start_sha", "head_sha")}
+        if not all(out.values()):
+            raise GithubOpsError(
+                f"merge request !{number} has no diff refs yet; GitLab is still computing its diff"
+            )
+        return out
+
+    def _mr_note(self, repo: str, number: int, body: str) -> dict[str, Any]:
+        path = f"{self._mr_path(repo, number)}/notes"
+        payload = self._dict(f"POST {path}", self.raw("POST", path, {"body": body}))
+        return note_record(payload, issue_url=self._mr_url(repo, number))
+
+    # -- ChangeOps: the merge request itself (#1018); landing is #1019 --------
 
     def pr_create(
         self,
@@ -940,24 +771,56 @@ class GitlabOps(JobBackend):
         *,
         draft: bool = False,
     ) -> PrRef:
-        raise self._unimplemented("ChangeOps", "pr_create")
+        """Open a merge request from ``head`` into ``base``. A draft is the
+        ``Draft:`` title prefix (field-verified: it sets ``draft: true`` and
+        holds the merge as ``draft_status``). A second open request from
+        the same branch is GitLab's 409, raised with its status."""
+        request: dict[str, Any] = {
+            "source_branch": head,
+            "target_branch": base,
+            "title": f"Draft: {title}" if draft and not title.startswith("Draft:") else title,
+        }
+        if body:
+            request["description"] = body
+        path = f"{self._project(repo)}/merge_requests"
+        payload = self._dict(f"POST {path}", self.raw("POST", path, request))
+        record = change_record(payload)
+        self._mr_urls[(repo, record["number"])] = record["html_url"]
+        return PrRef(number=record["number"], url=record["html_url"])
 
     def pr_get(self, repo: str, number: int) -> dict[str, Any]:
-        raise self._unimplemented("ChangeOps", "pr_get")
+        """The merge request as the loop's change record: the head sha the
+        checks hang off, the branch a fix run lands on, and where it stands
+        (:func:`change_record`)."""
+        return change_record(self._merge_request(repo, number))
 
     def pr_list_open(self, repo: str, *, head: str) -> list[Any]:
-        raise self._unimplemented("ChangeOps", "pr_list_open")
+        """The open merge requests from branch ``head``: none, or the one a
+        re-delivery refreshes."""
+        query = urlencode({"state": "opened", "source_branch": head, "per_page": 100})
+        path = f"{self._project(repo)}/merge_requests?{query}"
+        rows = self._list(f"GET {self._project(repo)}/merge_requests", self.raw("GET", path))
+        return [change_record(row) for row in rows if isinstance(row, dict)]
 
     def pr_update(
         self, repo: str, number: int, *, title: str | None = None, body: str | None = None
     ) -> dict[str, Any]:
-        raise self._unimplemented("ChangeOps", "pr_update")
+        fields: dict[str, Any] = {}
+        if title is not None:
+            fields["title"] = title
+        if body is not None:
+            fields["description"] = body
+        path = self._mr_path(repo, number)
+        return change_record(self._dict(f"PUT {path}", self.raw("PUT", path, fields)))
 
     def pr_comment(self, repo: str, number: int, body: str) -> str:
-        raise self._unimplemented("ChangeOps", "pr_comment")
+        return str(self._mr_note(repo, number, body)["html_url"])
 
     def pr_files(self, repo: str, number: int) -> list[Any]:
-        raise self._unimplemented("ChangeOps", "pr_files")
+        """The files the merge request changes, with their hunks, across
+        every page of ``GET .../diffs``."""
+        rows = self.raw_pages(f"{self._mr_path(repo, number)}/diffs")
+        return [file_record(row) for row in rows if isinstance(row, dict)]
 
     def pr_request_reviewers(self, repo: str, number: int, reviewers: Sequence[str]) -> None:
         raise self._unimplemented("ChangeOps", "pr_request_reviewers")
@@ -986,7 +849,86 @@ class GitlabOps(JobBackend):
     def pr_queue_state(self, repo: str, number: int) -> QueueState:
         raise self._unimplemented("ChangeOps", "pr_queue_state")
 
-    # -- ReviewOps (not implemented yet; #1018) --------------------------------
+    # -- ReviewOps: discussions, approvals, reviewer states (#1018) -----------
+    #
+    # A review on GitLab is not one object. An inline finding is a
+    # discussion anchored by a position (base, start and head sha plus the
+    # path and line); a reply is a note on that discussion; resolving it is
+    # a flag on the discussion (all field-verified, #1016 V1). A verdict is
+    # an approval (which the author may give on CE) or a reviewer state,
+    # and "request changes" is recorded but not enforced on CE, so the
+    # capability is UNSUPPORTED and the review degrades to a comment.
+
+    def _kind_of(self, user: Any) -> bool | None:
+        """The per-user bot flag for a payload's author object."""
+        user_id = user.get("id") if isinstance(user, dict) else None
+        return self.user_is_bot(int(user_id)) if isinstance(user_id, int) else None
+
+    def _discussions(self, repo: str, number: int) -> list[Any]:
+        rows = self.raw_pages(f"{self._mr_path(repo, number)}/discussions")
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            discussion_id = str(row.get("id") or "")
+            for note in row.get("notes") or []:
+                if isinstance(note, dict) and isinstance(note.get("id"), int):
+                    self._note_discussion[(repo, number, int(note["id"]))] = discussion_id
+        return rows
+
+    def _position(self, refs: Mapping[str, str], comment: ReviewComment) -> dict[str, Any]:
+        position: dict[str, Any] = {
+            "base_sha": refs["base_sha"],
+            "start_sha": refs["start_sha"],
+            "head_sha": refs["head_sha"],
+            "position_type": "text",
+            "old_path": comment.path,
+            "new_path": comment.path,
+        }
+        if comment.side == "LEFT":
+            position["old_line"] = comment.line
+        else:
+            position["new_line"] = comment.line
+        return position
+
+    def _post_discussions(
+        self, repo: str, number: int, comments: Sequence[ReviewComment], refs: Mapping[str, str]
+    ) -> tuple[PostedFinding, ...]:
+        """One discussion per finding, per anchor: a position GitLab refuses
+        fails its own finding (returned with ``comment_id=None`` for the
+        caller to put in the body) and no other."""
+        posted: list[PostedFinding] = []
+        path = f"{self._mr_path(repo, number)}/discussions"
+        for comment in comments:
+            anchor = f"{comment.path}:{comment.line}"
+            try:
+                data = self.raw(
+                    "POST", path, {"body": comment.body, "position": self._position(refs, comment)}
+                )
+            except GithubOpsError as exc:
+                log.warning(
+                    "gitlab.review_comment_refused",
+                    repo=repo,
+                    mr=number,
+                    anchor=anchor,
+                    error=str(exc)[:300],
+                    hint="the finding goes in the review comment's body instead",
+                )
+                posted.append(PostedFinding(anchor))
+                continue
+            discussion_id = str(data.get("id") or "") if isinstance(data, dict) else ""
+            notes = data.get("notes") if isinstance(data, dict) else None
+            root = (
+                notes[0] if isinstance(notes, list) and notes and isinstance(notes[0], dict) else {}
+            )
+            note_id = root.get("id")
+            if not discussion_id or not isinstance(note_id, int):
+                posted.append(PostedFinding(anchor))
+                continue
+            self._note_discussion[(repo, number, note_id)] = discussion_id
+            posted.append(
+                PostedFinding(anchor, note_id, thread_id_for(repo, number, discussion_id))
+            )
+        return tuple(posted)
 
     def pr_review_create(
         self,
@@ -996,7 +938,50 @@ class GitlabOps(JobBackend):
         body: str,
         comments: Sequence[ReviewComment] = (),
     ) -> SubmittedReview:
-        raise self._unimplemented("ReviewOps", "pr_review_create")
+        """Post a review: each inline finding as a discussion on the diff,
+        the body as a note, and the verdict as GitLab expresses it.
+
+        ``APPROVE`` is an approval (``POST .../approve`` with the head sha,
+        so a push in between refuses it); an approval GitLab refuses (a
+        Premium rule against the author approving, a stale head) falls
+        back to a plain comment, and the returned ``event`` says so.
+        ``REQUEST_CHANGES`` is a comment with the finding count: the free
+        tier records a reviewer's requested changes and does not enforce
+        them (#1016), so the loop never claims a gate the forge does not
+        hold. A caller reads ``event`` to learn what was accepted.
+        """
+        posted: tuple[PostedFinding, ...] = ()
+        if comments:
+            posted = self._post_discussions(repo, number, comments, self._diff_refs(repo, number))
+        accepted: ReviewEvent = event
+        text = body
+        if event == "REQUEST_CHANGES":
+            accepted = "COMMENT"
+            text = (
+                f"{body}\n\n_Changes requested: {len(comments)} finding(s) inline. GitLab's "
+                "free tier records a requested change without holding the merge for it, "
+                "so this review does not gate._"
+            )
+        note = self._mr_note(repo, number, text)
+        if event == "APPROVE":
+            try:
+                head = self._merge_request(repo, number).get("sha")
+                self.raw(
+                    "POST",
+                    f"{self._mr_path(repo, number)}/approve",
+                    {"sha": str(head)} if head else {},
+                )
+            except GithubOpsError as exc:
+                log.warning(
+                    "gitlab.approve_refused",
+                    repo=repo,
+                    mr=number,
+                    http_status=exc.http_status,
+                    error=str(exc)[:300],
+                    hint="the review stands as a comment, which does not gate the merge",
+                )
+                accepted = "COMMENT"
+        return SubmittedReview(str(note["html_url"]), accepted, int(note["id"]) or None, posted)
 
     def pr_review_comments_create(
         self,
@@ -1006,26 +991,72 @@ class GitlabOps(JobBackend):
         *,
         commit_id: str,
     ) -> tuple[PostedFinding, ...]:
-        raise self._unimplemented("ReviewOps", "pr_review_comments_create")
+        """Each finding as its own discussion, anchored on ``commit_id``: the
+        single-identity review (#513). A head that has moved past
+        ``commit_id`` refuses every anchor rather than anchoring them on a
+        diff the reviewer did not read."""
+        if not comments:
+            return ()
+        refs = self._diff_refs(repo, number)
+        if refs["head_sha"] != commit_id:
+            raise GithubOpsError(
+                f"merge request !{number} head {refs['head_sha'][:12]} no longer matches the "
+                f"reviewed commit {commit_id[:12]}"
+            )
+        return self._post_discussions(repo, number, comments, refs)
 
     def pr_review_locations(
         self, repo: str, number: int, *, commit_id: str | None
     ) -> dict[str, tuple[range, ...]]:
-        raise self._unimplemented("ReviewOps", "pr_review_locations")
+        """The commentable RIGHT-side ranges of the merge request's diff at
+        ``commit_id``, from ``GET .../diffs`` (each entry's ``diff`` is the
+        hunks of one file, **field-unverified** beyond the documented
+        shape). The head is checked before and after the paged read, as on
+        GitHub: a moving head cannot authorise an inline post."""
+
+        def head() -> str:
+            refs = self._diff_refs(repo, number)
+            if not commit_id or refs["head_sha"] != commit_id:
+                raise GithubOpsError("merge request head no longer matches the reviewed commit")
+            return refs["head_sha"]
+
+        before = head()
+        locations: dict[str, tuple[range, ...]] = {}
+        for entry in self.raw_pages(f"{self._mr_path(repo, number)}/diffs"):
+            if not isinstance(entry, dict):
+                raise GithubOpsError("merge request diffs need a list of changed files")
+            name = entry.get("new_path") or entry.get("old_path")
+            if not isinstance(name, str) or not name or name in locations:
+                raise GithubOpsError("merge request diffs contain missing or duplicate paths")
+            locations[name] = right_side_ranges(entry.get("diff"))
+        if head() != before:
+            raise GithubOpsError("merge request head changed while reading its diff")
+        return locations
 
     def pr_reviews(self, repo: str, number: int) -> list[Any]:
-        raise self._unimplemented("ReviewOps", "pr_reviews")
+        """The standing verdicts as review records (:func:`review_records`):
+        the approvals, then the reviewers who requested changes."""
+        base = self._mr_path(repo, number)
+        approvals = self.raw_lookup("GET", f"{base}/approvals")
+        reviewers = self.raw_lookup("GET", f"{base}/reviewers")
+        return review_records(
+            approvals if isinstance(approvals, dict) else None,
+            reviewers if isinstance(reviewers, list) else [],
+            kind_of=self._kind_of,
+        )
 
     def pr_review_comments(self, repo: str, number: int) -> list[Any]:
-        raise self._unimplemented("ReviewOps", "pr_review_comments")
+        """Every inline note on the merge request's diff, as review comment
+        records."""
+        return review_comment_records(self._discussions(repo, number), kind_of=self._kind_of)
 
     def pr_review_verdicts(
         self, repo: str, number: int, *, exclude: Identity | None = None
     ) -> tuple[ReviewVerdict, ...]:
-        raise self._unimplemented("ReviewOps", "pr_review_verdicts")
+        return fold_review_verdicts(self.pr_reviews(repo, number), exclude=exclude)
 
     def pr_review_state(self, repo: str, number: int, *, login: str | None = None) -> str:
-        raise self._unimplemented("ReviewOps", "pr_review_state")
+        return fold_reviews(self.pr_reviews(repo, number), login=login)
 
     def pr_review_feedback(
         self,
@@ -1036,19 +1067,83 @@ class GitlabOps(JobBackend):
         exclude_is_bot: bool | None = None,
         clip: int = 6000,
     ) -> str:
-        raise self._unimplemented("ReviewOps", "pr_review_feedback")
+        """What the reviewers said, for a fix round's brief: every inline
+        note not the loop's own, with its anchor. A GitLab review has no
+        body of its own, so the notes are the whole of the feedback."""
+
+        def excluded(user: Any) -> bool:
+            return exclude_login is not None and identities_match(
+                user_identity(user), (exclude_login, exclude_is_bot)
+            )
+
+        parts: list[str] = []
+        for comment in self.pr_review_comments(repo, number):
+            if excluded(comment.get("user")):
+                continue
+            body = str(comment.get("body") or "").strip()
+            if not body:
+                continue
+            path, line = str(comment.get("path") or ""), comment.get("line")
+            anchor = f"`{path}:{line}`: " if path and line else f"`{path}`: " if path else ""
+            parts.append(f"- {anchor}{body}")
+        return "\n\n".join(parts)[:clip]
 
     def pr_review_threads(self, repo: str, number: int) -> list[ReviewThread]:
-        raise self._unimplemented("ReviewOps", "pr_review_threads")
+        """Every inline thread on the merge request, with its replies, across
+        every page of discussions."""
+        threads: list[ReviewThread] = []
+        for discussion in self._discussions(repo, number):
+            if not isinstance(discussion, dict):
+                continue
+            thread = review_thread(repo, number, discussion, kind_of=self._kind_of)
+            if thread is not None:
+                threads.append(thread)
+        return threads
 
     def pr_comment_reply(self, repo: str, number: int, comment_id: int, body: str) -> str:
-        raise self._unimplemented("ReviewOps", "pr_comment_reply")
+        """Reply in the discussion that holds note ``comment_id``: learnt
+        from a read or a write this object made, else found by listing."""
+        key = (repo, number, int(comment_id))
+        if key not in self._note_discussion:
+            self._discussions(repo, number)
+        discussion_id = self._note_discussion.get(key)
+        if discussion_id is None:
+            raise GithubOpsError(
+                f"note {comment_id} is not on a discussion of merge request !{number}"
+            )
+        path = f"{self._mr_path(repo, number)}/discussions/{discussion_id}/notes"
+        data = self._dict(f"POST {path}", self.raw("POST", path, {"body": body}))
+        note_id = data.get("id")
+        if isinstance(note_id, int):
+            self._note_discussion[(repo, number, note_id)] = discussion_id
+        return f"{self._mr_url(repo, number)}#note_{note_id}" if note_id is not None else ""
 
     def pr_issue_comment(self, repo: str, number: int, body: str) -> str:
-        raise self._unimplemented("ReviewOps", "pr_issue_comment")
+        """A plain merge-request note: the fallback for body-only findings."""
+        return str(self._mr_note(repo, number, body)["html_url"])
 
     def resolve_review_thread(self, thread_id: str) -> bool:
-        raise self._unimplemented("ReviewOps", "resolve_review_thread")
+        """Mark the discussion resolved (``PUT .../discussions/:id`` with
+        ``resolved: true``, field-verified); True when it now is. The id
+        is the opaque one a :class:`ReviewThread` or :class:`PostedFinding`
+        carries."""
+        try:
+            repo, number, discussion_id = parse_thread_id(thread_id)
+        except ValueError as exc:
+            raise GithubOpsError(str(exc)) from exc
+        path = f"{self._mr_path(repo, number)}/discussions/{discussion_id}"
+        data = self._dict(f"PUT {path}", self.raw("PUT", path, {"resolved": True}))
+        notes = data.get("notes")
+        if isinstance(notes, list) and notes:
+            resolvable = [n for n in notes if isinstance(n, dict) and n.get("resolvable")]
+            if resolvable:
+                return all(bool(n.get("resolved")) for n in resolvable)
+        # GitLab answered without the notes (it does for a reopen): read back.
+        for discussion in self._discussions(repo, number):
+            if isinstance(discussion, dict) and str(discussion.get("id")) == discussion_id:
+                thread = review_thread(repo, number, discussion, kind_of=self._kind_of)
+                return thread.is_resolved if thread is not None else False
+        return False
 
     # -- ContentOps (not implemented yet; #1020) -------------------------------
 

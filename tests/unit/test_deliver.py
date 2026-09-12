@@ -1965,3 +1965,20 @@ class TestVerificationSection:
             verification="  ",
         )
         assert "Verification" not in ops.pr_kwargs["body"]
+
+
+class TestPullRequestCollision:
+    """A create refused because the head already has an open change (#387,
+    #1018): GitHub's 422, GitLab's 409, either way confirmed by a lookup;
+    any other status is not a collision."""
+
+    def test_each_forges_status_counts_and_others_do_not(self) -> None:
+        from sbxloop.deliver import _is_pr_collision
+        from sbxloop.errors import GithubOpsError
+
+        assert _is_pr_collision(GithubOpsError("Validation Failed (HTTP 422)", http_status=422))
+        assert _is_pr_collision(
+            GithubOpsError("Another open merge request already exists", http_status=409)
+        )
+        assert not _is_pr_collision(GithubOpsError("Not Found", http_status=404))
+        assert not _is_pr_collision(GithubOpsError("Forbidden", http_status=403))

@@ -109,12 +109,13 @@ descriptor the worker needs.
   forge's shape. Turning the mappings into typed models is the design
   revision the conformance work anticipated and is left open.
 
-- **A role a backend has not landed yet raises `RoleNotImplemented`.**
+- **An operation a backend has not landed yet raises `RoleNotImplemented`.**
   The GitLab backend answers the repository, issue, checks and policy
-  roles; the change, review and content roles raise a typed error naming
-  the backend, the role and the operation, so a run on a GitLab
-  repository fails closed at its first write, and `sbxloop doctor` lists
-  the same roles before any run starts. The conformance suite reads that
+  roles, the review role, and the merge request's create-and-read half of
+  the change role; the landing half and the content role raise a typed
+  error naming the backend, the role and the operation, so a run on a
+  GitLab repository fails closed at the first of them, and `sbxloop doctor`
+  lists the same operations before any run starts. The conformance suite reads that
   error as a skip naming the operation, the way an `UNSUPPORTED`
   capability skips with its name.
 
