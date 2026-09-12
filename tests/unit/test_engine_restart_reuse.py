@@ -21,6 +21,7 @@ import pytest
 
 from tests.conftest import FakeSbx
 from tests.fakes.fake_github import FakeGithub
+from tests.fakes.gitrepo import git
 from tests.unit.test_engine import (
     FILES_BUILD,
     REVIEW_OK,
@@ -183,14 +184,6 @@ class TestFallback:
         assert result.state == "merged"
         assert engine.store.get_run(result.run_id).branch == PRIOR_BRANCH
         assert fake.pr_create_calls == 1
-
-
-def git(*argv: str, cwd: Path) -> str:
-    import subprocess
-
-    return subprocess.run(  # nosec B603 B607
-        ["git", *argv], cwd=cwd, capture_output=True, text=True, check=True
-    ).stdout.strip()
 
 
 def checkout_with_prior_branch(tmp_path: Path, branch: str) -> Path:

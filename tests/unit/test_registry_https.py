@@ -7,6 +7,7 @@ import json
 import ssl
 import subprocess
 import threading
+import traceback
 from collections.abc import Iterator
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -189,3 +190,35 @@ def test_git_fetch_returns_a_bundle_without_project_execution(
     git("fetch", str(bundle), "refs/sbxloop/dependency", cwd=clone)
     git("checkout", "FETCH_HEAD", cwd=clone)
     assert (clone / "hello.txt").read_text() == "hi\n"
+
+
+def test_a_failing_git_operation_never_relays_the_credential(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Remote error text can echo the Authorization header, and GitPython
+    puts stderr into its exception: neither may reach the error a run
+    publishes. Only the operation and its exit status do — and no chained
+    exception carries the rest."""
+    from git import Git, GitCommandError
+
+    original = Git._call_process
+
+    def failing_fetch(self: Git, method: str, *args: object, **kwargs: object) -> object:
+        if method == "fetch":
+            raise GitCommandError(
+                ["git", "fetch"], 128, stderr=f"fatal: Authorization: Basic {TOKEN} was refused"
+            )
+        return original(self, method, *args, **kwargs)
+
+    monkeypatch.setattr(Git, "_call_process", failing_fetch)
+    with pytest.raises(RegistryFetchError) as excinfo:
+        execute_fetch(
+            {"registry": "private", "path": "/dependency.git", "operation": "git"},
+            tmp_path / "dependency.bundle",
+            timeout_s=10,
+            env=registry_env("https://registry.invalid", kind="go"),
+        )
+    assert str(excinfo.value) == "registry Git fetch failed (exit 128)"
+    rendered = "".join(traceback.format_exception(excinfo.value))
+    assert TOKEN not in rendered
+    assert "Authorization" not in rendered
