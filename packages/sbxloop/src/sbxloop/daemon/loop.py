@@ -41,6 +41,12 @@ from zoneinfo import ZoneInfo
 
 from sbxloop import __version__, hostgit
 from sbxloop.config import Config, GithubConfig, SandboxConfig, ScheduleConfig
+from sbxloop.daemon.controls.generation import (
+    GENERATION_KEY,
+    GENERATION_STARTED_KEY,
+    new_generation_id,
+)
+from sbxloop.daemon.controls.operations import OperationStore, reconcile_operations
 from sbxloop.daemon.github import DaemonGithub
 from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
 from sbxloop.daemon.logsink import event_log_subscriber
@@ -222,6 +228,9 @@ class CancelRequest(NamedTuple):
     run_id: str
     requester: str
     retry: bool
+    #: The durable operation the cancel was recorded under, finished when
+    #: the run settles (``None`` for a cancel the loop raised itself).
+    operation_id: str | None = None
 
 
 class RunHandle:
@@ -330,6 +339,10 @@ class DaemonLoop:
         self._holds_lock = threading.Lock()
         self._current: RunHandle | None = None
         self._current_lock = threading.Lock()
+        # Every mutating control leaves a durable record here before it
+        # acts; `recover()` stamps the generation that claims them.
+        self.operations = OperationStore(dstore)
+        self.generation: str | None = None
         # The item whose claim is in progress: `status()` reports it so a
         # restart is never timed into the window between the claim comment
         # landing on the source and the claim being persisted (#530).
@@ -556,25 +569,83 @@ class DaemonLoop:
             return f"`{key}` is not a setting this daemon knows"
         return f"written, but {row.source} sets `{row.display}` and wins"
 
-    def cancel_current(self, requester: str | None = None, *, retry: bool = False) -> bool:
+    def cancel_current(
+        self,
+        requester: str | None = None,
+        *,
+        retry: bool = False,
+        operation_id: str | None = None,
+    ) -> bool:
         """Operator cancel of the in-flight run. The engine stops at its next
         boundary and the item settles as *cancelled* — no retry, no breaker
         count — unless ``retry`` asks for a fresh run. Recorded under the
-        current lock so the request can never be attributed to a later run."""
+        current lock so the request can never be attributed to a later run.
+        ``operation_id`` is the durable record the settle step finishes."""
         with self._current_lock:
             handle = self._current
             if handle is None:
                 return False
-            self._cancel_request = CancelRequest(handle.run_id, requester or "operator", retry)
+            previous, self._cancel_request = (
+                self._cancel_request,
+                CancelRequest(handle.run_id, requester or "operator", retry, operation_id),
+            )
+        if previous is not None and previous.operation_id is not None:
+            # Superseded before it was honoured: the later request carries
+            # the same effect, and the earlier record must not claim it.
+            self.operations.finish(
+                previous.operation_id,
+                self.clock(),
+                state="failed",
+                error_code="superseded",
+                error_detail=f"replaced by a later cancel of {handle.run_id}",
+            )
         handle.engine.request_cancel()
         return True
 
     def _take_cancel(self, run_id: str) -> CancelRequest | None:
         """The cancel request for ``run_id``, consumed. Any other pending
-        request is stale (its run is gone) and dropped."""
+        request is stale (its run is gone) and dropped — and its record
+        finished as such, so nobody reads a dropped cancel as honoured."""
         with self._current_lock:
             request, self._cancel_request = self._cancel_request, None
-        return request if request is not None and request.run_id == run_id else None
+        if request is None:
+            return None
+        if request.run_id == run_id:
+            return request
+        if request.operation_id is not None:
+            self.operations.finish(
+                request.operation_id,
+                self.clock(),
+                state="failed",
+                error_code="target_already_terminal",
+                error_detail=f"run {request.run_id} was no longer in flight",
+            )
+        return None
+
+    def _finish_cancel_record(self, cancel: CancelRequest, *, honoured: bool, run_id: str) -> None:
+        """Settle the cancel's durable record from what the run did."""
+        if cancel.operation_id is None:
+            return
+        if honoured:
+            self.operations.finish(
+                cancel.operation_id,
+                self.clock(),
+                state="succeeded",
+                result={"mode": "current", "retry": cancel.retry, "run_id": run_id},
+            )
+            return
+        state: str
+        try:
+            state = self.store.get_run(run_id).state
+        except SbxloopError:
+            state = "unknown"
+        self.operations.finish(
+            cancel.operation_id,
+            self.clock(),
+            state="failed",
+            error_code="target_already_terminal",
+            error_detail=f"the run finished before the cancel was honoured; it is {state}",
+        )
 
     # -- operator item controls (#229) --------------------------------------------
 
@@ -922,6 +993,7 @@ class DaemonLoop:
             # it when no service manager stands in front, and to show uptime.
             "pid": os.getpid(),
             "started_at": self.started_at,
+            "generation": self.generation,
             "version": __version__,
             # Where it loaded its configuration from: the console anchors
             # its editor there rather than on its own working directory.
@@ -1806,6 +1878,12 @@ class DaemonLoop:
         if override is not None:
             return self._settle_override(item, run_id, override, result_box.get("result"))
         cancel = self._take_cancel(run_id)
+        if cancel is not None and not (
+            isinstance(error, RunCancelledError) and self._run_is_resumable(run_id)
+        ):
+            # The cancel came too late: the run finished (or failed) on its
+            # own and settles normally below. Its record says so.
+            self._finish_cancel_record(cancel, honoured=False, run_id=run_id)
         if (
             cancel is not None
             and isinstance(error, RunCancelledError)
@@ -2169,6 +2247,7 @@ class DaemonLoop:
             )
         self.source.report_cancelled(item, report)
         self._frontend_finished(item, report)
+        self._finish_cancel_record(cancel, honoured=True, run_id=run_id)
         return "cancelled"
 
     def _settle_gated(
@@ -3597,10 +3676,18 @@ class DaemonLoop:
         anyway (#254).
 
         Finishes with :meth:`_reconcile_orphan_runs`, which closes any run
-        row a dead process left non-terminal (#374)."""
+        row a dead process left non-terminal (#374).
+
+        Opens by stamping this process's generation and settling the
+        operations a previous generation left unfinished — from the
+        evidence the domain kept, before anything here changes it."""
+        self.generation = new_generation_id()
+        self.dstore.set_value(GENERATION_KEY, self.generation)
+        self.dstore.set_value(GENERATION_STARTED_KEY, repr(self.clock()))
         self._settle_half_claims()
         self._reconcile_gates()
         self._reconcile_review_holds()
+        reconcile_operations(self, generation=self.generation, now=self.clock())
         for item in self.dstore.running_items():
             now = self.clock()
             if item.run_id is None:

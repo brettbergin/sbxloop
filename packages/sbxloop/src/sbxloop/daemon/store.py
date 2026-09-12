@@ -55,6 +55,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import InstrumentedAttribute, Session, aliased
 
+import sbxloop.db.api_models  # noqa: F401  - registers the operations tables on Base
 from sbxloop.config import ScheduleConfig
 from sbxloop.daemon.model import ItemState, PendingReport, WorkItem
 from sbxloop.daemon.schedule import ScheduleRow
@@ -1338,6 +1339,20 @@ class DaemonStore:
     def _read(self) -> Iterator[Session]:
         """A session for a query, held under the lock for the same reason."""
         with self._lock, Session(self._engine) as session:
+            yield session
+
+    @contextmanager
+    def transaction(self) -> Iterator[Session]:
+        """One transaction under the store's lock, for a record that must
+        land with a domain write (an operation and its effect): the
+        operations store writes its rows through here."""
+        with self._write() as session:
+            yield session
+
+    @contextmanager
+    def read(self) -> Iterator[Session]:
+        """A query session under the store's lock, for the same callers."""
+        with self._read() as session:
             yield session
 
     def backfill_repo(self, repo: str | None) -> int:

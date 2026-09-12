@@ -2065,6 +2065,49 @@ fix rounds, no gate); an action that acts on the forge is refused with
 "could not tell" is a refusal, never a guess. The loop keeps its own
 refusals (it holds the locks); the two agree by test.
 
+### Operations: one record for every surface
+
+A reply that got lost and a command that never ran look the same to whoever
+sent it; so do a command the daemon claimed and one it finished. From
+`ctl pause` to a remote client's cancel, every mutating control is an
+**operation** (`daemon/controls/operations.py`) — a row in `api_operations`
+written *before* the effect and finished *after* it, with its transitions in
+`api_events`, the public chronology a remote client replays by `seq`. Reads
+(`status`, `queue`, `items`, the schedule listing) leave no record.
+
+`OperationRunner.run_sync` drives one command: **accept** (the row, its
+idempotency record and its `operation.accepted` event in one transaction,
+under the daemon store's lock — only then is acceptance acknowledged),
+**claim** under the daemon's generation, apply through `ControlService`,
+**finish** with the typed outcome as `result_json` or the `ControlError` code
+and the loop's sentence. A `stop` or `restart` stays `running` until its
+deferred effect has run; a cancel of the run in flight stays `running` until
+the run settles, and the loop finishes it from what the run did — `succeeded`
+when the item settled as cancelled, `failed target_already_terminal` naming
+the state the run reached when the cancel came too late, `superseded` when a
+later cancel replaced it. Success means exactly the effect the row's `effect`
+column promises and no more: the source's report, the gate's merge, the
+process exit are separate outcomes with their own events.
+
+An idempotency pair — a scope (the principal) and the client's key — makes a
+retry return the same operation when the request fingerprint matches, and a
+conflict when it does not; the `ctl` queue and chat pass none, since their
+transport already answers each request once. The bus is never the transaction
+coordinator: an event published to it proves nothing about durability, so
+nothing about an operation rides on it.
+
+Every daemon process is a **generation** (`daemon/controls/generation.py`),
+stamped into `daemon_state` at the top of `recover()` and named in
+`status()`. Recovery then settles the operations a dead generation left, from
+evidence, before anything else changes it: an `accepted` row was never claimed
+and is `expired` (stale intent is never applied at boot — the same rule the
+`ctl` queue enforces on its files); a `running` row claimed by another
+generation is judged per action from the domain — the run's state for a
+cancel, the gate's state for an approval, the item's state for an item verb,
+the fact that a new generation is answering for a stop or restart. What the
+evidence cannot decide is `reconciling` with the reason, for an operator; it is
+never guessed `succeeded`, and a timeout is never evidence.
+
 ### Repositories
 
 One daemon may tend several repositories. They are declared as an array of

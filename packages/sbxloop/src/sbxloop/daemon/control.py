@@ -106,6 +106,9 @@ class CommandReply(NamedTuple):
     #: daemon's stop flag only once the reply is on its way, so a chat
     #: bridge is not torn down under its own answer.
     after: Callable[[], None] | None = None
+    #: The durable operation the command was recorded under (a mutating
+    #: verb on a daemon with an operation store); ``None`` for a read.
+    operation_id: str | None = None
 
 
 # Item verbs talk to GitHub through the ops sandbox (#229): a live `abandon`
@@ -413,7 +416,7 @@ def _dispatch(
     service composes one, and nothing above parses one."""
     service = ControlService(loop)
     try:
-        return _dispatch_verb(
+        reply = _dispatch_verb(
             service, word, args, prefix=prefix, principal=principal, max_chars=max_chars
         )
     except ControlError as exc:
@@ -421,6 +424,9 @@ def _dispatch(
         # capability, a daemon not ready); the loop's own refusals are
         # rendered verb by verb below, as they always were.
         return CommandReply(f"{word} refused: {exc.message}", ok=False)
+    if service.operation_ids:
+        reply = reply._replace(operation_id=service.operation_ids[-1])
+    return reply
 
 
 def _dispatch_verb(
@@ -745,11 +751,13 @@ def _reply_from(data: dict[str, Any]) -> CommandReply:
     status dict when the daemon wrote one (#639) — a daemon from before that
     answers ``status`` with prose only, and the client says so."""
     status = data.get("status")
+    operation_id = data.get("operation_id")
     return CommandReply(
         str(data.get("text", "")),
         bool(data.get("ok", True)),
         status=status if isinstance(status, dict) else None,
         stale=bool(data.get("stale", False)),
+        operation_id=str(operation_id) if operation_id else None,
     )
 
 
@@ -1007,6 +1015,8 @@ class ControlServer:
             # The structured twin of the prose, so `ctl status --json` (#639)
             # gives scripts the same dict the chat card renders from.
             payload["status"] = json.loads(json.dumps(reply.status, default=str))
+        if reply.operation_id is not None:
+            payload["operation_id"] = reply.operation_id
         _write_atomic(reply_path, payload)
         request.unlink(missing_ok=True)
 

@@ -5,7 +5,7 @@ between ``pip install`` and the restart — so migrating has to happen when a
 store opens the database, not when an operator remembers to ask. That is what
 :func:`ensure_schema` does.
 
-One chain covers all nineteen tables. Both stores live in one file, so one
+One chain covers all twenty-one tables. Both stores live in one file, so one
 ``alembic_version`` row describes it; a store that opened only "its own"
 tables would still be looking at a file the other one migrates.
 

@@ -58,9 +58,15 @@ class ControlError(Exception):
 
 
 class Outcome(BaseModel):
-    """Base of every typed result. Frozen: an outcome is a record."""
+    """Base of every typed result. Frozen: an outcome is a record.
+
+    ``operation_id`` names the durable operation the effect was recorded
+    under, when the surface records one (``None`` for a loop without an
+    operation store — a test double)."""
 
     model_config = ConfigDict(extra="forbid", frozen=True)
+
+    operation_id: str | None = None
 
 
 class StatusOutcome(Outcome):
