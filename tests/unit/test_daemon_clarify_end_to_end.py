@@ -28,18 +28,22 @@ from sbxloop.daemon.discord import DiscordBridge
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.store import StateStore
 from sbxloop.events import EventBus
-from tests.unit.test_daemon_concierge import FakeClient as ScriptedWorker
-from tests.unit.test_daemon_concierge import FakeHost, FakeVersions, LoopWithRuns
+from tests.unit.test_daemon_concierge import (
+    FakeClient as ScriptedWorker,
+    FakeHost,
+    FakeVersions,
+    LoopWithRuns,
+)
 from tests.unit.test_daemon_discord import (
     BOT_USER,
     FakeChannel,
+    FakeClient as FakeDiscord,
     FakeLoop,
     FakeMessage,
     StubButton,
     StubView,
     wait_for,
 )
-from tests.unit.test_daemon_discord import FakeClient as FakeDiscord
 
 # The clarifying question at the heart of the report: the concierge needs to
 # know what the user wants changed, and the plausible answers are enumerable.

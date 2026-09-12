@@ -58,7 +58,6 @@ from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
-from urllib.parse import quote
 
 from pydantic import ValidationError
 
@@ -184,20 +183,6 @@ from sbxloop.errors import (
 )
 from sbxloop.events import EventBus, Hook, HostEventTypes
 from sbxloop.gc import workspace_pruned
-from sbxloop.gh.labels import FOLLOWUP_DESCRIPTOR, LabelSpec, ensure_label
-from sbxloop.gh.ops import (
-    FailedCheck,
-    GithubOps,
-    Identity,
-    PostedFinding,
-    ReviewComment,
-    SubmittedReview,
-    identities_match,
-    raw_lookup,
-    raw_pages,
-    user_identity,
-)
-from sbxloop.gh.permissions import workflows_write_granted
 from sbxloop.ids import branch_name, new_job_id, new_message_id, new_run_id
 from sbxloop.log import get_logger
 from sbxloop.policy import EgressGranter, egress_rejection
@@ -207,13 +192,28 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.provision import ContinueBranch, Provisioner
 from sbxloop.sbx.sandbox import SBXLOOP_DIR
+from sbxloop.vcs.github.labels import FOLLOWUP_DESCRIPTOR, LabelSpec, ensure_label
+from sbxloop.vcs.github.ops import (
+    FailedCheck,
+    GithubOps,
+    Identity,
+    MalformedResponse,
+    PostedFinding,
+    ReviewComment,
+    SubmittedReview,
+    github_transport,
+    identities_match,
+    user_identity,
+)
+from sbxloop.vcs.github.permissions import workflows_write_granted
+from sbxloop.vcs.protocol import VcsOps
 from sbxloop.verifylint import services_evidence
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import JobRequest
 
 log = get_logger(__name__)
 
-GithubOpsFactory = Callable[[WorkerClient, str], GithubOps]
+GithubOpsFactory = Callable[[WorkerClient, str], VcsOps]
 ServiceOpsFactory = Callable[..., ServiceOps]  # ServiceOps.__init__'s signature
 
 
@@ -256,7 +256,7 @@ class Pipeline:
     deadline: float
     # None when the run has no repository: the pipeline then ends after
     # the gate, `completed`.
-    ops: GithubOps | None
+    ops: VcsOps | None
     repo: str | None
     # Which stage list drives the run (#755): the developer pipeline for
     # `code`, plan → execute → judge → publish for `workload`.
@@ -356,7 +356,7 @@ class LoopEngine:
         self.clock = clock
         # The seam a test uses to script GitHub: every github.op the run
         # makes goes through the ops this factory returns.
-        self._github_ops: GithubOpsFactory = github_ops or GithubOps
+        self._github_ops: GithubOpsFactory = github_ops or self._default_github_ops
         # Same seam for the service sandbox's ops (#765).
         self._service_ops: ServiceOpsFactory = service_ops or ServiceOps
         # In-process cancellation (Ctrl-C in the TUI): checked at the same
@@ -1449,7 +1449,12 @@ class LoopEngine:
             **extra,
         )
 
-    def _ensure_delivery_repo(self, run_id: str, ops: GithubOps | None) -> bool | None:
+    def _default_github_ops(self, client: WorkerClient, run_id: str) -> GithubOps:
+        """The GitHub backend for a run, carrying the transport descriptor
+        derived from the configuration (#1015)."""
+        return GithubOps(client, run_id, transport=github_transport(self.config.github.api_url))
+
+    def _ensure_delivery_repo(self, run_id: str, ops: VcsOps | None) -> bool | None:
         """Probe (and, when allowed, create) the delivery repo up front.
 
         Runs right after worker install so a missing or typo'd repository
@@ -1596,7 +1601,7 @@ class LoopEngine:
         )
 
     @staticmethod
-    def _merge_base_problem(ops: GithubOps, repo: str, base: str, branch: str) -> str | None:
+    def _merge_base_problem(ops: VcsOps, repo: str, base: str, branch: str) -> str | None:
         """Why ``branch`` cannot be continued on ``base`` — None when the
         two share history, the test for "this branch is still about this
         repository's current line of work".
@@ -1607,7 +1612,10 @@ class LoopEngine:
         permissions problem that would report as "unrelated history".
         A miss is told apart by asking for the base ref itself.
         """
-        data = raw_lookup(ops, "GET", f"/repos/{repo}/compare/{base}...{branch}")
+        try:
+            data = ops.compare_lookup(repo, base, branch)
+        except MalformedResponse:
+            return f"GitHub's comparison with {base} had no usable shape"
         if data is None:
             if ops.ref_lookup(repo, f"heads/{base}") is None:
                 return (
@@ -1615,24 +1623,19 @@ class LoopEngine:
                     "origin, or the token cannot see it"
                 )
             return f"the branch has no merge base with {base} (unrelated history)"
-        if not isinstance(data, dict):
-            return f"GitHub's comparison with {base} had no usable shape"
         merge_base = data.get("merge_base_commit")
         if isinstance(merge_base, dict) and merge_base.get("sha"):
             return None
         return f"GitHub's comparison with {base} named no merge base"
 
     @staticmethod
-    def _prior_open_pr(ops: GithubOps, repo: str, branch: str, recorded: int | None) -> int | None:
+    def _prior_open_pr(ops: VcsOps, repo: str, branch: str, recorded: int | None) -> int | None:
         """The open pull request for ``branch``, or None when there is none
         to reattach to (it was closed or merged, so the restart opens a
         fresh one on the same branch)."""
-        owner = repo.split("/", 1)[0]
-        pulls = ops.raw("GET", f"/repos/{repo}/pulls?state=open&head={owner}:{branch}")
-        if isinstance(pulls, list):
-            for pull in pulls:
-                if isinstance(pull, dict) and pull.get("number"):
-                    return int(pull["number"])
+        for pull in ops.pr_list_open(repo, head=branch):
+            if isinstance(pull, dict) and pull.get("number"):
+                return int(pull["number"])
         if recorded is None:
             return None
         data = ops.pr_get(repo, recorded)
@@ -2815,7 +2818,7 @@ class LoopEngine:
         label = sinks.result_label(self.config.workload.result_label)
         try:
             ensure_label(p.ops, repo, label)
-            p.ops.raw("POST", f"/repos/{repo}/issues/{pr.number}/labels", {"labels": [label.name]})
+            p.ops.issue_labels_add(repo, pr.number, [label.name])
         except GithubOpsError:
             # The result is delivered; a label it could not carry is not a
             # reason to fail the run (the same rule as `_label_pr`).
@@ -3179,7 +3182,7 @@ class LoopEngine:
         if not labels or p.ops is None or p.repo is None:
             return
         try:
-            p.ops.raw("POST", f"/repos/{p.repo}/issues/{number}/labels", {"labels": labels})
+            p.ops.issue_labels_add(p.repo, number, labels)
         except GithubOpsError:
             log.warning(
                 "deliver.pr_labels_failed", run=p.run_id, pr=number, labels=labels, exc_info=True
@@ -3296,7 +3299,7 @@ class LoopEngine:
             # so the fix round that follows reconciles onto it rather than
             # into a body comment.
             posted_findings += tuple(
-                PostedFinding(rec.anchor, rec.comment_id, rec.thread_node_id)
+                PostedFinding(rec.anchor, rec.comment_id, rec.thread_id)
                 for rec in self._threads_for(run_id, [c.anchor for c in carried if not c.fixed])
             )
         except GithubOpsError:
@@ -3497,7 +3500,7 @@ class LoopEngine:
         run = self.store.get_run(run_id)
         if run.pr_number is None:
             return
-        records = [PostedRecord(round_no, f.anchor, f.comment_id, f.thread_node_id) for f in posted]
+        records = [PostedRecord(round_no, f.anchor, f.comment_id, f.thread_id) for f in posted]
         try:
             outcome = note_nonblocking(
                 ops,
@@ -3820,7 +3823,7 @@ class LoopEngine:
         assert ops is not None and repo is not None
         stamp = f"<!-- sbxloop:review-record run={run_id} -->"
         try:
-            existing = raw_pages(ops, f"/repos/{repo}/issues/{number}/comments")
+            existing = ops.issue_comments(repo, number)
         except GithubOpsError:
             existing = []
         for entry in existing:
@@ -4462,20 +4465,17 @@ class LoopEngine:
         return out
 
     @staticmethod
-    def _filed_on_repo(ops: GithubOps, repo: str, label: str, run_id: str) -> dict[str, str]:
+    def _filed_on_repo(ops: VcsOps, repo: str, label: str, run_id: str) -> dict[str, str]:
         """Follow-ups across runs, by key; this run wins for crash recovery.
         Read from the
         label's issue list, which unlike search is not eventually consistent."""
         out: dict[str, str] = {}
         data: list[Any] = []
         for page in range(1, 101):
-            chunk = ops.raw(
-                "GET",
-                f"/repos/{repo}/issues?labels={quote(label, safe='')}&state=all"
-                f"&per_page=100&page={page}",
-            )
-            if not isinstance(chunk, list):
-                raise LookupUnavailable("follow-up listing was malformed")
+            try:
+                chunk = ops.issues_list(repo, labels=[label], state="all", page=page)
+            except MalformedResponse as exc:
+                raise LookupUnavailable("follow-up listing was malformed") from exc
             data.extend(chunk)
             if len(chunk) < 100:
                 break
@@ -4501,10 +4501,10 @@ class LoopEngine:
         return out
 
     @staticmethod
-    def _ensure_label(ops: GithubOps, repo: str, label: str) -> None:
+    def _ensure_label(ops: VcsOps, repo: str, label: str) -> None:
         """Make sure the repository carries the follow-up label (best-effort:
         a refusal must not stop the filing — GitHub accepts an issue whose
-        label it cannot find). See :func:`sbxloop.gh.labels.ensure_label`;
+        label it cannot find). See :func:`sbxloop.vcs.github.labels.ensure_label`;
         ``sbxloop init-repo`` creates this and the lifecycle labels up front
         (#630)."""
         ensure_label(ops, repo, LabelSpec(label, *FOLLOWUP_DESCRIPTOR))

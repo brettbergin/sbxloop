@@ -36,16 +36,6 @@ from sbxloop.endpoint import parse_endpoint
 from sbxloop.engine.landing import allowed_merge_methods, resolve_merge_method
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError, StateError
-from sbxloop.gh.labels import lifecycle_specs, missing_labels
-from sbxloop.gh.ops import GithubOps
-from sbxloop.gh.permissions import (
-    NEEDS,
-    Need,
-    missing_from_app,
-    missing_from_scopes,
-    split_required,
-)
-from sbxloop.gh.protection import read_base_requirements
 from sbxloop.hostfiles import privacy
 from sbxloop.paths import SbxloopHome, describe, legacy_paths
 from sbxloop.sbx.bake import load_bake_record
@@ -53,6 +43,17 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import ConformanceReport, run_conformance
 from sbxloop.sbx.provision import gh_credential_status
 from sbxloop.sbx.prune import count_orphans
+from sbxloop.vcs.github.labels import lifecycle_specs, missing_labels
+from sbxloop.vcs.github.ops import GithubOps
+from sbxloop.vcs.github.permissions import (
+    NEEDS,
+    READ_PROBES,
+    Need,
+    missing_from_app,
+    missing_from_scopes,
+    split_required,
+)
+from sbxloop.vcs.protocol import Capability, VcsOps
 from sbxloop.worker.wheel import resolve_worker_wheel
 from sbxloop_worker.backends.copilot import (
     SDK_PERMISSION_KINDS,
@@ -157,6 +158,11 @@ class RepoProbe:
     # Whether the repository has Issues enabled (#631): the daemon polls
     # issues for work, and follow-ups are filed as issues. None = unknown.
     issues_enabled: bool | None = None
+    # What kind of credential the github box holds for this repository
+    # (#1009): a host-minted App installation token, or a classic or
+    # fine-grained PAT that lives until someone revokes it. Empty = not
+    # determined.
+    credential: str = ""
 
 
 def _repo_token_status(entry: RepoConfig, env: dict[str, str]) -> tuple[bool, str]:
@@ -244,6 +250,37 @@ def _count_orphans(cli: SbxCLI, state_db: Path) -> int:
         return count_orphans(cli, store)
 
 
+def vcs_backend_checks(config: Config) -> list[Check]:
+    """One row per forge an enabled repository lives on (#1009), naming
+    each capability's state — ``supported``, ``unsupported``, ``unknown``
+    — so a run never meets an UNKNOWN the doctor did not show first. A
+    kind the configuration names but no backend answers is a failing row:
+    the run would fail closed at its first operation, and this says so
+    before it starts."""
+    rows: list[Check] = []
+    for kind in config.vcs_kinds():
+        name = f"vcs backend {kind}"
+        if kind != "github":
+            rows.append(
+                Check(
+                    name,
+                    False,
+                    f'[vcs] kind = "{kind}" names a backend that is not implemented yet; '
+                    'only "github" answers a run today',
+                )
+            )
+            continue
+        report = GithubOps.CAPABILITIES
+        by_state: dict[str, list[str]] = {}
+        for capability, state in report.items():
+            by_state.setdefault(str(state), []).append(capability)
+        parts = [f"{state}: {', '.join(names)}" for state, names in by_state.items()]
+        if Capability.UNKNOWN in report.values():
+            parts.append("(signed API commits depend on the credential: a GitHub App's are)")
+        rows.append(Check(name, True, "; ".join(parts), hard=False))
+    return rows
+
+
 def repo_checks(
     config: Config,
     env: dict[str, str],
@@ -329,6 +366,8 @@ def repo_checks(
             rows.append(Check(name, False, "; ".join(notes)))
             continue
         notes.append(result.detail or "reachable, token has the required permissions")
+        if result.credential:
+            notes.append(f"credential: {result.credential}")
         merge_note, merge_row = _merge_method_status(name, config, result.merge_methods)
         notes.append(merge_note)
         rows.append(Check(name, True, "; ".join(notes)))
@@ -617,53 +656,39 @@ def _missing_from_push_bit(data: dict[str, object]) -> tuple[Need, ...]:
     return tuple(n for n in NEEDS if n.level == "write" and n.required)
 
 
-# The read a fine-grained PAT is asked to prove each permission with
-# (#696): GitHub answers 401/403 when the permission is not on the token,
-# and anything else — 200, an empty list, 404 on an empty repository, 422
-# — means the permission is there. ``{repo}`` and ``{base}`` are filled in;
-# a probe naming ``{base}`` is skipped when the repository has no base yet.
-_READ_PROBES: tuple[tuple[str, str], ...] = (
-    ("contents", "/repos/{repo}/commits?per_page=1&sha={base}"),
-    ("issues", "/repos/{repo}/issues?per_page=1"),
-    ("pull_requests", "/repos/{repo}/pulls?per_page=1"),
-    ("checks", "/repos/{repo}/commits/{base}/check-runs?per_page=1"),
-    ("actions", "/repos/{repo}/actions/runs?per_page=1"),
-)
-
-
-def _missing_from_probes(ops: GithubOps, repo: str, base: str) -> tuple[Need, ...]:
+def _missing_from_probes(ops: VcsOps, repo: str, base: str) -> tuple[Need, ...]:
     """The needs a fine-grained PAT fails a read for. A permission the
     token lacks entirely fails its read; a read-only grant on a write need
     is the push bit's business (:func:`_missing_from_push_bit`)."""
     by_permission = {n.permission: n for n in NEEDS}
     missing: list[Need] = []
-    for permission, template in _READ_PROBES:
-        if "{base}" in template and not base:
-            continue
-        try:
-            ops.raw("GET", template.format(repo=repo, base=base))
-        except GithubOpsError as exc:
-            if exc.http_status in (401, 403):
-                missing.append(by_permission[permission])
+    for permission in READ_PROBES:
+        if ops.permission_probe(permission, repo, base) is False:
+            missing.append(by_permission[permission])
     return tuple(missing)
 
 
 def _credential_needs(
-    ops: GithubOps,
+    ops: VcsOps,
     app_permissions: Mapping[str, str] | None,
     repo: str,
     base: str,
     data: dict[str, Any],
-) -> tuple[tuple[Need, ...], tuple[Need, ...], str]:
-    """``(required, optional, source)`` — what the credential lacks of
-    :data:`NEEDS`, judged from whichever source describes it (#696): the
-    App installation's grant, a classic PAT's scopes, or — a fine-grained
-    PAT, which reports neither — the push bit plus one read per permission.
+) -> tuple[tuple[Need, ...], tuple[Need, ...], str, str]:
+    """``(required, optional, source, credential)`` — what the credential
+    lacks of :data:`NEEDS`, judged from whichever source describes it
+    (#696): the App installation's grant, a classic PAT's scopes, or — a
+    fine-grained PAT, which reports neither — the push bit plus one read
+    per permission. ``credential`` names the kind of token that is, and
+    how long it lives (#1009): an App token is host-minted and expires
+    within the hour; a PAT lives until it is revoked, and GitHub does not
+    let the token read its own expiry.
     """
     if app_permissions is not None:
         # The installation's grant is the whole story: it is not a user.
         missing = missing_from_app(app_permissions)
         source = "the App installation's permissions"
+        credential = "GitHub App installation token (host-minted, expires within the hour)"
     else:
         # A PAT is capped twice: by what the token was granted, and by what
         # its user may do on this repository (the payload's push bit).
@@ -674,35 +699,33 @@ def _credential_needs(
                 *_missing_from_push_bit(data),
             )
             source = f"the classic PAT's scopes {', '.join(scopes) or '(none)'}"
+            credential = "classic PAT (long-lived; its expiry is not readable by the token)"
         else:
             found = (*_missing_from_push_bit(data), *_missing_from_probes(ops, repo, base))
             source = "a fine-grained PAT, asked endpoint by endpoint; workflows:write unverifiable"
+            credential = "fine-grained PAT (long-lived; its expiry is not readable by the token)"
         lacking = {n.permission for n in found}
         missing = tuple(n for n in NEEDS if n.permission in lacking)
     required, optional = split_required(missing)
-    return required, optional, source
+    return required, optional, source, credential
 
 
-def _ci_summary(ops: GithubOps, repo: str, base: str) -> RepoCi | None:
+def _ci_summary(ops: VcsOps, repo: str, base: str) -> RepoCi | None:
     """The repository's active Actions workflows and its latest run on
     ``base`` (#696); None when they could not be listed (actions:read
     missing is reported as a permission, not here)."""
     try:
-        listing = ops.raw("GET", f"/repos/{repo}/actions/workflows?per_page=100")
+        workflows = ops.workflows_list(repo)
     except GithubOpsError:
-        return None
-    workflows = listing.get("workflows") if isinstance(listing, dict) else None
-    if not isinstance(workflows, list):
         return None
     active = sum(1 for w in workflows if isinstance(w, dict) and w.get("state") == "active")
     latest: str | None = None
     if active and base:
         try:
-            runs = ops.raw("GET", f"/repos/{repo}/actions/runs?branch={base}&per_page=1")
+            listed = ops.workflow_runs(repo, branch=base, per_page=1)
         except GithubOpsError:
-            runs = None
-        listed = runs.get("workflow_runs") if isinstance(runs, dict) else None
-        if isinstance(listed, list) and listed and isinstance(listed[0], dict):
+            listed = []
+        if listed and isinstance(listed[0], dict):
             run = listed[0]
             outcome = str(run.get("conclusion") or run.get("status") or "unknown")
             latest = f"{run.get('name') or 'workflow'} {outcome}"
@@ -710,7 +733,7 @@ def _ci_summary(ops: GithubOps, repo: str, base: str) -> RepoCi | None:
 
 
 def _base_blockers(
-    ops: GithubOps, repo: str, base: str, config: Config, *, can_sign: bool
+    ops: VcsOps, repo: str, base: str, config: Config, *, can_sign: bool
 ) -> tuple[tuple[str, ...] | None, tuple[str, ...]]:
     """The rules of ``base`` the loop cannot satisfy (#673).
 
@@ -719,7 +742,7 @@ def _base_blockers(
     signed commits or a required deployment refuse a merge the same way
     (HTTP 405, the run ends blocked); a merge queue is not one — the loop
     enqueues (#676). Read by
-    :func:`sbxloop.gh.protection.read_base_requirements` — the same reading
+    :func:`sbxloop.vcs.github.protection.read_base_requirements` — the same reading
     the landing gate uses for required checks (#611) — and judged by the
     same :func:`sbxloop.engine.landing.base_blockers` the run would report.
     ``None`` when GitHub would not say (a token without admin on classic
@@ -728,7 +751,7 @@ def _base_blockers(
     """
     from sbxloop.engine.landing import base_blockers
 
-    requirements = read_base_requirements(ops, repo, base)
+    requirements = ops.base_requirements(repo, base)
     if requirements.source == "unknown" and not requirements.blockers():
         return None, requirements.unread
     return base_blockers(requirements, config.landing, can_sign=can_sign), requirements.unread
@@ -798,7 +821,7 @@ def sandbox_repo_probe(
                 reachable=False, detail="not found with this token", creatable=creatable
             )
         base = entry.deliver_base or str(data.get("default_branch") or "")
-        required, optional, source = _credential_needs(
+        required, optional, source, credential = _credential_needs(
             ops, box.provisioner.gh_app_permissions(entry.repo), entry.repo, base, data
         )
         has_issues = data.get("has_issues")
@@ -830,14 +853,13 @@ def sandbox_repo_probe(
             merge_methods=allowed_merge_methods(data),
             missing_labels=_missing_repo_labels(ops, config, entry),
             issues_enabled=has_issues if isinstance(has_issues, bool) else None,
+            credential=credential,
         )
 
     return probe
 
 
-def _missing_repo_labels(
-    ops: GithubOps, config: Config, entry: RepoConfig
-) -> tuple[str, ...] | None:
+def _missing_repo_labels(ops: VcsOps, config: Config, entry: RepoConfig) -> tuple[str, ...] | None:
     """The sbxloop labels ``entry`` does not carry (#630); None when the
     list could not be read (a token without issue read, a 5xx) — that is
     "unknown", not "all present"."""
@@ -1344,6 +1366,10 @@ def collect_checks(
                     "JWTs; install openssl or switch to a PAT",
                 )
             )
+        # One row per forge the repositories live on (#1009): what the
+        # backend can do, so an UNKNOWN is visible before a run hits it, or
+        # that no backend answers the configured kind yet.
+        checks.extend(vcs_backend_checks(config))
         # One row per configured repository: a repo whose credentials or
         # probe fail must not hide the verdict for the others.
         report("checking configured repositories")

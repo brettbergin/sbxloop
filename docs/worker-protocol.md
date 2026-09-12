@@ -68,14 +68,14 @@ delivery tier provisioning chose (see docs/architecture.md):
 
 ## Job kinds
 
-| kind            | fields                                                                                                                                       | result                                                                                                                                                                         |
-| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `agent.session` | `prompt`, `system_message?`, `system_preset: true`, `model?`, `resume_session_id?`, `permission_mode: auto\|read_only`, `expect: text\|json` | `output_text`, `output_json` (extracted from the last \`\`\`json fence when `expect=json`; missing JSON ⇒ typed `ExpectedJsonMissing` error), `session_id`, `usage`, `health?` |
-| `shell.check`   | `argv`, `cwd?`                                                                                                                               | `exit_code` + captured output. A nonzero exit is an **ok** result — the host owns the verification decision                                                                    |
-| `shell.batch`   | `commands`, `command_timeout_s?`, `cwd?`                                                                                                     | `output_json`: list of `{command, exit_code, output}` (one per command, in order); job `exit_code` is the first nonzero. Nonzero exits are still **ok** results                |
-| `github.op`     | `op`, `params`                                                                                                                               | op-specific JSON (see below)                                                                                                                                                   |
-| `service.http`  | `params: {credential, method, path, query?, headers?, body?, timeout_s?}`                                                                    | `{credential, method, path, status, headers, body (clipped, credential value redacted), truncated, elapsed_s}` — see "Service ops"                                             |
-| `service.fetch` | `params: {registry, path, operation?, ref?, sha256?}`                                                                                        | Artifact metadata `{registry, operation, bytes, sha256}`; bytes stay in a separate artifact for host-mediated transfer                                                         |
+| kind            | fields                                                                                                                                                               | result                                                                                                                                                                         |
+| --------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `agent.session` | `prompt`, `system_message?`, `system_preset: true`, `model?`, `resume_session_id?`, `permission_mode: auto\|read_only`, `expect: text\|json`                         | `output_text`, `output_json` (extracted from the last \`\`\`json fence when `expect=json`; missing JSON ⇒ typed `ExpectedJsonMissing` error), `session_id`, `usage`, `health?` |
+| `shell.check`   | `argv`, `cwd?`                                                                                                                                                       | `exit_code` + captured output. A nonzero exit is an **ok** result — the host owns the verification decision                                                                    |
+| `shell.batch`   | `commands`, `command_timeout_s?`, `cwd?`                                                                                                                             | `output_json`: list of `{command, exit_code, output}` (one per command, in order); job `exit_code` is the first nonzero. Nonzero exits are still **ok** results                |
+| `vcs.op`        | `op`, `params` (with an optional `transport` descriptor, see "Forge ops"); `github.op` is the spelling from before the backends were named, accepted for one release | op-specific JSON (see below)                                                                                                                                                   |
+| `service.http`  | `params: {credential, method, path, query?, headers?, body?, timeout_s?}`                                                                                            | `{credential, method, path, status, headers, body (clipped, credential value redacted), truncated, elapsed_s}` — see "Service ops"                                             |
+| `service.fetch` | `params: {registry, path, operation?, ref?, sha256?}`                                                                                                                | Artifact metadata `{registry, operation, bytes, sha256}`; bytes stay in a separate artifact for host-mediated transfer                                                         |
 
 The `agent.rate_limits` job runs in the existing agent sandbox, using
 `params: {backend}` and a positive timeout of at most ten seconds. It rejects
@@ -247,10 +247,20 @@ diagnosed instead of surfacing as whatever confusing error the in-VM tooling
 produced. Query history with
 `sbxloop logs <run> --type-prefix sandbox.resources`.
 
-## GitHub ops
+## Forge ops
 
-`github.op` jobs execute in the github sandbox only (the sole holder of
-`GH_TOKEN`). Ops: `issue.create`, `issue.comment`, `pr.create`, `pr.comment`,
+`vcs.op` jobs execute in the github sandbox only (the sole holder of the
+forge token). `params.transport` is a `TransportSpec` (#1015): the API root
+(`api_url`), how the token rides (`auth`: `bearer` for GitHub, `private-token`
+for GitLab, `token` for Gitea), how lists page (`pagination`: `page` by
+number, `link` by the `Link` header's `rel="next"`, `x-next-page` by
+GitLab's header), the `Accept` value and any API-version header, the names
+of the environment variables the sandbox holds the token in (`token_env` —
+names only; the descriptor never carries a value), and whether the `gh` CLI
+may serve the calls (`gh_cli`, a GitHub-only optimisation). The host derives
+it from the configuration; a job without one is served as GitHub from the
+API root the sandbox's environment names, exactly as before the descriptor
+existed. Ops: `issue.create`, `issue.comment`, `pr.create`, `pr.comment`,
 `contents.read`, `status.create`, `repo.get`, `ref.get`, `label.get`,
 `search.issues`,
 `raw.api`, `blobs.create_many`, `checks.failed_logs` (the failing check runs on a
@@ -258,8 +268,9 @@ commit with their Actions job logs, head+tail clipped; the REST transport fetche
 the log's blob-storage redirect without the bearer token), `token.scopes` (the
 classic PAT's `X-OAuth-Scopes` from `GET /rate_limit`, or `null` for a
 fine-grained PAT or App token — how `sbxloop doctor` learns what the credential
-may do, #696). Transport inside the sandbox: `gh api` when gh
-is available, otherwise a pure-stdlib REST client — both produce identical
+may do, #696). Transport inside the sandbox: a pure-stdlib REST client that
+speaks whatever the descriptor describes — the universal path — or `gh api`
+when the descriptor allows it and gh is available; both produce identical
 result shapes.
 
 Probes ask questions and get "no" as data: `repo.get`, `ref.get` and

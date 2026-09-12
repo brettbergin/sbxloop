@@ -400,6 +400,18 @@ secret_strategy = "proxy"
 # allow = []
 # deny = []
 
+# [vcs]
+# The version-control backend: which forge the repositories live on. Only
+# "github" answers a run today; "gitlab" and "gitea" load, and `sbxloop
+# doctor` reports them as not yet implemented, so a configuration can name
+# them ahead of the backend. Anything else is refused at load. A
+# `[[github.repos]]` entry may name its own `kind`. Without this section
+# `[github]` is read as kind = "github", and the loader says so once.
+# kind = "github"
+# The forge's API root. For "github" this is the same setting as
+# `[github] api_url` — set one, or the same value in both.
+# api_url = "https://api.github.com"
+
 # [github]
 # The GitHub integration. Unset (the default) disables GitHub entirely:
 # no github sandbox is provisioned, GH_TOKEN is not required, and a run
@@ -475,6 +487,7 @@ secret_strategy = "proxy"
 # across all of them.
 # [[github.repos]]
 # repo = "you/your-repo"
+# kind = "github"                  # the forge this repository lives on; unset uses [vcs]'s
 # workspace = "/path/to/checkout"  # this repo's host checkout; unset falls
 #                                  # back to [sandbox] workspace when that
 #                                  # checkout belongs to this repository

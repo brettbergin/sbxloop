@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from sbxloop.gh.ops import (
+from sbxloop.vcs.github.ops import (
     GithubOps,
     PaginationError,
     fold_required_contexts,

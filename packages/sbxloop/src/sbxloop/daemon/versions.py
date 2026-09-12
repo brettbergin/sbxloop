@@ -10,7 +10,7 @@ think to ask.
 
 This is the **only outbound HTTP the host itself makes** apart from the
 optional chat bridge and ``daemon notify``; everything else, all GitHub access
-included, is deliberately proxied through a sandbox (see :mod:`sbxloop.gh.ops`).
+included, is deliberately proxied through a sandbox (see :mod:`sbxloop.vcs.github.ops`).
 The request is unauthenticated and carries no credential, so the credential
 split is untouched. It is bounded by a short timeout and a response cap,
 memoised for :data:`PYPI_TTL_S`, and every failure degrades to "could not reach

@@ -19,7 +19,8 @@ from sbxloop.daemon.sources import (
 )
 from sbxloop.engine.model import Published
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import IssueRef
+from sbxloop.vcs.github.ops import IssueRef
+from tests.fakes.ops_stub import OpsStub
 
 LABELS = GitHubLabels("sbxloop:run", "sbxloop:in-progress", "sbxloop:failed")
 
@@ -41,7 +42,7 @@ def gh(number: int = 4, **overrides: Any) -> WorkItem:
     return WorkItem(**fields)
 
 
-class RecordingOps:
+class RecordingOps(OpsStub):
     """GithubOps stand-in for the issue source: scripted GET, recorded writes."""
 
     def __init__(self, issues: dict[str, dict[str, Any]] | None = None) -> None:

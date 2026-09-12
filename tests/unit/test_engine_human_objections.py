@@ -25,7 +25,7 @@ from sbxloop.engine.reconcile import (
 )
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import ReviewComment, ReviewThread, ThreadComment
+from sbxloop.vcs.github.ops import ReviewComment, ReviewThread, ThreadComment
 from tests.fakes.fake_github import FakeGithub
 
 REPO = "o/r"
@@ -54,7 +54,7 @@ def inline(gh: FakeGithub, path: str, line: int) -> HumanObjection:
         body="fix it",
         anchor=f"{path}:{line}",
         comment_id=posted.comment_id,
-        thread_node_id=posted.thread_node_id,
+        thread_id=posted.thread_id,
     )
 
 
@@ -120,7 +120,7 @@ class TestReplies:
         assert outcome.body_only == 1
         assert gh.replies == []
         assert gh.resolved == []
-        text = gh.issue_comments[0]
+        text = gh.issue_comments_posted[0]
         assert "review feedback" in text
         assert "`@alice` — **unanswered**" in text
 
@@ -183,7 +183,7 @@ class TestStoreRecord:
 
 def ack_thread(*comments: tuple[str, str], node: str = "PRRT_9") -> ReviewThread:
     return ReviewThread(
-        node_id=node,
+        thread_id=node,
         is_resolved=False,
         path="a.py",
         line=3,
@@ -243,7 +243,7 @@ class TestAcknowledgeHumanThreads:
         gh = FakeGithub()
         own = ack_thread((self.LOGIN, "[minor] naming"))
         rootless = ReviewThread(
-            node_id="PRRT_X",
+            thread_id="PRRT_X",
             is_resolved=False,
             path="b.py",
             line=None,

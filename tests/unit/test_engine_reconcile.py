@@ -26,7 +26,7 @@ from sbxloop.engine.reconcile import (
 from sbxloop.engine.review import Reconciliation
 from sbxloop.engine.store import PostedRecord, StateStore
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import ReviewComment
+from sbxloop.vcs.github.ops import ReviewComment
 from tests.fakes.fake_github import FakeGithub
 
 REPO = "o/r"
@@ -46,7 +46,7 @@ def seed(gh: FakeGithub, *anchors: tuple[str, int]) -> list[PostedRecord]:
         [ReviewComment(path=path, line=line, body="[major] fix it") for path, line in anchors],
     )
     return [
-        PostedRecord(1, p.anchor, p.comment_id, p.thread_node_id, submitted.review_id)
+        PostedRecord(1, p.anchor, p.comment_id, p.thread_id, submitted.review_id)
         for p in submitted.posted
     ]
 
@@ -114,7 +114,7 @@ class TestReconcileRound:
         comment_id, body = gh.replies[0]
         assert comment_id == posted[0].comment_id
         assert body.startswith("**addressed in 0123456789ab**: took the lock first")
-        assert gh.resolved == [posted[0].thread_node_id]
+        assert gh.resolved == [posted[0].thread_id]
         assert records == [("src/app.py:12", "addressed", True)]
 
     def test_refuted_and_unanswered_are_replied_to_but_left_open(self) -> None:
@@ -162,8 +162,8 @@ class TestReconcileRound:
         assert out.body_only == 2
         assert out.replied == 0
         assert gh.replies == []
-        assert len(gh.issue_comments) == 1
-        text = gh.issue_comments[0]
+        assert len(gh.issue_comments_posted) == 1
+        text = gh.issue_comments_posted[0]
         assert text.startswith("## Reconciliation — round 2")
         assert "- `a.py:1` — **addressed** — rewrote it" in text
         assert out.comment_url
@@ -302,7 +302,7 @@ class TestIdempotency:
         )
         run()
         again = run(done={BODY_COMMENT_KEY: "posted"})
-        assert len(gh.issue_comments) == 1
+        assert len(gh.issue_comments_posted) == 1
         assert again.comment_url is None
 
     def test_unreadable_threads_do_not_stop_the_replies(self) -> None:
@@ -322,7 +322,7 @@ class TestIdempotency:
         )
         assert out.replied == 1
         # The node id came from the store record, so it still resolved.
-        assert gh.resolved == [posted[0].thread_node_id]
+        assert gh.resolved == [posted[0].thread_id]
 
     def test_failed_capture_still_finds_its_live_thread_by_anchor(self) -> None:
         """`comment_id=None` can mean capture failed, not that no thread exists.
@@ -348,7 +348,7 @@ class TestIdempotency:
             record=recorder(records),
         )
         assert (out.replied, out.resolved, out.body_only) == (1, 1, 0)
-        assert gh.issue_comments == []
+        assert gh.issue_comments_posted == []
         assert len(gh.replies) == 1
         assert gh.replies[0][1].startswith("**addressed in 0123456789ab**: took the lock")
         assert records == [("a.py:1", "addressed", True)]

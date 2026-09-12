@@ -14,8 +14,7 @@ from textual.widgets import Input, OptionList, Select, TabbedContent, TabPane, T
 from sbxloop.backends import backend_named
 from sbxloop.cli.policyview import policy_view
 from sbxloop.config import Config
-from sbxloop.configedit import keys as configkeys
-from sbxloop.configedit import toml as configtoml
+from sbxloop.configedit import keys as configkeys, toml as configtoml
 from sbxloop.configedit.edit import (
     FILE_LAYER,
     config_path,

@@ -27,8 +27,7 @@ Two shapes are worth knowing before reading further:
 
 from __future__ import annotations
 
-from sqlalchemy import REAL, Index, Integer, Text
-from sqlalchemy import text as sql_text
+from sqlalchemy import REAL, Index, Integer, Text, text as sql_text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sbxloop.db.base import Base

@@ -24,7 +24,7 @@ FIXTURE_PATH = Path(__file__).resolve().parent.parent / "fixtures" / "github_fie
 
 # The two worker transports' failure lines (sbxloop_worker.githubops), each
 # wrapped in the host facade's ``github op <op> failed: <type>: <message>``
-# prefix (sbxloop.gh.ops). A fixture entry must match one of them: even a
+# prefix (sbxloop.vcs.github.ops). A fixture entry must match one of them: even a
 # synthetic entry has to be a string the worker could actually emit.
 _HOST_PREFIX = r"^github op (?P<op>[a-z_.]+) failed: GithubOpError: "
 GH_CLI_SHAPE = re.compile(

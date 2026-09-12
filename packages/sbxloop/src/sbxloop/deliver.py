@@ -1,6 +1,6 @@
 """Deliver a completed run's artifacts as a GitHub pull request.
 
-Everything goes through the :class:`GithubOps` facade, i.e. runs as
+Everything goes through the :class:`VcsOps` facade, i.e. runs as
 ``github.op`` jobs inside the github-ops sandbox — the only environment
 holding ``GH_TOKEN``; the credential split is preserved. Files are committed
 atomically through the git data API (blobs → tree → commit → ref) rather
@@ -27,7 +27,7 @@ arrive non-executable and a symlinked config de-linked, because the
 snapshot wrote ``100644`` for everything. ``FILE_MODE`` remains only for
 deletions, where the mode is a formality.
 
-Scaffold status: this is a real, unit-tested code path (stubbed GithubOps),
+Scaffold status: this is a real, unit-tested code path (stubbed VcsOps),
 but per the project pattern — unverified external behaviors get a seam and
 an e2e check, never a confident default — it is NOT field-proven until the
 real-sbx e2e workflow exercises it. Known e2e-validation items (each marker
@@ -79,10 +79,11 @@ from sbxloop.errors import (
     EmptyDeliveryError,
     GithubOpsError,
 )
-from sbxloop.gh.ops import GithubOps, PrRef
-from sbxloop.gh.permissions import WORKFLOWS_NEED, workflow_paths
 from sbxloop.ids import branch_name as branch_name  # re-export; shared with hostgit isolation
 from sbxloop.log import get_logger
+from sbxloop.vcs.github.ops import MalformedResponse, PrRef
+from sbxloop.vcs.github.permissions import WORKFLOWS_NEED, workflow_paths
+from sbxloop.vcs.protocol import VcsOps
 
 log = get_logger(__name__)
 
@@ -306,7 +307,7 @@ def _has_issues(data: object) -> bool | None:
 
 
 def ensure_repository(
-    ops: GithubOps, repo: str, *, create: bool = False, public: bool = False
+    ops: VcsOps, repo: str, *, create: bool = False, public: bool = False
 ) -> RepositoryProbe:
     """Probe the delivery repository; create it when explicitly allowed.
 
@@ -329,9 +330,9 @@ def ensure_repository(
             "--create-repo (config: [github] create_repo = true) to have "
             "sbxloop create it"
         )
-    owner, name = repo.split("/", 1)
+    owner = repo.split("/", 1)[0]
     try:
-        user = ops.raw("GET", "/user")
+        user = ops.authenticated_user()
     except GithubOpsError as exc:
         # ``GET /user`` needs a user token — a GitHub App installation
         # token gets 403 "Resource not accessible by integration" (#581).
@@ -346,12 +347,8 @@ def ensure_repository(
             hint="creating via the organization route",
         )
         user = {}
-    login = str(user.get("login", "")) if isinstance(user, dict) else ""
-    body = {"name": name, "private": not public, "auto_init": True}
-    if login.lower() == owner.lower():
-        made = ops.raw("POST", "/user/repos", body)
-    else:
-        made = ops.raw("POST", f"/orgs/{owner}/repos", body)
+    login = str(user.get("login", ""))
+    made = ops.repo_create(repo, private=not public, for_user=login.lower() == owner.lower())
     return RepositoryProbe(created=True, has_issues=_has_issues(made), url=_html_url(made))
 
 
@@ -379,7 +376,7 @@ class DeliveryPlan:
 
 
 def deliver_workspace(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     *,
     run_id: str,
@@ -524,7 +521,7 @@ def deliver_workspace(
     ]
     try:
         tree = _sha(
-            ops.raw("POST", f"/repos/{repo}/git/trees", {"base_tree": base_tree, "tree": entries}),
+            ops.tree_create(repo, base_tree=base_tree, entries=entries),
             f"tree for {repo}",
         )
     except GithubOpsError as exc:
@@ -542,14 +539,11 @@ def deliver_workspace(
             raise _refuse_workflow_delivery(touched, known=False, cause=exc) from exc
         raise
     commit = _sha(
-        ops.raw(
-            "POST",
-            f"/repos/{repo}/git/commits",
-            {
-                "message": commit_message or _commit_message(run_id, outcome),
-                "tree": tree,
-                "parents": [parent or base_sha],
-            },
+        ops.commit_create(
+            repo,
+            message=commit_message or _commit_message(run_id, outcome),
+            tree=tree,
+            parents=[parent or base_sha],
         ),
         f"commit for {repo}",
     )
@@ -641,7 +635,7 @@ def deliver_workspace(
 
 
 def _point_branch(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     branch: str,
     commit: str,
@@ -672,7 +666,7 @@ def _point_branch(
         _force_move(ops, repo, branch, commit, run_id=run_id, round_no=round_no, previous=previous)
         return
     try:
-        ops.raw("POST", f"/repos/{repo}/git/refs", {"ref": f"refs/heads/{branch}", "sha": commit})
+        ops.ref_create(repo, f"refs/heads/{branch}", commit)
     except GithubOpsError as exc:
         if _is_ref_refusal(exc):
             # A 422 that is not "already exists" is the repository refusing
@@ -698,7 +692,7 @@ def _point_branch(
 
 
 def _force_move(
-    ops: GithubOps,
+    ops: VcsOps,
     repo: str,
     branch: str,
     commit: str,
@@ -717,17 +711,13 @@ def _force_move(
     if hint is not None:
         fields["hint"] = hint
     log.info("deliver.branch_force_moved", **fields)
-    ops.raw("PATCH", f"/repos/{repo}/git/refs/heads/{branch}", {"sha": commit, "force": True})
+    ops.ref_force_update(repo, branch, commit)
 
 
-def _find_open_pr(ops: GithubOps, repo: str, branch: str) -> PrRef | None:
+def _find_open_pr(ops: VcsOps, repo: str, branch: str) -> PrRef | None:
     """The open PR whose head is ``branch`` — a re-delivery's earlier PR,
     which the force-moved branch has just refreshed."""
-    owner = repo.split("/", 1)[0]
-    pulls = ops.raw("GET", f"/repos/{repo}/pulls?state=open&head={owner}:{branch}")
-    if not isinstance(pulls, list):
-        return None
-    for pull in pulls:
+    for pull in ops.pr_list_open(repo, head=branch):
         if isinstance(pull, dict) and pull.get("number"):
             return PrRef(number=int(pull["number"]), url=str(pull.get("html_url", "")))
     return None
@@ -883,9 +873,7 @@ def _without_lfs_changes(
     return kept
 
 
-def _bootstrap_empty_repo(
-    ops: GithubOps, repo: str, base: str, *, run_id: str, outcome: str
-) -> None:
+def _bootstrap_empty_repo(ops: VcsOps, repo: str, base: str, *, run_id: str, outcome: str) -> None:
     """Give an empty repository its initial commit on ``base``.
 
     The contents API is the one endpoint that works with no ref to build
@@ -894,34 +882,31 @@ def _bootstrap_empty_repo(
     workspace ships its own.
     """
     readme = f"# {repo.split('/', 1)[1]}\n\nInitialized by sbxloop run {run_id}.\n"
-    ops.raw(
-        "PUT",
-        f"/repos/{repo}/contents/README.md",
-        {
-            "message": f"sbxloop run {run_id}: initialize repository\n\nOutcome: {outcome}",
-            "content": base64.b64encode(readme.encode()).decode(),
-            "branch": base,
-        },
+    ops.contents_put(
+        repo,
+        "README.md",
+        message=f"sbxloop run {run_id}: initialize repository\n\nOutcome: {outcome}",
+        content_b64=base64.b64encode(readme.encode()).decode(),
+        branch=base,
     )
 
 
-def _base_commit_sha(ops: GithubOps, repo: str, base: str) -> str | None:
+def _base_commit_sha(ops: VcsOps, repo: str, base: str) -> str | None:
     """The commit sha behind ``base``, or None when there is no such ref
     (missing branch or empty repository) — a state delivery bootstraps
     around, so it arrives as data, not as an exception."""
     return ops.ref_lookup(repo, f"heads/{base}")
 
 
-def _commit_tree_sha(ops: GithubOps, repo: str, commit_sha: str) -> str:
-    commit = ops.raw("GET", f"/repos/{repo}/git/commits/{commit_sha}")
+def _commit_tree_sha(ops: VcsOps, repo: str, commit_sha: str) -> str:
     try:
-        return str(commit["tree"]["sha"])
-    except (TypeError, KeyError) as exc:
+        return str(ops.commit_get(repo, commit_sha)["tree"]["sha"])
+    except (TypeError, KeyError, MalformedResponse) as exc:
         raise DeliveryError(f"cannot read base commit {commit_sha} of {repo}") from exc
 
 
 def _create_blobs(
-    ops: GithubOps, repo: str, uploads: dict[str, bytes], *, run_id: str | None = None
+    ops: VcsOps, repo: str, uploads: dict[str, bytes], *, run_id: str | None = None
 ) -> dict[str, str]:
     """Create all blobs via batched worker jobs; returns relative path -> sha."""
     shas: dict[str, str] = {}
@@ -991,7 +976,7 @@ def render_naming(template: str, *, title: str | None, outcome: str, run_id: str
 
 
 def _retitle(
-    ops: GithubOps, repo: str, number: int, *, current: str, wanted: str, run_id: str
+    ops: VcsOps, repo: str, number: int, *, current: str, wanted: str, run_id: str
 ) -> None:
     """Rename the open PR when a re-delivery wants a different title —
     the model retitled it in a fix round, or the template changed. Best
@@ -999,7 +984,7 @@ def _retitle(
     if not wanted or not current or current == wanted:
         return  # no current title = GitHub did not say; nothing to compare
     try:
-        ops.raw("PATCH", f"/repos/{repo}/pulls/{number}", {"title": wanted})
+        ops.pr_update(repo, number, title=wanted)
     except GithubOpsError:
         log.warning("deliver.title_unchanged", run=run_id, repo=repo, pr=number, exc_info=True)
         return
@@ -1143,13 +1128,13 @@ def _body(
     return summary + footer
 
 
-def _rebody(ops: GithubOps, repo: str, number: int, *, body: str, run_id: str) -> None:
+def _rebody(ops: VcsOps, repo: str, number: int, *, body: str, run_id: str) -> None:
     """Replace the open PR's description when a fix round authored one
     (#678) — a check that judges the body is otherwise incurable. Best
     effort, like the retitle: a refused edit must not fail a delivery
     that landed."""
     try:
-        ops.raw("PATCH", f"/repos/{repo}/pulls/{number}", {"body": body})
+        ops.pr_update(repo, number, body=body)
     except GithubOpsError:
         log.warning("deliver.body_unchanged", run=run_id, repo=repo, pr=number, exc_info=True)
         return

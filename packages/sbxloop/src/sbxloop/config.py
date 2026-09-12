@@ -31,7 +31,7 @@ import string
 import tomllib
 from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, cast
+from typing import Any, Literal, NamedTuple, cast, get_args
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -868,6 +868,65 @@ def _check_label_set(labels: Sequence[str], where: str) -> None:
         raise ValueError(f"{where} labels must be distinct (case-insensitively)")
 
 
+# Which forge holds a repository (#1009). ``github`` is the one backend
+# that answers today; ``gitlab`` and ``gitea`` load — the doctor reports
+# them as not yet implemented — so a configuration can name them before a
+# backend lands. Anything else is refused at load, naming these.
+VcsKind = Literal["github", "gitlab", "gitea"]
+VCS_KINDS: tuple[VcsKind, ...] = get_args(VcsKind)
+
+
+def _check_vcs_kind(value: object, key: str) -> VcsKind:
+    if value not in VCS_KINDS:
+        raise ValueError(f"{key} must be one of {', '.join(VCS_KINDS)}, got {value!r}")
+    return value
+
+
+def _check_https_root(value: str, key: str, example: str) -> str:
+    """A plain https URL — the root an API is served from."""
+    value = value.strip().rstrip("/")
+    parts = urlsplit(value)
+    if (
+        parts.scheme != "https"
+        or not parts.hostname
+        or parts.username is not None
+        or parts.query
+        or parts.fragment
+    ):
+        raise ValueError(f"{key} must be a plain https URL such as {example}, got {value!r}")
+    return value
+
+
+class VcsConfig(_ConfigModel):
+    """The version-control backend (#1009): which forge the configured
+    repositories live on, and where its API is served from.
+
+    ``kind`` is the daemon-wide default; a ``[[github.repos]]`` entry may
+    name its own. ``api_url`` is the forge's API root; for ``github`` it is
+    the same setting as ``[github] api_url``, and the two must agree when
+    both are set. ``[github]`` remains the section a repository is
+    declared in: it reads as ``[vcs] kind = "github"``, and the loader
+    says so once when no ``[vcs]`` section names the forge.
+    """
+
+    kind: VcsKind = "github"
+    api_url: str | None = None
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _check_kind(cls, value: object) -> VcsKind:
+        return _check_vcs_kind(value, "vcs.kind")
+
+    @field_validator("api_url")
+    @classmethod
+    def _check_api_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return _check_https_root(
+            value, "vcs.api_url", "'https://api.github.com' or 'https://gitlab.example.com'"
+        )
+
+
 class RepoConfig(_ConfigModel):
     """One repository sbxloop works with.
 
@@ -877,6 +936,9 @@ class RepoConfig(_ConfigModel):
     """
 
     repo: str
+    # Which forge holds this repository (#1009); None → `[vcs] kind`.
+    # `Config.vcs_kind_for` resolves the effective one.
+    kind: VcsKind | None = None
     agent_models: AgentModels = Field(default_factory=AgentModels)
     # Sparse `[agent.openai]` overrides for this repository; `Config.openai_for`
     # resolves the effective endpoint.
@@ -957,6 +1019,11 @@ class RepoConfig(_ConfigModel):
     @classmethod
     def _check_bot_login(cls, value: str | None) -> str | None:
         return None if value is None else _check_login(value, "github.repos[].bot_login")
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _check_kind(cls, value: object) -> VcsKind | None:
+        return None if value is None else _check_vcs_kind(value, "github.repos[].kind")
 
     @field_validator("env")
     @classmethod
@@ -1077,20 +1144,9 @@ class GithubConfig(_ConfigModel):
     @field_validator("api_url")
     @classmethod
     def _check_api_url(cls, value: str) -> str:
-        value = value.strip().rstrip("/")
-        parts = urlsplit(value)
-        if (
-            parts.scheme != "https"
-            or not parts.hostname
-            or parts.username is not None
-            or parts.query
-            or parts.fragment
-        ):
-            raise ValueError(
-                "github.api_url must be a plain https URL such as "
-                f"'https://api.github.com' or 'https://ghe.example.com/api/v3', got {value!r}"
-            )
-        return value
+        return _check_https_root(
+            value, "github.api_url", "'https://api.github.com' or 'https://ghe.example.com/api/v3'"
+        )
 
     @property
     def api_host(self) -> str:
@@ -2045,6 +2101,7 @@ DEFAULT_CONFIG_LOCKED: tuple[str, ...] = (
     "mcp",
     "credentials",
     "registries",
+    "vcs",
     "github.repos.token_env",
     "telemetry.dsn_env",
 )
@@ -2573,6 +2630,9 @@ class Config(_ConfigModel):
     credentials: list[CredentialConfig] = Field(default_factory=list)
     # External MCP servers the agent sessions may be given, by role.
     mcp: list[McpConfig] = Field(default_factory=list)
+    # The version-control backend (#1009): the forge the repositories live
+    # on. `[github]` stays the section a repository is declared in.
+    vcs: VcsConfig = Field(default_factory=VcsConfig)
     github: GithubConfig = Field(default_factory=GithubConfig)
     artifacts: ArtifactsConfig = Field(default_factory=ArtifactsConfig)
     budgets: Budgets = Field(default_factory=Budgets)
@@ -2594,6 +2654,43 @@ class Config(_ConfigModel):
     # Legacy (#818): schedules live in the daemon's database; an entry here
     # is imported into it once on daemon start and then ignored.
     schedules: list[ScheduleConfig] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def _fold_vcs_api_url(self) -> Config:
+        """``[vcs] api_url`` and ``[github] api_url`` are one setting for
+        the GitHub backend: a ``[vcs]`` value fills the ``[github]`` one
+        every consumer reads, and two different values are refused rather
+        than letting the transports and the sandboxes' allowlists disagree
+        about which server GitHub is."""
+        if self.vcs.api_url is None or self.vcs.kind != "github":
+            return self
+        github_default = type(self.github).model_fields["api_url"].default
+        if self.github.api_url == github_default:
+            self.github.api_url = self.vcs.api_url
+        elif self.github.api_url != self.vcs.api_url:
+            raise ValueError(
+                f"[vcs] api_url {self.vcs.api_url!r} and [github] api_url "
+                f"{self.github.api_url!r} disagree: set one, or the same value in both"
+            )
+        return self
+
+    def vcs_kind_for(self, repo: str | None = None) -> VcsKind:
+        """Which forge holds ``repo`` (#1009): the entry's own ``kind``,
+        else ``[vcs] kind``. ``None`` is the default repository."""
+        entry = self.github.find_repo(repo)
+        if entry is not None and entry.kind is not None:
+            return entry.kind
+        return self.vcs.kind
+
+    def vcs_kinds(self) -> tuple[VcsKind, ...]:
+        """Every forge an enabled repository lives on, in first-seen order
+        — ``[vcs] kind`` alone when no repository is configured."""
+        kinds: list[VcsKind] = []
+        for entry in self.github.enabled_repos():
+            kind = entry.kind or self.vcs.kind
+            if kind not in kinds:
+                kinds.append(kind)
+        return tuple(kinds) or (self.vcs.kind,)
 
     @field_validator("home", mode="after")
     @classmethod
@@ -3398,6 +3495,16 @@ def load_config_with_sources(
     except ValidationError as exc:
         raise ConfigError(f"invalid sbxloop configuration: {exc}") from exc
     config._model_env = dict(env)
+
+    if "github" in merged and "vcs" not in merged:
+        # The one-line notice #1009 promised: `[github]` is where a
+        # repository is declared, and it reads as the GitHub backend until
+        # `[vcs]` names the forge. Not a warning — every installation so far
+        # is configured this way and nothing about it is wrong.
+        log.info(
+            "config.vcs_defaulted",
+            hint='[github] is read as [vcs] kind = "github"; add a [vcs] section to name the forge',
+        )
 
     gh_host = (env.get("GH_HOST") or "").strip()
     if gh_host and gh_host.casefold() != config.github.web_host.casefold():

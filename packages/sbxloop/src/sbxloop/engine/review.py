@@ -38,7 +38,7 @@ from typing import Literal, NamedTuple
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from sbxloop.engine.model import PR_BODY_FILE, FixKind, TaskSpec
-from sbxloop.gh.ops import FailedCheck, ReviewComment, ReviewEvent
+from sbxloop.vcs.github.ops import FailedCheck, ReviewComment, ReviewEvent
 
 # How many inline comments one posted review may carry. A reviewer that
 # anchors a hundred nits is not reviewing, and GitHub rejects oversized

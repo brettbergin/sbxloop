@@ -13,9 +13,9 @@ model, and the run lifecycle.
 │ Engine                     LoopEngine + PhaseRunner + StateStore  │
 │                            (state machine, budgets, checkpoints)  │
 ├──────────────────────────┬────────────────────────────────────────┤
-│ Worker transport         │ GitHub ops facade                      │
-│ WorkerClient             │ GithubOps (typed github.op jobs) +     │
-│ (stream / poll)          │ engine.landing / engine.review         │
+│ Worker transport         │ Version-control backend                │
+│ WorkerClient             │ vcs.protocol roles → vcs/github        │
+│ (stream / poll)          │ (GithubOps: typed vcs.op jobs)         │
 ├──────────────────────────┴────────────────────────────────────────┤
 │ Sandbox layer              SbxCLI → Sandbox → Provisioner → Pair  │
 ├───────────────────────────────────────────────────────────────────┤
@@ -35,6 +35,74 @@ Two distributions ship from this repo in lockstep versions:
   `github-copilot-sdk` sits behind the worker's `[copilot]` extra, so the
   host never installs the Copilot runtime.
 
+## Version-control backends
+
+The host never talks to a forge directly: every read and write is a named
+operation on a backend object, and the operation runs inside the sandbox
+that holds the credential (the [credential split](#the-credential-split-in-one-picture)).
+What those operations are, and what they answer in, is fixed in two
+forge-neutral modules under `sbxloop/vcs/`; a backend package beside them
+(`vcs/github/` today) implements them against its own API.
+
+- **`vcs/protocol.py` — the roles.** Six role protocols plus one for the
+  commit path, because they have different consumers and different
+  capability profiles across forges: `RepoOps` (the repository, its
+  branches and files), `IssueOps` (issues, comments, labels, search),
+  `ChangeOps` (the pull request and its landing), `ReviewOps` (reviews,
+  inline threads, replies, resolution), `ChecksOps` (what CI reports and
+  what the change requires of it), `PolicyOps` (the credential and the
+  base's rules) and `ContentOps` (a commit built remotely, with no local
+  checkout — the least portable role). `VcsOps` is all of them at once. A
+  consumer annotates the role it needs, or `VcsOps`; never a backend. The
+  GitHub backend's `_implements` function is the type checker's proof that
+  it answers every role, and `tests/unit/test_vcs_protocol.py` holds that
+  every public operation on it belongs to exactly one.
+- **`vcs/model.py` — the shared types.** An issue or change reference, a
+  folded `ChecksVerdict`, a `ReviewThread`, the base's `BaseRequirements`:
+  the shapes the engine, the daemon and the doctor read. They carry no path,
+  no payload and no transport; a backend maps its API into them. The
+  vocabulary is the loop's own, not any forge's: a review thread and a
+  posted finding carry one opaque, backend-minted `thread_id`; a merge-queue
+  entry's state is `queued`, `testing`, `mergeable`, `blocked`, `removed` or
+  — a state the backend did not recognise, never read as mergeable —
+  `unknown`; a review comment's anchor (`path`, `line`, `side`) is the
+  caller's input, which the backend resolves into whatever its API anchors
+  on; an issue closes for a `CloseReason` the backend spells; and the
+  base's `blockers()` are phrased in the reading forge's own terms
+  (`BLOCKER_WORDING`), the GitHub wording being the one the loop has
+  always used.
+- **Capabilities are three-state, never a boolean.** A backend reports each
+  of `vcs.protocol.CAPABILITIES` (a merge queue, resolvable review threads,
+  draft changes, a request-changes review the forge enforces, a
+  host-minted short-lived token, a remote commit, required-checks
+  introspection, a bot-identity signal, signed API commits) as `SUPPORTED`,
+  `UNSUPPORTED` or `UNKNOWN`. `UNSUPPORTED` is a real answer and a design
+  input — a forge with no merge queue lands by merging directly. `UNKNOWN`
+  is a halt: the backend could not decide, and the caller names what it
+  needed and stops, the same fail-closed rule `BaseRequirements.source`
+  already follows. GitHub reports everything `SUPPORTED` except signed API
+  commits, which depend on the credential (a GitHub App's arrive signed, a
+  PAT's do not) and so are the doctor's to answer, not the transport's.
+- **The generic transport is private to the backend package.** `GithubOps.raw`,
+  `raw_lookup` and the `raw_pages` walker spell a path by hand, and fifty
+  such sites had accumulated across the host before #1010 named them. If
+  engine or daemon code needs a path, it needs a named operation on a
+  role; `tests/unit/test_vcs_raw_is_private.py` refuses a new one anywhere
+  outside `vcs/`. Without that rule the roles are decorative — callers
+  route around them the moment something is missing.
+
+`[vcs] kind` (and a `[[github.repos]]` entry's own `kind`) names the forge;
+`Config.vcs_kind_for` resolves it per repository and `sbxloop doctor` prints
+one `vcs backend <kind>` row per forge with each capability's state, or a
+failing row for a kind no backend answers yet. `[github]` stays the section
+a repository is declared in and reads as `kind = "github"`.
+
+The decision logic sits above the roles and knows no forge: the baseline
+comparison in `engine/checks.py` takes a folded verdict, not a payload; the
+wait/hold machine in `engine/landing.py` and the review round in
+`engine/review.py` read the shared types; the agent prompts never mention
+the forge at all, because the agent never touches it — the host does.
+
 ## The credential split, in one picture
 
 Two credentials exist in a deployment, and **no single VM ever holds both**.
@@ -47,7 +115,7 @@ each one into the box that needs it — never into the other.
 flowchart LR
     operator["operator<br/>chat, or a labelled issue"]
 
-    host["<b>Host — sbxloop daemon</b><br/>holds both token sources, injects each<br/>into one box only · harvests the agent's tree<br/>· speaks typed github.op jobs · mediates<br/>every hop, no VM can address another"]
+    host["<b>Host — sbxloop daemon</b><br/>holds both token sources, injects each<br/>into one box only · harvests the agent's tree<br/>· speaks typed vcs.op jobs · mediates<br/>every hop, no VM can address another"]
 
     subgraph green["Agent plane — the model runs here, and there is no GitHub token in it"]
         conc["concierge sandbox<br/>long-lived, chat's agent"]
@@ -89,7 +157,7 @@ Read three things off it:
 
 - **The agent side can never touch the repository.** It has no GitHub token
   and no route to one. Everything that reaches GitHub was harvested by the
-  host and re-spoken as a typed `github.op` job — a closed vocabulary, not a
+  host and re-spoken as a typed `vcs.op` job — a closed vocabulary, not a
   shell.
 - **The GitHub side can never be talked into anything.** It holds the token
   but runs no model and has no dev tools; it executes named ops and nothing
@@ -138,7 +206,7 @@ All traffic between them passes through the host.
 
 *Why it holds.* The model-driven side produces a tree and asks questions; the
 host harvests that tree and speaks to the credential-bearing side only in a
-closed vocabulary of typed jobs (`github.op`, `service.http`). Neither box has
+closed vocabulary of typed jobs (`vcs.op`, `service.http`). Neither box has
 an address for, or a route to, the other — the split is enforced by the same
 directionality invariant above. Stated as the property every design is held
 to: **the model's arbitrary commands never execute where a secret other than
@@ -226,7 +294,7 @@ credential:
 | credential | the configured agent credential only — `COPILOT_GITHUB_TOKEN` (`[agent] backend = "copilot"`, the default), `ANTHROPIC_API_KEY` (`"claude"`, #533), `OPENAI_API_KEY` (`"codex"`) or the variable `[agent.openai] api_key_env` names (`"openai"`) | `GH_TOKEN` only (a PAT, or a host-minted App installation token)                                                   |
 | injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows)                                                                          | built-in `github` service secret (PAT), or the in-VM env file carrying a host-minted App installation token (#568) |
 | network    | balanced policy + the backend's credential hosts (copilot's, a vendor API host, or the endpoint `[agent.openai]` names) + the `[github] api_url` hosts + plan-declared grants                                                                    | balanced policy + the `[github] api_url` hosts (+ the dotcom storage hosts when that is github.com)                |
-| runs       | agent SDK sessions (Copilot SDK, the Claude Agent SDK + Claude Code CLI, the Codex SDK, or the worker's own chat-completions loop with the openai backend), shell checks                                                                         | `github.op` jobs (gh CLI or REST)                                                                                  |
+| runs       | agent SDK sessions (Copilot SDK, the Claude Agent SDK + Claude Code CLI, the Codex SDK, or the worker's own chat-completions loop with the openai backend), shell checks                                                                         | `vcs.op` jobs (REST, or gh CLI on GitHub)                                                                          |
 
 A workload run's needs (#758) are held to a **profile** before any task
 runs. `[[workloads]]` declares each profile (`egress` patterns, the
@@ -2009,7 +2077,7 @@ these paths. Migration for an existing single-repo daemon: move
 verdicts. The host never holds the PAT, so that check is made from a
 short-lived github-ops sandbox per repository, provisioned with exactly that
 repository's credentials. The token is judged against the permission table
-in `sbxloop.gh.permissions` (`docs/permissions.md`, #696) from whichever
+in `sbxloop.vcs.github.permissions` (`docs/permissions.md`, #696) from whichever
 source describes it — the App installation's grant carried on the minted
 token, a classic PAT's `X-OAuth-Scopes` (the worker's `token.scopes` op), or
 for a fine-grained PAT one read per permission plus the repository payload's
@@ -2026,14 +2094,17 @@ to the sole configured repository when there is only one.
 
 ### Work item ids
 
-Every work item carries a **source-qualified id**. GitHub resources use a
+Every work item carries a **source-qualified id**. Forge resources use a
 **typed** grammar so a number is never ambiguous between the issue a run
-came from and the pull request it produced:
+came from and the pull request it produced, and the prefix names the forge
+— `gh:` GitHub, `gl:` GitLab, `gt:` Gitea — so one daemon can tend
+repositories on more than one without an id colliding:
 
 ```
 gh:issue:<number>    the GitHub issue a work item was claimed from (canonical)
 gh:pr:<number>       a pull request referenced as a work-item-adjacent resource
 gh:<number>          legacy alias, accepted on read, means gh:issue:<number>
+gl:issue:<number>    the same grammar on GitLab; gt: on Gitea
 ```
 
 One module, `sbxloop.ghids`, owns that grammar — `format_gh_id` /

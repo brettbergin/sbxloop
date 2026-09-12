@@ -15,8 +15,7 @@ from typing import Any
 
 import pytest
 
-from sbxloop_worker.backends import BackendUnavailableError, get_backend
-from sbxloop_worker.backends import openai as openai_backend
+from sbxloop_worker.backends import BackendUnavailableError, get_backend, openai as openai_backend
 from sbxloop_worker.backends.openai import (
     CODING_AGENT_PRESET,
     JSON_REASK,

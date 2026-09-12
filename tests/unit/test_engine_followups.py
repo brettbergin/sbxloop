@@ -27,6 +27,7 @@ from tests.conftest import FakeSbx
 from tests.fakes.fake_github import FakeGithub
 from tests.fakes.followups import with_lookups
 from tests.fakes.github_errors import github_error
+from tests.fakes.ops_stub import OpsStub
 from tests.unit.test_engine import (
     FILES_BUILD,
     FINDING,
@@ -223,7 +224,7 @@ class TestRendering:
         assert "Not filed as issues (Issues are disabled here)" in downgraded
 
 
-class FakeOps:
+class FakeOps(OpsStub):
     """Just enough of GithubOps to watch the label calls (#556): the probe
     goes through ``label_lookup`` (a 404 already turned into None by the
     worker op), the creation through ``raw``."""
@@ -350,8 +351,10 @@ class TestFilingWithExistingLabels:
         return harness.pipeline(fake).start("ship hello")
 
     @staticmethod
-    def _label_posts(fake: FakeGithub) -> list[tuple[str, str, Any]]:
-        return [c for c in fake.raw_calls if c[0] == "POST" and c[1].endswith("/labels")]
+    def _label_posts(fake: FakeGithub) -> list[str]:
+        """The repository labels the run asked to create — the backend's own
+        ledger of the operation, not of the request it made (#1014)."""
+        return list(fake.label_creates)
 
     def test_files_followups_when_every_label_already_exists(
         self, harness: Harness, caplog: pytest.LogCaptureFixture
@@ -418,8 +421,8 @@ class TestIssuesDisabled:
         assert result.state == "merged"
         assert fake.issues_created == []
         # Nothing was even attempted: no label ensure, no issue list.
-        assert not any(path.endswith("/labels") for _m, path, _b in fake.raw_calls)
-        (listed,) = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+        assert fake.label_creates == [] and fake.label_lookups == []
+        (listed,) = [c for c in fake.issue_comments_posted if c.startswith("## Follow-ups")]
         assert "Not filed as issues (Issues are disabled on this repository)" in listed
         assert "- [ ] **the greeting is not documented**" in listed
         (event,) = self._followup_events(harness)
@@ -444,7 +447,7 @@ class TestIssuesDisabled:
         result = self._run(harness, fake)
         assert result.state == "merged"
         assert fake.issues_created == []
-        (listed,) = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+        (listed,) = [c for c in fake.issue_comments_posted if c.startswith("## Follow-ups")]
         assert "Issues are disabled on this repository" in listed
         (event,) = self._followup_events(harness)
         assert event.data["mode"] == "comment" and event.data["reason"] == "issues_disabled"
@@ -511,7 +514,7 @@ def test_unchecked_followup_and_deferral_stay_on_the_pr(harness: Harness) -> Non
     result = harness.pipeline(fake).start("ship hello")
     assert result.state == "merged"
     assert fake.issues_created == []
-    (comment,) = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+    (comment,) = [c for c in fake.issue_comments_posted if c.startswith("## Follow-ups")]
     assert "no completed issue lookup" in comment
     assert "the greeting is not documented" in comment
     (event,) = [e for e in harness.events if e.type == HostEventTypes.RUN_FOLLOWUPS]
@@ -536,7 +539,7 @@ def test_semantic_duplicate_links_a_human_issue_without_creating_one(harness: Ha
     assert result.state == "merged"
     assert FOLLOWUP_A["title"] not in [t for t, _, _ in fake.issues_created]
     assert len(fake.issues_created) == 2
-    (comment,) = [c for c in fake.issue_comments if c.startswith("## Follow-ups")]
+    (comment,) = [c for c in fake.issue_comments_posted if c.startswith("## Follow-ups")]
     assert "https://github.com/o/r/issues/12" in comment
 
 
@@ -550,7 +553,7 @@ def test_failed_lookup_leaves_notes_without_changing_the_merge(
     harness.script(followup_script())
     result = harness.pipeline(fake).start("ship hello")
     assert result.state == "merged" and fake.issues_created == []
-    assert any("Not filed — issue lookup needs triage" in c for c in fake.issue_comments)
+    assert any("Not filed — issue lookup needs triage" in c for c in fake.issue_comments_posted)
     assert fake.labels_created == []
 
 

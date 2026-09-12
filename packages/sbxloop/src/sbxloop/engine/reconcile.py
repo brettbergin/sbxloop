@@ -18,7 +18,7 @@ fix round's re-delivery and the next review:
 * every reply carries a machine-readable marker naming the run and round,
   so a resume between posting a reply and recording it does not double-post.
 
-It talks to GitHub through :class:`~sbxloop.gh.ops.GithubOps` and to the
+It talks to GitHub through :class:`~sbxloop.vcs.github.ops.ReviewOps` and to the
 store through two small callbacks, which is what makes it testable with a
 fake ops object and no database.
 """
@@ -29,8 +29,9 @@ from collections.abc import Callable, Mapping, Sequence
 from typing import NamedTuple, Protocol
 
 from ..errors import GithubOpsError
-from ..gh.ops import GithubOps, ReviewThread, identities_match
 from ..log import get_logger
+from ..vcs.github.ops import ReviewThread, identities_match
+from ..vcs.protocol import ReviewOps
 from .review import (
     BLOCKING_SEVERITIES,
     CarriedVerdict,
@@ -161,7 +162,7 @@ def _anchor_index(threads: Sequence[ReviewThread]) -> dict[str, ReviewThread]:
 
 
 def reconcile_round(
-    ops: GithubOps,
+    ops: ReviewOps,
     repo: str,
     number: int,
     *,
@@ -251,7 +252,7 @@ def reconcile_round(
             )
             continue
         replied += 1
-        node_id = rec.thread_node_id or (thread.node_id if thread is not None else None)
+        node_id = rec.thread_id or (thread.thread_id if thread is not None else None)
         did_resolve = False
         # A finding the fixer addressed, or deliberately deferred to a
         # follow-up, is settled; refuted and unanswered threads stay open
@@ -336,7 +337,7 @@ class ConfirmOutcome(NamedTuple):
 
 
 def post_confirmations(
-    ops: GithubOps,
+    ops: ReviewOps,
     repo: str,
     number: int,
     *,
@@ -426,8 +427,8 @@ def post_confirmations(
             )
             continue
         replied += 1
-        node_id = (record_for.thread_node_id if record_for is not None else None) or (
-            thread.node_id if thread is not None else None
+        node_id = (record_for.thread_id if record_for is not None else None) or (
+            thread.thread_id if thread is not None else None
         )
         did_resolve = False
         if item.fixed and node_id:
@@ -527,7 +528,7 @@ class HumanRecorder(Protocol):
 
 
 def reconcile_human(
-    ops: GithubOps,
+    ops: ReviewOps,
     repo: str,
     number: int,
     *,
@@ -696,7 +697,7 @@ class NotedOutcome(NamedTuple):
 
 
 def note_nonblocking(
-    ops: GithubOps,
+    ops: ReviewOps,
     repo: str,
     number: int,
     *,
@@ -771,7 +772,7 @@ def note_nonblocking(
             )
             continue
         replied += 1
-        node_id = rec.thread_node_id or (thread.node_id if thread is not None else None)
+        node_id = rec.thread_id or (thread.thread_id if thread is not None else None)
         did_resolve = False
         if node_id:
             try:
@@ -826,7 +827,7 @@ def ack_body(*, run_id: str) -> str:
 
 
 def acknowledge_human_threads(
-    ops: GithubOps,
+    ops: ReviewOps,
     repo: str,
     number: int,
     *,

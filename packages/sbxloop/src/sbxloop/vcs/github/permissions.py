@@ -113,6 +113,19 @@ def missing_from_app(permissions: Mapping[str, str]) -> tuple[Need, ...]:
 WORKFLOWS_DIR = ".github/workflows/"
 WORKFLOWS_NEED = next(n for n in NEEDS if n.permission == "workflows")
 
+# The read a fine-grained PAT is asked to prove each permission with
+# (#696): GitHub answers 401/403 when the permission is not on the token,
+# and anything else — 200, an empty list, 404 on an empty repository, 422
+# — means the permission is there. ``{repo}`` and ``{base}`` are filled in;
+# a probe naming ``{base}`` cannot run until the repository has one.
+READ_PROBES: dict[str, str] = {
+    "contents": "/repos/{repo}/commits?per_page=1&sha={base}",
+    "issues": "/repos/{repo}/issues?per_page=1",
+    "pull_requests": "/repos/{repo}/pulls?per_page=1",
+    "checks": "/repos/{repo}/commits/{base}/check-runs?per_page=1",
+    "actions": "/repos/{repo}/actions/runs?per_page=1",
+}
+
 
 def workflow_paths(paths: Iterable[str]) -> tuple[str, ...]:
     """The entries of a delivery plan GitHub will hold to ``workflows:

@@ -886,9 +886,7 @@ class TestPostedFindings:
         )
 
         posted = store.posted_findings("r1")
-        assert [
-            (p.round, p.anchor, p.comment_id, p.thread_node_id, p.body_only) for p in posted
-        ] == [
+        assert [(p.round, p.anchor, p.comment_id, p.thread_id, p.body_only) for p in posted] == [
             (1, "a.py:10", 101, "PRRT_1", False),
             (1, "gone.py:99", None, None, True),
             (2, "b.py:3", 102, "PRRT_2", False),
@@ -1019,3 +1017,31 @@ class TestTheClaimIsAtomic:
                 other.close()
         finally:
             store.close()
+
+
+def test_posted_records_read_the_neutral_and_the_legacy_thread_key(tmp_path: Path) -> None:
+    """#1012: a row written before the thread id was neutral spells it
+    ``thread_node_id``; one written since spells it ``thread_id``. Both
+    read as the same record, so a run that straddles the change
+    reconciles its earlier rounds' findings."""
+    store = StateStore(tmp_path / "state.db")
+    try:
+        store.create_run("r1", "ship it")
+        TestPostedFindings._record(
+            store,
+            1,
+            7001,
+            [
+                {"anchor": "a.py:10", "comment_id": 101, "thread_node_id": "PRRT_1"},
+                {"anchor": "b.py:3", "comment_id": 102, "thread_id": "PRRT_2"},
+                {"anchor": "gone.py:99", "comment_id": None, "thread_id": None},
+            ],
+        )
+        posted = store.posted_findings("r1")
+    finally:
+        store.close()
+    assert [(p.anchor, p.thread_id) for p in posted] == [
+        ("a.py:10", "PRRT_1"),
+        ("b.py:3", "PRRT_2"),
+        ("gone.py:99", None),
+    ]

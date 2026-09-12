@@ -18,11 +18,12 @@ from sbxloop.daemon.sources import (
 )
 from sbxloop.errors import GithubOpsError
 from tests.fakes.github_errors import github_error
+from tests.fakes.ops_stub import OpsStub
 
 from .test_daemon_sources import LABELS, RecordingOps, issue
 
 
-class RouterOps:
+class RouterOps(OpsStub):
     """One GithubOps stand-in fronting a RecordingOps per repository.
 
     The daemon has a single github-ops sandbox; every call carries the repo

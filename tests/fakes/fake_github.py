@@ -1,4 +1,4 @@
-"""A scripted stand-in for :class:`sbxloop.gh.ops.GithubOps`.
+"""A scripted stand-in for :class:`sbxloop.vcs.github.ops.GithubOps`.
 
 The engine's ``github_ops`` seam accepts a factory returning any GithubOps;
 this one answers every call the pipeline makes from in-memory state and
@@ -50,7 +50,7 @@ from typing import Any
 from urllib.parse import parse_qs, quote, unquote
 
 from sbxloop.errors import GithubOpsError
-from sbxloop.gh.ops import (
+from sbxloop.vcs.github.ops import (
     ChecksVerdict,
     FailedCheck,
     GithubOps,
@@ -232,7 +232,7 @@ class FakeGithub(GithubOps):
         self.pr_create_calls = 0
         self.threads: list[ReviewThread] = []
         self.replies: list[tuple[int, str]] = []
-        self.issue_comments: list[str] = []
+        self.issue_comments_posted: list[str] = []
         # Follow-up issues filed after the merge (#517), and the labels the
         # engine made sure exist; `existing_issues` seeds the label listing.
         self.issues_created: list[tuple[str, str, list[str]]] = []
@@ -244,12 +244,28 @@ class FakeGithub(GithubOps):
         # leaves the payload silent (the 410 alone then decides).
         self.has_issues: bool | None = True
         self.labels_created: list[str] = []
+        # The single-label reads and the creates a run asked for (#1014), by
+        # name — the operations, whether or not the repository already had
+        # the label.
+        self.label_lookups: list[str] = []
+        self.label_creates: list[str] = []
         # Labels the repository already carries before the run (#556): a
         # single-label GET finds these, and creating one is a 422.
         self.labels_existing: set[str] = set()
         self.existing_issues: list[dict[str, Any]] = []
         self.issue_search_payload: Any = None
         self.issue_list_payload: Any = None
+        # The named operations' remaining endpoints (#1010), each a knob
+        # for what GitHub answers and a ledger of what was written.
+        self.issue_events_payload: list[dict[str, Any]] = []
+        self.check_runs_payload: list[dict[str, Any]] = []
+        self.workflows_payload: list[dict[str, Any]] = []
+        self.workflow_runs_payload: list[dict[str, Any]] = []
+        self.repos_created: list[tuple[str, dict[str, Any]]] = []
+        self.contents_written: list[tuple[str, dict[str, Any]]] = []
+        self.comments_deleted: list[int] = []
+        self.issues_closed: list[tuple[int, str]] = []
+        self.labels_removed: list[tuple[int, str]] = []
         self.resolved: list[str] = []
         self._comment_id = 0
         self._commits = 0
@@ -367,6 +383,7 @@ class FakeGithub(GithubOps):
         A 404 is an answer — no failed worker job — while any other failure
         still raises, as the real ``label.get`` op does under
         ``allow_missing``."""
+        self.label_lookups.append(name)
         with self._allow_missing():
             try:
                 data = self.raw("GET", f"/repos/{repo}/labels/{quote(name, safe='')}")
@@ -499,7 +516,7 @@ class FakeGithub(GithubOps):
                 if str(issue.get("number")) == path.rsplit("/", 1)[1]:
                     return dict(issue)
             raise GithubOpsError("issue not found", http_status=404)
-        if method == "GET" and "page=" in query and not query.endswith("page=1"):
+        if method == "GET" and int(parse_qs(query).get("page", ["1"])[0]) > 1:
             return []
         if method == "GET" and path == "/user":
             if self.fail_user_lookup is not None:
@@ -572,7 +589,7 @@ class FakeGithub(GithubOps):
             return list(self.reviews_payload)
         if method == "GET" and "/issues/" in path and path.endswith("/comments"):
             # The PR-as-issue comment listing: what pr_issue_comment posted.
-            return [{"body": body} for body in self.issue_comments]
+            return [{"body": body} for body in self.issue_comments_posted]
         if method == "GET" and path.endswith("/comments"):
             return list(self.comments_payload)
         if method == "GET" and path.endswith("/pulls") and "state=open&head=" in query:
@@ -624,6 +641,7 @@ class FakeGithub(GithubOps):
         if method == "POST" and path.endswith("/labels"):
             # Repository label creation (#517): an existing one is a 422.
             assert body is not None
+            self.label_creates.append(str(body["name"]))
             if body["name"] in self.labels_created or body["name"] in self.labels_existing:
                 raise self._failed(
                     "raw.api",
@@ -660,7 +678,7 @@ class FakeGithub(GithubOps):
             self._comment_id += 1
             self.threads.append(
                 ReviewThread(
-                    node_id=f"PRRT_{self._comment_id}",
+                    thread_id=f"PRRT_{self._comment_id}",
                     is_resolved=False,
                     path=str(body["path"]),
                     line=int(body["line"]),
@@ -671,6 +689,64 @@ class FakeGithub(GithubOps):
                 "id": self._comment_id,
                 "html_url": f"{self.pr['html_url']}#discussion_r{self._comment_id}",
             }
+        if method == "POST" and (path == "/user/repos" or re.fullmatch(r"/orgs/[^/]+/repos", path)):
+            assert body is not None
+            self.repos_created.append((path, dict(body)))
+            owner = self.repo.split("/", 1)[0] if path == "/user/repos" else path.split("/")[2]
+            return {
+                "html_url": f"https://github.com/{owner}/{body['name']}",
+                "has_issues": True,
+                "default_branch": "main",
+            }
+        if method == "PUT" and "/contents/" in path:
+            assert body is not None
+            self.contents_written.append((path.split("/contents/", 1)[1], dict(body)))
+            return {
+                "content": {"path": path.split("/contents/", 1)[1]},
+                "commit": {"sha": "init0001"},
+            }
+        if method == "DELETE" and "/issues/comments/" in path:
+            self.comments_deleted.append(int(path.rsplit("/", 1)[1]))
+            return {}
+        if method == "DELETE" and "/issues/" in path and "/labels/" in path:
+            number = int(path.split("/issues/", 1)[1].split("/", 1)[0])
+            name = unquote(path.rsplit("/labels/", 1)[1])
+            self.labels_removed.append((number, name))
+            for issue in self.existing_issues:
+                if issue.get("number") == number:
+                    issue["labels"] = [
+                        lb
+                        for lb in issue.get("labels") or []
+                        if (lb.get("name") if isinstance(lb, dict) else lb) != name
+                    ]
+            return []
+        if method == "PATCH" and re.fullmatch(r"/repos/[^/]+/[^/]+/issues/\d+", path):
+            assert body is not None and body.get("state") == "closed"
+            number = int(path.rsplit("/", 1)[1])
+            self.issues_closed.append((number, str(body.get("state_reason") or "")))
+            for issue in self.existing_issues:
+                if issue.get("number") == number:
+                    issue.update(body)
+                    return dict(issue)
+            return {"number": number, **body}
+        if method == "GET" and re.fullmatch(r"/repos/[^/]+/[^/]+/issues/\d+/events", path):
+            return list(self.issue_events_payload)
+        if method == "GET" and path.endswith("/issues"):
+            self._maybe_fail("issue_list")
+            if self.issue_list_payload is not None:
+                return self.issue_list_payload
+            return list(self.existing_issues)
+        if method == "GET" and path.endswith("/check-runs"):
+            return {"check_runs": list(self.check_runs_payload)}
+        if method == "GET" and path.endswith("/actions/workflows"):
+            return {"workflows": list(self.workflows_payload)}
+        if method == "GET" and path.endswith("/actions/runs"):
+            return {"workflow_runs": list(self.workflow_runs_payload)}
+        if method == "GET" and (path.endswith("/commits") or path.endswith("/pulls")):
+            # The permission probes' reads (#696): a listing, whatever it holds.
+            return []
+        if method == "GET" and path == "/rate_limit":
+            return {"resources": {"core": {"limit": 5000, "remaining": 4999}}}
         raise AssertionError(f"FakeGithub: unexpected raw call {method} {path}")
 
     # -- the pull request ----------------------------------------------------
@@ -781,7 +857,7 @@ class FakeGithub(GithubOps):
             node_id = f"PRRT_{self._comment_id}"
             self.threads.append(
                 ReviewThread(
-                    node_id=node_id,
+                    thread_id=node_id,
                     is_resolved=False,
                     path=comment.path,
                     line=comment.line,
@@ -811,15 +887,15 @@ class FakeGithub(GithubOps):
         return f"{self.pr['html_url']}#discussion_r{comment_id}"
 
     def pr_issue_comment(self, repo: str, number: int, body: str) -> str:
-        self.issue_comments.append(body)
+        self.issue_comments_posted.append(body)
         self._maybe_fail("pr_issue_comment")
-        return f"{self.pr['html_url']}#issuecomment-{len(self.issue_comments)}"
+        return f"{self.pr['html_url']}#issuecomment-{len(self.issue_comments_posted)}"
 
-    def resolve_review_thread(self, thread_node_id: str) -> bool:
-        self.resolved.append(thread_node_id)
+    def resolve_review_thread(self, thread_id: str) -> bool:
+        self.resolved.append(thread_id)
         self._maybe_fail("resolve_review_thread")
         for index, thread in enumerate(self.threads):
-            if thread.node_id == thread_node_id:
+            if thread.thread_id == thread_id:
                 self.threads[index] = thread._replace(is_resolved=True)
                 return True
         return False
@@ -862,7 +938,7 @@ class FakeGithub(GithubOps):
                 "enqueuePullRequest failed: [{'type': 'UNPROCESSABLE', 'message': "
                 "'Pull request is not mergeable'}]"
             )
-        return QueueEntry(id="MQE_1", state="QUEUED", position=1, head="queue0")
+        return QueueEntry(id="MQE_1", state="queued", position=1, head="queue0")
 
     def pr_queue_state(self, repo: str, number: int) -> QueueState:
         self.queue_reads += 1
