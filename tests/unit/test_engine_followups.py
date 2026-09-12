@@ -351,8 +351,10 @@ class TestFilingWithExistingLabels:
         return harness.pipeline(fake).start("ship hello")
 
     @staticmethod
-    def _label_posts(fake: FakeGithub) -> list[tuple[str, str, Any]]:
-        return [c for c in fake.raw_calls if c[0] == "POST" and c[1].endswith("/labels")]
+    def _label_posts(fake: FakeGithub) -> list[str]:
+        """The repository labels the run asked to create — the backend's own
+        ledger of the operation, not of the request it made (#1014)."""
+        return list(fake.label_creates)
 
     def test_files_followups_when_every_label_already_exists(
         self, harness: Harness, caplog: pytest.LogCaptureFixture
@@ -419,7 +421,7 @@ class TestIssuesDisabled:
         assert result.state == "merged"
         assert fake.issues_created == []
         # Nothing was even attempted: no label ensure, no issue list.
-        assert not any(path.endswith("/labels") for _m, path, _b in fake.raw_calls)
+        assert fake.label_creates == [] and fake.label_lookups == []
         (listed,) = [c for c in fake.issue_comments_posted if c.startswith("## Follow-ups")]
         assert "Not filed as issues (Issues are disabled on this repository)" in listed
         assert "- [ ] **the greeting is not documented**" in listed

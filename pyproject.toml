@@ -105,6 +105,10 @@ markers = [
     # by hand on real-git (lfs, submodules) and packaging tests. The commit
     # gate is `-m "not slow"`; CI runs both halves.
     "slow: process-bound tests (fake sbx, real workers, real git, builds)",
+    # A conformance scenario's declared capabilities (tests/conformance): a
+    # backend that reports one UNSUPPORTED skips the scenario with the
+    # capability named; one that reports UNKNOWN fails it.
+    "needs(*capabilities): the vcs capabilities a conformance scenario relies on",
     # The host-portability rows whose facts only the platform itself can
     # settle (a venv's real entry points, what chmod does on Windows). CI
     # runs `-m windows_host` on a Windows runner as well as in the Linux

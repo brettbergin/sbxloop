@@ -244,6 +244,11 @@ class FakeGithub(GithubOps):
         # leaves the payload silent (the 410 alone then decides).
         self.has_issues: bool | None = True
         self.labels_created: list[str] = []
+        # The single-label reads and the creates a run asked for (#1014), by
+        # name — the operations, whether or not the repository already had
+        # the label.
+        self.label_lookups: list[str] = []
+        self.label_creates: list[str] = []
         # Labels the repository already carries before the run (#556): a
         # single-label GET finds these, and creating one is a 422.
         self.labels_existing: set[str] = set()
@@ -378,6 +383,7 @@ class FakeGithub(GithubOps):
         A 404 is an answer — no failed worker job — while any other failure
         still raises, as the real ``label.get`` op does under
         ``allow_missing``."""
+        self.label_lookups.append(name)
         with self._allow_missing():
             try:
                 data = self.raw("GET", f"/repos/{repo}/labels/{quote(name, safe='')}")
@@ -635,6 +641,7 @@ class FakeGithub(GithubOps):
         if method == "POST" and path.endswith("/labels"):
             # Repository label creation (#517): an existing one is a 422.
             assert body is not None
+            self.label_creates.append(str(body["name"]))
             if body["name"] in self.labels_created or body["name"] in self.labels_existing:
                 raise self._failed(
                     "raw.api",
