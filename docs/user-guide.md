@@ -303,6 +303,33 @@ downloads anything, and names what to install rather than failing later with
 a traceback. `GIT_PYTHON_GIT_EXECUTABLE`, if you set it, is the executable
 the check looks at, since it is the one sbxloop will use.
 
+### Installation and host preparation are different jobs
+
+Everything sbxloop installs lands under the home, which the invoking account
+already owns — no step of the install needs root. What the *host* has to be
+able to do is separate, one-time, and on Linux partly an administrator's:
+
+| Capability                         | Who does it               | Without it                                                        |
+| ---------------------------------- | ------------------------- | ----------------------------------------------------------------- |
+| `/dev/kvm` exists                  | administrator             | no sandbox boots: a sandbox is a microVM                          |
+| `/dev/kvm` openable by the account | administrator             | same, and the usual cause — Docker documents the `kvm` group      |
+| `mkfs.ext4` (e2fsprogs)            | administrator             | Docker's sbx installer refuses to run, so `init` refuses too      |
+| sbx's AppArmor profile in `/etc`   | administrator             | the sandbox backend cannot start; `init` says so and carries on   |
+| a reachable `systemctl --user`     | log in as the account     | `init --systemd` refuses rather than writing units nothing runs   |
+| `loginctl enable-linger <account>` | account, or administrator | the daemon stops at logout — unattended persistence is not set up |
+
+None of this is done for you: no check joins a group, installs a package,
+starts a sandbox, or elevates a privilege. Each is *reported* instead —
+`sbxloop init` notes what it found, `sbxloop doctor` shows the same rows at
+any time, and the access checks ask the kernel whether this account can open
+the device rather than reading a group list (a group added in the current
+shell does not reach a running process until the next login).
+
+Only the relevant checks apply. On macOS, which brings its own
+virtualisation, none of the Linux rows appear at all; a `--no-systemd`
+install is never judged against a service manager it did not ask for; and a
+`--no-sbx` install is never judged against `mkfs.ext4`.
+
 ```bash
 curl -fsSL https://raw.githubusercontent.com/brettbergin/sbxloop/main/scripts/install.sh | sh
 export PATH="$HOME/.sbxloop/bin:$PATH"

@@ -538,6 +538,27 @@ def workspace_origin_checks(config: Config) -> list[Check]:
     ]
 
 
+def host_prep_checks(env: dict[str, str]) -> list[Check]:
+    """The host preparation an install cannot do for the operator (#898):
+    the kernel's virtualisation device and the sandbox backend's filesystem
+    tools, each with what it found and who has to fix it.
+
+    Soft rows. They diagnose a host, and every remedy is a one-time task —
+    some of them an administrator's — so they say what is wrong rather than
+    standing between an operator and the rest of the report; the sbx rows
+    below are what actually fail when a sandbox cannot boot. Off Linux the
+    capabilities do not apply and no row is shown at all.
+    """
+    from sbxloop.hostprep import HostPrep
+
+    prep = HostPrep(env=env)
+    return [
+        Check(f"host {capability.name}", capability.ready, capability.message, hard=False)
+        for capability in prep.sandbox_capabilities()
+        if capability.applicable
+    ]
+
+
 def host_lfs_check(config: Config) -> Check:
     """Whether the host can populate a Git LFS checkout (#693).
 
@@ -1059,6 +1080,7 @@ def collect_checks(
     cli = cli or SbxCLI(app_name=config.app_name or None)
     checks: list[Check] = []
     checks.append(host_check())
+    checks.extend(host_prep_checks(env))
     report = progress or (lambda _message: None)
 
     # sbx binary + version. The very first sbx invocation may trigger
@@ -1540,7 +1562,32 @@ def _launcher_checks(home: SbxloopHome, env: dict[str, str]) -> list[Check]:
                 hard=False,
             )
         )
+    checks.extend(_service_checks(home, env))
     return checks
+
+
+def _service_checks(home: SbxloopHome, env: dict[str, str]) -> list[Check]:
+    """Whether the units this home carries can actually run unattended
+    (#898): a per-user manager this session reaches, and an account whose
+    services survive logout.
+
+    Scoped to an install that asked for user units — a `--no-systemd` home
+    has none rendered, and judging it against a service manager it never
+    wanted would fail a supported mode. Soft rows: both remedies are the
+    operator's or an administrator's to run, and neither is something
+    doctor may do on their behalf.
+    """
+    from sbxloop.homeinit import UNIT_NAMES
+    from sbxloop.hostprep import HostPrep
+
+    if not all(home.unit(name).exists() for name in UNIT_NAMES):
+        return []
+    prep = HostPrep(env=env)
+    return [
+        Check(capability.name, capability.ready, capability.message, hard=False)
+        for capability in prep.service_capabilities(prep.login_name())
+        if capability.applicable
+    ]
 
 
 def home_checks(home: SbxloopHome, env: dict[str, str]) -> list[Check]:

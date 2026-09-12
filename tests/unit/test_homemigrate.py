@@ -23,6 +23,7 @@ from sbxloop.homemigrate import (
     migrate_options_for,
 )
 from sbxloop.paths import SbxloopHome
+from tests.fakes.fake_host import fake_prep
 from tests.unit.test_homeinit import FakeFetch, FakeRun
 
 
@@ -143,6 +144,9 @@ def make_migration(tmp_path: Path, host: dict[str, Any], **opts: Any) -> HomeMig
         machine="x86_64",
         sys_prefix=tmp_path / ".sbxloop-venv",
         user_units=host["units"],
+        # A prepared Linux host: a migration is about what moves, and the
+        # runner's own kvm device, PATH and session are none of its business.
+        prep=fake_prep(env=host["env"]),
     )
     return HomeMigration(host["home"], legacy, MigrateOptions(**opts), init=init, run=host["run"])
 
