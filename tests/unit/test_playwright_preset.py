@@ -31,11 +31,11 @@ def test_init_can_generate_a_self_contained_playwright_setup(
 
 
 @pytest.mark.parametrize(("backend", "stdio_type"), [("copilot", "local"), ("claude", "stdio")])
-def test_playwright_reaches_the_builder_on_both_backends(backend: str, stdio_type: str) -> None:
+def test_preset_servers_reach_the_builder_on_both_backends(backend: str, stdio_type: str) -> None:
     data = tomllib.loads(render_config_template("playwright"))
     data["agent"]["backend"] = backend
     config = Config.model_validate(data)
-    (spec,) = config.mcp_specs_for("builder")
+    spec, context7 = config.mcp_specs_for("builder")
     assert spec.name == "playwright"
     assert spec.transport == "stdio" and not spec.mediated
     assert not spec.env and not spec.headers
@@ -43,8 +43,13 @@ def test_playwright_reaches_the_builder_on_both_backends(backend: str, stdio_typ
     assert sdk["type"] == stdio_type
     assert sdk["command"] == spec.command
     assert sdk["args"] == spec.args
+    assert server_configs([context7], stdio_type=stdio_type)["context7"] == {
+        "type": "http",
+        "url": "https://mcp.context7.com/mcp",
+    }
     for role in ("planner", "operator", "critic", "concierge"):
         assert config.mcp_specs_for(role) == []
     allows = agent_policy_allows(config, config.sandbox.effective_languages)
     assert set(config.mcp[0].hosts) <= set(allows)
+    assert "mcp.context7.com" in allows
     assert config.mcp_hosts_for(CONCIERGE_MCP_ROLES) == []
