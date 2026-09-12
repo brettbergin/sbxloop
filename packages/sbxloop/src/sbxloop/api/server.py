@@ -20,6 +20,7 @@ from typing import Any
 from sbxloop.api.context import ApiContext
 from sbxloop.api.projector import Projector
 from sbxloop.config import ApiConfig
+from sbxloop.daemon.controls.steering import SteeringStore
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
@@ -70,6 +71,13 @@ class ApiServer:
             if self._failed is not None:
                 raise RuntimeError(f"the API listener did not start: {self._failed}")
             raise RuntimeError("the API listener did not start within 10 s")
+        # The listener starts before recovery: no run is in flight, so a
+        # steering instruction still waiting from the last process will
+        # never be answered — its receipt says so.
+        try:
+            SteeringStore(self.ctx.loop.dstore).settle_orphans(None, self.ctx.clock())
+        except Exception:
+            log.warning("api.steering_settle_failed", exc_info=True)
         self.ctx.projector.start()
         log.info("api.started", bind=self.config.bind, port=self.port)
 

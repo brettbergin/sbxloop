@@ -163,6 +163,16 @@ class RestartOutcome(Outcome):
     after: Callable[[], None] = Field(exclude=True)
 
 
+class SteerOutcome(Outcome):
+    """An instruction handed to the run in flight (#1038): its record, and
+    the engine's message id the reply will carry."""
+
+    steering_id: str
+    run_id: str
+    message_id: str
+    status: Literal["delivered"] = "delivered"
+
+
 class GateOutcome(Outcome):
     """A merge gate approved or a held result released; ``message`` is
     the loop's own sentence (it names the PR and the person)."""

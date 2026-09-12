@@ -3080,12 +3080,17 @@ class DaemonStore:
                 )
             ]
 
-    def claim_merge_gate(self, run_id: str, by: str | None = None) -> bool:
+    def claim_merge_gate(
+        self, run_id: str, by: str | None = None, *, expected_revision: int | None = None
+    ) -> bool:
         """CAS ``open → approving``: exactly one click/command wins; a
         double-click loses here instead of double-merging. ``by`` records
-        who won, for the resolution that follows to name."""
+        who won, for the resolution that follows to name. With
+        ``expected_revision`` the swap also requires the gate row to be at
+        that revision, so an approval given for an earlier state of the
+        gate loses here too (#1038)."""
         with self._write() as session:
-            result = session.execute(
+            stmt = (
                 update(MergeGateRow)
                 .where(MergeGateRow.run_id == run_id, MergeGateRow.state == "open")
                 .values(
@@ -3093,7 +3098,21 @@ class DaemonStore:
                     resolved_by=func.coalesce(by, MergeGateRow.resolved_by),
                 )
             )
+            if expected_revision is not None:
+                stmt = stmt.where(MergeGateRow.revision == expected_revision)
+            result = session.execute(stmt)
             return _rowcount(result) == 1
+
+    def merge_gates(self, states: Sequence[str] | None = None) -> list[MergeGate]:
+        """Every gate, newest first, optionally only in ``states`` — the
+        remote API's listing."""
+        stmt = select(MergeGateRow).order_by(
+            MergeGateRow.created_at.desc(), MergeGateRow.run_id.desc()
+        )
+        if states:
+            stmt = stmt.where(MergeGateRow.state.in_(list(states)))
+        with self._read() as session:
+            return [_row_to_gate(row) for row in session.scalars(stmt)]
 
     def reopen_merge_gate(self, run_id: str, detail: str | None = None) -> None:
         """A failed or interrupted approval puts the gate back up; the

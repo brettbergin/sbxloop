@@ -2025,6 +2025,30 @@ History is kept for `[api] replay_retention_s`; a cursor below what remains is
 `410 cursor_expired` with a pointer to the snapshot, never a silent skip. Live
 streams are bounded by `[api] max_stream_clients`.
 
+**Steering and deciding.** `POST /v1/runs/{id}/steering` (`runs:steer`; body
+`{"text": …, "source_refs": [...], "expected_revision": …}`) hands explicit
+direction to the run in flight — the same input path a message in the run's
+chat thread takes — and answers `202` with a steering record (`str_…`) whose
+status follows what became of it: `delivered` when the run took it,
+`handled` with the agent's `reply` and the `action` it took once the reply
+lands, `failed` when the daemon refused it, `undelivered` when the run ended
+first. `GET /v1/runs/{id}/steering` lists them. Instructions are handed over
+in the order they arrive and answered in turn, so conflicting directions are
+all heard and the later one is heard last; a run that is not in flight, or a
+tool run, is refused by name. `GET /v1/gates` and `/v1/gates/{id}` show the
+merge and publication gates with their `revision`, subject (`pull_request`,
+`head_sha`) and required authority; `POST /v1/gates/{id}/approve`
+(`gates:approve`; `expected_revision` required) endorses exactly the gate the
+person saw — a gate that moved is `409 stale_revision`, a second approval `409 already_in_progress` — and commits the release; the merge or publication
+completes afterwards and lands as `gate.resolved` in the chronology. A base
+that requires an approving review still waits for one: the API's approval is
+the daemon's, not the reviewer's. `POST /v1/runs/{id}/cancel` (`202`,
+honoured at the run's next boundary; never another run that happens to be
+current), `/resume`, `/round-grants` (`budgets:grant`; `{"rounds": n}`) and
+`/review-wait/resume` are the ctl verbs of the same names, each with an
+optional `expected_revision`. Every one of these is a `command` on the
+WebSocket too.
+
 ## Artifacts
 
 Every job in a run executes in the run's **workspace** — a host directory

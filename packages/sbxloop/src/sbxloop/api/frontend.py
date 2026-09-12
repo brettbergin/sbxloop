@@ -14,6 +14,7 @@ from typing import Any
 from sbxloop.api.chronology import DAEMON_ACTOR, Chronology
 from sbxloop.api.projector import Projector
 from sbxloop.api.stream import StreamHub
+from sbxloop.daemon.controls.steering import SteeringStore
 from sbxloop.daemon.model import DaemonNotice, RunReport, WorkItem
 from sbxloop.daemon.store import MergeGate
 from sbxloop.events import EventBus
@@ -96,6 +97,12 @@ class ApiFrontend:
                 "requeued": report.requeued,
             },
         )
+        # Whatever the run never answered is undelivered now; the receipt
+        # says so rather than implying the instruction changed the work.
+        try:
+            SteeringStore(self.chronology.dstore).undelivered_for_run(report.run_id, self.clock())
+        except Exception:
+            log.warning("api.steering_settle_failed", run=report.run_id, exc_info=True)
         if self.projector is not None:
             self.projector.wake()
 

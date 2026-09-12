@@ -33,12 +33,17 @@ carry their own prefix rather than ``daemon_``.
   issue numbers never alias). Assigned lazily on first read, stable
   after.
 
+* ``api_steering`` is one row per steering instruction a client submitted:
+  who, for which run at which revision, the text and what it cites, and
+  what became of it — delivered to the run, handled with the agent's
+  reply and action, refused, or never heard because the run ended first.
+
 JSON lives in ``TEXT`` columns, serialised in Python, as everywhere else.
 """
 
 from __future__ import annotations
 
-from sqlalchemy import REAL, Index, Integer, Text, UniqueConstraint, text
+from sqlalchemy import REAL, Index, Integer, Text, UniqueConstraint, text, text as sql_text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sbxloop.db.base import Base
@@ -149,3 +154,31 @@ class PublicIdRow(Base):
     workspace_id: Mapped[str] = mapped_column(Text, nullable=False)
     internal_key: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
+
+
+class SteeringRow(Base):
+    __tablename__ = "api_steering"
+    __table_args__ = (
+        Index("idx_api_steering_run", "run_id", "submitted_at"),
+        Index("idx_api_steering_message", "message_id"),
+    )
+
+    id: Mapped[str] = mapped_column(Text, primary_key=True)
+    run_id: Mapped[str] = mapped_column(Text, nullable=False)
+    message_id: Mapped[str | None] = mapped_column(Text)
+    principal_json: Mapped[str] = mapped_column(Text, nullable=False)
+    text: Mapped[str] = mapped_column(Text, nullable=False)
+    # ``sql_text``: the ``text`` column above shadows the import in this body.
+    source_refs_json: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=sql_text("'[]'")
+    )
+    expected_revision: Mapped[int | None] = mapped_column(Integer)
+    submitted_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    deadline_at: Mapped[float | None] = mapped_column(REAL)
+    status: Mapped[str] = mapped_column(Text, nullable=False)
+    delivered_at: Mapped[float | None] = mapped_column(REAL)
+    handled_at: Mapped[float | None] = mapped_column(REAL)
+    reply: Mapped[str | None] = mapped_column(Text)
+    action: Mapped[str | None] = mapped_column(Text)
+    error: Mapped[str | None] = mapped_column(Text)
+    operation_id: Mapped[str | None] = mapped_column(Text)

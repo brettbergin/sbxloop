@@ -725,6 +725,51 @@ class DaemonLoop:
         )
         return CancelOutcome(mode="queued", target=run_id, message=reason)
 
+    def steer_run(
+        self,
+        run_id: str,
+        text: str,
+        *,
+        by: str | None = None,
+        expected_revision: int | None = None,
+    ) -> str:
+        """Hand an instruction to the run in flight (#1038): the same
+        ``post_user_message`` a chat thread uses, so the agent pauses at
+        its next boundary, answers, and applies any course change.
+        Returns the engine's message id, which the run's ``chat.reply``
+        carries back. Refused by name when ``run_id`` is not the run in
+        flight (``not_eligible`` with its state, or ``unknown_target``),
+        when it is a tool run (nothing to steer), or when
+        ``expected_revision`` is not the run's — all judged under the
+        current-run lock, so the run cannot end between the check and the
+        hand-over."""
+        with self._current_lock:
+            handle = self._current
+            if handle is None or handle.run_id != run_id:
+                handle = None
+            else:
+                check_eligibility("steer", Subject(run_kind=handle.item.kind, is_current=True))
+                self._check_revision(run_id, expected_revision)
+                message_id = handle.engine.post_user_message(text)
+        if handle is None:
+            try:
+                record = self.store.get_run(run_id)
+            except SbxloopError as exc:
+                raise ControlError("unknown_target", f"unknown run {run_id}") from exc
+            raise ControlError(
+                "not_eligible",
+                f"run {run_id} is {record.state}; steering needs the run in flight",
+            )
+        log.info(
+            "run.steer",
+            run=run_id,
+            item=handle.item.item_id,
+            by=by or "operator",
+            message=message_id,
+            chars=len(text),
+        )
+        return message_id
+
     def _check_revision(self, run_id: str, expected: int | None) -> None:
         if expected is None:
             return
@@ -3034,17 +3079,29 @@ class DaemonLoop:
                 pr=hold.pr_number,
             )
 
-    def approve_merge(self, target: str, by: str | None = None) -> str:
+    def approve_merge(
+        self, target: str, by: str | None = None, *, expected_revision: int | None = None
+    ) -> str:
         """One human approval for a parked merge (``[landing] merge_gate``).
 
         Fast and event-loop-safe: resolve the gate, win (or lose) the CAS,
         spawn the gh-ops-only landing thread, answer in prose. Refusals
-        raise ``ValueError`` with the reason."""
+        raise ``ValueError`` with the reason. With ``expected_revision``
+        (a remote client's, #1038) the approval binds to that revision of
+        the gate: the swap to ``approving`` requires it, a gate that moved
+        is ``stale_revision``, and a lost swap is ``already_in_progress``
+        — typed refusals, since the caller is not a person reading prose."""
         gate = self.dstore.merge_gate_for(target.strip())
         if gate is None:
             raise ValueError(f"no merge gate for {target!r} — nothing is awaiting approval")
+        if expected_revision is not None and gate.revision != expected_revision:
+            raise ControlError(
+                "stale_revision",
+                f"gate for {gate.item_id} is at revision {gate.revision}, not {expected_revision}",
+                revision=gate.revision,
+            )
         if gate.kind == "publish":
-            return self._release_hold(gate, by)
+            return self._release_hold(gate, by, expected_revision=expected_revision)
         if gate.state == "merged":
             raise ValueError(f"{gate.item_id} already merged (PR #{gate.pr_number})")
         if gate.state == "dismissed":
@@ -3055,7 +3112,8 @@ class DaemonLoop:
         if self.github is None:
             raise ValueError("this daemon has no github handle to merge with")
         who = by or "operator"
-        if not self.dstore.claim_merge_gate(gate.run_id, who):
+        if not self.dstore.claim_merge_gate(gate.run_id, who, expected_revision=expected_revision):
+            self._lost_gate_swap(gate, expected_revision)
             return f"{gate.item_id} is already being merged — hold on."
         thread = threading.Thread(
             target=self._complete_landing,
@@ -3070,7 +3128,26 @@ class DaemonLoop:
             "(update if behind → checks → merge); I'll report in the run's thread."
         )
 
-    def _release_hold(self, gate: MergeGate, by: str | None) -> str:
+    def _lost_gate_swap(self, gate: MergeGate, expected_revision: int | None) -> None:
+        """A revision-bound approval lost the swap: say why, typed. A prose
+        caller (no revision) keeps its sentence."""
+        if expected_revision is None:
+            return
+        fresh = self.dstore.merge_gate_for(gate.run_id) or gate
+        if fresh.revision != expected_revision:
+            raise ControlError(
+                "stale_revision",
+                f"gate for {gate.item_id} is at revision {fresh.revision}, not {expected_revision}",
+                revision=fresh.revision,
+            )
+        raise ControlError(
+            "already_in_progress",
+            f"gate for {gate.item_id} is {fresh.state}: another approval got there first",
+        )
+
+    def _release_hold(
+        self, gate: MergeGate, by: str | None, *, expected_revision: int | None = None
+    ) -> str:
         """Release a workload held at publishing (#760): win the CAS, put
         the item back in the queue with its run pinned, and let the next
         tick resume the run at its publishing stage — the engine's own
@@ -3084,7 +3161,8 @@ class DaemonLoop:
                 "runs the item again from scratch"
             )
         who = by or "operator"
-        if not self.dstore.claim_merge_gate(gate.run_id, who):
+        if not self.dstore.claim_merge_gate(gate.run_id, who, expected_revision=expected_revision):
+            self._lost_gate_swap(gate, expected_revision)
             return f"{gate.item_id} is already being released — hold on."
         now = self.clock()
         try:

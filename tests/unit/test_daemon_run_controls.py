@@ -416,3 +416,120 @@ class TestCliResume:
         result = CliRunner().invoke(app, ["resume", "r_mine", "--no-tui"])
         assert "resume-run" not in result.output
         assert result.exit_code == 2 and "only unfinished runs can resume" in result.output
+
+
+class TestSteerRun:
+    """#1038: an instruction reaches the run in flight through the same
+    input path a chat thread uses, and only that run."""
+
+    def _in_flight(self, h: Harness) -> tuple[threading.Thread, list[str], threading.Event]:
+        started, release = threading.Event(), threading.Event()
+        run_ids: list[str] = []
+
+        def runner(
+            item: WorkItem, cfg: Config, run_id: str, bus: EventBus, resume: bool
+        ) -> RunResult:
+            run_ids.append(run_id)
+            h.store.create_run(run_id, "outcome", kind=item.kind)
+            h.store.set_run_state(run_id, "building")
+            started.set()
+            release.wait(5)
+            raise RunCancelledError("cancelled")
+
+        h.loop._runner = runner
+        t = threading.Thread(target=h.loop.tick)
+        t.start()
+        assert started.wait(5)
+        return t, run_ids, release
+
+    def test_the_run_in_flight_takes_the_message(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [gh_item()]
+        t, run_ids, release = self._in_flight(h)
+        try:
+            mid = h.loop.steer_run(run_ids[0], "Skip the migration", by="brett")
+            handle = h.loop._current
+            assert handle is not None
+            queued = handle.engine._chat_queue.get_nowait()
+            assert (queued.message_id, queued.text) == (mid, "Skip the migration")
+            with pytest.raises(ControlError) as stale:
+                h.loop.steer_run(run_ids[0], "x", expected_revision=999)
+            assert stale.value.code == "stale_revision"
+            with pytest.raises(ControlError) as other:
+                h.loop.steer_run("rnope", "x")
+            assert other.value.code == "unknown_target"
+        finally:
+            release.set()
+            t.join(5)
+        with pytest.raises(ControlError) as ended:
+            h.loop.steer_run(run_ids[0], "too late")
+        assert ended.value.code == "not_eligible" and "in flight" in ended.value.message
+
+    def test_a_tool_run_has_nothing_to_steer(self, tmp_path: Path) -> None:
+        h = Harness(tmp_path)
+        h.source.items = [gh_item("2", kind="tool", recipe="entrygraph", recipe_target="o/r")]
+        t, run_ids, release = self._in_flight(h)
+        try:
+            with pytest.raises(ControlError) as excinfo:
+                h.loop.steer_run(run_ids[0], "x")
+            assert excinfo.value.code == "unsupported_for_kind"
+        finally:
+            release.set()
+            t.join(5)
+
+    def test_the_service_records_the_instruction_and_its_fate(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.controls.steering import SteeringStore
+
+        h = Harness(tmp_path)
+        h.loop.recover()
+        service = ControlService(h.loop)
+        h.source.items = [gh_item()]
+        t, run_ids, release = self._in_flight(h)
+        try:
+            outcome = service.steer(OPS, run_ids[0], "Do it differently", source_refs=["m1"])
+            record = SteeringStore(h.dstore).get(outcome.steering_id)
+            assert record is not None and record.status == "delivered"
+            assert record.message_id == outcome.message_id and record.source_refs == ["m1"]
+            assert record.operation_id == outcome.operation_id
+            assert h.loop.operations.get(outcome.operation_id).state == "succeeded"  # type: ignore[union-attr]
+        finally:
+            release.set()
+            t.join(5)
+        with pytest.raises(ControlError) as excinfo:
+            service.steer(OPS, run_ids[0], "too late")
+        failed = SteeringStore(h.dstore).get(str(excinfo.value.detail["steering_id"]))
+        assert failed is not None and failed.status == "failed" and failed.error
+        with pytest.raises(ControlError) as blank:
+            service.steer(OPS, run_ids[0], "   ")
+        assert blank.value.code == "invalid_argument"
+
+    def test_a_restart_judges_a_claimed_steer_from_its_record(self, tmp_path: Path) -> None:
+        from sbxloop.daemon.controls.operations import OperationSpec
+        from sbxloop.daemon.controls.steering import SteeringStore
+
+        h = Harness(tmp_path)
+        store = SteeringStore(h.dstore)
+        spec = OperationSpec(action="run.steer", target_kind="run", target_key="r1", principal=OPS)
+        delivered, _ = h.loop.operations.accept(spec, now=1.0)
+        h.loop.operations.claim(delivered.id, "g_dead", now=2.0)
+        row = store.create(
+            run_id="r1",
+            text="x",
+            principal=OPS,
+            source_refs=[],
+            expected_revision=None,
+            now=1.0,
+            deadline_at=None,
+            operation_id=delivered.id,
+        )
+        store.delivered(row.id, "m1", 2.0)
+        lost, _ = h.loop.operations.accept(
+            OperationSpec(action="run.steer", target_kind="run", target_key="r2", principal=OPS),
+            now=3.0,
+        )
+        h.loop.operations.claim(lost.id, "g_dead", now=4.0)
+        again = restarted(h)
+        assert again.operations.get(delivered.id).state == "succeeded"  # type: ignore[union-attr]
+        judged = again.operations.get(lost.id)
+        assert judged is not None and judged.state == "failed"
+        assert judged.error_code == "interrupted_before_effect"

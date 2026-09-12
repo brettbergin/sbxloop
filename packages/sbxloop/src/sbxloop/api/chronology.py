@@ -17,21 +17,25 @@ skipped past.
 
 from __future__ import annotations
 
+import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 from sqlalchemy import delete, func, insert, select
 
+from sbxloop.daemon.controls.steering import SteeringStore
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.db.api_models import ApiEventRow
 from sbxloop.db.daemon_models import DaemonStateRow
 from sbxloop.db.engine_models import EventRow
+from sbxloop.events import HostEventTypes
 from sbxloop.log import get_logger
 
 log = get_logger(__name__)
 
 WATERMARK_KEY = "api.projection.watermark"
+CHAT_REPLY = HostEventTypes.CHAT_REPLY
 PRUNED_KEY = "api.projection.pruned_to"
 #: The actor every daemon-originated public event carries: truthful, and
 #: distinct from a person or a client.
@@ -120,7 +124,9 @@ class Chronology:
         with self.dstore.transaction() as session:
             watermark = _int_state(session, WATERMARK_KEY)
             rows = session.execute(
-                select(EventRow.seq, EventRow.ts, EventRow.run_id, EventRow.type)
+                select(
+                    EventRow.seq, EventRow.ts, EventRow.run_id, EventRow.type, EventRow.data_json
+                )
                 .where(EventRow.seq > watermark)
                 .order_by(EventRow.seq.asc())
                 .limit(self.BATCH)
@@ -141,10 +147,28 @@ class Chronology:
                             "source_seq": int(seq),
                             "data_json": None,
                         }
-                        for seq, ts, run_id, type_ in rows
+                        for seq, ts, run_id, type_, _data in rows
                     ]
                 )
             )
+            # A steering instruction is answered by the run's `chat.reply`:
+            # its record settles in the same transaction as the event, so
+            # a reader never sees the reply without the receipt or the
+            # receipt without the reply.
+            for _seq, _ts, _run, type_, data_json in rows:
+                if str(type_) != CHAT_REPLY:
+                    continue
+                data = json.loads(data_json) if data_json else {}
+                message_id = data.get("message_id")
+                if message_id:
+                    SteeringStore.settle_reply(
+                        session,
+                        message_id=str(message_id),
+                        now=now,
+                        reply=data.get("reply"),
+                        action=data.get("action"),
+                        error=data.get("error"),
+                    )
             last = int(rows[-1][0])
             self.after_copy(last)
             _set_state(session, WATERMARK_KEY, last)
@@ -172,8 +196,6 @@ class Chronology:
         occurred_at: float | None = None,
     ) -> int:
         """Append one daemon-originated event; returns its ``seq``."""
-        import json
-
         with self.dstore.transaction() as session:
             result = session.execute(
                 insert(ApiEventRow).values(
@@ -226,8 +248,6 @@ class Chronology:
     ) -> list[PublicEvent]:
         """Events after a cursor, oldest first; an engine event's data is
         joined from the engine's own row."""
-        import json
-
         stmt = (
             select(ApiEventRow, EventRow.data_json, EventRow.job_id)
             .outerjoin(EventRow, EventRow.seq == ApiEventRow.source_seq)

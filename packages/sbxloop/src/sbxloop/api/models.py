@@ -488,3 +488,86 @@ class EventOut(ApiModel):
     causation_id: str | None = None
     native_seq: int | None = None
     data: dict[str, Any] = Field(default_factory=dict)
+
+
+# -- steering and gates (#1038) ----------------------------------------------------
+
+
+class SteerRequest(ApiModel):
+    text: str = Field(min_length=1, max_length=16384)
+    #: What the instruction cites — message ids, URLs, revisions the
+    #: person read — kept on the record, never interpreted.
+    source_refs: list[str] = Field(default_factory=list, max_length=32)
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+class Steering(ApiModel):
+    id: str
+    workspace_id: str = WORKSPACE_ID
+    run_id: str
+    status: str
+    text: str
+    source_refs: list[str] = Field(default_factory=list)
+    actor: Actor
+    expected_revision: int | None = None
+    submitted_at: str
+    deadline_at: str | None = None
+    delivered_at: str | None = None
+    handled_at: str | None = None
+    reply: str | None = None
+    action: str | None = None
+    error: str | None = None
+    operation_id: str | None = None
+
+
+class SteerResult(ApiModel):
+    steering: Steering
+    operation: OperationOut
+
+
+class RunCommand(ApiModel):
+    reason: str | None = Field(default=None, max_length=2000)
+    retry: bool = False
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+class RoundGrant(ApiModel):
+    rounds: int = Field(ge=1, le=100)
+    expected_revision: int | None = Field(default=None, ge=0)
+
+
+class RunCommandResult(ApiModel):
+    run: Run
+    operation: OperationOut
+    message: str | None = None
+
+
+class Gate(ApiModel):
+    id: str
+    workspace_id: str = WORKSPACE_ID
+    kind: str
+    state: str
+    run_id: str
+    item_id: str | None = None
+    repository: str | None = None
+    pull_request: PullRequest | None = None
+    #: The head the gate's pull request stood at when last observed — what
+    #: an approval is judged against, named so the client can compare.
+    head_sha: str | None = None
+    created_at: str
+    resolved_at: str | None = None
+    resolved_by: str | None = None
+    detail: str | None = None
+    revision: int = 0
+    required_capability: str = "gates:approve"
+    available_actions: list[str] = Field(default_factory=list)
+
+
+class GateApproval(ApiModel):
+    expected_revision: int = Field(ge=0)
+
+
+class GateResult(ApiModel):
+    gate: Gate
+    operation: OperationOut
+    message: str | None = None

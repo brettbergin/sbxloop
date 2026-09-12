@@ -28,6 +28,9 @@ FEATURES: tuple[str, ...] = (
     "events",
     "events.stream",
     "ws",
+    "runs.control",
+    "steering",
+    "gates",
 )
 
 

@@ -17,6 +17,7 @@ from sbxloop.api.context import ApiContext
 from sbxloop.api.errors import Problem
 from sbxloop.api.models import (
     Actor,
+    Gate,
     GateSummary,
     Item,
     ItemDetail,
@@ -31,6 +32,7 @@ from sbxloop.api.models import (
     Repository,
     Rounds,
     Run,
+    Steering,
     Task,
     TaskOutputOut,
     rfc3339,
@@ -38,8 +40,9 @@ from sbxloop.api.models import (
 from sbxloop.api.publicids import PublicIds, item_key, parse_run_id, run_public_id, split_item_key
 from sbxloop.daemon.controls.eligibility import Subject, available_actions
 from sbxloop.daemon.controls.intake import RECIPE_PARAMETERS
+from sbxloop.daemon.controls.steering import Steering as SteeringRecord
 from sbxloop.daemon.model import WorkItem
-from sbxloop.daemon.store import dispatch_eligible_at
+from sbxloop.daemon.store import MergeGate, dispatch_eligible_at
 from sbxloop.engine.model import RunRecord, TaskRecord
 from sbxloop.errors import SbxloopError
 from sbxloop.ghids import is_api_id, is_chat_id, is_schedule_id, try_parse_gh_id
@@ -346,6 +349,81 @@ class Views:
             )
             for t in records
         ]
+
+    # -- gates and steering --------------------------------------------------------
+
+    def gate_by_public_id(self, public_id: str) -> MergeGate:
+        resolved = self.ids.resolve(public_id)
+        if resolved is None or resolved.kind != "gate":
+            raise not_found()
+        gate: MergeGate | None = self.dstore.merge_gate_for(resolved.key)
+        if gate is None or gate.run_id != resolved.key:
+            raise not_found()
+        return gate
+
+    def gates(self, rows: Sequence[MergeGate]) -> list[Gate]:
+        ids = self.ids.gate_ids([g.run_id for g in rows], self.now) if rows else {}
+        return [self._gate(gate, ids[gate.run_id]) for gate in rows]
+
+    def gate(self, gate: MergeGate) -> Gate:
+        return self.gates([gate])[0]
+
+    def _gate(self, gate: MergeGate, public_id: str) -> Gate:
+        run = self.run_record(gate.run_id)
+        item = self.dstore.get(gate.item_id)
+        subject = Subject(
+            run_kind=run.kind if run is not None else "code",
+            run_state=run.state if run is not None else None,
+            item_state=item.state if item is not None else None,
+            pinned=item is not None and item.run_id == gate.run_id,
+            gate_state=gate.state,
+        )
+        actions = available_actions(subject)
+        return Gate(
+            id=public_id,
+            kind=gate.kind,
+            state=gate.state,
+            run_id=run_public_id(gate.run_id),
+            item_id=self.ids.item_id(item, self.now) if item is not None else None,
+            repository=gate.repo or None,
+            pull_request=(
+                PullRequest(number=gate.pr_number, url=gate.pr_url, branch=gate.branch)
+                if gate.pr_number
+                else None
+            ),
+            head_sha=run.head_sha if run is not None else None,
+            created_at=rfc3339(gate.created_at) or "",
+            resolved_at=rfc3339(gate.resolved_at),
+            resolved_by=gate.resolved_by,
+            detail=gate.detail,
+            revision=gate.revision,
+            available_actions=["approve"] if "gate_approve" in actions else [],
+        )
+
+    def steering(self, record: SteeringRecord) -> Steering:
+        actor = record.principal
+        return Steering(
+            id=record.id,
+            run_id=run_public_id(record.run_id),
+            status=record.status,
+            text=record.text,
+            source_refs=list(record.source_refs),
+            actor=Actor(
+                kind=str(actor.get("kind", "client")),
+                id=str(actor.get("id", "")),
+                display=actor.get("display"),
+                via=str(actor.get("via", "")),
+            ),
+            expected_revision=record.expected_revision,
+            submitted_at=rfc3339(record.submitted_at) or "",
+            deadline_at=rfc3339(record.deadline_at),
+            delivered_at=rfc3339(record.delivered_at),
+            handled_at=rfc3339(record.handled_at),
+            reply=record.reply,
+            action=record.action,
+            error=record.error,
+            operation_id=record.operation_id,
+        )
 
     # -- the catalog ---------------------------------------------------------------
 

@@ -25,9 +25,9 @@ from sbxloop.db.api_models import PublicIdRow
 from sbxloop.ghids import normalize_item_id
 from sbxloop.ids import _token
 
-Kind = Literal["item", "repository"]
+Kind = Literal["item", "repository", "gate"]
 
-PREFIXES: dict[Kind, str] = {"item": "itm_", "repository": "repo_"}
+PREFIXES: dict[Kind, str] = {"item": "itm_", "repository": "repo_", "gate": "gate_"}
 RUN_PREFIX = "run_"
 
 
@@ -114,6 +114,13 @@ class PublicIds:
         """``item key -> public id`` for a page of items, one write."""
         return self.assign("item", [item_key(item) for item in items], now)
 
+    def gate_id(self, run_id: str, now: float) -> str:
+        """A gate is keyed by the run it parks: one per run."""
+        return self.assign("gate", [run_id], now)[run_id]
+
+    def gate_ids(self, run_ids: Iterable[str], now: float) -> dict[str, str]:
+        return self.assign("gate", list(run_ids), now)
+
     def repository_id(self, repo: str, now: float) -> str:
         return self.assign("repository", [repo], now)[repo]
 
@@ -129,5 +136,7 @@ class PublicIds:
             return None
         if row.kind not in PREFIXES:
             return None
-        kind: Kind = "item" if row.kind == "item" else "repository"
+        kind: Kind = (
+            "item" if row.kind == "item" else "gate" if row.kind == "gate" else "repository"
+        )
         return Resolved(kind, str(row.internal_key))

@@ -21,16 +21,24 @@ from sbxloop.api.context import ApiContext
 from sbxloop.api.errors import CONTROL_STATUS, Problem
 from sbxloop.api.models import (
     Admitted,
+    GateApproval,
+    GateResult,
     IntakeRequest,
     IssueIntake,
     Item,
     ItemCommand,
     ItemCommandResult,
     OperationOut,
+    RoundGrant,
+    RunCommand,
+    RunCommandResult,
+    SteerRequest,
+    SteerResult,
     ToolIntake,
     WorkloadIntake,
 )
 from sbxloop.api.projections import Views, not_found
+from sbxloop.daemon.controls.eligibility import Subject, check as check_eligibility
 from sbxloop.daemon.controls.intake import (
     AdmitRequest,
     IssueAdmission,
@@ -40,6 +48,8 @@ from sbxloop.daemon.controls.intake import (
 from sbxloop.daemon.controls.operations import IdempotencyConflict, Operation, OperationReplay
 from sbxloop.daemon.controls.principal import Principal
 from sbxloop.daemon.controls.results import AdmitOutcome, ItemOutcome, Outcome
+from sbxloop.daemon.controls.steering import SteeringStore
+from sbxloop.vcs.protocol import Capability
 
 KEY_HEADER = "Idempotency-Key"
 KEY_MAX = 200
@@ -256,6 +266,239 @@ async def item_command(
     return result
 
 
+# -- runs: cancel, resume, round grants, the review wait ---------------------------
+
+RunVerb = Literal["cancel", "resume", "grant_rounds", "review_resume"]
+
+RUN_ACTIONS: dict[RunVerb, str] = {
+    "cancel": "run.cancel",
+    "resume": "run.resume",
+    "grant_rounds": "run.grant_rounds",
+    "review_resume": "run.review_resume",
+}
+
+
+async def run_verb(
+    ctx: ApiContext,
+    auth: Authenticated,
+    verb: RunVerb,
+    public_id: str,
+    body: RunCommand | RoundGrant | None,
+    pair: tuple[str, str] | None,
+) -> RunCommandResult:
+    """Cancel, resume, grant rounds to, or re-arm the review wait of a run,
+    through the shared service verbs ctl and chat use."""
+    principal = auth.principal
+    service = ctx.service()
+    command = body if isinstance(body, RunCommand) else RunCommand()
+    grant = body if isinstance(body, RoundGrant) else None
+
+    def apply() -> Outcome:
+        views = Views(ctx)
+        record = views.run_by_public_id(public_id)
+        run_id = record.run_id
+        if verb == "cancel":
+            return service.cancel_run(
+                principal,
+                run_id,
+                retry=command.retry,
+                expected_revision=command.expected_revision,
+                idempotency=pair,
+            )
+        if verb == "resume":
+            return service.resume_run(
+                principal, run_id, expected_revision=command.expected_revision, idempotency=pair
+            )
+        if verb == "grant_rounds":
+            if grant is None:
+                raise Problem(422, "invalid_request", "a round grant names its rounds")
+            return service.grant_rounds(
+                principal,
+                run_id,
+                grant.rounds,
+                expected_revision=grant.expected_revision,
+                idempotency=pair,
+            )
+        return service.resume_review(principal, run_id, idempotency=pair)
+
+    try:
+        outcome = await run_command(ctx, apply)
+    except Replayed as replay:
+        existing = replay.operation
+        problem = replayed_problem(existing)
+        if problem is not None and existing.state != "running":
+            raise problem from replay
+
+        def reread() -> RunCommandResult:
+            views = Views(ctx)
+            return RunCommandResult(
+                run=views.run(views.run_by_public_id(public_id)),
+                operation=OperationOut.from_operation(existing),
+                message=(existing.result or {}).get("message") if existing.result else None,
+            )
+
+        return await ctx.call(reread)
+
+    def project() -> RunCommandResult:
+        views = Views(ctx)
+        return RunCommandResult(
+            run=views.run(views.run_by_public_id(public_id)),
+            operation=OperationOut.from_operation(_operation(ctx, outcome.operation_id)),
+            message=getattr(outcome, "message", None),
+        )
+
+    result = await ctx.call(project)
+    ctx.hub.notify()
+    return result
+
+
+# -- steering ------------------------------------------------------------------------
+
+
+async def steer(
+    ctx: ApiContext,
+    auth: Authenticated,
+    public_id: str,
+    body: SteerRequest,
+    pair: tuple[str, str] | None,
+) -> SteerResult:
+    """Explicit direction for the run in flight: a record, then the
+    hand-over; the reply settles the record when it lands."""
+    principal = auth.principal
+    service = ctx.service()
+    deadline_s = float(ctx.api.operation_deadline_s)
+
+    def apply() -> Outcome:
+        views = Views(ctx)
+        run_id = views.run_by_public_id(public_id).run_id
+        return service.steer(
+            principal,
+            run_id,
+            body.text,
+            source_refs=body.source_refs,
+            expected_revision=body.expected_revision,
+            deadline_s=deadline_s,
+            idempotency=pair,
+        )
+
+    try:
+        outcome = await run_command(ctx, apply)
+    except Replayed as replay:
+        existing = replay.operation
+        problem = replayed_problem(existing)
+        if problem is not None:
+            raise problem from replay
+
+        def reread() -> SteerResult:
+            views = Views(ctx)
+            record = SteeringStore(views.dstore).for_operation(existing.id)
+            if record is None:
+                raise not_found()
+            return SteerResult(
+                steering=views.steering(record), operation=OperationOut.from_operation(existing)
+            )
+
+        return await ctx.call(reread)
+
+    def project() -> SteerResult:
+        views = Views(ctx)
+        record = SteeringStore(views.dstore).get(getattr(outcome, "steering_id", ""))
+        if record is None:
+            raise not_found()
+        return SteerResult(
+            steering=views.steering(record),
+            operation=OperationOut.from_operation(_operation(ctx, outcome.operation_id)),
+        )
+
+    result = await ctx.call(project)
+    ctx.hub.notify()
+    return result
+
+
+# -- gates ---------------------------------------------------------------------------
+
+
+def forge_capability(ctx: ApiContext, repo: str | None) -> Capability:
+    """Whether the daemon's forge backend can complete a landing for
+    ``repo``: the backend's own answer for the capability the approve
+    path relies on (reading the base's required checks), ``UNKNOWN``
+    for a forge with no backend yet, ``UNSUPPORTED`` with no forge
+    handle at all. Read from the backend's static table — never by
+    provisioning a sandbox in the request path."""
+    loop: Any = ctx.loop
+    if getattr(loop, "github", None) is None:
+        return Capability.UNSUPPORTED
+    kind = ctx.config.vcs_kind_for(repo)
+    if kind != "github":
+        return Capability.UNKNOWN
+    from sbxloop.vcs.github.ops import GithubOps
+
+    table = getattr(GithubOps, "CAPABILITIES", {})
+    return Capability(table.get("required_checks_introspection", Capability.UNKNOWN))
+
+
+async def approve_gate(
+    ctx: ApiContext,
+    auth: Authenticated,
+    public_id: str,
+    body: GateApproval,
+    pair: tuple[str, str] | None,
+) -> GateResult:
+    """Endorse and release one gate at exactly the revision the person
+    saw: the eligibility (kind, state, the forge's ability to act) is
+    checked here, the revision-bound swap in the loop."""
+    principal = auth.principal
+    service = ctx.service()
+
+    def apply() -> Outcome:
+        views = Views(ctx)
+        gate = views.gate_by_public_id(public_id)
+        run = views.run_record(gate.run_id)
+        forge = forge_capability(ctx, gate.repo or None) if gate.kind == "merge" else None
+        check_eligibility(
+            "gate_approve",
+            Subject(
+                run_kind=run.kind if run is not None else "code",
+                run_state=run.state if run is not None else None,
+                gate_state=gate.state,
+                forge=forge,
+            ),
+        )
+        return service.approve_gate(
+            principal, gate.run_id, expected_revision=body.expected_revision, idempotency=pair
+        )
+
+    try:
+        outcome = await run_command(ctx, apply)
+    except Replayed as replay:
+        existing = replay.operation
+        problem = replayed_problem(existing)
+        if problem is not None and existing.state != "running":
+            raise problem from replay
+
+        def reread() -> GateResult:
+            views = Views(ctx)
+            return GateResult(
+                gate=views.gate(views.gate_by_public_id(public_id)),
+                operation=OperationOut.from_operation(existing),
+                message=(existing.result or {}).get("message"),
+            )
+
+        return await ctx.call(reread)
+
+    def project() -> GateResult:
+        views = Views(ctx)
+        return GateResult(
+            gate=views.gate(views.gate_by_public_id(public_id)),
+            operation=OperationOut.from_operation(_operation(ctx, outcome.operation_id)),
+            message=getattr(outcome, "message", None),
+        )
+
+    result = await ctx.call(project)
+    ctx.hub.notify()
+    return result
+
+
 #: The actions a typed command frame may name, with the capability each
 #: needs and the canonical route its idempotency scope is keyed on.
 ACTIONS: dict[str, tuple[str, str]] = {
@@ -263,6 +506,12 @@ ACTIONS: dict[str, tuple[str, str]] = {
     "item.retry": ("runs:control", "/v1/items/{id}/retry"),
     "item.requeue": ("runs:control", "/v1/items/{id}/requeue"),
     "item.abandon": ("runs:control", "/v1/items/{id}/abandon"),
+    "run.cancel": ("runs:control", "/v1/runs/{id}/cancel"),
+    "run.resume": ("runs:control", "/v1/runs/{id}/resume"),
+    "run.steer": ("runs:steer", "/v1/runs/{id}/steering"),
+    "run.grant_rounds": ("budgets:grant", "/v1/runs/{id}/round-grants"),
+    "run.review_resume": ("runs:control", "/v1/runs/{id}/review-wait/resume"),
+    "gate.approve": ("gates:approve", "/v1/gates/{id}/approve"),
 }
 
 
@@ -305,10 +554,49 @@ async def dispatch(
         return admitted.model_dump(mode="json")
     if not target:
         raise Problem(422, "invalid_request", f"{action} needs a target")
-    verb: ItemVerb = action.removeprefix("item.")  # type: ignore[assignment]
-    command = ItemCommand(reason=params.get("reason"), expected_revision=expected_revision)
     pair = idempotency_pair(
         auth.principal, idempotency_key, route.replace("{id}", target), required=False
     )
-    result = await item_command(ctx, auth, verb, target, command, pair)
-    return result.model_dump(mode="json")
+    from pydantic import ValidationError
+
+    try:
+        if action.startswith("item."):
+            verb: ItemVerb = action.removeprefix("item.")  # type: ignore[assignment]
+            command = ItemCommand(reason=params.get("reason"), expected_revision=expected_revision)
+            return (await item_command(ctx, auth, verb, target, command, pair)).model_dump(
+                mode="json"
+            )
+        if action == "run.steer":
+            request = SteerRequest(
+                text=str(params.get("text") or ""),
+                source_refs=list(params.get("source_refs") or []),
+                expected_revision=expected_revision,
+            )
+            return (await steer(ctx, auth, target, request, pair)).model_dump(mode="json")
+        if action == "gate.approve":
+            if expected_revision is None:
+                raise Problem(422, "invalid_request", "gate.approve needs expected_revision")
+            approval = GateApproval(expected_revision=expected_revision)
+            return (await approve_gate(ctx, auth, target, approval, pair)).model_dump(mode="json")
+        run_verb_name: RunVerb = action.removeprefix("run.")  # type: ignore[assignment]
+        run_body: RunCommand | RoundGrant
+        if run_verb_name == "grant_rounds":
+            run_body = RoundGrant(
+                rounds=int(params.get("rounds") or 0), expected_revision=expected_revision
+            )
+        else:
+            run_body = RunCommand(
+                reason=params.get("reason"),
+                retry=bool(params.get("retry", False)),
+                expected_revision=expected_revision,
+            )
+        return (await run_verb(ctx, auth, run_verb_name, target, run_body, pair)).model_dump(
+            mode="json"
+        )
+    except ValidationError as exc:
+        raise Problem(
+            422,
+            "invalid_request",
+            "the command's params are not valid",
+            errors=[{"loc": list(e["loc"]), "msg": e["msg"]} for e in exc.errors()],
+        ) from exc

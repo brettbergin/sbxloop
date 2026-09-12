@@ -18,7 +18,7 @@ message, but never parses it.
 from __future__ import annotations
 
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import asdict
 from typing import Any, Literal, TypeVar
 
@@ -54,8 +54,10 @@ from sbxloop.daemon.controls.results import (
     ScheduleListOutcome,
     ScheduleOutcome,
     StatusOutcome,
+    SteerOutcome,
     StopOutcome,
 )
+from sbxloop.daemon.controls.steering import SteeringStore
 from sbxloop.daemon.holds import OPERATOR_HOLD, hold_name
 from sbxloop.ghids import normalize_item_id
 
@@ -221,7 +223,13 @@ class ControlService:
 
     # -- runs -----------------------------------------------------------------------
 
-    def resume_review(self, principal: Principal, target: str) -> ReviewResumeOutcome:
+    def resume_review(
+        self,
+        principal: Principal,
+        target: str,
+        *,
+        idempotency: tuple[str, str] | None = None,
+    ) -> ReviewResumeOutcome:
         require(principal, "runs:control")
 
         def apply(_: str | None) -> ReviewResumeOutcome:
@@ -231,7 +239,68 @@ class ControlService:
                 raise ControlError("not_eligible", _message(exc)) from exc
             return ReviewResumeOutcome(target=target, message=message)
 
-        return self._record(self._spec("run.review_resume", principal, "target", target), apply)
+        spec = self._spec("run.review_resume", principal, "target", target, idempotency=idempotency)
+        return self._record(spec, apply)
+
+    def steer(
+        self,
+        principal: Principal,
+        run_id: str,
+        text: str,
+        *,
+        source_refs: Sequence[str] = (),
+        expected_revision: int | None = None,
+        deadline_s: float | None = None,
+        idempotency: tuple[str, str] | None = None,
+    ) -> SteerOutcome:
+        """Submit explicit direction to the run in flight (#1038): a record
+        first, then the hand-over; the record says what became of it."""
+        require(principal, "runs:steer")
+        text = text.strip()
+        if not text:
+            raise ControlError("invalid_argument", "an instruction needs some text")
+        store = SteeringStore(self.loop.dstore)
+
+        def apply(op_id: str | None) -> SteerOutcome:
+            # The record is written under the operation (a replay of the
+            # same key finds the operation, never a second record) and
+            # carries the operation id, so the reconciler can find it.
+            now = self.loop.clock()
+            record = store.create(
+                run_id=run_id,
+                text=text,
+                principal=principal,
+                source_refs=list(source_refs),
+                expected_revision=expected_revision,
+                now=now,
+                deadline_at=None if deadline_s is None else now + deadline_s,
+                operation_id=op_id,
+            )
+            try:
+                message_id = self.loop.steer_run(
+                    run_id,
+                    text,
+                    by=principal.attribution(),
+                    expected_revision=expected_revision,
+                )
+            except ControlError as exc:
+                store.failed(record.id, exc.message, self.loop.clock())
+                exc.detail.setdefault("steering_id", record.id)
+                raise
+            store.delivered(record.id, message_id, self.loop.clock())
+            return SteerOutcome(steering_id=record.id, run_id=run_id, message_id=message_id)
+
+        spec = self._spec(
+            "run.steer",
+            principal,
+            "run",
+            run_id,
+            idempotency=idempotency,
+            expected_revision=expected_revision,
+            text=text,
+            source_refs=list(source_refs),
+        )
+        return self._record(spec, apply)
 
     def cancel_current(self, principal: Principal, *, retry: bool = False) -> CancelOutcome:
         """Cancel the run in flight. Refused when nothing is running."""
@@ -281,6 +350,7 @@ class ControlService:
         *,
         retry: bool = False,
         expected_revision: int | None = None,
+        idempotency: tuple[str, str] | None = None,
     ) -> CancelOutcome:
         """Cancel one run by identity, whatever state the daemon holds it
         in; ``expected_revision`` refuses a cancel meant for an earlier
@@ -302,6 +372,7 @@ class ControlService:
             target_key=run_id,
             principal=principal,
             request={"retry": retry},
+            idempotency=idempotency,
             expected_revision=expected_revision,
             deferred=True,
         )
@@ -318,7 +389,12 @@ class ControlService:
         return outcome
 
     def resume_run(
-        self, principal: Principal, run_id: str, *, expected_revision: int | None = None
+        self,
+        principal: Principal,
+        run_id: str,
+        *,
+        expected_revision: int | None = None,
+        idempotency: tuple[str, str] | None = None,
     ) -> ResumeOutcome:
         """Admit a persisted run to the daemon's queue for resume."""
         require(principal, "runs:control")
@@ -334,39 +410,98 @@ class ControlService:
             target_key=run_id,
             principal=principal,
             request={},
+            idempotency=idempotency,
             expected_revision=expected_revision,
         )
         return self._record(spec, apply)
 
-    def grant_rounds(self, principal: Principal, run_id: str, rounds: int) -> GrantRoundsOutcome:
+    def grant_rounds(
+        self,
+        principal: Principal,
+        run_id: str,
+        rounds: int,
+        *,
+        expected_revision: int | None = None,
+        idempotency: tuple[str, str] | None = None,
+    ) -> GrantRoundsOutcome:
         require(principal, "budgets:grant")
         if rounds < 1:
             raise ControlError("invalid_argument", f"rounds must be at least 1, not {rounds}")
 
         def apply(_: str | None) -> GrantRoundsOutcome:
+            self._check_run_revision(run_id, expected_revision)
             try:
                 item = self.loop.grant_rounds(run_id, rounds, principal.attribution())
             except (KeyError, ValueError) as exc:
                 raise ControlError(_code_for(exc), _message(exc)) from exc
             return GrantRoundsOutcome(run_id=run_id, rounds=rounds, item_id=item.item_id)
 
-        spec = self._spec("run.grant_rounds", principal, "run", run_id, rounds=rounds)
+        spec = self._spec(
+            "run.grant_rounds",
+            principal,
+            "run",
+            run_id,
+            idempotency=idempotency,
+            expected_revision=expected_revision,
+            rounds=rounds,
+        )
         return self._record(spec, apply)
+
+    def _check_run_revision(self, run_id: str, expected: int | None) -> None:
+        """``stale_revision`` when the run row moved past what the caller
+        acted on; checked just before the loop's own refusals."""
+        if expected is None:
+            return
+        store = getattr(self.loop, "store", None)
+        if store is None:
+            return
+        try:
+            current = int(store.get_run(run_id).revision)
+        except Exception as exc:
+            raise ControlError("unknown_target", f"unknown run {run_id}") from exc
+        if current != expected:
+            raise ControlError(
+                "stale_revision",
+                f"run {run_id} is at revision {current}, not {expected}",
+                revision=current,
+            )
 
     # -- gates ----------------------------------------------------------------------
 
-    def approve_gate(self, principal: Principal, target: str) -> GateOutcome:
-        """Approve a parked merge, or release a held workload result."""
+    def approve_gate(
+        self,
+        principal: Principal,
+        target: str,
+        *,
+        expected_revision: int | None = None,
+        idempotency: tuple[str, str] | None = None,
+    ) -> GateOutcome:
+        """Approve a parked merge, or release a held workload result. With
+        ``expected_revision`` the approval binds to that revision of the
+        gate (#1038): the loop's swap requires it."""
         require(principal, "gates:approve")
 
         def apply(_: str | None) -> GateOutcome:
+            # The keyword only when there is one: the prose edge's doubles
+            # answer the two-argument form.
+            bound: dict[str, Any] = (
+                {} if expected_revision is None else {"expected_revision": expected_revision}
+            )
             try:
-                message = self.loop.approve_merge(target, by=principal.attribution())
+                message = self.loop.approve_merge(target, by=principal.attribution(), **bound)
             except (KeyError, ValueError) as exc:
                 raise ControlError(_code_for(exc), _message(exc)) from exc
             return GateOutcome(target=target, message=message)
 
-        return self._record(self._spec("gate.approve", principal, "target", target), apply)
+        spec = self._spec(
+            "gate.approve",
+            principal,
+            "target",
+            target,
+            idempotency=idempotency,
+            expected_revision=expected_revision,
+        )
+        return self._record(spec, apply)
 
     # -- items ----------------------------------------------------------------------
 

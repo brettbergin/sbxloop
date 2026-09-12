@@ -54,6 +54,7 @@ API_TABLES = (
     "api_refresh_tokens",
     "api_token_revocations",
     "api_public_ids",
+    "api_steering",
 )
 ALL_TABLES = ENGINE_TABLES + DAEMON_TABLES + API_TABLES
 

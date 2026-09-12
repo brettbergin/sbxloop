@@ -2223,6 +2223,32 @@ history is refused as `cursor_expired` from the highest `seq` ever pruned,
 never skipped past. The WebSocket's commands go through `api/commands.py`,
 the same functions the REST routes call, with the same idempotency scope.
 
+**Steering and gates (#1038).** A remote instruction is a record before it
+is an effect: `api_steering` (`daemon/controls/steering.py`) holds who, for
+which run at which revision, the text and what it cites, and its fate.
+`ControlService.steer` writes the row, then `DaemonLoop.steer_run` hands
+the text to the run in flight under the current-run lock — the same
+`post_user_message` a chat thread uses — after the eligibility check (a
+tool run has nothing to steer) and the revision check; the row is
+`delivered` with the engine's message id, or `failed` with the refusal.
+The agent's `chat.reply` carries that message id, and the chronology's
+projection settles the row `handled` (or `failed`) in the same transaction
+as the event; the API frontend marks whatever a finished run never answered
+`undelivered`, and the listener's start does the same for rows a previous
+process left waiting. No arbitration between directions: each is handed
+over in order and answered in turn. A gate approval binds to the gate's
+revision: `claim_merge_gate` takes the revision into its compare-and-swap,
+so an approval for a gate that moved loses the swap and is refused
+`stale_revision`, a second approval `already_in_progress` — typed, because
+the caller is not a person reading prose; the prose edge keeps its
+sentences. The API checks the gate's eligibility first, including whether
+the forge backend can complete the landing, read from the backend's static
+capability table (never by provisioning a sandbox in the request path):
+`UNKNOWN` refuses rather than guesses. What the approval promises is the
+recorded decision and the committed release; the landing thread merges (or
+the next tick publishes) afterwards, and a base that requires an approving
+review still parks the run awaiting one.
+
 ### Repositories
 
 One daemon may tend several repositories. They are declared as an array of

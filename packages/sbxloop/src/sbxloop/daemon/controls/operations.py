@@ -51,6 +51,7 @@ EFFECTS: dict[str, str] = {
     "run.cancel_provider": "the parked run is settled as cancelled",
     "run.resume": "the run is admitted to the queue and resumes at the next tick",
     "run.review_resume": "the review wait is re-armed",
+    "run.steer": "the instruction is durably handed to the run's input path",
     "run.grant_rounds": "the grant is recorded and the item re-admitted",
     "gate.approve": "the approval is recorded and the gate release committed",
     "item.admit": "one item is durably admitted through its source's rules",
@@ -548,6 +549,15 @@ def _judge(
         if record.state in TERMINAL_RUN_STATES:
             return "failed", "target_already_terminal", f"run is {record.state}"
         return "failed", "interrupted_before_effect", f"run is {record.state}; cancel was lost"
+    if op.action == "run.steer":
+        from sbxloop.daemon.controls.steering import SteeringStore
+
+        record = SteeringStore(loop.dstore).for_operation(op.id)
+        if record is None:
+            return "failed", "interrupted_before_effect", "no steering record was written"
+        if record.status in ("delivered", "handled"):
+            return "succeeded", None, None
+        return "failed", "interrupted_before_effect", f"the instruction is {record.status}"
     if op.action == "gate.approve":
         gate = loop.dstore.merge_gate_for(op.target_key)
         if gate is None:
