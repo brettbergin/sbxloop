@@ -123,10 +123,10 @@ from __future__ import annotations
 
 import contextlib
 import os
-import re
 import shutil
 import tempfile
 from collections.abc import Iterator, Sequence
+from configparser import Error as ConfigError
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -136,6 +136,7 @@ from git import (
     Git,
     GitCommandError,
     GitCommandNotFound,
+    GitConfigParser,
     InvalidGitRepositoryError,
     NoSuchPathError,
     Reference,
@@ -651,39 +652,30 @@ def clone_existing_branch(source: Path, target: Path, branch: str) -> str:
         ) from exc
 
 
-_SUBMODULE_CONFIG_RE = re.compile(r"^submodule\.(.+)\.(path|url) (.*)$")
-
-
 def list_submodules(repo_path: Path) -> list[Submodule]:
     """The submodules ``repo_path``'s ``.gitmodules`` declares, in file
     order; empty when there is no such file. A checkout is not needed —
-    the file is read with ``git config -f`` — so this also answers for a
-    workspace whose submodules were never populated."""
+    the file itself is parsed, as ``git config -f`` would — so this also
+    answers for a workspace whose submodules were never populated (which
+    is why ``Repo.submodules`` is not used: it reads gitlinks from HEAD).
+    Includes are never followed: the file is repository content."""
     modules = repo_path / ".gitmodules"
     if not modules.is_file():
         return []
     try:
-        with Repo(repo_path) as repo:
-            listing = repo.git.config(
-                "-f", str(modules), "--get-regexp", r"^submodule\..*\.(path|url)$"
-            )
-    except GitCommandError as exc:
-        if exc.status == 1:
-            return []  # no matching keys
-        raise ProvisionError(f"reading {modules} failed: {_describe(exc)}") from exc
-    except (InvalidGitRepositoryError, NoSuchPathError, ValueError) as exc:
+        with GitConfigParser(str(modules), read_only=True, merge_includes=False) as config:
+            found = [
+                Submodule(
+                    name=section[len('submodule "') : -1],
+                    path=str(config.get_value(section, "path", "")).strip(),
+                    url=str(config.get_value(section, "url", "")).strip(),
+                )
+                for section in config.sections()
+                if section.startswith('submodule "') and section.endswith('"')
+            ]
+    except (ConfigError, OSError, ValueError) as exc:
         raise ProvisionError(f"reading {modules} failed: {exc}") from exc
-    found: dict[str, dict[str, str]] = {}
-    for line in listing.splitlines():
-        match = _SUBMODULE_CONFIG_RE.match(line)
-        if match:
-            name, key, value = match.groups()
-            found.setdefault(name, {})[key] = value.strip()
-    return [
-        Submodule(name=name, path=entry["path"], url=entry.get("url", ""))
-        for name, entry in found.items()
-        if entry.get("path")
-    ]
+    return [sub for sub in found if sub.path]
 
 
 def populate_submodules(
@@ -766,8 +758,9 @@ def populate_submodules(
 
 
 def _is_gitlink_in_index(clone: Path, path: str) -> bool:
-    entry: str = Repo(clone).git.ls_files("--stage", "--", path)
-    return entry.startswith(f"{GITLINK_MODE} ")
+    with Repo(clone) as repo:
+        entry = repo.index.entries.get((path, 0))
+    return entry is not None and entry.mode == int(GITLINK_MODE, 8)
 
 
 def _submodule_update(
@@ -820,8 +813,12 @@ def _discard_half_populated(clone: Path, path: str) -> None:
         name = next((s.name for s in list_submodules(clone) if s.path == path), path)
         store = Path(repo.git_dir) / "modules" / name
         shutil.rmtree(store, ignore_errors=True)
-        with contextlib.suppress(GitCommandError):
-            repo.git.config("--unset", f"submodule.{name}.url")
+        # The entry may not exist: an `-c` override answers `submodule init`
+        # without writing one, and `--unset` tolerated that.
+        with repo.config_writer() as config:
+            section = f'submodule "{name}"'
+            if config.has_section(section):
+                config.remove_option(section, "url")
 
 
 def submodule_hosts(repo_path: Path) -> list[str]:

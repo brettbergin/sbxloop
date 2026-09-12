@@ -1247,6 +1247,32 @@ class TestSubmodules:
         )
         assert hostgit.list_submodules(make_repo(tmp_path, "plain")) == []
 
+    def test_awkward_names_and_values_survive_the_parse(self, tmp_path: Path) -> None:
+        """Whitespace, dots and `=` in names and values, read from the file
+        alone: no checkout, no commit — a workspace whose submodules were
+        never populated still answers."""
+        root = tmp_path / "ws"
+        Repo.init(root).close()
+        (root / ".gitmodules").write_text(
+            '[submodule "lib one"]\n\tpath = vendor/lib one\n'
+            "\turl = https://example.com/o/lib one.git\n"
+            '[submodule "odd.path x"]\n\tpath = odd\n\turl = ../odd.git\n'
+            '[submodule "eq"]\n\tpath = c = d\n\turl = x\n'
+            '[submodule "pathless"]\n\turl = y\n'
+        )
+        assert hostgit.list_submodules(root) == [
+            hostgit.Submodule("lib one", "vendor/lib one", "https://example.com/o/lib one.git"),
+            hostgit.Submodule("odd.path x", "odd", "../odd.git"),
+            hostgit.Submodule("eq", "c = d", "x"),
+        ]
+
+    def test_an_unparseable_gitmodules_is_a_provision_error(self, tmp_path: Path) -> None:
+        root = tmp_path / "ws"
+        Repo.init(root).close()
+        (root / ".gitmodules").write_text('[submodule "a"\npath = a\n')
+        with pytest.raises(ProvisionError, match="reading"):
+            hostgit.list_submodules(root)
+
     def test_fresh_clone_populates_from_the_host_checkout(
         self, tmp_path: Path, remote: PrivateGitServer
     ) -> None:
