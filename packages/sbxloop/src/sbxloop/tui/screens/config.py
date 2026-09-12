@@ -37,9 +37,7 @@ from sbxloop.cli.doctor import stored_schedules
 from sbxloop.cli.policyview import PolicyView, policy_view
 from sbxloop.cli.workloadview import NO_PROFILE_NOTE, ProfileView, profile_views
 from sbxloop.config import Config, load_config_with_sources
-from sbxloop.configedit import answered_by, applies_for
-from sbxloop.configedit import keys as configkeys
-from sbxloop.configedit import toml as configtoml
+from sbxloop.configedit import answered_by, applies_for, keys as configkeys, toml as configtoml
 from sbxloop.configedit.edit import (
     Verdict,
     config_path,

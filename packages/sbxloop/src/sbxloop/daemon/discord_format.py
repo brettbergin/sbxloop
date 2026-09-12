@@ -46,8 +46,8 @@ from sbxloop.cli.tui import (
     _LIFECYCLE_PREFIXES,
     _TRANSCRIPT_SKIP,
     TOOL_ARGS_LINE_CLIP,
+    _one_line as _one_line_mid,
 )
-from sbxloop.cli.tui import _one_line as _one_line_mid
 from sbxloop.daemon.model import DaemonNotice, RunReport, TaskOutcome, WorkItem
 from sbxloop.engine.model import PIPELINE_STAGES, WORKLOAD_STAGES, Published
 from sbxloop.events import Event, HostEventTypes

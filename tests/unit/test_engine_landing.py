@@ -1351,9 +1351,7 @@ class TestBlockedWithGreenChecks:
         assert outcome.approvals_have == 0 and outcome.approvals_required == 1
 
 
-QUEUED = QueueState(
-    merged=False, closed=False, entry=QueueEntry("MQE_1", "AWAITING_CHECKS", 1, "queue0")
-)
+QUEUED = QueueState(merged=False, closed=False, entry=QueueEntry("MQE_1", "testing", 1, "queue0"))
 QUEUE_MERGED = QueueState(merged=True, closed=False, entry=None, merge_sha="queued0001")
 NOT_QUEUED = QueueState(merged=False, closed=False, entry=None)
 

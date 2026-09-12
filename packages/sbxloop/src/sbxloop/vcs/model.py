@@ -62,16 +62,28 @@ class MergeOutcome(NamedTuple):
     stale: bool = False
 
 
+# Where a queued change stands, in the loop's own words: ``queued`` (in
+# line), ``testing`` (the queue is running its checks), ``mergeable``
+# (checks passed; the queue merges it next), ``blocked`` (the queue will
+# not merge it as it is), ``removed`` (taken out of the queue). ``unknown``
+# is a state the backend did not recognise — never read as mergeable.
+QueueEntryState = Literal["queued", "testing", "mergeable", "blocked", "removed", "unknown"]
+
+# Why an issue is closed: ``completed`` (the work was done) or
+# ``not_planned`` (triage — duplicate, won't fix, stale). A backend maps
+# these onto whatever its API accepts, or drops the reason when it has none.
+CloseReason = Literal["completed", "not_planned"]
+
+
 class QueueEntry(NamedTuple):
-    """The pull request's place in its base's merge queue (#676), as the
-    enqueue mutation and the queue read describe it. ``state`` is
-    GitHub's ``MergeQueueEntryState`` (QUEUED, AWAITING_CHECKS, MERGEABLE,
-    UNMERGEABLE, LOCKED); ``head`` is the commit the queue is testing for
-    this entry — the queue's own merge-group commit, not the PR's head —
-    which is where its checks report."""
+    """The change's place in its base's merge queue (#676): its opaque,
+    backend-minted ``id``, its :data:`QueueEntryState`, its position in
+    line, and ``head`` — the commit the queue is testing for this entry
+    (the queue's own merge-group commit, not the change's head), which is
+    where its checks report."""
 
     id: str
-    state: str
+    state: QueueEntryState
     position: int | None = None
     head: str = ""
 
@@ -93,12 +105,18 @@ class QueueState(NamedTuple):
 
 
 class ReviewComment(BaseModel):
-    """One inline comment, anchored to a line of the PR's diff."""
+    """One inline comment, anchored to a line of the change's diff.
+
+    The anchor is the caller's neutral input — a path, a line, and which
+    side of the diff the line is on: ``RIGHT`` the post-change side (the
+    default), ``LEFT`` the pre-change side, for a comment on a deleted
+    line. A backend resolves it into whatever its API anchors on (a
+    commit-and-side pair, a base/start/head position); the vocabulary
+    never leaks past the backend."""
 
     path: str
     line: int
     body: str
-    # RIGHT is the post-change side; a comment on a deleted line needs LEFT.
     side: Literal["LEFT", "RIGHT"] = "RIGHT"
 
 
@@ -106,18 +124,19 @@ class PostedFinding(NamedTuple):
     """Where one review finding actually landed on the PR.
 
     ``anchor`` is the ``path:line`` key the engine carries across rounds.
-    ``comment_id`` is the REST id of the inline comment that anchors the
+    ``comment_id`` is the id of the inline comment that anchors the
     finding's thread — ``None`` when the finding was posted in the review
-    body instead (anchor refused by GitHub, cap overflow, or no line at
+    body instead (anchor refused by the forge, cap overflow, or no line at
     all), which is exactly the case a later reconciliation pass must fall
-    back to a plain PR comment for. ``thread_node_id`` is the GraphQL node
-    id of that comment's review thread, needed to resolve it; ``None`` when
-    there is no inline comment or the lookup could not answer.
+    back to a plain change-level comment for. ``thread_id`` is the opaque,
+    backend-minted id of that comment's review thread, what
+    ``resolve_review_thread`` takes; ``None`` when there is no inline
+    comment or the lookup could not answer.
     """
 
     anchor: str
     comment_id: int | None = None
-    thread_node_id: str | None = None
+    thread_id: str | None = None
 
 
 def normalize_login(login: str) -> str:
@@ -186,7 +205,8 @@ class ReviewThread(NamedTuple):
     carries its own reply.
     """
 
-    node_id: str
+    # Opaque and backend-minted: what ``resolve_review_thread`` takes.
+    thread_id: str
     is_resolved: bool
     path: str
     line: int | None
@@ -374,6 +394,9 @@ class BaseRequirements(NamedTuple):
     ``unread`` names the sources that could not be read (``protection``,
     ``rulesets``), so a reason or a doctor row can say which — and why:
     classic protection needs admin.
+
+    ``forge`` names the backend that read them, so :meth:`blockers` can
+    phrase each rule in that forge's own terms (:data:`BLOCKER_WORDING`).
     """
 
     required_contexts: tuple[str, ...] | None
@@ -388,6 +411,7 @@ class BaseRequirements(NamedTuple):
     merge_queue: bool = False
     required_deployments: tuple[str, ...] = ()
     unread: tuple[str, ...] = ()
+    forge: str = "github"
 
     @property
     def requires_reviews(self) -> bool | None:
@@ -413,11 +437,15 @@ class BaseRequirements(NamedTuple):
         a merge commit. Rules the loop satisfies on its own — conversation
         resolution (it resolves the threads it answers), stale-review
         dismissal and a merge queue (it enqueues, #676) — are not blockers.
+        Each reason is phrased in the reading forge's own terms
+        (:data:`BLOCKER_WORDING`); a forge with no entry gets the generic
+        wording.
         """
+        words = BLOCKER_WORDING.get(self.forge, GENERIC_WORDING)
         out: list[str] = []
         if self.last_push_approval:
             out.append(
-                "the base requires approval of the last push (require_last_push_approval), "
+                f"the base requires approval of the last push ({words.last_push_rule}), "
                 "and the loop is always the last pusher — no approval can ever satisfy it"
             )
         if self.approvals_required and not can_approve:
@@ -431,14 +459,11 @@ class BaseRequirements(NamedTuple):
             )
         if self.code_owner_review and not can_approve:
             out.append(
-                "the base requires a review from a code owner (CODEOWNERS), which the loop "
-                "cannot give its own pull request"
+                f"the base requires a review from a code owner ({words.code_owners_file}), "
+                "which the loop cannot give its own pull request"
             )
         if self.signed_commits and not can_sign:
-            out.append(
-                "the base requires signed commits; GitHub signs commits the loop creates "
-                "through its API only when it authenticates as a GitHub App"
-            )
+            out.append(f"the base requires signed commits; {words.signing}")
         if self.linear_history and merge_method == "merge":
             out.append(
                 'the base requires a linear history and `[landing] merge_method = "merge"` '
@@ -451,3 +476,34 @@ class BaseRequirements(NamedTuple):
                 "the loop does not run"
             )
         return out
+
+
+class BlockerWording(NamedTuple):
+    """The forge-specific fragments of a :meth:`BaseRequirements.blockers`
+    reason: how the forge names the last-push rule, the code-owners file,
+    and when (if ever) it signs the commits the loop creates through its
+    API."""
+
+    last_push_rule: str
+    code_owners_file: str
+    signing: str
+
+
+GENERIC_WORDING = BlockerWording(
+    last_push_rule="the last-push approval rule",
+    code_owners_file="the code owners file",
+    signing="the loop's commits, created through the forge's API, arrive unsigned",
+)
+
+# One entry per backend, keyed by its kind. The GitHub wording is the one
+# the loop has always used; a reader who learnt it keeps it.
+BLOCKER_WORDING: dict[str, BlockerWording] = {
+    "github": BlockerWording(
+        last_push_rule="require_last_push_approval",
+        code_owners_file="CODEOWNERS",
+        signing=(
+            "GitHub signs commits the loop creates through its API only when it "
+            "authenticates as a GitHub App"
+        ),
+    ),
+}

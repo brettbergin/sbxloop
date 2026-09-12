@@ -443,8 +443,7 @@ class ClaudeBackend:
 
     def _host_tool_server(self, job: JobRequest, emit: EmitFn) -> Any:
         """An in-process MCP server whose tools round-trip to the host."""
-        from claude_agent_sdk import create_sdk_mcp_server
-        from claude_agent_sdk import tool as sdk_tool
+        from claude_agent_sdk import create_sdk_mcp_server, tool as sdk_tool
 
         assert job.host_tools_dir is not None
         tools = [

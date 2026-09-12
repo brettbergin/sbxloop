@@ -87,14 +87,14 @@ class PostedRecord(NamedTuple):
     """One review finding as it was posted on the PR, read back from the store.
 
     ``round`` is the review round that posted it (the phase attempt number).
-    ``comment_id``/``thread_node_id`` are ``None`` for a finding that landed
+    ``comment_id``/``thread_id`` are ``None`` for a finding that landed
     in the review body instead of its own thread — see ``body_only``.
     """
 
     round: int
     anchor: str
     comment_id: int | None = None
-    thread_node_id: str | None = None
+    thread_id: str | None = None
     review_id: int | None = None
 
     @property
@@ -1102,16 +1102,17 @@ class StateStore:
                 if not isinstance(item, dict) or not item.get("anchor"):
                     continue
                 comment_id = item.get("comment_id")
+                # Rows written before the id was neutral spell it as the
+                # GraphQL ``thread_node_id``; both forms read the same.
+                thread_id = item.get("thread_id")
+                if thread_id is None:
+                    thread_id = item.get("thread_node_id")
                 records.append(
                     PostedRecord(
                         round=int(row.attempt),
                         anchor=str(item["anchor"]),
                         comment_id=int(comment_id) if comment_id is not None else None,
-                        thread_node_id=(
-                            str(item["thread_node_id"])
-                            if item.get("thread_node_id") is not None
-                            else None
-                        ),
+                        thread_id=str(thread_id) if thread_id is not None else None,
                         review_id=int(review_id) if review_id is not None else None,
                     )
                 )

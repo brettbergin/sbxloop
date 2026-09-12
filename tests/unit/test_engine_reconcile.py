@@ -46,7 +46,7 @@ def seed(gh: FakeGithub, *anchors: tuple[str, int]) -> list[PostedRecord]:
         [ReviewComment(path=path, line=line, body="[major] fix it") for path, line in anchors],
     )
     return [
-        PostedRecord(1, p.anchor, p.comment_id, p.thread_node_id, submitted.review_id)
+        PostedRecord(1, p.anchor, p.comment_id, p.thread_id, submitted.review_id)
         for p in submitted.posted
     ]
 
@@ -114,7 +114,7 @@ class TestReconcileRound:
         comment_id, body = gh.replies[0]
         assert comment_id == posted[0].comment_id
         assert body.startswith("**addressed in 0123456789ab**: took the lock first")
-        assert gh.resolved == [posted[0].thread_node_id]
+        assert gh.resolved == [posted[0].thread_id]
         assert records == [("src/app.py:12", "addressed", True)]
 
     def test_refuted_and_unanswered_are_replied_to_but_left_open(self) -> None:
@@ -322,7 +322,7 @@ class TestIdempotency:
         )
         assert out.replied == 1
         # The node id came from the store record, so it still resolved.
-        assert gh.resolved == [posted[0].thread_node_id]
+        assert gh.resolved == [posted[0].thread_id]
 
     def test_failed_capture_still_finds_its_live_thread_by_anchor(self) -> None:
         """`comment_id=None` can mean capture failed, not that no thread exists.

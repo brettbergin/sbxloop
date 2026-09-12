@@ -157,7 +157,7 @@ class HumanObjection(NamedTuple):
     body: str
     anchor: str = ""
     comment_id: int | None = None
-    thread_node_id: str | None = None
+    thread_id: str | None = None
     # The reviewer is a GitHub App (REST ``user.type == "Bot"``, #613).
     is_bot: bool = False
 

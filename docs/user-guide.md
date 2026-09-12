@@ -1397,11 +1397,13 @@ running item's pinned run so its next dispatch starts over (attempts and
 backoff kept). The same controls are `!sbx items|abandon|retry|requeue` on
 Discord.
 
-`<item>` is a work item id. GitHub items are **typed** —
+`<item>` is a work item id. Forge items are **typed** —
 `gh:issue:<number>` for the issue a run was claimed from, `gh:pr:<number>`
 for a pull request referenced as a work-item resource — and the untyped
 legacy form `gh:<number>` is still accepted everywhere as an alias for
 `gh:issue:<number>`, so old commands, checkpoints and watches keep working.
+The prefix names the forge: `gh:` is GitHub, and the same grammar reads
+under `gl:` (GitLab) and `gt:` (Gitea) for the backends to come.
 Everything sbxloop prints uses the typed form. See
 [Work item ids](architecture.md#work-item-ids) for the full grammar.
 

@@ -79,7 +79,6 @@ from sbxloop.engine.model import RunKind
 from sbxloop.errors import DaemonError
 from sbxloop.ghids import (
     CHAT_PREFIX,
-    GH_PREFIX,
     SCHED_PREFIX,
     format_gh_id,
     normalize_item_id,
@@ -781,7 +780,7 @@ def _id_variants(item_id: str) -> tuple[str, str]:
     if parsed is None:
         return (item_id, item_id)
     if parsed.kind == "issue" and parsed.repo is None:
-        return (parsed.item_id, f"{GH_PREFIX}{parsed.number}")
+        return (parsed.item_id, f"{parsed.forge}:{parsed.number}")
     return (parsed.item_id, parsed.item_id)
 
 
@@ -1705,7 +1704,7 @@ class DaemonStore:
         ).first()
         if owner is None:
             return item_id
-        qualified = format_gh_id(parsed.kind, parsed.number, repo=repo)
+        qualified = format_gh_id(parsed.kind, parsed.number, repo=repo, forge=parsed.forge)
         log.info(
             "store.item_id_qualified",
             item=qualified,

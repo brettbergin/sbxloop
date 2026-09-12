@@ -41,7 +41,7 @@ HUMAN = "brettbergin"
 
 def thread(
     *,
-    node_id: str = "PRRT_1",
+    thread_id: str = "PRRT_1",
     path: str = "a.py",
     line: int | None = 12,
     resolved: bool = False,
@@ -50,7 +50,7 @@ def thread(
 ) -> ReviewThread:
     """``bot`` marks the root comment's author as a GitHub App."""
     return ReviewThread(
-        node_id=node_id,
+        thread_id=thread_id,
         is_resolved=resolved,
         path=path,
         line=line,
@@ -129,15 +129,15 @@ class TestMergeGate:
     def test_a_fully_reconciled_pr_merges(self) -> None:
         fake = FakeGithub()
         fake.threads = [
-            thread(node_id="PRRT_1", resolved=True),
+            thread(thread_id="PRRT_1", resolved=True),
             thread(
-                node_id="PRRT_2",
+                thread_id="PRRT_2",
                 path="b.py",
                 line=4,
                 comments=((LOGIN, "[minor] naming"), (LOGIN, "**refuted**: intentional")),
             ),
             thread(
-                node_id="PRRT_3",
+                thread_id="PRRT_3",
                 path="c.py",
                 line=9,
                 comments=((HUMAN, "rename"), (LOGIN, "**addressed** in abc123def456")),
@@ -152,7 +152,10 @@ class TestMergeGate:
 
     def test_an_unreconciled_loop_thread_blocks_and_is_named(self) -> None:
         fake = FakeGithub()
-        fake.threads = [thread(path="x.py", line=1), thread(node_id="PRRT_2", path="y.py", line=2)]
+        fake.threads = [
+            thread(path="x.py", line=1),
+            thread(thread_id="PRRT_2", path="y.py", line=2),
+        ]
         outcome = run_land(fake)
         assert isinstance(outcome, Blocked)
         assert outcome.why == "2 review threads unreconciled: x.py:1, y.py:2"
@@ -224,7 +227,7 @@ class TestManyThreads:
         fake = FakeGithub()
         fake.threads = [
             thread(
-                node_id=f"PRRT_{i}",
+                thread_id=f"PRRT_{i}",
                 path="a.py",
                 line=i,
                 resolved=True,
@@ -233,7 +236,7 @@ class TestManyThreads:
             for i in range(149)
         ]
         fake.threads.insert(
-            120, thread(node_id="PRRT_H", path="deep.py", line=7, comments=((HUMAN, "why?"),))
+            120, thread(thread_id="PRRT_H", path="deep.py", line=7, comments=((HUMAN, "why?"),))
         )
         outcome = run_land(fake)
         assert isinstance(outcome, Blocked)
@@ -405,7 +408,7 @@ class TestAckCap:
         # answers, as GitHub does.
         return [
             ReviewThread(
-                node_id=f"PRRT_{i}",
+                thread_id=f"PRRT_{i}",
                 is_resolved=False,
                 path="a.py",
                 line=i,
@@ -648,7 +651,7 @@ class TestBotSuffixIdentity:
                 comments=(("sbxloop", "[minor] x"), ("sbxloop", "**noted, not blocking**")),
             ),
             thread(
-                node_id="PRRT_2",
+                thread_id="PRRT_2",
                 path="b.py",
                 line=4,
                 resolved=True,

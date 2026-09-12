@@ -60,7 +60,17 @@ forge-neutral modules under `sbxloop/vcs/`; a backend package beside them
 - **`vcs/model.py` — the shared types.** An issue or change reference, a
   folded `ChecksVerdict`, a `ReviewThread`, the base's `BaseRequirements`:
   the shapes the engine, the daemon and the doctor read. They carry no path,
-  no payload and no transport; a backend maps its API into them.
+  no payload and no transport; a backend maps its API into them. The
+  vocabulary is the loop's own, not any forge's: a review thread and a
+  posted finding carry one opaque, backend-minted `thread_id`; a merge-queue
+  entry's state is `queued`, `testing`, `mergeable`, `blocked`, `removed` or
+  — a state the backend did not recognise, never read as mergeable —
+  `unknown`; a review comment's anchor (`path`, `line`, `side`) is the
+  caller's input, which the backend resolves into whatever its API anchors
+  on; an issue closes for a `CloseReason` the backend spells; and the
+  base's `blockers()` are phrased in the reading forge's own terms
+  (`BLOCKER_WORDING`), the GitHub wording being the one the loop has
+  always used.
 - **Capabilities are three-state, never a boolean.** A backend reports each
   of `vcs.protocol.CAPABILITIES` (a merge queue, resolvable review threads,
   draft changes, a request-changes review the forge enforces, a
@@ -2078,14 +2088,17 @@ to the sole configured repository when there is only one.
 
 ### Work item ids
 
-Every work item carries a **source-qualified id**. GitHub resources use a
+Every work item carries a **source-qualified id**. Forge resources use a
 **typed** grammar so a number is never ambiguous between the issue a run
-came from and the pull request it produced:
+came from and the pull request it produced, and the prefix names the forge
+— `gh:` GitHub, `gl:` GitLab, `gt:` Gitea — so one daemon can tend
+repositories on more than one without an id colliding:
 
 ```
 gh:issue:<number>    the GitHub issue a work item was claimed from (canonical)
 gh:pr:<number>       a pull request referenced as a work-item-adjacent resource
 gh:<number>          legacy alias, accepted on read, means gh:issue:<number>
+gl:issue:<number>    the same grammar on GitLab; gt: on Gitea
 ```
 
 One module, `sbxloop.ghids`, owns that grammar — `format_gh_id` /

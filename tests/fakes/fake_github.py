@@ -671,7 +671,7 @@ class FakeGithub(GithubOps):
             self._comment_id += 1
             self.threads.append(
                 ReviewThread(
-                    node_id=f"PRRT_{self._comment_id}",
+                    thread_id=f"PRRT_{self._comment_id}",
                     is_resolved=False,
                     path=str(body["path"]),
                     line=int(body["line"]),
@@ -850,7 +850,7 @@ class FakeGithub(GithubOps):
             node_id = f"PRRT_{self._comment_id}"
             self.threads.append(
                 ReviewThread(
-                    node_id=node_id,
+                    thread_id=node_id,
                     is_resolved=False,
                     path=comment.path,
                     line=comment.line,
@@ -884,11 +884,11 @@ class FakeGithub(GithubOps):
         self._maybe_fail("pr_issue_comment")
         return f"{self.pr['html_url']}#issuecomment-{len(self.issue_comments_posted)}"
 
-    def resolve_review_thread(self, thread_node_id: str) -> bool:
-        self.resolved.append(thread_node_id)
+    def resolve_review_thread(self, thread_id: str) -> bool:
+        self.resolved.append(thread_id)
         self._maybe_fail("resolve_review_thread")
         for index, thread in enumerate(self.threads):
-            if thread.node_id == thread_node_id:
+            if thread.thread_id == thread_id:
                 self.threads[index] = thread._replace(is_resolved=True)
                 return True
         return False
@@ -931,7 +931,7 @@ class FakeGithub(GithubOps):
                 "enqueuePullRequest failed: [{'type': 'UNPROCESSABLE', 'message': "
                 "'Pull request is not mergeable'}]"
             )
-        return QueueEntry(id="MQE_1", state="QUEUED", position=1, head="queue0")
+        return QueueEntry(id="MQE_1", state="queued", position=1, head="queue0")
 
     def pr_queue_state(self, repo: str, number: int) -> QueueState:
         self.queue_reads += 1

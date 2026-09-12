@@ -47,9 +47,9 @@ from sbxloop.sbx.sandbox import (
     RESULTS_DIR,
     TOOLS_DIR,
     VENV_DIR,
+    VENV_PYTHON as DEFAULT_PYTHON,
     Sandbox,
 )
-from sbxloop.sbx.sandbox import VENV_PYTHON as DEFAULT_PYTHON
 from sbxloop.worker.hosttools import HostToolBroker, HostToolHandler
 from sbxloop.worker.wheel import resolve_worker_wheel
 from sbxloop_worker.protocol import Event, EventTypes, JobRequest, JobResult

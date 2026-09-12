@@ -44,7 +44,7 @@ def seed(gh: FakeGithub, *anchors: tuple[str, int]) -> list[PostedRecord]:
         [ReviewComment(path=path, line=line, body="[major] fix it") for path, line in anchors],
     )
     return [
-        PostedRecord(1, p.anchor, p.comment_id, p.thread_node_id, submitted.review_id)
+        PostedRecord(1, p.anchor, p.comment_id, p.thread_id, submitted.review_id)
         for p in submitted.posted
     ]
 
@@ -175,7 +175,7 @@ class TestPostConfirmations:
         )
         assert outcome.replied == 1 and outcome.resolved == 1 and outcome.confirmed == 1
         assert gh.replies and "confirmed fixed" in gh.replies[0][1]
-        assert gh.resolved == [posted[0].thread_node_id]
+        assert gh.resolved == [posted[0].thread_id]
         assert all(t.is_resolved for t in gh.threads)
 
     def test_still_open_replies_and_leaves_the_thread_open(self) -> None:

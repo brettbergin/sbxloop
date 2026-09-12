@@ -44,8 +44,7 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
 from sbxloop.agentmodels import ModelSelection, model_for_phase, refreshed_models
 from sbxloop.cli.tui import format_event
 from sbxloop.config import SINK_NAMES, BridgeBackend, Config, ScheduleConfig
-from sbxloop.configedit import ConfigEditError, ConfigEditor
-from sbxloop.configedit import keys as configkeys
+from sbxloop.configedit import ConfigEditError, ConfigEditor, keys as configkeys
 from sbxloop.daemon import configview
 from sbxloop.daemon.chat_choices import (
     ChoiceQuestion,
@@ -89,6 +88,7 @@ from sbxloop.ids import new_job_id, new_run_id
 from sbxloop.log import get_logger
 from sbxloop.provider import ProviderHeldError, ProviderHold, ProviderRecovery
 from sbxloop.vcs.github.ops import MalformedResponse
+from sbxloop.vcs.model import CloseReason
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import (
     HostToolCall,
@@ -130,10 +130,11 @@ _DENIED_CONTROL_VERBS = frozenset({"stop"})
 #: `set_config`'s `restart` argument (#971): at once, after the run in
 #: flight, or not at all.
 RESTART_CHOICES: tuple[str, ...] = ("now", "after_run", "no")
-# GitHub's ``state_reason`` for a close. ``completed`` means the thing was
-# actually done; ``not_planned`` is the triage verdict — duplicate, won't fix,
-# stale. Nothing else is accepted, so the model cannot invent a reason.
-CLOSE_REASONS = ("completed", "not_planned")
+# Why an issue is closed (:data:`sbxloop.vcs.model.CloseReason`):
+# ``completed`` means the thing was actually done; ``not_planned`` is the
+# triage verdict — duplicate, won't fix, stale. Nothing else is accepted,
+# so the model cannot invent a reason.
+CLOSE_REASONS: tuple[CloseReason, ...] = get_args(CloseReason)
 #: Appended to a tool call's ``by`` for GitHub-facing attribution (see
 #: ``_tool_handler``). A transport's ``on_watch`` callback receives this same
 #: tagged string as its ``requester`` and must strip it back off before

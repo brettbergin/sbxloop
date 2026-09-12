@@ -1842,10 +1842,10 @@ class TestPipeline:
             reopened.close()
         assert [(p.round, p.anchor, p.body_only) for p in posted] == [(1, "hello.txt:1", False)]
         (only,) = posted
-        assert only.comment_id is not None and only.thread_node_id is not None
-        assert (only.comment_id, only.thread_node_id) == (
+        assert only.comment_id is not None and only.thread_id is not None
+        assert (only.comment_id, only.thread_id) == (
             fake.threads[0].root_comment_id,
-            fake.threads[0].node_id,
+            fake.threads[0].thread_id,
         )
 
     def test_delivery_opens_one_draft_pr_and_refreshes_it(self, harness: Harness) -> None:
@@ -3705,7 +3705,7 @@ class TestAppIdentityLanding:
 
         fake.threads = [
             ReviewThread(
-                node_id="PRRT_1",
+                thread_id="PRRT_1",
                 is_resolved=True,
                 path="a.py",
                 line=1,
@@ -3777,14 +3777,14 @@ class TestAppIdentityLanding:
         )
         fake.threads = [
             ReviewThread(
-                node_id="PRRT_1",
+                thread_id="PRRT_1",
                 is_resolved=True,
                 path="a.py",
                 line=1,
                 comments=(ThreadComment(1, "sbxloop", "[minor] naming", is_bot=True),),
             ),
             ReviewThread(
-                node_id="PRRT_2",
+                thread_id="PRRT_2",
                 is_resolved=False,
                 path="b.py",
                 line=2,

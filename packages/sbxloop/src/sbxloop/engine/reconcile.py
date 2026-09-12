@@ -252,7 +252,7 @@ def reconcile_round(
             )
             continue
         replied += 1
-        node_id = rec.thread_node_id or (thread.node_id if thread is not None else None)
+        node_id = rec.thread_id or (thread.thread_id if thread is not None else None)
         did_resolve = False
         # A finding the fixer addressed, or deliberately deferred to a
         # follow-up, is settled; refuted and unanswered threads stay open
@@ -427,8 +427,8 @@ def post_confirmations(
             )
             continue
         replied += 1
-        node_id = (record_for.thread_node_id if record_for is not None else None) or (
-            thread.node_id if thread is not None else None
+        node_id = (record_for.thread_id if record_for is not None else None) or (
+            thread.thread_id if thread is not None else None
         )
         did_resolve = False
         if item.fixed and node_id:
@@ -772,7 +772,7 @@ def note_nonblocking(
             )
             continue
         replied += 1
-        node_id = rec.thread_node_id or (thread.node_id if thread is not None else None)
+        node_id = rec.thread_id or (thread.thread_id if thread is not None else None)
         did_resolve = False
         if node_id:
             try:

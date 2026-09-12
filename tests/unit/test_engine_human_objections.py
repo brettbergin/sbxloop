@@ -54,7 +54,7 @@ def inline(gh: FakeGithub, path: str, line: int) -> HumanObjection:
         body="fix it",
         anchor=f"{path}:{line}",
         comment_id=posted.comment_id,
-        thread_node_id=posted.thread_node_id,
+        thread_id=posted.thread_id,
     )
 
 
@@ -183,7 +183,7 @@ class TestStoreRecord:
 
 def ack_thread(*comments: tuple[str, str], node: str = "PRRT_9") -> ReviewThread:
     return ReviewThread(
-        node_id=node,
+        thread_id=node,
         is_resolved=False,
         path="a.py",
         line=3,
@@ -243,7 +243,7 @@ class TestAcknowledgeHumanThreads:
         gh = FakeGithub()
         own = ack_thread((self.LOGIN, "[minor] naming"))
         rootless = ReviewThread(
-            node_id="PRRT_X",
+            thread_id="PRRT_X",
             is_resolved=False,
             path="b.py",
             line=None,

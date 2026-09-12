@@ -3293,7 +3293,7 @@ class LoopEngine:
             # so the fix round that follows reconciles onto it rather than
             # into a body comment.
             posted_findings += tuple(
-                PostedFinding(rec.anchor, rec.comment_id, rec.thread_node_id)
+                PostedFinding(rec.anchor, rec.comment_id, rec.thread_id)
                 for rec in self._threads_for(run_id, [c.anchor for c in carried if not c.fixed])
             )
         except GithubOpsError:
@@ -3494,7 +3494,7 @@ class LoopEngine:
         run = self.store.get_run(run_id)
         if run.pr_number is None:
             return
-        records = [PostedRecord(round_no, f.anchor, f.comment_id, f.thread_node_id) for f in posted]
+        records = [PostedRecord(round_no, f.anchor, f.comment_id, f.thread_id) for f in posted]
         try:
             outcome = note_nonblocking(
                 ops,

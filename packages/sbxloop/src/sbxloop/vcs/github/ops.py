@@ -19,65 +19,29 @@ from sbxloop.log import get_logger
 from sbxloop.vcs.github.permissions import READ_PROBES
 from sbxloop.vcs.github.protection import read_base_requirements
 from sbxloop.vcs.github.review_locations import right_side_ranges
-from sbxloop.vcs.model import BaseRequirements
 from sbxloop.vcs.model import (
+    BaseRequirements,
     CheckState as CheckState,
-)
-from sbxloop.vcs.model import (
     ChecksVerdict as ChecksVerdict,
-)
-from sbxloop.vcs.model import (
+    CloseReason as CloseReason,
     FailedCheck as FailedCheck,
-)
-from sbxloop.vcs.model import (
     Identity as Identity,
-)
-from sbxloop.vcs.model import (
     IssueRef as IssueRef,
-)
-from sbxloop.vcs.model import (
     MergeOutcome as MergeOutcome,
-)
-from sbxloop.vcs.model import (
     PostedFinding as PostedFinding,
-)
-from sbxloop.vcs.model import (
     PrRef as PrRef,
-)
-from sbxloop.vcs.model import (
     QueueEntry as QueueEntry,
-)
-from sbxloop.vcs.model import (
+    QueueEntryState as QueueEntryState,
     QueueState as QueueState,
-)
-from sbxloop.vcs.model import (
     ReviewComment as ReviewComment,
-)
-from sbxloop.vcs.model import (
     ReviewEvent as ReviewEvent,
-)
-from sbxloop.vcs.model import (
     ReviewThread as ReviewThread,
-)
-from sbxloop.vcs.model import (
     ReviewVerdict as ReviewVerdict,
-)
-from sbxloop.vcs.model import (
     SubmittedReview as SubmittedReview,
-)
-from sbxloop.vcs.model import (
     ThreadComment as ThreadComment,
-)
-from sbxloop.vcs.model import (
     approval_summary as approval_summary,
-)
-from sbxloop.vcs.model import (
     identities_match as identities_match,
-)
-from sbxloop.vcs.model import (
     logins_match as logins_match,
-)
-from sbxloop.vcs.model import (
     normalize_login as normalize_login,
 )
 from sbxloop.vcs.protocol import Capability, VcsOps
@@ -446,6 +410,19 @@ def fold_required_contexts(payload: Any) -> list[str]:
     return out
 
 
+# GitHub's ``MergeQueueEntryState`` in the loop's words. LOCKED is the
+# queue holding the entry while it merges it — field-unverified beyond
+# GitHub's schema description, and read as mergeable since the queue has
+# already decided to merge. Anything else is ``unknown``, never mergeable.
+_QUEUE_STATES: dict[str, QueueEntryState] = {
+    "QUEUED": "queued",
+    "AWAITING_CHECKS": "testing",
+    "MERGEABLE": "mergeable",
+    "LOCKED": "mergeable",
+    "UNMERGEABLE": "blocked",
+}
+
+
 def fold_queue_entry(node: Any) -> QueueEntry | None:
     """A GraphQL ``MergeQueueEntry`` node as a typed row; ``None`` when
     there is no entry (the PR is not queued) or the node has no id."""
@@ -455,7 +432,7 @@ def fold_queue_entry(node: Any) -> QueueEntry | None:
     position = node.get("position")
     return QueueEntry(
         id=str(node["id"]),
-        state=str(node.get("state") or ""),
+        state=_QUEUE_STATES.get(str(node.get("state") or ""), "unknown"),
         position=int(position) if isinstance(position, int) else None,
         head=str(head.get("oid") or "") if isinstance(head, dict) else "",
     )
@@ -540,7 +517,7 @@ def fold_review_threads(payload: Any) -> list[ReviewThread]:
             )
         threads.append(
             ReviewThread(
-                node_id=node_id,
+                thread_id=node_id,
                 is_resolved=bool(node.get("isResolved")),
                 path=str(node.get("path") or ""),
                 line=int(raw_line) if isinstance(raw_line, int) else None,
@@ -943,7 +920,7 @@ class GithubOps:
                 for thread in self.pr_review_threads(repo, number):
                     for comment in thread.comments:
                         if comment.comment_id is not None:
-                            threads_by_comment[comment.comment_id] = thread.node_id
+                            threads_by_comment[comment.comment_id] = thread.thread_id
             except GithubOpsError as exc:
                 log.warning("gh.review_threads_read_failed", repo=repo, pr=number, error=str(exc))
         posted: list[PostedFinding] = []
@@ -953,7 +930,7 @@ class GithubOps:
                 PostedFinding(
                     anchor=anchor,
                     comment_id=comment_id,
-                    thread_node_id=(
+                    thread_id=(
                         threads_by_comment.get(comment_id) if comment_id is not None else None
                     ),
                 )
@@ -1020,14 +997,14 @@ class GithubOps:
                 for thread in self.pr_review_threads(repo, number):
                     for entry in thread.comments:
                         if entry.comment_id is not None:
-                            threads_by_comment[entry.comment_id] = thread.node_id
+                            threads_by_comment[entry.comment_id] = thread.thread_id
             except GithubOpsError as exc:
                 log.warning("gh.review_threads_read_failed", repo=repo, pr=number, error=str(exc))
         return tuple(
             PostedFinding(
                 anchor=anchor_of(c),
                 comment_id=by_anchor.get(anchor_of(c)),
-                thread_node_id=threads_by_comment.get(by_anchor[anchor_of(c)])
+                thread_id=threads_by_comment.get(by_anchor[anchor_of(c)])
                 if anchor_of(c) in by_anchor
                 else None,
             )
@@ -1073,8 +1050,10 @@ class GithubOps:
         data = self.raw("POST", f"/repos/{repo}/issues/{number}/comments", {"body": body})
         return str(data.get("html_url", "")) if isinstance(data, dict) else ""
 
-    def resolve_review_thread(self, thread_node_id: str) -> bool:
-        """Mark a review thread resolved; True when it now is.
+    def resolve_review_thread(self, thread_id: str) -> bool:
+        """Mark a review thread resolved; True when it now is. ``thread_id``
+        is the opaque id a :class:`ReviewThread` or :class:`PostedFinding`
+        carries — here, the thread's GraphQL node id.
 
         GraphQL answers a failed mutation with a 200 and an ``errors`` array,
         so the body is the verdict, not the status.
@@ -1082,7 +1061,7 @@ class GithubOps:
         data = self.raw(
             "POST",
             "/graphql",
-            {"query": self._RESOLVE_MUTATION, "variables": {"id": thread_node_id}},
+            {"query": self._RESOLVE_MUTATION, "variables": {"id": thread_id}},
         )
         if not isinstance(data, dict):
             raise GithubOpsError(f"resolveReviewThread returned a malformed result: {data!r}")
@@ -1578,9 +1557,11 @@ class GithubOps:
         not a failed job (#558)."""
         self.raw_lookup("DELETE", f"/repos/{repo}/issues/{number}/labels/{quote(label, safe='')}")
 
-    def issue_close(self, repo: str, number: int | str, *, reason: str = "completed") -> None:
-        """Close the issue with ``reason`` (``completed``, ``not_planned``);
-        closing a closed issue is a no-op success."""
+    def issue_close(
+        self, repo: str, number: int | str, *, reason: CloseReason = "completed"
+    ) -> None:
+        """Close the issue with ``reason``, which GitHub takes verbatim as
+        its ``state_reason``; closing a closed issue is a no-op success."""
         self.raw(
             "PATCH",
             f"/repos/{repo}/issues/{number}",

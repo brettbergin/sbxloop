@@ -38,8 +38,6 @@ from tests.fakes.ops_stub import OpsStub
 from tests.fakes.rawdb import backdate, query_raw
 from tests.unit.test_hostgit import (
     git as git_cmd,
-)
-from tests.unit.test_hostgit import (
     make_repo,
     make_upstream_and_clone,
     push_upstream_commit,
