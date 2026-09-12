@@ -1976,7 +1976,7 @@ class TestPullRequestCollision:
         from sbxloop.deliver import _is_pr_collision
         from sbxloop.errors import GithubOpsError
 
-        assert _is_pr_collision(GithubOpsError("Validation Failed (HTTP 422)", http_status=422))
+        assert _is_pr_collision(github_error("pr_exists_422"))
         assert _is_pr_collision(
             GithubOpsError("Another open merge request already exists", http_status=409)
         )
