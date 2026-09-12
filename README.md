@@ -86,6 +86,11 @@ You'll need a host that supports [Docker Sandboxes](https://docs.docker.com/ai/s
 and GitHub Copilot access, an Anthropic API key, or an OpenAI API key. sbxloop requires
 Python 3.13 or newer; the installer sets up Python and the sandbox CLI for you.
 
+The host brings the rest: curl, tar, git and e2fsprogs. Git is sbxloop's own dependency —
+it reads and clones checkouts on the host, and the git inside a sandbox does not stand in
+for it — so the installer checks for a usable one before it downloads anything and tells
+you what to install if there is none.
+
 ### Install and initialize
 
 On macOS or Linux:
