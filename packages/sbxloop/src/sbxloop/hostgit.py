@@ -125,7 +125,6 @@ import contextlib
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -253,41 +252,23 @@ def is_tracked(repo_root: Path, path: Path) -> bool | None:
 
     None when git is unavailable or the probe fails, so the caller decides
     what "could not tell" means for it. The checkout may be one a sandbox
-    agent has written to, so its config is untrusted: ``core.fsmonitor``
-    (a hook git would run) is forced off on the command line, and inherited
-    ``GIT_*`` variables are dropped so they cannot point git elsewhere.
-    ``ls-files`` never executes anything else.
+    agent has written to, so its config is untrusted: the index is read
+    through :func:`sbxloop.safegit.read_repo`, whose private metadata
+    snapshot carries none of the checkout's config, hooks or drivers, and
+    answered from the typed index rather than a subprocess exit status.
     """
-    git = find_git()
-    if git is None:
+    if find_git() is None:
         return None
     try:
         relative = path.resolve().relative_to(repo_root.resolve())
     except ValueError:
         return False
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     try:
-        proc = subprocess.run(  # nosec B603 - list argv, git binary, no shell
-            [git, "-c", "core.fsmonitor=false", "ls-files", "--error-unmatch", "--", str(relative)],
-            cwd=repo_root,
-            env=env,
-            capture_output=True,
-            check=False,
-        )
-    except OSError:
+        with read_repo(repo_root) as repo:
+            return (relative.as_posix(), 0) in repo.index.entries
+    except (InvalidGitRepositoryError, NoSuchPathError, ProvisionError, ValueError, OSError):
         log.debug("git.is_tracked_probe_failed", root=str(repo_root), exc_info=True)
         return None
-    if proc.returncode == 0:
-        return True
-    if proc.returncode == 1:
-        return False
-    log.debug(
-        "git.is_tracked_probe_failed",
-        root=str(repo_root),
-        rc=proc.returncode,
-        stderr=proc.stderr.decode("utf-8", "replace")[-400:],
-    )
-    return None
 
 
 def head_commit(repo_path: Path) -> str | None:
@@ -1147,37 +1128,35 @@ def gitignored_files(root: Path) -> frozenset[str] | None:
     resolves ``GIT_WORK_TREE`` against its cwd -- which is ``root`` -- so
     a relative value would point at ``root/root`` and ignore nothing.
     """
-    git = find_git()
-    if git is None:
+    if find_git() is None:
         return None
     root = root.absolute()
-    argv = [
-        git,
-        "-c",
-        "core.fsmonitor=false",
-        "ls-files",
-        "--others",
-        "--ignored",
-        "--exclude-per-directory=.gitignore",
-        "-z",
-    ]
-    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
     if (root / ".git").exists():
         try:
-            return _ls_files(argv, root, env)
-        except (subprocess.CalledProcessError, OSError):
+            with read_repo(root) as repo:
+                return _ls_files(repo.git)
+        except (
+            InvalidGitRepositoryError,
+            NoSuchPathError,
+            GitCommandError,
+            ProvisionError,
+            ValueError,
+            OSError,
+        ):
             # Not a usable repo (a bare `.git` marker, corrupt HEAD, …):
             # fall through to the self-contained probe.
             log.debug("gitignore.in_place_probe_failed", root=str(root), exc_info=True)
     try:
         with tempfile.TemporaryDirectory(prefix="sbxloop-gitignore-") as tmp:
-            subprocess.run(  # nosec B603 - list argv, git binary, no shell
-                [git, "init", "-q", tmp], check=True, capture_output=True, env=env
+            Repo.init(tmp).close()
+            git = Git(str(root))
+            git.update_environment(
+                **{k: None for k in os.environ if k.startswith("GIT_")},
+                GIT_DIR=str(Path(tmp) / ".git"),
+                GIT_WORK_TREE=str(root),
             )
-            env["GIT_DIR"] = str(Path(tmp) / ".git")
-            env["GIT_WORK_TREE"] = str(root)
-            return _ls_files(argv, root, env)
-    except (subprocess.CalledProcessError, OSError):
+            return _ls_files(git)
+    except (GitCommandError, OSError):
         log.warning(
             "gitignore.probe_failed",
             root=str(root),
@@ -1187,13 +1166,18 @@ def gitignored_files(root: Path) -> frozenset[str] | None:
         return None
 
 
-def _ls_files(argv: Sequence[str], cwd: Path, env: dict[str, str]) -> frozenset[str]:
-    proc = subprocess.run(  # nosec B603 - list argv, git binary, no shell
-        list(argv), cwd=cwd, env=env, check=True, capture_output=True
+def _ls_files(git: Git) -> frozenset[str]:
+    """``git ls-files --others --ignored`` under in-tree rules only, as bytes:
+    a path git cannot decode is still a path, and must not drop out of the
+    listing on the way through a str."""
+    out: bytes = git.ls_files(
+        "--others",
+        "--ignored",
+        "--exclude-per-directory=.gitignore",
+        "-z",
+        stdout_as_string=False,
     )
-    return frozenset(
-        part.decode("utf-8", "surrogateescape") for part in proc.stdout.split(b"\0") if part
-    )
+    return frozenset(part.decode("utf-8", "surrogateescape") for part in out.split(b"\0") if part)
 
 
 def resolve_diff_base(repo_path: Path, remote_base_sha: str | None) -> str | None:

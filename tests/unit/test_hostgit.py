@@ -239,6 +239,18 @@ class TestGitignoredFiles:
         monkeypatch.setattr(hostgit, "find_git", lambda: None)
         assert hostgit.gitignored_files(tmp_path) is None
 
+    def test_a_path_git_cannot_decode_is_still_listed(self, tmp_path: Path) -> None:
+        """Bytes in, bytes out: a non-UTF-8 name under an ignore rule must
+        not drop out of the listing on the way through a str."""
+        root = make_repo(tmp_path)
+        (root / ".gitignore").write_text("dist/\n")
+        (root / "dist").mkdir()
+        raw = b"dist/caf\xe9.whl"
+        (root / os.fsdecode(raw)).write_bytes(b"")
+        listed = hostgit.gitignored_files(root)
+        assert listed is not None
+        assert {os.fsencode(p) for p in listed} == {raw}
+
 
 def rev(cwd: Path, ref: str = "HEAD") -> str:
     return subprocess.run(
@@ -1144,6 +1156,26 @@ class TestIsTracked:
     def test_without_git_is_unknown(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         root = make_repo(tmp_path)
         monkeypatch.setattr(hostgit, "find_git", lambda: None)
+        assert hostgit.is_tracked(root, root / "hello.txt") is None
+
+    def test_checkout_config_cannot_run_an_fsmonitor_hook(self, tmp_path: Path) -> None:
+        """The agent can write the checkout's .git/config; a core.fsmonitor
+        hook there must not execute on the host during the probe."""
+        root = make_repo(tmp_path)
+        marker = tmp_path / "pwned"
+        hook = tmp_path / "hook.sh"
+        hook.write_text(f"#!/bin/sh\ntouch {marker}\n")
+        hook.chmod(0o755)
+        git("config", "core.fsmonitor", str(hook), cwd=root)
+        git("config", "core.fsmonitorHookVersion", "1", cwd=root)
+        assert hostgit.is_tracked(root, root / "hello.txt") is True
+        assert not marker.exists()
+
+    def test_a_checkout_that_cannot_be_read_is_unknown(self, tmp_path: Path) -> None:
+        root = tmp_path / "ws"
+        (root / ".git").mkdir(parents=True)
+        (root / ".git" / "HEAD").write_text("ref\n")
+        (root / "hello.txt").write_text("x\n")
         assert hostgit.is_tracked(root, root / "hello.txt") is None
 
 
