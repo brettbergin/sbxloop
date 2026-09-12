@@ -60,6 +60,22 @@ class TestLoadSecretsEnv:
         assert load_secrets_env({}) is None
         assert SENTINEL not in os.environ
 
+    def test_a_windows_session_finds_the_same_home_the_process_runs_out_of(
+        self, tmp_path: Path
+    ) -> None:
+        """#899: without a Unix ``HOME`` the secrets lookup used to give up
+        while the home resolver fell back to the user directory — the host
+        ran out of one home and read no secrets from it. Both answer the
+        same now, from ``USERPROFILE`` alone."""
+        from sbxloop.paths import resolve_home_root
+
+        profile = tmp_path / "Users" / "Ada"
+        path = secrets_file(profile / ".sbxloop", f"{SENTINEL}=from-userprofile\n")
+        env = {"USERPROFILE": str(profile)}
+        assert resolve_home_root(env) == profile / ".sbxloop"
+        assert load_secrets_env(env) == path
+        assert os.environ[SENTINEL] == "from-userprofile"
+
 
 class TestConfigIntegration:
     def test_load_config_reads_secrets_settings(self, tmp_path: Path) -> None:

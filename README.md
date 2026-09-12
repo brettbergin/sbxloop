@@ -103,7 +103,10 @@ export PATH="$HOME/.sbxloop/bin:$PATH"
 On Windows, use WSL2: install a Linux distribution, turn on Docker Desktop's
 WSL integration for it, and run the same two lines inside that distribution.
 Native Windows cannot boot the sandboxes; `sbxloop run`, `daemon` and `bake`
-refuse there by name and `sbxloop doctor` says so in its first row.
+refuse there by name and `sbxloop doctor` says so in its first row. What it
+*can* do — lay out a home, find your config and secrets, and diagnose
+itself — is spelled out under
+[Platform support](docs/user-guide.md#platform-support).
 
 `sbxloop init` creates the home directory, installs the runtime, and writes
 your starter configuration and secrets file:

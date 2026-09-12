@@ -46,6 +46,7 @@ from sbxloop.gh.permissions import (
     split_required,
 )
 from sbxloop.gh.protection import read_base_requirements
+from sbxloop.hostfiles import privacy
 from sbxloop.paths import SbxloopHome, describe, legacy_paths
 from sbxloop.sbx.bake import load_bake_record
 from sbxloop.sbx.cli import SbxCLI
@@ -1585,13 +1586,18 @@ def home_checks(home: SbxloopHome, env: dict[str, str]) -> list[Check]:
             except OSError as exc:
                 checks.append(Check("home", False, f"{home.root} is not writable: {exc}"))
     if home.secrets_env.exists():
-        mode = home.secrets_env.stat().st_mode & 0o777
+        # The platform's own access control, not a POSIX mode: on Windows a
+        # mode check can only ever fail, and the `chmod 600` it suggests
+        # cannot clear it (:mod:`sbxloop.hostfiles`). A host that could not
+        # read the access control fails the row saying so, rather than
+        # passing every unreadable file.
+        verdict = privacy(home.secrets_env, os_name=home.os_name)
         checks.append(
             Check(
                 "secrets file",
-                mode == 0o600,
-                f"{home.secrets_env} mode {mode:04o}"
-                + ("" if mode == 0o600 else "; run `chmod 600` on it"),
+                verdict.ok,
+                f"{home.secrets_env} {verdict.detail}"
+                + ("" if verdict.ok or not verdict.remedy else f"; run `{verdict.remedy}`"),
             )
         )
     checks.extend(_launcher_checks(home, env))

@@ -46,6 +46,8 @@ from pathlib import Path
 
 import sbxloop
 from sbxloop.errors import SbxloopError
+from sbxloop.hostfiles import create_private, make_private
+from sbxloop.hostos import WSL2_GUIDE
 from sbxloop.log import get_logger
 from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.parse import parse_version
@@ -379,7 +381,9 @@ class HomeInit:
             )
         if self.options.sbx:
             installed = self._installed_sbx_version()
-            if installed == self.options.sbx_version:
+            if self.home.windows:
+                steps.append(("sbx", f"refuse: {self.SBX_UNSUPPORTED}"))
+            elif installed == self.options.sbx_version:
                 steps.append(("sbx", f"keep sbx {installed} at {home.sbx_binary}"))
             else:
                 steps.append(
@@ -422,12 +426,31 @@ class HomeInit:
         self.report.done.append("tree")
 
     def _launchers(self) -> None:
-        for path, name in (
-            (self.home.launcher, "sbxloop.launcher.sh"),
-            (self.home.sbx_launcher, "sbx.launcher.sh"),
-        ):
+        """``bin/``: the command that binds a shell to this home, and — on a
+        host that can boot sandboxes — the wrapper around its own ``sbx``.
+
+        Windows gets neither POSIX file. A ``#!/bin/sh`` script named
+        ``bin\\sbxloop`` is not something cmd or PowerShell can run, and
+        there is no native Windows ``sbx`` for a wrapper to stand in front
+        of (:mod:`sbxloop.hostos`), so writing one would promise a sandbox
+        runtime this host does not have.
+        """
+        written: list[tuple[Path, str]] = [
+            (
+                self.home.launcher,
+                "sbxloop.launcher.cmd" if self.home.windows else "sbxloop.launcher.sh",
+            )
+        ]
+        if not self.home.windows:
+            written.append((self.home.sbx_launcher, "sbx.launcher.sh"))
+        else:
+            self.report.notes.append(
+                f"no {self.home.sbx_launcher.name} wrapper: this host has no native sbx"
+            )
+        for path, name in written:
             path.write_text(template(name))
-            path.chmod(0o755)
+            if not self.home.windows:
+                path.chmod(0o755)
         self.report.done.append("launchers")
 
     # -- interpreter --------------------------------------------------------------
@@ -520,7 +543,19 @@ class HomeInit:
         except OSError:
             return None
 
+    #: What `init --sbx` says on a host the sandbox runtime has no build for.
+    #: The assets are a POSIX `.tar.gz` around an `install.sh`, so the step
+    #: cannot be attempted: it is refused before anything is downloaded,
+    #: rather than failing part-way through with a path or shell error.
+    SBX_UNSUPPORTED = (
+        "the sandbox runtime (Docker Sandboxes, `sbx`) has no native Windows build, so "
+        "`sbxloop init --sbx` cannot install one here; " + WSL2_GUIDE + ". The rest of "
+        "`sbxloop init` runs on this host — pass --no-sbx to lay the home out without it."
+    )
+
     def _sbx(self) -> None:
+        if self.home.windows:
+            raise InitError(self.SBX_UNSUPPORTED)
         wanted = self.options.sbx_version
         if self._installed_sbx_version() == wanted:
             self.report.skipped.append(f"sbx {wanted} (installed)")
@@ -650,10 +685,10 @@ class HomeInit:
             self.home.config_toml.write_text(render_config_template(self.options.preset))
             wrote.append(self.home.config_toml.name)
         if not self.home.secrets_env.exists():
-            self.home.secrets_env.touch(mode=0o600)
+            create_private(self.home.secrets_env, os_name=self.home.os_name)
             self.home.secrets_env.write_text(secrets_env_template())
             wrote.append(self.home.secrets_env.name)
-        self.home.secrets_env.chmod(0o600)
+        make_private(self.home.secrets_env, os_name=self.home.os_name)
         if wrote:
             self.report.done.append("config (" + ", ".join(wrote) + ")")
         else:
@@ -697,10 +732,13 @@ class HomeInit:
 
 
 def path_hint(home: SbxloopHome, env: Mapping[str, str]) -> str | None:
-    """What to tell the operator when ``bin/`` is not on PATH."""
+    """What to tell the operator when ``bin/`` is not on PATH — in the shell
+    this host's launcher is written for."""
     entries = env.get("PATH", "").split(os.pathsep)
     if str(home.bin) in entries:
         return None
+    if home.windows:
+        return f'setx PATH "{home.bin};%PATH%"'
     return f'export PATH="{home.bin}:$PATH"'
 
 

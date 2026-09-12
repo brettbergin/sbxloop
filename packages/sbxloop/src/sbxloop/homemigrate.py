@@ -36,6 +36,7 @@ from sbxloop import hostgit
 from sbxloop.backup import BackupInfo, _copy_db, create_backup
 from sbxloop.errors import SbxloopError
 from sbxloop.homeinit import RUNNER_UNIT, UNIT_NAMES, HomeInit, InitOptions, InitReport
+from sbxloop.hostfiles import create_private, make_private
 from sbxloop.log import get_logger
 from sbxloop.paths import SbxloopHome
 
@@ -453,7 +454,7 @@ class HomeMigration:
         legacy = self.legacy
         if legacy.pem is not None and not self.home.github_app_pem.exists():
             shutil.copy2(legacy.pem, self.home.github_app_pem)
-            self.home.github_app_pem.chmod(0o600)
+            make_private(self.home.github_app_pem, os_name=self.home.os_name)
             self.report.carried.append(f"App key from {legacy.pem}")
         if self.home.secrets_env.exists():
             self.report.notes.append(f"{self.home.secrets_env} already exists; kept")
@@ -466,9 +467,9 @@ class HomeMigration:
             if m and self.home.github_app_pem.exists():
                 line = f"{m.group(1)}{self.home.github_app_pem}"
             lines.append(line)
-        self.home.secrets_env.touch(mode=0o600)
+        create_private(self.home.secrets_env, os_name=self.home.os_name)
         self.home.secrets_env.write_text("\n".join(lines) + "\n")
-        self.home.secrets_env.chmod(0o600)
+        make_private(self.home.secrets_env, os_name=self.home.os_name)
         self.report.carried.append(f"secrets from {legacy.secrets}")
         for other in legacy.other_secrets:
             self.report.notes.append(

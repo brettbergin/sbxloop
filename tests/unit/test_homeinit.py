@@ -56,7 +56,7 @@ class FakeRun:
             if key.startswith(prefix):
                 raise subprocess.CalledProcessError(code, argv, output="", stderr="boom")
         if argv[1:2] == ["venv"]:
-            (self.home.venv / "bin").mkdir(parents=True, exist_ok=True)
+            self.home.venv_bin.mkdir(parents=True, exist_ok=True)
             self.home.venv_python.write_text("#!python\n")
         if argv[0].endswith("install.sh"):
             # Docker's installer, honouring PREFIX from the environment; it
@@ -152,6 +152,95 @@ def make(
         user_units=tmp_path / "units",
     )
     return home, init, run, fetch, said
+
+
+class TestWindowsHost:
+    """#899: `sbxloop init` on a native Windows host writes entry points
+    that host can run, and promises no sandbox runtime it does not have."""
+
+    @pytest.fixture(autouse=True)
+    def icacls(self, monkeypatch: pytest.MonkeyPatch) -> list[list[str]]:
+        """There is no `icacls` on the runner; record what init asks it."""
+        calls: list[list[str]] = []
+
+        def fake_run(argv: Any) -> subprocess.CompletedProcess[str]:
+            calls.append([str(a) for a in argv])
+            return subprocess.CompletedProcess([str(a) for a in argv], 0, "", "")
+
+        monkeypatch.setattr("sbxloop.hostfiles._run", fake_run)
+        return calls
+
+    def test_the_launcher_is_a_cmd_and_there_is_no_sbx_wrapper(self, tmp_path: Path) -> None:
+        home = SbxloopHome(tmp_path / "home", os_name="nt")
+        options = InitOptions(version="1.2.3", sbx=False, systemd=False)
+        init = HomeInit(
+            home,
+            options,
+            env={"USERPROFILE": str(tmp_path), "PATH": ""},
+            run=FakeRun(home, options.sbx_version),
+            fetch=FakeFetch(),
+            system="Windows",
+            machine="AMD64",
+            sys_prefix=tmp_path / "elsewhere-venv",
+            say=[].append,
+            user_units=tmp_path / "units",
+        )
+        init.execute()
+        assert home.launcher.name == "sbxloop.cmd" and home.launcher.is_file()
+        assert r"venv\Scripts\sbxloop.exe" in home.launcher.read_text()
+        assert not home.sbx_launcher.exists()
+        assert any("no sbx wrapper" in note for note in init.report.notes)
+
+    def test_init_sbx_is_refused_before_anything_is_downloaded(self, tmp_path: Path) -> None:
+        """Fail closed on unsupported work: the sbx assets are a POSIX
+        tarball around an install.sh, so the step is refused by name rather
+        than attempted and failed part-way through."""
+        home = SbxloopHome(tmp_path / "home", os_name="nt")
+        options = InitOptions(version="1.2.3", sbx=True, systemd=False)
+        fetch = FakeFetch()
+        init = HomeInit(
+            home,
+            options,
+            env={"USERPROFILE": str(tmp_path), "PATH": ""},
+            run=FakeRun(home, options.sbx_version),
+            fetch=fetch,
+            system="Windows",
+            machine="AMD64",
+            sys_prefix=tmp_path / "elsewhere-venv",
+            say=[].append,
+            user_units=tmp_path / "units",
+        )
+        with pytest.raises(InitError, match="no native Windows build"):
+            init.execute()
+        assert not any("sbx-releases" in url or url.startswith("u/") for url in fetch.urls)
+        assert "--no-sbx" in init.SBX_UNSUPPORTED
+        (step,) = [what for name, what in init.plan() if name == "sbx"]
+        assert "no native Windows build" in step
+
+    def test_the_secrets_file_is_restricted_not_chmodded(
+        self, tmp_path: Path, icacls: list[list[str]]
+    ) -> None:
+        """A mode is not privacy on Windows, so init reaches for the ACL
+        instead — and a failure there raises rather than leaving the file
+        open (:mod:`sbxloop.hostfiles`)."""
+        home = SbxloopHome(tmp_path / "home", os_name="nt")
+        options = InitOptions(version="1.2.3", sbx=False, systemd=False)
+        HomeInit(
+            home,
+            options,
+            env={"USERPROFILE": str(tmp_path), "PATH": ""},
+            run=FakeRun(home, options.sbx_version),
+            fetch=FakeFetch(),
+            system="Windows",
+            machine="AMD64",
+            sys_prefix=tmp_path / "elsewhere-venv",
+            say=[].append,
+            user_units=tmp_path / "units",
+        ).execute()
+        assert home.secrets_env.is_file()
+        granted = [c for c in icacls if c[0] == "icacls"]
+        assert granted and all("/inheritance:r" in c for c in granted)
+        assert all(str(home.secrets_env) in c for c in granted)
 
 
 class TestLayout:
@@ -434,6 +523,15 @@ class TestTemplates:
             assert "DBUS_SESSION_BUS_ADDRESS" in text
         assert 'exec "$home/sbx/bin/sbx" "$@"' in template("sbx.launcher.sh")
 
+    def test_the_windows_launcher_binds_to_its_own_home_too(self) -> None:
+        text = template("sbxloop.launcher.cmd")
+        assert 'set "SBXLOOP_HOME=%~dp0.."' in text
+        assert r"venv\Scripts\sbxloop.exe" in text
+        # the same trust boundary as the POSIX one: the launcher carries no
+        # secrets and reads none — sbxloop reads config\\secrets.env itself.
+        code = [ln for ln in text.splitlines() if not ln.strip().lower().startswith("rem")]
+        assert not any("secrets" in ln for ln in code)
+
     @pytest.mark.parametrize(
         ("name", "system", "machine", "ok"),
         [
@@ -459,6 +557,8 @@ class TestTemplates:
         home = SbxloopHome(tmp_path)
         assert path_hint(home, {"PATH": f"/usr/bin:{home.bin}"}) is None
         assert path_hint(home, {"PATH": "/usr/bin"}) == f'export PATH="{home.bin}:$PATH"'
+        windows = SbxloopHome(tmp_path / "h", os_name="nt")
+        assert path_hint(windows, {"PATH": "C:\\Windows"}).startswith("setx PATH")
 
 
 def expand_specifiers(value: str) -> str:

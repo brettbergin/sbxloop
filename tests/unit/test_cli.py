@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any, ClassVar
@@ -1086,6 +1087,36 @@ class TestDoctor:
         home(workdir).write_record(sbxloop_version="x", created_by="test")
         (row,) = [c for c in collect_checks(dict(os.environ)) if c.name == "home"]
         assert row.ok and "layout v1" in row.detail
+
+    def test_doctor_judges_the_secrets_file_by_the_hosts_own_access_control(
+        self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#899: on POSIX the row is the mode it always was. On a host whose
+        access control could not be read the row *fails* saying so — never
+        passes, which would call every unreadable secrets file safe."""
+        from sbxloop.cli.doctor import home_checks
+
+        secrets = home(workdir).secrets_env
+        secrets.write_text("GH_TOKEN=tok\n")
+        secrets.chmod(0o600)
+        (row,) = [
+            c for c in home_checks(home(workdir), dict(os.environ)) if c.name == "secrets file"
+        ]
+        assert row.ok and "mode 0600" in row.detail
+        secrets.chmod(0o644)
+        (row,) = [
+            c for c in home_checks(home(workdir), dict(os.environ)) if c.name == "secrets file"
+        ]
+        assert not row.ok and "mode 0644" in row.detail and "chmod 600" in row.detail
+
+        monkeypatch.setattr(
+            "sbxloop.hostfiles._run",
+            lambda argv: subprocess.CompletedProcess(list(argv), 1, "", "Access is denied."),
+        )
+        windows = SbxloopHome(home(workdir).root, os_name="nt")
+        (row,) = [c for c in home_checks(windows, dict(os.environ)) if c.name == "secrets file"]
+        assert not row.ok and "could not be read" in row.detail
+        assert "chmod" not in row.detail and "icacls" in row.detail
 
     def test_doctor_fails_without_tokens(
         self, workdir: Path, fake_sbx: FakeSbx, monkeypatch: pytest.MonkeyPatch

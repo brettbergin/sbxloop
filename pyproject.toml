@@ -100,6 +100,12 @@ markers = [
     # by hand on real-git (lfs, submodules) and packaging tests. The commit
     # gate is `-m "not slow"`; CI runs both halves.
     "slow: process-bound tests (fake sbx, real workers, real git, builds)",
+    # The host-portability rows whose facts only the platform itself can
+    # settle (a venv's real entry points, what chmod does on Windows). CI
+    # runs `-m windows_host` on a Windows runner as well as in the Linux
+    # shards, where most of them skip; the cross-platform branches they
+    # guard are covered on every host through injected seams.
+    "windows_host: host behaviour a native Windows runner has to confirm",
 ]
 # Coverage is CI's job (`make test-cov`): tracing costs ~15% wall on full
 # runs, and --cov-fail-under in addopts makes every partial run (single
