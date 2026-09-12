@@ -25,6 +25,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=6.0" },
     { name = "pytest-xdist", specifier = ">=3.6" },
     { name = "ruff", specifier = ">=0.16.6" },
+    { name = "sbxloop", extras = ["api"], editable = "packages/sbxloop" },
     { name = "types-pyyaml", specifier = ">=6.0" },
 ]
 

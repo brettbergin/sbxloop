@@ -12,13 +12,13 @@ from __future__ import annotations
 import getpass
 import time
 from datetime import UTC, datetime
-from typing import Annotated
+from typing import Annotated, Any
 
 import typer
 from rich.console import Console
 from rich.table import Table
 
-from sbxloop.api.auth.keys import load_or_create, rotate
+from sbxloop.api import MISSING_EXTRA, api_available
 from sbxloop.api.auth.store import ApiAuthStore, StandaloneSessions, parse_capabilities
 from sbxloop.config import load_config
 from sbxloop.daemon.controls.principal import CAPABILITIES
@@ -136,13 +136,26 @@ def client_revoke(
     console.print(f"{client.id} ({client.name}) revoked")
 
 
+def _keys() -> Any:
+    """The signing-key module, imported here rather than at the top: it
+    needs the ``sbxloop[api]`` extra, and ``sbxloop`` as a whole must load
+    on an install without it. A missing extra is refused by name."""
+    if not api_available():
+        # Plain text: rich would read `[api]` in the message as markup.
+        console.print(MISSING_EXTRA, markup=False, style="red")
+        raise typer.Exit(code=1)
+    from sbxloop.api.auth import keys
+
+    return keys
+
+
 @key_app.command("rotate")
 def key_rotate() -> None:
     """Replace the signing key. Tokens signed by the old key still verify
     until they expire; a daemon already running picks the new key up on
     its next start."""
     config = load_config()
-    keys = rotate(config.paths)
+    keys = _keys().rotate(config.paths)
     console.print(f"signing key rotated: now {keys.current.kid}")
     if keys.previous is not None:
         console.print(f"[dim]{keys.previous.kid} still verifies the tokens it signed[/]")
@@ -153,7 +166,7 @@ def key_rotate() -> None:
 def key_show() -> None:
     """The current key id (creating the key if there is none)."""
     config = load_config()
-    keys = load_or_create(config.paths)
+    keys = _keys().load_or_create(config.paths)
     console.print(f"kid: {keys.current.kid}")
     if keys.previous is not None:
         console.print(f"previous: {keys.previous.kid}")

@@ -20,7 +20,10 @@ MISSING_EXTRA = (
 
 def api_available() -> bool:
     """Whether the ``sbxloop[api]`` extra is installed."""
-    return all(importlib.util.find_spec(name) is not None for name in ("fastapi", "uvicorn", "jwt"))
+    return all(
+        importlib.util.find_spec(name) is not None
+        for name in ("fastapi", "uvicorn", "jwt", "cryptography")
+    )
 
 
 def require_available() -> None:

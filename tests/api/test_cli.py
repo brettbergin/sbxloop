@@ -86,6 +86,32 @@ class TestMissingExtra:
     def test_available_here(self) -> None:
         assert api_available()
 
+    def test_the_cli_loads_and_the_key_commands_refuse_without_the_extra(
+        self, home: SbxloopHome, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`sbxloop` as a whole must import on an install without the extra
+        (CI's plain `uv sync` is one): the key module's `cryptography`
+        import was pulled in by `sbxloop.cli.app` at import time and took
+        every command down with it."""
+        import importlib
+
+        import sbxloop.cli.api as cli_api
+
+        for name in ("fastapi", "uvicorn", "jwt", "cryptography"):
+            monkeypatch.setitem(sys.modules, name, None)
+        try:
+            importlib.reload(cli_api)
+            assert not api_available()
+            result = runner.invoke(app, ["api", "key", "show"])
+            assert result.exit_code == 1 and "sbxloop[api]" in result.output
+            # Registering a client needs no cryptography: it still works.
+            created = runner.invoke(app, ["api", "client", "create", "r", "--cap", "runs:read"])
+            assert created.exit_code == 0, created.output
+        finally:
+            for name in ("fastapi", "uvicorn", "jwt", "cryptography"):
+                monkeypatch.delitem(sys.modules, name, raising=False)
+            importlib.reload(cli_api)
+
     def test_the_daemon_refuses_by_name_without_the_extra(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

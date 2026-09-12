@@ -23,7 +23,13 @@ dev = [
     "mdformat-frontmatter>=2.0.8",
     "types-PyYAML>=6.0",
     "httpx>=0.27",
+    # The remote API's extra rides the dev group so the suite, mypy and CI
+    # exercise the listener; an install without it still imports and runs.
+    "sbxloop[api]",
 ]
+
+[tool.uv.sources]
+sbxloop = { workspace = true }
 
 [tool.ruff]
 line-length = 100
