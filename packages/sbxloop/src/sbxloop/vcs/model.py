@@ -397,6 +397,15 @@ class BaseRequirements(NamedTuple):
 
     ``forge`` names the backend that read them, so :meth:`blockers` can
     phrase each rule in that forge's own terms (:data:`BLOCKER_WORDING`).
+
+    ``all_checks_required`` is a forge that gates on the whole pipeline
+    rather than on named contexts (GitLab's "pipeline must succeed",
+    field-verified on CE 19.3 for #1016): ``required_contexts`` is then
+    ``()`` — nothing is *named* — and every check the head reports is
+    required. A caller judging checks treats the reported set as the
+    gating set (:func:`sbxloop.engine.checks.judge_checks`), and a red the
+    base already had still refuses the merge, which the landing hands to a
+    person rather than looping on.
     """
 
     required_contexts: tuple[str, ...] | None
@@ -412,6 +421,7 @@ class BaseRequirements(NamedTuple):
     required_deployments: tuple[str, ...] = ()
     unread: tuple[str, ...] = ()
     forge: str = "github"
+    all_checks_required: bool = False
 
     @property
     def requires_reviews(self) -> bool | None:
@@ -496,7 +506,11 @@ GENERIC_WORDING = BlockerWording(
 )
 
 # One entry per backend, keyed by its kind. The GitHub wording is the one
-# the loop has always used; a reader who learnt it keeps it.
+# the loop has always used; a reader who learnt it keeps it. The GitLab
+# wording names the settings a GitLab reader knows (#1017): approvals of
+# the latest pipeline's author, the CODEOWNERS file GitLab also reads, and
+# the fact that commits made through the commits API arrive unsigned
+# (field-verified on CE 19.3: the signature read is a 404).
 BLOCKER_WORDING: dict[str, BlockerWording] = {
     "github": BlockerWording(
         last_push_rule="require_last_push_approval",
@@ -505,5 +519,10 @@ BLOCKER_WORDING: dict[str, BlockerWording] = {
             "GitHub signs commits the loop creates through its API only when it "
             "authenticates as a GitHub App"
         ),
+    ),
+    "gitlab": BlockerWording(
+        last_push_rule="the approval-settings rule that removes approvals on a new push",
+        code_owners_file="CODEOWNERS",
+        signing="GitLab does not sign commits created through its commits API",
     ),
 }

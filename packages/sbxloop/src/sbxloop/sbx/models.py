@@ -55,6 +55,9 @@ class SandboxSpec(BaseModel):
     secrets: list[SecretSpec] = Field(default_factory=list)
     # Plain environment: may sit in the in-VM env file under any strategy.
     persistent_env: dict[str, str] = Field(default_factory=dict)
+    # The variable(s) a github-role box holds its forge token in (#1017):
+    # GitHub's pair, or another forge's one name. Names, never values.
+    forge_token_envs: list[str] = Field(default_factory=lambda: ["GH_TOKEN", "GITHUB_TOKEN"])
     # The service sandbox's secrets (`[[credentials]]` values and the
     # registries' `auth_env`, #765/#766): values that travel only the
     # credential's non-proxy road — per-job stdin, or the 0600 env file —

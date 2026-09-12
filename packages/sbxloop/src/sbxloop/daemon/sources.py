@@ -832,7 +832,7 @@ class GitHubIssueSource:
             return
         self._guard(
             "claim comment removal",
-            lambda ops: ops.issue_comment_delete(self.repo, comment_id),
+            lambda ops: ops.issue_comment_delete(self.repo, comment_id, number=int(number)),
         )
 
     def report_started(self, item: WorkItem, run_id: str) -> None:

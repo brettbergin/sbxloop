@@ -75,6 +75,14 @@ def fingerprint(followup: Followup) -> str:
     return hashlib.sha256(json.dumps(content, sort_keys=True).encode()).hexdigest()
 
 
+def _issue_paths(repo: str, number: int) -> tuple[str, ...]:
+    """The URL paths an issue of ``repo`` may live at, lower-cased: the
+    ``/<repo>/issues/<n>`` GitHub and Gitea serve, and GitLab's
+    ``/<repo>/-/issues/<n>`` (#1017). Anything else is evidence from some
+    other repository, or not an issue."""
+    return (f"/{repo}/issues/{number}".lower(), f"/{repo}/-/issues/{number}".lower())
+
+
 def issue_evidence(data: Any, repo: str) -> IssueEvidence:
     """Validate the read before trusting either an identity or an empty result."""
     if not isinstance(data, dict) or "pull_request" in data:
@@ -91,7 +99,7 @@ def issue_evidence(data: Any, repo: str) -> IssueEvidence:
         or not isinstance(url, str)
         or parsed is None
         or parsed.scheme != "https"
-        or parsed.path.lower() != f"/{repo}/issues/{number}".lower()
+        or parsed.path.lower() not in _issue_paths(repo, number)
         or not isinstance(data.get("title"), str)
         or not isinstance(data.get("body"), (str, type(None)))
         or data.get("state") not in ("open", "closed")

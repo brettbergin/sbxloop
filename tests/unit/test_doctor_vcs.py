@@ -35,16 +35,33 @@ class TestBackendRows:
     def test_a_kind_no_backend_answers_fails_the_row(self) -> None:
         rows = vcs_backend_checks(
             cfg(
-                vcs={"kind": "gitlab"},
+                vcs={"kind": "gitlab", "api_url": "https://gl.example/api/v4"},
                 github={"repos": [{"repo": "o/a"}, {"repo": "o/b", "kind": "gitea"}]},
             )
         )
         assert [(r.name, r.ok, r.hard) for r in rows] == [
-            ("vcs backend gitlab", False, True),
+            ("vcs backend gitlab", True, False),
             ("vcs backend gitea", False, True),
         ]
-        assert "not implemented yet" in rows[0].detail
-        assert '"github" answers a run today' in rows[0].detail
+        assert "not implemented yet" in rows[1].detail
+        assert "github, gitlab" in rows[1].detail
+
+    def test_gitlab_lists_its_verified_matrix_and_the_roles_still_missing(self) -> None:
+        (row,) = vcs_backend_checks(
+            cfg(
+                vcs={"kind": "gitlab", "api_url": "https://gl.example/api/v4"},
+                github={"repo": "o/r"},
+            )
+        )
+        assert row.ok and not row.hard
+        assert "supported: review_threads" in row.detail
+        assert "unsupported: request_changes_review" in row.detail
+        assert "unknown: merge_queue" in row.detail and "merge trains" in row.detail
+        assert "not implemented yet: ChangeOps, ReviewOps, ContentOps" in row.detail
+
+    def test_a_forge_without_an_api_root_fails_its_row(self) -> None:
+        (row,) = vcs_backend_checks(cfg(vcs={"kind": "gitlab"}, github={"repo": "o/r"}))
+        assert not row.ok and row.hard and "[vcs] api_url is not set" in row.detail
 
     def test_one_row_per_forge_not_per_repository(self) -> None:
         rows = vcs_backend_checks(cfg(github={"repos": [{"repo": "o/a"}, {"repo": "o/b"}]}))

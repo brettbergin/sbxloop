@@ -34,6 +34,38 @@ def requires(*contexts: str, source: str = "protection") -> BaseRequirements:
 NONE_DECLARED = requires()
 
 
+class TestWholePipelineRequired:
+    """A forge that gates on the whole pipeline (#1016 V2, GitLab's
+    "pipeline must succeed"): no context is named, every reported check
+    gates, and the judgment's source is the rule read, not the fallback."""
+
+    WHOLE = BaseRequirements((), 0, "protected_branch+project", all_checks_required=True)
+
+    def test_every_reported_check_gates_under_the_rules_source(self) -> None:
+        judged = judge_checks(
+            verdict(failed=("lint",), passed=("ci",)), CheckPolicy(requirements=self.WHOLE)
+        )
+        assert judged.state == "red" and judged.fix == ("lint",)
+        assert set(judged.gating) == {"lint", "ci"}
+        assert judged.source == "protected_branch+project"
+
+    def test_a_red_the_base_already_had_is_not_the_loops_to_fix(self) -> None:
+        # The forge will still refuse the merge over it; that is the
+        # landing's hold for a person, not a fix round on someone else's red.
+        judged = judge_checks(
+            verdict(failed=("lint",), passed=("ci",)),
+            CheckPolicy(
+                requirements=self.WHOLE, baseline_sha="b", baseline=verdict(failed=("lint",))
+            ),
+        )
+        assert judged.state == "green" and judged.fix == ()
+        assert judged.preexisting == ("lint",)
+
+    def test_nothing_named_and_no_flag_is_the_old_fallback(self) -> None:
+        judged = judge_checks(verdict(passed=("ci",)), CheckPolicy(requirements=NONE_DECLARED))
+        assert judged.source == "all"
+
+
 class TestWithoutABaseline:
     """`NO_POLICY`: what the loop did before #611 — every check gates,
     every red is the PR's."""

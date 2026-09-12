@@ -536,6 +536,9 @@ def github_transport(api_url: str) -> TransportSpec:
 
 
 class GithubOps:
+    #: The forge kind this backend answers for; the loop's ``[vcs] kind``.
+    KIND: ClassVar[str] = "github"
+
     def __init__(
         self,
         client: WorkerClient,
@@ -1583,8 +1586,12 @@ class GithubOps:
             {"state": "closed", "state_reason": reason},
         )
 
-    def issue_comment_delete(self, repo: str, comment_id: int) -> None:
-        """Delete one issue comment by its id."""
+    def issue_comment_delete(
+        self, repo: str, comment_id: int, *, number: int | None = None
+    ) -> None:
+        """Delete one issue comment by its id. ``number`` is the issue it is
+        on, which a forge that addresses comments under their issue needs
+        (#1017); GitHub addresses them by id alone."""
         self.raw("DELETE", f"/repos/{repo}/issues/comments/{comment_id}")
 
     # -- pull requests -------------------------------------------------------

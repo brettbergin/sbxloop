@@ -2,6 +2,19 @@
 
 ### Added
 
+- **A GitLab backend for the read paths.** `[vcs] kind = "gitlab"` with
+  `[vcs] api_url` now selects a backend that answers the repository,
+  issue, checks and policy roles against GitLab's REST API from the
+  github-role sandbox, which holds the project token under `GITLAB_TOKEN`
+  and reaches only the GitLab host. The base's rules are read the way
+  GitLab CE expresses them: "pipeline must succeed" gates every check the
+  head reports rather than a named list. `sbxloop doctor` prints the
+  verified capability matrix for GitLab and names the roles that have not
+  landed yet; a run that reaches one of those (a merge request, a review,
+  a remote commit) fails closed naming the operation. The conformance
+  suite runs the read scenarios against a GitLab fake and, with the live
+  harness, against a real GitLab CE.
+
 - **Playwright MCP setup for Copilot and Claude builders.**
   `sbxloop init --preset playwright` configures Node, a pinned MCP package,
   its matching headless Chromium installation, download hosts and builder

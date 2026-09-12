@@ -1,13 +1,19 @@
 # Spike: a configurable version-control backend (GitHub, GitLab, Gitea)
 
-Status: **tracked as an epic; the forge-agnostic steps have landed and the
-field questions are answered.** The epic is
+Status: **tracked as an epic; the forge-agnostic steps have landed, the
+field questions are answered, and the GitLab backend is landing in
+steps.** The epic is
 [issue #1009](https://github.com/brettbergin/sbxloop/issues/1009); its
 child issues follow the sequence at the end of this document. Steps 1-5
 landed as #1022-#1027 and #1029. The six field questions (#1016) were
 answered on 2026-09-12 against GitLab CE 19.3.2 and Gitea 1.24.7 running in
 Docker; the evidence, the corrected capability matrix and the decisions they
-force are in [Field verification](#field-verification-1016).
+force are in [Field verification](#field-verification-1016). Step 6, the
+GitLab read paths (#1017), is `vcs/gitlab/`; it settled the typed-returns
+question the conformance work raised (#1014) by fixing the record contract
+instead: the keys consumers read are the shared vocabulary, in the first
+backend's spelling, and every backend folds into them
+(`docs/architecture.md`, "Records are the first backend's spelling").
 
 Code-seam claims below were read off this tree and are reproducible with the
 commands quoted beside them. GitLab and Gitea claims are **verified** where

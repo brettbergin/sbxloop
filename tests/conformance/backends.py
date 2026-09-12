@@ -18,12 +18,25 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from typing import Protocol
+from typing import NamedTuple, Protocol
 
 from sbxloop.vcs.model import ChecksVerdict, FailedCheck
 from sbxloop.vcs.protocol import VcsOps
 from tests.fakes.fake_github import FakeGithub
-from tests.live.env import live_forge
+from tests.fakes.fake_gitlab import FakeGitlab
+from tests.live.env import LiveForge, live_forge
+
+
+class SeededRules(NamedTuple):
+    """What the base requires after :meth:`Seeds.base_rules`, as the forge
+    can express it: the contexts it names, the approvals it counts, and
+    whether it gates on the whole pipeline instead of naming any (#1016
+    V2). A scenario asserts against this, so a forge that cannot name a
+    check is held to what it *can* say rather than to GitHub's shape."""
+
+    required: tuple[str, ...]
+    approvals: int
+    all_checks_required: bool = False
 
 
 class Seeds(Protocol):
@@ -38,13 +51,15 @@ class Seeds(Protocol):
         """The change's head has one check called ``name`` still running."""
         ...
 
-    def base_rules(self, *, required: Sequence[str], approvals: int) -> None:
+    def base_rules(self, *, required: Sequence[str], approvals: int) -> SeededRules:
         """The base branch requires the checks ``required`` green and
-        ``approvals`` approving reviews before a merge."""
+        ``approvals`` approving reviews before a merge — or the nearest
+        the forge can express, which is what comes back."""
         ...
 
-    def existing_issue(self, number: int, title: str, labels: Sequence[str]) -> None:
-        """The repository carries issue ``number`` with ``labels``."""
+    def existing_issue(self, title: str, labels: Sequence[str]) -> int:
+        """The repository carries an issue titled ``title`` with ``labels``;
+        its number."""
         ...
 
 
@@ -74,14 +89,16 @@ class _GithubSeeds:
     def pending_check(self, name: str) -> None:
         self.fake.checks = [ChecksVerdict("pending", 1, (name,), ())]
 
-    def base_rules(self, *, required: Sequence[str], approvals: int) -> None:
+    def base_rules(self, *, required: Sequence[str], approvals: int) -> SeededRules:
         self.fake.protection = {
             "required_status_checks": {"contexts": list(required)},
             "required_pull_request_reviews": {"required_approving_review_count": approvals},
         }
         self.fake.rules = []
+        return SeededRules(tuple(required), approvals)
 
-    def existing_issue(self, number: int, title: str, labels: Sequence[str]) -> None:
+    def existing_issue(self, title: str, labels: Sequence[str]) -> int:
+        number = 41
         self.fake.existing_issues.append(
             {
                 "number": number,
@@ -92,6 +109,7 @@ class _GithubSeeds:
                 "labels": [{"name": label} for label in labels],
             }
         )
+        return number
 
 
 def _github() -> VcsOps:
@@ -101,6 +119,52 @@ def _github() -> VcsOps:
 def _github_seeds(ops: VcsOps) -> Seeds:
     assert isinstance(ops, FakeGithub)
     return _GithubSeeds(ops)
+
+
+class _GitlabSeeds:
+    """The fake GitLab is CE (#1016): required checks cannot be named, so
+    ``base_rules`` turns on "pipeline must succeed" and answers with the
+    whole pipeline required and no approvals."""
+
+    def __init__(self, fake: FakeGitlab) -> None:
+        self.fake = fake
+
+    def failed_check(self, name: str, excerpt: str) -> None:
+        self.fake.seed_verdict(
+            self.fake.head_sha,
+            ChecksVerdict("red", 1, (), (name,)),
+            logs=[FailedCheck(name, "failure", excerpt, "")],
+        )
+
+    def pending_check(self, name: str) -> None:
+        self.fake.seed_verdict(self.fake.head_sha, ChecksVerdict("pending", 1, (name,), ()))
+
+    def base_rules(self, *, required: Sequence[str], approvals: int) -> SeededRules:
+        self.fake.settings["only_allow_merge_if_pipeline_succeeds"] = True
+        self.fake.protected = {
+            "name": "main",
+            "push_access_levels": [{"access_level": 0}],
+            "merge_access_levels": [{"access_level": 30}],
+            "allow_force_push": False,
+        }
+        self.fake.enterprise = False
+        return SeededRules((), 0, all_checks_required=True)
+
+    def existing_issue(self, title: str, labels: Sequence[str]) -> int:
+        self.fake.seed_issue(41, title, labels)
+        return 41
+
+
+def _gitlab() -> VcsOps:
+    return FakeGitlab(repo="acme/widgets")
+
+
+def _gitlab_seeds(ops: VcsOps) -> Seeds:
+    assert isinstance(ops, FakeGitlab)
+    return _GitlabSeeds(ops)
+
+
+# -- live forges ----------------------------------------------------------------
 
 
 def _no_backend(kind: str) -> Callable[[], VcsOps]:
@@ -127,15 +191,79 @@ def _live_without_backend(kind: str) -> Callable[[], str | None]:
     return unavailable
 
 
+def _live_unavailable(kind: str) -> Callable[[], str | None]:
+    def unavailable() -> str | None:
+        forge = live_forge(kind)
+        return forge if isinstance(forge, str) else None
+
+    return unavailable
+
+
+def _live_gitlab_forge() -> LiveForge:
+    forge = live_forge("gitlab")
+    assert not isinstance(forge, str), forge
+    return forge
+
+
+def _live_gitlab() -> VcsOps:
+    """The real GitLab backend over the worker's own transport, in this
+    process (``tests/live/localclient.py``), against the harness forge."""
+    from sbxloop.vcs.gitlab.ops import GitlabOps, gitlab_transport
+    from tests.live.localclient import LocalWorkerClient
+
+    forge = _live_gitlab_forge()
+    spec = gitlab_transport(forge.api_url)
+    client = LocalWorkerClient(spec, forge.get("GITLAB_TOKEN"), ca_file=forge.ca_file)
+    return GitlabOps(client, "live", transport=spec)  # type: ignore[arg-type]
+
+
+class _LiveGitlabSeeds:
+    """Seeds against the harness's ``acme/widgets``: the seed script
+    already protected ``main`` and set "pipeline must succeed" as the
+    administrator (``tests/live/seed_gitlab.py``); a Developer cannot
+    change those, so ``base_rules`` reports what stands. Statuses go on
+    the base's head, the only commit a read scenario knows."""
+
+    def __init__(self, ops: VcsOps, forge: LiveForge) -> None:
+        self.ops = ops
+        self.forge = forge
+
+    def _head(self) -> str:
+        sha = self.ops.ref_lookup(self.forge.repo, "heads/main")
+        assert sha
+        return sha
+
+    def failed_check(self, name: str, excerpt: str) -> None:
+        self.ops.status_create(
+            self.forge.repo, self._head(), "failure", context=name, description=excerpt
+        )
+
+    def pending_check(self, name: str) -> None:
+        self.ops.status_create(self.forge.repo, self._head(), "pending", context=name)
+
+    def base_rules(self, *, required: Sequence[str], approvals: int) -> SeededRules:
+        return SeededRules((), 0, all_checks_required=True)
+
+    def existing_issue(self, title: str, labels: Sequence[str]) -> int:
+        return self.ops.issue_create(self.forge.repo, title, "", labels=list(labels)).number
+
+
+def _live_gitlab_seeds(ops: VcsOps) -> Seeds:
+    return _LiveGitlabSeeds(ops, _live_gitlab_forge())
+
+
 BACKENDS: dict[str, Backend] = {
     "github": Backend(kind="github", repo="o/r", base="main", make=_github, seeds=_github_seeds),
+    "gitlab": Backend(
+        kind="gitlab", repo="acme/widgets", base="main", make=_gitlab, seeds=_gitlab_seeds
+    ),
     "gitlab-live": Backend(
         kind="gitlab",
         repo="acme/widgets",
         base="main",
-        make=_no_backend("gitlab"),
-        seeds=_no_seeds,
-        unavailable=_live_without_backend("gitlab"),
+        make=_live_gitlab,
+        seeds=_live_gitlab_seeds,
+        unavailable=_live_unavailable("gitlab"),
     ),
     "gitea-live": Backend(
         kind="gitea",

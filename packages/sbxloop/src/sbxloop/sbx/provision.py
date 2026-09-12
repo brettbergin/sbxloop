@@ -49,9 +49,17 @@ from dataclasses import dataclass
 from functools import partial
 from pathlib import Path
 from typing import Literal, NamedTuple
+from urllib.parse import urlsplit
 
 from sbxloop import backends, hostgit, toolchains
-from sbxloop.config import Config, CredentialConfig, RegistryConfig, RepoConfig, SandboxConfig
+from sbxloop.config import (
+    Config,
+    CredentialConfig,
+    RegistryConfig,
+    RepoConfig,
+    SandboxConfig,
+    VcsKind,
+)
 from sbxloop.endpoint import Endpoint, parse_endpoint
 from sbxloop.engine.model import RunKind
 from sbxloop.errors import (
@@ -165,7 +173,7 @@ _PROXY_BROKEN_VERDICTS = ("invisible-under-exec", "sentinel-under-exec")
 # ``service``: the service sandbox's credentials (#765) are operator values
 # bound to hosts the sbx proxy has no service for; they only ever travel
 # the non-proxy road.
-EnvFileReason = Literal["strategy", "cached", "app", "service"]
+EnvFileReason = Literal["strategy", "cached", "app", "service", "forge"]
 
 
 @dataclass(frozen=True)
@@ -383,12 +391,16 @@ def agent_policy_allows(
     )
 
 
-def github_policy_allows(config: Config) -> list[str]:
+def github_policy_allows(config: Config, kind: VcsKind = "github") -> list[str]:
     """The github sandbox's network allowlist: the API and web hosts of the
     configured GitHub (#623) plus, on github.com, the storage hosts uploads
     and release assets redirect to; an Enterprise Server serves those from
-    its one host. Deduped: ``extra_allow_domains`` may repeat a baseline
-    host and sbx fails the whole policy call on a repeat."""
+    its one host. For another forge (#1017) it is that forge's API host,
+    the one ``[vcs] api_url`` names, and nothing of GitHub's. Deduped:
+    ``extra_allow_domains`` may repeat a baseline host and sbx fails the
+    whole policy call on a repeat."""
+    if kind != "github":
+        return dedupe_domains([*forge_hosts(config, kind), *config.sandbox.extra_allow_domains])
     return dedupe_domains(
         [
             *config.github.allow_domains,
@@ -396,6 +408,16 @@ def github_policy_allows(config: Config) -> list[str]:
             *config.sandbox.extra_allow_domains,
         ]
     )
+
+
+def forge_hosts(config: Config, kind: VcsKind) -> tuple[str, ...]:
+    """The host a non-GitHub forge's API and web pages are served from,
+    one host for both on GitLab and Gitea, from ``[vcs] api_url``; empty
+    when the configuration has not named one (the backend factory refuses
+    that by name)."""
+    api_url = config.vcs_api_url_for(kind)
+    host = urlsplit(api_url).hostname if api_url else None
+    return (host,) if host else ()
 
 
 # What the service sandbox's toolchain install reaches beyond the installer
@@ -522,16 +544,41 @@ class Provisioner:
             persistent_env=self.agent_persistent_env(repo),
             files=self.agent_files(repo),
         )
-        github = SandboxSpec(
-            name=sandbox_name(run_id, "github"),
+        github = self._github_spec(sandbox_name(run_id, "github"), workspace, repo, template)
+        return agent, github
+
+    def _github_spec(
+        self, name: str, workspace: Path, repo: str | None, template: str | None
+    ) -> SandboxSpec:
+        """The github-role spec for the forge ``repo`` lives on (#1017). On
+        GitHub the token is the sbx ``github`` service secret; on another
+        forge sbx has no service for it, so the spec carries no secret and
+        the token rides the env-file road under the forge's own variable
+        (:meth:`forge_token_envs`), and the allowlist is that forge's host."""
+        kind = self.forge_kind(repo)
+        return SandboxSpec(
+            name=name,
             role="github",
             workspace=workspace,
             template=template,
-            policy_allows=github_policy_allows(self.config),
-            secrets=[SecretSpec(kind="service", service="github")],
+            policy_allows=github_policy_allows(self.config, kind),
+            secrets=[SecretSpec(kind="service", service="github")] if kind == "github" else [],
             persistent_env=self.github_repo_env(repo),
+            forge_token_envs=list(self.forge_token_envs(repo)),
         )
-        return agent, github
+
+    def forge_kind(self, repo: str | None) -> VcsKind:
+        """Which forge ``repo`` lives on (#1009): its entry's own ``kind``,
+        else ``[vcs] kind``."""
+        return self.config.vcs_kind_for(repo)
+
+    def forge_token_envs(self, repo: str | None) -> tuple[str, ...]:
+        """The variable(s) the github box for ``repo`` holds its token in:
+        GitHub's ``GH_TOKEN``/``GITHUB_TOKEN`` pair, or the forge's one name
+        (``GITLAB_TOKEN``), the names the transport descriptor carries."""
+        from sbxloop.vcs.backends import sandbox_token_envs
+
+        return sandbox_token_envs(self.forge_kind(repo))
 
     def _submodule_hosts(
         self, run_id: str, workspace: Path, languages: Sequence[str], repo: str | None
@@ -748,6 +795,19 @@ class Provisioner:
             raise ProvisionError(
                 f"{entry.token_env} (the token_env of {entry.repo}) is not set on the host."
             )
+        scoped = entry.repo if entry is not None else repo
+        kind = self.forge_kind(scoped)
+        if kind != "github":
+            # Another forge's credential is one long-lived token (#1029),
+            # in the variable `[vcs] token_env` names; no App mode exists.
+            name = self.config.vcs_token_env_for(scoped) or ""
+            token = self.env.get(name, "") if name else ""
+            if token:
+                return GhPat(token)
+            raise ProvisionError(
+                f"{name} is not set on the host; a {kind} repository needs its access token "
+                "there (`[vcs] token_env` names the variable)."
+            )
         app = app_credentials(self.env)
         pat = next((self.env.get(name, "") for name in GH_TOKEN_ENVS if self.env.get(name)), "")
         if app is not None and pat:
@@ -836,7 +896,7 @@ class Provisioner:
         run's repository rather than a globally configured one. No credential
         is carried here — the token is registered as a secret.
         """
-        env = self.github_host_env()
+        env = self.github_host_env() if self.forge_kind(repo) == "github" else {}
         entry = self._repo_entry(repo)
         if entry is None:
             return env
@@ -1510,7 +1570,7 @@ class Provisioner:
         # by one thread must not flip the other thread's delivery mid-flight.
         env_file_reasons: dict[SandboxRole, EnvFileReason | None] = {
             "agent": self._env_file_reason("agent", None),
-            "github": self._env_file_reason("github", gh_cred),
+            "github": self._env_file_reason("github", gh_cred, kind=self.forge_kind(repo)),
             "service": self._env_file_reason("service", None),
         }
 
@@ -1875,15 +1935,7 @@ class Provisioner:
     def github_only_spec(self, name: str, workspace: Path, repo: str | None = None) -> SandboxSpec:
         """A github-role spec that is not tied to a run — the daemon's
         long-lived polling/ops sandbox. Mirrors the pair's github spec."""
-        return SandboxSpec(
-            name=name,
-            role="github",
-            workspace=workspace,
-            template=self.config.sandbox.template,
-            policy_allows=github_policy_allows(self.config),
-            secrets=[SecretSpec(kind="service", service="github")],
-            persistent_env=self.github_repo_env(repo),
-        )
+        return self._github_spec(name, workspace, repo, self.config.sandbox.template)
 
     def agent_only_spec(self, name: str, workspace: Path) -> SandboxSpec:
         """An agent-role spec that is not tied to a run — the daemon's
@@ -1932,7 +1984,7 @@ class Provisioner:
         return self._ensure_single(
             spec,
             cred.token(),
-            reason=self._env_file_reason("github", cred),
+            reason=self._env_file_reason("github", cred, kind=self.forge_kind(repo)),
             post_create=post_create,
             run_id=run_id,
         )
@@ -2114,10 +2166,15 @@ class Provisioner:
         )
 
     def _env_file_reason(
-        self, role: SandboxRole, gh_cred: GhCredential | None
+        self, role: SandboxRole, gh_cred: GhCredential | None, *, kind: VcsKind = "github"
     ) -> EnvFileReason | None:
         """Why ``role``'s credentials go to the in-VM env file (``None`` →
         try the sbx secret proxy)."""
+        if role == "github" and kind != "github":
+            # sbx's secret proxy knows GitHub's service; another forge's
+            # token has no service to ride, so it takes the env-file road
+            # (#1017), the same road a PAT takes under `plain-env`.
+            return "forge"
         if role == "service":
             # Operator credentials for arbitrary hosts: the proxy has no
             # service for them, and they are never an sbx argument (#765).
@@ -2247,7 +2304,7 @@ class Provisioner:
                 message=message,
             )
             return
-        env_name = self.agent_token_env() if spec.role == "agent" else "GH_TOKEN"
+        env_name = self.agent_token_env() if spec.role == "agent" else spec.forge_token_envs[0]
         how = (
             "using the in-VM env file directly"
             if via_file
@@ -2274,6 +2331,18 @@ class Provisioner:
                 name=spec.name,
                 env=env_name,
                 cached=True,
+                delivery=delivery,
+                message=message,
+            )
+        elif reason == "forge":
+            forge_names = "/".join(spec.forge_token_envs)
+            message = f"{forge_names}: the forge's token has no sbx proxy service; {how}"
+            log.info("sandbox.forge_token", run=run_id, sandbox=spec.name, detail=message)
+            self.bus.emit(
+                "sandbox.forge_token",
+                run_id,
+                name=spec.name,
+                envs=list(spec.forge_token_envs),
                 delivery=delivery,
                 message=message,
             )
@@ -2363,7 +2432,7 @@ class Provisioner:
         purge, not the primary defense: a probe that cannot get a clean
         answer logs and proceeds rather than failing provisioning.
         """
-        if spec.role != "github":
+        if spec.role != "github" or "GH_TOKEN" not in spec.forge_token_envs:
             return
         probe = [
             "sh",
@@ -2655,8 +2724,8 @@ class Provisioner:
         if spec.role == "agent":
             exports[self.agent_token_env()] = token
         elif spec.role == "github":
-            exports["GH_TOKEN"] = token
-            exports["GITHUB_TOKEN"] = token
+            for name in spec.forge_token_envs:
+                exports[name] = token
         # The service sandbox has no token: its credentials are secret_env.
         self._write_env_file(sandbox, exports)
 
@@ -2720,7 +2789,7 @@ class Provisioner:
         provider carries the catalogue and the values.
         """
         gh_cred = self.gh_credential(repo) if role == "github" else None
-        if self._env_file_reason(role, gh_cred) is None:
+        if self._env_file_reason(role, gh_cred, kind=self.forge_kind(repo)) is None:
             return None
         supported = (
             self._stdin_env_supported(sandbox)
@@ -2749,9 +2818,10 @@ class Provisioner:
         cred = gh_cred
         assert cred is not None
         persistent = self.github_repo_env(repo)
+        names = self.forge_token_envs(repo)
 
         def provide() -> dict[str, str]:
             token = cred.token()
-            return {**persistent, "GH_TOKEN": token, "GITHUB_TOKEN": token}
+            return {**persistent, **dict.fromkeys(names, token)}
 
         return provide

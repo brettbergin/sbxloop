@@ -168,6 +168,12 @@ def judge_checks(verdict: ChecksVerdict, policy: CheckPolicy = NO_POLICY) -> Che
         declared, source = tuple(policy.required), "config"
     elif policy.requirements.required_contexts:
         declared, source = policy.requirements.required_contexts, policy.requirements.source
+    elif policy.requirements.all_checks_required:
+        # A forge that gates on the whole pipeline names no context (#1016,
+        # GitLab's "pipeline must succeed"): everything the head reports is
+        # required, and the source is the rule that was read, not the
+        # "nothing declared" fallback below.
+        declared, source = None, policy.requirements.source
     else:
         declared, source = None, "all"
     gating = tuple(n for n in declared if n not in ignored) if declared else tuple(names)

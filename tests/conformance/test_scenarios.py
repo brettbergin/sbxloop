@@ -69,9 +69,10 @@ class TestIssues:
         assert ops.issue_get(repo, ref.number)["state"] == "closed"
 
     def test_listing_by_label_finds_a_seeded_issue(self, subject: Subject) -> None:
-        subject.seeds.existing_issue(41, "queued work", ["sbxloop:run"])
+        number = subject.seeds.existing_issue("queued work", ["sbxloop:run"])
         listed = subject.ops.issues_list(subject.repo, labels=["sbxloop:run"])
-        assert any(entry.get("number") == 41 for entry in listed)
+        assert any(entry.get("number") == number for entry in listed)
+        assert all("pull_request" not in entry for entry in listed if isinstance(entry, dict))
 
 
 class TestChange:
@@ -155,18 +156,20 @@ class TestChecks:
 class TestPolicy:
     @pytest.mark.needs("required_checks_introspection")
     def test_base_requirements_from_the_bases_rules(self, subject: Subject) -> None:
-        subject.seeds.base_rules(required=["ci", "lint"], approvals=1)
+        seeded = subject.seeds.base_rules(required=["ci", "lint"], approvals=1)
         requirements = subject.ops.base_requirements(subject.repo, subject.base)
         assert isinstance(requirements, BaseRequirements)
         assert requirements.required_contexts is not None
-        assert set(requirements.required_contexts) == {"ci", "lint"}
-        assert requirements.approvals_required == 1
+        assert set(requirements.required_contexts) == set(seeded.required)
+        assert requirements.all_checks_required is seeded.all_checks_required
+        assert requirements.approvals_required == seeded.approvals
         assert requirements.source != "unknown"
         assert requirements.forge == subject.kind
 
-    def test_an_unprotected_base_is_an_answer(self, subject: Subject) -> None:
+    def test_a_base_with_no_named_check_is_an_answer(self, subject: Subject) -> None:
         requirements = subject.ops.base_requirements(subject.repo, subject.base)
         assert requirements.required_contexts == ()
+        assert requirements.source != "unknown"
         assert requirements.blockers() == []
 
 

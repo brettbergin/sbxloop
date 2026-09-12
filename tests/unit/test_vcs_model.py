@@ -83,12 +83,25 @@ class TestBlockerWording:
         )
 
     def test_another_forge_gets_its_own_or_the_generic_wording(self) -> None:
-        elsewhere = self.REQ._replace(forge="gitlab")
+        elsewhere = self.REQ._replace(forge="gitea")
         reasons = elsewhere.blockers()
         assert not any("GitHub" in r or "CODEOWNERS" in r for r in reasons)
         assert any(f"({GENERIC_WORDING.code_owners_file})" in r for r in reasons)
         assert any(GENERIC_WORDING.signing in r for r in reasons)
-        assert "gitlab" not in BLOCKER_WORDING, "no GitLab backend yet; the generic wording serves"
+        assert "gitea" not in BLOCKER_WORDING, "no Gitea backend yet; the generic wording serves"
+
+    def test_gitlab_is_read_in_its_own_words(self) -> None:
+        reasons = self.REQ._replace(forge="gitlab").blockers()
+        assert not any("GitHub" in r for r in reasons)
+        assert any(BLOCKER_WORDING["gitlab"].signing in r for r in reasons)
+        assert any("(CODEOWNERS)" in r for r in reasons)
+
+    def test_a_forge_gating_on_the_whole_pipeline_names_no_context(self) -> None:
+        # GitLab's "pipeline must succeed" (#1016 V2): nothing is named,
+        # everything reported is required, and the flag says so.
+        whole = BaseRequirements((), 0, "protected_branch+project", all_checks_required=True)
+        assert whole.required_contexts == () and whole.all_checks_required
+        assert BaseRequirements((), 0, "none").all_checks_required is False
 
     def test_the_forge_defaults_to_github_so_nothing_read_before_changes(self) -> None:
         assert BaseRequirements((), 0, "none").forge == "github"
