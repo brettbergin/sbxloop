@@ -1681,7 +1681,11 @@ autolink too, which is why Discord's trick is not the one used here.) Replying o
 rather than answering one message, so — as on Slack — the concierge and
 steering are @mention-only (`@your-bot` in the control channel or in a
 run's thread), and people can talk to each other in a run's thread without
-the bot answering. `sbxloop doctor` shows one
+the bot answering. A thread you open under any *other* post in the control
+channel — a run's finish notice, a concierge answer, a gate prompt — counts
+as the control channel: an @mention there reaches the concierge and is
+answered in that thread, and `!sbx` commands work there too. Only a run's
+own thread steers. `sbxloop doctor` shows one
 `chat bridge (mattermost)` row: extra installed, token present.
 A mention here is `@username` rather than an id, so before the daemon pings
 anyone from something it remembered — a run watch, a merge gate's notify

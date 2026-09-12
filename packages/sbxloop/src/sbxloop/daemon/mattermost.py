@@ -626,6 +626,7 @@ class MattermostBridge(ChatBridge):
             channel=MattermostTarget(channel, root_id if in_thread else None),
             raw=MattermostMessage(channel, post_id, root_id if in_thread else None),
             reply_to_id=root_id if in_thread else None,
+            parent_channel_id=channel if in_thread else None,
         )
 
     def _inbound(self, message: Any) -> Inbound | None:
