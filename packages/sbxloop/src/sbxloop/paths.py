@@ -182,6 +182,10 @@ class SbxloopHome:
         return self.root / "state"
 
     @property
+    def sandbox_allocations(self) -> Path:
+        return self.state / "sandbox-allocations"
+
+    @property
     def runs(self) -> Path:
         return self.root / "runs"
 

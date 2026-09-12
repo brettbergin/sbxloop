@@ -676,6 +676,8 @@ class LoopEngine:
         (``keep_sandboxes``, ``keep_on_failure``) also stay resume-time
         choices — they are operator intent about THIS attempt, not run
         identity, and flipping keep on to debug a crashing run must work.
+        Sandbox CPU/memory limits also come from the current operator config:
+        a saved run cannot retain an allocation the operator has reduced.
         Model settings refresh separately at each new phase from the original
         config location; the run's explicit --model override remains pinned.
         Drift from the config this engine was built with is reported via a
@@ -720,11 +722,26 @@ class LoopEngine:
         drift = self._config_drift(stored, current)
         if drift:
             message = (
-                "resuming with the run's original config; the current config "
+                "resuming with the run's original config except current sandbox "
+                "CPU/memory limits; the current config "
                 "differs (model settings refresh before each new phase): " + "; ".join(drift)
             )
             log.warning("run.config_drift", run=run_id, drift=drift)
             self.bus.emit(HostEventTypes.RUN_CONFIG_DRIFT, run_id, message=message)
+        resource_keys = {"cpus", "memory"} | {
+            f"{purpose}_{key}"
+            for purpose in ("concierge", "github", "service")
+            for key in ("cpus", "memory")
+        }
+        stored.sandbox = stored.sandbox.model_copy(
+            update={key: getattr(current.sandbox, key) for key in resource_keys}
+        )
+        # An override removed from the live config must disappear from the
+        # resumed allocation too. The repository's other pinned rules survive.
+        for entry in stored.github.repos:
+            live = current.github.find_repo(entry.repo)
+            entry.cpus = live.cpus if live is not None else None
+            entry.memory = live.memory if live is not None else None
         self.config = stored
         if self._worker_python_from_config:
             self.worker_python = stored.worker_python
