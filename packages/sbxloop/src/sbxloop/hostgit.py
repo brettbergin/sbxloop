@@ -267,8 +267,15 @@ def is_tracked(repo_root: Path, path: Path) -> bool | None:
         return False
     try:
         with read_repo(repo_root) as repo:
-            return (relative.as_posix(), 0) in repo.index.entries
-    except (InvalidGitRepositoryError, NoSuchPathError, ProvisionError, ValueError, OSError):
+            return any(path == relative.as_posix() for _mode, path in _index_entries(repo))
+    except (
+        InvalidGitRepositoryError,
+        NoSuchPathError,
+        GitCommandError,
+        ProvisionError,
+        ValueError,
+        OSError,
+    ):
         log.debug("git.is_tracked_probe_failed", root=str(repo_root), exc_info=True)
         return None
 
@@ -759,8 +766,9 @@ def populate_submodules(
 
 def _is_gitlink_in_index(clone: Path, path: str) -> bool:
     with Repo(clone) as repo:
-        entry = repo.index.entries.get((path, 0))
-    return entry is not None and entry.mode == int(GITLINK_MODE, 8)
+        return any(
+            mode == GITLINK_MODE and entry == path for mode, entry in _index_entries(repo, path)
+        )
 
 
 def _submodule_update(
@@ -1345,14 +1353,29 @@ def submodule_is_dirty(sub: Path) -> bool:
         return False
 
 
+def _index_entries(repo: Repo, *pathspecs: str) -> list[tuple[str, str]]:
+    """``(mode, path)`` for every index entry, from ``ls-files --stage -z``
+    read as bytes. Not ``repo.index.entries``: GitPython decodes entry
+    paths strictly, and one filename git could not decode as UTF-8 would
+    turn a whole repository's index into a ``UnicodeDecodeError``. Here such
+    a name is still a path (``surrogateescape``)."""
+    out: bytes = repo.git.ls_files("--stage", "-z", "--", *pathspecs, stdout_as_string=False)
+    entries: list[tuple[str, str]] = []
+    for record in out.split(b"\0"):
+        if not record:
+            continue
+        meta, _tab, path = record.partition(b"\t")
+        entries.append((meta.split(b" ", 1)[0].decode(), path.decode("utf-8", "surrogateescape")))
+    return entries
+
+
 def _gitlinks(repo: Repo, ignore: Sequence[str] = ()) -> list[str]:
     """Paths of the gitlinks in the index, skipping any top-level entry named
     in ``ignore`` (the ``:!<name>`` exclusion the status listing applies)."""
-    gitlink = int(GITLINK_MODE, 8)
     return [
-        str(path)
-        for (path, _stage), entry in repo.index.entries.items()
-        if entry.mode == gitlink and str(path).split("/", 1)[0] not in ignore
+        path
+        for mode, path in _index_entries(repo)
+        if mode == GITLINK_MODE and path.split("/", 1)[0] not in ignore
     ]
 
 
