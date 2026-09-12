@@ -57,6 +57,16 @@ CHOICE_EMOJI: tuple[str, ...] = ("one", "two", "three", "four", "five")
 #: The approve button's twin: reacting with this on a gate prompt approves.
 GATE_EMOJI = "white_check_mark"
 
+# A markdown link or image. The server's embed scan never looks inside one,
+# so these are already inert and are copied through untouched.
+_MD_LINK_RE = re.compile(r"!?\[[^\]\n]*\]\([^)\s]*\)")
+# A URL the server would treat as an *autolink*: bare, or in angle brackets —
+# CommonMark makes ``<url>`` an autolink too, which is why Discord's
+# angle-bracket trick is the wrong one to copy here.
+_AUTOLINK_RE = re.compile(r"<(https?://[^>\s]+)>|(?<!\w)(https?://[^\s<>\[\]()]+)")
+# Punctuation a sentence leaves on the end of a URL, which is not part of it.
+_URL_TAIL = ".,;:!?"
+
 # A zero-width space: invisible in a rendered post, and enough to stop the
 # mention parser matching the name that follows.
 ZERO_WIDTH_SPACE = "​"
@@ -82,6 +92,57 @@ def neutralize_mentions(text: str) -> str:
 
 def _park(match: re.Match[str]) -> str:
     return f"@{ZERO_WIDTH_SPACE}{match.group(1)}"
+
+
+def defuse_unfurls(text: str) -> str:
+    """Keep every link clickable and stop it growing a preview card.
+
+    Mattermost decides what to embed under a post from the *first autolink*
+    in its message — that is the whole rule, and it is what fills a run's
+    thread with website cards for every PR, issue and CI link the
+    chronology carries. There is no per-post flag to turn it off
+    (``EnableLinkPreviews`` is server-wide, and no post prop overrides it),
+    but there does not need to be: the server's scan only visits autolink
+    nodes, so a markdown link — ``[label](url)`` — is never a candidate.
+    Rewriting each bare URL as a link to itself leaves the same text, the
+    same click and no card.
+
+    Two traps this avoids. ``<url>`` is an autolink in CommonMark, so
+    Discord's angle-bracket suppression would still unfurl here. And a URL
+    already inside a markdown link must be left exactly as it is — putting
+    a link inside a link corrupts both.
+
+    Code spans and fenced blocks are skipped: nothing in them is a link to
+    Mattermost either, and rewriting one would corrupt what the agent is
+    quoting.
+    """
+    out: list[str] = []
+    for segment, is_code in _code_segments(str(text)):
+        out.append(segment if is_code else _defuse_segment(segment))
+    return "".join(out)
+
+
+def _defuse_segment(segment: str) -> str:
+    """One non-code stretch: rewrite the autolinks around the markdown links
+    already in it, which are copied through verbatim."""
+    parts: list[str] = []
+    last = 0
+    for match in _MD_LINK_RE.finditer(segment):
+        parts.append(_AUTOLINK_RE.sub(_as_markdown_link, segment[last : match.start()]))
+        parts.append(match.group(0))
+        last = match.end()
+    parts.append(_AUTOLINK_RE.sub(_as_markdown_link, segment[last:]))
+    return "".join(parts)
+
+
+def _as_markdown_link(match: re.Match[str]) -> str:
+    url = match.group(1) or match.group(2) or ""
+    tail = ""
+    while url and url[-1] in _URL_TAIL:
+        url, tail = url[:-1], url[-1] + tail
+    if not url:
+        return match.group(0)
+    return f"[{url}]({url}){tail}"
 
 
 def embed_attachment(spec: EmbedSpec) -> dict[str, Any]:
@@ -138,6 +199,7 @@ __all__ = [
     "EMOJI_NAMES",
     "GATE_EMOJI",
     "ZERO_WIDTH_SPACE",
+    "defuse_unfurls",
     "embed_attachment",
     "neutralize_mentions",
     "thread_permalink",

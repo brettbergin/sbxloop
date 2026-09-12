@@ -61,6 +61,10 @@ def get_backend(name: str | None = None) -> AgentBackend:
         from sbxloop_worker.backends.codex import CodexBackend
 
         return CodexBackend()
+    if resolved == "openai":
+        from sbxloop_worker.backends.openai import OpenAIBackend
+
+        return OpenAIBackend()
     raise BackendUnavailableError(f"unknown agent backend {resolved!r}")
 
 

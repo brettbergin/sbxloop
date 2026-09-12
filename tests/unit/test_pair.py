@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 import sbxloop.sbx.pair as pair_mod
+from sbxloop.config import Config
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.pair import CleanupRegistry, SandboxPair, cleanup_registry
@@ -30,6 +31,7 @@ def make_pair(fake_sbx: FakeSbx, tmp_path: Path, *, keep: bool = False) -> Sandb
         agent=Sandbox(cli, "sbxloop-r1-agent"),
         github=Sandbox(cli, "sbxloop-r1-github"),
         keep=keep,
+        config=Config(),
     )
 
 

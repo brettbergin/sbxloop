@@ -16,6 +16,7 @@ from textual.worker import get_current_worker
 
 from sbxloop import modelcatalog
 from sbxloop.backends import AgentBackend
+from sbxloop.config import Config
 from sbxloop.configedit.keys import FieldSpec
 from sbxloop.log import redact_text
 from sbxloop.paths import SbxloopHome
@@ -45,10 +46,14 @@ class ModelScreen(ValueScreen):
         in_file: bool,
         home: SbxloopHome,
         backend: AgentBackend,
+        config: Config | None = None,
     ) -> None:
         super().__init__(spec, value, source=source, target=target, in_file=in_file)
-        self.home, self.backend = home, backend
-        self.catalog = modelcatalog.load_catalog(home, backend)
+        self.home, self.backend, self.config = home, backend, config
+        # The endpoint the openai backend's catalog is keyed by (#617): a
+        # listing from another endpoint is never offered.
+        self.endpoint = modelcatalog.catalog_endpoint(config) if config is not None else None
+        self.catalog = modelcatalog.load_catalog(home, backend, endpoint=self.endpoint)
         self.choices: list[ValueEdit] = []
         self.refreshing = False
 
@@ -184,11 +189,11 @@ class ModelScreen(ValueScreen):
     def refresh_models(self) -> None:
         try:
             catalog: modelcatalog.ModelCatalog | None = modelcatalog.refresh_catalog(
-                self.home, self.backend
+                self.home, self.backend, self.config
             )
             error = None
         except Exception as exc:
-            catalog = modelcatalog.load_catalog(self.home, self.backend)
+            catalog = modelcatalog.load_catalog(self.home, self.backend, endpoint=self.endpoint)
             error = redact_text(str(exc))[:500]
         if not get_current_worker().is_cancelled:
             self.app.call_from_thread(self.refreshed, catalog, error)

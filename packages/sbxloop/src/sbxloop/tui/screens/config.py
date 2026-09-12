@@ -394,6 +394,7 @@ class ConfigScreen(ConsoleScreen):
                 **args,
                 home=self.console_app.deps.home,
                 backend=backend_for(self.config),
+                config=self.config,
             )
             if self.config is not None and configkeys.is_model_key(dotted)
             else ValueScreen(spec, value, **args)

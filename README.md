@@ -143,9 +143,12 @@ You only need the credential for the backend you choose.
 
 For Codex, use `backend = "codex"` and put `OPENAI_API_KEY=your_api_key` in
 `secrets.env`. Provisioning installs the Python Codex SDK in the agent sandbox.
-The [backend guide](docs/user-guide.md#agent-backends-copilot-claude-or-codex)
+For a self-hosted server or gateway speaking the OpenAI wire shape, use
+`backend = "openai"` and name the endpoint under `[agent.openai]`.
+The [backend guide](docs/user-guide.md#agent-backends-copilot-claude-codex-or-an-openai-compatible-endpoint)
 covers setup and model listing; the [Codex implementation plan](docs/codex-backend.md)
-records its tool contract and verification limits.
+and the [OpenAI-compatible endpoint plan](docs/openai-backend.md) record their
+tool contracts and verification limits.
 
 Models can differ by agent while sharing one backend: for example, use Haiku
 for the concierge, Opus for the builder, and Sonnet for review. Configure

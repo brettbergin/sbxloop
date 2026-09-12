@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 
 from sbxloop.config import Config, MattermostConfig
+from sbxloop.daemon import mattermost
 from sbxloop.daemon.chat import build_bridge
 from sbxloop.daemon.chat_choices import Choice, ChoiceQuestion
 from sbxloop.daemon.discord_format import EmbedSpec
@@ -35,7 +36,7 @@ from sbxloop.daemon.mattermost import (
     MattermostTarget,
 )
 from sbxloop.daemon.mattermost_format import ZERO_WIDTH_SPACE
-from sbxloop.daemon.model import WorkItem
+from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.store import ChatThread, DaemonStore
 from sbxloop.errors import DaemonError
 from sbxloop.events import EventBus
@@ -70,19 +71,47 @@ class FakeMattermostClient:
         self.lookups: list[str] = []
         self.users = {USER_ID: "ana"}
         self.connected = False
+        self.connects = 0
         self.closed = False
+        self.closes = 0
+        # Set when the websocket is gone, exactly as the real client's is:
+        # `drop()` is a network blip, a server restart, a proxy timeout.
+        self._closed: asyncio.Event | None = None
+        self.fail_connect: Exception | None = None
         self.fail_post: Exception | None = None
+        self.fail_get_post: Exception | None = None
+        # Posts the server still has, by id, and the ones it soft-deleted.
+        self.by_id: dict[str, dict[str, Any]] = {}
+        self.deleted: set[str] = set()
         self.fail_upload = False
         self.uploads: list[tuple[str, str, bytes]] = []
         self.team_name = "sbx"
         self._seq = 0
 
     async def connect(self) -> tuple[str, str]:
+        if self.fail_connect is not None:
+            raise self.fail_connect
         self.connected = True
+        self.connects += 1
+        self._closed = asyncio.Event()
         return BOT_ID, BOT_NAME
 
     async def close(self) -> None:
         self.closed = True
+        self.closes += 1
+        if self._closed is not None:
+            self._closed.set()
+
+    async def wait_closed(self) -> None:
+        if self._closed is None:
+            return
+        await self._closed.wait()
+
+    def drop(self) -> None:
+        """The socket goes away under the bridge, as it does on a server
+        restart or an idle proxy timeout."""
+        if self._closed is not None:
+            self.bridge._aloop.call_soon_threadsafe(self._closed.set)  # type: ignore[union-attr]
 
     async def create_post(self, body: dict[str, Any]) -> dict[str, Any]:
         if self.fail_post is not None:
@@ -90,7 +119,23 @@ class FakeMattermostClient:
         self._seq += 1
         post_id = f"p{self._seq:025d}"
         self.posts.append({**body, "id": post_id})
+        self.by_id[post_id] = {
+            "id": post_id,
+            "channel_id": body["channel_id"],
+            "root_id": body.get("root_id", ""),
+            "delete_at": 0,
+        }
         return {"id": post_id, "channel_id": body["channel_id"]}
+
+    async def get_post(self, post_id: str) -> dict[str, Any]:
+        if self.fail_get_post is not None:
+            raise self.fail_get_post
+        known = self.by_id.get(post_id)
+        if known is None:
+            raise MattermostApiError(404, "Unable to get the post")
+        if post_id in self.deleted:
+            return {**known, "delete_at": 1700000000000}
+        return known
 
     async def patch_post(self, post_id: str, body: dict[str, Any]) -> dict[str, Any]:
         self.patches.append((post_id, body))
@@ -748,6 +793,89 @@ class TestRefusedReactions:
         bridge.close()
 
 
+class TestReceivedAckReassert:
+    """The asker's own webapp drops a reaction that lands before their
+    create-post reply: the reply's empty reaction list replaces the one the
+    websocket already delivered, and only the person who asked loses the
+    mark. Saving it again is a 200 the server re-broadcasts, so the ⏳ — and
+    only the ⏳ — goes on twice."""
+
+    def test_the_received_mark_is_saved_twice(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge._reassert_s = 0.02
+        msg = MattermostMessage(CHANNEL, "p" * 26)
+
+        async def scenario() -> None:
+            await bridge._add_reaction(msg, "⏳")
+            # The first save is immediate: everyone else's client keeps it.
+            assert client.reactions == [(BOT_ID, "p" * 26, "hourglass_flowing_sand")]
+            await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        assert client.reactions == [(BOT_ID, "p" * 26, "hourglass_flowing_sand")] * 2
+        bridge.close()
+
+    def test_only_the_received_mark_is_reasserted(self, tmp_path: Path) -> None:
+        """✅ and ⚠ land seconds after the post, long past the reply that
+        does the wiping; a second save would be a wasted call."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge._reassert_s = 0.02
+        msg = MattermostMessage(CHANNEL, "p" * 26)
+
+        async def scenario() -> None:
+            await bridge._add_reaction(msg, "✅")
+            await bridge._add_reaction(msg, "⚠")
+            await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        assert client.reactions == [
+            (BOT_ID, "p" * 26, "white_check_mark"),
+            (BOT_ID, "p" * 26, "warning"),
+        ]
+        bridge.close()
+
+    def test_a_refused_received_mark_is_not_reasserted(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A server that would not take the first save will not take the
+        second; retrying it only re-asks the question the refusal already
+        answered once."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge._reassert_s = 0.02
+        client.fail_reaction = MattermostApiError(400, "Invalid or missing emoji_name parameter")
+
+        async def scenario() -> None:
+            with caplog.at_level(logging.WARNING):
+                await bridge._add_reaction(MattermostMessage(CHANNEL, "p" * 26), "⏳")
+                await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        assert client.reactions == []
+        assert len([r for r in caplog.records if "reaction_refused" in r.getMessage()]) == 1
+        bridge.close()
+
+    def test_a_reassert_that_fails_is_quiet(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The post can be gone by the time the second save runs; the first
+        one already did the job for everyone but the asker, and a 404 here
+        is not news anyone needs above debug."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge._reassert_s = 0.02
+        msg = MattermostMessage(CHANNEL, "p" * 26)
+
+        async def scenario() -> None:
+            await bridge._add_reaction(msg, "⏳")
+            client.fail_reaction = MattermostApiError(404, "post not found")
+            with caplog.at_level(logging.WARNING):
+                await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        assert client.reactions == [(BOT_ID, "p" * 26, "hourglass_flowing_sand")]
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        bridge.close()
+
+
 class TestSpentAffordances:
     """A seeded emoji is this bridge's button; one left on a settled prompt
     is a button that can only fail. Discord clears its view and Slack its
@@ -838,3 +966,314 @@ class TestPostAttachmentCap:
         assert "part5.txt" in body and "part6.txt" in body
         assert "part0.txt" not in body
         bridge.close()
+
+
+class TestReconnect:
+    """The websocket is the only way anything reaches the daemon from chat.
+    REST keeps working when it drops, so a bridge that does not rebuild it
+    goes on posting a run's chronology while every steer, command and
+    @mention is silently discarded."""
+
+    def test_a_dropped_connection_is_rebuilt(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            assert wait_for(lambda: client.connects == 1)
+            client.drop()
+            assert wait_for(lambda: client.connects == 2)
+            # the dead session is let go before the next dial, or the client
+            # leaks one HTTP session per outage
+            assert client.closes >= 1
+        finally:
+            bridge.close()
+
+    def test_the_bridge_hears_again_after_a_reconnect(self, tmp_path: Path) -> None:
+        """The point of the reconnect: an @mention after the outage is
+        answered, where before it vanished."""
+        concierge = FakeConcierge()
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        try:
+            assert wait_for(lambda: client.connects == 1)
+            client.drop()
+            assert wait_for(lambda: client.connects == 2)
+            client.deliver(posted(f"@{BOT_NAME} what is running?"))
+            assert wait_for(lambda: bool(concierge.turns))
+        finally:
+            bridge.close()
+
+    def test_a_reconnect_that_fails_backs_off_and_keeps_trying(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An instance that comes back later must find the daemon still
+        listening: the loop never gives up."""
+        monkeypatch.setattr(mattermost, "RECONNECT_MIN_S", 0.01)
+        monkeypatch.setattr(mattermost, "RECONNECT_MAX_S", 0.02)
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            assert wait_for(lambda: client.connects == 1)
+            client.fail_connect = MattermostApiError(502, "bad gateway")
+            client.drop()
+            assert wait_for(lambda: client.closes >= 3)  # retried, not given up on
+            assert client.connects == 1
+            client.fail_connect = None
+            assert wait_for(lambda: client.connects == 2)
+        finally:
+            bridge.close()
+
+    def test_the_first_connect_is_not_retried(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A bad token or a wrong URL is a configuration error: the base
+        bridge reports it once and carries on degraded. Retrying it forever
+        would bury the one message that says what to fix."""
+        config = Config.model_validate(
+            {"home": str(tmp_path / "state"), "mattermost": {"url": URL, "channel_id": CHANNEL}}
+        )
+        dstore = DaemonStore(config.paths.state_db)
+        holder: dict[str, FakeMattermostClient] = {}
+
+        def factory(b: MattermostBridge) -> FakeMattermostClient:
+            holder["client"] = FakeMattermostClient(b)
+            holder["client"].fail_connect = MattermostApiError(401, "invalid or expired session")
+            return holder["client"]
+
+        bridge = MattermostBridge(
+            config, dstore, loop_ref=FakeLoop(dstore), client_factory=factory, token="mmtoken"
+        )
+        with caplog.at_level(logging.ERROR):
+            bridge.start()
+            assert wait_for(lambda: any("connect_failed" in r.getMessage() for r in caplog.records))
+        assert holder["client"].connects == 0
+        bridge.close()
+
+    def test_closing_during_an_outage_does_not_dial_again(self, tmp_path: Path) -> None:
+        """A shutdown never sits through a backoff, and never races a dial
+        against the close that is tearing the client down."""
+        bridge, client, _ = make_bridge(tmp_path)
+        client.fail_connect = MattermostApiError(502, "bad gateway")
+        assert wait_for(lambda: client.connects == 1)
+        client.drop()
+        bridge.close()
+        settled = client.connects
+        assert not wait_for(lambda: client.connects > settled, timeout=0.3)
+
+
+class TestMentionHandles:
+    """A Mattermost mention is `@username`, so an id alone cannot be one.
+    Every notice built from *stored* ids — a run watch, a gate's notify
+    list — is sent exactly when the name cache the inbound path fills is
+    empty, which is what made these pings text instead of notifications."""
+
+    def test_a_watcher_from_before_a_restart_is_pinged_by_handle(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            item, _, _ = start_run(bridge)
+            # The watch is in the store; the name cache is not — the shape a
+            # restart leaves behind, and the shape that used to post a bare
+            # 26-character id at the person who asked to be told.
+            bridge.dstore.add_run_watch("r1", USER_ID, time.time(), backend="mattermost")
+            bridge._watchers["r1"] = [USER_ID]
+            assert USER_ID not in bridge._names
+            bridge.run_finished(item, RunReport("r1", "completed", "done"))
+            marker = "run `r1` finished"
+            assert wait_for(lambda: any(marker in p["message"] for p in client.posts))
+            notice = next(p for p in client.posts if marker in p["message"])
+            assert notice["message"].startswith("@ana ")
+            assert USER_ID not in notice["message"]
+        finally:
+            bridge.close()
+
+    def test_a_gate_prompt_pings_its_notify_list_by_handle(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            start_run(bridge)
+            asyncio.run(bridge._post_gate_prompt(make_gate("r1", notify=(USER_ID,))))
+            prompt = client.posts[-1]["message"]
+            assert prompt.startswith("@ana ")
+        finally:
+            bridge.close()
+
+    def test_a_handle_is_looked_up_once_per_id(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            asyncio.run(bridge._resolve_mentions([USER_ID, USER_ID]))
+            asyncio.run(bridge._resolve_mentions([USER_ID]))
+            assert client.lookups == [USER_ID]
+        finally:
+            bridge.close()
+
+    def test_an_id_that_cannot_be_resolved_is_not_retried_on_every_notice(
+        self, tmp_path: Path
+    ) -> None:
+        """A deactivated account 404s. It renders as itself — a broken ping
+        is better than a wrong one — and is not looked up again."""
+        bridge, client, _ = make_bridge(tmp_path)
+        gone = "z" * 26
+        try:
+            asyncio.run(bridge._resolve_mentions([gone]))
+            asyncio.run(bridge._resolve_mentions([gone]))
+            assert client.lookups == [gone]
+            assert bridge.mention_user(gone) == f"@{gone}"
+        finally:
+            bridge.close()
+
+    def test_another_service_s_ids_are_left_alone(self, tmp_path: Path) -> None:
+        """Several bridges can run at once and watcher ids are backend-less
+        in the store: a Discord snowflake must not become a users lookup."""
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            asyncio.run(bridge._resolve_mentions(["1234567890"]))
+            assert client.lookups == []
+        finally:
+            bridge.close()
+
+
+class TestLinkPreviews:
+    """Mattermost embeds under a post are chosen from the *first autolink*
+    in its message, so a chronology of PR, issue and CI links grows a
+    website card under every one. A markdown link is never a candidate."""
+
+    def test_a_bare_url_becomes_a_link_to_itself(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "PR https://git/pull/7 is green"))
+        assert client.posts[-1]["message"] == (
+            "PR [https://git/pull/7](https://git/pull/7) is green"
+        )
+        bridge.close()
+
+    def test_an_angle_bracketed_url_is_defused_too(self, tmp_path: Path) -> None:
+        """CommonMark makes `<url>` an autolink, so Discord's suppression
+        trick would still unfurl here — it is the wrong one to copy."""
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "🔀 PR #7 <https://git/pull/7>"))
+        assert client.posts[-1]["message"] == "🔀 PR #7 [https://git/pull/7](https://git/pull/7)"
+        bridge.close()
+
+    def test_a_markdown_link_is_left_exactly_as_it_is(self, tmp_path: Path) -> None:
+        """A link inside a link corrupts both."""
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "see [PR #7](https://git/pull/7)"))
+        assert client.posts[-1]["message"] == "see [PR #7](https://git/pull/7)"
+        bridge.close()
+
+    def test_sentence_punctuation_stays_outside_the_link(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "merged at https://git/c/abc."))
+        assert client.posts[-1]["message"] == "merged at [https://git/c/abc](https://git/c/abc)."
+        bridge.close()
+
+    def test_a_url_in_a_code_span_is_left_alone(self, tmp_path: Path) -> None:
+        """Nothing in a code span is a link to Mattermost either, and
+        rewriting one would corrupt what the agent is quoting."""
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "run `curl https://git/pull/7`"))
+        assert client.posts[-1]["message"] == "run `curl https://git/pull/7`"
+        bridge.close()
+
+    def test_an_edit_defuses_the_same_way(self, tmp_path: Path) -> None:
+        """A status line edited in place must not grow a card on the edit."""
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(bridge._edit(MattermostMessage(CHANNEL, "p" * 26), "done https://git/pull/7"))
+        assert client.patches[-1][1]["message"] == ("done [https://git/pull/7](https://git/pull/7)")
+        bridge.close()
+
+    def test_several_links_in_one_post_are_all_defused(self, tmp_path: Path) -> None:
+        """Only the first autolink is embedded, but which one is first is
+        not this seam's business to reason about."""
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(bridge._send(MattermostTarget(CHANNEL), "https://a/1 then https://b/2"))
+        assert client.posts[-1]["message"] == (
+            "[https://a/1](https://a/1) then [https://b/2](https://b/2)"
+        )
+        bridge.close()
+
+    def test_an_intentional_ping_still_gets_its_links_defused(self, tmp_path: Path) -> None:
+        """Mention safety and preview safety are separate axes: a watch
+        notice pings people *and* carries the PR link."""
+        bridge, client, _ = make_bridge(tmp_path)
+        asyncio.run(
+            bridge._send(MattermostTarget(CHANNEL), "@ana https://git/pull/7", mention_users=True)
+        )
+        assert client.posts[-1]["message"] == "@ana [https://git/pull/7](https://git/pull/7)"
+        bridge.close()
+
+
+class TestMessageFetch:
+    """Every caller of the fetch is asking whether a message is still
+    there, and treats None as "put a new one up". A handle built without
+    asking answered "still there" for a post that had been deleted."""
+
+    def test_a_gate_prompt_that_is_gone_is_re_posted(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            start_run(bridge)
+            gate = make_gate("r1", notify=())
+            asyncio.run(bridge._post_gate_prompt(gate))
+            prompt_id = client.posts[-1]["id"]
+            assert bridge.dstore.gate_prompt("r1", "mattermost") is not None
+            bridge.dstore.create_merge_gate(
+                "r1", "gh:issue:7", "you/repo", 7, "https://x/pull/7", "b", [], "tok77", time.time()
+            )
+            bridge.dstore.set_gate_prompt("r1", CHANNEL, prompt_id, backend="mattermost")
+            # somebody tidied the channel
+            del client.by_id[prompt_id]
+            posted_before = len(client.posts)
+            asyncio.run(bridge._reattach_gates())
+            assert len(client.posts) > posted_before
+            assert "waiting for your approval" in client.posts[-1]["message"]
+        finally:
+            bridge.close()
+
+    def test_a_gate_prompt_still_there_is_left_alone(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            start_run(bridge)
+            asyncio.run(bridge._post_gate_prompt(make_gate("r1", notify=())))
+            prompt_id = client.posts[-1]["id"]
+            bridge.dstore.create_merge_gate(
+                "r1", "gh:issue:7", "you/repo", 7, "https://x/pull/7", "b", [], "tok77", time.time()
+            )
+            bridge.dstore.set_gate_prompt("r1", CHANNEL, prompt_id, backend="mattermost")
+            posted_before = len(client.posts)
+            asyncio.run(bridge._reattach_gates())
+            assert len(client.posts) == posted_before
+        finally:
+            bridge.close()
+
+    def test_a_soft_deleted_post_reads_as_gone(self, tmp_path: Path) -> None:
+        """Mattermost keeps deleted rows; some paths hand one back with
+        `delete_at` set rather than answering 404."""
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            asyncio.run(bridge._send(MattermostTarget(CHANNEL), "hi"))
+            post_id = client.posts[-1]["id"]
+            client.deleted.add(post_id)
+            found = asyncio.run(bridge._fetch_message(MattermostTarget(CHANNEL), post_id))
+            assert found is None
+        finally:
+            bridge.close()
+
+    def test_a_server_that_could_not_answer_is_not_an_absence(self, tmp_path: Path) -> None:
+        """Fail closed: reporting a post missing because the lookup broke
+        would put a duplicate up next to the one still standing."""
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            asyncio.run(bridge._send(MattermostTarget(CHANNEL), "hi"))
+            post_id = client.posts[-1]["id"]
+            client.fail_get_post = MattermostApiError(500, "internal server error")
+            with pytest.raises(MattermostApiError):
+                asyncio.run(bridge._fetch_message(MattermostTarget(CHANNEL), post_id))
+        finally:
+            bridge.close()
+
+    def test_the_handle_carries_the_server_s_own_thread_root(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            root = "r" * 26
+            asyncio.run(bridge._send(MattermostTarget(CHANNEL, root_id=root), "in a thread"))
+            post_id = client.posts[-1]["id"]
+            found = asyncio.run(bridge._fetch_message(MattermostTarget(CHANNEL), post_id))
+            assert found is not None
+            assert found.post_id == post_id
+            assert found.root_id == root
+        finally:
+            bridge.close()
