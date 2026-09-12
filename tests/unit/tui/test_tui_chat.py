@@ -17,7 +17,7 @@ from sbxloop.tui.screens.chat import ChatScreen
 from sbxloop.tui.widgets.chat_input import ChatInput
 from sbxloop.tui.widgets.message import ChoiceButton
 from sbxloop.tui.widgets.thread import ThreadView
-from tests.unit.tui.conftest import drive, make_app
+from tests.unit.tui.conftest import drive, make_app, until
 
 
 def test_compose_outbound_mirrors_the_routing_rules() -> None:
@@ -63,7 +63,7 @@ def test_chat_screen_shows_rows_sends_addressed_text_and_clicks(seeded: SbxloopH
         async with app.run_test(size=(140, 45)) as pilot:
             await pilot.pause(0.5)
             await pilot.press("4")
-            await pilot.pause(1.0)
+            await until(pilot, lambda: isinstance(app.screen, ChatScreen))
             assert isinstance(app.screen, ChatScreen)
             view = app.screen.query_one(ThreadView)
             assert len(view.widgets) == 2

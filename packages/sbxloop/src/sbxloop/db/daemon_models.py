@@ -39,6 +39,11 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from sbxloop.db.base import Base
 
+#: ``text`` under a second name. ``LocalMessageRow`` has a column called
+#: ``text``, which shadows the import for every line after it in that class
+#: body — including the ``server_default``s that need it.
+sql_text = text
+
 
 class WorkItemRow(Base):
     """One thing the daemon has been asked to do, and how far it has got.
@@ -59,11 +64,11 @@ class WorkItemRow(Base):
     item_id: Mapped[str] = mapped_column(Text, primary_key=True, nullable=True)
     source_key: Mapped[str] = mapped_column(Text, nullable=False)
     title: Mapped[str] = mapped_column(Text, nullable=False)
-    body: Mapped[str] = mapped_column(Text, nullable=False, server_default="''")
-    url: Mapped[str] = mapped_column(Text, nullable=False, server_default="''")
+    body: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("''"))
+    url: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("''"))
     state: Mapped[str] = mapped_column(Text, nullable=False)
-    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-    claimed: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
+    claimed: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
     run_id: Mapped[str | None] = mapped_column(Text)
     last_error: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
@@ -72,7 +77,7 @@ class WorkItemRow(Base):
     requested_by: Mapped[str | None] = mapped_column(Text)
     # Empty for a row written before multi-repo; settled at daemon startup
     # rather than claimed by whichever repository is polled first.
-    repo: Mapped[str] = mapped_column(Text, nullable=False, server_default="''")
+    repo: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("''"))
     # Earliest the item may be dispatched — a scheduled retry's backoff.
     not_before: Mapped[float | None] = mapped_column(REAL)
     # Held across the two steps of a claim, so a daemon killed mid-claim
@@ -83,7 +88,7 @@ class WorkItemRow(Base):
     prior_run_id: Mapped[str | None] = mapped_column(Text)
     prior_branch: Mapped[str | None] = mapped_column(Text)
     prior_pr_number: Mapped[int | None] = mapped_column(Integer)
-    run_kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="'code'")
+    run_kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'code'"))
     profile: Mapped[str | None] = mapped_column(Text)
     recipe: Mapped[str | None] = mapped_column(Text)
     recipe_target: Mapped[str | None] = mapped_column(Text)
@@ -106,9 +111,12 @@ class RunResumeRow(Base):
     """One resume of one run. Counted against the per-item resume budget."""
 
     __tablename__ = "daemon_run_resumes"
+    # AUTOINCREMENT on disk (the baseline wrote it): ids are never reused,
+    # which readers that track a high-water mark rely on.
     __table_args__ = (
         Index("idx_daemon_resumes_at", "resumed_at"),
         Index("idx_daemon_resumes_item", "item_id"),
+        {"sqlite_autoincrement": True},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, nullable=True)
@@ -142,7 +150,7 @@ class RunWatchRow(Base):
     run_id: Mapped[str] = mapped_column(Text, nullable=False)
     watcher_id: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
-    backend: Mapped[str] = mapped_column(Text, nullable=False, server_default="'discord'")
+    backend: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'discord'"))
 
     # The table has no PRIMARY KEY on disk — only the UNIQUE above — and it
     # must stay that way, so the mapper is told what identifies a row
@@ -159,7 +167,7 @@ class RequesterRow(Base):
     __table_args__ = (PrimaryKeyConstraint("source_key", "repo"),)
 
     source_key: Mapped[str] = mapped_column(Text, nullable=False)
-    repo: Mapped[str] = mapped_column(Text, nullable=False, server_default="''")
+    repo: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("''"))
     requester_id: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
 
@@ -175,11 +183,11 @@ class PriorAttemptRow(Base):
     __table_args__ = (PrimaryKeyConstraint("source_key", "repo"),)
 
     source_key: Mapped[str] = mapped_column(Text, nullable=False)
-    repo: Mapped[str] = mapped_column(Text, nullable=False, server_default="''")
+    repo: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("''"))
     run_id: Mapped[str | None] = mapped_column(Text)
     branch: Mapped[str | None] = mapped_column(Text)
     pr_number: Mapped[int | None] = mapped_column(Integer)
-    updated_at: Mapped[float] = mapped_column(REAL, nullable=False, server_default="0")
+    updated_at: Mapped[float] = mapped_column(REAL, nullable=False, server_default=sql_text("0"))
 
 
 class ChatThreadRow(Base):
@@ -192,7 +200,7 @@ class ChatThreadRow(Base):
     )
 
     run_id: Mapped[str] = mapped_column(Text, nullable=False)
-    backend: Mapped[str] = mapped_column(Text, nullable=False, server_default="'discord'")
+    backend: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'discord'"))
     channel_id: Mapped[str] = mapped_column(Text, nullable=False)
     thread_id: Mapped[str] = mapped_column(Text, nullable=False)
     # The headline card and the status line inside the thread, edited in
@@ -219,12 +227,12 @@ class MergeGateRow(Base):
     item_id: Mapped[str] = mapped_column(Text, nullable=False)
     repo: Mapped[str] = mapped_column(Text, nullable=False)
     pr_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    pr_url: Mapped[str] = mapped_column(Text, nullable=False, server_default="''")
+    pr_url: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("''"))
     branch: Mapped[str | None] = mapped_column(Text)
-    notify_ids: Mapped[str] = mapped_column(Text, nullable=False, server_default="'[]'")
+    notify_ids: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'[]'"))
     custom_id: Mapped[str] = mapped_column(Text, nullable=False)
-    state: Mapped[str] = mapped_column(Text, nullable=False, server_default="'open'")
-    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="'merge'")
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'open'"))
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'merge'"))
     # Where the prompt was posted, before it moved to `daemon_gate_prompts`
     # so it could exist once per backend. Still readable, never written
     # again — an older daemon in a rollback window may write them, and the
@@ -267,22 +275,26 @@ class ReviewHoldRow(Base):
     item_id: Mapped[str] = mapped_column(Text, nullable=False)
     repo: Mapped[str] = mapped_column(Text, nullable=False)
     pr_number: Mapped[int] = mapped_column(Integer, nullable=False)
-    pr_url: Mapped[str] = mapped_column(Text, nullable=False, server_default="''")
+    pr_url: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("''"))
     branch: Mapped[str | None] = mapped_column(Text)
     # Who requested the changes, and whether they were a bot — an automated
     # reviewer gets one answer, never a fix loop.
-    login: Mapped[str] = mapped_column(Text, nullable=False, server_default="''")
+    login: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("''"))
     is_bot: Mapped[int | None] = mapped_column(Integer)
-    approvals_required: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    approvals_required: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sql_text("1")
+    )
     # Held because a person drafted the pull request, rather than because
     # the base demands an approval.
-    held_by_draft: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-    notify_ids: Mapped[str] = mapped_column(Text, nullable=False, server_default="'[]'")
-    state: Mapped[str] = mapped_column(Text, nullable=False, server_default="'open'")
+    held_by_draft: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sql_text("0")
+    )
+    notify_ids: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'[]'"))
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'open'"))
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
     since_at: Mapped[float] = mapped_column(REAL, nullable=False)
     next_poll_at: Mapped[float] = mapped_column(REAL, nullable=False)
-    polls: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    polls: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
     resolved_at: Mapped[float | None] = mapped_column(REAL)
     resolved_by: Mapped[str | None] = mapped_column(Text)
     detail: Mapped[str | None] = mapped_column(Text)
@@ -296,10 +308,15 @@ class PendingClarificationRow(Base):
     """
 
     __tablename__ = "daemon_pending_clarifications"
-    __table_args__ = (Index("idx_pending_clarify_due", "state", "deadline"),)
+    # AUTOINCREMENT on disk (the baseline wrote it): ids are never reused,
+    # which readers that track a high-water mark rely on.
+    __table_args__ = (
+        Index("idx_pending_clarify_due", "state", "deadline"),
+        {"sqlite_autoincrement": True},
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, nullable=True)
-    backend: Mapped[str] = mapped_column(Text, nullable=False, server_default="'discord'")
+    backend: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'discord'"))
     channel_id: Mapped[str | None] = mapped_column(Text)
     prompt_message_id: Mapped[str | None] = mapped_column(Text)
     asker_id: Mapped[str | None] = mapped_column(Text)
@@ -308,7 +325,7 @@ class PendingClarificationRow(Base):
     assumption: Mapped[str] = mapped_column(Text, nullable=False)
     deadline: Mapped[float] = mapped_column(REAL, nullable=False)
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
-    state: Mapped[str] = mapped_column(Text, nullable=False, server_default="'open'")
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'open'"))
     resolved_at: Mapped[float | None] = mapped_column(REAL)
 
 
@@ -322,6 +339,8 @@ class LocalMessageRow(Base):
     """
 
     __tablename__ = "daemon_local_messages"
+    # AUTOINCREMENT on disk (the baseline wrote it): ids are never reused,
+    # which readers that track a high-water mark rely on.
     __table_args__ = (
         Index("idx_local_messages_channel", "channel_id", "id"),
         Index("idx_local_messages_updated", "channel_id", "updated_at"),
@@ -330,25 +349,30 @@ class LocalMessageRow(Base):
             "id",
             sqlite_where=text("direction = 'in' AND taken_at IS NULL"),
         ),
+        {"sqlite_autoincrement": True},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True, nullable=True)
     direction: Mapped[str] = mapped_column(Text, nullable=False)
     channel_id: Mapped[str] = mapped_column(Text, nullable=False)
-    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default="'message'")
-    text: Mapped[str] = mapped_column(Text, nullable=False, server_default="''")
+    kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'message'"))
+    text: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("''"))
     # Opaque here: the bridge layer owns what is inside them.
     embed_json: Mapped[str | None] = mapped_column(Text)
     choices_json: Mapped[str | None] = mapped_column(Text)
     gate_run_id: Mapped[str | None] = mapped_column(Text)
     reply_to_id: Mapped[int | None] = mapped_column(Integer)
-    mention_users: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
-    author_id: Mapped[str] = mapped_column(Text, nullable=False, server_default="'sbx'")
-    author_name: Mapped[str] = mapped_column(Text, nullable=False, server_default="'sbx'")
-    reactions_json: Mapped[str] = mapped_column(Text, nullable=False, server_default="'[]'")
+    mention_users: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sql_text("0")
+    )
+    author_id: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'sbx'"))
+    author_name: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'sbx'"))
+    reactions_json: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=sql_text("'[]'")
+    )
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
     edited_at: Mapped[float | None] = mapped_column(REAL)
-    updated_at: Mapped[float] = mapped_column(REAL, nullable=False, server_default="0")
+    updated_at: Mapped[float] = mapped_column(REAL, nullable=False, server_default=sql_text("0"))
     # When the daemon took an inbound message. NULL means still pending.
     taken_at: Mapped[float | None] = mapped_column(REAL)
 

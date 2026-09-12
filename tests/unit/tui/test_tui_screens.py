@@ -115,7 +115,7 @@ def test_runs_screen_lists_filters_and_opens_a_run(seeded: SbxloopHome) -> None:
             assert table.row_count == 3
             table.move_cursor(row=table.get_row_index("r_live"))
             await pilot.press("enter")
-            await pilot.pause(1.0)
+            await until(pilot, lambda: isinstance(app.screen, RunDetailScreen))
             assert isinstance(app.screen, RunDetailScreen)
             assert app.screen.run_id == "r_live"
 
@@ -126,6 +126,8 @@ def test_run_screen_tabs_render_the_store(seeded: SbxloopHome) -> None:
     async def scenario() -> None:
         app = make_app(seeded, run="r_live")
         async with app.run_test(size=(140, 45)) as pilot:
+            # Not `until` on the screen: a worker fills this page after mount and
+            # the assertions below read what it wrote.
             await pilot.pause(1.5)
             screen = app.screen
             assert isinstance(screen, RunDetailScreen)
@@ -262,7 +264,7 @@ def test_escape_clears_the_event_filter_before_leaving_the_run(seeded: SbxloopHo
     async def scenario() -> None:
         app = make_app(seeded, run="r_live")
         async with app.run_test(size=(140, 45)) as pilot:
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, RunDetailScreen))
             assert isinstance(app.screen, RunDetailScreen)
             await pilot.press("slash")
             await pilot.press(*"pol")
@@ -283,6 +285,8 @@ def test_events_wait_while_follow_is_off(seeded: SbxloopHome) -> None:
     async def scenario() -> None:
         app = make_app(seeded, run="r_live")
         async with app.run_test(size=(140, 45)) as pilot:
+            # Not `until` on the screen: a worker fills this page after mount and
+            # the assertions below read what it wrote.
             await pilot.pause(1.5)
             screen = app.screen
             assert isinstance(screen, RunDetailScreen)

@@ -79,10 +79,12 @@ refreshes the launchers and the rendered units for the new version. `--no-sbx` p
 the installed sandbox runtime; plain `init` would install this sbxloop release's default
 sbx version, which may be older than the one the operator installed.
 
-`reset-failed` matters: `StartLimitBurst=5` per 600 s leaves a unit that crash-looped in
-`failed`, where a plain `restart` will not revive it. The daemon comes back unpaused (holds
-are in-memory), so re-take any hold you want to keep. Pin the version exactly — a
-downgrade is the same two commands with an older `X.Y.Z`. Then check it:
+On a host installed under a custom `SBXLOOP_HOME`, read `~/.sbxloop` above as that root —
+`sbxloop` itself already honours the variable, so only the two explicit `~/.sbxloop/…`
+paths change. `reset-failed` matters: `StartLimitBurst=5` per 600 s leaves a unit that
+crash-looped in `failed`, where a plain `restart` will not revive it. The daemon comes back
+unpaused (holds are in-memory), so re-take any hold you want to keep. Pin the version
+exactly — a downgrade is the same two commands with an older `X.Y.Z`. Then check it:
 
 ```bash
 systemctl --user is-active sbxloop-daemon
@@ -180,9 +182,36 @@ Two settings, and no names in the file:
   label — or changing the variable; the workflow file does not change.
 - The **`schedule`** is how often the host checks PyPI.
 
-Every path is under `${HOME}/.sbxloop`, resolved in the job's first step (job-level `env:`
-values are literals — GitHub does not expand `${HOME}` there), so a host `sbxloop init`
-built needs no edits.
+### Where the job deploys to
+
+The job's first step resolves the sbxloop home **once** and derives every path it touches
+from that root — the launcher, the venv interpreter, the home's `uv` and its caches, and
+through `SBXLOOP_HOME` in the job environment, the backup, `init`, `doctor`, the health
+check and the rollback too. Nothing downstream re-derives a root, so a deploy cannot
+address one installation and health-check another. It resolves in this order:
+
+1. The repository variable **`SBXLOOP_HOME`**, if set.
+2. The runner process's own `SBXLOOP_HOME`.
+3. `${HOME}/.sbxloop` — the default `sbxloop init` builds.
+
+The resolution happens in a step rather than in a job-level `env:` because those values are
+literals: GitHub does not expand `${HOME}` there. A root that is not absolute, or that
+holds a newline, fails the job before anything on the host is touched — there is no working
+directory to make a relative path mean anything, and every step would read it differently.
+A `~/`-prefixed root expands against the service user's home, the same as the loader does.
+A home whose path contains spaces is carried through as itself.
+
+So a host `sbxloop init` built with the default home needs no edits. A host installed under
+a custom `SBXLOOP_HOME` needs the job to be told, and there are two ways:
+
+- **The runner unit.** `sbxloop init --systemd --runner DIR` renders
+  `github-runner.service` with `Environment=SBXLOOP_HOME=<the home it just built>`, so a
+  runner started from that unit already hands every job the right root. This is the path to
+  prefer: the home comes from the installation itself and cannot fall out of step with it.
+- **The repository variable.** Where the runner was registered some other way — GitHub's
+  `svc.sh`, a container, a shell — set the repository variable `SBXLOOP_HOME` to the same
+  absolute path. It wins over the runner's environment, which is what makes it useful for
+  correcting a runner that carries the wrong one. Leave it unset on a default install.
 
 ### `sbxloop daemon notify`
 
@@ -207,19 +236,33 @@ tar xzf actions-runner-linux-x64-<X>.tar.gz
   --token "$(gh api -X POST repos/<owner>/<repo>/actions/runners/registration-token --jq .token)" \
   --name <host> --labels <host> --work _work --unattended --replace
 
-cp contrib/systemd/github-runner.service ~/.config/systemd/user/
-systemctl --user daemon-reload
-systemctl --user enable --now github-runner
-loginctl enable-linger "$USER"
+# render the unit for this runner directory, from anywhere — init enables it
+sbxloop init --systemd --no-sbx --runner "$HOME/actions-runner"
+systemctl --user start github-runner
 ```
 
 `self-hosted`, `Linux` and `X64` are added automatically; `--labels <host>` is the one
-`SBXLOOP_DEPLOY_HOST` must match. The runner is a *user* unit
-([contrib/systemd/github-runner.service](../contrib/systemd/github-runner.service)) rather
-than GitHub's `svc.sh` system unit: a system service has no `XDG_RUNTIME_DIR` or
-`DBUS_SESSION_BUS_ADDRESS`, so `systemctl --user restart sbxloop-daemon` fails there with
+`SBXLOOP_DEPLOY_HOST` must match.
+
+The unit is not a file to copy: the packaged template
+([contrib/systemd/github-runner.service](../contrib/systemd/github-runner.service)) carries
+an `@RUNNER@` placeholder where the runner directory goes, and `init --systemd --runner DIR`
+is what puts the absolute path in it, writes it into `~/.sbxloop/systemd/`, enables it from
+there and turns lingering on. So the command needs no source checkout — a wheel or
+`install.sh` installation has everything — and runs from any directory, including the runner
+directory itself. `--no-sbx` leaves an already-installed sandbox runtime alone; init only
+*enables* units, never starts them, which is why `start` is a separate line. Re-running init
+later without `--runner` leaves this unit where it is but stops refreshing it, so carry the
+flag on the host's init line — including the one in the upgrade sequence in
+[contrib/systemd/README.md](../contrib/systemd/README.md).
+
+The runner is a *user* unit rather than GitHub's `svc.sh` system unit: a system service has
+no `XDG_RUNTIME_DIR` or `DBUS_SESSION_BUS_ADDRESS`, so
+`systemctl --user restart sbxloop-daemon` fails there with
 "Failed to connect to bus". `KillMode=process` so stopping the runner never cuts off a
-deploy mid-restart. Confirm with `gh api repos/<owner>/<repo>/actions/runners --jq '.runners[].status'`.
+deploy mid-restart, and `Environment=SBXLOOP_HOME=` carries the home init built so every
+job on the runner deploys to this installation. Confirm with
+`gh api repos/<owner>/<repo>/actions/runners --jq '.runners[].status'`.
 
 ### Security
 

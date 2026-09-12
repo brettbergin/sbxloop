@@ -13,7 +13,7 @@ from sbxloop.tui.widgets.panel import TextPanel
 from sbxloop.tui.widgets.tables import ConsoleTable
 from sbxloop_worker.protocol import Usage
 from tests.fakes.rawdb import exec_raw
-from tests.unit.tui.conftest import FakeCtl, drive, live_status, make_app
+from tests.unit.tui.conftest import FakeCtl, drive, live_status, make_app, until
 
 LONG_REASON = (
     "github op raw.api failed: GithubOpError: gh api POST "
@@ -179,7 +179,7 @@ def test_a_long_reason_cannot_eat_the_table(tmp_path: Path) -> None:
         app = make_app(home)
         async with app.run_test(size=(150, 30)) as pilot:
             await pilot.press("2")
-            await pilot.pause(1.5)
+            await until(pilot, lambda: isinstance(app.screen, RunsScreen))
             screen = app.screen
             assert isinstance(screen, RunsScreen)
             table = screen.query_one("#runs", ConsoleTable)

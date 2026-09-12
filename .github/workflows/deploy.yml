@@ -22,10 +22,13 @@ name: Deploy the daemon
 #
 # THE HOST IS ONE VARIABLE (#640): the runner label — also the name the
 # notices call the host — is the repository variable SBXLOOP_DEPLOY_HOST
-# (default `db`). Every path is under the sbxloop home, ${HOME}/.sbxloop,
-# the layout `sbxloop init` builds (contrib/systemd/README.md). Nothing
-# else here names a machine or a user, and no step needs a working
-# directory: every command answers the same from anywhere.
+# (default `db`). Every path is under the sbxloop home, the layout
+# `sbxloop init` builds (contrib/systemd/README.md): ${HOME}/.sbxloop
+# unless the host was installed under a custom SBXLOOP_HOME, which the
+# first step honours from the runner's environment or the repository
+# variable SBXLOOP_HOME (#895). Nothing else here names a machine or a
+# user, and no step needs a working directory: every command answers the
+# same from anywhere.
 #
 # SECURITY INVARIANT — DO NOT BREAK:
 #   No job carrying the `self-hosted` label may be reachable from a
@@ -99,21 +102,47 @@ jobs:
         # Every path the deploy touches is under the sbxloop home. Written
         # to GITHUB_ENV because a job-level `env:` value is a literal — the
         # shell would not expand a ${HOME} inside it.
+        env:
+          # The optional repository variable, empty when unset (#895).
+          SBXLOOP_HOME_VAR: ${{ vars.SBXLOOP_HOME }}
         run: |
           set -euo pipefail
+          # The home, resolved once (#895): the repository variable, else
+          # the runner's own SBXLOOP_HOME (the rendered github-runner unit
+          # exports the home init built), else the default. Every path
+          # below derives from it, so the version check, backup, install,
+          # health check and rollback cannot drift to another home.
+          root="${SBXLOOP_HOME_VAR:-}"
+          [ -n "${root}" ] || root="${SBXLOOP_HOME:-}"
+          [ -n "${root}" ] || root="${HOME}/.sbxloop"
+          case "${root}" in
+            "~") root="${HOME}" ;;
+            "~/"*) root="${HOME}/${root#\~/}" ;;
+          esac
+          # Fail closed rather than deploy to a path this job cannot
+          # address: a relative root is a different directory in every step
+          # (there is no working directory), and a newline would corrupt
+          # every assignment after it.
+          case "${root}" in
+            *$'\n'*) echo "::error::the sbxloop home may not contain a newline"; exit 1 ;;
+            /*) ;;
+            *) echo "::error::the sbxloop home must be an absolute path, not '${root}'"; exit 1 ;;
+          esac
+          # Unquoted on purpose: GITHUB_ENV takes the value verbatim to the
+          # end of the line, so a home holding spaces survives as itself.
           {
-            echo "SBXLOOP_HOME=${HOME}/.sbxloop"
+            echo "SBXLOOP_HOME=${root}"
             # The launcher: binds every command to the home (PATH with
             # /usr/sbin for mkfs.ext4, dbus, the home's tmp and caches) and
             # execs the venv. It exports no secrets; sbxloop reads its
             # own secrets file itself.
-            echo "SBXLOOP=${HOME}/.sbxloop/bin/sbxloop"
-            echo "VENV_SBXLOOP=${HOME}/.sbxloop/venv/bin/sbxloop"
-            echo "VENV_PYTHON=${HOME}/.sbxloop/venv/bin/python"
+            echo "SBXLOOP=${root}/bin/sbxloop"
+            echo "VENV_SBXLOOP=${root}/venv/bin/sbxloop"
+            echo "VENV_PYTHON=${root}/venv/bin/python"
             # The home's own uv, and where it keeps its cache and interpreters.
-            echo "UV=${HOME}/.sbxloop/bin/uv"
-            echo "UV_CACHE_DIR=${HOME}/.sbxloop/cache/uv"
-            echo "UV_PYTHON_INSTALL_DIR=${HOME}/.sbxloop/python"
+            echo "UV=${root}/bin/uv"
+            echo "UV_CACHE_DIR=${root}/cache/uv"
+            echo "UV_PYTHON_INSTALL_DIR=${root}/python"
           } >> "$GITHUB_ENV"
 
       - name: Resolve the target version

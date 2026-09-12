@@ -44,6 +44,8 @@ def test_discovered_model_can_be_selected_by_name_without_typing_slug(seeded, ke
         app = make_app(seeded)
         async with app.run_test(size=(120, 40)) as pilot:
             app.push_screen(picker(seeded, key), edits.append)
+            # Not `until` on the screen: the page's worker fills it after mount,
+            # and every assertion below reads what the worker wrote.
             await pilot.pause(0.2)
             assert isinstance(app.screen, ModelScreen)
             app.screen.query_one("#model-filter", Input).value = "friendly"

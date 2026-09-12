@@ -126,8 +126,10 @@ addopts = [
 [tool.coverage.run]
 branch = true
 omit = [
-    # Exercised only by the real-sbx e2e workflow: requires the Copilot SDK
-    # runtime and a Copilot subscription.
+    # A real session requires the Copilot SDK runtime and a subscription, so
+    # the e2e workflow is what exercises this module end to end. Its decision
+    # logic is unit-tested (backends/copilot_errors.py is not omitted, and
+    # the fake-SDK tests drive the session path) but not counted here.
     "*/sbxloop_worker/backends/copilot.py",
 ]
 
