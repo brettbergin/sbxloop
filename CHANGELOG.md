@@ -38,6 +38,47 @@
 
 ### Fixed
 
+- **A failed sbx installation is no longer recorded as the installed
+  version.** `sbxloop init` treated *any* installer failure that left an
+  executable under the prefix as the one outcome an unprivileged run is
+  expected to hit — the AppArmor profile that needs root — and then wrote
+  the requested version into `sbx/VERSION`. An upgrade whose installer
+  refused before it copied anything (Debian keeps `mkfs.ext4` off a non-root
+  PATH) therefore reported success on the strength of the *previous*
+  release's binary, and the next init skipped the repair because the marker
+  said the version was installed.
+
+  The AppArmor outcome is now recognised only when the failure says so, and
+  its note says the sandbox backend cannot start until an administrator
+  installs the profile rather than reporting a finished install. Every other
+  failure keeps its own exit code and output, whatever is lying around under
+  the prefix. `sbx/VERSION` is written only after the executable is there,
+  is executable, and answers `sbx version` with the version that was asked
+  for; a failed install clears the marker, so a later init reinstalls
+  instead of skipping.
+
+- **The installer now tells a host without git what it is missing, before it
+  downloads anything.** `scripts/install.sh` checked `curl` and `tar`, then
+  fetched uv, a CPython and every package, and handed over to `sbxloop init`
+  — which imports sbxloop, which imports GitPython, which resolves the git
+  executable at *import* time. A host with no usable git therefore failed at
+  the last step of a bootstrap that had already written the home, with
+  `ImportError: Bad git executable.` and a traceback through a third-party
+  package: nothing an operator could read as "install git". Git is a host
+  dependency in its own right — sbxloop reads and clones checkouts on the
+  host — and the git a sandbox carries is a separate one that does not stand
+  in for it, so installing it in a VM never fixed this.
+
+  Git is now a declared prerequisite alongside `curl` and `tar`, checked
+  before the first mkdir or download and reported with advice for the host's
+  own OS. A git that is present but cannot run (`git --version` fails) is
+  caught too, rather than passing a `command -v` and failing later.
+  `GIT_PYTHON_GIT_EXECUTABLE` is what gets checked when it is set, since it
+  is the executable GitPython will use: an explicitly configured working git
+  passes with nothing on `PATH`, and one pointed at nothing fails even with a
+  usable git on `PATH`. Nothing is installed on the operator's behalf and no
+  privileged command is run.
+
 - **The ⏳ "received" mark now shows up for the person who asked, on
   Mattermost.** It was already on the server — the bot reacts within
   milliseconds of a post — but the asker's own web/desktop app never

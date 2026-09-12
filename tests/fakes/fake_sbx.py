@@ -98,6 +98,18 @@ def sandbox_dir(root: Path, name: str) -> Path:
     return root / "sandboxes" / name
 
 
+def rm_linger(root: Path) -> int:
+    """How many further ``ls`` calls a removed sandbox keeps being listed for.
+
+    Real ``sbx rm`` returns once the backend accepts the teardown, not once
+    it has finished: the name stays taken for a while afterwards (#952). Zero
+    (the default) keeps removal instant, which is what every other test
+    wants.
+    """
+    path = root / "rm_linger"
+    return int(path.read_text().strip()) if path.is_file() else 0
+
+
 def require_sandbox(root: Path, name: str) -> Path:
     path = sandbox_dir(root, name)
     if not (path / "meta.json").is_file():
@@ -383,6 +395,21 @@ def cmd_ls(root: Path) -> int:
             if not meta_path.is_file():
                 continue
             meta = json.loads(meta_path.read_text())
+            remaining = int(meta.get("removing", 0))
+            if remaining:
+                # A teardown in flight (see cmd_rm): still listed, one call
+                # closer to gone.
+                remaining -= 1
+                if remaining <= 0:
+                    # Inside the branch, not at the top of `cmd_ls`: a
+                    # teardown finishing is the rare case, and `ls` is one of
+                    # the calls this module's import budget is kept small for.
+                    import shutil
+
+                    shutil.rmtree(path)
+                    continue
+                meta["removing"] = remaining
+                meta_path.write_text(json.dumps(meta))
             rows.append(
                 (
                     path.name,
@@ -422,6 +449,14 @@ def cmd_rm(root: Path, args: list[str]) -> int:
         print("usage: sbx rm [--force] SANDBOX", file=sys.stderr)
         return 2
     path = require_sandbox(root, names[0])
+    linger = rm_linger(root)
+    if linger > 0:
+        # Accepted, not finished: the sandbox stays in the inventory (and the
+        # name stays taken) until `ls` has been asked `linger` more times.
+        meta = json.loads((path / "meta.json").read_text())
+        meta["removing"] = linger
+        (path / "meta.json").write_text(json.dumps(meta))
+        return 0
     shutil.rmtree(path)
     return 0
 

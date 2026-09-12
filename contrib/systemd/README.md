@@ -11,11 +11,14 @@ builds it.
    curl -fsSL https://raw.githubusercontent.com/brettbergin/sbxloop/main/scripts/install.sh | sh
    ```
 
-   That puts `uv`, a CPython and the `sbxloop[discord,slack]` venv under
-   the home, then runs `sbxloop init --systemd`, which writes the
-   launchers (`~/.sbxloop/bin/sbxloop`, `~/.sbxloop/bin/sbx`), installs
-   Docker's `sbx` under `~/.sbxloop/sbx`, writes `config/sbxloop.toml` and
-   a 0600 `config/secrets.env`, renders the units into `~/.sbxloop/systemd`
+   The host needs curl, tar and git already installed — the script checks
+   all three before it downloads anything, git included: sbxloop cannot
+   start without one. That puts `uv`, a CPython and the
+   `sbxloop[discord,slack]` venv under the home, then runs
+   `sbxloop init --systemd`, which writes the launchers
+   (`~/.sbxloop/bin/sbxloop`, `~/.sbxloop/bin/sbx`), installs Docker's
+   `sbx` under `~/.sbxloop/sbx`, writes `config/sbxloop.toml` and a 0600
+   `config/secrets.env`, renders the units into `~/.sbxloop/systemd`
    and enables them (never starts them), and turns lingering on so user
    units outlive the login. Put `~/.sbxloop/bin` on your `PATH`. Already
    have sbxloop installed some other way? `sbxloop init --systemd` from

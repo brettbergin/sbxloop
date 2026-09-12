@@ -9,9 +9,11 @@ One idempotent command builds everything a host needs under the home
 3. the interpreter: ``uv`` in ``bin/``, a uv-managed CPython under
    ``python/``, and ``venv/`` with ``sbxloop[discord,slack]`` and the
    worker pinned to this exact version (skipped when init already runs
-   from that venv);
+   from that venv) — every uv command pointed at the home's own
+   directories, never the ones the invoking user's environment names;
 4. Docker's ``sbx``, installed by its own installer with the home as
-   ``PREFIX``, pinned to the series sbxloop is tested against;
+   ``PREFIX``, pinned to the series sbxloop is tested against and recorded
+   in ``sbx/VERSION`` only once the installed executable reports it;
 5. ``config/sbxloop.toml`` from the packaged template and
    ``config/secrets.env`` (0600) from the packaged example — never
    overwritten unless asked;
@@ -47,6 +49,7 @@ import sbxloop
 from sbxloop.errors import SbxloopError
 from sbxloop.log import get_logger
 from sbxloop.paths import SbxloopHome
+from sbxloop.sbx.parse import parse_version
 
 log = get_logger(__name__)
 
@@ -115,11 +118,193 @@ def template(name: str) -> str:
     return resources.files("sbxloop.data").joinpath("home", name).read_text(encoding="utf-8")
 
 
-def render_unit(name: str, home: SbxloopHome, *, runner_dir: Path | None = None) -> str:
-    text = template(name).replace("@HOME@", str(home.root))
-    if runner_dir is not None:
-        text = text.replace("@RUNNER@", str(runner_dir))
+#: Directives systemd reads verbatim to the end of the line: no word
+#: splitting, no unescaping, only specifier expansion. A space inside one of
+#: these needs nothing; a literal ``%`` has to be doubled. Quoting them is
+#: what breaks them — systemd keeps the quotes as part of the path.
+_PATH_DIRECTIVES = frozenset({"WorkingDirectory", "RootDirectory"})
+
+#: Directives systemd splits into words the way a shell line is split —
+#: quotes group, backslash escapes, specifiers expand — but with no ``$``
+#: expansion, so an assignment holding a space has to be one quoted word.
+_ENV_DIRECTIVES = frozenset({"Environment"})
+
+#: Command lines: split into words like the above, and every word after the
+#: executable is also subject to ``$`` expansion.
+_EXEC_DIRECTIVES = frozenset(
+    {
+        "ExecCondition",
+        "ExecReload",
+        "ExecStart",
+        "ExecStartPost",
+        "ExecStartPre",
+        "ExecStop",
+        "ExecStopPost",
+    }
+)
+
+#: What no unit line can carry at all: the line ends at the first newline,
+#: and systemd rejects the rest as unprintable.
+_UNRENDERABLE = frozenset(chr(c) for c in range(0x20) if c != 0x09) | {"\x7f"}
+
+#: What systemd refuses in the *executable* of a command line, quoted or not
+#: ("Executable name contains special characters"): quotes, a backslash, and
+#: any control character — a tab included, though a plain space is fine.
+#: Arguments may hold all of these; the program to run may not.
+_EXEC_PATH_FORBIDDEN = frozenset("\"'\\\t")
+
+
+def _fill(text: str, values: Mapping[str, str]) -> str:
+    for placeholder, raw in values.items():
+        text = text.replace(placeholder, raw)
     return text
+
+
+def _check_renderable(raw: str, *, directive: str, placeholder: str) -> None:
+    bad = sorted(set(raw) & _UNRENDERABLE)
+    if bad:
+        chars = ", ".join(repr(c) for c in bad)
+        raise InitError(
+            f"{directive}=: {placeholder} is {raw!r}, which holds {chars}; a systemd "
+            "unit line ends at the first newline and carries no control characters. "
+            "Use a directory whose name has none."
+        )
+
+
+def _needs_quotes(word: str) -> bool:
+    return any(ch.isspace() or ch in "'\"" for ch in word)
+
+
+def _escape_word(raw: str, *, expand_dollar: bool) -> str:
+    escaped = raw.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
+    return escaped.replace("$", "$$") if expand_dollar else escaped
+
+
+def _render_word(
+    word: str,
+    values: Mapping[str, str],
+    *,
+    directive: str,
+    executable: bool,
+    expand_dollar: bool,
+) -> str:
+    """One word of a split directive, with the host's paths escaped into it.
+
+    ``parsed`` is what systemd will read back out; ``rendered`` is what goes
+    on the line. Only the substituted paths are escaped — whatever the
+    template says around them (a ``%`` specifier, say) is left alone.
+    """
+    parsed = rendered = word
+    filled = False
+    for placeholder, raw in values.items():
+        if placeholder not in word:
+            continue
+        _check_renderable(raw, directive=directive, placeholder=placeholder)
+        if executable:
+            if not word.startswith(placeholder):
+                # `ExecStart=-@HOME@/bin/x` and friends: the prefix would end
+                # up inside the quotes. No template does this today.
+                raise InitError(
+                    f"{directive}=: {placeholder} has to open the executable word, "
+                    f"not sit inside {word!r}"
+                )
+            bad = sorted(set(raw) & _EXEC_PATH_FORBIDDEN)
+            if bad:
+                chars = ", ".join(repr(c) for c in bad)
+                raise InitError(
+                    f"{directive}=: {placeholder} is {raw!r}, and systemd refuses "
+                    f"{chars} in the executable of a command line however it is "
+                    "quoted. Use a directory whose name has none."
+                )
+        parsed = parsed.replace(placeholder, raw)
+        rendered = rendered.replace(placeholder, _escape_word(raw, expand_dollar=expand_dollar))
+        filled = True
+    if filled and _needs_quotes(parsed):
+        return f'"{rendered}"'
+    return rendered
+
+
+def _render_path_value(value: str, values: Mapping[str, str], *, directive: str) -> str:
+    parsed = rendered = value
+    for placeholder, raw in values.items():
+        if placeholder not in value:
+            continue
+        _check_renderable(raw, directive=directive, placeholder=placeholder)
+        parsed = parsed.replace(placeholder, raw)
+        rendered = rendered.replace(placeholder, raw.replace("%", "%%"))
+    if parsed != parsed.strip():
+        raise InitError(
+            f"{directive}=: systemd strips the whitespace around a verbatim path "
+            f"value, so {parsed!r} cannot be written into a unit. Use a directory "
+            "whose name neither opens nor ends with a space."
+        )
+    if parsed.endswith("\\"):
+        raise InitError(
+            f"{directive}=: a unit line ending in a backslash runs on into the next "
+            f"one, so {parsed!r} cannot be written into a unit. Use a directory whose "
+            "name does not end in a backslash."
+        )
+    return rendered
+
+
+def _render_unit_line(line: str, values: Mapping[str, str]) -> str:
+    if not any(placeholder in line for placeholder in values):
+        return line
+    if line.lstrip().startswith(("#", ";")):
+        return _fill(line, values)  # a comment is never parsed
+    directive, sep, value = line.partition("=")
+    key = directive.strip()
+    if not sep:
+        raise InitError(f"unit line {line!r} carries a host path but is not a directive")
+    if key in _PATH_DIRECTIVES:
+        return directive + sep + _render_path_value(value, values, directive=key)
+    if key in _ENV_DIRECTIVES or key in _EXEC_DIRECTIVES:
+        is_exec = key in _EXEC_DIRECTIVES
+        return (
+            directive
+            + sep
+            + " ".join(
+                _render_word(
+                    word,
+                    values,
+                    directive=key,
+                    executable=is_exec and index == 0,
+                    expand_dollar=is_exec and index > 0,
+                )
+                for index, word in enumerate(value.split())
+            )
+        )
+    raise InitError(
+        f"{key}=: sbxloop knows no systemd quoting rule for this directive, so a host "
+        "path cannot be put in it safely; add one to homeinit before the template does"
+    )
+
+
+def render_unit(name: str, home: SbxloopHome, *, runner_dir: Path | None = None) -> str:
+    """The packaged unit with this host's paths in it, spelled per directive.
+
+    A home is whatever directory the operator chose, so it may hold spaces,
+    quotes, dollars or percent signs — and every systemd directive spells
+    those differently. ``ExecStart=`` is split into words like a shell line,
+    ``Environment=`` the same but without ``$`` expansion, while
+    ``WorkingDirectory=`` is read whole to the end of the line and is broken,
+    not helped, by quotes. What systemd cannot represent at all (a control
+    character, a quote in an executable path) stops ``init`` here, naming the
+    path, rather than at the first start that cannot find its binary.
+    """
+    values = {"@HOME@": str(home.root)}
+    if runner_dir is not None:
+        values["@RUNNER@"] = str(runner_dir)
+    return "\n".join(_render_unit_line(line, values) for line in template(name).split("\n"))
+
+
+def _apparmor_only_failure(detail: str) -> bool:
+    """Whether an installer failure is the one outcome an unprivileged run is
+    expected to hit: the AppArmor profile it drops into ``/etc`` is root's to
+    write, and it is the installer's last step. The detail has to say so —
+    a failure that named nothing, or named anything else, is not this one."""
+    lowered = detail.lower()
+    return "apparmor" in lowered
 
 
 def sbx_asset_name_matches(name: str, *, system: str, machine: str) -> bool:
@@ -269,14 +454,14 @@ class HomeInit:
                 "pass --version X.Y.Z to say which release to install, or --wheels DIR"
             )
         uv = self._ensure_uv()
-        self.run([str(uv), "python", "install", PYTHON_SERIES])
+        self._uv_run([str(uv), "python", "install", PYTHON_SERIES])
         if not self.home.venv_python.exists():
-            self.run([str(uv), "venv", "--python", PYTHON_SERIES, str(self.home.venv)])
+            self._uv_run([str(uv), "venv", "--python", PYTHON_SERIES, str(self.home.venv)])
         spec = [f"sbxloop[{INSTALL_EXTRAS}]=={self.version}", f"sbxloop-worker=={self.version}"]
         argv = [str(uv), "pip", "install", "--python", str(self.home.venv_python)]
         if self.options.wheels is not None:
             argv += ["--find-links", str(self.options.wheels)]
-        self.run([*argv, *spec])
+        self._uv_run([*argv, *spec])
         self.report.done.append(f"venv (sbxloop {self.version})")
 
     def _uv_env(self) -> dict[str, str]:
@@ -287,6 +472,16 @@ class HomeInit:
             "UV_CACHE_DIR": str(self.home.cache / "uv"),
             "UV_PYTHON_INSTALL_DIR": str(self.home.python),
         }
+
+    def _uv_run(self, argv: Sequence[str]) -> subprocess.CompletedProcess[str]:
+        """Every uv command that builds the home — the installer that puts uv
+        in ``bin/``, and each command that installer's uv then runs — under the
+        home's own directories. uv reads ``UV_PYTHON_INSTALL_DIR`` and
+        ``UV_CACHE_DIR`` from the environment and otherwise falls back to the
+        invoking user's, which would leave the managed interpreter and its
+        cache somewhere the home's launcher never looks: whatever the operator
+        inherited, the home being built is the one that wins."""
+        return self._run_env(argv, self._uv_env())
 
     def _ensure_uv(self) -> Path:
         """``bin/uv``: the home's own, downloaded with Astral's installer into
@@ -304,19 +499,21 @@ class HomeInit:
         with tempfile.TemporaryDirectory(dir=self.home.tmp) as scratch:
             script = Path(scratch) / "uv-install.sh"
             self.fetch(UV_INSTALLER_URL, script)
-            self._run_env(["sh", str(script)], self._uv_env())
+            self._uv_run(["sh", str(script)])
         if not uv.exists():
             raise InitError(f"the uv installer did not leave {uv} behind")
         return uv
 
-    def _run_env(self, argv: Sequence[str], env: Mapping[str, str]) -> None:
+    def _run_env(
+        self, argv: Sequence[str], env: Mapping[str, str]
+    ) -> subprocess.CompletedProcess[str]:
         """Run with an explicit environment through the same seam as ``run``:
         the values ride on the process environment for the call's duration
         so a fake runner sees the same argv a real one would."""
         saved = {k: os.environ.get(k) for k in env}
         os.environ.update(env)
         try:
-            self.run(argv)
+            return self.run(argv)
         finally:
             for key, value in saved.items():
                 if value is None:
@@ -359,19 +556,76 @@ class HomeInit:
                 "PREFIX": str(self.home.sbx_prefix),
                 "PATH": "/usr/sbin:/sbin:" + self.env.get("PATH", "/usr/bin:/bin"),
             }
+            partial: str | None = None
             try:
                 self._run_env([str(installer)], env)
             except subprocess.CalledProcessError as exc:
-                if not self.home.sbx_binary.exists():
+                detail = (exc.stderr or exc.stdout or "").strip() or "no output"
+                if not _apparmor_only_failure(detail):
+                    # Anything else is a failed install, whatever is lying
+                    # around under the prefix: an executable left by an
+                    # earlier release is not proof this one landed.
+                    self._forget_sbx(wanted)
                     raise InitError(
-                        f"sbx install failed (exit {exc.returncode}): {exc.stderr or exc.stdout}"
+                        f"sbx install failed (exit {exc.returncode}): {detail}"
                     ) from exc
-                self.report.notes.append(
-                    "sbx installed; its AppArmor profile was not (needs root): "
-                    f"sudo PREFIX={self.home.sbx_prefix} {installer.name} from the release tarball"
+                partial = (
+                    "sbx binaries installed; its AppArmor profile was not (that step needs "
+                    f"root), so the sandbox backend cannot start yet: sudo PREFIX="
+                    f"{self.home.sbx_prefix} {installer.name} from the release tarball"
                 )
+            self._verify_sbx(wanted, env)
         self.home.sbx_version_file.write_text(wanted + "\n")
-        self.report.done.append(f"sbx {wanted}")
+        if partial is None:
+            self.report.done.append(f"sbx {wanted}")
+        else:
+            self.report.notes.append(partial)
+            self.report.done.append(f"sbx {wanted} (AppArmor profile pending)")
+
+    def _verify_sbx(self, wanted: str, env: Mapping[str, str]) -> None:
+        """What the prefix must hold before ``sbx/VERSION`` may claim *wanted*:
+        an executable, and that executable reporting the version asked for.
+        Anything this cannot establish — a missing component, an executable
+        that will not answer, output with no version in it — is a failed
+        install, never a marker."""
+        problem = self._sbx_problem(wanted, env)
+        if problem is None:
+            return
+        self._forget_sbx(wanted)
+        raise InitError(problem)
+
+    def _sbx_problem(self, wanted: str, env: Mapping[str, str]) -> str | None:
+        binary = self.home.sbx_binary
+        if not binary.is_file() or not os.access(binary, os.X_OK):
+            return f"sbx {wanted} install left no executable at {binary}"
+        try:
+            result = self._run_env([str(binary), "version"], env)
+        except (subprocess.CalledProcessError, OSError) as exc:
+            return f"sbx {wanted} install left {binary}, but `sbx version` failed: {exc}"
+        output = f"{result.stdout or ''}\n{result.stderr or ''}".strip()
+        reported = parse_version(output)
+        if reported is None:
+            return (
+                f"sbx {wanted} install left {binary}, but `sbx version` reported no version: "
+                f"{output or 'no output'}"
+            )
+        if reported != wanted.lstrip("v"):
+            return (
+                f"sbx {wanted} install left {binary} reporting {reported}: the install did not "
+                "replace the executable"
+            )
+        return None
+
+    def _forget_sbx(self, wanted: str) -> None:
+        """Drop ``sbx/VERSION`` after a failed install: whatever is under the
+        prefix now, no later init may skip the repair as done."""
+        stale = self._installed_sbx_version()
+        self.home.sbx_version_file.unlink(missing_ok=True)
+        if stale is not None and stale != wanted:
+            self.report.notes.append(
+                f"the failed sbx {wanted} install cleared the marker for sbx {stale}; "
+                "the next init reinstalls"
+            )
 
     @staticmethod
     def _find_installer(unpacked: Path) -> Path:
