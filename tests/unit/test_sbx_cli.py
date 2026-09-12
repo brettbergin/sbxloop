@@ -64,6 +64,38 @@ class TestLifecycle:
         with pytest.raises(SbxNotFoundError):
             cli.rm("ghost")
 
+    def test_rm_waits_for_a_teardown_still_in_flight(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """`sbx rm` returns when the backend accepts the teardown, not when it
+        has finished: a caller about to re-create the name must not see the
+        removal as done while sbx still lists it (#952)."""
+        monkeypatch.setattr("sbxloop.sbx.cli.RM_SETTLE_POLL_S", 0.01)
+        cli.create(spec("boxa", tmp_path))
+        fake_sbx.linger_removals(3)
+        cli.rm("boxa")
+        assert cli.ls() == []
+
+    def test_rm_fails_closed_when_the_teardown_never_lands(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A name sbx never stops listing is "could not tell", not success:
+        the caller must not create over it."""
+        monkeypatch.setattr("sbxloop.sbx.cli.RM_SETTLE_POLL_S", 0.01)
+        cli.create(spec("boxa", tmp_path))
+        fake_sbx.linger_removals(10_000)
+        cli.rm("boxa", settle=False)
+        with pytest.raises(SbxError, match="still lists it"):
+            cli.wait_gone("boxa", timeout=0.05)
+
+    def test_rm_can_skip_the_settle_wait(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        cli.create(spec("boxa", tmp_path))
+        fake_sbx.linger_removals(10_000)
+        cli.rm("boxa", settle=False)
+        assert [info.name for info in cli.ls()] == ["boxa"]
+
     def test_version(self, cli: SbxCLI) -> None:
         assert cli.version() == "0.38.0"
 

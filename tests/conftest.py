@@ -79,6 +79,12 @@ class FakeSbx:
     def meta(self, name: str) -> dict[str, Any]:
         return json.loads((self.state / "sandboxes" / name / "meta.json").read_text())
 
+    def linger_removals(self, calls: int) -> None:
+        """Make ``rm`` return before the teardown finishes: the sandbox keeps
+        being listed (and its name keeps being taken) for ``calls`` more
+        ``ls`` invocations, the way a real backend reaps asynchronously."""
+        (self.state / "rm_linger").write_text(str(calls))
+
     def policies(self) -> list[list[str]]:
         """Recorded policy mutations, one entry per rule.
 
