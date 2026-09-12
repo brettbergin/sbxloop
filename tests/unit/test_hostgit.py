@@ -325,6 +325,19 @@ class TestChangesSince:
         (change,) = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF))
         assert (change.path, change.mode) == ("link", "120000")
 
+    def test_a_path_git_cannot_decode_is_still_a_change(self, tmp_path: Path) -> None:
+        """The record's path comes from the raw bytes: a non-UTF-8 name must
+        not be replaced on the way through a str, or the file on disk is
+        never found and the change is reported as a deletion."""
+        _, clone = make_clone(tmp_path)
+        raw = b"caf\xe9.txt"
+        (clone / os.fsdecode(raw)).write_text("x\n")
+        git("add", "-A", cwd=clone)
+        git("commit", "-q", "-m", "undecodable", cwd=clone)
+        (change,) = hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF))
+        assert os.fsencode(change.path) == raw
+        assert (change.status, change.mode) == ("added", "100644")
+
     def test_unchanged_clone_is_empty(self, tmp_path: Path) -> None:
         _, clone = make_clone(tmp_path)
         assert hostgit.changes_since(clone, rev(clone, hostgit.CLONE_BASE_REF)) == []
@@ -1178,6 +1191,19 @@ class TestIsTracked:
         monkeypatch.setattr(hostgit, "find_git", lambda: None)
         assert hostgit.is_tracked(root, root / "hello.txt") is None
 
+    def test_a_tracked_name_git_cannot_decode_is_still_answered(self, tmp_path: Path) -> None:
+        """One undecodable filename must not turn every answer for the
+        repository into "could not tell"."""
+        root = make_repo(tmp_path)
+        raw = b"caf\xe9.toml"
+        (root / os.fsdecode(raw)).write_text("x = 1\n")
+        git("add", "-A", cwd=root)
+        git("commit", "-q", "-m", "undecodable", cwd=root)
+        assert hostgit.is_tracked(root, root / os.fsdecode(raw)) is True
+        assert hostgit.is_tracked(root, root / "hello.txt") is True
+        (root / "local.toml").write_text("x = 1\n")
+        assert hostgit.is_tracked(root, root / "local.toml") is False
+
     def test_checkout_config_cannot_run_an_fsmonitor_hook(self, tmp_path: Path) -> None:
         """The agent can write the checkout's .git/config; a core.fsmonitor
         hook there must not execute on the host during the probe."""
@@ -1246,6 +1272,20 @@ class TestSubmodules:
             f"{remote.url}/lib.git",
         )
         assert hostgit.list_submodules(make_repo(tmp_path, "plain")) == []
+
+    def test_a_sibling_name_git_cannot_decode_does_not_break_populating(
+        self, tmp_path: Path, remote: PrivateGitServer
+    ) -> None:
+        app, _, _ = make_submodule_setup(tmp_path, remote.url)
+        (app / os.fsdecode(b"caf\xe9.txt")).write_text("x\n")
+        git("add", "-A", cwd=app)
+        git("commit", "-q", "-m", "undecodable sibling", cwd=app)
+        clone = tmp_path / "run"
+        hostgit.clone_for_run(app, clone, "sbxloop/r1")
+        assert hostgit.populate_submodules(clone, source=app, token=None) == [
+            ("vendor/lib", "local")
+        ]
+        assert hostgit.is_dirty(clone) is False
 
     def test_awkward_names_and_values_survive_the_parse(self, tmp_path: Path) -> None:
         """Whitespace, dots and `=` in names and values, read from the file
