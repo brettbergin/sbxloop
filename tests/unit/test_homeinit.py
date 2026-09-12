@@ -335,6 +335,9 @@ class TestTemplates:
             "sbxloop-daemon.service", home
         )
         assert "WorkingDirectory=" + str(home.root) in render_unit("sbxloop-daemon.service", home)
+        # #953: a clean stop or restart exits 143 (SIGTERM) and is not a failure
+        daemon_unit = render_unit("sbxloop-daemon.service", home)
+        assert "SuccessExitStatus=143" in daemon_unit and "Restart=always" in daemon_unit
 
     def test_launchers_bind_to_their_own_home(self) -> None:
         for name in ("sbxloop.launcher.sh", "sbx.launcher.sh"):

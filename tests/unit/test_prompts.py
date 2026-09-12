@@ -356,6 +356,15 @@ def test_concierge_prompt_carries_contract() -> None:
     assert "thread" in text and "not here" in text
     assert "Never claim to have done something you did not do" in text
     assert "!sbx" in text  # the configured prefix reaches the model
+    # configuration is read through the tool, never recalled
+    assert "**Configuration questions go to `config_keys`, never to memory**" in text
+    assert "name the layer that set it" in text and "**never from chat**" in text
+    assert "The tool reads; it changes nothing." in text
+    # #969: the restart is an operator verb it may run; it never reaches for stop
+    assert "`restart [--now]` is the operator's restart" in text
+    assert (
+        "restart begins once your reply is posted" in text and "never reach for\n  `stop`" in text
+    )
     # intake is one hop: the issue is filed with the trigger label and runs
     assert "`sbxloop:run`" in text
     assert "`create_issue`, **one call, no confirmation**" in text
@@ -367,7 +376,19 @@ def test_concierge_prompt_carries_contract() -> None:
     # triage's other half: a reply is direct, a close never is
     assert "`comment_on_issue`" in text and "`close_issue`" in text
     assert "pass **their own words** as `confirmation`" in text
-    assert "The one exception is\n  `close_issue`" in text
+    assert "The two exceptions are\n  `close_issue`" in text and "and\n  `set_config`" in text
+    # a configuration change: the card first, the four choices, one call, never on silence
+    assert "**A request to change a setting**" in text
+    for label in (
+        "**Set and restart now**",
+        "**Set and restart after the current\n  run**",
+        "**Set only**",
+        "**Cancel**",
+    ):
+        assert label in text, label
+    assert "First `config_keys` on that key, always" in text
+    assert "ONE `set_config` call\n  quoting their words as `confirmation`" in text
+    assert "`sbx-pending` to a `close_issue` or `set_config` confirmation" in text
     # the configured repositories reach the model, with their per-repo facts
     assert "owner/repo — enabled, base main" in text and "`list_repos`" in text
     # drift: the concierge reports versions, a human does the upgrading

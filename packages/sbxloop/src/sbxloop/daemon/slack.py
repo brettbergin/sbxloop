@@ -283,6 +283,7 @@ class SlackBridge(ChatBridge):
             channel=SlackTarget(channel, thread_ts if in_thread else None),
             raw=SlackMessage(channel, ts, thread_ts if in_thread else None),
             reply_to_id=thread_ts if in_thread else None,
+            parent_channel_id=channel if in_thread else None,
         )
 
     async def _control_channel(self) -> Any:

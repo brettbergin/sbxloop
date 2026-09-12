@@ -48,12 +48,20 @@ from pydantic import (
 
 from sbxloop.backends import ANTHROPIC_TOKEN_ENV, COPILOT_TOKEN_ENV, OPENAI_TOKEN_ENV
 from sbxloop.chatservices import CHAT_SERVICES, service_named
+from sbxloop.endpoint import parse_endpoint
 from sbxloop.errors import ConfigError
 from sbxloop.ids import DEFAULT_BRANCH_PREFIX
 from sbxloop.log import LogFormat, LogLevel, get_logger
 from sbxloop.paths import SbxloopHome, home_root_from_env, resolve_home_root
 from sbxloop.toolchains import DEFAULT_LANGUAGES, normalize_language, supported_languages
-from sbxloop_worker.protocol import McpServerSpec, McpTransport
+from sbxloop_worker.protocol import (
+    OPENAI_BASE_URL_ENV,
+    OPENAI_KEY_NAME_ENV,
+    OPENAI_RETRIES_ENV,
+    OPENAI_TIMEOUT_ENV,
+    McpServerSpec,
+    McpTransport,
+)
 
 log = get_logger(__name__)
 
@@ -62,7 +70,19 @@ ENV_PREFIX = "SBXLOOP_"
 # SBXLOOP_-prefixed variables consumed by the *worker process* rather than
 # host configuration; the env config layer must not treat them as settings.
 # `home` is SBXLOOP_HOME, read by sbxloop.paths, never a layered key.
-RESERVED_ENV_KEYS = frozenset({"worker_backend", "echo_script", "home"})
+RESERVED_ENV_KEYS = frozenset(
+    {
+        "worker_backend",
+        "echo_script",
+        "home",
+        # The openai backend's endpoint settings, delivered to the agent
+        # sandbox's worker as plain env (`sbx.provision`), never a setting.
+        *(
+            name[len(ENV_PREFIX) :].lower()
+            for name in (OPENAI_KEY_NAME_ENV, OPENAI_TIMEOUT_ENV, OPENAI_RETRIES_ENV)
+        ),
+    }
+)
 
 # Environment the loop delivers to a sandbox itself (#679): the credentials
 # it mints and the worker's own selectors. Operator `[sandbox] env` and a
@@ -77,6 +97,9 @@ LOOP_MANAGED_ENV = frozenset(
         COPILOT_TOKEN_ENV,
         ANTHROPIC_TOKEN_ENV,
         OPENAI_TOKEN_ENV,
+        # Where the openai backend's model calls go: `[agent.openai]
+        # base_url`, delivered by provisioning, never an operator env.
+        OPENAI_BASE_URL_ENV,
     }
 )
 _ENV_NAME_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
@@ -180,6 +203,97 @@ class AgentModels(_ConfigModel):
         if value is not None and not value.strip():
             raise ValueError("a model override must not be blank; omit it to inherit")
         return value
+
+
+def _check_base_url(value: str | None, key: str) -> str | None:
+    """Parse an endpoint URL at load, keeping the normalised form; the
+    reason it will not do is prefixed with the key that carries it."""
+    if value is None:
+        return None
+    try:
+        return parse_endpoint(value).url
+    except ValueError as exc:
+        raise ValueError(f"{key}: {exc}") from None
+
+
+def _check_api_key_env(value: str, key: str) -> str:
+    if not _ENV_NAME_RE.match(value):
+        raise ValueError(f"{key}: {value!r} is not an environment variable name")
+    if value.startswith(ENV_PREFIX):
+        raise ValueError(f"{key}: {value} is reserved for sbxloop's own settings")
+    return value
+
+
+class OpenAIBackendConfig(_ConfigModel):
+    """`[agent.openai]`: the endpoint the ``openai`` backend runs against.
+
+    ``base_url`` is the OpenAI-compatible root including its version path
+    (``http://vllm.internal:8000/v1``) — required when ``[agent] backend =
+    "openai"`` and parsed at config load, not at run start, so an absent or
+    unparseable URL fails the daemon's config read with a named reason. A
+    single-label hostname, an IPv4 or IPv6 literal and an explicit port are
+    all accepted here, for this operator-configured endpoint only: the
+    rule for what a *plan* may declare is unchanged.
+
+    ``api_key_env`` is the env var **name** holding the credential, never
+    the key; it is registered with sbx bound to the endpoint's host, so an
+    endpoint wanting no credential still needs a value (a placeholder) in
+    that variable. ``request_timeout_s`` and ``max_retries`` reach the SDK
+    client, defaulted for a local box that may generate slowly rather than
+    for a hosted API. ``allow_insecure_endpoint`` must be set for an
+    ``http://`` URL: a credential bound to it goes on the wire in cleartext,
+    which is never something a config does by accident.
+    """
+
+    base_url: str | None = None
+    api_key_env: str = OPENAI_TOKEN_ENV
+    request_timeout_s: float = Field(default=600.0, gt=0)
+    max_retries: int = Field(default=2, ge=0)
+    allow_insecure_endpoint: bool = False
+
+    @field_validator("base_url")
+    @classmethod
+    def _check_url(cls, value: str | None) -> str | None:
+        return _check_base_url(value, "agent.openai.base_url")
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _check_env(cls, value: str) -> str:
+        return _check_api_key_env(value, "agent.openai.api_key_env")
+
+    def check_transport(self, where: str) -> None:
+        """The cleartext rule, on the effective settings (a repository's
+        override may set either side)."""
+        if self.base_url is None:
+            return
+        if parse_endpoint(self.base_url).insecure and not self.allow_insecure_endpoint:
+            raise ValueError(
+                f"{where} base_url {self.base_url!r} is plain http:// — the credential "
+                f"{self.api_key_env} would travel in cleartext; set "
+                "allow_insecure_endpoint = true to do that on purpose, or use https://"
+            )
+
+
+class OpenAIEndpointOverride(_ConfigModel):
+    """`[github.repos.openai]`: sparse overrides of `[agent.openai]` for one
+    repository, so code that must stay on a private endpoint can pin it
+    while the rest keep the default. Omit a key to inherit. The endpoint
+    only: the credential (`api_key_env`) is one per host, since the run's
+    secret delivery is keyed by that one name."""
+
+    base_url: str | None = None
+    request_timeout_s: float | None = Field(default=None, gt=0)
+    max_retries: int | None = Field(default=None, ge=0)
+    allow_insecure_endpoint: bool | None = None
+
+    @field_validator("base_url")
+    @classmethod
+    def _check_url(cls, value: str | None) -> str | None:
+        return _check_base_url(value, "github.repos[].openai.base_url")
+
+    def over(self, base: OpenAIBackendConfig) -> OpenAIBackendConfig:
+        """``base`` with every key set here written over it."""
+        return base.model_copy(update=self.model_dump(exclude_none=True))
 
 
 class SandboxConfig(_ConfigModel):
@@ -764,6 +878,9 @@ class RepoConfig(_ConfigModel):
 
     repo: str
     agent_models: AgentModels = Field(default_factory=AgentModels)
+    # Sparse `[agent.openai]` overrides for this repository; `Config.openai_for`
+    # resolves the effective endpoint.
+    openai: OpenAIEndpointOverride = Field(default_factory=OpenAIEndpointOverride)
     # The host checkout of *this* repository that runs clone and refresh.
     # None falls back to the legacy ``[sandbox] workspace``, but only when
     # that checkout demonstrably belongs to this repo (see
@@ -1589,6 +1706,12 @@ class DaemonConfig(_ConfigModel):
     # only at task-phase boundaries and interrupted runs are resumable, so
     # this is a courtesy wait, not a correctness requirement.
     shutdown_grace_s: float = 60.0
+    # An operator's `restart` (#969) exits and relies on a service manager to
+    # start the daemon again. Under systemd the daemon can tell; under any
+    # other supervisor (launchd, a container runtime, a process manager)
+    # this says one is there. False and no systemd: `restart` is refused by
+    # name, because the daemon would exit into nothing.
+    supervised: bool = False
     # Retention for runs/<run_id>/ on disk (workspace clone + harvested
     # artifacts). Swept on daemon start and daily; 0 disables. The SQLite
     # rows are never removed. See sbxloop.gc for what is exempt.
@@ -1915,6 +2038,18 @@ class ChatConfig(_ConfigModel):
     backend: ChatBackend | None = None
 
 
+#: What `[concierge] config_locked` says when the operator says nothing:
+#: egress, tool grants and every credential *name* (values never live here).
+DEFAULT_CONFIG_LOCKED: tuple[str, ...] = (
+    "policy",
+    "mcp",
+    "credentials",
+    "registries",
+    "github.repos.token_env",
+    "telemetry.dsn_env",
+)
+
+
 class ConciergeConfig(_ConfigModel):
     """The control channel's agent: an LLM session that answers @mentions
     in the chat control channel, operates the daemon (every ``!sbx``
@@ -1953,6 +2088,18 @@ class ConciergeConfig(_ConfigModel):
     # its stated assumption — no goal is ever silently dropped. Also the
     # clickable-choice TTL, so buttons and the auto-file expire in step.
     clarify_ttl_s: float = Field(default=900.0, ge=60, le=86400)
+    # The configuration tools (#971): `config_keys` reads any key of the
+    # operator's config/sbxloop.toml as it is on disk; `set_config` changes
+    # one on the person's explicit yes and restarts the daemon to apply it.
+    # False removes both from the roster. The chat sections, this gate and
+    # the lock list below are never changed from chat whatever this says.
+    edit_config: bool = True
+    # Dotted prefixes chat may read but not change — egress, tool grants and
+    # credential names by default, because widening those from a chat
+    # mention is a different weight of act than raising a cap. A prefix
+    # covers everything under it; `*` matches one segment; indices are not
+    # segments. Remove one here, on the host, to allow it from chat.
+    config_locked: list[str] = Field(default_factory=lambda: list(DEFAULT_CONFIG_LOCKED))
 
 
 class EntrygraphConfig(_ConfigModel):
@@ -2106,15 +2253,19 @@ class AgentConfig(_ConfigModel):
     ``ANTHROPIC_API_KEY`` on the host; provisioning installs Node and the
     Claude Code CLI into the agent sandbox and allows ``api.anthropic.com``
     egress. ``codex`` runs the Codex Python SDK and its bundled runtime with
-    ``OPENAI_API_KEY``, reaching ``api.openai.com``. The credential is
-    injected into the agent sandbox alone, and the top-level ``model`` key
-    names the model the chosen backend runs (``"auto"`` lets the backend
-    pick its default).
+    ``OPENAI_API_KEY``, reaching ``api.openai.com``. ``openai`` runs the
+    ``openai`` Python client against the endpoint ``[agent.openai]`` names
+    — a self-hosted server or gateway speaking the OpenAI wire shape, or
+    the hosted API — with the credential ``api_key_env`` names, bound to
+    that endpoint's host. The credential is injected into the agent
+    sandbox alone, and the top-level ``model`` key names the model the
+    chosen backend runs (``"auto"`` lets the backend pick its default).
     An unknown value fails config loading with the accepted choices named.
     """
 
-    backend: Literal["copilot", "claude", "codex"] = "copilot"
+    backend: Literal["copilot", "claude", "codex", "openai"] = "copilot"
     models: AgentModels = Field(default_factory=AgentModels)
+    openai: OpenAIBackendConfig = Field(default_factory=OpenAIBackendConfig)
 
 
 # Where a workload's result may go when the run publishes (#759 delivers
@@ -2622,6 +2773,61 @@ class Config(_ConfigModel):
         if entry is not None and entry.env is not None:
             return dict(entry.env)
         return dict(self.sandbox.env)
+
+    def openai_for(self, repo: str | None = None) -> OpenAIBackendConfig:
+        """The effective `[agent.openai]` settings for ``repo``: the
+        entry's `[github.repos.openai]` overrides over the global block."""
+        entry = self.github.effective_repo(repo)
+        if entry is None:
+            return self.agent.openai
+        return entry.openai.over(self.agent.openai)
+
+    @model_validator(mode="after")
+    def _check_openai_endpoint(self) -> Config:
+        """Everything about the openai backend's endpoint that needs the
+        whole config, failing at load rather than at the first model call:
+        an endpoint is required under ``backend = "openai"`` (globally — a
+        repository override alone leaves every other run without one), a
+        cleartext endpoint needs saying so, and the credential's env var
+        may not also be an operator-configured one, or the run's credential
+        would be clobbered or clobber silently.
+        """
+        selected = self.agent.backend == "openai"
+        settings: list[tuple[str, OpenAIBackendConfig]] = [("[agent.openai]", self.agent.openai)]
+        settings += [
+            (f"[github.repos.openai] ({entry.repo})", self.openai_for(entry.repo))
+            for entry in self.github.repos
+        ]
+        if selected and self.agent.openai.base_url is None:
+            raise ValueError(
+                '[agent.openai] base_url is required when [agent] backend = "openai": '
+                "the OpenAI-compatible root the agent's model calls go to, e.g. "
+                '"http://vllm.internal:8000/v1"'
+            )
+        if not selected:
+            # An inert block: its shape was checked field by field, and the
+            # cleartext rule is about a credential actually bound to it.
+            return self
+        for where, effective in settings:
+            effective.check_transport(where)
+        api_key_env = self.agent.openai.api_key_env
+        taken = {
+            **dict.fromkeys(self.sandbox.env, "[sandbox] env"),
+            **{
+                name: f"[github.repos] env ({entry.repo})"
+                for entry in self.github.repos
+                for name in (entry.env or {})
+            },
+            **{reg.auth_env: "[[registries]] auth_env" for reg in self.registries if reg.auth_env},
+            **{cred.env: "[[credentials]] env" for cred in self.credentials},
+        }
+        if api_key_env in taken:
+            raise ValueError(
+                f"[agent.openai] api_key_env {api_key_env} is also named by "
+                f"{taken[api_key_env]}; the agent's credential is delivered by sbxloop "
+                "itself and cannot be configured elsewhere"
+            )
+        return self
 
     @field_validator("registries")
     @classmethod

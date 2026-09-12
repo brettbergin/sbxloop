@@ -33,9 +33,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
@@ -44,12 +45,16 @@ from urllib.parse import quote
 from sbxloop.agentmodels import ModelSelection, model_for_phase, refreshed_models
 from sbxloop.cli.tui import format_event
 from sbxloop.config import SINK_NAMES, BridgeBackend, Config, ScheduleConfig
+from sbxloop.configedit import ConfigEditError, ConfigEditor
+from sbxloop.configedit import keys as configkeys
+from sbxloop.daemon import configview
 from sbxloop.daemon.chat_choices import (
     ChoiceQuestion,
     PendingFiling,
     parse_choice_question,
     parse_pending_filing,
 )
+from sbxloop.daemon.configpolicy import refusal
 from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX, dispatch, format_log_tail, plain
 from sbxloop.daemon.loop import day_window
 from sbxloop.daemon.model import WorkItem
@@ -123,6 +128,9 @@ _FINISHED_RUN_STATES = TERMINAL_RUN_STATES
 #: process-level act stays with a human at a keyboard (ctl, chat, the
 #: console). ``cancel`` is the model's way to stop work.
 _DENIED_CONTROL_VERBS = frozenset({"stop"})
+#: `set_config`'s `restart` argument (#971): at once, after the run in
+#: flight, or not at all.
+RESTART_CHOICES: tuple[str, ...] = ("now", "after_run", "no")
 # GitHub's ``state_reason`` for a close. ``completed`` means the thing was
 # actually done; ``not_planned`` is the triage verdict — duplicate, won't fix,
 # stale. Nothing else is accepted, so the model cannot invent a reason.
@@ -141,6 +149,16 @@ CHAT_NAMES: dict[str, str] = {
 }
 
 
+def _sequence(effects: Sequence[Callable[[], None]]) -> Callable[[], None]:
+    """One callable running ``effects`` in order."""
+
+    def run() -> None:
+        for effect in effects:
+            effect()
+
+    return run
+
+
 class ConciergeReply(NamedTuple):
     text: str
     ok: bool = True
@@ -154,6 +172,10 @@ class ConciergeReply(NamedTuple):
     #: tells the concierge to proceed on the stated assumption instead of
     #: dropping the goal (ask, never block).
     pending: PendingFiling | None = None
+    #: An effect a tool promised that must follow the reply, not precede
+    #: it — a restart the daemon would otherwise begin under its own
+    #: answer (#969). The bridge runs it once the reply is posted.
+    after: Callable[[], None] | None = None
 
 
 class SessionHost(Protocol):
@@ -279,6 +301,8 @@ class Concierge:
         # an issue they ask for records them as its requester. Turns run one
         # at a time on the executor, so one slot is enough.
         self._turn_author_id: str | None = None
+        # Effects the turn's tools promised for after the reply (#969).
+        self._turn_after: list[Callable[[], None]] = []
         self._turn_message_id: str | None = None
 
         self.host = host
@@ -366,12 +390,21 @@ class Concierge:
             self._turn_author_id = author_id
             self._turn_via = via
             self._turn_message_id = message_id
+            self._turn_after = []
             try:
-                return self._run_turn(text, author=author, on_tool=on_tool)
+                reply = self._run_turn(text, author=author, on_tool=on_tool)
+            except BaseException:
+                # No reply will be posted, so nothing is waiting on one:
+                # the effects the tools promised still happen.
+                for effect in self._turn_after:
+                    effect()
+                raise
             finally:
                 self._turn_author_id = None
                 self._turn_via = None
                 self._turn_message_id = None
+            after, self._turn_after = self._turn_after, []
+            return reply._replace(after=_sequence(after)) if after else reply
 
         return self._executor.submit(run)
 
@@ -721,9 +754,14 @@ class Concierge:
                         "retry <item> | requeue <item> | merge <item|run> | "
                         "release <item|run> | grant-rounds <run> <n> | "
                         "resume-repo <owner/name> | "
-                        "schedules [pause <name>|resume <name>|remove <name>]. Pass the "
+                        "schedules [pause <name>|resume <name>|remove <name>] | "
+                        "restart [--now]. Pass the "
                         "command line without the prefix. Mutating commands take effect "
-                        "immediately. merge approves a PR parked behind the merge gate; "
+                        "immediately. restart exits the daemon once the current run "
+                        "finishes (--now cancels it first; it is resumable) and its "
+                        "service manager starts it again — it posts why when it is back; "
+                        "a daemon nothing would restart refuses, and says so. "
+                        "merge approves a PR parked behind the merge gate; "
                         "release publishes a workload result the profile held back "
                         "(both only when the person asking clearly wants it). "
                         "schedules lists the stored schedules (cadence, profile, ask, last "
@@ -968,6 +1006,77 @@ class Concierge:
                 self._tool_delete_schedule,
             ),
         ]
+        if self.config.concierge.edit_config:
+            tools += [
+                HostTool(
+                    HostToolSpec(
+                        name="config_keys",
+                        description=(
+                            "The daemon's configuration as it is resolved right now, read "
+                            "from the operator's config file with every other layer applied "
+                            "— never from memory. No arguments: the sections with how many "
+                            "keys each has and how many the operator's file sets. `prefix` "
+                            "(a section like `daemon`, or one key like "
+                            "`daemon.max_runs_per_day`): one card per key — its value, "
+                            "which layer set it, what it accepts (type, choices, bounds), "
+                            "whether a change applies live or at the daemon's next start, "
+                            "whether chat may never change it or it is locked, and what it "
+                            "is for. `grep`: keys whose name or description contains the "
+                            "text. `repo` (owner/name) addresses one configured "
+                            "repository's own settings, with `prefix` relative to it. "
+                            "Read-only: it changes nothing."
+                        ),
+                        parameters=_schema(
+                            {
+                                "prefix": {"type": "string"},
+                                "grep": {"type": "string"},
+                                "repo": {"type": "string"},
+                            }
+                        ),
+                    ),
+                    self._tool_config_keys,
+                ),
+                HostTool(
+                    HostToolSpec(
+                        name="set_config",
+                        description=(
+                            "Change one key of the operator's config file, then restart the "
+                            "daemon so it applies. `key` is a dotted path (`config_keys` "
+                            "shows it); `value` is the value as an operator writes it "
+                            "(`20`, `true`, `squash`, one list item per line); `unset: true` "
+                            "removes the key so the layer beneath answers; `repo` "
+                            "(owner/name) addresses one configured repository's own setting. "
+                            "The whole file is judged by the loader with every other layer "
+                            "applied before anything is written, and the previous file is "
+                            "kept as a backup. `restart`: `now` cancels the current run "
+                            "(resumable) and restarts at once; `after_run` (the default) "
+                            "restarts once the current run finishes; `no` writes without "
+                            "restarting. A key that applies live needs no restart and gets "
+                            "none. Only on an explicit yes: ask first — showing the key's "
+                            "card, the new value and whether a restart is needed, with "
+                            "clickable choices — and quote their words in `confirmation`. "
+                            "Never on your own initiative; never on silence. The chat "
+                            "sections, this tool's own gate and any locked prefix are "
+                            "refused by name."
+                        ),
+                        parameters=_schema(
+                            {
+                                "key": {"type": "string"},
+                                "value": {"type": "string"},
+                                "unset": {"type": "boolean"},
+                                "repo": {"type": "string"},
+                                "confirmation": {"type": "string"},
+                                "restart": {
+                                    "type": "string",
+                                    "enum": list(RESTART_CHOICES),
+                                },
+                            },
+                            ["key", "confirmation"],
+                        ),
+                    ),
+                    self._tool_set_config,
+                ),
+            ]
         if self.config.github.repo_list():
             tools.append(
                 HostTool(
@@ -1261,7 +1370,10 @@ class Concierge:
             self.loop, command, prefix=self._chat.command_prefix, by=by, via="concierge"
         )
         if reply.after is not None:
-            reply.after()
+            # Not here: the model has not composed its answer yet, and a
+            # restart begun now would close the bridge under it. The turn
+            # carries the effect out and the bridge runs it after posting.
+            self._turn_after.append(reply.after)
         text = plain(reply.text)
         if reply.status is not None:
             text += "\n" + _status_detail(reply.status)
@@ -1754,6 +1866,154 @@ class Concierge:
             f"{text} `schedules` lists it; `schedules pause {spec.name}` parks it; "
             "`delete_schedule` removes it."
         )
+
+    # -- configuration (#970) ------------------------------------------------------
+
+    def _config_editor(self) -> ConfigEditor:
+        """The operator's file as it is on disk now — not this process's copy
+        of it, which may predate an edit made on the host or the console."""
+        return ConfigEditor(self.config.paths, os.environ)
+
+    def _repo_prefix(self, args: dict[str, Any]) -> tuple[str | None, str | None]:
+        """``repo`` resolved to the editor's path for that entry
+        (``github.repos[N]``), joined with ``prefix`` when one was given."""
+        selector = str(args.get("repo") or "").strip()
+        prefix = str(args.get("prefix") or "").strip().strip(".")
+        if not selector:
+            return prefix or None, None
+        entry = self.config.github.find_repo(selector)
+        if entry is None:
+            known = ", ".join(r.repo for r in self.config.github.repo_list()) or "(none)"
+            return None, f"unknown repository {selector!r} — configured repositories: {known}"
+        index = next(
+            i
+            for i, candidate in enumerate(self.config.github.repo_list())
+            if candidate.repo.casefold() == entry.repo.casefold()
+        )
+        base = f"github.repos[{index}]"
+        return (f"{base}.{prefix}" if prefix else base), None
+
+    def _tool_config_keys(self, args: dict[str, Any], by: str) -> str:
+        prefix, error = self._repo_prefix(args)
+        if error is not None:
+            return error
+        grep = str(args.get("grep") or "").strip() or None
+        try:
+            rows = self._config_editor().resolved()
+        except (ConfigEditError, SbxloopError) as exc:
+            return f"the configuration could not be read: {_one_line(str(exc), 300)}"
+        if prefix is None and grep is None:
+            return configview.sections(rows)
+        cards = [
+            configview.card(row, refusal=self._config_refusal)
+            for row in rows
+            if configview.matches(row, prefix=prefix, grep=grep)
+        ]
+        if not cards:
+            what = f"no key under `{prefix}`" if prefix else f"no key mentions {grep!r}"
+            if prefix and grep:
+                what += f" mentions {grep!r}"
+            return f"{what} — call with no arguments for the sections"
+        return configview.bounded(cards, self.config.concierge.max_tool_result_chars)
+
+    def _config_refusal(self, dotted: str) -> str | None:
+        return refusal(dotted, self.config.concierge.config_locked)
+
+    def _tool_set_config(self, args: dict[str, Any], by: str) -> str:
+        """The one config write (#971), in the order that keeps it safe: the
+        person's yes, the policy, the loader, the file, then the restart —
+        each step refusing before the next can act. The restart rides the
+        reply out (``_turn_after``): the daemon must not begin exiting under
+        the answer that says it will."""
+        key_arg = str(args.get("key") or "").strip()
+        if not key_arg:
+            return "set_config needs `key` — `config_keys` shows the dotted path"
+        dotted, error = self._repo_prefix({**args, "prefix": key_arg})
+        if error is not None:
+            return error
+        assert dotted is not None
+        unset = bool(args.get("unset", False))
+        value = str(args.get("value") if args.get("value") is not None else "")
+        if not unset and not value.strip():
+            return f"set_config needs `value` for `{dotted}` (or `unset: true` to remove it)"
+        mode = str(args.get("restart") or "after_run").strip()
+        if mode not in RESTART_CHOICES:
+            return f"restart must be one of {', '.join(RESTART_CHOICES)}, not {mode!r}"
+        confirmation = _one_line(str(args.get("confirmation", "")), 200)
+        if not confirmation:
+            return (
+                f"set_config needs the person's own words agreeing that `{dotted}` should "
+                "change. Show them the key's card (`config_keys`), the new value and whether "
+                "a restart is needed, ask, and pass what they answered as `confirmation`."
+            )
+        why = self._config_refusal(dotted)
+        if why is not None:
+            return f"`{dotted}` is not changed from chat — {why}. Nothing was written."
+        editor = self._config_editor()
+        try:
+            change = editor.unset(dotted) if unset else editor.set(dotted, value)
+        except (ConfigEditError, SbxloopError) as exc:
+            return f"{_one_line(str(exc), 300)}. Nothing was written."
+        if not change.ok:
+            return (
+                f"the loader refused the file with `{dotted}` changed: "
+                f"{_one_line(change.verdict.error or 'unknown', 300)}. Nothing was written."
+            )
+        try:
+            backup = editor.commit(change)
+        except OSError as exc:
+            return (
+                f"could not write {editor.path}: {_one_line(str(exc), 200)}. Nothing was written."
+            )
+        shown = "unset" if unset else configkeys.display(change.new)
+        log.info(
+            "concierge.config_set",
+            key=dotted,
+            old=change.old,
+            new=change.new,
+            unset=unset,
+            by=by,
+            confirmation=confirmation,
+            backup=str(backup) if backup else None,
+        )
+        lines = [
+            f"unset `{dotted}` in {editor.path}"
+            if unset
+            else f"set `{dotted}` = {shown} in {editor.path}"
+        ]
+        if backup is not None:
+            lines.append(f"previous kept as {backup.name} beside it")
+        if change.note is not None:
+            lines.append(change.note)
+        if change.applies == "live":
+            lines.append("no restart needed: model settings refresh before the next phase or turn")
+            return "\n".join(lines)
+        if mode == "no":
+            lines.append("not restarting: the daemon reads it at its next start")
+            return "\n".join(lines)
+        from sbxloop.daemon.loop import UNSUPERVISED_REFUSAL
+
+        if self.loop.supervisor() is None:
+            lines.append(f"written, but the restart was refused: {UNSUPERVISED_REFUSAL}")
+            return "\n".join(lines)
+        reason = f"unset {dotted}" if unset else f"set {dotted} = {shown}"
+        now = mode == "now"
+        self._turn_after.append(
+            lambda: self.loop.request_restart(
+                by=by, reason=reason, now=now, key=dotted, value=change.new
+            )
+        )
+        lines.append(
+            "restarting "
+            + (
+                "now (the current run is cancelled; it is resumable)"
+                if now
+                else "after the current run"
+            )
+            + " once this reply is posted; the daemon says here whether the change is in "
+            "effect when it is back"
+        )
+        return "\n".join(lines)
 
     def _tool_delete_schedule(self, args: dict[str, Any], by: str) -> str:
         name = str(args.get("name") or "").strip()

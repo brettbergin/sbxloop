@@ -72,9 +72,32 @@ secret_strategy = "proxy"
 # egress. "codex" runs the Python Codex SDK with its pinned CLI runtime and
 # needs OPENAI_API_KEY; provisioning allows api.openai.com. Codex uses
 # worker-controlled tools so read-only review and tool-call limits apply.
+# "openai" runs the openai Python client against the endpoint [agent.openai]
+# names — a self-hosted server or gateway speaking the OpenAI wire shape, or
+# the hosted API — with worker-controlled tools like codex; provisioning
+# allows that endpoint's host and binds the credential to it.
 # The chosen credential is injected into the agent sandbox
 # alone, and the top-level `model` names the model the chosen backend runs.
 # backend = "copilot"
+
+# [agent.openai]
+# The endpoint the "openai" backend runs against. Required when
+# backend = "openai": the OpenAI-compatible root including its version path.
+# A hostname on your network, an IPv4/IPv6 literal and an explicit port are
+# all accepted here (and only here — a plan still declares egress as dotted
+# domains); a malformed or missing URL fails config loading with the reason.
+# base_url = "http://vllm.internal:8000/v1"
+# The env var NAME holding the credential, never the key. It is registered
+# with sbx bound to the endpoint's host, so an endpoint wanting no credential
+# still needs a placeholder value in that variable.
+# api_key_env = "OPENAI_API_KEY"
+# Client patience, sized for a local box that may generate slowly: how long
+# one request may take, and how many times the client retries a failed one.
+# request_timeout_s = 600
+# max_retries = 2
+# A plain http:// base_url refuses to load unless this is set: the credential
+# would travel in cleartext, which is never done by accident.
+# allow_insecure_endpoint = false
 
 # [agent.models]
 # Omit a key to inherit top-level model. Explicit "auto" asks the backend
@@ -480,6 +503,14 @@ secret_strategy = "proxy"
 # operator_plan = "auto"
 # operator_execute = "auto"
 # operator_judge = "auto"
+# [github.repos.openai]
+# Sparse per-repository overrides over [agent.openai] for a repository whose
+# code must stay on a private endpoint; omit a key to inherit. The endpoint
+# only — api_key_env is one per host.
+# base_url = "http://private-vllm:8000/v1"
+# request_timeout_s = 900
+# max_retries = 2
+# allow_insecure_endpoint = true
 # [[github.repos]]
 # repo = "you/other-repo"
 # enabled = false              # registered but not polled
@@ -642,6 +673,9 @@ secret_strategy = "proxy"
 # max_consecutive_failures = 3     # circuit breaker ...
 # breaker_cooldown_s = 3600.0      # ... and how long it stays open
 # shutdown_grace_s = 60.0          # keep below systemd TimeoutStopSec
+# supervised = false               # `restart` exits and relies on a service manager to
+#                                  # start the daemon again: systemd is detected; set true
+#                                  # under any other supervisor, else restart is refused
 # Retention for ~/.sbxloop/runs/<run>/ (workspace clones, harvested artifacts):
 # swept on daemon start and daily; `sbxloop gc` for non-daemon use. 0 disables.
 # prune_runs_after_days = 14
@@ -789,6 +823,14 @@ secret_strategy = "proxy"
 # clarify_ttl_s = 900              # a filing-blocking clarifying question waits this
 #                                  # long (also the clickable-choice TTL); then the
 #                                  # issue files on the concierge's stated assumption
+# edit_config = true               # the config tools: read any key (config_keys), change
+#                                  # one on your explicit yes and restart to apply it
+#                                  # (set_config); false removes both. The chat sections
+#                                  # and this gate are never changed from chat regardless
+# config_locked = ["policy", "mcp", "credentials", "registries", "github.repos.token_env", "telemetry.dsn_env"]
+#                                  # dotted prefixes chat may read but not change — egress,
+#                                  # tool grants and credential names by default (`*` is
+#                                  # one segment); remove one here to allow it from chat
 
 # [entrygraph]
 # The fixed repository-analysis workload the concierge can queue

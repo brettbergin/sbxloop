@@ -271,6 +271,8 @@ class TestJobShape:
             "start_entrygraph",
             "create_schedule",
             "delete_schedule",
+            "config_keys",
+            "set_config",
             # Last, and never gated: it reaches nothing outside the host, and
             # with `available_tools == []` it is this session's only way to
             # read a procedure at all.
@@ -417,6 +419,40 @@ class TestTools:
         (resp,) = client.responses
         assert resp.text.startswith("(command not accepted)") and "cancel" in resp.text
         assert not getattr(loop, "stopped", False)
+
+    def test_sbx_control_restart_takes_effect_only_after_the_reply(self, tmp_path: Path) -> None:
+        """`restart` (#969) is accepted, but its exit rides the reply: the
+        tool result says it will happen, nothing has happened when the turn
+        returns, and the bridge runs `reply.after` once the answer is out."""
+        concierge, client, _, loop, _ = make(
+            tmp_path,
+            [{"calls": [("sbx_control", {"command": "restart"})], "text": "restarting now"}],
+        )
+        reply = turn(concierge, "restart yourself")
+        (resp,) = client.responses
+        assert resp.ok and "exits once the current run" in resp.text
+        assert not getattr(loop, "stopped", False) and not getattr(loop, "restarts", [])
+        assert reply.text == "restarting now" and reply.after is not None
+        reply.after()
+        assert loop.stopped
+        assert loop.restarts == [
+            {
+                "by": "Discord user `brett` (via concierge)",
+                "reason": "operator restart",
+                "now": False,
+            }
+        ]
+
+    def test_sbx_control_restart_refusal_carries_no_effect(self, tmp_path: Path) -> None:
+        concierge, client, _, loop, _ = make(
+            tmp_path, [{"calls": [("sbx_control", {"command": "restart"})]}]
+        )
+        loop.supervisor_kind = None
+        reply = turn(concierge, "restart yourself")
+        (resp,) = client.responses
+        assert resp.text.startswith("(command not accepted) restart refused:")
+        assert "[daemon] supervised = true" in resp.text  # `plain` strips the code spans
+        assert reply.after is None and not getattr(loop, "stopped", False)
 
     def test_sbx_control_bad_verb_is_not_accepted(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(
@@ -3062,3 +3098,361 @@ class TestSchedules:
     def test_the_tools_are_offered(self, tmp_path: Path) -> None:
         concierge, _, _, _, _ = make(tmp_path, [], config=self.PROFILES)
         assert {"create_schedule", "delete_schedule"} <= set(concierge.tool_names)
+
+
+class TestConfigKeys:
+    """`config_keys` (#970): the configuration as resolved from the
+    operator's file on disk, sections first, cards by prefix, addressed by
+    repository — read-only, bounded, and never a repr."""
+
+    TWO: ClassVar[dict[str, Any]] = {
+        "github": {"repos": [{"repo": "owner/one"}, {"repo": "owner/two"}]}
+    }
+
+    @staticmethod
+    def _write(concierge: Concierge, text: str) -> None:
+        path = concierge.config.paths.config_toml
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    def _run(self, tmp_path: Path, args: dict[str, Any], **make_kw: Any) -> str:
+        concierge, client, *_ = make(tmp_path, [{"calls": [("config_keys", args)]}], **make_kw)
+        self._write(concierge, "[daemon]\nmax_runs_per_day = 20\n")
+        turn(concierge, "config?")
+        (resp,) = client.responses
+        assert resp.ok
+        return resp.text
+
+    def test_no_arguments_lists_the_sections(self, tmp_path: Path) -> None:
+        text = self._run(tmp_path, {})
+        assert "sections (ask for one by prefix)" in text
+        (daemon,) = [line for line in text.splitlines() if line.startswith("- `daemon`")]
+        assert "1 set in the operator's file" in daemon
+
+    def test_a_prefix_gives_cards_with_layer_and_applies(self, tmp_path: Path) -> None:
+        text = self._run(tmp_path, {"prefix": "daemon.max_runs_per_day"})
+        assert text.startswith("`daemon.max_runs_per_day` = 20 · set by home config · accepts int")
+        assert "applies restart" in text and "calendar-day cap" in text
+        live = self._run(tmp_path, {"prefix": "agent.models.build"})
+        assert "applies live" in live and "set by default" in live
+        never = self._run(tmp_path, {"prefix": "concierge.enabled"})
+        assert "never from chat: it is the concierge's own switch" in never
+
+    def test_grep_finds_by_name_or_description(self, tmp_path: Path) -> None:
+        text = self._run(tmp_path, {"grep": "calendar-day"})
+        assert text.startswith("`daemon.max_runs_per_day`") and "\n`" not in text
+        assert self._run(tmp_path, {"grep": "no such thing"}).startswith(
+            "no key mentions 'no such thing' — call with no arguments"
+        )
+        assert self._run(tmp_path, {"prefix": "nowhere"}).startswith("no key under `nowhere`")
+
+    def test_a_repository_is_addressed_by_name_not_index(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        ("config_keys", {"repo": "owner/two", "prefix": "repo"}),
+                        ("config_keys", {"repo": "two", "prefix": "agent_models.build"}),
+                        ("config_keys", {"repo": "owner/nope"}),
+                    ]
+                }
+            ],
+            config=self.TWO,
+        )
+        self._write(
+            concierge,
+            '[[github.repos]]\nrepo = "owner/one"\n[[github.repos]]\nrepo = "owner/two"\n',
+        )
+        turn(concierge, "what's the base for two?")
+        by_full, by_name, unknown = client.responses
+        assert by_full.text.startswith("`github.repos[1].repo` = owner/two · set by home config")
+        assert by_name.text.startswith("`github.repos[1].agent_models.build` =")
+        assert "applies live" in by_name.text
+        assert unknown.text == (
+            "unknown repository 'owner/nope' — configured repositories: owner/one, owner/two"
+        )
+
+    def test_a_long_listing_is_cut_on_a_card_and_says_so(self, tmp_path: Path) -> None:
+        text = self._run(
+            tmp_path, {"prefix": "daemon"}, config={"concierge": {"max_tool_result_chars": 1000}}
+        )
+        assert len(text) <= 1000
+        assert "more — narrow the prefix or add grep" in text
+        assert "'" not in text.split("\n")[0]  # values, not reprs
+
+    def test_it_reads_the_file_on_disk_not_the_process_copy(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(
+            tmp_path,
+            [{"calls": [("config_keys", {"prefix": "daemon.max_runs_per_day"})]}],
+        )
+        self._write(concierge, "[daemon]\nmax_runs_per_day = 7\n")
+        turn(concierge, "cap?")
+        (resp,) = client.responses
+        assert "= 7 · set by home config" in resp.text
+        assert concierge.config.daemon.max_runs_per_day == 12  # the process still holds the default
+
+    def test_the_tool_is_offered(self, tmp_path: Path) -> None:
+        concierge, *_ = make(tmp_path, [])
+        assert "config_keys" in concierge.tool_names
+
+
+class TestSetConfig:
+    """`set_config` (#971): the person's yes, the policy, the loader, the
+    file, then the restart — each refusing before the next can act, and the
+    restart riding the reply out rather than beginning under it."""
+
+    YES = "yes, set it to 20"
+
+    @staticmethod
+    def _write(concierge: Concierge, text: str) -> None:
+        path = concierge.config.paths.config_toml
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+    @staticmethod
+    def _text(concierge: Concierge) -> str:
+        return concierge.config.paths.config_toml.read_text()
+
+    def _run(
+        self,
+        tmp_path: Path,
+        args: dict[str, Any],
+        *,
+        seed: str = "[daemon]\nmax_runs_per_day = 3\n",
+        **make_kw: Any,
+    ) -> tuple[Concierge, Any, LoopWithRuns, ConciergeReply]:
+        concierge, client, _, loop, _ = make(
+            tmp_path, [{"calls": [("set_config", args)], "text": "done"}], **make_kw
+        )
+        self._write(concierge, seed)
+        reply = turn(concierge, "raise the cap")
+        (resp,) = client.responses
+        return concierge, resp, loop, reply
+
+    def test_without_the_persons_words_nothing_is_written(self, tmp_path: Path) -> None:
+        concierge, resp, loop, _ = self._run(
+            tmp_path, {"key": "daemon.max_runs_per_day", "value": "20"}
+        )
+        assert resp.text.startswith("set_config needs the person's own words")
+        assert "`daemon.max_runs_per_day`" in resp.text
+        assert self._text(concierge) == "[daemon]\nmax_runs_per_day = 3\n"
+        assert not loop.restarts
+
+    def test_never_from_chat_and_locked_keys_are_refused_by_name(self, tmp_path: Path) -> None:
+        for key, why in (
+            ("discord.channel_id", "never from chat: it configures the chat channel"),
+            ("concierge.edit_config", "never from chat: it is the gate on these tools"),
+            ("policy.allow", "locked by `[concierge] config_locked` (`policy`)"),
+            ("home", "never from chat: not a file setting"),
+        ):
+            concierge, resp, loop, _ = self._run(
+                tmp_path / key.replace(".", "_"),
+                {"key": key, "value": "x", "confirmation": self.YES},
+            )
+            assert resp.text.startswith(f"`{key}` is not changed from chat — {why}"), key
+            assert resp.text.endswith("Nothing was written.")
+            assert self._text(concierge) == "[daemon]\nmax_runs_per_day = 3\n"
+            assert not loop.restarts
+
+    def test_a_value_the_loader_refuses_leaves_the_file_byte_identical(
+        self, tmp_path: Path
+    ) -> None:
+        seed = "# keep me\n[concierge]\ntimeout_s = 60.0\n"
+        concierge, resp, loop, _ = self._run(
+            tmp_path,
+            {"key": "concierge.timeout_s", "value": "5", "confirmation": self.YES},
+            seed=seed,
+        )
+        assert resp.text.startswith(
+            "the loader refused the file with `concierge.timeout_s` changed:"
+        )
+        assert resp.text.endswith("Nothing was written.")
+        assert self._text(concierge) == seed
+        assert not list(concierge.config.paths.config.glob("sbxloop.toml.bak-*"))
+        assert not loop.restarts
+        _, bad, _, _ = self._run(
+            tmp_path / "bad",
+            {"key": "daemon.max_runs_per_day", "value": "soon", "confirmation": self.YES},
+        )
+        assert "whole number" in bad.text and bad.text.endswith("Nothing was written.")
+
+    def test_an_accepted_change_is_written_backed_up_and_restarts_after_the_reply(
+        self, tmp_path: Path
+    ) -> None:
+        concierge, resp, loop, reply = self._run(
+            tmp_path, {"key": "daemon.max_runs_per_day", "value": "20", "confirmation": self.YES}
+        )
+        assert resp.ok
+        lines = resp.text.splitlines()
+        assert (
+            lines[0]
+            == f"set `daemon.max_runs_per_day` = 20 in {concierge.config.paths.config_toml}"
+        )
+        assert lines[1].startswith("previous kept as sbxloop.toml.bak-")
+        assert lines[-1].startswith("restarting after the current run once this reply is posted")
+        assert self._text(concierge) == "[daemon]\nmax_runs_per_day = 20\n"
+        assert list(concierge.config.paths.config.glob("sbxloop.toml.bak-*"))
+        # nothing has happened to the daemon yet: the restart rides the reply
+        assert not loop.restarts and not getattr(loop, "stopped", False)
+        assert reply.after is not None
+        reply.after()
+        assert loop.stopped
+        assert loop.restarts == [
+            {
+                "by": "Discord user `brett` (via concierge)",
+                "reason": "set daemon.max_runs_per_day = 20",
+                "now": False,
+                "key": "daemon.max_runs_per_day",
+                "value": 20,
+            }
+        ]
+
+    def test_restart_now_and_no(self, tmp_path: Path) -> None:
+        _, now, loop, reply = self._run(
+            tmp_path / "now",
+            {
+                "key": "daemon.max_runs_per_day",
+                "value": "20",
+                "confirmation": self.YES,
+                "restart": "now",
+            },
+        )
+        assert "restarting now (the current run is cancelled" in now.text
+        assert reply.after is not None
+        reply.after()
+        assert loop.cancelled == 1 and loop.restarts[0]["now"] is True
+        concierge, no, loop, reply = self._run(
+            tmp_path / "no",
+            {
+                "key": "daemon.max_runs_per_day",
+                "value": "20",
+                "confirmation": self.YES,
+                "restart": "no",
+            },
+        )
+        assert no.text.endswith("not restarting: the daemon reads it at its next start")
+        assert reply.after is None and not loop.restarts
+        assert "max_runs_per_day = 20" in self._text(concierge)
+        _, bad, _, _ = self._run(
+            tmp_path / "bad",
+            {
+                "key": "daemon.max_runs_per_day",
+                "value": "20",
+                "confirmation": self.YES,
+                "restart": "later",
+            },
+        )
+        assert bad.text == "restart must be one of now, after_run, no, not 'later'"
+
+    def test_a_live_key_needs_no_restart(self, tmp_path: Path) -> None:
+        concierge, resp, loop, reply = self._run(
+            tmp_path, {"key": "agent.models.build", "value": "gpt-5", "confirmation": self.YES}
+        )
+        assert resp.text.endswith(
+            "no restart needed: model settings refresh before the next phase or turn"
+        )
+        assert reply.after is None and not loop.restarts
+        assert 'build = "gpt-5"' in self._text(concierge)
+
+    def test_unsupervised_writes_and_says_the_restart_was_refused(self, tmp_path: Path) -> None:
+        concierge, client, _, loop, _ = make(
+            tmp_path,
+            [
+                {
+                    "calls": [
+                        (
+                            "set_config",
+                            {
+                                "key": "daemon.max_runs_per_day",
+                                "value": "20",
+                                "confirmation": self.YES,
+                            },
+                        )
+                    ]
+                }
+            ],
+        )
+        loop.supervisor_kind = None
+        self._write(concierge, "[daemon]\nmax_runs_per_day = 3\n")
+        reply = turn(concierge, "raise the cap")
+        (resp,) = client.responses
+        assert (
+            "written, but the restart was refused: this daemon is not under a service manager"
+            in resp.text
+        )
+        assert "max_runs_per_day = 20" in self._text(concierge)
+        assert reply.after is None and not loop.restarts
+
+    def test_a_key_another_layer_sets_is_written_and_flagged(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("SBXLOOP_DAEMON__POLL_INTERVAL_S", "5.0")
+        concierge, resp, _, _ = self._run(
+            tmp_path,
+            {
+                "key": "daemon.poll_interval_s",
+                "value": "9",
+                "confirmation": self.YES,
+                "restart": "no",
+            },
+            seed="[daemon]\npoll_interval_s = 7.0\n",
+        )
+        assert "env sets it too and wins: the loop still sees 5.0" in resp.text
+        assert "poll_interval_s = 9" in self._text(concierge)
+
+    def test_a_repository_setting_lands_in_its_own_entry(self, tmp_path: Path) -> None:
+        concierge, resp, _, _ = self._run(
+            tmp_path,
+            {
+                "key": "deliver_base",
+                "value": "trunk",
+                "repo": "owner/two",
+                "confirmation": self.YES,
+                "restart": "no",
+            },
+            seed='[[github.repos]]\nrepo = "owner/one"\n[[github.repos]]\nrepo = "owner/two"\n',
+            config={"github": {"repos": [{"repo": "owner/one"}, {"repo": "owner/two"}]}},
+        )
+        assert resp.text.startswith("set `github.repos[1].deliver_base` = trunk in")
+        text = self._text(concierge)
+        assert text.index('repo = "owner/two"') < text.index('deliver_base = "trunk"')
+        assert text.count("deliver_base") == 1
+
+    def test_unset_removes_the_line_and_names_the_fallback(self, tmp_path: Path) -> None:
+        concierge, resp, _, _ = self._run(
+            tmp_path,
+            {
+                "key": "landing.merge_method",
+                "unset": True,
+                "confirmation": self.YES,
+                "restart": "no",
+            },
+            seed='[landing]\nmerge_method = "squash"\n',
+        )
+        assert resp.text.startswith("unset `landing.merge_method` in")
+        assert "now comes from its default: 'auto'" in resp.text
+        assert "merge_method" not in self._text(concierge)
+        _, again, _, _ = self._run(
+            tmp_path / "again",
+            {"key": "landing.merge_method", "unset": True, "confirmation": self.YES},
+            seed="[landing]\n",
+        )
+        assert again.text == "landing.merge_method already says that. Nothing was written."
+
+    def test_the_gate_removes_both_tools(self, tmp_path: Path) -> None:
+        concierge, *_ = make(tmp_path, [], config={"concierge": {"edit_config": False}})
+        assert (
+            "config_keys" not in concierge.tool_names and "set_config" not in concierge.tool_names
+        )
+        concierge, *_ = make(tmp_path / "on", [])
+        assert {"config_keys", "set_config"} <= set(concierge.tool_names)
+
+    def test_a_locked_prefix_is_shown_as_such_by_config_keys(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(
+            tmp_path, [{"calls": [("config_keys", {"prefix": "policy.allow"})]}]
+        )
+        self._write(concierge, "")
+        turn(concierge, "policy?")
+        (resp,) = client.responses
+        assert "locked by `[concierge] config_locked` (`policy`)" in resp.text

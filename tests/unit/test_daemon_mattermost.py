@@ -793,6 +793,89 @@ class TestRefusedReactions:
         bridge.close()
 
 
+class TestReceivedAckReassert:
+    """The asker's own webapp drops a reaction that lands before their
+    create-post reply: the reply's empty reaction list replaces the one the
+    websocket already delivered, and only the person who asked loses the
+    mark. Saving it again is a 200 the server re-broadcasts, so the ⏳ — and
+    only the ⏳ — goes on twice."""
+
+    def test_the_received_mark_is_saved_twice(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge._reassert_s = 0.02
+        msg = MattermostMessage(CHANNEL, "p" * 26)
+
+        async def scenario() -> None:
+            await bridge._add_reaction(msg, "⏳")
+            # The first save is immediate: everyone else's client keeps it.
+            assert client.reactions == [(BOT_ID, "p" * 26, "hourglass_flowing_sand")]
+            await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        assert client.reactions == [(BOT_ID, "p" * 26, "hourglass_flowing_sand")] * 2
+        bridge.close()
+
+    def test_only_the_received_mark_is_reasserted(self, tmp_path: Path) -> None:
+        """✅ and ⚠ land seconds after the post, long past the reply that
+        does the wiping; a second save would be a wasted call."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge._reassert_s = 0.02
+        msg = MattermostMessage(CHANNEL, "p" * 26)
+
+        async def scenario() -> None:
+            await bridge._add_reaction(msg, "✅")
+            await bridge._add_reaction(msg, "⚠")
+            await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        assert client.reactions == [
+            (BOT_ID, "p" * 26, "white_check_mark"),
+            (BOT_ID, "p" * 26, "warning"),
+        ]
+        bridge.close()
+
+    def test_a_refused_received_mark_is_not_reasserted(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A server that would not take the first save will not take the
+        second; retrying it only re-asks the question the refusal already
+        answered once."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge._reassert_s = 0.02
+        client.fail_reaction = MattermostApiError(400, "Invalid or missing emoji_name parameter")
+
+        async def scenario() -> None:
+            with caplog.at_level(logging.WARNING):
+                await bridge._add_reaction(MattermostMessage(CHANNEL, "p" * 26), "⏳")
+                await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        assert client.reactions == []
+        assert len([r for r in caplog.records if "reaction_refused" in r.getMessage()]) == 1
+        bridge.close()
+
+    def test_a_reassert_that_fails_is_quiet(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The post can be gone by the time the second save runs; the first
+        one already did the job for everyone but the asker, and a 404 here
+        is not news anyone needs above debug."""
+        bridge, client, _ = make_bridge(tmp_path)
+        bridge._reassert_s = 0.02
+        msg = MattermostMessage(CHANNEL, "p" * 26)
+
+        async def scenario() -> None:
+            await bridge._add_reaction(msg, "⏳")
+            client.fail_reaction = MattermostApiError(404, "post not found")
+            with caplog.at_level(logging.WARNING):
+                await asyncio.sleep(0.2)
+
+        asyncio.run(scenario())
+        assert client.reactions == [(BOT_ID, "p" * 26, "hourglass_flowing_sand")]
+        assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+        bridge.close()
+
+
 class TestSpentAffordances:
     """A seeded emoji is this bridge's button; one left on a settled prompt
     is a button that can only fail. Discord clears its view and Slack its
@@ -1192,5 +1275,95 @@ class TestMessageFetch:
             assert found is not None
             assert found.post_id == post_id
             assert found.root_id == root
+        finally:
+            bridge.close()
+
+
+class TestControlChannelThreads:
+    """On Mattermost a reply is a thread post, so a thread under *any*
+    control-channel post is its own surface. One under a run's headline is
+    that run's thread; one under anything else — the run's finish notice,
+    a concierge answer, a gate prompt — used to be neither surface the bot
+    listens on, and an @mention there vanished: no ack, no reply, no log."""
+
+    def test_a_mention_in_a_thread_under_a_notice_reaches_the_concierge(
+        self, tmp_path: Path
+    ) -> None:
+        concierge = FakeConcierge()
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        try:
+            asyncio.run(bridge._send(MattermostTarget(CHANNEL), "✅ run r9 finished"))
+            notice_id = client.posts[-1]["id"]
+            client.deliver(
+                posted(f"@{BOT_NAME} what happened there?", post_id="t" * 26, root_id=notice_id)
+            )
+            assert wait_for(lambda: bool(concierge.turns))
+            assert concierge.turns[0][0] == "what happened there?"
+            # answered where the person is looking: in that thread
+            answer = next(p for p in client.posts if "hello" in p["message"])
+            assert answer.get("root_id") == notice_id
+            # and acknowledged like any other ask
+            assert wait_for(
+                lambda: ("b" * 26, "t" * 26, "hourglass_flowing_sand") in client.reactions
+            )
+        finally:
+            bridge.close()
+
+    def test_a_command_in_such_a_thread_runs(self, tmp_path: Path) -> None:
+        bridge, client, floop = make_bridge(tmp_path)
+        try:
+            asyncio.run(bridge._send(MattermostTarget(CHANNEL), "a notice"))
+            notice_id = client.posts[-1]["id"]
+            client.deliver(posted("!sbx pause", post_id="t" * 26, root_id=notice_id))
+            assert wait_for(lambda: bool(floop.hold_calls))
+        finally:
+            bridge.close()
+
+    def test_people_still_talk_in_such_a_thread_without_the_bot(self, tmp_path: Path) -> None:
+        concierge = FakeConcierge()
+        bridge, client, floop = make_bridge(tmp_path, concierge=concierge)
+        try:
+            asyncio.run(bridge._send(MattermostTarget(CHANNEL), "a notice"))
+            notice_id = client.posts[-1]["id"]
+            client.deliver(posted("agreed, that looks right", post_id="t" * 26, root_id=notice_id))
+            assert not wait_for(
+                lambda: bool(concierge.turns) or bool(floop.hold_calls), timeout=0.3
+            )
+        finally:
+            bridge.close()
+
+    def test_a_thread_under_a_run_headline_is_still_a_steer_not_a_concierge_turn(
+        self, tmp_path: Path
+    ) -> None:
+        """The fold applies only where there is no run thread: steering
+        keeps requiring the real one, so nothing is steered by accident."""
+        concierge = FakeConcierge()
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        try:
+            _, _, engine = start_run(bridge)
+            known = thread_of(bridge)
+            client.deliver(
+                posted(f"@{BOT_NAME} focus on the tests", post_id="s" * 26, root_id=known.thread_id)
+            )
+            assert wait_for(lambda: engine.posted == ["focus on the tests"])
+            assert concierge.turns == []
+        finally:
+            bridge.close()
+
+    def test_an_ignored_human_message_leaves_a_trace(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The one outcome that used to have none."""
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            with caplog.at_level(logging.DEBUG, logger="sbxloop.daemon.chat"):
+                client.deliver(posted("just chatting", post_id="t" * 26))
+                assert wait_for(
+                    lambda: any("message_ignored" in r.getMessage() for r in caplog.records)
+                )
+            record = next(r for r in caplog.records if "message_ignored" in r.getMessage())
+            assert isinstance(record.msg, dict)
+            assert record.msg["mentioned"] is False
+            assert record.msg["in_control"] is True
         finally:
             bridge.close()

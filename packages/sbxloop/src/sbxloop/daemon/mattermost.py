@@ -52,7 +52,10 @@ How Mattermost's shapes map onto the bridge's:
   (a resolved gate or an answered question loses the reactions that were
   seeded on it, the way a Discord view loses its buttons). A reaction that
   the server refuses is the one failure a human cannot see, so it is said
-  out loud once rather than swallowed.
+  out loud once rather than swallowed. The ⏳ has one more enemy: the
+  asker's *own* webapp, which drops a reaction that lands before its
+  create-post reply comes back (see ``RECEIVED_REASSERT_S``), so the bridge
+  puts that one mark on twice.
 
 ``aiohttp`` is an optional extra (``sbxloop[mattermost]``); the import is
 deferred and its absence surfaces as an actionable error. Mattermost's API
@@ -78,7 +81,7 @@ from typing import Any, ClassVar
 
 from sbxloop.chatservices import MATTERMOST_TOKEN_ENV
 from sbxloop.config import ChatBackend, Config, MattermostConfig
-from sbxloop.daemon.chat import ChatBridge, Inbound
+from sbxloop.daemon.chat import ACK_RECEIVED, ChatBridge, Inbound
 from sbxloop.daemon.chat_choices import ChoiceQuestion, render_prose
 from sbxloop.daemon.chat_routing import MATTERMOST_MENTION_RE
 from sbxloop.daemon.concierge import Concierge
@@ -128,6 +131,21 @@ RECONNECT_MAX_S = 60.0
 #: A Mattermost client drops the indicator a few seconds after the last
 #: frame, so a turn that thinks for a minute has to keep saying it.
 TYPING_INTERVAL_S = 3.0
+#: How long after the ⏳ lands to put it on a second time.
+#:
+#: The asker's own web/desktop app races the first one. Their client stores
+#: a reaction the moment the websocket delivers it — and the bot reacts
+#: within ~50ms of the post — but their create-post HTTP reply lands after
+#: that, carrying a post the server serialised BEFORE the reaction existed,
+#: and the app's reactions reducer *replaces* what it holds for the post
+#: with the reply's (empty) list. Every other viewer already had the post
+#: and keeps the mark; the one person it was for watches their message go
+#: straight to ✅. Saving an identical reaction again is a 200 and the server
+#: broadcasts ``reaction_added`` again, which the client stores after the
+#: wipe. 1.5s clears a slow reply without waiting past the answer on a
+#: quick concierge turn — and a mark that arrives after ✅ still renders
+#: beside it, so late is harmless.
+RECEIVED_REASSERT_S = 1.5
 #: Question posts remembered for their body and seeded digits. Bounded like
 #: the other per-message maps: a long-lived daemon must not grow one entry
 #: per question it ever asked.
@@ -394,6 +412,10 @@ class MattermostBridge(ChatBridge):
         self.token = token if token is not None else os.environ.get(MATTERMOST_TOKEN_ENV, "")
         self._user_id: str | None = None
         self._username: str | None = None
+        # The second ⏳ per post, in flight; cancelled with the client so a
+        # shutdown never waits on a beat nobody will see.
+        self._reasserts: set[asyncio.Task[None]] = set()
+        self._reassert_s = RECEIVED_REASSERT_S
         self._names: dict[str, str] = {}  # user id -> username
         self._team: str = ""  # the control channel's team, for permalinks
         # Gate prompt post id -> run id, so a ✅ reaction finds its gate.
@@ -538,6 +560,10 @@ class MattermostBridge(ChatBridge):
             log.debug("mattermost.close_before_reconnect_failed", exc_info=True)
 
     async def _close_client(self) -> None:
+        # A second ⏳ still waiting on its beat has nobody left to see it.
+        for task in self._reasserts:
+            task.cancel()
+        self._reasserts.clear()
         await self.client.close()
 
     async def _resolve_team(self) -> None:
@@ -626,6 +652,7 @@ class MattermostBridge(ChatBridge):
             channel=MattermostTarget(channel, root_id if in_thread else None),
             raw=MattermostMessage(channel, post_id, root_id if in_thread else None),
             reply_to_id=root_id if in_thread else None,
+            parent_channel_id=channel if in_thread else None,
         )
 
     def _inbound(self, message: Any) -> Inbound | None:
@@ -970,14 +997,40 @@ class MattermostBridge(ChatBridge):
             raise ValueError(f"no Mattermost reaction name for {emoji!r}")
         if not self._user_id:
             return
+        if await self._save_reaction(message.post_id, emoji, name) and emoji == ACK_RECEIVED:
+            # The one mark the asker's own client is known to drop — put
+            # it on again once their create-post reply has done its worst.
+            task = asyncio.ensure_future(self._reassert(message.post_id, emoji, name))
+            self._reasserts.add(task)
+            task.add_done_callback(self._reasserts.discard)
+
+    async def _save_reaction(self, post_id: str, emoji: str, name: str) -> bool:
+        """One reaction save; True when the server took it. A refused save
+        is reported (once per name) rather than raised, anything else
+        propagates for the caller to log with its own context."""
+        assert self._user_id is not None
         try:
-            await self.client.create_reaction(self._user_id, message.post_id, name)
+            await self.client.create_reaction(self._user_id, post_id, name)
         except MattermostApiError as exc:
             # Reacting twice is not an error worth raising: the mark the
             # caller wanted is already there.
             if exc.status != 400:
                 raise
             self._report_reaction_refused(emoji, name, exc)
+            return False
+        return True
+
+    async def _reassert(self, post_id: str, emoji: str, name: str) -> None:
+        """Save the received mark a second time, after ``RECEIVED_REASSERT_S``.
+        Nothing here can be worth surfacing: the first save already landed,
+        and this one exists only to outlive the asker's client wiping it."""
+        await asyncio.sleep(self._reassert_s)
+        if not self._user_id:
+            return
+        try:
+            await self._save_reaction(post_id, emoji, name)
+        except Exception:
+            log.debug("mattermost.reassert_failed", post=post_id, emoji_name=name, exc_info=True)
 
     def _report_reaction_refused(self, emoji: str, name: str, exc: MattermostApiError) -> None:
         """A 400 on a reaction, said out loud once per emoji name.

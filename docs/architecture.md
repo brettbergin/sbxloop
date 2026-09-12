@@ -220,13 +220,13 @@ repositories are configured, the github sandbox is scoped to the one the
 run's work item came from, and carries that repository's `token_env`
 credential:
 
-|            | agent sandbox                                                                                                                                                           | github sandbox                                                                                                     |
-| ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ |
-| name       | `sbxloop-<run>-agent`                                                                                                                                                   | `sbxloop-<run>-github`                                                                                             |
-| credential | the configured agent credential only — `COPILOT_GITHUB_TOKEN` (`[agent] backend = "copilot"`, the default) or `ANTHROPIC_API_KEY` (`"claude"`, #533)                    | `GH_TOKEN` only (a PAT, or a host-minted App installation token)                                                   |
-| injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows) | built-in `github` service secret (PAT), or the in-VM env file carrying a host-minted App installation token (#568) |
-| network    | balanced policy + copilot hosts + the `[github] api_url` hosts + plan-declared grants                                                                                   | balanced policy + the `[github] api_url` hosts (+ the dotcom storage hosts when that is github.com)                |
-| runs       | agent SDK sessions (Copilot SDK, or the Claude Agent SDK + Claude Code CLI with the claude backend), shell checks                                                       | `github.op` jobs (gh CLI or REST)                                                                                  |
+|            | agent sandbox                                                                                                                                                                                                                                    | github sandbox                                                                                                     |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
+| name       | `sbxloop-<run>-agent`                                                                                                                                                                                                                            | `sbxloop-<run>-github`                                                                                             |
+| credential | the configured agent credential only — `COPILOT_GITHUB_TOKEN` (`[agent] backend = "copilot"`, the default), `ANTHROPIC_API_KEY` (`"claude"`, #533), `OPENAI_API_KEY` (`"codex"`) or the variable `[agent.openai] api_key_env` names (`"openai"`) | `GH_TOKEN` only (a PAT, or a host-minted App installation token)                                                   |
+| injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows)                                                                          | built-in `github` service secret (PAT), or the in-VM env file carrying a host-minted App installation token (#568) |
+| network    | balanced policy + the backend's credential hosts (copilot's, a vendor API host, or the endpoint `[agent.openai]` names) + the `[github] api_url` hosts + plan-declared grants                                                                    | balanced policy + the `[github] api_url` hosts (+ the dotcom storage hosts when that is github.com)                |
+| runs       | agent SDK sessions (Copilot SDK, the Claude Agent SDK + Claude Code CLI, the Codex SDK, or the worker's own chat-completions loop with the openai backend), shell checks                                                                         | `github.op` jobs (gh CLI or REST)                                                                                  |
 
 A workload run's needs (#758) are held to a **profile** before any task
 runs. `[[workloads]]` declares each profile (`egress` patterns, the
@@ -381,6 +381,26 @@ adapter isolates Codex state/configuration from the target checkout and
 uses an ephemeral API-key credential store. See
 [the Codex backend design](codex-backend.md), including the experimental
 API pin and **field-unverified** live-sandbox checks.
+
+The `openai` descriptor selects the official `openai` client against an
+endpoint the operator names under `[agent.openai]` — a self-hosted server,
+a gateway, or the hosted API — with the credential `api_key_env` names,
+bound to that endpoint's host. A backend's credential host and egress are
+therefore read from config through the descriptor's accessors, never off a
+constant: the three vendor backends answer every config the same way, this
+one answers from `[agent.openai]` and a repository's own override. **A
+model endpoint is operator config, not plan-declared egress**: it is
+infrastructure the run needs before any plan exists, allowed on the agent
+sandbox at provision time and bound to the credential there, never granted
+late from a plan's `egress`. That is why `sbxloop.endpoint` accepts a
+single-label hostname, an address literal and an explicit port for the
+configured endpoint alone, while the rule for what a plan may declare is
+unchanged. The client is not an agent harness, so the worker owns the loop
+and drives the same governed tool layer codex does; the wire is stateless,
+so a session is a worker-held transcript. See
+[the OpenAI-compatible endpoint backend design](openai-backend.md),
+including what stays **field-unverified** about sbx's handling of those
+host shapes and a real served endpoint.
 
 Under the default `proxy` secret strategy, sbxloop first attempts sbx's
 keychain-backed injection, where **token values never enter the VM**.
@@ -1809,6 +1829,29 @@ repo-attribution passes skip `sched:` rows as they skip `chat:` rows;
 (`ghids.is_local_id`) — no issue behind them, provenance names the schedule
 and its due. `schedules` (ctl, `!sbx`, the concierge's `sbx_control`) lists
 each schedule's cadence, last fire and next due.
+
+**Configuration from chat (#967).** The concierge's `config_keys` and
+`set_config` tools are the console's per-key editor (`sbxloop.configedit`:
+what a key accepts from the model, the comment-keeping `tomlkit` write, the
+loader's verdict on the whole draft with every other layer applied, the
+atomic save with a timestamped backup) run in the daemon process against
+the home's `config/sbxloop.toml` as it is on disk — the sandbox never sees
+the file or a path. A write needs the person's own words in `confirmation`
+(the `close_issue` pattern), and nothing is written until the loader has
+accepted the draft, so a restart never fails on a file this path wrote.
+Then `DaemonLoop.request_restart` (the `restart` verb, #969: the courtesy
+exit, a marker in `daemon_state`, the supervisor's relaunch) rides the
+reply out on `ConciergeReply.after` — a restart begun inside the tool call
+would close the bridge under the answer — and the process that comes back
+re-resolves the key and posts *now in effect* or *written, but `<layer>`
+sets … and wins*. `daemon/configpolicy.py` holds what chat may never
+change whatever the operator says: the chat sections (the channel the
+outcome is reported on), the concierge's own switch and gate keys (no
+self-widening), and the env-only keys; `[concierge] config_locked` is the
+operator's own list on top (egress, tool grants and credential names by
+default). Model keys apply live (`refreshed_models`); everything else at
+the next start, which is why the restart is part of the write rather than
+advice after it.
 
 ### Repositories
 
