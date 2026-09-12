@@ -31,6 +31,7 @@ from sbxloop.homeinit import (
     template,
 )
 from sbxloop.paths import SbxloopHome
+from tests.fakes.fake_host import fake_prep
 
 runner = CliRunner()
 
@@ -164,8 +165,15 @@ def installer_fails(
 
 
 def make(
-    tmp_path: Path, **overrides: Any
+    tmp_path: Path, host: Any = None, **overrides: Any
 ) -> tuple[SbxloopHome, HomeInit, FakeRun, FakeFetch, list[str]]:
+    """Init against a *prepared* Linux host unless a test says otherwise.
+
+    The host's own kvm device, PATH and session never reach these tests in
+    either direction: every capability `sbxloop init` probes comes from
+    ``fake_prep``, so the same assertions hold on a laptop, a CI runner and
+    a container.
+    """
     home = SbxloopHome(tmp_path / "home")
     options = InitOptions(**{"version": "1.2.3", **overrides})
     run, fetch, said = FakeRun(home, options.sbx_version), FakeFetch(), []
@@ -180,6 +188,7 @@ def make(
         sys_prefix=tmp_path / "elsewhere-venv",
         say=said.append,
         user_units=tmp_path / "units",
+        prep=host if host is not None else fake_prep(env={"PATH": "/usr/bin", "USER": "bergs"}),
     )
     return home, init, run, fetch, said
 

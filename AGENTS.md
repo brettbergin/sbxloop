@@ -81,8 +81,9 @@ Each of these has broken a real run when violated.
   - `gh/` — GitHub REST/GraphQL ops, base-branch protection, App auth.
   - `sbx/` — sandbox pair provisioning, baking, conformance probes.
   - `toolchains.py`, `verifylint.py`, `policy.py`, `deliver.py`,
-    `hostgit.py`, `config.py` — toolchain series, gate detection, network
-    policy, delivery, host-side git, the config model.
+    `hostgit.py`, `hostprep.py`, `config.py` — toolchain series, gate
+    detection, network policy, delivery, host-side git, the host
+    capabilities an install cannot grant itself, the config model.
   - `configedit/` — the operator config edited one key at a time (what a
     key accepts, the comment-keeping write, the loader's verdict, the
     backup); the console, `sbxloop config set` and the daemon's tools share
