@@ -401,6 +401,11 @@ def cmd_ls(root: Path) -> int:
                 # closer to gone.
                 remaining -= 1
                 if remaining <= 0:
+                    # Inside the branch, not at the top of `cmd_ls`: a
+                    # teardown finishing is the rare case, and `ls` is one of
+                    # the calls this module's import budget is kept small for.
+                    import shutil
+
                     shutil.rmtree(path)
                     continue
                 meta["removing"] = remaining
