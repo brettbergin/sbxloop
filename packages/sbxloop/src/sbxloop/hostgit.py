@@ -1084,9 +1084,15 @@ def fetch_tags(
     try:
         with Repo(clone) as repo:
             if source is not None and tag_count(source):
+                # A filesystem path, not a configured remote: there is no
+                # `Remote` to fetch through, so this one stays a passthrough.
                 repo.git.fetch("--tags", str(source), env=_local_clone_env())
                 return TagFetch(tag_count(clone), "local")
-            repo.git.fetch("--tags", "origin", env=_clone_env(token, credential_url=credential_url))
+            # The credential lives in the environment for exactly this
+            # fetch: `custom_environment` restores the `Git` instance's
+            # environment on exit, and nothing here writes `.git/config`.
+            with repo.git.custom_environment(**_clone_env(token, credential_url=credential_url)):
+                repo.remotes.origin.fetch(tags=True)
             return TagFetch(tag_count(clone), "remote")
     except (GitCommandError, InvalidGitRepositoryError, NoSuchPathError, OSError) as exc:
         raise ProvisionError(
@@ -1098,8 +1104,7 @@ def fetch_tags(
 def tag_count(repo_path: Path) -> int:
     """How many tags ``repo_path`` holds."""
     with Repo(repo_path) as repo:
-        listing: str = repo.git.tag("--list")
-    return len(listing.split()) if listing else 0
+        return len(repo.tags)
 
 
 def gitignored_files(root: Path) -> frozenset[str] | None:
@@ -1448,7 +1453,7 @@ def _fetch_branch_from_source(clone: Repo, source: Path, branch: str) -> None:
     last: GitCommandError | None = None
     for src_ref in (f"refs/remotes/origin/{branch}", f"refs/heads/{branch}"):
         try:
-            clone.git.fetch("origin", f"{src_ref}:refs/remotes/origin/{branch}")
+            clone.remotes.origin.fetch(f"{src_ref}:refs/remotes/origin/{branch}")
             return
         except GitCommandError as exc:
             last = exc

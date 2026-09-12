@@ -1776,6 +1776,27 @@ class TestFetchTags:
             assert fetched == hostgit.TagFetch(tags=1, source="remote")
             assert describe(clone) == "v0.9"
 
+    def test_the_credential_is_scoped_to_the_fetch(self, tmp_path: Path) -> None:
+        """The token rides a `custom_environment` block around the one fetch
+        that needs it: never the process environment, never the clone's
+        config, and gone once the fetch returns."""
+        upstream = make_repo(tmp_path, "upstream")
+        git("tag", "v0.9", cwd=upstream)
+        (tmp_path / "remotes").mkdir()
+        bare_from(upstream, tmp_path / "remotes", "o/app.git")
+        with PrivateGitServer(
+            tmp_path / "remotes", username="x-access-token", token="ghs_tags"
+        ) as private:
+            clone = tmp_path / "run"
+            hostgit.clone_from_remote(
+                f"{private.url}/o/app.git", clone, "sbxloop/r1", token="ghs_tags"
+            )
+            hostgit.fetch_tags(clone, source=None, token="ghs_tags", credential_url=private.url)
+        assert hostgit.CLONE_TOKEN_ENV not in os.environ
+        assert "ghs_tags" not in (clone / ".git" / "config").read_text()
+        with Repo(clone) as repo:
+            assert hostgit.CLONE_TOKEN_ENV not in repo.git.environment()
+
     def test_a_repository_without_tags_is_not_an_error(self, tmp_path: Path) -> None:
         app = make_repo(tmp_path, "app")
         clone = tmp_path / "run"
