@@ -37,6 +37,13 @@ How Mattermost's shapes map onto the bridge's:
   what run watches persist), and :meth:`mention_user` resolves that id back
   to a handle through a cache, so attribution reads ``Mattermost user
   `ana``` like the others.
+* Link previews are the other thing the send seam owes a run's thread.
+  Mattermost picks what to embed from the *first autolink* in a post, so a
+  chronology full of PR, issue and CI links grows a website card under
+  every one of them; ``defuse_unfurls`` writes each bare URL as a markdown
+  link to itself, which the server's scan never visits. A post carrying a
+  card needs none of this — the server stops at the attachment — but it
+  costs nothing to be consistent.
 * Discord's *interactions* have analogs here, and the bridge owes a human
   the same three signals it gets there: **something received it** (the ⏳
   ack reaction), **something is still working on it** (a ``user_typing``
@@ -45,7 +52,10 @@ How Mattermost's shapes map onto the bridge's:
   (a resolved gate or an answered question loses the reactions that were
   seeded on it, the way a Discord view loses its buttons). A reaction that
   the server refuses is the one failure a human cannot see, so it is said
-  out loud once rather than swallowed.
+  out loud once rather than swallowed. The ⏳ has one more enemy: the
+  asker's *own* webapp, which drops a reaction that lands before its
+  create-post reply comes back (see ``RECEIVED_REASSERT_S``), so the bridge
+  puts that one mark on twice.
 
 ``aiohttp`` is an optional extra (``sbxloop[mattermost]``); the import is
 deferred and its absence surfaces as an actionable error. Mattermost's API
@@ -64,14 +74,14 @@ import functools
 import json
 import os
 import re
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, ClassVar
 
 from sbxloop.chatservices import MATTERMOST_TOKEN_ENV
 from sbxloop.config import ChatBackend, Config, MattermostConfig
-from sbxloop.daemon.chat import ChatBridge, Inbound
+from sbxloop.daemon.chat import ACK_RECEIVED, ChatBridge, Inbound
 from sbxloop.daemon.chat_choices import ChoiceQuestion, render_prose
 from sbxloop.daemon.chat_routing import MATTERMOST_MENTION_RE
 from sbxloop.daemon.concierge import Concierge
@@ -80,6 +90,7 @@ from sbxloop.daemon.mattermost_format import (
     CHOICE_EMOJI,
     EMOJI_NAMES,
     GATE_EMOJI,
+    defuse_unfurls,
     embed_attachment,
     neutralize_mentions,
     thread_permalink,
@@ -104,14 +115,37 @@ _MATTERMOST_ID_RE = re.compile(r"^[a-z0-9]{26}$")
 # HTTP statuses that mean the control channel is misconfigured, reported
 # once with the fix rather than on every flush.
 _CHANNEL_STATUSES = frozenset({403, 404})
+# ...and what the same two mean about a single post: it is not there, or is
+# no longer ours to touch. Either way the caller should put a new one up.
+_MISSING_STATUSES = frozenset({403, 404})
 #: Mattermost takes at most five files on one post (Discord takes ten); the
 #: rest are named by host path, so a workload result never silently loses an
 #: artifact to a transport limit.
 MAX_POST_FILES = 5
+#: A lost websocket is rebuilt after this long, doubling to the cap. The
+#: socket is the daemon's only inbound path, so the first retry is quick; the
+#: cap keeps a long outage down to one attempt — and one log line — a minute.
+RECONNECT_MIN_S = 1.0
+RECONNECT_MAX_S = 60.0
 #: How often the bridge re-asserts "…is typing" while a concierge turn runs.
 #: A Mattermost client drops the indicator a few seconds after the last
 #: frame, so a turn that thinks for a minute has to keep saying it.
 TYPING_INTERVAL_S = 3.0
+#: How long after the ⏳ lands to put it on a second time.
+#:
+#: The asker's own web/desktop app races the first one. Their client stores
+#: a reaction the moment the websocket delivers it — and the bot reacts
+#: within ~50ms of the post — but their create-post HTTP reply lands after
+#: that, carrying a post the server serialised BEFORE the reaction existed,
+#: and the app's reactions reducer *replaces* what it holds for the post
+#: with the reply's (empty) list. Every other viewer already had the post
+#: and keeps the mark; the one person it was for watches their message go
+#: straight to ✅. Saving an identical reaction again is a 200 and the server
+#: broadcasts ``reaction_added`` again, which the client stores after the
+#: wipe. 1.5s clears a slow reply without waiting past the answer on a
+#: quick concierge turn — and a mark that arrives after ✅ still renders
+#: beside it, so late is harmless.
+RECEIVED_REASSERT_S = 1.5
 #: Question posts remembered for their body and seeded digits. Bounded like
 #: the other per-message maps: a long-lived daemon must not grow one entry
 #: per question it ever asked.
@@ -178,6 +212,9 @@ class MattermostClient:
         self.session: Any = None
         self.ws: Any = None
         self._reader: asyncio.Task[None] | None = None
+        # Set when the reader stops for any reason, so the bridge can tell a
+        # live connection from a dead one (``wait_closed``).
+        self._closed: asyncio.Event | None = None
         # Frames the client sends are numbered; the authentication challenge
         # below is 1 and everything after it counts on from there.
         self._seq = 1
@@ -208,6 +245,7 @@ class MattermostClient:
         await self.ws.send_json(
             {"seq": 1, "action": "authentication_challenge", "data": {"token": self.token}}
         )
+        self._closed = asyncio.Event()
         self._reader = asyncio.create_task(self._listen())
         return str(me.get("id") or ""), str(me.get("username") or "")
 
@@ -218,19 +256,46 @@ class MattermostClient:
             await self.ws.close()
         if self.session is not None:
             await self.session.close()
+        if self._closed is not None:
+            # Nothing is listening any more; anyone waiting on the reader
+            # must not be parked on it through shutdown.
+            self._closed.set()
+
+    async def wait_closed(self) -> None:
+        """Return when the websocket reader has stopped — the connection is
+        gone and nothing inbound will arrive until it is rebuilt."""
+        if self._closed is None:
+            return
+        await self._closed.wait()
 
     async def _listen(self) -> None:
+        """Read frames until the socket ends, then say so.
+
+        The ``async for`` returns on a clean close, a server restart, a
+        proxy's idle timeout or a dropped network — all of which look
+        identical from here and all of which mean the same thing: the
+        daemon is now deaf. Whether to dial again is the bridge's call, so
+        this only reports.
+        """
         assert self.ws is not None
-        async for message in self.ws:
-            if message.type is not self._aiohttp.WSMsgType.TEXT:
-                continue
-            try:
-                payload = json.loads(message.data)
-            except ValueError:
-                log.debug("mattermost.bad_frame", exc_info=True)
-                continue
-            if isinstance(payload, dict):
-                self.bridge._handle_ws_event(payload)
+        try:
+            async for message in self.ws:
+                if message.type is not self._aiohttp.WSMsgType.TEXT:
+                    continue
+                try:
+                    payload = json.loads(message.data)
+                except ValueError:
+                    log.debug("mattermost.bad_frame", exc_info=True)
+                    continue
+                if isinstance(payload, dict):
+                    self.bridge._handle_ws_event(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("mattermost.reader_failed", exc_info=True)
+        finally:
+            if self._closed is not None:
+                self._closed.set()
 
     # -- the calls the bridge makes -------------------------------------------------
 
@@ -281,6 +346,10 @@ class MattermostClient:
         result = await self._request("POST", "/files", data=form)
         infos = result.get("file_infos") or []
         return str(infos[0].get("id") or "") if infos else ""
+
+    async def get_post(self, post_id: str) -> dict[str, Any]:
+        result: dict[str, Any] = await self._request("GET", f"/posts/{post_id}")
+        return result
 
     async def get_user(self, user_id: str) -> dict[str, Any]:
         result: dict[str, Any] = await self._request("GET", f"/users/{user_id}")
@@ -343,6 +412,10 @@ class MattermostBridge(ChatBridge):
         self.token = token if token is not None else os.environ.get(MATTERMOST_TOKEN_ENV, "")
         self._user_id: str | None = None
         self._username: str | None = None
+        # The second ⏳ per post, in flight; cancelled with the client so a
+        # shutdown never waits on a beat nobody will see.
+        self._reasserts: set[asyncio.Task[None]] = set()
+        self._reassert_s = RECEIVED_REASSERT_S
         self._names: dict[str, str] = {}  # user id -> username
         self._team: str = ""  # the control channel's team, for permalinks
         # Gate prompt post id -> run id, so a ✅ reaction finds its gate.
@@ -373,6 +446,39 @@ class MattermostBridge(ChatBridge):
         return MattermostClient(bridge, bridge.mattermost.url or "", bridge.token)
 
     async def _run_client(self) -> None:
+        """Hold a live websocket for as long as the bridge runs.
+
+        The socket is the *only* way anything reaches the daemon from chat,
+        and REST is untouched when it drops. So a bridge that does not
+        rebuild it goes on posting every run's chronology while silently
+        discarding every steer, command and @mention — healthy from the
+        outside, deaf. discord.py reconnects on its own and so does Slack's
+        Socket Mode client; this client is ours, so the supervision has to
+        be too.
+
+        The *first* connect is not retried. A bad token, a wrong URL or a
+        host that is not there is a configuration error, and the base
+        bridge already reports it once and carries on degraded — retrying
+        it forever would bury the one message that says what to fix. Only a
+        connection that was up is rebuilt.
+        """
+        await self._connect()
+        assert self._stop_evt is not None
+        while not self._stop_evt.is_set():
+            await self._wait_for_disconnect()
+            if self._stop_evt.is_set():
+                return
+            log.warning(
+                "mattermost.disconnected",
+                channel=self.mattermost.channel_id,
+                hint="nothing inbound reaches the daemon until the websocket is back — "
+                "steers, commands and @mentions are dropped meanwhile; rebuilding it",
+            )
+            if not await self._reconnect():
+                return
+
+    async def _connect(self) -> None:
+        """Dial, learn who we are, and open for business."""
         self._user_id, self._username = await self.client.connect()
         await self._resolve_team()
         log.info(
@@ -382,10 +488,82 @@ class MattermostBridge(ChatBridge):
             channel=self.mattermost.channel_id,
         )
         self.mark_ready()
+
+    async def _reconnect(self) -> bool:
+        """Rebuild the connection, backing off between attempts, until it is
+        up or the bridge is stopping. True when connected.
+
+        It never gives up: an instance that comes back an hour later should
+        find the daemon still listening, and there is nothing else to fall
+        back to.
+        """
+        delay = RECONNECT_MIN_S
+        attempt = 0
+        while await self._pause(delay):
+            attempt += 1
+            try:
+                await self._close_quietly()
+                await self._connect()
+            except Exception as exc:
+                delay = min(delay * 2, RECONNECT_MAX_S)
+                log.warning(
+                    "mattermost.reconnect_failed",
+                    attempt=attempt,
+                    error=str(exc),
+                    retry_in_s=delay,
+                    exc_info=True,
+                )
+                continue
+            log.info("mattermost.reconnected", attempt=attempt)
+            return True
+        return False
+
+    async def _wait_for_disconnect(self) -> None:
+        """Return when the reader has stopped, or the bridge is stopping.
+
+        A client that cannot report a drop parks on the stop event, which is
+        all this did before there was anything to supervise.
+        """
         assert self._stop_evt is not None
-        await self._stop_evt.wait()
+        stop = asyncio.ensure_future(self._stop_evt.wait())
+        wait_closed = getattr(self.client, "wait_closed", None)
+        if wait_closed is None:
+            try:
+                await stop
+            finally:
+                stop.cancel()
+            return
+        closed = asyncio.ensure_future(wait_closed())
+        try:
+            await asyncio.wait({stop, closed}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stop.cancel()
+            closed.cancel()
+
+    async def _pause(self, seconds: float) -> bool:
+        """Wait out a backoff; False when the bridge stopped meanwhile, so a
+        shutdown never has to sit through one."""
+        assert self._stop_evt is not None
+        try:
+            await asyncio.wait_for(self._stop_evt.wait(), timeout=seconds)
+        except TimeoutError:
+            return True
+        return False
+
+    async def _close_quietly(self) -> None:
+        """Let go of what is left of the dead connection before dialing
+        again: the client builds a fresh HTTP session per connect, so a
+        reconnect that skipped this would leak one per outage."""
+        try:
+            await self.client.close()
+        except Exception:
+            log.debug("mattermost.close_before_reconnect_failed", exc_info=True)
 
     async def _close_client(self) -> None:
+        # A second ⏳ still waiting on its beat has nobody left to see it.
+        for task in self._reasserts:
+            task.cancel()
+        self._reasserts.clear()
         await self.client.close()
 
     async def _resolve_team(self) -> None:
@@ -639,7 +817,37 @@ class MattermostBridge(ChatBridge):
         return MattermostTarget(self.mattermost.channel_id or "", root_id=thread_id)
 
     async def _fetch_message(self, channel: Any, message_id: str) -> Any:
-        return MattermostMessage(channel.channel, message_id, getattr(channel, "root_id", None))
+        """The handle for a post we made, or None when it is not there any
+        more.
+
+        This used to be free — ``(channel_id, post_id)`` is everything
+        ``patch`` and ``reactions`` need, so the handle could be built
+        without asking. But no caller wants a handle: each one is asking
+        whether the *message* is still there, and each treats None as "it
+        is gone, put a new one up". A fabricated handle answered "still
+        there" every time, so a gate prompt somebody deleted was never
+        re-posted, and a deleted status message was never replaced — every
+        later edit 404ing into a warning instead. One GET per recovery path
+        is the honest price.
+
+        A status the server could not answer with is *not* an absence: a
+        transient failure propagates rather than being reported as a
+        missing post, which would put a duplicate up.
+        """
+        try:
+            post = await self.client.get_post(message_id)
+        except MattermostApiError as exc:
+            if exc.status not in _MISSING_STATUSES:
+                raise
+            log.debug("mattermost.post_gone", post=message_id, status=exc.status)
+            return None
+        if _deleted_at(post):
+            return None
+        return MattermostMessage(
+            str(post.get("channel_id") or getattr(channel, "channel", "") or ""),
+            str(post.get("id") or message_id),
+            str(post.get("root_id") or "") or None,
+        )
 
     async def _send(
         self,
@@ -737,12 +945,19 @@ class MattermostBridge(ChatBridge):
         return ids, notes
 
     def _body(self, text: str, embed: EmbedSpec | None, *, mention_users: bool = False) -> str:
-        """The post text: clipped and mention-safe. ``embed`` reaches here
-        only when cards are off (``[mattermost] embeds = false``), in which
-        case it is rendered into the text as its plain twin."""
+        """The post text: clipped, mention-safe and preview-free. ``embed``
+        reaches here only when cards are off (``[mattermost] embeds =
+        false``), in which case it is rendered into the text as its plain
+        twin.
+
+        Both guards run after the clip, as the other bridges' do: each adds
+        a few characters, and Mattermost's real ceiling is the server's
+        (16383 by default), far above the shared ``max_message_chars``.
+        """
         limit = self.mattermost.max_message_chars
         parts = [part for part in (text, embed.as_text() if embed is not None else "") if part]
         body = _clip("\n\n".join(parts), limit)
+        body = defuse_unfurls(body)
         return body if mention_users else neutralize_mentions(body)
 
     def _report_channel_error(self, exc: Exception) -> bool:
@@ -781,14 +996,40 @@ class MattermostBridge(ChatBridge):
             raise ValueError(f"no Mattermost reaction name for {emoji!r}")
         if not self._user_id:
             return
+        if await self._save_reaction(message.post_id, emoji, name) and emoji == ACK_RECEIVED:
+            # The one mark the asker's own client is known to drop — put
+            # it on again once their create-post reply has done its worst.
+            task = asyncio.ensure_future(self._reassert(message.post_id, emoji, name))
+            self._reasserts.add(task)
+            task.add_done_callback(self._reasserts.discard)
+
+    async def _save_reaction(self, post_id: str, emoji: str, name: str) -> bool:
+        """One reaction save; True when the server took it. A refused save
+        is reported (once per name) rather than raised, anything else
+        propagates for the caller to log with its own context."""
+        assert self._user_id is not None
         try:
-            await self.client.create_reaction(self._user_id, message.post_id, name)
+            await self.client.create_reaction(self._user_id, post_id, name)
         except MattermostApiError as exc:
             # Reacting twice is not an error worth raising: the mark the
             # caller wanted is already there.
             if exc.status != 400:
                 raise
             self._report_reaction_refused(emoji, name, exc)
+            return False
+        return True
+
+    async def _reassert(self, post_id: str, emoji: str, name: str) -> None:
+        """Save the received mark a second time, after ``RECEIVED_REASSERT_S``.
+        Nothing here can be worth surfacing: the first save already landed,
+        and this one exists only to outlive the asker's client wiping it."""
+        await asyncio.sleep(self._reassert_s)
+        if not self._user_id:
+            return
+        try:
+            await self._save_reaction(post_id, emoji, name)
+        except Exception:
+            log.debug("mattermost.reassert_failed", post=post_id, emoji_name=name, exc_info=True)
 
     def _report_reaction_refused(self, emoji: str, name: str, exc: MattermostApiError) -> None:
         """A 400 on a reaction, said out loud once per emoji name.
@@ -935,9 +1176,29 @@ class MattermostBridge(ChatBridge):
 
     def mention_user(self, user_id: str) -> str:
         """``@handle`` — a Mattermost mention is a username, so a stored user
-        id is resolved through the cache the inbound path fills. An id we
-        never saw post renders as itself rather than as a broken ping."""
+        id is resolved through the name cache. An id whose handle could not
+        be learned renders as itself rather than as a broken ping."""
         return f"@{self._names.get(user_id, user_id)}"
+
+    async def _resolve_mentions(self, user_ids: Iterable[str]) -> None:
+        """Learn the handles this bridge's mentions are spelled with.
+
+        A Mattermost mention is ``@username``, and the name cache is filled
+        by the *inbound* path — so it holds whoever has posted since this
+        process started, and nobody else. Every id that reaches here came
+        off the store instead: a run watch, a gate's notify list, a review
+        ask. After a restart the cache has none of them, and the notice
+        that tells somebody their run finished went out carrying a bare
+        26-character id — text, not a notification, to the one person who
+        asked to be told.
+
+        One users call per id never seen; ``_lookup_name`` caches the id
+        itself when the lookup fails, so a deactivated account is not
+        looked up again on every notice.
+        """
+        for user_id in user_ids:
+            if user_id and user_id not in self._names and self._owns_user_id(user_id):
+                await self._lookup_name(user_id)
 
     def _owns_user_id(self, user_id: str) -> bool:
         return bool(_MATTERMOST_ID_RE.match(user_id))
@@ -979,6 +1240,16 @@ class _MattermostTyping:
         while True:
             await self.bridge._send_typing(self.target)
             await asyncio.sleep(TYPING_INTERVAL_S)
+
+
+def _deleted_at(post: dict[str, Any]) -> bool:
+    """Whether a post the server still returned is soft-deleted. A missing
+    post is normally a 404, but Mattermost keeps deleted rows and some
+    paths hand one back with ``delete_at`` set."""
+    try:
+        return int(post.get("delete_at") or 0) > 0
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return False
 
 
 def _decode_json(raw: Any) -> dict[str, Any] | None:
