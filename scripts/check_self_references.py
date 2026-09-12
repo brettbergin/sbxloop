@@ -31,17 +31,19 @@ Deliberate exceptions live in ONE reviewed file, ``scripts/self-references.allow
 matches anything fails the gate too, so the list cannot go stale.
 
 Exit 0 when clean; otherwise every finding as ``path:line: rule: text`` and
-exit 1. Stdlib only — runs as ``make lint`` does, without the package.
+exit 1. Runs under the workspace environment (``uv run``), as ``make lint``
+and CI invoke it: the file list is read from the index through GitPython.
 """
 
 from __future__ import annotations
 
 import ast
 import re
-import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+from git import Repo
 
 ROOT = Path(__file__).resolve().parents[1]
 ALLOWLIST = ROOT / "scripts" / "self-references.allow"
@@ -194,11 +196,11 @@ def check_console_text() -> list[Finding]:
 
 def _tracked_files() -> list[Path]:
     """What the repository ships: git's index, not whatever sits in the
-    working tree (a venv, build output, editor state)."""
-    listing = subprocess.run(
-        ["git", "-C", str(ROOT), "ls-files", "-z"], check=True, capture_output=True
-    ).stdout
-    return [ROOT / name for name in listing.decode("utf-8").split("\0") if name]
+    working tree (a venv, build output, editor state). A tree that is not a
+    repository is a hard failure, never a fallback to walking the filesystem:
+    the gate must not quietly check the wrong file set."""
+    with Repo(ROOT) as repo:
+        return [ROOT / path for path, _stage in repo.index.entries]
 
 
 def _personal_scope() -> list[Path]:

@@ -2363,6 +2363,13 @@ class TelemetryConfig(_ConfigModel):
 
     dsn_env: str = "GLITCHTIP_DSN"
     environment: str = "production"
+    #: How much of a log record's structured fields a report may carry.
+    #: ``diagnostic`` sends only what cannot describe the work — counts,
+    #: durations, flags, the static operator hint; ``all`` adds the free-text
+    #: fields (reasons, error strings, item ids, urls) that say *which* run
+    #: failed, for an operator whose reporting server may hold that;
+    #: ``none`` is the event name alone.
+    log_fields: Literal["none", "diagnostic", "all"] = "diagnostic"
 
     @field_validator("dsn_env")
     @classmethod

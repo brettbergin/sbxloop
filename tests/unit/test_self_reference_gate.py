@@ -16,6 +16,7 @@ from types import ModuleType
 
 import pytest
 import yaml
+from git import InvalidGitRepositoryError, Repo
 
 ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts" / "check_self_references.py"
@@ -212,6 +213,30 @@ class TestPersonalIdentifiers:
         ]
 
 
+class TestTrackedFiles:
+    """The file list is an input to every check: a wrong list shows up as
+    the gate passing on a file it should have flagged."""
+
+    def test_the_index_decides_not_the_working_tree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        with Repo.init(tmp_path) as repo:
+            (tmp_path / "shipped.py").write_text("x = 1\n")
+            (tmp_path / "scratch.txt").write_text("not the repository's problem\n")
+            repo.index.add(["shipped.py"])
+        module = _load()
+        monkeypatch.setattr(module, "ROOT", tmp_path)
+        assert module._tracked_files() == [tmp_path / "shipped.py"]
+
+    def test_a_tree_that_is_not_a_repository_fails_hard(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        module = _load()
+        monkeypatch.setattr(module, "ROOT", tmp_path)
+        with pytest.raises(InvalidGitRepositoryError):
+            module._tracked_files()
+
+
 class TestAllowlist:
     def test_an_entry_covers_every_match_of_that_text_in_that_file(
         self, gate: ModuleType, tmp_path: Path
@@ -252,10 +277,10 @@ class TestWiring:
     def test_make_lint_and_the_ci_lint_job_run_the_gate(self) -> None:
         makefile = (ROOT / "Makefile").read_text()
         lint_target = makefile.split("lint:", 1)[1].split("\n\n", 1)[0]
-        assert "python3 scripts/check_self_references.py" in lint_target
+        assert "uv run python scripts/check_self_references.py" in lint_target
         workflow = yaml.safe_load((ROOT / ".github" / "workflows" / "ci.yml").read_text())
         steps = workflow["jobs"]["lint"]["steps"]
-        assert {"run": "python3 scripts/check_self_references.py"} in steps
+        assert {"run": "uv run python scripts/check_self_references.py"} in steps
 
     def test_ci_push_filter_is_main_alone(self) -> None:
         """#643: working branches are built through their pull request; a

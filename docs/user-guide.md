@@ -1422,7 +1422,19 @@ Your message is
 relayed to the agent exactly like the CLI's `--chat` (answered at the next
 checkpoint, which can be minutes into a long step — a note under your
 message says where the agent is, `⏳ steer queued — agent is mid-execute on t2 (12/40 tool calls so far)`, edited in place until the ⏳ reaction turns ✅
-when the reply lands). `!sbx status|pause [--hold NAME]|resume [--hold NAME|--all]|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>|merge <item|run>|release <item|run>|grant-rounds <run> <n>|resume-repo <owner/name>|schedules [pause <name>|resume <name>]|log [--tail N] [--level L] [--grep T]|stop` in the control channel drive the daemon
+when the reply lands).
+
+Anything you address to the bot — a steer, or an @mention in the control
+channel — is marked on your own message as it moves: **⏳ received**, then
+**✅ answered** or **⚠ something went wrong**. The ⏳ goes on the moment the
+message is routed, before the work behind it starts, so it is there while
+the concierge is still thinking rather than arriving with the reply; a
+steer the run can no longer take settles to ⚠ rather than leaving a clock
+for an answer that will never come; and a message that gets a second turn
+against it later (answering a clarifying question does) is never marked
+received again after it has been answered.
+
+`!sbx status|pause [--hold NAME]|resume [--hold NAME|--all]|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>|merge <item|run>|release <item|run>|grant-rounds <run> <n>|resume-repo <owner/name>|schedules [pause <name>|resume <name>]|log [--tail N] [--level L] [--grep T]|stop` in the control channel drive the daemon
 itself. Pause is a set of **named holds**: a bare `pause`/`resume` acts on the
 operator's hold, the deploy pipeline holds `deploy-<run id>` while it waits for
 the daemon to go idle, and the daemon idles while any hold stands — so an
@@ -1525,6 +1537,16 @@ seeds the question with one emoji per choice — reacting 1️⃣/2️⃣ answer
 because Mattermost's own interactive buttons post to a callback URL, which
 would cost the daemon the dial-out property its bridge is built on, while a
 reaction arrives on the websocket already open.
+
+Answering settles the message the same way everywhere: the question stays
+readable, the chosen option and who chose it are recorded under it, and the
+affordance goes — Discord's buttons disappear, Slack's blocks drop, and
+Mattermost's seeded digits are taken back off, so nobody reacts to a
+question that is already answered. A reaction that arrives on a Mattermost
+question the daemon no longer holds is answered in the thread under it
+(a bot account there has no private note to send), once, however many
+people try it — for the life of the daemon process that asked; one that
+restarted in between no longer recognises the post and stays quiet.
 "What's open?" lists the repository's open issues and which are queued or
 running; `queued: false` shows everything the daemon is not currently
 queued or running — the backlog plus issues that failed or are blocked and
@@ -1630,7 +1652,17 @@ environment / `.env` — never in `sbxloop.toml`. Create a bot account in the
 *System Console* → *Integrations* → *Bot Accounts*, then add it to the
 control channel. The bridge connects over a **websocket**, so like Slack's
 Socket Mode it dials out: no public URL, no inbound hole, and a daemon
-behind NAT works.
+behind NAT works. It holds that connection open for as long as the daemon
+runs: a socket that drops — a server restart, an idle proxy timeout, a
+network blip — is rebuilt with a backoff (one second, doubling to one a
+minute) for as long as it takes, and each attempt is in the log
+(`mattermost.disconnected`, `mattermost.reconnected`). It matters that this
+heals on its own: REST is unaffected by the drop, so a bridge holding a
+dead socket would keep posting every run's chronology while silently
+discarding every steer, command and @mention. A *first* connect that fails
+is not retried — a bad token or a wrong URL is something to fix, not to
+wait out — and is reported as `chat.connect_failed` with the daemon
+carrying on without chat.
 On Mattermost's shapes: the run thread is the reply stream under the
 headline post (its post id is the thread id; `thread_per_run = false` posts
 everything top-level), and Mattermost does not nest, so the one-level
@@ -1638,19 +1670,48 @@ chronology is the shape it already wants. Reactions use the standard emoji
 names. Mattermost has no allowed-mentions control, so agent prose is passed
 through a mention guard — a zero-width space parks every `@name` that would
 resolve, leaving it readable and inert — which is why a run's prose can
-never ping `@channel`. Replying on Mattermost means posting in a thread
+never ping `@channel`. **Link previews** are off the same way. Discord and
+Slack each have a per-message switch; Mattermost's `EnableLinkPreviews` is
+server-wide, and a chronology carrying a PR, an issue and a CI link would
+otherwise grow a website card under each one. But the server picks what to
+embed from the *first autolink* in a post, and a markdown link is never an
+autolink — so every bare URL goes out written as a link to itself: same
+text, same click, no card. (Angle brackets would not do it: `<url>` is an
+autolink too, which is why Discord's trick is not the one used here.) Replying on Mattermost means posting in a thread
 rather than answering one message, so — as on Slack — the concierge and
 steering are @mention-only (`@your-bot` in the control channel or in a
 run's thread), and people can talk to each other in a run's thread without
 the bot answering. `sbxloop doctor` shows one
 `chat bridge (mattermost)` row: extra installed, token present.
+A mention here is `@username` rather than an id, so before the daemon pings
+anyone from something it remembered — a run watch, a merge gate's notify
+list, a review ask — it resolves those ids to handles through the users
+API. That matters after a restart, when the bridge has not yet seen any of
+those people post: without it the notice telling you your run finished went
+out carrying a bare 26-character id, which is text, not a notification. An
+id that cannot be resolved (a deactivated account) renders as itself and is
+not looked up again.
 Cards are coloured message attachments (`[mattermost] embeds`) — a post the
 server rejects is retried text-only, so a run's chronology never goes
 missing over presentation — a workload result's files are uploaded up to
-`max_attachment_bytes` and named by host path beyond it (or if an upload
-fails; a named file is never silently dropped), and the merge gate's
-approve button is a seeded ✅: reacting with it approves, exactly as
-`!sbx merge` does.
+`max_attachment_bytes` and five per post (Mattermost's own limit; the rest
+are named by host path, as is any file too large or whose upload fails — a
+named file is never silently dropped), and the merge gate's approve button
+is a seeded ✅: reacting with it approves, exactly as `!sbx merge` does, and
+the reaction comes back off once the gate resolves so a merged prompt never
+looks like it is still waiting for you. A prompt or a status message that
+somebody deleted is noticed and put back on the next restart, rather than
+leaving a standing gate with nothing to approve it with.
+
+While the concierge is working on an @mention it shows **"…is typing"**
+under the message box, for as long as the turn takes — the same signal
+Discord gives, sent over the websocket the bridge already holds, so it
+costs no API call. The ⏳ / ✅ reactions on your own message say *received*
+and *answered* on top of it. Those marks go by Mattermost's standard emoji
+names; if your instance's emoji set does not carry one, the bridge says so
+once in the log (`mattermost.reaction_refused`, naming the emoji and what
+the server said) rather than leaving you with an ack that silently never
+appears.
 
 ## Artifacts
 
@@ -2168,6 +2229,7 @@ the home's `config/sbxloop.toml`:
 [telemetry]
 dsn_env = "GLITCHTIP_DSN"
 environment = "production"
+log_fields = "diagnostic"
 ```
 
 Reports include unhandled CLI exceptions, sbxloop ERROR events, and WARNING
@@ -2175,10 +2237,45 @@ events logged with an exception. They carry the sbxloop release, deployment
 label, static event name, exception types and messages, chained exceptions,
 exception-group members, and stack filenames, paths, functions, line numbers,
 and source context. Recognizable credential patterns are redacted using the
-same filter as local logs. Local variables, command arguments, and structured
-log fields are not collected. Messages and source context can include
-application data; configure a reporting destination appropriate for that data.
-Individual text values are limited to 100,000 characters by the SDK.
+same filter as local logs. Local variables and command arguments are not
+collected. Messages and source context can include application data; configure
+a reporting destination appropriate for that data. Individual text values are
+limited to 100,000 characters by the SDK.
+
+#### What an exception-less error report carries
+
+Most ERROR events are not exceptions: a circuit breaker opening, a work item
+abandoned, a sandbox that could not be provisioned. They reach the server with
+no traceback, so on their own they are a bare event name and nothing to act on.
+Three things travel with them instead:
+
+- **The call site**, as the report's culprit (`sbxloop.daemon.loop in _handle_failure`) — the same class of fact a traceback frame carries, so two
+  call sites that log the same event name no longer read alike.
+- **The event's `hint`**, the static sentence the call site writes for an
+  operator reading the journal, as the report's title line
+  (`breaker.opened: <hint>`). It is this repository's own prose, identical on
+  every occurrence, so a report that explains itself still groups with the
+  others of its kind.
+- **The record's structured fields**, as far as `log_fields` allows.
+
+`log_fields` decides how much of the record travels, because a log field can
+hold a target repository's content:
+
+| Value        | What travels                                                                                                                                                                                                |
+| ------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `none`       | Nothing of the record: the event name and the call site alone, as before this setting existed.                                                                                                              |
+| `diagnostic` | The default. Numbers and flags (attempt counts, durations, cooldowns, failure streaks), the static `hint`, and enum-valued keys sbxloop writes itself (`role`, `backend`, `kind`, `stage`, `state`, …).     |
+| `all`        | Everything above plus the free-text fields — `reason`, `error`, item ids, branch names, urls — which say *which* run failed and why. Choose this only for a reporting server that may hold repository text. |
+
+Under every value, fields whose key names a credential are already masked by
+the same filter local logs use, free-text values are scrubbed for credential
+shapes and trimmed to 2,000 characters, and nothing the SDK itself would add
+(breadcrumbs, request, user, server name, module list) is ever sent.
+
+Reports upgrading from an earlier version regroup once: adding the culprit and
+the hint changes the fingerprint the server derives, so existing issues for
+these events stop receiving new occurrences and a new issue opens in their
+place.
 
 The SDK is confined to the host: no DSN is injected into sandboxes and no
 sandbox egress rule is added. Session tracking, tracing, profiling, metrics,
@@ -2193,6 +2290,7 @@ Remove or empty the DSN to disable reporting, then restart the daemon.
 | ----------------------- | --------------- | ------------------------------------------------------------------------- |
 | `telemetry.dsn_env`     | `GLITCHTIP_DSN` | Name of the environment variable containing the DSN; never the DSN value. |
 | `telemetry.environment` | `production`    | Deployment label attached to reports.                                     |
+| `telemetry.log_fields`  | `diagnostic`    | How much of a log record a report carries: `none`, `diagnostic`, `all`.   |
 
 These are host settings, with no per-repository override; tracked project
 configuration cannot change the reporting destination.

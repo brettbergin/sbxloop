@@ -51,7 +51,14 @@ class FanoutFrontend:
             try:
                 bridge.start(connect_wait_s=connect_wait_s)
             except Exception as exc:
-                log.error("chat.bridge_failed", backend=bridge.backend, error=str(exc))
+                log.error(
+                    "chat.bridge_failed",
+                    backend=bridge.backend,
+                    error=str(exc),
+                    hint="a chat bridge would not start, so the daemon refuses to run "
+                    "half-connected; the backend's token and its channel id in the "
+                    "config are what to check",
+                )
                 for done in started:
                     try:
                         done.close(drain_wait_s=0.0)

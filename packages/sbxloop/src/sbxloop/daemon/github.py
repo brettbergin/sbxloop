@@ -216,6 +216,9 @@ class DaemonGithub:
                 sandbox=self.name,
                 duration_s=round(time.monotonic() - started, 1),
                 error=str(exc),
+                hint="the long-lived sandbox the daemon makes its GitHub calls from "
+                "could not be created, so polling and delivery cannot run; the sandbox "
+                "backend, its image and the host's disk are what to check — `sbxloop doctor`",
             )
             raise DaemonError(f"cannot provision the daemon github sandbox: {exc}") from exc
         self._sandbox, self._client = sandbox, clients[0]

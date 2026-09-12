@@ -1576,6 +1576,10 @@ class Provisioner:
                                 role=spec.role,
                                 error=str(exc),
                                 exc_info=len(errors) > 0,
+                                hint="one of the run's sandbox pair could not be "
+                                "created, so the run cannot start; the sandbox backend, "
+                                "the image the role bakes from and the host's disk are "
+                                "what to check — `sbxloop doctor --deep`",
                             )
                             errors.append(exc)
                     if errors:

@@ -24,9 +24,16 @@ def test_telemetry_is_operator_configuration(tmp_path: Path) -> None:
     config = load_config(tmp_path, env={"SBXLOOP_TELEMETRY__ENVIRONMENT": "staging"})
     assert config.telemetry.environment == "staging"
     assert Config().telemetry.dsn_env == "GLITCHTIP_DSN"
-    kept, dropped = _project_layer({"telemetry": {"dsn_env": "ATTACKER", "environment": "x"}})
+    assert Config().telemetry.log_fields == "diagnostic"
+    kept, dropped = _project_layer(
+        {"telemetry": {"dsn_env": "ATTACKER", "environment": "x", "log_fields": "all"}}
+    )
     assert kept == {}
-    assert sorted(dropped) == ["telemetry.dsn_env", "telemetry.environment"]
+    assert sorted(dropped) == [
+        "telemetry.dsn_env",
+        "telemetry.environment",
+        "telemetry.log_fields",
+    ]
 
 
 @pytest.mark.parametrize("fmt", ["console", "json"])
@@ -75,8 +82,8 @@ def test_logged_errors_are_reported_once_without_payloads(
         )
         frames = events[0]["exception"]["values"][0]["stacktrace"]["frames"]
         assert frames[-1]["function"] == "test_logged_errors_are_reported_once_without_payloads"
-        assert events[0]["message"] == "run.crashed"
-        assert events[1]["message"] == "run.abandoned"
+        assert events[0]["message"]["message"] == "run.crashed"
+        assert events[1]["message"]["message"] == "run.abandoned"
         assert events[0]["environment"] == "test"
         assert "context_line" in frames[-1]
         # Source excerpts can contain this test's literal fixtures; actual
@@ -97,6 +104,121 @@ def test_logged_errors_are_reported_once_without_payloads(
     finally:
         telemetry.shutdown_telemetry()
         configure_logging("DEBUG")
+
+
+@pytest.fixture
+def reports(monkeypatch: pytest.MonkeyPatch):
+    """Capture what a configured client would have queued, per policy."""
+    import sentry_sdk
+    from sentry_sdk.transport import Transport
+
+    envelopes: list = []
+
+    class MemoryTransport(Transport):
+        def capture_envelope(self, envelope):
+            envelopes.append(envelope)
+
+    real_client = sentry_sdk.Client
+    monkeypatch.setattr(
+        sentry_sdk, "Client", lambda **options: real_client(**options, transport=MemoryTransport)
+    )
+    monkeypatch.setenv("GLITCHTIP_DSN", "https://public@errors.example.com/1")
+
+    def capture(log_fields: str, emit) -> list[dict]:
+        configure_logging("DEBUG", stream=io.StringIO())
+        try:
+            telemetry.configure_telemetry(
+                TelemetryConfig(environment="test", log_fields=log_fields)
+            )
+            emit(get_logger("sbxloop.test"))
+            telemetry.shutdown_telemetry()
+        finally:
+            configure_logging("DEBUG")
+        return [item.payload.json for envelope in envelopes for item in envelope.items]
+
+    yield capture
+    telemetry.shutdown_telemetry()
+
+
+def _breaker(log) -> None:
+    """An ERROR event with no exception — the shape a bare name cannot explain."""
+    log.error(
+        "breaker.opened",
+        consecutive_failures=3,
+        cooldown_s=900.0,
+        held=True,
+        role="agent",
+        reason="checks failed on customer-response-service",
+        item="gh:issue:41",
+        hint="dispatch is paused; a breaker that keeps opening is the host, not an item",
+    )
+
+
+def test_an_exception_less_error_explains_itself(reports) -> None:
+    """A bare event name is not a report: the hint titles it, the call site
+    locates it, and the counts say how bad it got."""
+    (event,) = reports("diagnostic", _breaker)
+    assert event["message"]["message"] == "breaker.opened"  # the grouping key
+    assert event["message"]["formatted"].startswith("breaker.opened: dispatch is paused")
+    assert event["culprit"] == f"{__name__} in _breaker"
+    assert event["extra"] == {
+        "consecutive_failures": 3,
+        "cooldown_s": 900.0,
+        "held": True,
+        "role": "agent",
+        "hint": "dispatch is paused; a breaker that keeps opening is the host, not an item",
+    }
+
+
+def test_diagnostic_fields_cannot_describe_the_work(reports) -> None:
+    """Counts, flags and this repository's own vocabulary travel; free text
+    that could hold a target repository's content does not."""
+    (event,) = reports("diagnostic", _breaker)
+    assert "customer-response-service" not in json.dumps(event)
+    assert "gh:issue:41" not in json.dumps(event)
+
+
+def test_all_adds_the_free_text_that_says_which_run_failed(reports) -> None:
+    (event,) = reports("all", _breaker)
+    assert event["extra"]["reason"] == "checks failed on customer-response-service"
+    assert event["extra"]["item"] == "gh:issue:41"
+
+
+def test_none_keeps_the_record_local(reports) -> None:
+    (event,) = reports("none", _breaker)
+    assert "extra" not in event
+    assert event["message"]["formatted"] == "breaker.opened"
+    assert event["culprit"] == f"{__name__} in _breaker"
+
+
+def test_reported_fields_are_scrubbed_and_bounded(reports) -> None:
+    def emit(log) -> None:
+        log.error(
+            "deliver.failed",
+            token="ghp_0123456789abcdefghijklmnopqrstuvwxyz",
+            reason="Authorization: Bearer test-credential\n" + "detail " * 2000,
+        )
+
+    (event,) = reports("all", emit)
+    serialized = json.dumps(event)
+    assert "ghp_0123456789" not in serialized
+    assert "test-credential" not in serialized
+    assert len(event["extra"]["reason"]) == 2_000
+
+
+def test_an_exception_keeps_its_own_title_and_location(reports) -> None:
+    def emit(log) -> None:
+        try:
+            raise RuntimeError("Upstream request failed with HTTP 503")
+        except RuntimeError:
+            log.error("deliver.failed", exc_info=True, attempt=2)
+
+    (event,) = reports("diagnostic", emit)
+    assert event["exception"]["values"][0]["type"] == "RuntimeError"
+    # The traceback already locates it; a synthesized culprit would only
+    # name the frame that logged, not the frame that raised.
+    assert "culprit" not in event
+    assert event["extra"] == {"attempt": 2}
 
 
 def test_cli_reports_and_flushes_an_unhandled_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -221,6 +343,23 @@ def test_sdk_ambient_context_is_discarded() -> None:
         "modules": {"private": "1"},
     }
     assert telemetry._before_send(event, {}) == {"event_id": "id", "message": "run.crashed"}
+
+
+def test_only_the_fields_this_module_chose_reach_extra() -> None:
+    """Chosen fields ride their own key until ``_before_send`` promotes them,
+    so an ``extra`` the SDK put on the event is still unambiguously not ours
+    and is still dropped."""
+    event = {
+        "event_id": "id",
+        "culprit": "sbxloop.daemon.loop in _tick",
+        "extra": {"argv": "private"},
+        telemetry._FIELDS_KEY: {"attempt": 2},
+    }
+    assert telemetry._before_send(event, {}) == {
+        "event_id": "id",
+        "culprit": "sbxloop.daemon.loop in _tick",
+        "extra": {"attempt": 2},
+    }
 
 
 @pytest.mark.parametrize("explicit", [True, False])
