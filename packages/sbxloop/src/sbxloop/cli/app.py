@@ -3057,6 +3057,7 @@ def list_models(
     `sbxloop run --model`.
     """
     from sbxloop.cli.models import (
+        NoModelListing,
         fetch_backend_rows,
         format_context,
         format_efforts,
@@ -3068,17 +3069,29 @@ def list_models(
     selected_repo = _resolve_repo(config, repo).repo if repo is not None else None
     choices = model_plan(config, repo=selected_repo)
     try:
-        rows = fetch_backend_rows(backend, timeout_s=timeout_s)
+        rows = fetch_backend_rows(backend, timeout_s=timeout_s, config=config)
+    except NoModelListing as exc:
+        # Not a failure: a served endpoint need not list its models, and
+        # the configured model is still the one to use. The cache is
+        # advisory, so there is nothing to update either.
+        if json_output:
+            typer.echo("[]")
+        typer.echo(
+            f"{exc} — the configured model ({config.model}) is still valid to use; an "
+            "absent listing is not a failure",
+            err=True,
+        )
+        return
     except SbxloopError as exc:
         # escape(): the install hint (`sbxloop[copilot]`) and arbitrary SDK
         # error text must not be parsed as rich markup.
         console.print(f"[bold red]list-models failed:[/] {rich_escape(str(exc))}")
         raise typer.Exit(2) from exc
     if rows:
-        from sbxloop.modelcatalog import save_catalog
+        from sbxloop.modelcatalog import catalog_endpoint, save_catalog
 
         try:
-            save_catalog(config.paths, backend, rows)
+            save_catalog(config.paths, backend, rows, endpoint=catalog_endpoint(config))
         except (OSError, ValueError):
             typer.echo("Models listed, but the TUI model cache could not be updated.", err=True)
     if json_output:

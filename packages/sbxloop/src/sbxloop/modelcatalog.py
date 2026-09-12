@@ -2,6 +2,9 @@
 
 The cache is advisory: an omitted alias remains a valid configuration value.
 Only picker metadata is persisted, never raw SDK replies or credentials.
+
+A catalog is keyed by backend and, for the openai backend, by the endpoint it
+was fetched from: a listing from one endpoint is never offered for another.
 """
 
 from __future__ import annotations
@@ -49,6 +52,9 @@ class ModelCatalog(BaseModel):
 
     version: Literal[1] = 1
     backend: Literal["copilot", "claude", "codex", "openai"]
+    # The `[agent.openai] base_url` the listing came from; None for the
+    # vendor backends, whose host is fixed.
+    endpoint: str | None = None
     fetched_at: float = Field(ge=0, allow_inf_nan=False)
     models: list[CatalogModel] = Field(min_length=1, max_length=2000)
 
@@ -63,7 +69,19 @@ class ModelCatalog(BaseModel):
         return (time.time() if now is None else now) - self.fetched_at >= REFRESH_AFTER_S
 
 
-def load_catalog(home: SbxloopHome, backend: AgentBackend) -> ModelCatalog | None:
+def catalog_endpoint(config: Config) -> str | None:
+    """What a catalog under ``config`` is keyed by beyond the backend: the
+    configured endpoint for the openai backend, nothing for the rest."""
+    if config.agent.backend != "openai":
+        return None
+    return config.openai_for().base_url
+
+
+def load_catalog(
+    home: SbxloopHome, backend: AgentBackend, *, endpoint: str | None = None
+) -> ModelCatalog | None:
+    """The cached catalog for ``backend`` fetched from ``endpoint`` — a
+    catalog from another endpoint (or none) is not offered."""
     path = home.model_catalogs / f"{backend.name}.json"
     try:
         with path.open("rb") as stream:
@@ -71,13 +89,19 @@ def load_catalog(home: SbxloopHome, backend: AgentBackend) -> ModelCatalog | Non
         if len(data) > MAX_CACHE_BYTES:
             return None
         catalog = ModelCatalog.model_validate_json(data)
-        return catalog if catalog.backend == backend.name else None
+        if catalog.backend != backend.name or catalog.endpoint != endpoint:
+            return None
+        return catalog
     except (OSError, ValueError):
         return None
 
 
 def save_catalog(
-    home: SbxloopHome, backend: AgentBackend, rows: Sequence[ModelRow]
+    home: SbxloopHome,
+    backend: AgentBackend,
+    rows: Sequence[ModelRow],
+    *,
+    endpoint: str | None = None,
 ) -> ModelCatalog:
     """Atomically replace a complete successful catalogue; failures keep the old one."""
     models = {
@@ -87,7 +111,12 @@ def save_catalog(
     if not models:
         raise ValueError("The backend returned no models; keeping the previous catalog.")
     catalog = ModelCatalog.model_validate(
-        {"backend": backend.name, "fetched_at": time.time(), "models": list(models.values())}
+        {
+            "backend": backend.name,
+            "endpoint": endpoint,
+            "fetched_at": time.time(),
+            "models": list(models.values()),
+        }
     )
     data = catalog.model_dump_json().encode()
     if len(data) > MAX_CACHE_BYTES:
@@ -108,8 +137,14 @@ def save_catalog(
     return catalog
 
 
-def refresh_catalog(home: SbxloopHome, backend: AgentBackend) -> ModelCatalog:
-    return save_catalog(home, backend, fetch_backend_rows(backend, timeout_s=QUERY_TIMEOUT_S))
+def refresh_catalog(
+    home: SbxloopHome, backend: AgentBackend, config: Config | None = None
+) -> ModelCatalog:
+    """Fetch and cache; ``config`` supplies the endpoint the openai backend
+    lists from and keys the catalog by."""
+    endpoint = catalog_endpoint(config) if config is not None else None
+    rows = fetch_backend_rows(backend, timeout_s=QUERY_TIMEOUT_S, config=config)
+    return save_catalog(home, backend, rows, endpoint=endpoint)
 
 
 _lock = threading.Lock()
@@ -124,18 +159,19 @@ def refresh_after_provision(config: Config) -> threading.Thread | None:
     A catalog failure must never delay or roll back a successfully built box.
     """
     home, backend = config.paths, backend_for(config)
-    key = (str(home.root.resolve()), backend.name)
+    endpoint = catalog_endpoint(config)
+    key = (str(home.root.resolve()), f"{backend.name}@{endpoint or ''}")
     with _lock:
         if key in _active or time.monotonic() < _retry_at.get(key, 0):
             return None
-        catalog = load_catalog(home, backend)
+        catalog = load_catalog(home, backend, endpoint=endpoint)
         if catalog is not None and not catalog.stale():
             return None
         _active.add(key)
 
     def discover() -> None:
         try:
-            catalog = refresh_catalog(home, backend)
+            catalog = refresh_catalog(home, backend, config)
             log.info("models.cached", backend=backend.name, count=len(catalog.models))
         except Exception as exc:
             # SDK errors can echo credentials. The interactive refresh/listing

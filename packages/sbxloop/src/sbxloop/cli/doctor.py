@@ -29,9 +29,10 @@ from sqlalchemy.exc import SQLAlchemyError
 import sbxloop
 from sbxloop import toolchains
 from sbxloop.agentmodels import model_for_phase, model_plan
-from sbxloop.backends import backend_for
+from sbxloop.backends import AgentBackend, backend_for
 from sbxloop.chatservices import ChatService, service_named
 from sbxloop.config import Config, MergeMethod, RepoConfig, load_config, load_config_with_sources
+from sbxloop.endpoint import parse_endpoint
 from sbxloop.engine.landing import allowed_merge_methods, resolve_merge_method
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError, StateError
@@ -72,6 +73,18 @@ class Check:
 
 
 ProgressFn = Callable[[str], None]
+
+
+def _agent_credential_detail(agent: AgentBackend, config: Config, env: dict[str, str]) -> str:
+    """The credential row's text. The vendor backends keep their literal
+    strings; the openai backend's row also names the endpoint the
+    configured variable is bound to, since that is what the variable is
+    *for* and where a wrong key would be refused."""
+    if not agent.has_token(config, env):
+        return agent.missing_token_detail(config)
+    if agent.name != "openai":
+        return "set"
+    return f"set — bound to the endpoint at {agent.token_host(config)}"
 
 
 def _sdk_version() -> str:
@@ -1103,8 +1116,15 @@ def collect_checks(
                     )
                 )
 
-        # network policy reachable for the chosen agent backend's hosts
-        for host in backend_for(config).token_hosts(config):
+        # network policy reachable for the chosen agent backend's hosts —
+        # each distinct one, since a repository's own endpoint override
+        # (openai) binds the same credential to another host
+        agent_hosts = dict.fromkeys(
+            host
+            for repo in (None, *(entry.repo for entry in config.github.repos))
+            for host in backend_for(config).token_hosts(config, repo)
+        )
+        for host in agent_hosts:
             report(f"checking network policy for {host}")
             try:
                 allowed = cli.policy_check(host)
@@ -1249,9 +1269,21 @@ def collect_checks(
         Check(
             agent.doctor_check_name(config),
             agent.has_token(config, env),
-            "set" if agent.has_token(config, env) else agent.missing_token_detail(config),
+            _agent_credential_detail(agent, config, env),
         )
     )
+    if agent.name == "openai":
+        # Whether the endpoint answers *from the host* — stated as exactly
+        # that: the agent sandbox's route to it is a question doctor
+        # cannot answer, and the row says so rather than implying it.
+        from sbxloop.cli.models import probe_openai_endpoint
+
+        openai_settings = config.openai_for()
+        assert openai_settings.base_url is not None  # required under the backend at load
+        authority = parse_endpoint(openai_settings.base_url).authority
+        report(f"probing the model endpoint at {authority}")
+        answered, detail = probe_openai_endpoint(config, env=env)
+        checks.append(Check(f"endpoint: {authority}", answered, detail, hard=False))
     checks.extend(registry_credential_checks(config, env))
     checks.extend(credentials_checks(config, env))
     checks.extend(mcp_checks(config, env))

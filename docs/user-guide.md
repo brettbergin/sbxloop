@@ -333,6 +333,15 @@ Under `[agent] backend = "codex"`, install the optional host extra:
 catalogue, including supported reasoning levels, without starting a model
 turn. Running jobs needs no host SDK extra.
 
+Under `[agent] backend = "openai"` the command asks the configured endpoint
+itself — `GET <base_url>/models`, which vLLM, LiteLLM and the hosted API all
+serve — with the key `api_key_env` names, over the stdlib (id and name; a
+served listing carries no billing or context metadata). An endpoint that
+answers 404 there serves no listing: the command says so and exits cleanly,
+because the configured `model` is still valid to use and the model cache is
+advisory. That cache is keyed by the endpoint as well as the backend, so a
+listing from one endpoint is never offered for another.
+
 Or as a library:
 
 ```python
