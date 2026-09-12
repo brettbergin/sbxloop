@@ -992,7 +992,7 @@ class TestDoctor:
         env["COPILOT_GITHUB_TOKEN"] = "tok"
         (row,) = [c for c in collect_checks(env) if c.name == "chat concierge"]
         assert row.ok and "180s per message" in row.detail
-        assert "config edits: on (6 prefix(es) locked)" in row.detail
+        assert "config edits: on (7 prefix(es) locked)" in row.detail
         (workdir / "sbxloop.toml").write_text(
             "[discord]\nchannel_id = 42\n[concierge]\nedit_config = false\n"
         )
