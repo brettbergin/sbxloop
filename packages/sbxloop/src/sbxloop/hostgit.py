@@ -133,7 +133,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-from git import GitCommandError, InvalidGitRepositoryError, NoSuchPathError, Repo
+from git import (
+    Git,
+    GitCommandError,
+    GitCommandNotFound,
+    InvalidGitRepositoryError,
+    NoSuchPathError,
+    Repo,
+)
 
 from sbxloop import gitcredentials
 from sbxloop.errors import DeliveryError, ProvisionError
@@ -884,19 +891,12 @@ class LfsPopulation:
 
 def lfs_version() -> str | None:
     """The host's ``git lfs version`` line, or None when git-lfs is not
-    installed (git then does not know the subcommand)."""
-    git = find_git()
-    if git is None:
-        return None
+    installed (git then does not know the subcommand, and exits non-zero)
+    or there is no git at all."""
     try:
-        proc = subprocess.run(  # nosec B603 - list argv, git binary, no shell
-            [git, "lfs", "version"], capture_output=True, text=True, check=False
-        )
-    except OSError:
+        return str(Git().lfs("version")).strip() or None
+    except (GitCommandError, GitCommandNotFound):
         return None
-    if proc.returncode != 0:
-        return None
-    return proc.stdout.strip() or None
 
 
 def lfs_endpoint(repo_url: str) -> str:
