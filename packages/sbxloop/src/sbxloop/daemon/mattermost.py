@@ -108,6 +108,11 @@ _CHANNEL_STATUSES = frozenset({403, 404})
 #: rest are named by host path, so a workload result never silently loses an
 #: artifact to a transport limit.
 MAX_POST_FILES = 5
+#: A lost websocket is rebuilt after this long, doubling to the cap. The
+#: socket is the daemon's only inbound path, so the first retry is quick; the
+#: cap keeps a long outage down to one attempt — and one log line — a minute.
+RECONNECT_MIN_S = 1.0
+RECONNECT_MAX_S = 60.0
 #: How often the bridge re-asserts "…is typing" while a concierge turn runs.
 #: A Mattermost client drops the indicator a few seconds after the last
 #: frame, so a turn that thinks for a minute has to keep saying it.
@@ -178,6 +183,9 @@ class MattermostClient:
         self.session: Any = None
         self.ws: Any = None
         self._reader: asyncio.Task[None] | None = None
+        # Set when the reader stops for any reason, so the bridge can tell a
+        # live connection from a dead one (``wait_closed``).
+        self._closed: asyncio.Event | None = None
         # Frames the client sends are numbered; the authentication challenge
         # below is 1 and everything after it counts on from there.
         self._seq = 1
@@ -208,6 +216,7 @@ class MattermostClient:
         await self.ws.send_json(
             {"seq": 1, "action": "authentication_challenge", "data": {"token": self.token}}
         )
+        self._closed = asyncio.Event()
         self._reader = asyncio.create_task(self._listen())
         return str(me.get("id") or ""), str(me.get("username") or "")
 
@@ -218,19 +227,46 @@ class MattermostClient:
             await self.ws.close()
         if self.session is not None:
             await self.session.close()
+        if self._closed is not None:
+            # Nothing is listening any more; anyone waiting on the reader
+            # must not be parked on it through shutdown.
+            self._closed.set()
+
+    async def wait_closed(self) -> None:
+        """Return when the websocket reader has stopped — the connection is
+        gone and nothing inbound will arrive until it is rebuilt."""
+        if self._closed is None:
+            return
+        await self._closed.wait()
 
     async def _listen(self) -> None:
+        """Read frames until the socket ends, then say so.
+
+        The ``async for`` returns on a clean close, a server restart, a
+        proxy's idle timeout or a dropped network — all of which look
+        identical from here and all of which mean the same thing: the
+        daemon is now deaf. Whether to dial again is the bridge's call, so
+        this only reports.
+        """
         assert self.ws is not None
-        async for message in self.ws:
-            if message.type is not self._aiohttp.WSMsgType.TEXT:
-                continue
-            try:
-                payload = json.loads(message.data)
-            except ValueError:
-                log.debug("mattermost.bad_frame", exc_info=True)
-                continue
-            if isinstance(payload, dict):
-                self.bridge._handle_ws_event(payload)
+        try:
+            async for message in self.ws:
+                if message.type is not self._aiohttp.WSMsgType.TEXT:
+                    continue
+                try:
+                    payload = json.loads(message.data)
+                except ValueError:
+                    log.debug("mattermost.bad_frame", exc_info=True)
+                    continue
+                if isinstance(payload, dict):
+                    self.bridge._handle_ws_event(payload)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.debug("mattermost.reader_failed", exc_info=True)
+        finally:
+            if self._closed is not None:
+                self._closed.set()
 
     # -- the calls the bridge makes -------------------------------------------------
 
@@ -373,6 +409,39 @@ class MattermostBridge(ChatBridge):
         return MattermostClient(bridge, bridge.mattermost.url or "", bridge.token)
 
     async def _run_client(self) -> None:
+        """Hold a live websocket for as long as the bridge runs.
+
+        The socket is the *only* way anything reaches the daemon from chat,
+        and REST is untouched when it drops. So a bridge that does not
+        rebuild it goes on posting every run's chronology while silently
+        discarding every steer, command and @mention — healthy from the
+        outside, deaf. discord.py reconnects on its own and so does Slack's
+        Socket Mode client; this client is ours, so the supervision has to
+        be too.
+
+        The *first* connect is not retried. A bad token, a wrong URL or a
+        host that is not there is a configuration error, and the base
+        bridge already reports it once and carries on degraded — retrying
+        it forever would bury the one message that says what to fix. Only a
+        connection that was up is rebuilt.
+        """
+        await self._connect()
+        assert self._stop_evt is not None
+        while not self._stop_evt.is_set():
+            await self._wait_for_disconnect()
+            if self._stop_evt.is_set():
+                return
+            log.warning(
+                "mattermost.disconnected",
+                channel=self.mattermost.channel_id,
+                hint="nothing inbound reaches the daemon until the websocket is back — "
+                "steers, commands and @mentions are dropped meanwhile; rebuilding it",
+            )
+            if not await self._reconnect():
+                return
+
+    async def _connect(self) -> None:
+        """Dial, learn who we are, and open for business."""
         self._user_id, self._username = await self.client.connect()
         await self._resolve_team()
         log.info(
@@ -382,8 +451,76 @@ class MattermostBridge(ChatBridge):
             channel=self.mattermost.channel_id,
         )
         self.mark_ready()
+
+    async def _reconnect(self) -> bool:
+        """Rebuild the connection, backing off between attempts, until it is
+        up or the bridge is stopping. True when connected.
+
+        It never gives up: an instance that comes back an hour later should
+        find the daemon still listening, and there is nothing else to fall
+        back to.
+        """
+        delay = RECONNECT_MIN_S
+        attempt = 0
+        while await self._pause(delay):
+            attempt += 1
+            try:
+                await self._close_quietly()
+                await self._connect()
+            except Exception as exc:
+                delay = min(delay * 2, RECONNECT_MAX_S)
+                log.warning(
+                    "mattermost.reconnect_failed",
+                    attempt=attempt,
+                    error=str(exc),
+                    retry_in_s=delay,
+                    exc_info=True,
+                )
+                continue
+            log.info("mattermost.reconnected", attempt=attempt)
+            return True
+        return False
+
+    async def _wait_for_disconnect(self) -> None:
+        """Return when the reader has stopped, or the bridge is stopping.
+
+        A client that cannot report a drop parks on the stop event, which is
+        all this did before there was anything to supervise.
+        """
         assert self._stop_evt is not None
-        await self._stop_evt.wait()
+        stop = asyncio.ensure_future(self._stop_evt.wait())
+        wait_closed = getattr(self.client, "wait_closed", None)
+        if wait_closed is None:
+            try:
+                await stop
+            finally:
+                stop.cancel()
+            return
+        closed = asyncio.ensure_future(wait_closed())
+        try:
+            await asyncio.wait({stop, closed}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stop.cancel()
+            closed.cancel()
+
+    async def _pause(self, seconds: float) -> bool:
+        """Wait out a backoff; False when the bridge stopped meanwhile, so a
+        shutdown never has to sit through one."""
+        assert self._stop_evt is not None
+        try:
+            await asyncio.wait_for(self._stop_evt.wait(), timeout=seconds)
+        except TimeoutError:
+            return True
+        return False
+
+    async def _close_quietly(self) -> None:
+        """Let go of what is left of the dead connection before dialing
+        again: the client builds a fresh HTTP session per connect, so a
+        reconnect that skipped this would leak one per outage."""
+        try:
+            await self.client.close()
+        except Exception:
+            log.debug("mattermost.close_before_reconnect_failed", exc_info=True)
 
     async def _close_client(self) -> None:
         await self.client.close()

@@ -1652,7 +1652,17 @@ environment / `.env` — never in `sbxloop.toml`. Create a bot account in the
 *System Console* → *Integrations* → *Bot Accounts*, then add it to the
 control channel. The bridge connects over a **websocket**, so like Slack's
 Socket Mode it dials out: no public URL, no inbound hole, and a daemon
-behind NAT works.
+behind NAT works. It holds that connection open for as long as the daemon
+runs: a socket that drops — a server restart, an idle proxy timeout, a
+network blip — is rebuilt with a backoff (one second, doubling to one a
+minute) for as long as it takes, and each attempt is in the log
+(`mattermost.disconnected`, `mattermost.reconnected`). It matters that this
+heals on its own: REST is unaffected by the drop, so a bridge holding a
+dead socket would keep posting every run's chronology while silently
+discarding every steer, command and @mention. A *first* connect that fails
+is not retried — a bad token or a wrong URL is something to fix, not to
+wait out — and is reported as `chat.connect_failed` with the daemon
+carrying on without chat.
 On Mattermost's shapes: the run thread is the reply stream under the
 headline post (its post id is the thread id; `thread_per_run = false` posts
 everything top-level), and Mattermost does not nest, so the one-level

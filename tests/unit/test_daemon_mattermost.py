@@ -24,6 +24,7 @@ from typing import Any
 import pytest
 
 from sbxloop.config import Config, MattermostConfig
+from sbxloop.daemon import mattermost
 from sbxloop.daemon.chat import build_bridge
 from sbxloop.daemon.chat_choices import Choice, ChoiceQuestion
 from sbxloop.daemon.discord_format import EmbedSpec
@@ -70,7 +71,13 @@ class FakeMattermostClient:
         self.lookups: list[str] = []
         self.users = {USER_ID: "ana"}
         self.connected = False
+        self.connects = 0
         self.closed = False
+        self.closes = 0
+        # Set when the websocket is gone, exactly as the real client's is:
+        # `drop()` is a network blip, a server restart, a proxy timeout.
+        self._closed: asyncio.Event | None = None
+        self.fail_connect: Exception | None = None
         self.fail_post: Exception | None = None
         self.fail_upload = False
         self.uploads: list[tuple[str, str, bytes]] = []
@@ -78,11 +85,29 @@ class FakeMattermostClient:
         self._seq = 0
 
     async def connect(self) -> tuple[str, str]:
+        if self.fail_connect is not None:
+            raise self.fail_connect
         self.connected = True
+        self.connects += 1
+        self._closed = asyncio.Event()
         return BOT_ID, BOT_NAME
 
     async def close(self) -> None:
         self.closed = True
+        self.closes += 1
+        if self._closed is not None:
+            self._closed.set()
+
+    async def wait_closed(self) -> None:
+        if self._closed is None:
+            return
+        await self._closed.wait()
+
+    def drop(self) -> None:
+        """The socket goes away under the bridge, as it does on a server
+        restart or an idle proxy timeout."""
+        if self._closed is not None:
+            self.bridge._aloop.call_soon_threadsafe(self._closed.set)  # type: ignore[union-attr]
 
     async def create_post(self, body: dict[str, Any]) -> dict[str, Any]:
         if self.fail_post is not None:
@@ -838,3 +863,92 @@ class TestPostAttachmentCap:
         assert "part5.txt" in body and "part6.txt" in body
         assert "part0.txt" not in body
         bridge.close()
+
+
+class TestReconnect:
+    """The websocket is the only way anything reaches the daemon from chat.
+    REST keeps working when it drops, so a bridge that does not rebuild it
+    goes on posting a run's chronology while every steer, command and
+    @mention is silently discarded."""
+
+    def test_a_dropped_connection_is_rebuilt(self, tmp_path: Path) -> None:
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            assert wait_for(lambda: client.connects == 1)
+            client.drop()
+            assert wait_for(lambda: client.connects == 2)
+            # the dead session is let go before the next dial, or the client
+            # leaks one HTTP session per outage
+            assert client.closes >= 1
+        finally:
+            bridge.close()
+
+    def test_the_bridge_hears_again_after_a_reconnect(self, tmp_path: Path) -> None:
+        """The point of the reconnect: an @mention after the outage is
+        answered, where before it vanished."""
+        concierge = FakeConcierge()
+        bridge, client, _ = make_bridge(tmp_path, concierge=concierge)
+        try:
+            assert wait_for(lambda: client.connects == 1)
+            client.drop()
+            assert wait_for(lambda: client.connects == 2)
+            client.deliver(posted(f"@{BOT_NAME} what is running?"))
+            assert wait_for(lambda: bool(concierge.turns))
+        finally:
+            bridge.close()
+
+    def test_a_reconnect_that_fails_backs_off_and_keeps_trying(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An instance that comes back later must find the daemon still
+        listening: the loop never gives up."""
+        monkeypatch.setattr(mattermost, "RECONNECT_MIN_S", 0.01)
+        monkeypatch.setattr(mattermost, "RECONNECT_MAX_S", 0.02)
+        bridge, client, _ = make_bridge(tmp_path)
+        try:
+            assert wait_for(lambda: client.connects == 1)
+            client.fail_connect = MattermostApiError(502, "bad gateway")
+            client.drop()
+            assert wait_for(lambda: client.closes >= 3)  # retried, not given up on
+            assert client.connects == 1
+            client.fail_connect = None
+            assert wait_for(lambda: client.connects == 2)
+        finally:
+            bridge.close()
+
+    def test_the_first_connect_is_not_retried(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """A bad token or a wrong URL is a configuration error: the base
+        bridge reports it once and carries on degraded. Retrying it forever
+        would bury the one message that says what to fix."""
+        config = Config.model_validate(
+            {"home": str(tmp_path / "state"), "mattermost": {"url": URL, "channel_id": CHANNEL}}
+        )
+        dstore = DaemonStore(config.paths.state_db)
+        holder: dict[str, FakeMattermostClient] = {}
+
+        def factory(b: MattermostBridge) -> FakeMattermostClient:
+            holder["client"] = FakeMattermostClient(b)
+            holder["client"].fail_connect = MattermostApiError(401, "invalid or expired session")
+            return holder["client"]
+
+        bridge = MattermostBridge(
+            config, dstore, loop_ref=FakeLoop(dstore), client_factory=factory, token="mmtoken"
+        )
+        with caplog.at_level(logging.ERROR):
+            bridge.start()
+            assert wait_for(lambda: any("connect_failed" in r.getMessage() for r in caplog.records))
+        assert holder["client"].connects == 0
+        bridge.close()
+
+    def test_closing_during_an_outage_does_not_dial_again(self, tmp_path: Path) -> None:
+        """A shutdown never sits through a backoff, and never races a dial
+        against the close that is tearing the client down."""
+        bridge, client, _ = make_bridge(tmp_path)
+        client.fail_connect = MattermostApiError(502, "bad gateway")
+        assert wait_for(lambda: client.connects == 1)
+        client.drop()
+        bridge.close()
+        settled = client.connects
+        assert not wait_for(lambda: client.connects > settled, timeout=0.3)
