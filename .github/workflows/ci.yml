@@ -12,30 +12,22 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  format:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # hatch-vcs needs tags to resolve the version
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-      - run: uv sync --all-packages
-      - run: uv run ruff format --check .
-
-  mdformat:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # hatch-vcs needs tags to resolve the version
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-      - run: uv sync --all-packages
-      - run: uv run mdformat --check .
-
+  # Every static gate in one runner. These were four jobs (format, mdformat,
+  # lint, security); each spent ~10s on checkout and `uv sync` to do ~5s of
+  # work, and all four finished more than three minutes before the pytest
+  # shards that decide how long a run takes. They cost concurrency, not wall
+  # clock, and concurrency is what the shards below need: the per-account cap
+  # on GitHub-hosted jobs is 20 on the Free plan, and this workflow was
+  # sitting at 19.
+  #
+  # The job keeps the name `lint` because that is a required status check on
+  # main — renaming it, or splitting a required context back out, wedges every
+  # pull request behind a check that never reports. `typecheck` and `build`
+  # stay their own jobs for the same reason.
+  #
+  # `!cancelled()` on each gate so one failure does not hide the rest: a ruff
+  # diff and a bandit finding are reported in the same run, the way they were
+  # when these were separate jobs.
   lint:
     runs-on: ubuntu-latest
     steps:
@@ -46,8 +38,16 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --all-packages
+      - run: uv run ruff format --check .
+        if: ${{ !cancelled() }}
       - run: uv run ruff check .
+        if: ${{ !cancelled() }}
+      - run: uv run mdformat --check .
+        if: ${{ !cancelled() }}
       - run: uv run python scripts/check_self_references.py
+        if: ${{ !cancelled() }}
+      - run: uv run bandit -c pyproject.toml -r packages/sbxloop/src packages/sbxloop-worker/src
+        if: ${{ !cancelled() }}
 
   typecheck:
     runs-on: ubuntu-latest
@@ -60,18 +60,6 @@ jobs:
           enable-cache: true
       - run: uv sync --all-packages
       - run: uv run mypy
-
-  security:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0  # hatch-vcs needs tags to resolve the version
-      - uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-      - run: uv sync --all-packages
-      - run: uv run bandit -c pyproject.toml -r packages/sbxloop/src packages/sbxloop-worker/src
 
   # Exercise the published optional SDK against a fake stdio process. No
   # inference credentials, model calls or real Codex runtime are involved.
@@ -130,26 +118,48 @@ jobs:
         env:
           SBXLOOP_TEST_PLAYWRIGHT: "1"
 
-  # The suite in three slices per interpreter: the ~3900 in-process tests,
-  # and the ~770 process-bound `slow` tests (fake sbx, real workers, real
-  # git) spread over two runners with the deterministic `--shard` from the
-  # root conftest. Each slice writes its own coverage data; `test` below
+  # The suite in five slices per interpreter: the ~5700 in-process tests over
+  # two runners, and the ~950 process-bound `slow` tests (fake sbx, real
+  # workers, real git) over three, all cut by the deterministic `--shard` from
+  # the root conftest. Each slice writes its own coverage data; `test` below
   # combines them and holds the 85% line, so the required contexts stay
-  # `test (3.13)` / `test (3.14)`.
+  # `test (3.13)` / `test (3.14)` however many slices there are.
+  #
+  # Five, not three, because the shards set the run's length and neither half
+  # fits in one runner any more: measured on main, `fast` ran 220s and the two
+  # `slow` halves 185s and 251s, against a 292s run. The suite has roughly
+  # half again as many tests as when the two-way split was written (#750), and
+  # a slice cannot go below the largest single unit you refuse to cut — so
+  # cutting `fast` in two and `slow` in three lands both near 150s.
+  #
+  # `--shard` runs before pytest's own `-m` filter (root conftest, tryfirst),
+  # so it slices the whole collection and each `-m` selection then falls out
+  # of the slice. Verified to partition exactly: the fast shards sum to 5717
+  # at every width tried.
+  #
+  # Ten pytest jobs put the workflow's peak at 18 concurrent (`test` needs
+  # `pytest`, so its two run after everything else has finished), against a
+  # per-account cap of 20 on the Free plan. If jobs start queuing rather than
+  # all starting at once, that is the cap, not the runners — drop `fast` back
+  # to one slice before touching anything else.
   pytest:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.13", "3.14"]
-        slice: [fast, slow-1, slow-2]
+        slice: [fast-1, fast-2, slow-1, slow-2, slow-3]
         include:
-          - slice: fast
-            select: -m "not slow"
+          - slice: fast-1
+            select: -m "not slow" --shard 1/2
+          - slice: fast-2
+            select: -m "not slow" --shard 2/2
           - slice: slow-1
-            select: -m slow --shard 1/2
+            select: -m slow --shard 1/3
           - slice: slow-2
-            select: -m slow --shard 2/2
+            select: -m slow --shard 2/3
+          - slice: slow-3
+            select: -m slow --shard 3/3
     steps:
       - uses: actions/checkout@v4
         with:
