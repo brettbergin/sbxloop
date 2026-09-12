@@ -9,6 +9,7 @@ passes, a planted reference fails with `path:line: rule: text`."""
 from __future__ import annotations
 
 import importlib.util
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -227,6 +228,19 @@ class TestTrackedFiles:
         module = _load()
         monkeypatch.setattr(module, "ROOT", tmp_path)
         assert module._tracked_files() == [tmp_path / "shipped.py"]
+
+    def test_a_name_git_cannot_decode_is_one_more_path(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        raw = b"caf\xe9.py"
+        with Repo.init(tmp_path) as repo:
+            (tmp_path / os.fsdecode(raw)).write_text("x = 1\n")
+            (tmp_path / "plain.py").write_text("y = 2\n")
+            # Only these two: the test home drops its own files into tmp_path.
+            repo.git.add("--", os.fsdecode(raw), "plain.py")
+        module = _load()
+        monkeypatch.setattr(module, "ROOT", tmp_path)
+        assert sorted(os.fsencode(p.name) for p in module._tracked_files()) == [raw, b"plain.py"]
 
     def test_a_tree_that_is_not_a_repository_fails_hard(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
