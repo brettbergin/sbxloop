@@ -38,8 +38,9 @@ from sbxloop.cli.doctor import stored_schedules
 from sbxloop.cli.policyview import PolicyView, policy_view
 from sbxloop.cli.workloadview import NO_PROFILE_NOTE, ProfileView, profile_views
 from sbxloop.config import Config, load_config_with_sources
-from sbxloop.tui import actions, configkeys, configtoml
-from sbxloop.tui.configedit import (
+from sbxloop.configedit import keys as configkeys
+from sbxloop.configedit import toml as configtoml
+from sbxloop.configedit.edit import (
     FILE_LAYER,
     Verdict,
     config_path,
@@ -47,6 +48,7 @@ from sbxloop.tui.configedit import (
     read_text,
     validate_text,
 )
+from sbxloop.tui import actions
 from sbxloop.tui.screens.base import ConsoleScreen
 from sbxloop.tui.screens.configvalue import ValueEdit, ValueScreen
 from sbxloop.tui.screens.modals import ConfirmScreen, TextPromptScreen

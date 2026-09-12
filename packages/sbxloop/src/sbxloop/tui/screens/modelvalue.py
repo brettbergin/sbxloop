@@ -16,9 +16,9 @@ from textual.worker import get_current_worker
 
 from sbxloop import modelcatalog
 from sbxloop.backends import AgentBackend
+from sbxloop.configedit.keys import FieldSpec
 from sbxloop.log import redact_text
 from sbxloop.paths import SbxloopHome
-from sbxloop.tui.configkeys import FieldSpec
 from sbxloop.tui.screens.configvalue import ValueEdit, ValueScreen
 
 

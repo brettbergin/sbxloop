@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Literal
 
 from sbxloop.config import TUI_CONTROL_CHANNEL, Config
+from sbxloop.configedit.edit import save_text
 from sbxloop.daemon.control import plain
 from sbxloop.daemon.mailbox import MailboxClient
 from sbxloop.daemon.store import DaemonStore, apply_item_verb
@@ -35,7 +36,6 @@ from sbxloop.sbx.prune import (
     remove_sandbox,
 )
 from sbxloop.sbx.secretstate import clean_secrets, rotate_registrations, secrets_context
-from sbxloop.tui.configedit import save_text
 from sbxloop.tui.data import CtlClient, DaemonSnapshot, probe_daemon
 from sbxloop.tui.runner import ChildHandle, CommandRunner, sbxloop_argv
 from sbxloop.tui.system import unit_argv
