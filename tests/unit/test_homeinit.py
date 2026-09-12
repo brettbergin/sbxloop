@@ -396,6 +396,16 @@ class TestSbxInstall:
         enable = next(c for c in run.calls if c[:3] == ["systemctl", "--user", "enable"])
         assert str(home.unit("github-runner.service")) in enable
 
+    def test_runner_unit_carries_the_home_it_was_installed_under(self, tmp_path: Path) -> None:
+        """#895: a job on this runner deploys to the installation that is
+        there, not to whatever `$HOME/.sbxloop` would be."""
+        home, init, _run, _, _ = make(
+            tmp_path, systemd=True, runner_dir=tmp_path / "actions-runner"
+        )
+        init.execute()
+        text = home.unit("github-runner.service").read_text()
+        assert f"Environment=SBXLOOP_HOME={home.root}" in text
+
     def test_uv_on_path_is_copied_into_the_home(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

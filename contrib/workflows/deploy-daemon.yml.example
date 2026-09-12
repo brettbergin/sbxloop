@@ -11,15 +11,23 @@
 # release the deploy's own hold whatever happened; tell the control channel.
 #
 # Assumes the sbxloop home `sbxloop init --systemd` builds
-# (contrib/systemd/README.md): everything under ~/.sbxloop — the launcher
-# bin/sbxloop (it exports no secrets; sbxloop reads its own secrets file),
-# the venv, the home's uv, and the user unit `sbxloop-daemon`. No
-# step needs a working directory. The Actions runner runs as that same user
-# (`sbxloop init --systemd --runner DIR`) so it can `systemctl --user restart`.
+# (contrib/systemd/README.md): the launcher bin/sbxloop (it exports no
+# secrets; sbxloop reads its own secrets file), the venv, the home's uv, and
+# the user unit `sbxloop-daemon`. No step needs a working directory. The
+# Actions runner runs as that same user (`sbxloop init --systemd --runner
+# DIR`) so it can `systemctl --user restart`.
 #
 # Two settings: the repository variable SBXLOOP_DEPLOY_HOST is the runner
 # label (register the runner with `--labels <that>`) and the name notices
 # call the host; the `schedule` below is how often the host checks PyPI.
+#
+# A THIRD ONLY IF THE HOME MOVED: the home defaults to $HOME/.sbxloop, and
+# an operator who installed under a custom SBXLOOP_HOME has two ways to
+# tell this job. The runner unit init renders carries the home it was
+# installed under, so a runner started from it already names the right one.
+# Where the runner was set up some other way, set the repository variable
+# SBXLOOP_HOME to the same absolute path; it wins over the runner's
+# environment. Leave it unset otherwise.
 #
 # SECURITY: a self-hosted runner executes whatever a workflow says as its
 # user. Never let a job carrying the `self-hosted` label be reachable from a
@@ -68,16 +76,43 @@ jobs:
 
     steps:
       - name: Resolve host paths
+        env:
+          # The optional repository variable, empty when unset.
+          SBXLOOP_HOME_VAR: ${{ vars.SBXLOOP_HOME }}
         run: |
           set -euo pipefail
+          # Resolve the home once; every path below derives from it, so the
+          # version check, backup, install, health check and rollback all
+          # address the installation that is actually on this host. Order:
+          # the repository variable, else the runner's own SBXLOOP_HOME
+          # (the rendered github-runner unit exports the home init built),
+          # else the documented default.
+          root="${SBXLOOP_HOME_VAR:-}"
+          [ -n "${root}" ] || root="${SBXLOOP_HOME:-}"
+          [ -n "${root}" ] || root="${HOME}/.sbxloop"
+          case "${root}" in
+            "~") root="${HOME}" ;;
+            "~/"*) root="${HOME}/${root#\~/}" ;;
+          esac
+          # Fail closed rather than deploy to a path this job cannot
+          # address: a relative root is a different directory in every step
+          # (there is no working directory), and a newline would corrupt
+          # every assignment after it.
+          case "${root}" in
+            *$'\n'*) echo "::error::the sbxloop home may not contain a newline"; exit 1 ;;
+            /*) ;;
+            *) echo "::error::the sbxloop home must be an absolute path, not '${root}'"; exit 1 ;;
+          esac
+          # Unquoted on purpose: GITHUB_ENV takes the value verbatim to the
+          # end of the line, so a home holding spaces survives as itself.
           {
-            echo "SBXLOOP_HOME=${HOME}/.sbxloop"
-            echo "SBXLOOP=${HOME}/.sbxloop/bin/sbxloop"
-            echo "VENV_SBXLOOP=${HOME}/.sbxloop/venv/bin/sbxloop"
-            echo "VENV_PYTHON=${HOME}/.sbxloop/venv/bin/python"
-            echo "UV=${HOME}/.sbxloop/bin/uv"
-            echo "UV_CACHE_DIR=${HOME}/.sbxloop/cache/uv"
-            echo "UV_PYTHON_INSTALL_DIR=${HOME}/.sbxloop/python"
+            echo "SBXLOOP_HOME=${root}"
+            echo "SBXLOOP=${root}/bin/sbxloop"
+            echo "VENV_SBXLOOP=${root}/venv/bin/sbxloop"
+            echo "VENV_PYTHON=${root}/venv/bin/python"
+            echo "UV=${root}/bin/uv"
+            echo "UV_CACHE_DIR=${root}/cache/uv"
+            echo "UV_PYTHON_INSTALL_DIR=${root}/python"
           } >> "$GITHUB_ENV"
 
       - name: Resolve the target version
