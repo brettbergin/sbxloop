@@ -484,6 +484,38 @@ class TestInstall:
 
 
 class TestInstallFallbacks:
+    @pytest.mark.parametrize("series", ["3.13", "3.14"])
+    def test_venv_repair_matches_the_sandbox_interpreter(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, series: str
+    ) -> None:
+        fake_sbx.script(
+            "exec boxa python3 -m venv",
+            returncode=1,
+            stderr="ensurepip is not available",
+            once=True,
+        )
+        fake_sbx.script("exec boxa python3 -c import sys", stdout=f"python{series}-venv\n")
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+        fake_sbx.script("exec boxa python3 -m venv", returncode=0)
+
+        assert make_client(sandbox, EventBus())._create_venv(60, False)
+
+        apt = [c[-1] for c in fake_sbx.invocations("exec") if "apt-get" in c[-1]]
+        assert len(apt) == 1
+        assert f"python{series}-venv" in apt[0].split()
+        assert "python3-venv" not in apt[0].split()
+
+    @pytest.mark.parametrize("rc, output", [(1, ""), (0, ""), (0, "python3.14-venv; false")])
+    def test_venv_repair_does_not_guess_an_unknown_package(
+        self, sandbox: Sandbox, fake_sbx: FakeSbx, rc: int, output: str
+    ) -> None:
+        fake_sbx.script("exec boxa python3 -m venv", returncode=1, stderr="no ensurepip")
+        fake_sbx.script("exec boxa python3 -c import sys", returncode=rc, stdout=output)
+        fake_sbx.script("exec boxa sh -c sudo -n apt-get", returncode=0)
+
+        assert not make_client(sandbox, EventBus())._create_venv(60, False)
+        assert not [c for c in fake_sbx.invocations("exec") if "apt-get" in c[-1]]
+
     def test_venv_failure_self_heals_via_apt(
         self, sandbox: Sandbox, fake_sbx: FakeSbx, tmp_path: Path
     ) -> None:
