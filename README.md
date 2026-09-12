@@ -20,8 +20,14 @@
 <p>
   <a href="https://github.com/github/copilot-sdk"><img src="https://img.shields.io/badge/GitHub_Copilot-SDK-000000?logo=githubcopilot&amp;logoColor=white" alt="GitHub Copilot SDK" /></a>
   <a href="https://github.com/anthropics/claude-agent-sdk-python"><img src="https://img.shields.io/badge/Claude-Agent_SDK-D97757?logo=claude&amp;logoColor=white" alt="Claude Agent SDK" /></a>
+  <a href="https://developers.openai.com/codex/sdk/"><img src="https://img.shields.io/badge/OpenAI_Codex-SDK-000000?logo=openai&amp;logoColor=white" alt="OpenAI Codex SDK" /></a>
+  <a href="https://platform.openai.com/docs/api-reference/chat"><img src="https://img.shields.io/badge/OpenAI-compatible_API-412991?logo=openai&amp;logoColor=white" alt="OpenAI-compatible API" /></a>
+  <a href="https://github.com/"><img src="https://img.shields.io/badge/GitHub-supported-181717?logo=github&amp;logoColor=white" alt="GitHub supported" /></a>
+  <a href="https://about.gitlab.com/"><img src="https://img.shields.io/badge/GitLab-config_preview-FC6D26?logo=gitlab&amp;logoColor=white" alt="GitLab configuration preview" /></a>
+  <a href="https://about.gitea.com/"><img src="https://img.shields.io/badge/Gitea-config_preview-609926?logo=gitea&amp;logoColor=white" alt="Gitea configuration preview" /></a>
   <a href="https://discordpy.readthedocs.io/"><img src="https://img.shields.io/badge/Discord-5865F2?logo=discord&amp;logoColor=white" alt="Discord" /></a>
-  <a href="https://github.com/slackapi/python-slack-sdk"><img src="https://img.shields.io/badge/Slack-4A154B" alt="Slack" /></a>
+  <a href="https://github.com/slackapi/python-slack-sdk"><img src="https://img.shields.io/badge/Slack-4A154B?logo=slack&amp;logoColor=white" alt="Slack" /></a>
+  <a href="https://developers.mattermost.com/integrate/reference/"><img src="https://img.shields.io/badge/Mattermost-0058CC?logo=mattermost&amp;logoColor=white" alt="Mattermost" /></a>
   <a href="https://docs.astral.sh/uv/"><img src="https://img.shields.io/badge/uv-DE5FE9?logo=uv&amp;logoColor=white" alt="uv" /></a>
   <a href=".github/workflows/ci.yml"><img src="https://img.shields.io/badge/GitHub_Actions-2088FF?logo=githubactions&amp;logoColor=white" alt="GitHub Actions" /></a>
 </p>
