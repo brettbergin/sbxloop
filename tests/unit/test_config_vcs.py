@@ -15,6 +15,7 @@ import pytest
 
 from sbxloop.config import (
     DEFAULT_CONFIG_LOCKED,
+    FORGE_TOKEN_ENVS,
     VCS_KINDS,
     Config,
     load_config,
@@ -119,3 +120,38 @@ class TestLoaderNotice:
         (tmp_path / "sbxloop.toml").write_text('[vcs]\nkind = "svn"\n')
         with pytest.raises(ConfigError, match="github, gitlab, gitea"):
             load_config(tmp_path, env={"HOME": str(tmp_path)})
+
+
+class TestTokenEnv:
+    """The variable the forge token is read from is a name that travels
+    through config; the value only ever lives in secrets.env."""
+
+    def test_github_has_no_single_token_variable(self) -> None:
+        config = cfg(github={"repos": [{"repo": "o/a"}]})
+        assert config.vcs_token_env_for("o/a") is None, "GH_TOKEN/GITHUB_TOKEN or the App"
+        assert cfg().vcs_token_env_for() is None
+
+    def test_the_other_forges_default_to_their_own_variable(self) -> None:
+        assert FORGE_TOKEN_ENVS == {"gitlab": "GITLAB_TOKEN", "gitea": "GITEA_TOKEN"}
+        config = cfg(
+            vcs={"kind": "gitlab"},
+            github={"repos": [{"repo": "o/a"}, {"repo": "o/b", "kind": "gitea"}]},
+        )
+        assert config.vcs_token_env_for("o/a") == "GITLAB_TOKEN"
+        assert config.vcs_token_env_for("o/b") == "GITEA_TOKEN"
+
+    def test_the_section_and_then_the_entry_override_the_default(self) -> None:
+        config = cfg(
+            vcs={"kind": "gitlab", "token_env": "GL_MAIN"},
+            github={"repos": [{"repo": "o/a"}, {"repo": "o/b", "token_env": "GL_OTHER"}]},
+        )
+        assert config.vcs_token_env_for("o/a") == "GL_MAIN"
+        assert config.vcs_token_env_for("o/b") == "GL_OTHER"
+        github_entry = cfg(github={"repos": [{"repo": "o/c", "token_env": "GH_TWO"}]})
+        assert github_entry.vcs_token_env_for("o/c") == "GH_TWO"
+
+    def test_a_name_that_is_not_a_variable_is_refused(self) -> None:
+        with pytest.raises(
+            ValueError, match=r"vcs\.token_env must be an environment variable name"
+        ):
+            cfg(vcs={"token_env": "glpat-abc123"})

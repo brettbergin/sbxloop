@@ -72,3 +72,30 @@ class TestCredentialNote:
             config, {"GH_TOKEN": "tok"}, probe=lambda _e: RepoProbe(reachable=True)
         )
         assert "credential:" not in row.detail
+
+
+class TestTokenRow:
+    """A repository on another forge is judged on its own token variable,
+    by the name the configuration resolves, never on GH_TOKEN."""
+
+    def test_a_gitlab_repository_needs_its_own_variable(self) -> None:
+        config = cfg(vcs={"kind": "gitlab"}, github={"repos": [{"repo": "acme/alpha"}]})
+        (row,) = repo_checks(config, {"GH_TOKEN": "tok"})
+        assert not row.ok and "token_env GITLAB_TOKEN is not set on the host" in row.detail
+        (row,) = repo_checks(config, {"GITLAB_TOKEN": "glpat"})
+        assert row.ok and "token from GITLAB_TOKEN" in row.detail
+
+    def test_the_configured_name_is_the_one_checked(self) -> None:
+        config = cfg(
+            vcs={"kind": "gitea", "token_env": "GT_MAIN"},
+            github={"repos": [{"repo": "acme/alpha"}]},
+        )
+        (row,) = repo_checks(config, {"GITEA_TOKEN": "x"})
+        assert not row.ok and "GT_MAIN is not set" in row.detail
+        (row,) = repo_checks(config, {"GT_MAIN": "x"})
+        assert row.ok and "token from GT_MAIN" in row.detail
+
+    def test_a_github_repository_is_unchanged(self) -> None:
+        config = cfg(github={"repos": [{"repo": "acme/alpha"}]})
+        (row,) = repo_checks(config, {"GH_TOKEN": "tok"})
+        assert row.ok and "token from GH_TOKEN" in row.detail

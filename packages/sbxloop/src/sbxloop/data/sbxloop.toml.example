@@ -411,6 +411,22 @@ secret_strategy = "proxy"
 # The forge's API root. For "github" this is the same setting as
 # `[github] api_url` — set one, or the same value in both.
 # api_url = "https://api.github.com"
+# The host variable the forge token is read from (a name; the value lives
+# in secrets.env). Unset: GITLAB_TOKEN for "gitlab", GITEA_TOKEN for
+# "gitea"; for "github" the credential is GH_TOKEN/GITHUB_TOKEN or the App
+# installation, and a [[github.repos]] entry's own token_env still wins.
+# token_env = "GITLAB_TOKEN"
+#
+# The same three keys for a self-managed GitLab — a project access token
+# with the `api` scope, long-lived, so give it an expiry when creating it:
+# kind = "gitlab"
+# api_url = "https://gitlab.example.com/api/v4"
+# token_env = "GITLAB_TOKEN"
+#
+# ...and for a Gitea instance, with an access token from its settings page:
+# kind = "gitea"
+# api_url = "https://gitea.example.com/api/v1"
+# token_env = "GITEA_TOKEN"
 
 # [github]
 # The GitHub integration. Unset (the default) disables GitHub entirely:
