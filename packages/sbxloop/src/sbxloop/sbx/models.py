@@ -7,6 +7,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from sbxloop.resources import SandboxResources
+
 SandboxRole = Literal["agent", "github", "service"]
 
 
@@ -49,6 +51,7 @@ class SandboxSpec(BaseModel):
     name: str
     role: SandboxRole
     workspace: Path
+    resources: SandboxResources = Field(default_factory=SandboxResources)
     agent: str = "shell"
     template: str | None = None
     policy_allows: list[str] = Field(default_factory=list)

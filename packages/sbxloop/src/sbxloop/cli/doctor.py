@@ -38,6 +38,7 @@ from sbxloop.engine.store import StateStore
 from sbxloop.errors import GithubOpsError, SbxError, SbxNotFoundError, StateError
 from sbxloop.hostfiles import privacy
 from sbxloop.paths import SbxloopHome, describe, legacy_paths
+from sbxloop.resources import ResourcePurpose
 from sbxloop.sbx.bake import load_bake_record
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import ConformanceReport, run_conformance
@@ -74,6 +75,32 @@ class Check:
 
 
 ProgressFn = Callable[[str], None]
+
+
+def sandbox_resource_checks(config: Config) -> list[Check]:
+    """Requested allocations, not measured consumption or reserved host cores."""
+    purposes: tuple[ResourcePurpose, ...] = ("agent", "concierge", "github", "service")
+    checks = []
+    for purpose in purposes:
+        resources = config.sandbox_resources_for(purpose)
+        checks.append(
+            Check(
+                f"sandbox resources: {purpose}",
+                True,
+                f"{resources.cpus} CPUs, {resources.memory} memory per VM (requested)",
+            )
+        )
+    for repo in config.github.repos:
+        if repo.cpus is not None or repo.memory is not None:
+            resources = config.sandbox_resources_for("agent", repo.repo)
+            checks.append(
+                Check(
+                    f"sandbox resources: {repo.repo}",
+                    True,
+                    f"run agent: {resources.cpus} CPUs, {resources.memory} memory (requested)",
+                )
+            )
+    return checks
 
 
 def _agent_credential_detail(agent: AgentBackend, config: Config, env: dict[str, str]) -> str:
@@ -1157,6 +1184,7 @@ def collect_checks(
     cli = cli or SbxCLI(app_name=config.app_name or None)
     checks: list[Check] = []
     checks.append(host_check())
+    checks.extend(sandbox_resource_checks(config))
     checks.extend(host_prep_checks(env))
     report = progress or (lambda _message: None)
 
@@ -1871,6 +1899,7 @@ def doctor_report(
                 config.paths,
                 deep=deep,
                 template=config.sandbox.template,
+                resources=config.sandbox_resources_for("service"),
                 progress=report,
             )
         except SbxError as exc:
