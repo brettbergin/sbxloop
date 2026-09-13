@@ -61,6 +61,7 @@ class ApiServer:
                 retention_s=float(config.replay_retention_s),
             )
             ctx.projector.catalog_with(self._catalog_run)
+        ctx.projector.deliver_work_with(ctx.project_work)
         # uvicorn's loggers are noisy at INFO; the daemon narrates the start.
         for name in ("uvicorn", "uvicorn.error", "uvicorn.access"):
             logging.getLogger(name).setLevel(logging.WARNING)

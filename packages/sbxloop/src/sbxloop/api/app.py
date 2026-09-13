@@ -9,10 +9,13 @@ are off — a remote client reads the contract, not a page.
 from __future__ import annotations
 
 import json
+import time
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
+import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -24,6 +27,7 @@ from sbxloop.api.routes import (
     artifacts,
     auth,
     catalog,
+    collaboration,
     control,
     diagnostics,
     events,
@@ -38,6 +42,7 @@ from sbxloop.api.routes import (
 from sbxloop.config import ApiConfig
 
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+log = structlog.get_logger(__name__)
 
 #: The version the committed contract snapshot carries: the document is
 #: compared without the build's own version string.
@@ -60,25 +65,45 @@ def openapi_document(config: ApiConfig | None = None, *, snapshot: bool = False)
 
 
 def create_app(ctx: ApiContext) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        await ctx.call(ctx.recover_collaboration)
+        yield
+
     app = FastAPI(
         title="sbxloop",
         version=__version__,
         openapi_url="/v1/openapi.json",
         docs_url=None,
         redoc_url=None,
+        lifespan=lifespan,
     )
     app.state.ctx = ctx
     max_body = int(ctx.api.max_body_bytes)
 
-    @app.middleware("http")
     async def _request_id(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
         # A client's own id is echoed so it can correlate; otherwise one is
         # minted. Either way it rides every problem body and log line.
         given = request.headers.get("x-request-id", "").strip()
-        request.state.request_id = given[:64] if given else "req_" + uuid.uuid4().hex[:16]
-        response = await call_next(request)
+        trace_id = "req_" + uuid.uuid4().hex[:16]
+        request.state.request_id = given[:64] if given else trace_id
+        started = time.monotonic()
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+        finally:
+            # Templates exclude user-supplied paths; never log headers, query or body.
+            log.info(
+                "api.request",
+                method=request.method,
+                route=getattr(request.scope.get("route"), "path", "unmatched"),
+                status=status,
+                trace_id=trace_id,
+                duration_ms=round((time.monotonic() - started) * 1000, 1),
+            )
         response.headers["X-Request-Id"] = request.state.request_id
         return response
 
@@ -117,13 +142,14 @@ def create_app(ctx: ApiContext) -> FastAPI:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=list(ctx.api.cors_origins),
-            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
             allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id"],
             expose_headers=["X-Request-Id", "Location", "Retry-After"],
             allow_credentials=False,
             max_age=600,
         )
 
+    app.middleware("http")(_request_id)
     errors.install(app)
     app.include_router(health.router)
     app.include_router(meta.router)
@@ -140,4 +166,5 @@ def create_app(ctx: ApiContext) -> FastAPI:
     app.include_router(events.router)
     app.include_router(ws.router)
     app.include_router(auth.router)
+    app.include_router(collaboration.router)
     return app

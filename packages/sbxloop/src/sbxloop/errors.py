@@ -13,6 +13,10 @@ class ConfigError(SbxloopError):
     """Invalid or unloadable configuration."""
 
 
+class ToolRejectedError(SbxloopError):
+    """An expected tool refusal whose reason the agent can act on."""
+
+
 class SecretStateError(SbxloopError):
     """A secret registration could not be inspected or replaced."""
 

@@ -20,7 +20,7 @@ import time
 from pydantic import BaseModel, ConfigDict
 
 from sbxloop.backends import BACKENDS
-from sbxloop.config import Config
+from sbxloop.config import VCS_KINDS, Config
 from sbxloop.engine.model import TERMINAL_RUN_STATES
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import SbxError, StateError
@@ -37,12 +37,16 @@ from sbxloop.sbx.models import SandboxInfo, SandboxRole
 # against racing a run that another terminal just started or is mid-phase.
 DEFAULT_MIN_AGE_S = 3600.0
 
-_NAME_RE = re.compile(r"^sbxloop-(?P<run>[^-]+)-(?P<role>agent|github|service)$")
+_VCS_NAME_KINDS = "|".join(VCS_KINDS)
+_NAME_RE = re.compile(rf"^sbxloop-(?P<run>[^-]+)-(?P<role>agent|service|{_VCS_NAME_KINDS})$")
 
 # Sandboxes the daemon owns for its whole lifetime (not tied to a run):
-# the github-ops box and the concierge box. Never pruned here — the daemon
+# the VCS-ops box and the concierge box. Never pruned here — the daemon
 # manages them; `sbxloop sandbox rm` removes them explicitly.
-DAEMON_OWNED_PREFIXES = ("sbxloop-daemon-github-", "sbxloop-concierge-")
+DAEMON_OWNED_PREFIXES = (
+    *(f"sbxloop-daemon-{kind}-" for kind in VCS_KINDS),
+    "sbxloop-concierge-",
+)
 
 
 class SandboxVerdict(BaseModel):
@@ -106,7 +110,7 @@ def _classify_one(
     if name.startswith(DAEMON_OWNED_PREFIXES):
         return SandboxVerdict(
             name=name,
-            reason="daemon-owned sandbox (github-ops / concierge); not touched — "
+            reason="daemon-owned sandbox (VCS-ops / concierge); not touched — "
             "`sbxloop sandbox rm` removes it explicitly",
         )
     match = _NAME_RE.match(name)
@@ -115,7 +119,8 @@ def _classify_one(
             name=name,
             reason="unrecognized sbxloop naming scheme; not touched",
         )
-    run_id, role = match.group("run"), match.group("role")
+    run_id, suffix = match.group("run"), match.group("role")
+    role = "github" if suffix in VCS_KINDS else suffix
 
     try:
         run = store.get_run(run_id)

@@ -12,7 +12,13 @@ from sbxloop.config import Config
 from sbxloop.errors import ProvisionError
 from sbxloop.events import EventBus
 from sbxloop.sbx.cli import SbxCLI
-from sbxloop.sbx.provision import GhPat, Provisioner, github_policy_allows
+from sbxloop.sbx.provision import (
+    GhPat,
+    Provisioner,
+    github_policy_allows,
+    sandbox_name,
+    sandbox_name_candidates,
+)
 from tests.conftest import FakeSbx
 
 GITLAB = {
@@ -68,6 +74,8 @@ class TestSpec:
             fake_sbx, tmp_path, {"GITLAB_TOKEN": "glpat-x", "COPILOT_GITHUB_TOKEN": "c"}
         )
         _agent, github = provisioner.build_specs("r1", tmp_path)
+        assert github.name == "sbxloop-r1-gitlab"
+        assert github.name == sandbox_name("r1", "github", vcs_kind="gitlab")
         assert github.secrets == []
         assert github.forge_token_envs == ["GITLAB_TOKEN"]
         assert "gitlab.example.com" in github.policy_allows
@@ -77,6 +85,12 @@ class TestSpec:
         # The daemon's long-lived box is the same spec.
         daemon = provisioner.github_only_spec("d", tmp_path, "acme/widgets")
         assert daemon.secrets == [] and daemon.forge_token_envs == ["GITLAB_TOKEN"]
+
+    def test_existing_non_github_boxes_remain_discoverable(self) -> None:
+        assert sandbox_name_candidates("r1", "github", vcs_kind="gitlab") == (
+            "sbxloop-r1-gitlab",
+            "sbxloop-r1-github",
+        )
 
     def test_the_allowlist_without_an_api_root_is_empty_not_githubs(self) -> None:
         config = Config.model_validate({"vcs": {"kind": "gitlab"}, "github": {"repo": "a/b"}})
