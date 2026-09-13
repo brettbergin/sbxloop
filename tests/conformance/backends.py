@@ -16,12 +16,14 @@ it. The suite skips with that reason; nothing about the gate changes.
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from typing import NamedTuple, Protocol
 
 from sbxloop.vcs.model import ChecksVerdict, FailedCheck
 from sbxloop.vcs.protocol import VcsOps
+from tests.fakes.fake_gitea import FakeGitea
 from tests.fakes.fake_github import FakeGithub
 from tests.fakes.fake_gitlab import FakeGitlab
 from tests.live.env import LiveForge, live_forge
@@ -62,6 +64,17 @@ class Seeds(Protocol):
         its number."""
         ...
 
+    def standing_rules(self) -> SeededRules:
+        """What the base requires before any scenario seeds a rule: nothing
+        on a fake, whatever the harness seeded on a live forge (a
+        protected base is the shape #1016 verified against)."""
+        ...
+
+    def approve(self, number: int) -> None:
+        """A second person approves change ``number``, where the base needs
+        an approval before a merge; nothing where it does not."""
+        ...
+
 
 def _always_available() -> str | None:
     return None
@@ -96,6 +109,12 @@ class _GithubSeeds:
         }
         self.fake.rules = []
         return SeededRules(tuple(required), approvals)
+
+    def standing_rules(self) -> SeededRules:
+        return SeededRules((), 0)
+
+    def approve(self, number: int) -> None:
+        return None
 
     def existing_issue(self, title: str, labels: Sequence[str]) -> int:
         number = 41
@@ -150,6 +169,12 @@ class _GitlabSeeds:
         self.fake.enterprise = False
         return SeededRules((), 0, all_checks_required=True)
 
+    def standing_rules(self) -> SeededRules:
+        return SeededRules((), 0)
+
+    def approve(self, number: int) -> None:
+        return None
+
     def existing_issue(self, title: str, labels: Sequence[str]) -> int:
         self.fake.seed_issue(41, title, labels)
         return 41
@@ -164,31 +189,65 @@ def _gitlab_seeds(ops: VcsOps) -> Seeds:
     return _GitlabSeeds(ops)
 
 
+class _GiteaSeeds:
+    """The fake Gitea (#1021): required contexts and an approval count are
+    readable from the branch (#1016 V4), so ``base_rules`` is exactly what
+    was asked; an approval is a second user's review, because the author's
+    own does not count."""
+
+    def __init__(self, fake: FakeGitea) -> None:
+        self.fake = fake
+
+    def failed_check(self, name: str, excerpt: str) -> None:
+        self.fake.seed_verdict(
+            self.fake.branches[CHANGE_BRANCH],
+            ChecksVerdict("red", 1, (), (name,)),
+            logs=[FailedCheck(name, "failure", excerpt, "")],
+        )
+
+    def pending_check(self, name: str) -> None:
+        self.fake.seed_verdict(
+            self.fake.branches[CHANGE_BRANCH], ChecksVerdict("pending", 1, (name,), ())
+        )
+
+    def base_rules(self, *, required: Sequence[str], approvals: int) -> SeededRules:
+        self.fake.branch_rules = {
+            "required_approvals": approvals,
+            "enable_status_check": bool(required),
+            "status_check_contexts": list(required),
+            "user_can_merge": True,
+        }
+        return SeededRules(tuple(required), approvals)
+
+    def standing_rules(self) -> SeededRules:
+        return SeededRules((), 0)
+
+    def approve(self, number: int) -> None:
+        self.fake.seed_review(number, "APPROVED", author="rev-bob")
+
+    def existing_issue(self, title: str, labels: Sequence[str]) -> int:
+        self.fake.seed_issue(41, title, labels)
+        return 41
+
+
+def _gitea() -> VcsOps:
+    """The fake Gitea with the change branch cut and the loop's labels
+    present, the shape the live reset gives the harness repository."""
+    fake = FakeGitea(repo="acme/widgets")
+    fake.trees["commit0"] = {**fake.trees["base123"], "a.py": ("100644", b"x = 1\ny = 2\nz = 3\n")}
+    fake.commits["commit0"] = {"sha": "commit0", "parents": ["base123"], "message": "one change"}
+    fake.branches[CHANGE_BRANCH] = "commit0"
+    for name in ("sbxloop:run", "sbxloop:in-progress"):
+        fake._ensure_label(name)
+    return fake
+
+
+def _gitea_seeds(ops: VcsOps) -> Seeds:
+    assert isinstance(ops, FakeGitea)
+    return _GiteaSeeds(ops)
+
+
 # -- live forges ----------------------------------------------------------------
-
-
-def _no_backend(kind: str) -> Callable[[], VcsOps]:
-    def make() -> VcsOps:
-        raise AssertionError(f"no backend implements kind {kind!r}")
-
-    return make
-
-
-def _no_seeds(ops: VcsOps) -> Seeds:
-    raise AssertionError("a live forge without a backend has no seeds")
-
-
-def _live_without_backend(kind: str) -> Callable[[], str | None]:
-    """A live forge the harness can reach but no backend can drive yet:
-    skip naming both facts, so the skip says the forge was there."""
-
-    def unavailable() -> str | None:
-        forge = live_forge(kind)
-        if isinstance(forge, str):
-            return forge
-        return f"live {kind} {forge.version} answers, but no backend implements kind {kind!r} yet"
-
-    return unavailable
 
 
 def _live_unavailable(kind: str) -> Callable[[], str | None]:
@@ -307,12 +366,141 @@ class _LiveGitlabSeeds:
     def base_rules(self, *, required: Sequence[str], approvals: int) -> SeededRules:
         return SeededRules((), 0, all_checks_required=True)
 
+    def standing_rules(self) -> SeededRules:
+        return SeededRules((), 0, all_checks_required=True)
+
+    def approve(self, number: int) -> None:
+        return None
+
     def existing_issue(self, title: str, labels: Sequence[str]) -> int:
         return self.ops.issue_create(self.forge.repo, title, "", labels=list(labels)).number
 
 
 def _live_gitlab_seeds(ops: VcsOps) -> Seeds:
     return _LiveGitlabSeeds(ops, _live_gitlab_forge())
+
+
+# -- live Gitea -------------------------------------------------------------------
+
+
+def _live_gitea_forge() -> LiveForge:
+    forge = live_forge("gitea")
+    assert not isinstance(forge, str), forge
+    return forge
+
+
+def _live_gitea() -> VcsOps:
+    """The real Gitea backend over the worker's own transport, in this
+    process, against the harness forge."""
+    from sbxloop.vcs.gitea.ops import GiteaOps, gitea_transport
+    from tests.live.localclient import LocalWorkerClient
+
+    forge = _live_gitea_forge()
+    spec = gitea_transport(forge.api_url)
+    client = LocalWorkerClient(spec, forge.get("GITEA_TOKEN"), ca_file=forge.ca_file)
+    _reset_live_gitea(forge, CHANGE_BRANCH)
+    return GiteaOps(client, "live", transport=spec)  # type: ignore[arg-type]
+
+
+def _reset_live_gitea(forge: LiveForge, branch: str) -> None:
+    """The Gitea twin of :func:`_reset_live_branch`: the last run's open
+    pull requests closed, the change and content branches (and any
+    pending branch a dead delivery left) deleted, the change branch cut
+    again from the base with one commit whose third line is new, both
+    required contexts green on its head (the seeded base requires ``ci``
+    and ``lint``), and the loop's labels present."""
+    from time import time_ns
+    from urllib.parse import quote
+
+    dev = forge.client("GITEA_TOKEN", "Developer")
+    repo = f"/repos/{forge.repo}"
+    for pull in dev.get(f"{repo}/pulls", query={"state": "open", "limit": 50}).data or []:
+        if pull["head"]["ref"] in (branch, CONTENT_BRANCH):
+            dev.patch(f"{repo}/pulls/{pull['number']}", {"state": "closed"})
+    stale = [
+        b["name"]
+        for b in dev.get(f"{repo}/branches", query={"limit": 50}).data or []
+        if b["name"] in (branch, CONTENT_BRANCH) or b["name"].startswith("sbxloop/pending/")
+    ]
+    for name in stale:
+        dev.delete(f"{repo}/branches/{quote(name, safe='')}", check=False)
+    dev.post(f"{repo}/branches", {"new_branch_name": branch, "old_branch_name": "main"})
+    on_base = dev.get(f"{repo}/contents/a.py", query={"ref": "main"}, check=False)
+    commit = dev.post(
+        f"{repo}/contents",
+        {
+            "branch": branch,
+            "message": "sbxloop conformance: one change to review",
+            "files": [
+                {
+                    "operation": "update" if on_base.ok else "create",
+                    "path": "a.py",
+                    "content": base64.b64encode(
+                        f"x = 1\ny = 2\nz = {time_ns()}\n".encode()
+                    ).decode(),
+                }
+            ],
+        },
+    )
+    sha = commit.data["commit"]["sha"]
+    for context in ("ci", "lint"):
+        dev.post(
+            f"{repo}/statuses/{sha}",
+            {
+                "state": "success",
+                "context": context,
+                "description": "sbxloop conformance: green head",
+            },
+        )
+    present = {lb["name"] for lb in dev.get(f"{repo}/labels", query={"limit": 50}).data or []}
+    for name in ("sbxloop:run", "sbxloop:in-progress"):
+        if name not in present:
+            dev.post(f"{repo}/labels", {"name": name, "color": "#cccccc"})
+
+
+class _LiveGiteaSeeds:
+    """Seeds against the harness's ``acme/widgets`` on Gitea: ``main`` is
+    protected by the administrator (one approval, the contexts ``ci`` and
+    ``lint``, #1016 V4), which a write collaborator reads and cannot
+    change, so ``base_rules`` reports what stands; statuses go on the change
+    branch's head; an approval is the reviewer's token's review."""
+
+    def __init__(self, ops: VcsOps, forge: LiveForge) -> None:
+        self.ops = ops
+        self.forge = forge
+
+    def _head(self) -> str:
+        sha = self.ops.ref_lookup(self.forge.repo, f"heads/{CHANGE_BRANCH}")
+        assert sha
+        return sha
+
+    def failed_check(self, name: str, excerpt: str) -> None:
+        self.ops.status_create(
+            self.forge.repo, self._head(), "failure", context=name, description=excerpt
+        )
+
+    def pending_check(self, name: str) -> None:
+        self.ops.status_create(self.forge.repo, self._head(), "pending", context=name)
+
+    def base_rules(self, *, required: Sequence[str], approvals: int) -> SeededRules:
+        return SeededRules(("ci", "lint"), 1)
+
+    def standing_rules(self) -> SeededRules:
+        return SeededRules(("ci", "lint"), 1)
+
+    def approve(self, number: int) -> None:
+        reviewer = self.forge.client("GITEA_REVIEWER_TOKEN", "Reviewer")
+        reviewer.post(
+            f"/repos/{self.forge.repo}/pulls/{number}/reviews",
+            {"event": "APPROVED", "body": "sbxloop conformance: approved"},
+        )
+
+    def existing_issue(self, title: str, labels: Sequence[str]) -> int:
+        return self.ops.issue_create(self.forge.repo, title, "", labels=list(labels)).number
+
+
+def _live_gitea_seeds(ops: VcsOps) -> Seeds:
+    return _LiveGiteaSeeds(ops, _live_gitea_forge())
 
 
 BACKENDS: dict[str, Backend] = {
@@ -328,13 +516,16 @@ BACKENDS: dict[str, Backend] = {
         seeds=_live_gitlab_seeds,
         unavailable=_live_unavailable("gitlab"),
     ),
+    "gitea": Backend(
+        kind="gitea", repo="acme/widgets", base="main", make=_gitea, seeds=_gitea_seeds
+    ),
     "gitea-live": Backend(
         kind="gitea",
         repo="acme/widgets",
         base="main",
-        make=_no_backend("gitea"),
-        seeds=_no_seeds,
-        unavailable=_live_without_backend("gitea"),
+        make=_live_gitea,
+        seeds=_live_gitea_seeds,
+        unavailable=_live_unavailable("gitea"),
     ),
 }
 

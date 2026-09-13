@@ -17,7 +17,21 @@ backend's spelling, and every backend folds into them
 Steps 7 and 8, the review (#1018) and the landing (#1019), followed in
 the same package; the landing keeps merge trains behind a per-project
 capability, because the free tier has none and a project that has them
-is field-unverified beyond GitLab's documented API.
+is field-unverified beyond GitLab's documented API. Step 9, the remote
+commit (#1020), kept the GitHub-shaped content role and staged the
+changeset in the backend (see the V5 outcome). Steps 10 and 11, the Gitea
+backend (#1021), landed as `vcs/gitea/`: every role answered, the
+unsupported capabilities degraded in the open, and the V3 decision's
+operator list as `[vcs] bot_logins` with a per-repository override. The
+#1021 probe added to the verified facts: Gitea's `/git/` paths are GET
+only; `POST /branches {old_ref_name}` creates a branch at a commit and a
+second create is a 409; deleting the head branch of an open pull request
+closes it; the combined status's rows carry the state under `status`;
+an update or delete through the contents API needs no `sha`; a label
+the repository lacks is dropped from an add without a word; a `WIP:`
+pull request is refused with a 405 and retitling clears it; a review's
+`event` takes Gitea's own state words (`APPROVED`, not GitHub's `APPROVE`:
+an unknown word is recorded as a `PENDING` review that counts for nothing).
 
 Code-seam claims below were read off this tree and are reproducible with the
 commands quoted beside them. GitLab and Gitea claims are **verified** where

@@ -774,6 +774,15 @@ def _credential_needs(
         )
         lacking = {n.permission for n in found}
         missing = tuple(n for n in NEEDS if n.permission in lacking)
+    elif kind == "gitea":
+        # A Gitea token cannot read its own record (#1016 V6): the push bit
+        # plus one read per permission, and a credential that never expires.
+        found = (*_missing_from_push_bit(data), *_missing_from_probes(ops, repo, base))
+        source = "a Gitea token cannot read its own scopes; asked endpoint by endpoint"
+        info = ops.credential_info()
+        credential = info.summary() if info is not None else "Gitea access token"
+        lacking = {n.permission for n in found}
+        missing = tuple(n for n in NEEDS if n.permission in lacking)
     elif app_permissions is not None:
         # The installation's grant is the whole story: it is not a user.
         missing = missing_from_app(app_permissions)

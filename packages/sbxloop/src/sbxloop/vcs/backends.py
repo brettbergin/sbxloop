@@ -15,11 +15,15 @@ attempt to build one — never as a wrong-forge request later.
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Any, Protocol
 
-from sbxloop.config import FORGE_TOKEN_ENVS
 from sbxloop.errors import GithubOpsError
+from sbxloop.vcs.gitea.ops import (
+    SANDBOX_TOKEN_ENV as GITEA_SANDBOX_TOKEN_ENV,
+    GiteaOps,
+    gitea_transport,
+)
 from sbxloop.vcs.github.ops import GithubOps, github_transport
 from sbxloop.vcs.gitlab.ops import (
     SANDBOX_TOKEN_ENV as GITLAB_SANDBOX_TOKEN_ENV,
@@ -52,14 +56,18 @@ class BackendClass(Protocol):
 
 #: The backend class per kind. A kind absent here loads in the
 #: configuration and fails at the factory.
-BACKENDS: dict[str, type[Any]] = {"github": GithubOps, "gitlab": GitlabOps}
+BACKENDS: dict[str, type[Any]] = {
+    "github": GithubOps,
+    "gitlab": GitlabOps,
+    "gitea": GiteaOps,
+}
 
 #: The variable each kind's sandbox holds its token in (#1029): GitHub's
 #: pair, GitLab's one name. Names travel; values never do.
 SANDBOX_TOKEN_ENVS: dict[str, tuple[str, ...]] = {
     "github": ("GH_TOKEN", "GITHUB_TOKEN"),
     "gitlab": (GITLAB_SANDBOX_TOKEN_ENV,),
-    "gitea": (FORGE_TOKEN_ENVS["gitea"],),
+    "gitea": (GITEA_SANDBOX_TOKEN_ENV,),
 }
 
 
@@ -82,6 +90,8 @@ def transport_for(kind: str, api_url: str | None) -> TransportSpec | None:
         )
     if kind == "gitlab":
         return gitlab_transport(api_url)
+    if kind == "gitea":
+        return gitea_transport(api_url)
     raise BackendNotImplemented(kind)
 
 
@@ -92,14 +102,21 @@ def backend_for(
     *,
     api_url: str | None,
     timeout_s: float = 120.0,
+    bot_logins: Sequence[str] = (),
 ) -> VcsOps:
     """A backend of ``kind`` over ``client``, carrying the descriptor for
-    ``api_url``."""
+    ``api_url``. ``bot_logins`` is the operator's list of automated
+    reviewers (``[vcs] bot_logins``), the bot signal a forge without one
+    (Gitea, #1016 V3) reads; the other backends have their own signal and
+    ignore it."""
     cls = BACKENDS.get(kind)
     if cls is None:
         raise BackendNotImplemented(kind)
     transport = transport_for(kind, api_url)
-    backend: VcsOps = cls(client, run_id, timeout_s=timeout_s, transport=transport)
+    extra: dict[str, Any] = {}
+    if kind == "gitea":
+        extra["bot_logins"] = tuple(bot_logins)
+    backend: VcsOps = cls(client, run_id, timeout_s=timeout_s, transport=transport, **extra)
     return backend
 
 

@@ -240,4 +240,10 @@ class DaemonGithub:
         """The backend for this box's forge over ``client``, with the
         transport descriptor the configuration derives."""
         kind = self.kind
-        return backend_for(kind, client, DAEMON_RUN_ID, api_url=self.config.vcs_api_url_for(kind))
+        return backend_for(
+            kind,
+            client,
+            DAEMON_RUN_ID,
+            api_url=self.config.vcs_api_url_for(kind),
+            bot_logins=self.config.bot_logins_for(self.repo),
+        )

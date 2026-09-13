@@ -32,7 +32,7 @@ class TestBackendRows:
         for capability, state in GithubOps.CAPABILITIES.items():
             assert f"{state}: " in row.detail and capability in row.detail
 
-    def test_a_kind_no_backend_answers_fails_the_row(self) -> None:
+    def test_every_configured_kind_gets_its_row(self) -> None:
         rows = vcs_backend_checks(
             cfg(
                 vcs={"kind": "gitlab", "api_url": "https://gl.example/api/v4"},
@@ -41,10 +41,23 @@ class TestBackendRows:
         )
         assert [(r.name, r.ok, r.hard) for r in rows] == [
             ("vcs backend gitlab", True, False),
-            ("vcs backend gitea", False, True),
+            ("vcs backend gitea", True, False),
         ]
-        assert "not implemented yet" in rows[1].detail
-        assert "github, gitlab" in rows[1].detail
+        assert "unsupported: merge_queue, review_threads" in rows[1].detail
+        assert "not implemented" not in rows[1].detail
+
+    def test_a_gitea_token_is_judged_by_probes_and_never_expires(self) -> None:
+        from sbxloop.cli.doctor import _credential_needs, _credential_verdict
+        from tests.fakes.fake_gitea import FakeGitea
+
+        fake = FakeGitea()
+        required, _optional, source, credential = _credential_needs(
+            fake, None, "acme/widgets", "main", {"permissions": {"push": True}}, kind="gitea"
+        )
+        assert required == () and "endpoint by endpoint" in source
+        assert credential == "Gitea access token (never expires)"
+        warning, problem = _credential_verdict(fake, "gitea")
+        assert "never expires" in warning and problem == ""
 
     def test_gitlab_lists_its_verified_matrix_and_the_roles_still_missing(self) -> None:
         (row,) = vcs_backend_checks(

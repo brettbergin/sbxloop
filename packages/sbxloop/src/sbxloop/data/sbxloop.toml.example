@@ -426,10 +426,10 @@ service_memory = "2g"
 
 # [vcs]
 # The version-control backend: which forge the repositories live on.
-# "github" and "gitlab" answer a run in full (on GitLab a delivery is one
-# commits-API changeset, and a merge train only where the project has one);
-# "gitea" loads, and `sbxloop doctor` reports it as not yet implemented.
-# Anything else is refused at load. A `[[github.repos]]` entry may name its
+# "github", "gitlab" and "gitea" each answer a run in full (on GitLab a
+# delivery is one commits-API changeset and a merge train only where the
+# project has one; on Gitea there is no queue and no review thread, and a
+# fix round commits on top of the branch). Anything else is refused at load. A `[[github.repos]]` entry may name its
 # own `kind`. Without this section `[github]` is read as kind = "github",
 # and the loader says so once.
 # kind = "github"
@@ -441,6 +441,12 @@ service_memory = "2g"
 # "gitea"; for "github" the credential is GH_TOKEN/GITHUB_TOKEN or the App
 # installation, and a [[github.repos]] entry's own token_env still wins.
 # token_env = "GITLAB_TOKEN"
+# The logins of automated reviewers on a forge with no bot signal of its
+# own (Gitea): a listed login's review is read as a bot's (one fix round,
+# never a block); everyone else is a person until listed. GitHub and
+# GitLab read their own flag and ignore this. A [[github.repos]] entry may
+# name its own list.
+# bot_logins = []
 #
 # The same three keys for a self-managed GitLab — a project access token
 # with the `api` scope, long-lived, so give it an expiry when creating it:
@@ -448,10 +454,12 @@ service_memory = "2g"
 # api_url = "https://gitlab.example.com/api/v4"
 # token_env = "GITLAB_TOKEN"
 #
-# ...and for a Gitea instance, with an access token from its settings page:
+# ...and for a Gitea instance, with an access token from its settings page
+# (long-lived: Gitea tokens have no expiry, so scope it to the repository):
 # kind = "gitea"
 # api_url = "https://gitea.example.com/api/v1"
 # token_env = "GITEA_TOKEN"
+# bot_logins = ["ci-bot"]
 
 # [github]
 # The GitHub integration. Unset (the default) disables GitHub entirely:
@@ -533,6 +541,7 @@ service_memory = "2g"
 # memory = "12g"
 # repo = "you/your-repo"
 # kind = "github"                  # the forge this repository lives on; unset uses [vcs]'s
+# bot_logins = []                  # automated reviewers on a forge without a bot flag; unset uses [vcs]'s
 # workspace = "/path/to/checkout"  # this repo's host checkout; unset falls
 #                                  # back to [sandbox] workspace when that
 #                                  # checkout belongs to this repository

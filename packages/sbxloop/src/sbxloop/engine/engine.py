@@ -1471,8 +1471,15 @@ class LoopEngine:
         from sbxloop.vcs.backends import backend_for
 
         entry = self.config.github.effective_repo(None)
-        kind = self.config.vcs_kind_for(entry.repo if entry is not None else None)
-        return backend_for(kind, client, run_id, api_url=self.config.vcs_api_url_for(kind))
+        repo = entry.repo if entry is not None else None
+        kind = self.config.vcs_kind_for(repo)
+        return backend_for(
+            kind,
+            client,
+            run_id,
+            api_url=self.config.vcs_api_url_for(kind),
+            bot_logins=self.config.bot_logins_for(repo),
+        )
 
     def _ensure_delivery_repo(self, run_id: str, ops: VcsOps | None) -> bool | None:
         """Probe (and, when allowed, create) the delivery repo up front.
