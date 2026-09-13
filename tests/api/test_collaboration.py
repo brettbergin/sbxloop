@@ -135,6 +135,43 @@ def test_turns_keep_channel_memory_and_expand_team_mentions(api: Any) -> None:
     assert len(concierge.calls) == 2
 
 
+def test_chat_messages_carry_turn_status_and_user_feedback_reactions(api: Any) -> None:
+    api.ctx.concierge = FakeConcierge()
+    headers = bearer(register(api))
+    channel_id = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+
+    accepted = api.client.post(
+        f"/v1/channels/{channel_id}/turns",
+        headers=headers,
+        json={"content": "hello"},
+    ).json()
+    input_message = accepted["message"]
+    assert input_message["reactions"] == ["⏳"]
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        turn = api.client.get(
+            f"/v1/channels/{channel_id}/turns/{accepted['turn']['id']}", headers=headers
+        ).json()
+        if turn["status"] not in {"accepted", "running"}:
+            break
+        time.sleep(0.01)
+    assert turn["status"] == "completed"
+    messages = api.client.get(f"/v1/channels/{channel_id}/messages", headers=headers).json()
+    assert messages[0]["reactions"] == ["⏳", "✅"]
+
+    reply = messages[1]
+    route = f"/v1/channels/{channel_id}/messages/{reply['id']}/reaction"
+    reacted = api.client.put(route, headers=headers, json={"emoji": "👍", "active": True})
+    assert reacted.status_code == 200
+    assert reacted.json()["reactions"] == ["👍"]
+    repeated = api.client.put(route, headers=headers, json={"emoji": "👍", "active": True})
+    assert repeated.json()["reactions"] == ["👍"]
+    removed = api.client.put(route, headers=headers, json={"emoji": "👍", "active": False})
+    assert removed.json()["reactions"] == []
+    assert api.client.put(route, headers=headers, json={"emoji": "not-emoji"}).status_code == 422
+
+
 def test_ordinary_conversation_cannot_use_action_tools(api: Any) -> None:
     concierge = FakeConcierge()
     api.ctx.concierge = concierge
