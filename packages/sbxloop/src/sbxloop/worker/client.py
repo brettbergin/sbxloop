@@ -23,6 +23,7 @@ import codecs
 import contextlib
 import json
 import queue
+import re
 import shlex
 import threading
 import time
@@ -161,10 +162,73 @@ def _toolchain_probe(selected: Sequence[toolchains.Toolchain]) -> str:
 log = get_logger(__name__)
 
 
-def _output_tail(result: ExecResult, limit: int = 2000) -> str:
+# Echoed to both streams by a setup command's script once the login shell has
+# read its profile, so what the image prints on login can be told from what the
+# command produced. A target's sandbox image is free to announce itself — a
+# version manager, a banner, an MOTD — and none of that is the operator's
+# command talking, least of all in the error it failed with, where a long
+# enough banner pushed the real message out of the tail.
+SETUP_MARK = "sbxloop-setup-begin"
+
+
+def _after_mark(text: str, mark: str) -> str:
+    """What a stream carried after ``mark``'s own line.
+
+    The first occurrence, not the last. The profile runs before the mark is
+    echoed, so the first one is always the script's own — which leaves a
+    command that echoes the token itself with all of its output.
+    """
+    _profile, separator, rest = text.partition(f"{mark}\n")
+    return rest if separator else text
+
+
+def _apt_lock_contended(result: ExecResult) -> bool:
+    output = f"{result.stderr}\n{result.stdout}".lower()
+    return (
+        result.returncode == 100
+        and "lock" in output
+        and any(
+            marker in output
+            for marker in (
+                "held by process",
+                "resource temporarily unavailable",
+                "is another process using it",
+            )
+        )
+    )
+
+
+def _apt_failure_hint(result: ExecResult) -> str:
+    if _apt_lock_contended(result):
+        return "another apt/dpkg process still holds the lock; retry after it finishes"
+    output = f"{result.stderr}\n{result.stdout}".lower()
+    if "permission denied" in output or "are you root" in output:
+        return "check the sandbox user's sudo permissions"
+    if "unable to locate package" in output or "has no installation candidate" in output:
+        return "check the package name and the configured apt repositories"
+    if any(
+        marker in output
+        for marker in ("failed to fetch", "could not resolve", "temporary failure resolving")
+    ):
+        return "check the sandbox network policy, DNS and configured apt mirrors"
+    return (
+        "inspect apt's output; rc=100 alone does not distinguish locks, mirrors or package errors"
+    )
+
+
+def _output_tail(result: ExecResult, limit: int = 2000, *, mark: str | None = None) -> str:
     """Combined stderr+stdout tail: sbx exec surfaces some in-sandbox errors
-    on stdout, so stderr alone can be empty exactly when it matters."""
-    combined = "\n".join(part.strip() for part in (result.stderr, result.stdout) if part.strip())
+    on stdout, so stderr alone can be empty exactly when it matters.
+
+    ``mark`` names a token the script echoes to both streams once the login
+    profile has run; everything before it is the profile's and is dropped. A
+    stream without the mark is kept whole — the script never reached the echo,
+    so whatever is there is the diagnostic.
+    """
+    stderr, stdout = result.stderr, result.stdout
+    if mark is not None:
+        stderr, stdout = _after_mark(stderr, mark), _after_mark(stdout, mark)
+    combined = "\n".join(part.strip() for part in (stderr, stdout) if part.strip())
     return combined[-limit:] if combined else "(no output)"
 
 
@@ -277,9 +341,10 @@ class WorkerClient:
         (Debian/Ubuntu split ensurepip out). The ladder:
 
         1. ``python3 -m venv`` — the clean path.
-        2. On a venv/ensurepip failure: ``sudo -n apt-get install
-           python3-venv python3-pip`` (the template's agent user has sudo;
-           apt hosts are on the balanced allowlist), then retry the venv.
+        2. On a venv/ensurepip failure: probe the running ``python3`` and
+           install its matching ``python3.X-venv`` plus ``python3-pip``
+           with apt, then retry the venv. The distro's unversioned venv
+           package may target a different interpreter from the image's.
         3. Still no venv: **user-site fallback** — ``python3 -m pip install
            --user`` (adding ``--break-system-packages`` when pip reports an
            externally-managed environment), and the worker runs under the
@@ -682,6 +747,38 @@ class WorkerClient:
             return
         self._provision_toolchains(missing, timeout)
 
+    def _install_apt(self, packages: Sequence[str], timeout: float) -> ExecResult:
+        """Retry confirmed apt lock contention, including the update lists lock.
+
+        All provisioning apt paths share this policy. Apt owns its locks;
+        never delete them or try to hold them on apt's behalf. Retry the
+        whole idempotent batch at most twelve times, five seconds apart,
+        within the caller's original timeout (including command runtime).
+        Other errors return immediately with their original diagnostics.
+        """
+        command = [
+            "sh",
+            "-c",
+            f"sudo -n apt-get update -q && sudo -n apt-get install -y -q {shlex.join(packages)}",
+        ]
+        deadline = time.monotonic() + timeout
+        result = self.sandbox.exec(command, timeout=timeout)
+        for attempt in range(12):
+            if not _apt_lock_contended(result) or deadline - time.monotonic() <= 5.0:
+                return result
+            log.info(
+                "worker.apt_lock_wait",
+                sandbox=self.sandbox.name,
+                retry=attempt + 1,
+                delay_s=5.0,
+            )
+            time.sleep(5.0)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return result
+            result = self.sandbox.exec(command, timeout=remaining)
+        return result
+
     def _provision_toolchains(
         self, missing: Sequence[toolchains.Toolchain], timeout: float
     ) -> None:
@@ -694,17 +791,11 @@ class WorkerClient:
             toolchains=[tc.name for tc in missing],
         )
         packages = toolchains.apt_packages(missing)
+        apt_ok = True
         if packages:
             apt_for = [tc for tc in missing if tc.apt_packages]
-            result = self.sandbox.exec(
-                [
-                    "sh",
-                    "-c",
-                    "sudo -n apt-get update -q && "
-                    f"sudo -n apt-get install -y -q {' '.join(packages)}",
-                ],
-                timeout=timeout,
-            )
+            result = self._install_apt(packages, timeout)
+            apt_ok = result.ok
             if not result.ok:
                 log.warning(
                     "worker.dev_tools_ensure_failed",
@@ -713,12 +804,19 @@ class WorkerClient:
                     rc=result.returncode,
                     wanted="; ".join(tc.wanted for tc in apt_for),
                     output=_output_tail(result),
-                    hint="the agent has to bootstrap these itself; rc=100 usually means apt "
-                    "could not reach its mirrors — check the sandbox network policy allows "
-                    "the Ubuntu/Debian apt hosts",
+                    hint=_apt_failure_hint(result),
                 )
         for toolchain in missing:
             if toolchain.install_script is None:
+                continue
+            if not apt_ok and toolchain.apt_packages:
+                log.warning(
+                    "worker.toolchain_installer_skipped",
+                    sandbox=self.sandbox.name,
+                    toolchain=toolchain.name,
+                    reason="apt prerequisites did not install; "
+                    "the agent must bootstrap this toolchain",
+                )
                 continue
             # A compile-from-source entry (ruby-build) declares how long it
             # needs; the caller's budget is a floor, never a cap on it.
@@ -772,19 +870,11 @@ class WorkerClient:
             log.debug("worker.apt_packages_present", sandbox=self.sandbox.name, packages=packages)
             return
         log.info("worker.apt_packages_installing", sandbox=self.sandbox.name, packages=missing)
-        result = self.sandbox.exec(
-            [
-                "sh",
-                "-c",
-                f"sudo -n apt-get update -q && sudo -n apt-get install -y -q {shlex.join(missing)}",
-            ],
-            timeout=timeout,
-        )
+        result = self._install_apt(missing, timeout)
         if not result.ok:
             raise WorkerError(
                 f"apt packages {missing} did not install (rc={result.returncode}); "
-                "rc=100 usually means apt could not reach its mirrors or knows no such "
-                f"package — check the name and the sandbox network policy: {_output_tail(result)}"
+                f"{_apt_failure_hint(result)}: {_output_tail(result)}"
             )
         self.apt_installed = missing
 
@@ -806,24 +896,35 @@ class WorkerClient:
         output tail become one ``sandbox.setup`` event; the first non-zero
         exit stops the sequence and fails provisioning naming the command,
         because the project would not build for the agent either.
+
+        The tail is the command's own output: whatever the image prints on
+        login is cut at ``SETUP_MARK``, so a banner cannot crowd out the
+        message a failing command ended the run with.
         """
         for command in commands:
             started = time.monotonic()
             payload = self._env_payload()
             script = f"cd {shlex.quote(cwd)} && {command}"
+            # First in the login shell's script, and ahead of the environment:
+            # the profile has run by the time the mark is echoed, so it divides
+            # the image's own output from everything sbxloop and the operator
+            # then do — an env file that fails to source still has its say.
+            mark = f"echo {SETUP_MARK}; echo {SETUP_MARK} >&2; "
             if payload is None:
                 # The env file is what the worker process loads at startup;
                 # a template without one (no secrets, proxy delivery) runs
                 # the command in the profile's environment alone.
-                inner = shlex.join(["sh", "-lc", f"[ -f {ENV_FILE} ] && . {ENV_FILE}; {script}"])
+                inner = shlex.join(
+                    ["sh", "-lc", f"{mark}[ -f {ENV_FILE} ] && . {ENV_FILE}; {script}"]
+                )
                 cmd = ["sh", "-c", f"exec {inner}"]
             else:
                 inner = shlex.join(
-                    ["sh", "-lc", f'eval "${JOB_ENV_VAR}"; unset {JOB_ENV_VAR}; {script}']
+                    ["sh", "-lc", f'{mark}eval "${JOB_ENV_VAR}"; unset {JOB_ENV_VAR}; {script}']
                 )
                 cmd = ["sh", "-c", f'{JOB_ENV_VAR}="$(cat)" exec {inner}']
             result = self.sandbox.exec(cmd, timeout=timeout, stdin=payload)
-            tail = _output_tail(result)
+            tail = _output_tail(result, mark=SETUP_MARK)
             if payload is not None:
                 tail = _scrub(tail, self._secret_values(payload))
             duration = round(time.monotonic() - started, 1)
@@ -883,14 +984,7 @@ class WorkerClient:
         probe = self.sandbox.exec(["sh", "-c", self._SEARCH_FALLBACK_PROBE])
         if probe.ok:
             return
-        result = self.sandbox.exec(
-            [
-                "sh",
-                "-c",
-                "sudo -n apt-get update -q && sudo -n apt-get install -y -q ripgrep",
-            ],
-            timeout=timeout,
-        )
+        result = self._install_apt(["ripgrep"], timeout)
         if not result.ok:
             log.warning(
                 "worker.search_fallback_ensure_failed",
@@ -912,18 +1006,7 @@ class WorkerClient:
         if result.ok:
             return True
         output = f"{result.stdout} {result.stderr}".lower()
-        if "ensurepip" in output or "venv" in output:
-            # Self-heal: the official templates run Ubuntu with a sudo-capable
-            # agent user, and apt hosts are on the balanced allowlist.
-            self.sandbox.exec(
-                [
-                    "sh",
-                    "-c",
-                    "sudo -n apt-get update -q && "
-                    "sudo -n apt-get install -y -q python3-venv python3-pip",
-                ],
-                timeout=timeout,
-            )
+        if ("ensurepip" in output or "venv" in output) and self._repair_venv(timeout):
             result = self.sandbox.exec(venv_cmd, timeout=timeout)
             if result.ok:
                 return True
@@ -933,8 +1016,42 @@ class WorkerClient:
             rc=result.returncode,
             output=_output_tail(result),
             action="falling back to a user-site install with the system python3",
+            hint="repair the base image's matching python3.X-venv package and re-run sbxloop bake",
         )
         return False
+
+    def _repair_venv(self, timeout: float) -> bool:
+        # Query the interpreter, never parse executable paths or the error's
+        # suggested command. A template may select a newer Python than apt's
+        # python3-venv metapackage serves.
+        probe = self.sandbox.exec(
+            [
+                "python3",
+                "-c",
+                "import sys; print('python%d.%d-venv' % sys.version_info[:2])",
+            ],
+            timeout=timeout,
+        )
+        package = probe.stdout.strip()
+        if not probe.ok or re.fullmatch(r"python3\.[0-9]+-venv", package) is None:
+            log.warning(
+                "worker.venv_repair_failed",
+                sandbox=self.sandbox.name,
+                reason="could not determine the running python3's matching venv package",
+                rc=probe.returncode,
+                output=_output_tail(probe),
+            )
+            return False
+        result = self._install_apt([package, "python3-pip"], timeout)
+        if not result.ok:
+            log.warning(
+                "worker.venv_repair_failed",
+                sandbox=self.sandbox.name,
+                package=package,
+                rc=result.returncode,
+                output=_output_tail(result),
+            )
+        return result.ok
 
     def _pip_user_install(self, target: str, *, timeout: float, no_deps: bool) -> None:
         pip = ["python3", "-m", "pip", "install", "--quiet", "--user"]

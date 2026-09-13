@@ -53,6 +53,7 @@ from sbxloop.errors import ConfigError
 from sbxloop.ids import DEFAULT_BRANCH_PREFIX
 from sbxloop.log import LogFormat, LogLevel, get_logger
 from sbxloop.paths import SbxloopHome, home_root_from_env, resolve_home_root
+from sbxloop.resources import CpuCount, MemoryLimit, ResourcePurpose, SandboxResources
 from sbxloop.toolchains import DEFAULT_LANGUAGES, normalize_language, supported_languages
 from sbxloop_worker.protocol import (
     OPENAI_BASE_URL_ENV,
@@ -319,6 +320,15 @@ class SandboxConfig(_ConfigModel):
     behavior — runs mutate the workspace directly, no git involved.
     """
 
+    # Mandatory per-VM allocations. Zero/auto is deliberately unsupported.
+    cpus: CpuCount = 6
+    memory: MemoryLimit = "12g"
+    concierge_cpus: CpuCount = 2
+    concierge_memory: MemoryLimit = "4g"
+    github_cpus: CpuCount = 1
+    github_memory: MemoryLimit = "2g"
+    service_cpus: CpuCount = 1
+    service_memory: MemoryLimit = "2g"
     template: str | None = None
     workspace: Path | None = None
     workspace_isolation: WorkspaceIsolation = "auto"
@@ -984,6 +994,9 @@ class RepoConfig(_ConfigModel):
     """
 
     repo: str
+    # Only the run agent: helpers and the concierge keep their own sizing.
+    cpus: CpuCount | None = None
+    memory: MemoryLimit | None = None
     # Which forge holds this repository (#1009); None → `[vcs] kind`.
     # `Config.vcs_kind_for` resolves the effective one.
     kind: VcsKind | None = None
@@ -2951,6 +2964,21 @@ class Config(_ConfigModel):
         the default repository, and a repository with no entry gets the
         daemon-wide set."""
         return self.daemon.labels_for(self.github.effective_repo(repo))
+
+    def sandbox_resources_for(
+        self, purpose: ResourcePurpose, repo: str | None = None
+    ) -> SandboxResources:
+        """Resolve a VM's allocation; no repository means the global default."""
+        if purpose == "agent":
+            entry = self.github.find_repo(repo) if repo is not None else None
+            return SandboxResources(
+                cpus=entry.cpus if entry and entry.cpus is not None else self.sandbox.cpus,
+                memory=entry.memory if entry and entry.memory is not None else self.sandbox.memory,
+            )
+        return SandboxResources(
+            cpus=getattr(self.sandbox, f"{purpose}_cpus"),
+            memory=getattr(self.sandbox, f"{purpose}_memory"),
+        )
 
     def sandbox_env_for(self, repo: str | None = None) -> dict[str, str]:
         """The plain environment ``repo``'s agent sandbox gets (#679): the

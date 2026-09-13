@@ -9,6 +9,9 @@ from __future__ import annotations
 
 from importlib import resources
 
+import tomlkit
+from tomlkit.items import Table
+
 DEFAULT_CONFIG_TOML = (
     resources.files("sbxloop.data").joinpath("sbxloop.toml.example").read_text(encoding="utf-8")
 )
@@ -29,16 +32,30 @@ def config_presets() -> dict[str, str]:
 
 
 def render_config_template(preset: str | None = None) -> str:
-    """The template `sbxloop init` writes, with a preset's sections appended.
+    """The template `sbxloop init` writes, with a preset's sections merged.
 
-    Every table in the template is commented out, so appending a preset's
-    live `[budgets]`/`[limits]` yields valid TOML. Raises KeyError for a
-    preset name the package does not ship.
+    Resource limits are live in the template. Merge preset sandbox keys
+    into that table, retaining limits the preset did not override and the
+    template's operator guidance. Unknown preset names raise KeyError.
     """
     if preset is None:
         return DEFAULT_CONFIG_TOML
     fragment = config_presets()[preset]
-    return DEFAULT_CONFIG_TOML.rstrip("\n") + "\n\n" + fragment
+    document = tomlkit.parse(DEFAULT_CONFIG_TOML)
+    for key, value in tomlkit.parse(fragment).body:
+        if key is None:
+            document.append(None, value)
+            continue
+        current = document.get(key.key)
+        if isinstance(current, Table) and isinstance(value, Table):
+            for child_key, child_value in value.value.body:
+                if child_key is None:
+                    current.append(None, child_value)
+                else:
+                    current[child_key.key] = child_value
+        else:
+            document[key.key] = value
+    return tomlkit.dumps(document)
 
 
 def secrets_env_template() -> str:
