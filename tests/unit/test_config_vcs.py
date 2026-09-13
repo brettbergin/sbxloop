@@ -122,6 +122,27 @@ class TestLoaderNotice:
             load_config(tmp_path, env={"HOME": str(tmp_path)})
 
 
+class TestBotLogins:
+    """The automated reviewers on a forge without a bot signal (#1021):
+    a `[vcs]` default and a per-repository override, empty by default."""
+
+    def test_empty_by_default_so_every_reviewer_is_human(self) -> None:
+        assert cfg().bot_logins_for() == ()
+        assert cfg(github={"repos": [{"repo": "o/a"}]}).bot_logins_for("o/a") == ()
+
+    def test_the_section_and_then_the_entry(self) -> None:
+        config = cfg(
+            vcs={"kind": "gitea", "api_url": "https://gt.example/api/v1", "bot_logins": ["ci-bot"]},
+            github={"repos": [{"repo": "o/a"}, {"repo": "o/b", "bot_logins": ["renovate"]}]},
+        )
+        assert config.bot_logins_for("o/a") == ("ci-bot",)
+        assert config.bot_logins_for("o/b") == ("renovate",)
+
+    def test_an_empty_login_is_refused(self) -> None:
+        with pytest.raises(ValueError, match=r"vcs\.bot_logins must not contain an empty login"):
+            cfg(vcs={"kind": "gitea", "api_url": "https://gt.example/api/v1", "bot_logins": [" "]})
+
+
 class TestTokenEnv:
     """The variable the forge token is read from is a name that travels
     through config; the value only ever lives in secrets.env."""

@@ -560,4 +560,9 @@ BLOCKER_WORDING: dict[str, BlockerWording] = {
         code_owners_file="CODEOWNERS",
         signing="GitLab does not sign commits created through its commits API",
     ),
+    "gitea": BlockerWording(
+        last_push_rule="dismiss stale approvals (the rule that removes approvals on a new push)",
+        code_owners_file="CODEOWNERS",
+        signing="Gitea does not sign commits created through its contents API",
+    ),
 }

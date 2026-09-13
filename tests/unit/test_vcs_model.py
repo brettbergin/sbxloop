@@ -83,12 +83,18 @@ class TestBlockerWording:
         )
 
     def test_another_forge_gets_its_own_or_the_generic_wording(self) -> None:
-        elsewhere = self.REQ._replace(forge="gitea")
+        elsewhere = self.REQ._replace(forge="bitbucket")
         reasons = elsewhere.blockers()
         assert not any("GitHub" in r or "CODEOWNERS" in r for r in reasons)
         assert any(f"({GENERIC_WORDING.code_owners_file})" in r for r in reasons)
         assert any(GENERIC_WORDING.signing in r for r in reasons)
-        assert "gitea" not in BLOCKER_WORDING, "no Gitea backend yet; the generic wording serves"
+        assert "bitbucket" not in BLOCKER_WORDING
+
+    def test_gitea_is_read_in_its_own_words(self) -> None:
+        reasons = self.REQ._replace(forge="gitea").blockers()
+        assert not any("GitHub" in r for r in reasons)
+        assert any("Gitea does not sign" in r for r in reasons)
+        assert any("dismiss stale approvals" in r for r in reasons)
 
     def test_gitlab_is_read_in_its_own_words(self) -> None:
         reasons = self.REQ._replace(forge="gitlab").blockers()

@@ -51,6 +51,21 @@
   deletion the base no longer has is dropped rather than failing the
   commit. `sbxloop doctor` lists nothing as not implemented for GitLab.
 
+- **A Gitea backend.** `[vcs] kind = "gitea"` with `[vcs] api_url` selects
+  a backend that answers every role against Gitea's REST API, and says
+  plainly what Gitea lacks: no merge queue (the landing merges directly),
+  no review threads (a finding is a review comment the loop answers with a
+  change-level comment and never resolves), no bot flag (the new
+  `[vcs] bot_logins`, with a `[[github.repos]] bot_logins` override, names
+  the automated reviewers; everyone else is a person), and tokens that
+  never expire (the doctor's credential row says so and judges the token's
+  permissions endpoint by endpoint). A draft is the `WIP:` prefix, the
+  base's required contexts and approvals are read from the branch as a
+  write collaborator, and a delivery is one contents-API changeset with a
+  fix round committed on top of the branch. The conformance suite runs
+  every scenario on a Gitea fake and, with the live harness, against
+  Gitea 1.24.7.
+
 - **Playwright MCP setup for Copilot and Claude builders.**
   `sbxloop init --preset playwright` configures Node, a pinned MCP package,
   its matching headless Chromium installation, download hosts and builder

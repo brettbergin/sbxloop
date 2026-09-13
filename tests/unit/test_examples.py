@@ -279,7 +279,15 @@ def test_example_documents_both_github_forms() -> None:
     text = EXAMPLE.read_text()
     assert "[[github.repos]]" in text
     assert re.search(r"^# repo = \"you/your-repo\"", text, re.MULTILINE)
-    for key in ("deliver_base", "enabled", "token_env", "trigger_label", "labels", "workspace"):
+    for key in (
+        "deliver_base",
+        "enabled",
+        "token_env",
+        "bot_logins",
+        "trigger_label",
+        "labels",
+        "workspace",
+    ):
         assert re.search(rf"^#\s*{key} = ", text, re.MULTILINE), key
 
 

@@ -96,6 +96,28 @@ class TestTheGitlabBackendAnswersEveryRole:
         assert isinstance(fake, VcsOps)
 
 
+class TestTheGiteaBackendAnswersEveryRole:
+    """The third backend (#1021) is held to the same partition."""
+
+    GITEA_PRIVATE: ClassVar[set[str]] = {"raw_text", "raw_pages"}
+
+    def test_every_operation_belongs_to_exactly_one_role(self) -> None:
+        from sbxloop.vcs.gitea.ops import GiteaOps
+
+        placed = set().union(*(_role_methods(role) for role in ROLES))
+        operations = _public_methods(GiteaOps) - TRANSPORT - self.GITEA_PRIVATE
+        assert sorted(operations - placed) == [], "operations on no role"
+        assert sorted(placed - operations) == [], "role methods the backend lacks"
+
+    def test_structurally_at_runtime(self) -> None:
+        from tests.fakes.fake_gitea import FakeGitea
+
+        fake = FakeGitea()
+        for role in ROLES:
+            assert isinstance(fake, role), role.__name__
+        assert isinstance(fake, VcsOps)
+
+
 class TestCapabilities:
     def test_github_reports_every_capability_in_one_of_three_states(self) -> None:
         report = FakeGithub().capabilities()

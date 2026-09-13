@@ -903,6 +903,17 @@ def _check_https_root(value: str, key: str, example: str) -> str:
     return value
 
 
+def _check_logins(value: list[str], key: str) -> list[str]:
+    """A list of forge logins: each stripped and non-empty."""
+    logins: list[str] = []
+    for raw in value:
+        login = str(raw).strip()
+        if not login:
+            raise ValueError(f"{key} must not contain an empty login")
+        logins.append(login)
+    return logins
+
+
 class VcsConfig(_ConfigModel):
     """The version-control backend (#1009): which forge the configured
     repositories live on, and where its API is served from.
@@ -918,11 +929,26 @@ class VcsConfig(_ConfigModel):
     the section a repository is declared in: it reads as ``[vcs] kind =
     "github"``, and the loader says so once when no ``[vcs]`` section names
     the forge.
+
+    ``bot_logins`` names the automated reviewers on a forge that has no bot
+    signal of its own (Gitea, #1016 V3): a listed login's review is read
+    as a bot's (one fix round, never a block, like a GitHub App's), every
+    other reviewer is a person until listed. Empty by default: treating a
+    human as a bot drops their feedback after one answer, which is the
+    failure the one-round rule must never cause. A ``[[github.repos]]``
+    entry may name its own list. GitHub and GitLab read their forge's flag
+    and ignore this key.
     """
 
     kind: VcsKind = "github"
     api_url: str | None = None
     token_env: str | None = None
+    bot_logins: list[str] = Field(default_factory=list)
+
+    @field_validator("bot_logins")
+    @classmethod
+    def _check_bot_logins(cls, value: list[str]) -> list[str]:
+        return _check_logins(value, "vcs.bot_logins")
 
     @field_validator("kind", mode="before")
     @classmethod
@@ -977,6 +1003,15 @@ class RepoConfig(_ConfigModel):
     # Environment variable holding the token for this repository; None → the
     # daemon-wide GH_TOKEN.
     token_env: str | None = None
+    # The automated reviewers on a forge without a bot signal (#1021);
+    # None → `[vcs] bot_logins`. `Config.bot_logins_for` resolves it.
+    bot_logins: list[str] | None = None
+
+    @field_validator("bot_logins")
+    @classmethod
+    def _check_bot_logins(cls, value: list[str] | None) -> list[str] | None:
+        return None if value is None else _check_logins(value, "github.repos.bot_logins")
+
     # Per-repo overrides of the seven lifecycle labels (#630); None → the
     # `[daemon]` value. `Config.labels_for` resolves the effective set.
     trigger_label: str | None = None
@@ -2717,6 +2752,15 @@ class Config(_ConfigModel):
         if kind == "github":
             return None
         return self.vcs.token_env or FORGE_TOKEN_ENVS[kind]
+
+    def bot_logins_for(self, repo: str | None = None) -> tuple[str, ...]:
+        """The automated reviewers on ``repo``'s forge (#1021): the entry's
+        own ``bot_logins`` when it names any, else ``[vcs] bot_logins``.
+        Read by a backend whose forge has no bot signal (Gitea)."""
+        entry = self.github.find_repo(repo)
+        if entry is not None and entry.bot_logins is not None:
+            return tuple(entry.bot_logins)
+        return tuple(self.vcs.bot_logins)
 
     def vcs_api_url_for(self, kind: VcsKind) -> str | None:
         """The API root a backend of ``kind`` speaks to: ``[github] api_url``

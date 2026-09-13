@@ -44,9 +44,30 @@ class TestFactory:
             transport_for("gitlab", None)
 
     def test_a_kind_no_backend_answers_fails_closed(self) -> None:
-        with pytest.raises(BackendNotImplemented, match='"gitea"'):
-            backend_for("gitea", StubWorkerClient({}), "r1", api_url="https://gt.example/api/v1")  # type: ignore[arg-type]
-        assert capabilities_for("gitea") is None and unimplemented_roles("gitea") == ()
+        with pytest.raises(BackendNotImplemented, match='"svn"'):
+            backend_for("svn", StubWorkerClient({}), "r1", api_url="https://svn.example/api")  # type: ignore[arg-type]
+        assert capabilities_for("svn") is None and unimplemented_roles("svn") == ()
+
+    def test_gitea_takes_the_operators_bot_list(self) -> None:
+        from sbxloop.vcs.gitea.ops import GiteaOps
+
+        ops = backend_for(
+            "gitea",
+            StubWorkerClient({}),  # type: ignore[arg-type]
+            "r1",
+            api_url="https://gt.example/api/v1",
+            bot_logins=["ci-bot"],
+        )
+        assert isinstance(ops, GiteaOps) and ops.bot_logins == frozenset({"ci-bot"})
+        assert ops.transport is not None and ops.transport.auth == "token"
+        gitlab = backend_for(
+            "gitlab",
+            StubWorkerClient({}),
+            "r1",
+            api_url="https://gl.example/api/v4",
+            bot_logins=["x"],  # type: ignore[arg-type]
+        )
+        assert not hasattr(gitlab, "bot_logins"), "GitLab reads its own flag"
 
     def test_the_registry_reports_what_each_kind_can_do(self) -> None:
         github = capabilities_for("github")
@@ -55,6 +76,9 @@ class TestFactory:
         assert gitlab is not None and gitlab["review_threads"] is Capability.SUPPORTED
         assert unimplemented_roles("github") == () and unimplemented_operations("github") == ()
         assert unimplemented_roles("gitlab") == () and unimplemented_operations("gitlab") == ()
+        gitea = capabilities_for("gitea")
+        assert gitea is not None and gitea["review_threads"] is Capability.UNSUPPORTED
+        assert unimplemented_roles("gitea") == ()
 
     def test_each_kinds_sandbox_token_variables(self) -> None:
         assert sandbox_token_envs("github") == ("GH_TOKEN", "GITHUB_TOKEN")

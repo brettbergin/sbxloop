@@ -114,8 +114,31 @@ descriptor the worker needs.
   raises a typed error naming the backend, the role and the operation, so
   a run on that forge fails closed at the first of them, and `sbxloop doctor` lists the same operations before any run starts. The conformance
   suite reads that error as a skip naming the operation, the way an
-  `UNSUPPORTED` capability skips with its name. The GitLab backend's list
-  is empty since #1020; the mechanism stays for the next backend.
+  `UNSUPPORTED` capability skips with its name. The GitLab and Gitea
+  backends' lists are empty; the mechanism stays for the next backend.
+
+- **Gitea answers with what it lacks said plainly.** The third backend
+  (`vcs/gitea/`, #1021) speaks Gitea's GitHub-shaped REST API and folds
+  the few differences (a `pull_request: null` key dropped, a status's
+  state under `status`, `REQUEST_CHANGES` as `CHANGES_REQUESTED`, the
+  `WIP:` prefix as the draft). Where Gitea has no feature, the backend
+  reports `UNSUPPORTED` and degrades in the open: no merge queue, so the
+  landing merges directly; no review threads, so each review comment is
+  its own thread, a reply is a change-level comment quoting the anchor,
+  and `resolve_review_thread` answers `False` (a person resolves in the web
+  UI); no bot flag, so `[vcs] bot_logins` (with a per-repository override,
+  `Config.bot_logins_for`) is the bot signal, passed to the backend at
+  construction, and every unlisted reviewer is a person; no token that
+  reads itself, so `credential_info` says the token never expires and the
+  doctor judges its permissions endpoint by endpoint. The base's rules come
+  from the branch view a write collaborator can read (contexts, approvals,
+  whether the token may merge), with the admin-only flags left `unread`.
+  A delivery is staged as on GitLab and written as one contents-API
+  changeset on a pending branch; the run's branch is created at that
+  commit; a fix round commits the difference between the branch's tree
+  and the wanted one on top of the branch, because deleting a branch
+  closes its open pull request (field-verified) and nothing moves a
+  branch.
 
 - **A delivery on GitLab is one changeset.** `deliver.py` speaks GitHub's
   blob, tree, commit and ref steps, and GitLab has none of those objects
@@ -163,7 +186,7 @@ one `vcs backend <kind>` row per forge with each capability's state, or a
 failing row for a kind no backend answers yet. `[github]` stays the section
 a repository is declared in and reads as `kind = "github"`. The github-role
 sandbox for a repository on another forge holds that forge's token under
-the forge's own variable (`GITLAB_TOKEN`), delivered by the env-file road
+the forge's own variable (`GITLAB_TOKEN`, `GITEA_TOKEN`), delivered by the env-file road
 because sbx's secret proxy knows only GitHub's service, and reaches only
 that forge's host; the daemon's shared polling box follows `[vcs] kind`, so
 a `[[github.repos]] kind` that differs from it is honoured by a run's own

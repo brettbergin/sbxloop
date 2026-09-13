@@ -85,6 +85,8 @@ class TestChange:
         assert change["draft"] is True
         assert ops.pr_ready_for_review(str(change["node_id"])) is True
         assert ops.pr_get(repo, ref.number)["draft"] is False
+        # A base that needs an approval gets one from a second person.
+        subject.seeds.approve(ref.number)
         outcome = ops.pr_merge(repo, ref.number, method="squash", sha=str(change["head"]["sha"]))
         assert isinstance(outcome, MergeOutcome) and outcome.merged and outcome.sha
         assert ops.pr_get(repo, ref.number)["merged"] is True
@@ -166,11 +168,14 @@ class TestPolicy:
         assert requirements.source != "unknown"
         assert requirements.forge == subject.kind
 
-    def test_a_base_with_no_named_check_is_an_answer(self, subject: Subject) -> None:
+    def test_the_bases_standing_rules_are_an_answer(self, subject: Subject) -> None:
+        standing = subject.seeds.standing_rules()
         requirements = subject.ops.base_requirements(subject.repo, subject.base)
-        assert requirements.required_contexts == ()
         assert requirements.source != "unknown"
-        assert requirements.blockers() == []
+        assert set(requirements.required_contexts or ()) == set(standing.required)
+        assert requirements.approvals_required == standing.approvals
+        if not standing.required and not standing.approvals:
+            assert requirements.blockers() == []
 
 
 class TestContent:
