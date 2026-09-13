@@ -106,6 +106,10 @@ class Chronology:
         #: rows are inserted and before the watermark moves. A test raises
         #: here to prove the two commit together.
         self.after_copy: Callable[[int], None] = lambda seq: None
+        #: A fault seam after the source rows are read and before they are
+        #: copied. A test commits a concurrent engine event here to exercise
+        #: SQLite's deferred-transaction read-to-write upgrade race.
+        self.after_read: Callable[[], None] = lambda: None
 
     # -- projection ------------------------------------------------------------
 
@@ -121,7 +125,11 @@ class Chronology:
                 return total
 
     def _project_batch(self, now: float) -> int:
-        with self.dstore.transaction() as session:
+        # Reserve the write lock before reading the source rows. The engine
+        # store writes through another connection; if it committed between a
+        # deferred read and this batch's INSERT, WAL would reject the stale
+        # snapshot's read-to-write upgrade with SQLITE_BUSY.
+        with self.dstore.immediate_transaction() as session:
             watermark = _int_state(session, WATERMARK_KEY)
             rows = session.execute(
                 select(
@@ -133,6 +141,7 @@ class Chronology:
             ).all()
             if not rows:
                 return 0
+            self.after_read()
             session.execute(
                 insert(ApiEventRow).values(
                     [

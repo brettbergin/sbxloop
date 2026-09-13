@@ -4,6 +4,7 @@ with the cursor below it refused."""
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
@@ -88,6 +89,40 @@ class TestProjection:
         assert [r.type for r in chron.read(type_prefix="run.")] == ["run.finished"]
         assert [r.seq for r in chron.read(run_id="r1")] == [first + 1, last]
         assert chron.read(limit=1) == rows[:1]
+
+    def test_concurrent_engine_write_does_not_break_read_to_write_projection(
+        self, stores: tuple[StateStore, DaemonStore]
+    ) -> None:
+        store, dstore = stores
+        chron = Chronology(dstore)
+        _engine_events(store, "r1", 1)
+        raced = False
+
+        def write_between_projection_read_and_write() -> None:
+            nonlocal raced
+            conn = sqlite3.connect(store.path, timeout=0, isolation_level=None)
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute(
+                    "INSERT INTO events (run_id, ts, type, job_id, data_json) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    ("r1", 101.0, "worker.stdout", None, '{"i": 1}'),
+                )
+                conn.commit()
+                raced = True
+            except sqlite3.OperationalError as exc:
+                assert "locked" in str(exc)
+            finally:
+                conn.close()
+
+        chron.after_read = write_between_projection_read_and_write
+
+        assert chron.project(now=500.0) == 1
+        assert not raced
+        chron.after_read = lambda: None
+        store.append_event(Event(ts=101.0, run_id="r1", type="worker.stdout", data={"i": 1}))
+        assert chron.project(now=501.0) == 1
+        assert [row.source_seq for row in chron.read()] == [1, 2]
 
 
 class TestRetention:
