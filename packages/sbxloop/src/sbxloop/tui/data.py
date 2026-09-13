@@ -14,7 +14,7 @@ from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
-from sbxloop.config import TUI_CONTROL_CHANNEL
+from sbxloop.config import TUI_CONTROL_CHANNEL, Config, VcsKind
 from sbxloop.daemon.control import CommandReply
 from sbxloop.daemon.mailbox import MailboxClient
 from sbxloop.daemon.model import WorkItem
@@ -172,6 +172,8 @@ class RunDetail:
     thread: ChatThread | None
     last_event_ts: float | None
     landing_events: tuple[Event, ...]
+    #: The forge pinned in the run's config snapshot; drives its sandbox name.
+    vcs_kind: VcsKind
     usage: RunUsage | None = None
     #: A workload's profile (#804): the one its run config pins, else the
     #: one the grant named; None for a code run or a run with no profile.
@@ -228,11 +230,23 @@ def build_run_detail(
         thread=mailbox.thread_for_run(run_id),
         last_event_ts=last_event_ts,
         landing_events=tuple(landing),
+        vcs_kind=vcs_kind_of(mailbox, run_id, item.repo if item is not None else None),
         usage=usage,
         profile=profile,
         needs_granted=granted,
         needs_refused=refused,
     )
+
+
+def vcs_kind_of(mailbox: MailboxClient, run_id: str, repo: str | None) -> VcsKind:
+    """The run snapshot's forge; old or unreadable snapshots were GitHub."""
+    try:
+        with mailbox.read_engine() as engine:
+            raw = engine.get_run_config(run_id)
+        saved = Config.model_validate_json(raw)
+    except (ValueError, TypeError):
+        return "github"
+    return saved.vcs_kind_for(repo)
 
 
 def workload_profile_of(mailbox: MailboxClient, run_id: str) -> str | None:

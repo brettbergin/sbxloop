@@ -117,7 +117,7 @@ from sbxloop.provider import ProviderHeldError, ProviderRecovery
 from sbxloop.recipes import get_recipe
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxRole
-from sbxloop.sbx.provision import sandbox_name
+from sbxloop.sbx.provision import sandbox_name_candidates
 from sbxloop.sbx.prune import remove_run_sandbox, remove_run_sandbox_secrets
 
 log = get_logger(__name__)
@@ -952,7 +952,7 @@ class DaemonLoop:
             # A pinned run that is not the one in flight is dead (a pending
             # resume): its microVMs and secrets would otherwise outlive the
             # ledger row that recovery uses to find them.
-            self._close_dead_run(fresh.run_id, "abandoned", now)
+            self._close_dead_run(fresh.run_id, "abandoned", now, repo=fresh.repo)
         self._deliver_report(fresh)
         return fresh
 
@@ -983,7 +983,7 @@ class DaemonLoop:
                 run=pinned,
             )
         elif pinned is not None:
-            self._close_dead_run(pinned, "requeued", now)
+            self._close_dead_run(pinned, "requeued", now, repo=before.repo if before else None)
             self._notice(
                 "item.requeue_unpinned",
                 f"requeue: {item_id} unpinned from {pinned}",
@@ -994,11 +994,13 @@ class DaemonLoop:
             self._notice("item.requeued", f"requeue: {item_id} re-queued", item=item_id)
         return fresh
 
-    def _close_dead_run(self, run_id: str, result: str, now: float) -> None:
+    def _close_dead_run(
+        self, run_id: str, result: str, now: float, *, repo: str | None = None
+    ) -> None:
         """A pinned run that will never be resumed: drop its sandboxes and
         secrets first (so an interruption here leaves the ledger open for
         recovery to finish the job), then close its ledger row."""
-        self._remove_stale_run_sandboxes(run_id)
+        self._remove_stale_run_sandboxes(run_id, repo=repo)
         self._end_run_cancelled(run_id, f"cancelled: run {result} (never resumed)", source=result)
         self.dstore.finish_ledger(run_id, result, now)
 
@@ -1461,7 +1463,7 @@ class DaemonLoop:
         if gate is not None and gate.kind == "publish" and gate.state == "approving":
             # Not an interruption (#760): a held result was released and
             # the run resumes at its publishing stage. One stage, then done.
-            self._remove_stale_run_sandboxes(run_id)
+            self._remove_stale_run_sandboxes(run_id, repo=item.repo)
             self._notice(
                 "run.resuming",
                 f"resuming {run_id} for {item.item_id} at publishing — released by "
@@ -1475,7 +1477,7 @@ class DaemonLoop:
             # Not an interruption either (#675): a reviewer asked for
             # changes on the parked PR and the run resumes at its landing
             # stage to make them. Bounded by the run's own fix rounds.
-            self._remove_stale_run_sandboxes(run_id)
+            self._remove_stale_run_sandboxes(run_id, repo=item.repo)
             self._notice(
                 "run.review_resumed",
                 f"🔁 resuming {run_id} for {item.item_id} on its own PR #{hold.pr_number} — "
@@ -1491,7 +1493,7 @@ class DaemonLoop:
             # Not an interruption (#523): the run ended one fix round short
             # and was granted more. The resume budget bounds crash-resume
             # churn; this continuation is bounded by the grant itself.
-            self._remove_stale_run_sandboxes(run_id)
+            self._remove_stale_run_sandboxes(run_id, repo=item.repo)
             self._notice(
                 "run.resuming",
                 f"resuming {run_id} for {item.item_id} on its own PR with {granted.granted_rounds} "
@@ -1525,7 +1527,7 @@ class DaemonLoop:
         # under the same names and `sbx create` refuses a name that exists
         # (field: SIGKILL mid-run → 'sandbox already exists' on the very
         # next start).
-        self._remove_stale_run_sandboxes(run_id)
+        self._remove_stale_run_sandboxes(run_id, repo=item.repo)
         self._notice(
             "run.resuming",
             f"resuming {run_id} for {item.item_id} (resume {resumes + 1}/{budget})",
@@ -4236,7 +4238,7 @@ class DaemonLoop:
                 continue
             now = self.clock()
             if item.state == "failed" and item.run_id == run_id:
-                self._close_dead_run(run_id, "abandoned", now)
+                self._close_dead_run(run_id, "abandoned", now, repo=item.repo)
                 self._notice(
                     "recovery.offline_abandon",
                     f"recovery: {item_id} abandoned offline; run {run_id} closed",
@@ -4246,7 +4248,7 @@ class DaemonLoop:
             elif item.state == "queued" and item.run_id != run_id:
                 # Requeued (unpinned) offline: the run is dead and will not be
                 # resumed — close its ledger and drop its sandboxes.
-                self._close_dead_run(run_id, "requeued", now)
+                self._close_dead_run(run_id, "requeued", now, repo=item.repo)
                 self._notice(
                     "recovery.offline_requeue",
                     f"recovery: {item_id} requeued offline; run {run_id} closed",
@@ -4257,7 +4259,7 @@ class DaemonLoop:
             # running one was reconciled above.
         self._deliver_pending_reports()
 
-    def _remove_stale_run_sandboxes(self, run_id: str) -> None:
+    def _remove_stale_run_sandboxes(self, run_id: str, *, repo: str | None = None) -> None:
         """A dead process leaves the run's microVMs — and their secret
         registrations — behind. Both must go before resume re-provisions
         under the same names: a lingering secret cannot be replaced, so the
@@ -4276,22 +4278,23 @@ class DaemonLoop:
                 roles += ("service",)
         except StateError:
             pass
+        vcs_kind = self.config.vcs_kind_for(repo)
         for role in roles:
-            name = sandbox_name(run_id, role)
-            try:
-                remove_run_sandbox(self.sbx, name, role, self.config)
-                self._notice(
-                    "recovery.stale_sandbox_removed",
-                    f"recovery: removed stale sandbox {name} (and its secrets)",
-                    run=run_id,
-                    sandbox=name,
-                    role=role,
-                )
-            except SbxError:
-                # No such sandbox — the common case — but a secret may
-                # still linger from a rollback race; clearing it is cheap.
-                log.debug("recovery.no_stale_sandbox", run=run_id, sandbox=name, role=role)
-                remove_run_sandbox_secrets(self.sbx, name, role, self.config)
+            for name in sandbox_name_candidates(run_id, role, vcs_kind=vcs_kind):
+                try:
+                    remove_run_sandbox(self.sbx, name, role, self.config)
+                    self._notice(
+                        "recovery.stale_sandbox_removed",
+                        f"recovery: removed stale sandbox {name} (and its secrets)",
+                        run=run_id,
+                        sandbox=name,
+                        role=role,
+                    )
+                except SbxError:
+                    # No such sandbox — the common case — but a secret may
+                    # still linger from a rollback race; clearing it is cheap.
+                    log.debug("recovery.no_stale_sandbox", run=run_id, sandbox=name, role=role)
+                    remove_run_sandbox_secrets(self.sbx, name, role, self.config)
 
     def _any_credentialed_registries(self) -> bool:
         """Whether any repo this daemon runs for fetches through a service

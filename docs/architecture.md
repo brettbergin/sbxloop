@@ -372,21 +372,21 @@ merge then run through the `git.merge` worker job, where repository hooks
 and drivers have the same authority as other agent code. This preserves
 host-initiated transport and mediation between the credential and agent
 planes; no new listener or box-to-box channel is introduced.
-The github sandbox exists only when the GitHub integration is configured
+The VCS sandbox exists only when the repository integration is configured
 (`[github] repo = "owner/repo"`, or at least one `[[github.repos]]` entry);
-without it, `pair.github` is `None`, `GH_TOKEN`
-is not required, and the run has no GitHub capability at all. When several
-repositories are configured, the github sandbox is scoped to the one the
+without it, the internally named `pair.github` is `None`, a forge token
+is not required, and the run has no VCS capability at all. When several
+repositories are configured, the VCS sandbox is scoped to the one the
 run's work item came from, and carries that repository's `token_env`
 credential:
 
-|            | agent sandbox                                                                                                                                                                                                                                    | github sandbox                                                                                                     |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| name       | `sbxloop-<run>-agent`                                                                                                                                                                                                                            | `sbxloop-<run>-github`                                                                                             |
-| credential | the configured agent credential only — `COPILOT_GITHUB_TOKEN` (`[agent] backend = "copilot"`, the default), `ANTHROPIC_API_KEY` (`"claude"`, #533), `OPENAI_API_KEY` (`"codex"`) or the variable `[agent.openai] api_key_env` names (`"openai"`) | `GH_TOKEN` only (a PAT, or a host-minted App installation token)                                                   |
-| injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows)                                                                          | built-in `github` service secret (PAT), or the in-VM env file carrying a host-minted App installation token (#568) |
-| network    | balanced policy + the backend's credential hosts (copilot's, a vendor API host, or the endpoint `[agent.openai]` names) + the `[github] api_url` hosts + plan-declared grants                                                                    | balanced policy + the `[github] api_url` hosts (+ the dotcom storage hosts when that is github.com)                |
-| runs       | agent SDK sessions (Copilot SDK, the Claude Agent SDK + Claude Code CLI, the Codex SDK, or the worker's own chat-completions loop with the openai backend), shell checks                                                                         | `vcs.op` jobs (REST, or gh CLI on GitHub)                                                                          |
+|            | agent sandbox                                                                                                                                                                                                                                    | VCS sandbox                                                                                                     |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| name       | `sbxloop-<run>-agent`                                                                                                                                                                                                                            | `sbxloop-<run>-<forge>`                                                                                         |
+| credential | the configured agent credential only — `COPILOT_GITHUB_TOKEN` (`[agent] backend = "copilot"`, the default), `ANTHROPIC_API_KEY` (`"claude"`, #533), `OPENAI_API_KEY` (`"codex"`) or the variable `[agent.openai] api_key_env` names (`"openai"`) | the configured forge token only                                                                                 |
+| injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows)                                                                          | built-in `github` service secret on GitHub; the non-proxy env-file path on other forges and for GitHub App auth |
+| network    | balanced policy + the backend's credential hosts (copilot's, a vendor API host, or the endpoint `[agent.openai]` names) + the repository's forge hosts + plan-declared grants                                                                    | balanced policy + the repository's forge API hosts (+ GitHub's dotcom storage hosts when applicable)            |
+| runs       | agent SDK sessions (Copilot SDK, the Claude Agent SDK + Claude Code CLI, the Codex SDK, or the worker's own chat-completions loop with the openai backend), shell checks                                                                         | `vcs.op` jobs (REST, or gh CLI on GitHub)                                                                       |
 
 A workload run's needs (#758) are held to a **profile** before any task
 runs. `[[workloads]]` declares each profile (`egress` patterns, the
@@ -753,7 +753,7 @@ provisions a fresh pair.
 ### The daemon's own sandboxes
 
 `sbxloop daemon` owns two long-lived sandboxes outside any run's pair, both
-named per state dir (`sbxloop-daemon-github-<digest>`,
+named per state dir (`sbxloop-daemon-<forge>-<digest>`,
 `sbxloop-concierge-<digest>`) and both reported-but-never-pruned by
 `sandbox prune`:
 
