@@ -30,6 +30,7 @@ from sbxloop.api.models import (
     RestartRequest,
     ScheduleCreate,
     ScheduleResult,
+    ScheduleUpdate,
 )
 from sbxloop.api.projections import Views, holds_view, not_found, schedule_by_name
 from sbxloop.config import ScheduleConfig
@@ -243,6 +244,43 @@ async def create_schedule(
 
     def apply() -> Outcome:
         return service.add_schedule(principal, spec, source=SCHEDULE_SOURCE, idempotency=pair)
+
+    outcome, operation = await _apply(ctx, apply)
+    message = str(getattr(outcome, "message", "")) if outcome is not None else ""
+    if not message and operation.result:
+        message = str(operation.result.get("message") or "")
+
+    def project() -> ScheduleResult:
+        return ScheduleResult(
+            schedule=schedule_by_name(ctx.loop, spec.name),
+            message=message,
+            operation=OperationOut.from_operation(operation),
+        )
+
+    result = await ctx.call(project)
+    ctx.hub.notify()
+    return result
+
+
+async def update_schedule(
+    ctx: ApiContext,
+    auth: Authenticated,
+    name: str,
+    body: ScheduleUpdate,
+    pair: tuple[str, str] | None,
+) -> ScheduleResult:
+    """Replace one schedule in the daemon store as one recorded operation."""
+    principal = auth.principal
+    service = ctx.service()
+    try:
+        spec = ScheduleConfig.model_validate(body.model_dump())
+    except ValueError as exc:
+        raise Problem(422, "invalid_request", str(exc)) from exc
+
+    def apply() -> Outcome:
+        return service.update_schedule(
+            principal, name, spec, source=SCHEDULE_SOURCE, idempotency=pair
+        )
 
     outcome, operation = await _apply(ctx, apply)
     message = str(getattr(outcome, "message", "")) if outcome is not None else ""

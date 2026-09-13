@@ -286,6 +286,7 @@ rechecked when it arrives) and a `revision` a command may pin.
 | `DELETE` | `/v1/daemon/holds/{name}`                    | `daemon:manage`        | Release your hold; `?force=true` overrides another's                  |
 | `POST`   | `/v1/daemon/stop`, `/v1/daemon/restart`      | `daemon:manage`        | Graceful stop; a stop the supervisor undoes                           |
 | `GET`    | `/v1/schedules[/{name}]`                     | `runs:read`            | Schedules with cadence, last and next due                             |
+| `PATCH`  | `/v1/schedules/{name}`                       | `daemon:manage`        | Atomically replace or rename a schedule while preserving run history  |
 | `POST`   | \`/v1/schedules\[/{name}/pause               | resume\]\`             | `daemon:manage`                                                       |
 | `DELETE` | `/v1/schedules/{name}`                       | `daemon:manage`        | Remove                                                                |
 | `GET`    | `/v1/logs`, `/v1/configuration`              | `diagnostics:read`     | The log ring, redacted; the allowlisted configuration with provenance |

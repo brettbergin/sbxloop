@@ -776,6 +776,10 @@ class ScheduleCreate(ApiModel):
     timezone: str | None = None
 
 
+class ScheduleUpdate(ScheduleCreate):
+    """Complete replacement for one schedule, applied atomically."""
+
+
 class ScheduleResult(ApiModel):
     schedule: Schedule | None = None
     message: str

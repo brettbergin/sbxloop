@@ -3895,6 +3895,64 @@
         "title": "ScheduleResult",
         "type": "object"
       },
+      "ScheduleUpdate": {
+        "additionalProperties": false,
+        "description": "Complete replacement for one schedule, applied atomically.",
+        "properties": {
+          "ask": {
+            "title": "Ask",
+            "type": "string"
+          },
+          "cron": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cron"
+          },
+          "every": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Every"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "profile": {
+            "title": "Profile",
+            "type": "string"
+          },
+          "timezone": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Timezone"
+          }
+        },
+        "required": [
+          "name",
+          "profile",
+          "ask"
+        ],
+        "title": "ScheduleUpdate",
+        "type": "object"
+      },
       "ServiceDefinitionOut": {
         "additionalProperties": false,
         "properties": {
@@ -8961,6 +9019,57 @@
           }
         },
         "summary": "Get Schedule",
+        "tags": [
+          "admin"
+        ]
+      },
+      "patch": {
+        "description": "Atomically replace a schedule while preserving its pause and firing history.",
+        "operationId": "update_schedule_v1_schedules__name__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ScheduleUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ScheduleResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Schedule",
         "tags": [
           "admin"
         ]
