@@ -8,6 +8,7 @@ daemon store's lock and transaction.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +16,7 @@ from typing import Any
 from sqlalchemy import func, insert, select
 from sqlalchemy.exc import IntegrityError
 
+from sbxloop.api.agents import AGENTS
 from sbxloop.api.auth.store import hash_secret
 from sbxloop.daemon.controls.principal import ALL_CAPABILITIES, CAPABILITIES, WORKSPACE_ID
 from sbxloop.daemon.store import DaemonStore
@@ -533,7 +535,12 @@ class CollaborationStore:
                     intent=intent,
                     participants_json=json.dumps(
                         [
-                            {"agent_slug": target, "status": "queued", "error": None}
+                            {
+                                "agent_slug": target,
+                                "status": "queued",
+                                "error": None,
+                                "read_only": target == "critic",
+                            }
                             for target in (targets or (None,))
                         ]
                     ),
@@ -622,6 +629,7 @@ class CollaborationStore:
             if participant_index is not None:
                 progress = json.loads(turn.participants_json)
                 progress[participant_index]["status"] = "completed"
+                progress[participant_index]["message_id"] = message_id
                 turn.participants_json = json.dumps(progress)
             row = session.get(MessageRow, message_id)
             assert row is not None  # nosec B101
@@ -711,6 +719,12 @@ class CollaborationStore:
             queued: list[tuple[int, Turn, LocalUser, str]] = []
             for row in rows:
                 if row.status in {"running", "cancelling"}:
+                    progress = json.loads(row.participants_json)
+                    if any(p.get("parent_index") is not None for p in progress):
+                        interrupted.append(
+                            (row.id, all(p["status"] == "completed" for p in progress))
+                        )
+                        continue
                     replies = set(
                         session.scalars(
                             select(MessageRow.agent_slug).where(
@@ -826,7 +840,12 @@ class CollaborationStore:
             progress = json.loads(row.participants_json)
             if not progress:
                 progress = [
-                    {"agent_slug": target, "status": "queued", "error": None}
+                    {
+                        "agent_slug": target,
+                        "status": "queued",
+                        "error": None,
+                        "read_only": target == "critic",
+                    }
                     for target in (json.loads(row.targets_json) or [None])
                 ]
             progress[index]["status"] = "running"
@@ -878,6 +897,121 @@ class CollaborationStore:
             )
             result = _turn(row)
         return self.finish_turn(turn_id, error=None, now=now) if settle else result
+
+    def queue_handoff(
+        self,
+        user_id: str,
+        channel_id: str,
+        turn_id: str,
+        source_index: int,
+        agent_slug: str,
+        message: str,
+        now: float,
+    ) -> str:
+        """Persist a bounded peer request without changing the user's root targets."""
+        if agent_slug not in {a.slug for a in AGENTS}:
+            raise CollaborationError("unknown_agent", "Choose a native sbxloop agent.")
+        if not 1 <= len(message.strip()) <= 4000:
+            raise CollaborationError(
+                "invalid_handoff", "Provide a message of 1 to 4000 characters."
+            )
+        message = message.strip()
+        key = hashlib.sha256(json.dumps([source_index, agent_slug, message]).encode()).hexdigest()
+        with self.dstore.immediate_transaction() as session:
+            channel = session.get(ChannelRow, channel_id)
+            turn = session.get(TurnRow, turn_id)
+            if (
+                channel is None
+                or channel.user_id != user_id
+                or channel.state != "active"
+                or turn is None
+                or turn.channel_id != channel_id
+                or turn.status != "running"
+            ):
+                raise CollaborationError("handoff_stopped", "This chat turn is no longer running.")
+            progress = json.loads(turn.participants_json)
+            if not 0 <= source_index < len(progress):
+                raise CollaborationError(
+                    "invalid_handoff", "The requesting participant is missing."
+                )
+            source = progress[source_index]
+            if source["status"] != "running":
+                raise CollaborationError(
+                    "handoff_stopped", "The requesting agent is no longer running."
+                )
+            for index, participant in enumerate(progress):
+                if participant.get("request_key") == key:
+                    return (
+                        f"Queued @{agent_slug} as handoff {index}. "
+                        "Its reply will appear in this chat."
+                    )
+            source_slug = source["agent_slug"] or "concierge"
+            if agent_slug == source_slug:
+                raise CollaborationError("invalid_handoff", "Address a different agent.")
+            handed = [p for p in progress if p.get("parent_index") is not None]
+            if len(handed) >= 6:
+                raise CollaborationError(
+                    "handoff_limit", "This turn has reached its six-handoff limit."
+                )
+            if sum(p.get("parent_index") == source_index for p in handed) >= 2:
+                raise CollaborationError(
+                    "handoff_limit", "Each response can request at most two peers."
+                )
+            depth = int(source.get("depth", 0)) + 1
+            if depth > 3:
+                raise CollaborationError(
+                    "handoff_limit", "This turn has reached its handoff depth limit."
+                )
+            read_only = (
+                bool(source.get("read_only")) or source_slug == "critic" or agent_slug == "critic"
+            )
+            index = len(progress)
+            progress.append(
+                {
+                    "agent_slug": agent_slug,
+                    "status": "queued",
+                    "error": None,
+                    "parent_index": source_index,
+                    "requested_by": source_slug,
+                    "request": message,
+                    "request_key": key,
+                    "depth": depth,
+                    "read_only": read_only,
+                }
+            )
+            turn.participants_json = json.dumps(progress)
+            message_id = "msg_" + _token(16)
+            sequence = self._next_sequence(session, channel_id)
+            session.execute(
+                insert(MessageRow).values(
+                    id=message_id,
+                    channel_id=channel_id,
+                    turn_id=turn_id,
+                    sequence=sequence,
+                    role="assistant",
+                    kind="agent_handoff",
+                    agent_slug=source_slug,
+                    content=f"@{source_slug} asked @{agent_slug}:\n\n{message}",
+                    created_at=now,
+                )
+            )
+            channel.updated_at = now
+            channel.revision += 1
+            _event(
+                session,
+                "collaboration.handoff.queued",
+                now,
+                data={
+                    "channel_id": channel_id,
+                    "turn_id": turn_id,
+                    "index": index,
+                    "requested_by": source_slug,
+                    "agent_slug": agent_slug,
+                    "read_only": read_only,
+                    "message_id": message_id,
+                },
+            )
+            return f"Queued @{agent_slug} as handoff {index}. Its reply will appear in this chat."
 
     # -- teams ---------------------------------------------------------------------
 

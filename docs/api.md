@@ -98,6 +98,28 @@ code changes and workload execution use managed runs; a chat session has no
 checkout, editor, or shell. Critic chat receives only explicitly allowed read-only
 host tools and no MCP servers. The host rejects tools outside that allowlist.
 
+Delegated chat also exposes `handoff_agent(agent_slug, message)`. An agent can
+ask any other native role for help; plain `@mentions` in its prose do not
+dispatch work. The tool queues a peer response in the same turn after already
+queued participants, without waiting inside the current response. The peer
+receives the original user request, the scoped peer request, and prior chat
+replies. It may explicitly hand back to the sender for synthesis.
+
+Handoffs append durable `agent_handoff` messages and
+`collaboration.handoff.queued` events. Per-member progress includes
+`requested_by`, `parent_index`, `request`, and `read_only`. Handoff events and
+concierge tool logs omit the peer request text. Repeating the same sender/recipient/request
+within one response returns the original receipt without another invocation.
+The user's original targets and idempotency identity remain unchanged.
+
+Each response can request two peers, with six additional responses total and
+three handoff levels per user turn. A role cannot hand off to itself. Critic
+and every descendant of a read-only response retain the read-only host-tool
+allowlist and no MCP servers, regardless of the recipient role. A peer request
+does not grant new human approval. Ordinary conversation has no handoff tool.
+Stop skips queued peers as well as team members. Restart recovery considers all
+dynamic participants, and never replays an interrupted handoff.
+
 `GET /v1/channels/{id}/turns?active_only=true` reports active turns and per-member
 progress. `POST /v1/channels/{id}/turns/{turn}/cancel` stops queued responses.
 An in-flight member may finish and its result is preserved; remaining members

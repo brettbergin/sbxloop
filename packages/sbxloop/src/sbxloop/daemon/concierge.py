@@ -312,6 +312,8 @@ class Concierge:
         self._turn_persona: str | None = None
         self._turn_allow_actions = True
         self._turn_role: Role = "concierge"
+        self._turn_read_only = False
+        self._turn_handoff: Callable[[str, str], str] | None = None
 
         self.host = host
         self.bus = bus
@@ -385,6 +387,8 @@ class Concierge:
         allow_actions: bool = True,
         history: str | None = None,
         agent_role: Role = "concierge",
+        read_only: bool = False,
+        handoff: Callable[[str, str], str] | None = None,
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
@@ -410,6 +414,8 @@ class Concierge:
             self._turn_persona = persona
             self._turn_allow_actions = allow_actions
             self._turn_role = agent_role
+            self._turn_read_only = read_only
+            self._turn_handoff = handoff
             self._turn_after = []
             try:
                 reply = self._run_turn(
@@ -430,6 +436,8 @@ class Concierge:
                 self._turn_persona = None
                 self._turn_allow_actions = True
                 self._turn_role = "concierge"
+                self._turn_read_only = False
+                self._turn_handoff = None
             after, self._turn_after = self._turn_after, []
             return reply._replace(after=_sequence(after)) if after else reply
 
@@ -555,6 +563,18 @@ class Concierge:
         )
         available_tools = self._chat_tools()
         persona = self._turn_persona or ""
+        if self._turn_read_only:
+            persona += "\n\nThis peer request inherits read-only access. Inspect and advise only."
+        if "handoff_agent" in available_tools:
+            persona += (
+                "\n\nUse handoff_agent to ask a native peer for help when needed. "
+                "An @mention in prose does not invoke an agent. Handoffs are asynchronous: "
+                "the peer runs after this response and answers in the shared chat. "
+                "Finish your response after queuing; do not poll or invent the peer's reply. "
+                "You may ping the sender back if they need to synthesize the result. "
+                "Stay within the user's request. Each response can ask two peers, with at "
+                "most six handoffs and three levels per user turn. Read-only access is inherited."
+            )
         if not self._turn_allow_actions:
             persona += (
                 "\n\nThis is an ordinary conversation turn. Do not perform or promise any "
@@ -589,7 +609,9 @@ class Concierge:
             max_tool_calls=cfg.max_tool_calls,
             mcp_servers=(
                 self.config.mcp_specs_for(self._turn_role)
-                if self._turn_allow_actions and self._turn_role != "critic"
+                if self._turn_allow_actions
+                and self._turn_role != "critic"
+                and not self._turn_read_only
                 else []
             ),
             host_tools=[t.spec for t in available_tools.values()],
@@ -784,8 +806,6 @@ class Concierge:
     def _chat_tools(self) -> dict[str, HostTool]:
         if not self._turn_allow_actions:
             return {}
-        if self._turn_role != "critic":
-            return self._tools
         # Explicit allowlist: new tools cannot silently grant a reviewer write access.
         reads = {
             "list_runs",
@@ -803,7 +823,41 @@ class Concierge:
             "pr_status",
             "list_issues",
         }
-        return {name: tool for name, tool in self._tools.items() if name in reads}
+        available = (
+            {name: tool for name, tool in self._tools.items() if name in reads}
+            if self._turn_role == "critic" or self._turn_read_only
+            else dict(self._tools)
+        )
+        if self._turn_handoff is not None:
+            available["handoff_agent"] = HostTool(
+                HostToolSpec(
+                    name="handoff_agent",
+                    description=(
+                        "Ask a native agent for help in this chat. "
+                        "Queues a peer response after yours; does not wait for it."
+                    ),
+                    parameters=_schema(
+                        {
+                            "agent_slug": {
+                                "type": "string",
+                                "enum": ["concierge", "planner", "builder", "critic", "operator"],
+                            },
+                            "message": {"type": "string", "minLength": 1, "maxLength": 4000},
+                        },
+                        ["agent_slug", "message"],
+                    ),
+                ),
+                self._tool_handoff,
+            )
+        return available
+
+    def _tool_handoff(self, args: dict[str, Any], _by: str) -> str:
+        if self._turn_handoff is None:
+            raise ValueError("No collaboration turn is active.")
+        agent, message = args.get("agent_slug"), args.get("message")
+        if not isinstance(agent, str) or not isinstance(message, str):
+            raise ValueError("An agent slug and message are required.")
+        return self._turn_handoff(agent, message)
 
     def _tool_handler(self, call: HostToolCall, *, author: str) -> HostToolResponse:
         tool = self._chat_tools().get(call.name)
@@ -2576,6 +2630,8 @@ def _visible_tool_arguments(call: HostToolCall) -> dict[str, Any]:
     resolved targets are named in the reply either way.
     """
     arguments = dict(call.arguments)
+    if call.name == "handoff_agent":
+        return {"agent_slug": arguments.get("agent_slug")}
     if call.name == "start_entrygraph" and arguments.get("url") is not None:
         arguments["url"] = "<redacted url>"
     return arguments

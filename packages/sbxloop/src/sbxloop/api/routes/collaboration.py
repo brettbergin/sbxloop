@@ -216,7 +216,12 @@ def _turn_out(turn: Turn) -> TurnOut:
         input_message_id=turn.input_message_id,
         status=turn.status,
         targets=list(turn.targets),
-        participants=[ParticipantOut.model_validate(p) for p in turn.participants],
+        participants=[
+            ParticipantOut.model_validate(
+                {key: value for key, value in p.items() if key in ParticipantOut.model_fields}
+            )
+            for p in turn.participants
+        ],
         error=turn.error,
         created_at=rfc3339(turn.created_at) or "",
         started_at=rfc3339(turn.started_at),

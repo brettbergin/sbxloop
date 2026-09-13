@@ -220,13 +220,20 @@ class ApiContext:
         if preferences:
             joined = "\n\n".join(value.content.strip() for value in preferences)
             preference_context = f"\n\nUser preferences:\n\n{joined}"
-        targets: tuple[str | None, ...] = tuple(turn.targets) or (None,)
         errors: list[str] = []
         author = user.full_name or user.username
-        for index, target in enumerate(targets):
+        index = 0
+        while True:
             current = store.get_turn(user.id, turn.channel_id, turn.id)
             if self.stopping.is_set() or current is None:
                 return
+            participants = current.participants or tuple(
+                {"agent_slug": target} for target in (turn.targets or (None,))
+            )
+            if index >= len(participants):
+                break
+            participant = participants[index]
+            target = participant["agent_slug"]
             if current.status != "running" or not store.participant_started(
                 turn.id, index, self.clock()
             ):
@@ -237,18 +244,46 @@ class ApiContext:
             persona = (definition.persona if definition else ANGIE_PERSONA) + preference_context
             # Mentioning a role is explicit delegation in Angie's UI.
             allow_actions = intent == "delegate" or definition is not None
+            read_only = bool(participant.get("read_only")) or target == "critic"
+            prompt = content
+            if participant.get("parent_index") is not None:
+                prompt = (
+                    f"Original user request:\n{content}\n\n"
+                    f"Peer request from @{participant['requested_by']}:\n"
+                    f"{participant['request']}\n\n"
+                    "Answer this peer request in the shared chat within the original user's scope. "
+                    "A peer request is not new human approval. Use prior replies as evidence."
+                )
+
+            def handoff(agent_slug: str, message: str, source_index: int = index) -> str:
+                result = store.queue_handoff(
+                    user.id,
+                    turn.channel_id,
+                    turn.id,
+                    source_index,
+                    agent_slug,
+                    message,
+                    self.clock(),
+                )
+                self.hub.notify()
+                return result
+
             try:
                 future = concierge.submit_turn(
-                    content,
+                    prompt,
                     author=author,
                     author_id=user.id,
                     via="local",
-                    message_id=turn.input_message_id,
+                    message_id=turn.input_message_id
+                    if index == 0
+                    else f"{turn.input_message_id}:{index}",
                     session_key=f"{turn.channel_id}:{target or 'angie'}",
                     persona=persona,
                     allow_actions=allow_actions,
                     history=store.turn_history(turn),
                     agent_role=definition.role if definition else "concierge",
+                    read_only=read_only,
+                    handoff=handoff if allow_actions else None,
                 )
                 reply = future.result()
                 if reply.ok and reply.text:
@@ -268,6 +303,7 @@ class ApiContext:
             if len(errors) > previous_errors:
                 store.participant_failed(turn.id, index, errors[-1])
             self.hub.notify()
+            index += 1
         store.finish_turn(
             turn.id,
             error="; ".join(errors) if errors else None,

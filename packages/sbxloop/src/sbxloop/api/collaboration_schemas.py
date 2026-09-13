@@ -224,6 +224,10 @@ class ParticipantOut(ApiModel):
     agent_slug: str | None
     status: str
     error: str | None = None
+    requested_by: str | None = None
+    parent_index: int | None = None
+    request: str | None = None
+    read_only: bool = False
 
 
 class TurnOut(ApiModel):
