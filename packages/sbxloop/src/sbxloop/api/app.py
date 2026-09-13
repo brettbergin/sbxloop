@@ -10,7 +10,8 @@ from __future__ import annotations
 
 import json
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import FastAPI, Request, Response
@@ -61,12 +62,18 @@ def openapi_document(config: ApiConfig | None = None, *, snapshot: bool = False)
 
 
 def create_app(ctx: ApiContext) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        await ctx.call(ctx.recover_collaboration)
+        yield
+
     app = FastAPI(
         title="sbxloop",
         version=__version__,
         openapi_url="/v1/openapi.json",
         docs_url=None,
         redoc_url=None,
+        lifespan=lifespan,
     )
     app.state.ctx = ctx
     max_body = int(ctx.api.max_body_bytes)

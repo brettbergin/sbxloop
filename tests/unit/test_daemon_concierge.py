@@ -1920,6 +1920,35 @@ class TestFailures:
         assert client.jobs[2].resume_session_id is None
         assert host.failures == []  # not a sandbox failure: no drop
 
+    def test_lost_product_session_reconstructs_durable_history(self, tmp_path: Path) -> None:
+        concierge, client, _, _, dstore = make(
+            tmp_path,
+            [
+                {"session_id": "sA"},
+                {"raise": WorkerError("session sA not found in store")},
+                {"text": "blue"},
+            ],
+        )
+        try:
+            concierge.submit_turn("remember blue", author="owner", session_key="channel-a").result(
+                10
+            )
+            reply = concierge.submit_turn(
+                "what color?",
+                author="owner",
+                session_key="channel-a",
+                history='{"role":"user","content":"remember blue"}',
+                allow_actions=False,
+            ).result(10)
+            assert reply.text == "blue"
+            assert client.jobs[-1].resume_session_id is None
+            assert "remember blue" in client.jobs[-1].prompt
+            assert client.jobs[-1].prompt.endswith("what color?")
+            assert client.jobs[-1].host_tools == []
+        finally:
+            concierge.close()
+            dstore.close()
+
     def test_timeout_is_an_actionable_error(self, tmp_path: Path) -> None:
         concierge, _client, host, *_ = make(
             tmp_path, [{"raise": WorkerTimeoutError("job timed out after 180s")}]

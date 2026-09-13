@@ -912,20 +912,19 @@ async def create_turn(
     intent = "delegate" if targets else body.intent
     try:
         turn, message, created = await ctx.call(
-            ctx.collaboration.accept_turn,
-            user.id,
+            ctx.accept_collaboration_turn,
+            user,
             channel_id,
             content=body.content.strip(),
             targets=targets,
             client_turn_id=body.client_turn_id,
             client_message_id=body.client_message_id,
             actor=auth.principal.audit(),
-            now=ctx.clock(),
+            intent=intent,
         )
     except CollaborationError as exc:
         raise _problem(exc) from exc
     if created:
-        ctx.start_collaboration_turn(turn, user, body.content.strip(), intent=intent)
         ctx.hub.notify()
     return TurnAccepted(turn=_turn_out(turn), message=_message_out(message), replayed=not created)
 

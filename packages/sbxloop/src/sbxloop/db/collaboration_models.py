@@ -81,6 +81,7 @@ class TurnRow(Base):
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
     started_at: Mapped[float | None] = mapped_column(REAL)
     completed_at: Mapped[float | None] = mapped_column(REAL)
+    intent: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'conversation'"))
 
 
 class TeamRow(Base):

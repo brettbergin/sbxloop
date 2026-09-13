@@ -90,6 +90,7 @@ class Turn:
     created_at: float
     started_at: float | None
     completed_at: float | None
+    intent: str = "conversation"
 
 
 @dataclass(frozen=True, slots=True)
@@ -184,6 +185,7 @@ def _turn(row: TurnRow) -> Turn:
         created_at=float(row.created_at),
         started_at=None if row.started_at is None else float(row.started_at),
         completed_at=None if row.completed_at is None else float(row.completed_at),
+        intent=str(row.intent),
     )
 
 
@@ -471,6 +473,7 @@ class CollaborationStore:
         client_message_id: str | None,
         actor: dict[str, Any] | None,
         now: float,
+        intent: str = "conversation",
     ) -> tuple[Turn, Message, bool]:
         """Append the user message and accepted turn atomically.
 
@@ -491,10 +494,15 @@ class CollaborationStore:
                 if existing is not None:
                     message = session.get(MessageRow, existing.input_message_id)
                     assert message is not None  # nosec B101 - turn invariant
-                    if message.content != content:
+                    if (
+                        message.content != content
+                        or tuple(json.loads(existing.targets_json)) != targets
+                        or existing.intent != intent
+                        or message.client_message_id != client_message_id
+                    ):
                         raise CollaborationError(
                             "idempotency_conflict",
-                            "client_turn_id was already used with different content",
+                            "client_turn_id was already used with a different request",
                         )
                     return _turn(existing), _message(message), False
             turn_id = "trn_" + _token(16)
@@ -520,6 +528,7 @@ class CollaborationStore:
                     input_message_id=message_id,
                     status="accepted",
                     targets_json=json.dumps(list(targets)),
+                    intent=intent,
                     created_at=now,
                 )
             )
@@ -618,13 +627,42 @@ class CollaborationStore:
             return _message(row)
 
     def finish_turn(self, turn_id: str, *, error: str | None, now: float) -> Turn | None:
-        with self.dstore.transaction() as session:
+        with self.dstore.immediate_transaction() as session:
             row = session.get(TurnRow, turn_id)
             if row is None or row.status in {"completed", "failed", "cancelled"}:
                 return None if row is None else _turn(row)
             row.status = "failed" if error else "completed"
             row.error = error
             row.completed_at = now
+            channel = session.get(ChannelRow, row.channel_id)
+            if error and channel is not None and channel.state == "active":
+                message_id = "msg_" + _token(16)
+                sequence = self._next_sequence(session, row.channel_id)
+                session.execute(
+                    insert(MessageRow).values(
+                        id=message_id,
+                        channel_id=row.channel_id,
+                        turn_id=turn_id,
+                        sequence=sequence,
+                        role="assistant",
+                        kind="turn_error",
+                        content=error,
+                        created_at=now,
+                    )
+                )
+                channel.updated_at = now
+                channel.revision += 1
+                _event(
+                    session,
+                    "collaboration.message.created",
+                    now,
+                    data={
+                        "channel_id": row.channel_id,
+                        "turn_id": turn_id,
+                        "message_id": message_id,
+                        "sequence": sequence,
+                    },
+                )
             session.flush()
             _event(
                 session,
@@ -633,6 +671,94 @@ class CollaborationStore:
                 data={"channel_id": row.channel_id, "turn_id": row.id, "error": error},
             )
             return _turn(row)
+
+    def recover_turns(self, now: float) -> list[tuple[Turn, LocalUser, str]]:
+        """Settle interrupted execution and return only work that never started.
+
+        Called before the listener admits requests. Never replay a running
+        turn: external actions may already have happened before the crash.
+        """
+        with self.dstore.read() as session:
+            rows = list(
+                session.scalars(select(TurnRow).where(TurnRow.status.in_(("accepted", "running"))))
+            )
+            interrupted: list[tuple[str, bool]] = []
+            queued: list[tuple[int, Turn, LocalUser, str]] = []
+            for row in rows:
+                if row.status == "running":
+                    replies = set(
+                        session.scalars(
+                            select(MessageRow.agent_slug).where(
+                                MessageRow.turn_id == row.id,
+                                MessageRow.role == "assistant",
+                                MessageRow.kind != "turn_error",
+                            )
+                        )
+                    )
+                    expected = set(json.loads(row.targets_json)) or {None}
+                    interrupted.append((row.id, expected <= replies))
+                    continue
+                channel = session.get(ChannelRow, row.channel_id)
+                user = session.get(LocalUserRow, channel.user_id) if channel else None
+                message = session.get(MessageRow, row.input_message_id)
+                if channel and channel.state == "active" and user and user.active and message:
+                    queued.append((message.sequence, _turn(row), _user(user), message.content))
+                else:
+                    interrupted.append((row.id, False))
+        for turn_id, answered in interrupted:
+            self.finish_turn(
+                turn_id,
+                now=now,
+                error=None
+                if answered
+                else (
+                    "The daemon restarted before this turn finished. Its actions may "
+                    "already have run; review the activity before explicitly retrying."
+                ),
+            )
+        # Sequence is authoritative inside each channel even when timestamps tie.
+        queued.sort(key=lambda item: (item[1].channel_id, item[0]))
+        return [(turn, user, content) for _, turn, user, content in queued]
+
+    def turn_history(self, turn: Turn, *, max_chars: int = 60_000) -> str:
+        """Prior turns and completed peers in this turn, without future input."""
+        with self.dstore.read() as session:
+            current = session.get(MessageRow, turn.input_message_id)
+            if current is None:
+                return ""
+            # Replies may be appended after a later user message was accepted.
+            # Include replies to earlier inputs, not merely earlier sequences.
+            prior_turns = select(MessageRow.turn_id).where(
+                MessageRow.channel_id == turn.channel_id,
+                MessageRow.role == "user",
+                MessageRow.sequence < current.sequence,
+            )
+            rows = session.scalars(
+                select(MessageRow)
+                .where(
+                    MessageRow.channel_id == turn.channel_id,
+                    MessageRow.turn_id.in_(prior_turns)
+                    | ((MessageRow.turn_id == turn.id) & (MessageRow.role == "assistant")),
+                )
+                .order_by(MessageRow.sequence.desc())
+                .limit(200)
+            )
+            chunks: list[str] = []
+            remaining = max_chars
+            for row in rows:
+                chunk = json.dumps(
+                    {
+                        "role": row.role,
+                        "agent": row.agent_slug,
+                        "content": row.content,
+                    },
+                    ensure_ascii=False,
+                )
+                if len(chunk) > remaining:
+                    break
+                chunks.append(chunk)
+                remaining -= len(chunk) + 1
+        return "\n".join(reversed(chunks))
 
     def get_turn(self, user_id: str, channel_id: str, turn_id: str) -> Turn | None:
         with self.dstore.read() as session:

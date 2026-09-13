@@ -83,7 +83,21 @@ An ordinary turn talks to Angie without host or MCP action tools. A known
 records work intent and enables the corresponding concierge tools. Team members
 receive separate role-scoped sessions and their replies are persisted as
 separate messages. Repeating a `client_turn_id` returns the accepted turn;
-reusing it for different text is rejected.
+reusing it for different text, targets, intent, or message identity is rejected.
+
+Turns execute in admission order through the single concierge. A team's members
+run sequentially, each receiving durable channel history and the earlier members'
+replies. The context is bounded to the latest 200 messages and 60,000 characters;
+it excludes other channels and later queued user inputs. History also rebuilds
+context after a provider session is lost or the daemon restarts.
+
+Before serving requests after a restart, the API resumes accepted turns that
+never started. A running turn with every expected reply already persisted is
+completed without another invocation. Other interrupted running turns fail with
+a durable explanation: their actions may already have occurred, so they are not
+automatically replayed. Provider failures also appear in channel history.
+Deleting a channel prevents queued turns and remaining team members from starting
+and discards late replies. It does not undo an action already running.
 
 Connection credentials remain in sbxloop's environment and configuration.
 These routes report redacted readiness and deliberately reject browser-supplied

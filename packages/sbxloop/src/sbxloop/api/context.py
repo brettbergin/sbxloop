@@ -25,7 +25,7 @@ from sbxloop.api.auth.keys import SigningKeys
 from sbxloop.api.auth.ratelimit import FailureLimiter
 from sbxloop.api.auth.store import ApiAuthStore
 from sbxloop.api.chronology import Chronology
-from sbxloop.api.collaboration import CollaborationStore, LocalUser, Turn
+from sbxloop.api.collaboration import CollaborationStore, LocalUser, Message, Turn
 from sbxloop.api.publicids import PublicIds
 from sbxloop.api.stream import StreamHub
 from sbxloop.config import Config
@@ -67,8 +67,10 @@ class ApiContext:
             max_workers=EXECUTOR_THREADS, thread_name_prefix="sbxloop-api-worker"
         )
         self.turn_executor = ThreadPoolExecutor(
-            max_workers=2, thread_name_prefix="sbxloop-collaboration"
+            max_workers=1, thread_name_prefix="sbxloop-collaboration"
         )
+        self._turn_admission = threading.Lock()
+        self._collaboration_recovered = False
         self._semaphore: asyncio.Semaphore | None = None
         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
         self._public_ids: PublicIds | None = None
@@ -124,6 +126,43 @@ class ApiContext:
     def collaboration_available(self) -> bool:
         return self.concierge is not None and not self.stopping.is_set()
 
+    def recover_collaboration(self) -> None:
+        with self._turn_admission:
+            if self._collaboration_recovered:
+                return
+            queued = self.collaboration.recover_turns(self.clock())
+            if queued and self.concierge is None:
+                # Retain accepted work until the configured runtime is available.
+                return
+            for turn, user, content in queued:
+                self.start_collaboration_turn(turn, user, content, intent=turn.intent)
+            self._collaboration_recovered = True
+            self.hub.notify()
+
+    def accept_collaboration_turn(
+        self,
+        user: LocalUser,
+        channel_id: str,
+        **values: Any,
+    ) -> tuple[Turn, Message, bool]:
+        # Acceptance and submission share an ordering boundary. Concurrent HTTP
+        # requests cannot submit the second turn ahead of the first.
+        with self._turn_admission:
+            turn, message, created = self.collaboration.accept_turn(
+                user.id,
+                channel_id,
+                now=self.clock(),
+                **values,
+            )
+            if created:
+                self.start_collaboration_turn(
+                    turn,
+                    user,
+                    message.content,
+                    intent=turn.intent,
+                )
+            return turn, message, created
+
     def start_collaboration_turn(
         self,
         turn: Turn,
@@ -144,56 +183,87 @@ class ApiContext:
 
         def run() -> None:
             store = self.collaboration
+            while not self.ready.wait(0.1):
+                if self.stopping.is_set():
+                    return
+            if self.stopping.is_set():
+                return
             if not store.start_turn(turn.id, self.clock()):
                 self.hub.notify()
                 return
-            preferences = store.list_preferences(user.id)
-            preference_context = ""
-            if preferences:
-                joined = "\n\n".join(value.content.strip() for value in preferences)
-                preference_context = f"\n\nUser preferences:\n\n{joined}"
-            targets: tuple[str | None, ...] = tuple(turn.targets) or (None,)
-            errors: list[str] = []
-            author = user.full_name or user.username
-            for target in targets:
-                definition = AGENTS_BY_SLUG.get(target) if target else None
-                persona = (definition.persona if definition else ANGIE_PERSONA) + preference_context
-                # Mentioning a role is explicit delegation in Angie's UI.
-                allow_actions = intent == "delegate" or definition is not None
-                try:
-                    future = concierge.submit_turn(
-                        content,
-                        author=author,
-                        author_id=user.id,
-                        via="local",
-                        message_id=turn.input_message_id,
-                        session_key=f"{turn.channel_id}:{target or 'angie'}",
-                        persona=persona,
-                        allow_actions=allow_actions,
-                    )
-                    reply = future.result()
-                    if reply.ok and reply.text:
-                        store.append_reply(
-                            turn.id,
-                            content=reply.text,
-                            agent_slug=target,
-                            now=self.clock(),
-                        )
-                        if reply.after is not None:
-                            reply.after()
-                    else:
-                        errors.append(reply.error or f"@{target or 'angie'} did not answer")
-                except BaseException as exc:
-                    errors.append(str(exc)[:300] or type(exc).__name__)
-                self.hub.notify()
-            store.finish_turn(
-                turn.id,
-                error="; ".join(errors) if errors and len(errors) == len(targets) else None,
-                now=self.clock(),
-            )
+            try:
+                self._execute_collaboration_turn(turn, user, content, intent=intent)
+            except Exception:
+                # Do not expose arbitrary provider exceptions (which may include
+                # credentials) in durable chat history.
+                store.finish_turn(
+                    turn.id,
+                    error="This turn could not finish. Check the daemon logs.",
+                    now=self.clock(),
+                )
             self.hub.notify()
 
         self.turn_executor.submit(run)
+
+    def _execute_collaboration_turn(
+        self,
+        turn: Turn,
+        user: LocalUser,
+        content: str,
+        *,
+        intent: str,
+    ) -> None:
+        store = self.collaboration
+        concierge = self.concierge
+        preferences = store.list_preferences(user.id)
+        preference_context = ""
+        if preferences:
+            joined = "\n\n".join(value.content.strip() for value in preferences)
+            preference_context = f"\n\nUser preferences:\n\n{joined}"
+        targets: tuple[str | None, ...] = tuple(turn.targets) or (None,)
+        errors: list[str] = []
+        author = user.full_name or user.username
+        for target in targets:
+            current = store.get_turn(user.id, turn.channel_id, turn.id)
+            if self.stopping.is_set() or current is None or current.status != "running":
+                return
+            definition = AGENTS_BY_SLUG.get(target) if target else None
+            persona = (definition.persona if definition else ANGIE_PERSONA) + preference_context
+            # Mentioning a role is explicit delegation in Angie's UI.
+            allow_actions = intent == "delegate" or definition is not None
+            try:
+                future = concierge.submit_turn(
+                    content,
+                    author=author,
+                    author_id=user.id,
+                    via="local",
+                    message_id=turn.input_message_id,
+                    session_key=f"{turn.channel_id}:{target or 'angie'}",
+                    persona=persona,
+                    allow_actions=allow_actions,
+                    history=store.turn_history(turn),
+                )
+                reply = future.result()
+                if reply.ok and reply.text:
+                    delivered = store.append_reply(
+                        turn.id,
+                        content=reply.text,
+                        agent_slug=target,
+                        now=self.clock(),
+                    )
+                    if delivered is not None and reply.after is not None:
+                        reply.after()
+                else:
+                    errors.append(reply.error or f"@{target or 'angie'} did not answer")
+            except Exception:
+                errors.append(f"@{target or 'angie'} could not finish. Check the daemon logs.")
+            self.hub.notify()
+        store.finish_turn(
+            turn.id,
+            error="; ".join(errors) if errors else None,
+            now=self.clock(),
+        )
+        self.hub.notify()
 
     def service(self) -> ControlService:
         """A service over the loop; one per request, since it collects the
