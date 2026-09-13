@@ -63,7 +63,7 @@ class RunDetailScreen(ConsoleScreen):
         Binding("w", "resume_review", "Check review now", show=False),
         Binding("plus", "grant_rounds", "Grant rounds", show=False),
         Binding("s", "shell_agent", "Shell (agent)"),
-        Binding("S", "shell_github", "Shell (github)", show=False),
+        Binding("S", "shell_github", "Shell (VCS)", show=False),
     ]
     DEFAULT_CSS = """
     RunDetailScreen #header { height: auto; max-height: 8; padding: 0 1; border: round $primary; }
@@ -606,7 +606,11 @@ class RunDetailScreen(ConsoleScreen):
         )
 
     def _shell(self, role: str) -> None:
-        name = sandbox_name(self.run_id, "agent" if role == "agent" else "github")
+        if role == "agent":
+            name = sandbox_name(self.run_id, "agent")
+        else:
+            kind = self.detail.vcs_kind if self.detail is not None else "github"
+            name = sandbox_name(self.run_id, "github", vcs_kind=kind)
         self.console_app.perform(actions.shell(self.console_app.deps, name))
 
     def action_shell_agent(self) -> None:

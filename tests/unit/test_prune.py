@@ -52,12 +52,28 @@ class TestClassification:
 
     def test_daemon_owned_names_are_reported_not_pruned(self, store: StateStore) -> None:
         verdicts = classify_sandboxes(
-            [info("sbxloop-daemon-github-0badf00d"), info("sbxloop-concierge-0badf00d")],
+            [
+                info("sbxloop-daemon-github-0badf00d"),
+                info("sbxloop-daemon-gitlab-0badf00d"),
+                info("sbxloop-concierge-0badf00d"),
+            ],
             store,
             min_age_s=0.0,
         )
-        assert [v.orphan for v in verdicts] == [False, False]
+        assert [v.orphan for v in verdicts] == [False, False, False]
         assert all("daemon-owned" in v.reason for v in verdicts)
+
+    def test_forge_suffix_is_the_internal_vcs_role(self, store: StateStore) -> None:
+        store.create_run("rabc12345", "x")
+        store.set_run_state("rabc12345", "completed")
+        now = store.get_run("rabc12345").updated_at
+
+        (verdict,) = classify_sandboxes(
+            [info("sbxloop-rabc12345-gitlab")], store, min_age_s=0.0, now=now
+        )
+
+        assert verdict.orphan
+        assert verdict.role == "github"
 
     def test_unknown_run_is_orphan_with_multi_host_honesty(self, store: StateStore) -> None:
         (verdict,) = classify_sandboxes([info("sbxloop-rabc12345-agent")], store)

@@ -259,6 +259,7 @@ NoticeKind = Literal[
     "daemon.schedule_paused",
     "daemon.schedule_resumed",
     "daemon.schedule_added",
+    "daemon.schedule_updated",
     "daemon.schedule_removed",
     "daemon.schedules_imported",
     "daemon.restart_requested",

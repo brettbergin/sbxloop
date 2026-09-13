@@ -254,6 +254,7 @@ class Chronology:
         run_id: str | None = None,
         type_prefix: str | None = None,
         limit: int = 100,
+        newest_first: bool = False,
     ) -> list[PublicEvent]:
         """Events after a cursor, oldest first; an engine event's data is
         joined from the engine's own row."""
@@ -261,7 +262,7 @@ class Chronology:
             select(ApiEventRow, EventRow.data_json, EventRow.job_id)
             .outerjoin(EventRow, EventRow.seq == ApiEventRow.source_seq)
             .where(ApiEventRow.seq > after)
-            .order_by(ApiEventRow.seq.asc())
+            .order_by(ApiEventRow.seq.desc() if newest_first else ApiEventRow.seq.asc())
             .limit(limit)
         )
         if run_id is not None:

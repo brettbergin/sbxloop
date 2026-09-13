@@ -305,6 +305,35 @@ class TestJobShape:
         assert dstore.get_value(STATE_SESSION_ID) == "sB"
         assert dstore.get_value(STATE_SESSION_TURNS) == "1"
 
+    def test_product_sessions_are_scoped_by_channel_and_role(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {"session_id": "session-a"},
+                {"session_id": "session-b"},
+                {"session_id": "session-a"},
+            ],
+        )
+        for key in ("channel-a:angie", "channel-b:angie", "channel-a:angie"):
+            concierge.submit_turn("hello", author="owner", session_key=key).result(timeout=10)
+        assert [job.resume_session_id for job in client.jobs] == [None, None, "session-a"]
+
+    def test_conversation_turn_has_persona_but_no_action_tools(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(tmp_path, [{"session_id": "conversation"}])
+        concierge.submit_turn(
+            "hello",
+            author="owner",
+            session_key="channel-a:angie",
+            persona="\nYou are Angie.",
+            allow_actions=False,
+        ).result(timeout=10)
+        (job,) = client.jobs
+        assert job.host_tools == []
+        assert job.mcp_servers == []
+        assert job.system_message is not None
+        assert "You are Angie." in job.system_message
+        assert "ordinary conversation turn" in job.system_message
+
     def test_github_tool_present_when_repo_configured(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(tmp_path, [{}], github=FakeGithub())
         turn(concierge)
@@ -1891,6 +1920,35 @@ class TestFailures:
         assert client.jobs[2].resume_session_id is None
         assert host.failures == []  # not a sandbox failure: no drop
 
+    def test_lost_product_session_reconstructs_durable_history(self, tmp_path: Path) -> None:
+        concierge, client, _, _, dstore = make(
+            tmp_path,
+            [
+                {"session_id": "sA"},
+                {"raise": WorkerError("session sA not found in store")},
+                {"text": "blue"},
+            ],
+        )
+        try:
+            concierge.submit_turn("remember blue", author="owner", session_key="channel-a").result(
+                10
+            )
+            reply = concierge.submit_turn(
+                "what color?",
+                author="owner",
+                session_key="channel-a",
+                history='{"role":"user","content":"remember blue"}',
+                allow_actions=False,
+            ).result(10)
+            assert reply.text == "blue"
+            assert client.jobs[-1].resume_session_id is None
+            assert "remember blue" in client.jobs[-1].prompt
+            assert client.jobs[-1].prompt.endswith("what color?")
+            assert client.jobs[-1].host_tools == []
+        finally:
+            concierge.close()
+            dstore.close()
+
     def test_timeout_is_an_actionable_error(self, tmp_path: Path) -> None:
         concierge, _client, host, *_ = make(
             tmp_path, [{"raise": WorkerTimeoutError("job timed out after 180s")}]
@@ -2907,12 +2965,13 @@ class TestStartWorkload:
             ],
             config=self.PROFILES,
         )
-        for _ in range(2):
-            concierge.submit_turn("once", author="a", message_id="5").result(timeout=10)
+        concierge.submit_turn("once", author="a", message_id="5").result(timeout=10)
+        dstore.set_state("chat:5", "done", 10)
+        concierge.submit_turn("once", author="a", message_id="5").result(timeout=10)
         first, second = client.responses
         assert first.text and first.text.startswith("queued workload `chat:5`")
-        assert second.text == "`chat:5` is already queued or running (profile `research`)."
-        assert dstore.get("chat:5") is not None
+        assert second.text == "`chat:5` already exists (done; profile `research`)."
+        assert dstore.get("chat:5").state == "done"  # type: ignore[union-attr]
 
     def test_a_turn_without_a_message_id_gets_a_fresh_key(self, tmp_path: Path) -> None:
         concierge, client, _, _, dstore = make(

@@ -57,7 +57,8 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import InstrumentedAttribute, Session, aliased
 
-import sbxloop.db.api_models  # noqa: F401  - registers the operations tables on Base
+import sbxloop.db.api_models  # registers the operations tables on Base
+import sbxloop.db.collaboration_models  # noqa: F401 - registers collaboration tables on Base
 from sbxloop.config import ScheduleConfig
 from sbxloop.daemon.model import ItemState, PendingReport, WorkItem
 from sbxloop.daemon.schedule import ScheduleRow
@@ -2765,6 +2766,53 @@ class DaemonStore:
                 )
             )
             return _rowcount(result) == 1
+
+    def update_schedule(self, name: str, spec: ScheduleConfig, *, now: float) -> bool:
+        """Replace one schedule spec in a single transaction.
+
+        Pause state and firing history survive. A cadence or timezone change
+        starts a fresh grid at ``now`` so an edit cannot immediately replay an
+        old cadence. False means the current name is absent or the new name is
+        already occupied.
+        """
+        with self._lock, begin_immediate(self._engine) as conn:
+            current = conn.execute(
+                select(
+                    ScheduleRowModel.every,
+                    ScheduleRowModel.cron,
+                    ScheduleRowModel.timezone,
+                ).where(
+                    ScheduleRowModel.name == name,
+                    ScheduleRowModel.ask.is_not(None),
+                )
+            ).first()
+            if current is None:
+                return False
+            if spec.name != name:
+                target = conn.execute(
+                    select(ScheduleRowModel.ask).where(ScheduleRowModel.name == spec.name)
+                ).first()
+                if target is not None and target.ask is not None:
+                    return False
+            changed_grid = (current.every, current.cron, current.timezone) != (
+                spec.every,
+                spec.cron,
+                spec.timezone,
+            )
+            values: dict[str, Any] = {
+                "name": spec.name,
+                "profile": spec.profile,
+                "ask": spec.ask,
+                "every": spec.every,
+                "cron": spec.cron,
+                "timezone": spec.timezone,
+            }
+            if changed_grid:
+                values.update(anchor=now, last_due=None)
+            conn.execute(
+                update(ScheduleRowModel).where(ScheduleRowModel.name == name).values(**values)
+            )
+            return True
 
     def schedule_row(self, name: str, now: float) -> ScheduleRow:
         """The schedule's row, created at ``now`` on first sight — the

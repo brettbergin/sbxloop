@@ -346,6 +346,35 @@ class TestSchedules:
         assert removed.json()["operation"]["action"] == "schedule.remove"
         assert api.client.get("/v1/schedules/nightly", headers=headers).status_code == 404
 
+    def test_a_schedule_is_updated_atomically_without_losing_pause_state(
+        self, scheduled: Api
+    ) -> None:
+        api = scheduled
+        headers = api.bearer(MANAGE)
+        assert api.client.post("/v1/schedules/hourly/pause", headers=headers).status_code == 200
+
+        changed = api.client.patch(
+            "/v1/schedules/hourly",
+            json={
+                "name": "twice-daily",
+                "profile": "brief",
+                "ask": "Updated summary",
+                "every": "12h",
+                "timezone": "UTC",
+            },
+            headers=headers,
+        )
+
+        assert changed.status_code == 200, changed.text
+        body = changed.json()
+        assert body["schedule"]["name"] == "twice-daily"
+        assert body["schedule"]["cadence"] == "every 12h"
+        assert body["schedule"]["ask"] == "Updated summary"
+        assert body["schedule"]["paused"]
+        assert body["operation"]["action"] == "schedule.update"
+        assert api.client.get("/v1/schedules/hourly", headers=headers).status_code == 404
+        assert api.client.get("/v1/schedules/twice-daily", headers=headers).status_code == 200
+
     def test_the_socket_takes_the_same_commands(self, scheduled: Api) -> None:
         api = scheduled
         with api.client.websocket_connect("/v1/ws", headers=api.bearer(MANAGE)) as ws:

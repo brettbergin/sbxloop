@@ -4,13 +4,16 @@ fails closed by name."""
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from sbxloop.config import Config
-from sbxloop.daemon.github import DaemonGithub
+from sbxloop.daemon.github import DaemonGithub, sandbox_name_for
 from sbxloop.errors import GithubOpsError
 from sbxloop.events import EventBus
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.models import SandboxInfo
 from sbxloop.vcs.backends import (
     BackendNotImplemented,
     backend_for,
@@ -77,9 +80,37 @@ class TestTheDaemonsBox:
             config, SbxCLI(binary=str(fake_sbx.binary)), EventBus(), worker_python="python"
         )
         assert box.kind == "gitlab"
+        assert box.name == sandbox_name_for(config.paths, "gitlab")
+        assert box.name.startswith("sbxloop-daemon-gitlab-")
         ops = box.backend(StubWorkerClient({}))  # type: ignore[arg-type]
         assert isinstance(ops, GitlabOps)
         assert ops.transport is not None and ops.transport.api_url == "https://gl.example/api/v4"
+
+    def test_a_renamed_box_cleans_up_the_pre_upgrade_name(self, tmp_path: Path) -> None:
+        config = Config.model_validate(
+            {
+                "home": str(tmp_path / "home"),
+                "vcs": {"kind": "gitlab", "api_url": "https://gl.example/api/v4"},
+                "github": {"repo": "acme/widgets"},
+            }
+        )
+        legacy = sandbox_name_for(config.paths, "github")
+
+        class StubSbx:
+            def __init__(self) -> None:
+                self.names = {legacy}
+
+            def ls(self) -> list[SandboxInfo]:
+                return [SandboxInfo(name=name) for name in self.names]
+
+            def rm(self, name: str, *, force: bool = False) -> None:
+                self.names.remove(name)
+
+        cli = StubSbx()
+        box = DaemonGithub(config, cli, EventBus(), worker_python="python")  # type: ignore[arg-type]
+        box.remove_stale()
+
+        assert legacy not in cli.names
 
     def test_a_repository_on_its_own_forge(self, fake_sbx: FakeSbx, tmp_path: str) -> None:
         config = Config.model_validate(

@@ -372,21 +372,21 @@ merge then run through the `git.merge` worker job, where repository hooks
 and drivers have the same authority as other agent code. This preserves
 host-initiated transport and mediation between the credential and agent
 planes; no new listener or box-to-box channel is introduced.
-The github sandbox exists only when the GitHub integration is configured
+The VCS sandbox exists only when the repository integration is configured
 (`[github] repo = "owner/repo"`, or at least one `[[github.repos]]` entry);
-without it, `pair.github` is `None`, `GH_TOKEN`
-is not required, and the run has no GitHub capability at all. When several
-repositories are configured, the github sandbox is scoped to the one the
+without it, the internally named `pair.github` is `None`, a forge token
+is not required, and the run has no VCS capability at all. When several
+repositories are configured, the VCS sandbox is scoped to the one the
 run's work item came from, and carries that repository's `token_env`
 credential:
 
-|            | agent sandbox                                                                                                                                                                                                                                    | github sandbox                                                                                                     |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------ |
-| name       | `sbxloop-<run>-agent`                                                                                                                                                                                                                            | `sbxloop-<run>-github`                                                                                             |
-| credential | the configured agent credential only — `COPILOT_GITHUB_TOKEN` (`[agent] backend = "copilot"`, the default), `ANTHROPIC_API_KEY` (`"claude"`, #533), `OPENAI_API_KEY` (`"codex"`) or the variable `[agent.openai] api_key_env` names (`"openai"`) | `GH_TOKEN` only (a PAT, or a host-minted App installation token)                                                   |
-| injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows)                                                                          | built-in `github` service secret (PAT), or the in-VM env file carrying a host-minted App installation token (#568) |
-| network    | balanced policy + the backend's credential hosts (copilot's, a vendor API host, or the endpoint `[agent.openai]` names) + the `[github] api_url` hosts + plan-declared grants                                                                    | balanced policy + the `[github] api_url` hosts (+ the dotcom storage hosts when that is github.com)                |
-| runs       | agent SDK sessions (Copilot SDK, the Claude Agent SDK + Claude Code CLI, the Codex SDK, or the worker's own chat-completions loop with the openai backend), shell checks                                                                         | `vcs.op` jobs (REST, or gh CLI on GitHub)                                                                          |
+|            | agent sandbox                                                                                                                                                                                                                                    | VCS sandbox                                                                                                     |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| name       | `sbxloop-<run>-agent`                                                                                                                                                                                                                            | `sbxloop-<run>-<forge>`                                                                                         |
+| credential | the configured agent credential only — `COPILOT_GITHUB_TOKEN` (`[agent] backend = "copilot"`, the default), `ANTHROPIC_API_KEY` (`"claude"`, #533), `OPENAI_API_KEY` (`"codex"`) or the variable `[agent.openai] api_key_env` names (`"openai"`) | the configured forge token only                                                                                 |
+| injection  | `sbx secret set-custom`, bound to `api.github.com` (PAT→Copilot token exchange; the exchanged token lives in SDK memory, so copilot API hosts need only network allows)                                                                          | built-in `github` service secret on GitHub; the non-proxy env-file path on other forges and for GitHub App auth |
+| network    | balanced policy + the backend's credential hosts (copilot's, a vendor API host, or the endpoint `[agent.openai]` names) + the repository's forge hosts + plan-declared grants                                                                    | balanced policy + the repository's forge API hosts (+ GitHub's dotcom storage hosts when applicable)            |
+| runs       | agent SDK sessions (Copilot SDK, the Claude Agent SDK + Claude Code CLI, the Codex SDK, or the worker's own chat-completions loop with the openai backend), shell checks                                                                         | `vcs.op` jobs (REST, or gh CLI on GitHub)                                                                       |
 
 A workload run's needs (#758) are held to a **profile** before any task
 runs. `[[workloads]]` declares each profile (`egress` patterns, the
@@ -753,7 +753,7 @@ provisions a fresh pair.
 ### The daemon's own sandboxes
 
 `sbxloop daemon` owns two long-lived sandboxes outside any run's pair, both
-named per state dir (`sbxloop-daemon-github-<digest>`,
+named per state dir (`sbxloop-daemon-<forge>-<digest>`,
 `sbxloop-concierge-<digest>`) and both reported-but-never-pruned by
 `sandbox prune`:
 
@@ -2232,6 +2232,22 @@ single connections and the loop's locks are never touched from the event
 loop thread. Refusals are `application/problem+json` with the `ControlError`
 code mapped to a status; every response carries an `X-Request-Id`.
 
+The additive collaboration layer gives local product clients durable users,
+channels, messages, turns, teams, preferences, workflow definitions, and a
+redacted connection view. Its ORM rows share `DaemonStore` and every read and
+write goes through the same store lock and API executor; it never opens a
+second SQLite connection. Accepting a turn appends its user message and
+idempotency key in one immediate transaction. The concierge then runs outside
+the HTTP loop in a role-scoped session and appends immutable reply messages.
+Channel tombstones are checked again at reply time, so late work cannot
+resurrect a deleted channel. Each collaboration mutation also records a
+`collaboration.*` row in the existing public chronology transaction.
+
+The tool boundary follows explicit work intent. An ordinary conversation gets
+no host or MCP action tools. A known agent/team mention, explicit target, or
+`delegate` intent enables action tools for that role. This keeps conversation
+and delegated work visibly distinct while reusing the same concierge runtime.
+
 Authentication is the daemon's own. `sbxloop api client create` registers a
 client (`api_clients`: a name, the scrypt verifier of a secret shown once,
 the capabilities granted); `POST /v1/auth/token` exchanges the secret for an
@@ -2347,7 +2363,7 @@ attachments, and never served as a type a browser would run. Usage
 client: `null` stays `null`, `recorded` says whether anything was
 reported, and `spend` is `null` by construction with the basis stated —
 telemetry, not an invoice. A window folds every run touched in it from the
-samples' own timestamps and is at most 31 days wide.
+samples' own timestamps and is at most 90 days wide.
 
 **Diagnostics and administration (#1040).** `api/diagnostics.py` reads the
 same in-process log ring `ctl log` and the concierge read

@@ -303,8 +303,30 @@ def mount_probe_command(workspace: Path | None, marker: str) -> str:
 PostCreate = Callable[[Sandbox, SandboxRole], None]
 
 
-def sandbox_name(run_id: str, role: SandboxRole) -> str:
-    return f"sbxloop-{run_id}-{role}"
+def sandbox_name(run_id: str, role: SandboxRole, *, vcs_kind: VcsKind = "github") -> str:
+    """The externally visible name for one member of a run's sandbox set.
+
+    ``github`` remains the internal role name for the credential-isolated
+    forge worker, but its sandbox name follows the backend it actually runs.
+    Keeping the role separate preserves the worker and event protocol while
+    avoiding a GitLab or Gitea box being presented to an operator as GitHub.
+    """
+    suffix = vcs_kind if role == "github" else role
+    return f"sbxloop-{run_id}-{suffix}"
+
+
+def sandbox_name_candidates(
+    run_id: str, role: SandboxRole, *, vcs_kind: VcsKind = "github"
+) -> tuple[str, ...]:
+    """Current name, then any pre-forge-naming name an upgrade may leave.
+
+    Callers that inspect or remove an already-created sandbox use this
+    instead of stranding a non-GitHub run made by an older release.
+    """
+    current = sandbox_name(run_id, role, vcs_kind=vcs_kind)
+    if role != "github" or vcs_kind == "github":
+        return (current,)
+    return (current, sandbox_name(run_id, role))
 
 
 def dedupe_domains(domains: Iterable[str]) -> list[str]:
@@ -546,7 +568,12 @@ class Provisioner:
             persistent_env=self.agent_persistent_env(repo),
             files=self.agent_files(repo),
         )
-        github = self._github_spec(sandbox_name(run_id, "github"), workspace, repo, template)
+        github = self._github_spec(
+            sandbox_name(run_id, "github", vcs_kind=self.forge_kind(repo)),
+            workspace,
+            repo,
+            template,
+        )
         return agent, github
 
     def _github_spec(
