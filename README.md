@@ -21,8 +21,8 @@
 
 Built on [Docker Sandboxes (`sbx`)](https://docs.docker.com/ai/sandboxes/),
 sbxloop automates generic agent workloads you define as well as software development
-from chat, issues, or your terminal—planning, coding, testing, and handling 
-feedback through to merge. For general [agentic workloads](docs/architecture.md#workloads), 
+from chat, issues, or your terminal—planning, coding, testing, and handling
+feedback through to merge. For general [agentic workloads](docs/architecture.md#workloads),
 it researches, writes reports, or generates files. Watch, steer, or stop it anytime.
 
 Out-of-scope findings are checked against existing issues; tracked problems
