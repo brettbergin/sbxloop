@@ -3811,6 +3811,11 @@
             "title": "Auth Type",
             "type": "string"
           },
+          "available": {
+            "default": true,
+            "title": "Available",
+            "type": "boolean"
+          },
           "color": {
             "title": "Color",
             "type": "string"
@@ -3833,6 +3838,17 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "unavailable_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unavailable Reason"
           }
         },
         "required": [

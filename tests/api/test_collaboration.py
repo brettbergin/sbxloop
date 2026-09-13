@@ -220,6 +220,11 @@ def test_connections_report_operator_configuration_without_accepting_secrets(api
     services = api.client.get("/v1/connections/services", headers=headers)
     assert services.status_code == 200
     assert {value["key"] for value in services.json()} >= {"github", "slack", "discord"}
+    catalog = {value["key"]: value for value in services.json()}
+    for forge in ("gitlab", "gitea"):
+        assert catalog[forge]["available"] is False
+        assert catalog[forge]["unavailable_reason"]
+        assert catalog[forge]["fields"] == []
     configured = api.client.get("/v1/connections", headers=headers)
     assert configured.status_code == 200
     assert all(value["masked_credentials"] for value in configured.json())

@@ -116,6 +116,34 @@ PREFERENCE_NAMES = frozenset(item["name"] for item in PREFERENCE_DEFINITIONS)
 
 SERVICE_DEFINITIONS: tuple[dict[str, object], ...] = (
     {
+        "key": "gitlab",
+        "name": "GitLab",
+        "description": "GitLab repositories, merge requests, and issues",
+        "auth_type": "api_key",
+        "color": "#FC6D26",
+        "fields": [],
+        "agent_slug": None,
+        "available": False,
+        "unavailable_reason": (
+            "GitLab execution is not available in this SBXLOOP version. "
+            "Connection setup will be available when its forge backend is implemented."
+        ),
+    },
+    {
+        "key": "gitea",
+        "name": "Gitea",
+        "description": "Self-hosted Gitea repositories, pull requests, and issues",
+        "auth_type": "api_key",
+        "color": "#609926",
+        "fields": [],
+        "agent_slug": None,
+        "available": False,
+        "unavailable_reason": (
+            "Gitea execution is not available in this SBXLOOP version. "
+            "Connection setup will be available when its forge backend is implemented."
+        ),
+    },
+    {
         "key": "github",
         "name": "GitHub",
         "description": "Repository management — pull requests, issues, and code review",

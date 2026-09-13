@@ -120,6 +120,8 @@ class ServiceDefinitionOut(ApiModel):
     color: str
     fields: list[ServiceFieldOut]
     agent_slug: str | None
+    available: bool = True
+    unavailable_reason: str | None = None
 
 
 class ConnectionOut(ApiModel):
