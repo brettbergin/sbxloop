@@ -79,6 +79,7 @@ class Message:
     agent_slug: str | None
     created_at: float
     work: dict[str, Any] | None = None
+    reactions: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -175,6 +176,7 @@ def _message(row: MessageRow) -> Message:
         agent_slug=None if row.agent_slug is None else str(row.agent_slug),
         created_at=float(row.created_at),
         work=json.loads(row.work_json) if row.work_json else None,
+        reactions=tuple(str(value) for value in json.loads(row.reactions_json or "[]")),
     )
 
 
@@ -523,6 +525,7 @@ class CollaborationStore:
                     role="user",
                     kind="message",
                     content=content,
+                    reactions_json=json.dumps(["⏳"]),
                     created_at=now,
                 )
             )
@@ -704,6 +707,59 @@ class CollaborationStore:
         with self.dstore.read() as session:
             return session.get(MessageRow, message_id) is not None
 
+    def set_message_reaction(
+        self,
+        user_id: str,
+        channel_id: str,
+        message_id: str,
+        *,
+        emoji: str,
+        active: bool,
+        now: float,
+    ) -> Message | None:
+        """Idempotently add or remove one reaction on a user's channel message."""
+        emoji = emoji.strip()
+        if not emoji or any(character.isspace() for character in emoji):
+            raise CollaborationError("invalid_reaction", "Choose one emoji without spaces.")
+        with self.dstore.immediate_transaction() as session:
+            channel = session.get(ChannelRow, channel_id)
+            row = session.get(MessageRow, message_id)
+            if (
+                channel is None
+                or channel.user_id != user_id
+                or channel.state != "active"
+                or row is None
+                or row.channel_id != channel_id
+            ):
+                return None
+            reactions = [str(value) for value in json.loads(row.reactions_json or "[]")]
+            changed = False
+            if active and emoji not in reactions:
+                if len(reactions) >= 16:
+                    raise CollaborationError(
+                        "reaction_limit", "This message already has 16 reactions."
+                    )
+                reactions.append(emoji)
+                changed = True
+            elif not active and emoji in reactions:
+                reactions.remove(emoji)
+                changed = True
+            if changed:
+                row.reactions_json = json.dumps(reactions, ensure_ascii=False)
+                _event(
+                    session,
+                    "collaboration.message.reactions.updated",
+                    now,
+                    data={
+                        "channel_id": channel_id,
+                        "message_id": message_id,
+                        "emoji": emoji,
+                        "active": active,
+                    },
+                )
+            session.flush()
+            return _message(row)
+
     def finish_turn(self, turn_id: str, *, error: str | None, now: float) -> Turn | None:
         with self.dstore.immediate_transaction() as session:
             row = session.get(TurnRow, turn_id)
@@ -723,6 +779,15 @@ class CollaborationStore:
             row.error = error
             row.completed_at = now
             channel = session.get(ChannelRow, row.channel_id)
+            input_message = session.get(MessageRow, row.input_message_id)
+            if input_message is not None:
+                reactions = [
+                    str(value) for value in json.loads(input_message.reactions_json or "[]")
+                ]
+                outcome = "⚠" if error else "✅"
+                if outcome not in reactions:
+                    reactions.append(outcome)
+                input_message.reactions_json = json.dumps(reactions, ensure_ascii=False)
             if error and channel is not None and channel.state == "active":
                 message_id = "msg_" + _token(16)
                 sequence = self._next_sequence(session, row.channel_id)
