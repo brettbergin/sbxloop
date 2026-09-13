@@ -228,11 +228,23 @@ class SbxCLI:
 
     def create(self, spec: SandboxSpec) -> None:
         args = ["create", f"--name={spec.name}"]
+        args += ["--cpus", str(spec.resources.cpus), "--memory", spec.resources.memory]
         if spec.template:
             args += ["--template", spec.template]
         args += [spec.agent, str(spec.workspace)]
         # Creating a microVM can take a while on first template pull.
-        self.run(*args, timeout=600.0)
+        try:
+            self.run(*args, timeout=600.0)
+        except SbxError as exc:
+            raise type(exc)(
+                f"cannot create {spec.name} with {spec.resources.cpus} CPUs and "
+                f"{spec.resources.memory} memory: check host capacity and that "
+                "`sbx create --help` supports --cpus and --memory; "
+                "sbxloop will not retry without resource limits",
+                argv=exc.argv,
+                returncode=exc.returncode,
+                stderr=exc.stderr,
+            ) from exc
 
     def exec(
         self,

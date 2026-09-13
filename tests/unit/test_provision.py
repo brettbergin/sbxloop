@@ -51,6 +51,22 @@ def make_provisioner(
 
 
 class TestSpecs:
+    def test_allocation_mismatch_refuses_the_entire_reused_pair_before_mutation(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        provisioner = make_provisioner(fake_sbx, tmp_path)
+        provisioner.ensure_pair("r1", workspace=tmp_path / "work")
+        before = fake_sbx.invocations()
+        provisioner.config.sandbox.memory = "16g"
+        with pytest.raises(ProvisionError, match="needs recreation"):
+            provisioner.ensure_pair("r1", workspace=tmp_path / "work", reuse_sandboxes=True)
+        after = fake_sbx.invocations()[len(before) :]
+        assert not any(
+            call[0] in ("create", "rm", "secret", "policy", "cp", "exec") for call in after
+        )
+        assert fake_sbx.meta("sbxloop-r1-agent")["cpus"] == 6
+        assert fake_sbx.meta("sbxloop-r1-agent")["memory"] == "12g"
+
     def test_build_specs_roles_and_domains(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
         provisioner = make_provisioner(fake_sbx, tmp_path)
         agent, github = provisioner.build_specs("r1", tmp_path)

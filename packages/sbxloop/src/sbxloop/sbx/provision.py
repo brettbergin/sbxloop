@@ -75,6 +75,7 @@ from sbxloop.ids import branch_name
 from sbxloop.log import get_logger
 from sbxloop.policy import PROMPT_ADVERTISED_DOMAINS, baseline_allows
 from sbxloop.sbx import registries
+from sbxloop.sbx.allocations import record_allocation, require_allocation
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import (
     PROBE_EXEC_STDIN_ENV,
@@ -532,6 +533,7 @@ class Provisioner:
         agent = SandboxSpec(
             name=sandbox_name(run_id, "agent"),
             role="agent",
+            resources=self.config.sandbox_resources_for("agent", repo),
             workspace=workspace,
             template=template,
             policy_allows=agent_policy_allows(
@@ -559,6 +561,7 @@ class Provisioner:
         return SandboxSpec(
             name=name,
             role="github",
+            resources=self.config.sandbox_resources_for("github"),
             workspace=workspace,
             template=template,
             policy_allows=github_policy_allows(self.config, kind),
@@ -1597,6 +1600,11 @@ class Provisioner:
         # created so rollback stays complete.
         rollback_lock = threading.Lock()
         reusable = {info.name for info in self.cli.ls()} if reuse_sandboxes else set()
+        # Validate the whole reused pair before changing policy, secrets or files
+        # on any member. A refusal preserves the old VMs and their session state.
+        for spec in specs:
+            if spec.name in reusable:
+                require_allocation(self.config.paths, Sandbox(self.cli, spec.name), spec.resources)
 
         def provision_one(spec: SandboxSpec) -> Sandbox:
             started = time.monotonic()
@@ -1606,8 +1614,17 @@ class Provisioner:
                 sandbox=spec.name,
                 role=spec.role,
                 template=spec.template,
+                cpus=spec.resources.cpus,
+                memory=spec.resources.memory,
             )
-            self.bus.emit("sandbox.provision_start", run_id, name=spec.name, role=spec.role)
+            self.bus.emit(
+                "sandbox.provision_start",
+                run_id,
+                name=spec.name,
+                role=spec.role,
+                cpus=spec.resources.cpus,
+                memory=spec.resources.memory,
+            )
             if env_file_reasons[spec.role] is not None:
                 # sbx stamps *registered* secrets into the VM at create;
                 # purge leftovers parked at this name first (#576).
@@ -1624,6 +1641,7 @@ class Provisioner:
             if spec.name not in reusable:
                 with rollback_lock:
                     created.append(sandbox)
+                record_allocation(self.config.paths, sandbox, spec.resources)
             self._apply_policy(spec)
             reason = env_file_reasons[spec.role]
             if reason is not None:
@@ -1839,6 +1857,7 @@ class Provisioner:
         return SandboxSpec(
             name=sandbox_name(run_id, "service"),
             role="service",
+            resources=self.config.sandbox_resources_for("service"),
             workspace=workspace,
             template=self.config.sandbox.template,
             policy_allows=service_policy_allows(credentials, regs, (), self.config.policy.deny),
@@ -1944,6 +1963,7 @@ class Provisioner:
         return SandboxSpec(
             name=name,
             role="agent",
+            resources=self.config.sandbox_resources_for("concierge"),
             workspace=workspace,
             template=self.config.sandbox.template,
             policy_allows=agent_policy_allows(
@@ -2025,13 +2045,21 @@ class Provisioner:
         created: Sandbox | None = None
         registered_secret_rms: list[Callable[[], bool]] = []
         try:
-            self.bus.emit("sandbox.provision_start", label, name=spec.name, role=spec.role)
+            self.bus.emit(
+                "sandbox.provision_start",
+                label,
+                name=spec.name,
+                role=spec.role,
+                cpus=spec.resources.cpus,
+                memory=spec.resources.memory,
+            )
             if reason is not None:
                 # Stable-named boxes (the daemon's, doctor's) are exactly the
                 # ones that accumulate stale registrations (#576).
                 self._purge_stale_registrations(spec)
             self.cli.create(spec)
             created = Sandbox(self.cli, spec.name)
+            record_allocation(self.config.paths, created, spec.resources)
             self._apply_policy(spec)
             if reason is not None:
                 self._apply_env_file_only(label, spec, created, token, reason)

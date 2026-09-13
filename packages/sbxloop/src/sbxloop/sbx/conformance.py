@@ -43,6 +43,7 @@ from pydantic import BaseModel, ConfigDict
 
 from sbxloop.errors import SbxError, SbxloopError, SbxNotFoundError
 from sbxloop.paths import SbxloopHome
+from sbxloop.resources import SandboxResources
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.parse import _CELL_SPLIT, parse_version
@@ -706,14 +707,23 @@ def _apply_drift(
         )
 
 
-def _scratch_sandbox(cli: SbxCLI, home: SbxloopHome, template: str | None) -> tuple[Sandbox, Path]:
+def _scratch_sandbox(
+    cli: SbxCLI,
+    home: SbxloopHome,
+    template: str | None,
+    resources: SandboxResources | None = None,
+) -> tuple[Sandbox, Path]:
     nonce = _secrets.token_hex(4)
     # Resolve like provisioning does: sbx mounts the workspace by path.
     workspace = _conformance_dir(home) / f"scratch-{nonce}"
     workspace.mkdir(parents=True, exist_ok=True)
     workspace = workspace.resolve()
     spec = SandboxSpec(
-        name=f"sbxloop-doctor-{nonce}", role="agent", workspace=workspace, template=template
+        name=f"sbxloop-doctor-{nonce}",
+        role="agent",
+        workspace=workspace,
+        template=template,
+        resources=resources or SandboxResources(cpus=1, memory="2g"),
     )
     cli.create(spec)
     return Sandbox(cli, spec.name), workspace
@@ -725,6 +735,7 @@ def run_conformance(
     *,
     deep: bool = False,
     template: str | None = None,
+    resources: SandboxResources | None = None,
     progress: ProgressFn | None = None,
 ) -> ConformanceReport:
     """Run the probe catalog and reconcile with the version-keyed cache.
@@ -758,7 +769,7 @@ def run_conformance(
     sandbox_probes = [p for p in CATALOG if p.tier == "sandbox"]
     if deep:
         report_progress("creating scratch sandbox for deep probes (first boot can be slow)")
-        sandbox, workspace = _scratch_sandbox(cli, home, template)
+        sandbox, workspace = _scratch_sandbox(cli, home, template, resources)
         try:
             ctx = ProbeContext(cli, sandbox=sandbox, workspace=workspace)
             for probe in sandbox_probes:
