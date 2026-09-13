@@ -279,8 +279,8 @@ def test_deploy_preserves_the_operator_installed_sbx(
 
 class TestStructuredControl:
     """#639: the job reads the daemon through `ctl status --json` and
-    speaks through `daemon notify` — never prose, the secrets file or the
-    daemon's config."""
+    speaks through sbxloop's notifier — never prose, the secrets file or
+    the daemon's config."""
 
     @pytest.mark.parametrize("fixture", ["deploy", "example"])
     def test_no_step_reads_secrets_or_config(
@@ -311,9 +311,30 @@ class TestStructuredControl:
         assert 'jq -r "${CURRENT_JQ}"' in _step(text, "Wait for the daemon to go idle")
         for name in ("Announce", "Report"):
             step = _step(text, name)
-            assert 'daemon notify "${MSG}"' in step, name
+            command = (
+                'DEPLOY_NOTICE="${MSG}" "${VENV_PYTHON}" "${PIPELINE}" deploy-notify'
+                if fixture == "deploy"
+                else 'daemon notify "${MSG}"'
+            )
+            assert command in step, name
             # A chat outage must not fail (or roll back) a deploy.
             assert "continue-on-error: true" in step, name
+
+    def test_self_deploy_notices_use_the_deploy_channel(self, deploy: str) -> None:
+        channel_id = "4shafe93rpnkzqcdqnso7cmbzc"
+        assert f"DEPLOY_CHANNEL: {channel_id}" in deploy
+        assert "8f4oqymuufrb8pzpwyuqjz718r" not in deploy
+        notices = [line for line in deploy.splitlines() if '"${PIPELINE}" deploy-notify' in line]
+        assert len(notices) == 3
+        assert all("DEPLOY_NOTICE=" in notice for notice in notices)
+        assert deploy.index("name: Load the trusted workflow helper") < deploy.index(
+            "name: Announce"
+        )
+        assert deploy.index("name: Report") < deploy.index("name: Clean up the workflow helper")
+
+    def test_generic_deploy_notices_keep_using_the_control_channel(self, example: str) -> None:
+        assert "DEPLOY_CHANNEL" not in example
+        assert "daemon notify --channel" not in example
 
 
 def _script(text: str, name: str) -> str:

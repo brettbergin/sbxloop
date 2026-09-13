@@ -13,8 +13,8 @@
 #     cp sbxloop.toml.example sbxloop.toml && cp .env.example .env
 #
 # Every key is present with its default and a one-line comment. The
-# top-level keys are live; every `[section]` and its keys ship commented
-# out, so a fresh copy is exactly the built-in defaults and uncommenting a
+# top-level keys and sandbox resource limits are live; other settings ship
+# commented out. A fresh copy uses the built-in defaults and uncommenting a
 # line is how you change one — uncomment the `[section]` header along with
 # the key. Secrets never live here — they live in .env / the environment
 # (see .env.example).
@@ -116,7 +116,31 @@ secret_strategy = "proxy"
 # operator_execute = "auto"
 # operator_judge = "auto"
 
-# [sandbox]
+[sandbox]
+# Per-VM allocations: always passed to sbx create, including on old configs
+# that omit these keys. Positive integer CPUs only; 0/all-host is refused.
+# Memory accepts positive whole MiB (m) or GiB (g); no auto/empty limit.
+# Run agent, including code, workload and tool runs; bake uses these too.
+cpus = 6
+# Run-agent memory cap in binary units.
+memory = "12g"
+# The long-lived chat concierge has a separate allocation.
+concierge_cpus = 2
+# Concierge memory cap, including its worker installation.
+concierge_memory = "4g"
+# Each run's and the daemon's GitHub helper.
+github_cpus = 1
+# Memory cap for each GitHub helper.
+github_memory = "2g"
+# Each credential/dependency helper, and diagnostic scratch sandboxes.
+service_cpus = 1
+# Memory cap for each service or diagnostic helper.
+service_memory = "2g"
+# These are per-sandbox limits, not an aggregate host reservation. Size
+# for all simultaneously running VMs. Smaller hosts need smaller values.
+# Changed limits apply at creation. Reuse with unknown/different allocation
+# is refused, preserving the VM: save in-VM work/history, remove that VM,
+# then resume/restart. `sbxloop doctor` shows requested allocations.
 # Custom sandbox template reference (defaults to the sbx shell template).
 # `sbxloop bake` builds one with the worker preinstalled, cutting the
 # per-run install out of provisioning.
@@ -505,6 +529,10 @@ secret_strategy = "proxy"
 # cap, circuit breaker, one run at a time) stay daemon-wide and are shared
 # across all of them.
 # [[github.repos]]
+# Run-agent resource overrides; omitted values inherit [sandbox].
+# cpus = 6
+# Run-agent memory override; omitted inherits [sandbox] memory.
+# memory = "12g"
 # repo = "you/your-repo"
 # kind = "github"                  # the forge this repository lives on; unset uses [vcs]'s
 # workspace = "/path/to/checkout"  # this repo's host checkout; unset falls

@@ -286,6 +286,26 @@ for the transport-level statement of the same rules.
 
 ## The security primitive: one run = two sandboxes (three, with credentials)
 
+All creation paths pass explicit CPU and memory allocations through
+`SandboxSpec.resources` to `SbxCLI.create`. The run agent defaults to 6 CPUs
+and 12 GiB (also used by bake), the concierge to 2 CPUs and 4 GiB, and each
+GitHub/service helper to 1 CPU and 2 GiB. Diagnostics use the service
+allocation. These are per-VM limits, not an aggregate host scheduler.
+`Config.sandbox_resources_for` resolves operator settings and sparse
+per-repository run-agent overrides. Zero CPU and automatic memory are
+invalid; creation never retries without the limits.
+On resume, CPU/memory settings and repository allocation overrides come
+from the current operator config, while other run rules stay pinned to the
+snapshot. The ordinary config-drift event explains this exception.
+
+Provisioning writes the requested allocation to a host receipt under
+`SbxloopHome.sandbox_allocations`, paired with a random nonce in the VM.
+Before reusing a run pair or concierge VM, it checks both the requested
+allocation and the nonce. Unknown or changed allocations fail closed before
+mutating the existing VMs; operators preserve any needed state and recreate
+them. This is creation provenance, not telemetry or independent verification
+of the backend's resource enforcement.
+
 Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pair`
 — and a run granted `[[credentials]]`, or whose repository has a credentialed
 `[[registries]]` entry, a third, the *service* sandbox (#765, #766),
@@ -598,8 +618,25 @@ warn: the operator named them. The commands run from the engine after both
 worker installs, in the agent's workdir, launched exactly as a job is (the
 login shell evals the stdin-delivered exports or sources the env file), each
 reported as a `sandbox.setup` event with delivered secret values scrubbed from
-the tail; the first failure raises out of provisioning like an install failure,
-so `keep_on_failure` applies. The bake installs the global package list only.
+the tail and the login profile's own output cut from it — the script echoes a
+mark once the profile has run, and a stream without the mark is kept whole; the
+first failure raises out of provisioning like an install failure, so
+`keep_on_failure` applies. The bake installs the global package list plus
+`xz-utils`, so a later language top-up can extract xz archives even when the
+bake did not select that language. All worker provisioning apt paths share
+bounded retries for confirmed lock contention (including the update lists
+lock): twelve retries, five seconds apart, within the caller's original
+timeout. Other apt errors return immediately. A toolchain installer is
+skipped when its pooled apt prerequisite install fails; the diagnostic
+distinguishes contention, permission, package and mirror failures.
+
+Worker venv repair probes the running sandbox `python3` and installs its
+matching `python3.X-venv` package, since the distro's `python3-venv`
+metapackage may target a different minor version. An unknown interpreter or
+failed apt repair is logged before ordinary provisioning falls back to a
+user-site install. `sbxloop bake` requires the isolated worker interpreter
+and refuses to save a template or bake record after that fallback, so a
+missing venv prerequisite cannot be persisted as a successful bake.
 
 ### Verify mode (#682)
 

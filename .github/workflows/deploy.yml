@@ -98,6 +98,8 @@ jobs:
       INPUT_VERSION: ${{ inputs.version }}
       # The host, as the notices name it (and the runner label above).
       HOST: ${{ vars.SBXLOOP_DEPLOY_HOST || 'db' }}
+      # Deploy notices belong together, apart from the daemon's control channel.
+      DEPLOY_CHANNEL: 4shafe93rpnkzqcdqnso7cmbzc
       UNIT: sbxloop-daemon
       # This deploy's pause hold (#534). The operator's own `pause` is a
       # separate hold: it survives the deploy, and we release only ours.
@@ -235,9 +237,10 @@ jobs:
           else
             MSG="🚀 sbxloop \`${FROM}\` → \`${VERSION}\` staged on \`${HOST}\` — restart deferred until the daemon is idle (now: ${CURRENT}); hold \`${HOLD}\` — [run](${RUN_URL})"
           fi
-          # Through the configured [chat] backend, with the bot already in
-          # the channel: this job reads no secrets file and no config (#639).
-          "${SBXLOOP}" daemon notify "${MSG}"
+          # The trusted workflow helper calls the installed notifier library
+          # through its old two-argument API, so this works before the host is
+          # upgraded and after a rollback. sbxloop still owns config + secrets.
+          DEPLOY_NOTICE="${MSG}" "${VENV_PYTHON}" "${PIPELINE}" deploy-notify
 
       - name: Wait for the daemon to go idle
         id: drain
@@ -304,7 +307,7 @@ jobs:
         env:
           VERSION: ${{ steps.final.outputs.version }}
         run: |
-          "${SBXLOOP}" daemon notify "Deploy batch refreshed after draining: installing ${VERSION} on ${HOST}."
+          DEPLOY_NOTICE="Deploy batch refreshed after draining: installing ${VERSION} on ${HOST}." "${VENV_PYTHON}" "${PIPELINE}" deploy-notify
 
       - name: Fetch the release wheels
         id: wheels
@@ -521,10 +524,6 @@ jobs:
         if: always() && steps.wheels.outputs.dist != ''
         run: rm -rf -- "${{ steps.wheels.outputs.dist }}"
 
-      - name: Clean up the workflow helper
-        if: always() && env.PIPELINE_DIR != ''
-        run: rm -rf -- "${PIPELINE_DIR}"
-
       - name: Report
         if: always() && steps.installed.outputs.changed == 'true'
         env:
@@ -554,6 +553,10 @@ jobs:
           else
             MSG="❌ deploy of sbxloop \`${VERSION}\` to \`${HOST}\` **${RESULT}** — rollback could not restore health; ${HOST} needs a human. [run](${RUN_URL})"
           fi
-          # Through the configured [chat] backend (#639): sbxloop reads its
-          # own secrets file; this job reads no secrets and no config.
-          "${SBXLOOP}" daemon notify "${MSG}"
+          # The helper survives an upgrade or rollback; the installed
+          # notifier still reads sbxloop's config and secrets (#639).
+          DEPLOY_NOTICE="${MSG}" "${VENV_PYTHON}" "${PIPELINE}" deploy-notify
+
+      - name: Clean up the workflow helper
+        if: always() && env.PIPELINE_DIR != ''
+        run: rm -rf -- "${PIPELINE_DIR}"

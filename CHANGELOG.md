@@ -75,6 +75,18 @@
 
 ### Fixed
 
+- **A setup command's output is now the command's, not the sandbox image's.**
+  `[sandbox] setup_commands` run under a login shell, so the image's profile
+  runs first — and an image is free to announce itself there: a version
+  manager naming the release it selected, a banner, an MOTD, on either
+  stream. All of it arrived in the command's `sandbox.setup` tail as though
+  the command had written it, and in the error the first failing command ends
+  provisioning with, where a long enough banner pushed the real message past
+  the 2000-character tail and out of sight. The script now marks the point
+  where the profile is done and the tail starts there. A launch that dies
+  before the mark — a profile that fails, an environment file that will not
+  source — keeps its whole output, since that is the only diagnostic there is.
+
 - **The automated upgrade now deploys to the home the host was installed
   under.** An operator can put the whole sbxloop home anywhere with
   `SBXLOOP_HOME`, but the reusable deploy workflow opened by writing

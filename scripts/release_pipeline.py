@@ -324,6 +324,31 @@ def deploy_decision(current: str, target: str, state: dict, *, now: int, manual:
     return "deploy"
 
 
+def deploy_notice(
+    config: Any,
+    text: str,
+    channel_id: str,
+    *,
+    post: Callable[[Any, str], Any],
+) -> Any:
+    """Route a notice without requiring the installed CLI's newest options.
+
+    The workflow helper comes from its trusted workflow SHA, while ``post``
+    comes from the installed sbxloop. Copying the selected backend's config
+    lets even the older two-argument ``post_notice(config, text)`` target the
+    deploy channel before an upgrade and after a rollback.
+    """
+    backend = config.chat_backend
+    if backend is None:
+        raise ValueError("no chat backend is configured")
+    channel_id = channel_id.strip()
+    if not channel_id:
+        raise ValueError("deployment notice channel is empty")
+    section = config.chat_section(backend).model_copy(update={"channel_id": channel_id})
+    routed = config.model_copy(update={backend: section})
+    return post(routed, text)
+
+
 def receipt_valid(data: dict) -> bool:
     if (
         not isinstance(data, dict)
@@ -338,6 +363,25 @@ def receipt_valid(data: dict) -> bool:
 
 def main() -> None:
     mode = sys.argv[1]
+    if mode == "deploy-notify":
+        # Imports stay inside this mode: release and deploy selection above
+        # remain stdlib-only, including on a host with an older sbxloop.
+        from sbxloop.config import load_config, load_secrets_env
+        from sbxloop.daemon.notify import post_notice
+        from sbxloop.errors import SbxloopError
+
+        load_secrets_env()
+        try:
+            posted = deploy_notice(
+                load_config(),
+                os.environ["DEPLOY_NOTICE"],
+                os.environ["DEPLOY_CHANNEL"],
+                post=post_notice,
+            )
+        except SbxloopError as exc:
+            raise ValueError(str(exc)) from exc
+        print(f"posted to {posted.backend} channel {posted.channel_id}")
+        return
     api = Github(os.environ["GITHUB_REPOSITORY"])
     manual = os.environ.get("MANUAL") == "true"
     if mode == "batch":

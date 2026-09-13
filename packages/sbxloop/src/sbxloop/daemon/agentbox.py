@@ -38,6 +38,7 @@ from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
 from sbxloop.paths import SbxloopHome
 from sbxloop.provider import ProviderRecovery
+from sbxloop.sbx.allocations import require_allocation
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import Sandbox
@@ -318,6 +319,11 @@ class DaemonAgent:
         stale = False
         if self.exists():
             sandbox = Sandbox(self.sbx, self.name)
+            # Resource changes are not worker failures: never route this refusal
+            # through the destructive retry path and lose conversation history.
+            require_allocation(
+                self.config.paths, sandbox, self.config.sandbox_resources_for("concierge")
+            )
             client = self._make_client(sandbox)
             if not self.install_workers or self._is_reusable(client):
                 self._sandbox = sandbox

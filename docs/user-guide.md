@@ -47,6 +47,57 @@ interim hardening proposed in #592). Sandboxes are cattle: they are
 torn down at run end and re-provisioned on resume, while all durable state
 (workspace, SQLite checkpoints, event log) lives on the host.
 
+### Sandbox CPU and memory
+
+Every new VM receives explicit CPU and memory limits. These defaults are
+live in the `sbxloop.toml` written by `sbxloop init`, and also apply to
+existing configuration files that omit the keys:
+
+```toml
+[sandbox]
+cpus = 6
+memory = "12g"
+concierge_cpus = 2
+concierge_memory = "4g"
+github_cpus = 1
+github_memory = "2g"
+service_cpus = 1
+service_memory = "2g"
+```
+
+The run agent uses `cpus`/`memory` for code, workload and tool runs; bake
+uses the same allocation. Each GitHub helper uses `github_*`, each
+credential/dependency helper uses `service_*`, and the long-lived chat
+concierge uses `concierge_*`. Diagnostic scratch VMs use `service_*`.
+An operator's `[[github.repos]]` entry can override `cpus` and/or `memory`
+for that repository's run agent. A repository-carried config cannot raise
+these operator limits.
+
+CPUs must be positive integers: `0` (all host CPUs) is refused. Memory
+accepts positive whole MiB (`m`) or GiB (`g`), case-insensitively; `2048m`
+and `2g` are equivalent. Empty, automatic and percentage limits are refused.
+There is no fallback to uncapped creation if sbx rejects the flags. See
+[the sbx create reference](https://docs.docker.com/reference/cli/sbx/create/).
+
+These are **per-VM allocations**, not an aggregate budget or a reservation
+of specific host cores. Account for every concurrent VM and other host
+processes; smaller hosts need smaller settings. Larger test suites may need
+larger repository overrides. `[limits] mem_warn`/`mem_abort` still monitor
+pressure inside the VM and do not set its size. `sbxloop doctor` shows
+requested allocations, and provisioning events include CPU and memory.
+
+Resumes use the current operator CPU/memory settings even when the run's
+other rules come from its saved configuration. Limits take effect at creation. A host receipt under
+`state/sandbox-allocations/`, tied to a nonce in the VM, checks reuse across
+daemon restarts and provider recovery. A pre-cutover VM, changed allocation,
+missing receipt or failed identity check refuses reuse before modifying
+that VM. This preserves in-VM work and concierge session history, but it
+does not resize or stop the old VM. Stop the run/daemon, copy any needed
+in-VM work and session files out with `sbx cp`, remove the named VM with
+`sbx rm`, and resume/restart to create it with the new limits. Use the same
+`sbx --app-name` when configured. Allocation receipts describe successful
+creation requests, not measured runtime enforcement.
+
 ### Agent backends: Copilot, Claude, Codex or an OpenAI-compatible endpoint
 
 The SDK that runs the agent personas is configurable (#533) — Copilot stays
@@ -405,6 +456,24 @@ landed; a run whose languages the template lacks — a Go repo on a Python bake,
 say — keeps the baked worker and provisions the missing toolchain on top, and
 the `sandbox.prebaked` event and `sbxloop doctor` both say so, so you know
 when a re-bake would stop paying for that per provision.
+
+Baked templates also require `xz-utils`, even when JavaScript is not selected,
+so later toolchain top-ups can extract `.tar.xz` archives. A bake fails if
+that package cannot be installed; existing templates need a re-bake to gain it.
+Provisioning retries confirmed apt/dpkg lock contention up to twelve times,
+five seconds apart, within the original install timeout. Other apt errors
+return immediately. If a toolchain's apt prerequisites fail, its installer
+is skipped and the warning names the cause instead of attempting extraction
+with missing tools.
+
+The bake requires an isolated worker virtualenv. If the base image lacks
+`ensurepip`, installation probes its running `python3` and installs the
+matching `python3.X-venv` package (plus `python3-pip`) before retrying.
+If repair fails, bake stops without saving a template; `--keep` retains the
+scratch sandbox for inspection. Ordinary provisioning keeps the user-site
+fallback for unusual images and logs the repair failure. Re-bake and set
+`[sandbox] template` to the saved ref to avoid repeating installation on new
+sandboxes.
 
 #### Which models can I use?
 
@@ -1165,8 +1234,11 @@ the in-VM env file) and under the
 run's egress policy as already applied — a command that needs a host the
 allowlist lacks fails here, not in a phase. Every command's exit code,
 duration and output tail is a `sandbox.setup` event (delivered secret values
-scrubbed); the first non-zero exit ends the run at provisioning with the
-command in the error, and `keep_on_failure` keeps the sandbox for `sbxloop shell`. A `[[github.repos]]` entry may carry its own `apt_packages` or
+scrubbed). The tail is the command's own output: an image that announces
+itself on login — a version manager, a banner, an MOTD — has that dropped, so
+a banner cannot crowd the command out of the tail, while a launch that fails
+before the command runs keeps everything it printed. The first non-zero exit
+ends the run at provisioning with the command in the error, and `keep_on_failure` keeps the sandbox for `sbxloop shell`. A `[[github.repos]]` entry may carry its own `apt_packages` or
 `setup_commands`, which replaces the top-level list; a per-repo package list
 is paid at that repository's provision, since the bake reads the global list
 only.
@@ -2785,6 +2857,15 @@ The notable knobs:
 | `[github.repos.openai] base_url` / `request_timeout_s` / `max_retries` / `allow_insecure_endpoint` | unset                                                                                           | Sparse per-repository overrides of `[agent.openai]` for a repository whose code must stay on a private endpoint; unset keys inherit. The endpoint only — `api_key_env` is one per host.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `keep_sandboxes` / `keep_on_failure`                                                               | `false`                                                                                         | Sandbox retention for debugging (see above).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `secret_strategy`                                                                                  | `proxy`                                                                                         | `proxy` keeps token values out of the VM; `plain-env` skips the sbx proxy — tokens are piped per job over worker stdin when this sbx supports it, else written to an in-VM env file. On current sbx the cached exec-visibility verdict makes the non-proxy / env-file fallback the common case even under `proxy`, not an edge case (#46; interim hardening #592).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `[sandbox] cpus`                                                                                   | `6`                                                                                             | Positive integer CPUs for each run agent and bake VM; per-repository cpus override. See Sandbox CPU and memory for cutover and recreation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `[sandbox] memory`                                                                                 | `12g`                                                                                           | Positive whole MiB/GiB cap for each run agent and bake VM; per-repository memory override. See Sandbox CPU and memory for cutover and recreation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `[sandbox] concierge_cpus`                                                                         | `2`                                                                                             | Positive integer CPUs for the long-lived concierge VM. See Sandbox CPU and memory for cutover and recreation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `[sandbox] concierge_memory`                                                                       | `4g`                                                                                            | Memory cap for the concierge VM. See Sandbox CPU and memory for cutover and recreation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `[sandbox] github_cpus`                                                                            | `1`                                                                                             | Positive integer CPUs for each run or daemon GitHub helper. See Sandbox CPU and memory for cutover and recreation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `[sandbox] github_memory`                                                                          | `2g`                                                                                            | Memory cap for each GitHub helper. See Sandbox CPU and memory for cutover and recreation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `[sandbox] service_cpus`                                                                           | `1`                                                                                             | Positive integer CPUs for each service helper and diagnostic scratch VM. See Sandbox CPU and memory for cutover and recreation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `[sandbox] service_memory`                                                                         | `2g`                                                                                            | Memory cap for each service or diagnostic helper. See Sandbox CPU and memory for cutover and recreation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `[[github.repos]] cpus / memory`                                                                   | `inherit [sandbox]`                                                                             | Sparse overrides for the run agent only; helpers and concierge retain their own allocations. See Sandbox CPU and memory for cutover and recreation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 | `[sandbox] template`                                                                               | unset                                                                                           | Baked template ref from `sbxloop bake`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | `[sandbox] workspace`                                                                              | unset                                                                                           | The checkout runs are cut from. Unset: the daemon clones each repository into `~/.sbxloop/workspaces/<owner>/<name>` on first use and refreshes it before every run; set it to use a checkout of your own.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
 | `[sandbox] workspace_isolation`                                                                    | `auto`                                                                                          | Per-run clone isolation when `workspace` is a git checkout (see below).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
@@ -2833,9 +2914,9 @@ The notable knobs:
 | `[daemon] refresh_workspace`                                                                       | `true`                                                                                          | `git fetch` + fast-forward the workspace checkout before each fresh daemon run.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `[tui] operator_id` / `emoji` / `daemon_unit` / `refresh_s` / `retention_days`                     | `""` / `true` / `sbxloop-daemon` / `0.5` / `14`                                                 | The operator console (`sbxloop tui`), always on: who it speaks as (empty = the login name), glyph markers, the systemd user unit it tails and restarts, its live refresh interval, and how long the daemon keeps the console's mailbox rows (`0` keeps them). The rendering knobs are the `[discord]` / `[slack]` / `[mattermost]` ones.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 
-sbxloop does not size the sandbox: `sbx create` is called without CPU or
-memory flags, so the microVM is whatever size sbx gives every sandbox.
-Memory pressure is instead made visible through `[limits]`: `mem_warn` emits
+The `[sandbox]` resource settings size each VM through `sbx create` CPU and
+memory flags; see [Sandbox CPU and memory](#sandbox-cpu-and-memory).
+Pressure inside that allocation is visible through `[limits]`: `mem_warn` emits
 a warning; `mem_abort` (off by default, because a parallel test run spikes
 memory transiently) fails the task with an explicit "sandbox memory
 exhausted" error instead of letting an in-VM OOM surface as an inexplicable
