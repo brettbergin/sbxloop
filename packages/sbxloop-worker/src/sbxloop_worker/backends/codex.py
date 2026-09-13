@@ -62,6 +62,22 @@ def _clean(text: str) -> str:
     return redact_secrets(text)
 
 
+def _clean_json(value: Any) -> Any:
+    """Redact strings after parsing, preserving JSON containers and scalars.
+
+    Display redaction treats ``credentials: []`` as a secret assignment and
+    replaces the array with bare asterisks. Parsing that display text loses
+    the plan and can salvage an unrelated nested array instead.
+    """
+    if isinstance(value, str):
+        return _clean(value)
+    if isinstance(value, list):
+        return [_clean_json(item) for item in value]
+    if isinstance(value, dict):
+        return {_clean(key): _clean_json(item) for key, item in value.items()}
+    return value
+
+
 def _session_fingerprint(job: JobRequest, specs: list[HostToolSpec]) -> str:
     """Bind persisted SDK tools to the capabilities currently authorized.
 
@@ -166,7 +182,7 @@ class CodexBackend:
                 client.unregister_turn_notifications(turn_id)
             return BackendResult(
                 output_text=state.final_text,
-                output_json=extract_json(state.final_text) if job.expect == "json" else None,
+                output_json=state.final_json,
                 session_id=f"codex-v1:{session_id}:{fingerprint}",
                 usage=state.usage if state.samples else None,
                 # Token notifications can also accompany compaction. They
@@ -195,6 +211,7 @@ class _SessionState:
         self.samples = 0
         self.last_total: dict[str, Any] | None = None
         self.final_text = ""
+        self.final_json: Any = None
         self.saw_final_answer = False
         self.messages: set[str] = set()
         self.responses: dict[str, tuple[str, dict[str, Any]]] = {}
@@ -350,13 +367,17 @@ class _SessionState:
             return
         if isinstance(item_id, str):
             self.messages.add(item_id)
-        text = _clean(text)
-        self.emit(EventTypes.AGENT_MESSAGE, content=text, model=self.model, backend=BACKEND_NAME)
+        display_text = _clean(text)
+        self.emit(
+            EventTypes.AGENT_MESSAGE, content=display_text, model=self.model, backend=BACKEND_NAME
+        )
         if item.get("phase") == "final_answer":
             self.saw_final_answer = True
-            self.final_text = text
-        elif item.get("phase") is None and not self.saw_final_answer:
-            self.final_text = text
+        elif item.get("phase") is not None or self.saw_final_answer:
+            return
+        self.final_text = display_text
+        if self.job.expect == "json":
+            self.final_json = _clean_json(extract_json(text))
 
     def _usage(self, payload: dict[str, Any]) -> None:
         total, last = _object(payload.get("total")), _object(payload.get("last"))

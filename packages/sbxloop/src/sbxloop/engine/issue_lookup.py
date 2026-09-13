@@ -98,7 +98,7 @@ def issue_evidence(data: Any, repo: str) -> IssueEvidence:
         or number <= 0
         or not isinstance(url, str)
         or parsed is None
-        or parsed.scheme != "https"
+        or parsed.scheme not in {"http", "https"}
         or parsed.path.lower() not in _issue_paths(repo, number)
         or not isinstance(data.get("title"), str)
         or not isinstance(data.get("body"), (str, type(None)))

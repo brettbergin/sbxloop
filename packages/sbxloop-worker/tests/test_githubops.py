@@ -853,9 +853,9 @@ class TestRestTransportText:
             RestTransport(token="tok").request_text("GET", "/repos/o/r/actions/jobs/7/logs")
         assert info.value.http_status == 404
 
-    def test_non_https_refused(self) -> None:
-        with pytest.raises(GithubOpError, match="non-HTTPS"):
-            RestTransport(token="tok").request_text("GET", "http://api.github.com/x")
+    def test_non_http_scheme_refused(self) -> None:
+        with pytest.raises(GithubOpError, match="HTTP or HTTPS"):
+            RestTransport(token="tok").request_text("GET", "file:///etc/passwd")
 
 
 class TestRestTransport:

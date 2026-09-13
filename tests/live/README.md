@@ -17,8 +17,8 @@ uv run python -m tests.live.seed_gitlab
 ```
 
 `harness up` mints a throwaway CA and a `localhost` certificate under
-`tests/live/.state/certs`: both forges serve HTTPS only, because the worker
-transport refuses a plain-http API root. The seeds are idempotent; run them
+`tests/live/.state/certs`: both forges serve HTTPS to exercise encrypted
+transport, though their API roots may also use HTTP. The seeds are idempotent; run them
 again after a restart. They print the URLs, users, token variable names and
 repository slugs, and write the values to `tests/live/.state/live.env`. That
 directory is git-ignored; nothing secret is printed, logged or passed on a

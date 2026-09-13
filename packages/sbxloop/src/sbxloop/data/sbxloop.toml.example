@@ -435,6 +435,8 @@ service_memory = "2g"
 # kind = "github"
 # The forge's API root. For "github" this is the same setting as
 # `[github] api_url` — set one, or the same value in both.
+# "gitlab" and "gitea" accept HTTP or HTTPS; "github" requires HTTPS.
+# HTTP sends the forge token unencrypted.
 # api_url = "https://api.github.com"
 # The host variable the forge token is read from (a name; the value lives
 # in secrets.env). Unset: GITLAB_TOKEN for "gitlab", GITEA_TOKEN for

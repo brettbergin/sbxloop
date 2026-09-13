@@ -932,18 +932,19 @@ def _check_vcs_kind(value: object, key: str) -> VcsKind:
     return value
 
 
-def _check_https_root(value: str, key: str, example: str) -> str:
-    """A plain https URL — the root an API is served from."""
+def _check_api_root(value: str, key: str, example: str, *, allow_http: bool = False) -> str:
+    """A plain API root, with HTTP accepted for self-managed forges."""
     value = value.strip().rstrip("/")
     parts = urlsplit(value)
     if (
-        parts.scheme != "https"
+        parts.scheme not in (("http", "https") if allow_http else ("https",))
         or not parts.hostname
         or parts.username is not None
         or parts.query
         or parts.fragment
     ):
-        raise ValueError(f"{key} must be a plain https URL such as {example}, got {value!r}")
+        schemes = "http or https" if allow_http else "https"
+        raise ValueError(f"{key} must be a plain {schemes} URL such as {example}, got {value!r}")
     return value
 
 
@@ -985,11 +986,14 @@ class VcsConfig(_ConfigModel):
 
     @field_validator("api_url")
     @classmethod
-    def _check_api_url(cls, value: str | None) -> str | None:
+    def _check_api_url(cls, value: str | None, info: ValidationInfo) -> str | None:
         if value is None:
             return None
-        return _check_https_root(
-            value, "vcs.api_url", "'https://api.github.com' or 'https://gitlab.example.com'"
+        return _check_api_root(
+            value,
+            "vcs.api_url",
+            "'https://api.github.com' or 'https://gitlab.example.com/api/v4'",
+            allow_http=info.data.get("kind") in ("gitlab", "gitea"),
         )
 
 
@@ -1213,7 +1217,7 @@ class GithubConfig(_ConfigModel):
     @field_validator("api_url")
     @classmethod
     def _check_api_url(cls, value: str) -> str:
-        return _check_https_root(
+        return _check_api_root(
             value, "github.api_url", "'https://api.github.com' or 'https://ghe.example.com/api/v3'"
         )
 

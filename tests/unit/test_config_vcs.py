@@ -91,7 +91,33 @@ class TestApiUrl:
         config = cfg(vcs={"kind": "gitlab", "api_url": "https://gitlab.example.com"})
         assert config.github.api_url == "https://api.github.com"
 
-    def test_the_root_must_be_a_plain_https_url(self) -> None:
+    @pytest.mark.parametrize("kind", ["gitlab", "gitea"])
+    @pytest.mark.parametrize("scheme", ["http", "https"])
+    def test_self_managed_forge_accepts_http_and_https(self, kind: str, scheme: str) -> None:
+        root = f"{scheme}://forge.example.com:8080/api/v4"
+        config = cfg(vcs={"kind": kind, "api_url": f"  {root}/  "})
+        assert config.vcs.api_url == root
+        assert config.vcs_api_url_for(kind) == root  # type: ignore[arg-type]
+        assert config.github.api_url == "https://api.github.com"
+
+    @pytest.mark.parametrize(
+        "root",
+        [
+            "ftp://gitlab.example.com/api/v4",
+            "gitlab.example.com/api/v4",
+            "http:///api/v4",
+            "http://user:password@gitlab.example.com/api/v4",
+            "https://user:password@gitlab.example.com/api/v4",
+            "http://gitlab.example.com/api/v4?token=value",
+            "https://gitlab.example.com/api/v4#fragment",
+            "",
+        ],
+    )
+    def test_self_managed_forge_requires_a_plain_http_or_https_url(self, root: str) -> None:
+        with pytest.raises(ValueError, match=r"vcs\.api_url must be a plain http or https URL"):
+            cfg(vcs={"kind": "gitlab", "api_url": root})
+
+    def test_github_still_requires_a_plain_https_url(self) -> None:
         with pytest.raises(ValueError, match=r"vcs\.api_url must be a plain https URL"):
             cfg(vcs={"api_url": "http://gitlab.example.com"})
 

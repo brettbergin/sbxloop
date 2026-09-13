@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -40,6 +41,46 @@ def completed(status: str = "completed", error: str | None = None) -> Any:
         "turn/completed",
         turn={"id": "turn-1", "status": status, "error": {"message": error} if error else None},
     )
+
+
+@pytest.mark.parametrize("fenced", [False, True])
+@pytest.mark.parametrize("phase", [None, "final_answer"])
+def test_workload_plan_is_parsed_before_display_redaction(
+    sdk: Any, fenced: bool, phase: str | None
+) -> None:
+    plan = {
+        "title": "Produce a file",
+        "tasks": [
+            {
+                "id": "t1",
+                "title": "Produce the file",
+                "depends_on": [],
+                "needs": {"hosts": [], "credentials": [], "sink": "artifact", "repo": None},
+            }
+        ],
+    }
+    text = json.dumps(plan)
+    sdk.script = [message(f"```json\n{text}\n```" if fenced else text, phase=phase), completed()]
+    events: list[dict[str, Any]] = []
+    result = CodexBackend().run_session(job(expect="json"), lambda _, **data: events.append(data))
+    assert result.output_json == plan
+    assert '"credentials": ***' in result.output_text
+    assert any('"credentials": ***' in event.get("content", "") for event in events)
+
+
+def test_structured_response_keeps_values_redacted_without_changing_json_types(
+    sdk: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    key = "sk-test-structured-output-secret"
+    monkeypatch.setenv("OPENAI_API_KEY", key)
+    sdk.script = [
+        message(json.dumps({"tasks": [], "report": [key, "password=example-secret"]})),
+        completed(),
+    ]
+    events: list[dict[str, Any]] = []
+    result = CodexBackend().run_session(job(expect="json"), lambda _, **data: events.append(data))
+    assert result.output_json == {"tasks": [], "report": ["[REDACTED]", "password=***"]}
+    assert key not in str(result) + str(events)
 
 
 def usage(total: int, last: int, *, output: int = 3, cache: int = 2) -> Any:
