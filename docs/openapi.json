@@ -430,6 +430,104 @@
         "title": "ChannelUpdate",
         "type": "object"
       },
+      "ChannelWorkOut": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_slug": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Slug"
+          },
+          "item_actions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Item Actions",
+            "type": "array"
+          },
+          "item_id": {
+            "title": "Item Id",
+            "type": "string"
+          },
+          "item_revision": {
+            "default": 0,
+            "title": "Item Revision",
+            "type": "integer"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "run_actions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Run Actions",
+            "type": "array"
+          },
+          "run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Id"
+          },
+          "run_revision": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Run Revision"
+          },
+          "stage": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Stage"
+          },
+          "state": {
+            "title": "State",
+            "type": "string"
+          },
+          "title": {
+            "title": "Title",
+            "type": "string"
+          },
+          "turn_id": {
+            "title": "Turn Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "item_id",
+          "turn_id",
+          "agent_slug",
+          "title",
+          "kind",
+          "state"
+        ],
+        "title": "ChannelWorkOut",
+        "type": "object"
+      },
       "Configuration": {
         "additionalProperties": false,
         "description": "The allowlisted effective configuration: never a secret value,\nnever a host path; ``sections`` says what is readable at all.",
@@ -2094,6 +2192,16 @@
               }
             ],
             "title": "Turn Id"
+          },
+          "work": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ChannelWorkOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -6176,6 +6284,52 @@
           }
         },
         "summary": "Cancel Turn",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/work": {
+      "get": {
+        "operationId": "channel_work_v1_channels__channel_id__work_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/ChannelWorkOut"
+                  },
+                  "title": "Response Channel Work V1 Channels  Channel Id  Work Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Channel Work",
         "tags": [
           "collaboration"
         ]

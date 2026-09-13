@@ -2965,12 +2965,13 @@ class TestStartWorkload:
             ],
             config=self.PROFILES,
         )
-        for _ in range(2):
-            concierge.submit_turn("once", author="a", message_id="5").result(timeout=10)
+        concierge.submit_turn("once", author="a", message_id="5").result(timeout=10)
+        dstore.set_state("chat:5", "done", 10)
+        concierge.submit_turn("once", author="a", message_id="5").result(timeout=10)
         first, second = client.responses
         assert first.text and first.text.startswith("queued workload `chat:5`")
-        assert second.text == "`chat:5` is already queued or running (profile `research`)."
-        assert dstore.get("chat:5") is not None
+        assert second.text == "`chat:5` already exists (done; profile `research`)."
+        assert dstore.get("chat:5").state == "done"  # type: ignore[union-attr]
 
     def test_a_turn_without_a_message_id_gets_a_fresh_key(self, tmp_path: Path) -> None:
         concierge, client, _, _, dstore = make(

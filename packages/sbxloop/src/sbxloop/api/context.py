@@ -126,6 +126,14 @@ class ApiContext:
     def collaboration_available(self) -> bool:
         return self.concierge is not None and not self.stopping.is_set()
 
+    def project_work(self, channel_id: str | None = None) -> list[Any]:
+        """Deliver recorded work; never dispatch or replay an agent tool."""
+        from sbxloop.api.work_delivery import project_work
+
+        if not self.ready.is_set() or self.stopping.is_set():
+            return []
+        return project_work(self, channel_id)
+
     def recover_collaboration(self) -> None:
         with self._turn_admission:
             if self._collaboration_recovered:

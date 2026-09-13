@@ -202,6 +202,21 @@ class ChannelPage(ApiModel):
     has_more: bool
 
 
+class ChannelWorkOut(ApiModel):
+    item_id: str
+    turn_id: str
+    agent_slug: str | None
+    title: str
+    kind: str
+    state: str
+    run_id: str | None = None
+    stage: str | None = None
+    item_revision: int = 0
+    run_revision: int | None = None
+    item_actions: list[str] = Field(default_factory=list)
+    run_actions: list[str] = Field(default_factory=list)
+
+
 class MessageOut(ApiModel):
     id: str
     channel_id: str
@@ -212,6 +227,7 @@ class MessageOut(ApiModel):
     content: str
     agent_slug: str | None
     created_at: str
+    work: ChannelWorkOut | None = None
 
 
 class TurnCreate(ApiModel):

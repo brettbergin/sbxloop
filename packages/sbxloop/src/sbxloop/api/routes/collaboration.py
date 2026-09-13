@@ -28,6 +28,7 @@ from sbxloop.api.collaboration_schemas import (
     ChannelOut,
     ChannelPage,
     ChannelUpdate,
+    ChannelWorkOut,
     ConnectionMutation,
     ConnectionOut,
     ConnectionTestOut,
@@ -234,6 +235,7 @@ def _message_out(message: Message) -> MessageOut:
         content=message.content,
         agent_slug=message.agent_slug,
         created_at=rfc3339(message.created_at) or "",
+        work=ChannelWorkOut.model_validate(message.work) if message.work else None,
     )
 
 
@@ -920,10 +922,27 @@ async def list_messages(
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
 ) -> list[MessageOut]:
     user = await ctx.call(_local_user, ctx, auth)
+    channel = await ctx.call(ctx.collaboration.get_channel, user.id, channel_id)
+    if channel is None:
+        raise Problem(404, "channel_not_found", "channel not found")
+    await ctx.call(ctx.project_work, channel_id)
     messages = await ctx.call(ctx.collaboration.list_messages, user.id, channel_id, after=after)
     if messages is None:
         raise Problem(404, "channel_not_found", "channel not found")
     return [_message_out(message) for message in messages]
+
+
+@router.get("/channels/{channel_id}/work", response_model=list[ChannelWorkOut])
+async def channel_work(
+    channel_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+) -> list[ChannelWorkOut]:
+    user = await ctx.call(_local_user, ctx, auth)
+    channel = await ctx.call(ctx.collaboration.get_channel, user.id, channel_id)
+    if channel is None:
+        raise Problem(404, "channel_not_found", "channel not found")
+    return await ctx.call(ctx.project_work, channel_id)
 
 
 async def _targets(

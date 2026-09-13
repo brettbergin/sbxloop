@@ -78,6 +78,7 @@ class Message:
     content: str
     agent_slug: str | None
     created_at: float
+    work: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -173,6 +174,7 @@ def _message(row: MessageRow) -> Message:
         content=str(row.content),
         agent_slug=None if row.agent_slug is None else str(row.agent_slug),
         created_at=float(row.created_at),
+        work=json.loads(row.work_json) if row.work_json else None,
     )
 
 
@@ -646,6 +648,61 @@ class CollaborationStore:
                 },
             )
             return _message(row)
+
+    def append_work_result(
+        self,
+        message_id: str,
+        *,
+        channel_id: str,
+        turn_id: str,
+        content: str,
+        agent_slug: str | None,
+        work: dict[str, Any],
+        now: float,
+    ) -> Message | None:
+        """Append one server-owned work result, idempotently."""
+        with self.dstore.immediate_transaction() as session:
+            existing = session.get(MessageRow, message_id)
+            if existing is not None:
+                return _message(existing)
+            channel = session.get(ChannelRow, channel_id)
+            turn = session.get(TurnRow, turn_id)
+            if (
+                channel is None
+                or channel.state != "active"
+                or turn is None
+                or turn.channel_id != channel_id
+            ):
+                return None
+            session.execute(
+                insert(MessageRow).values(
+                    id=message_id,
+                    channel_id=channel_id,
+                    turn_id=turn_id,
+                    sequence=self._next_sequence(session, channel_id),
+                    role="assistant",
+                    kind="work_result",
+                    content=content,
+                    agent_slug=agent_slug,
+                    work_json=json.dumps(work, default=str),
+                    created_at=now,
+                )
+            )
+            channel.updated_at = now
+            channel.revision += 1
+            row = session.get(MessageRow, message_id)
+            assert row is not None  # nosec B101
+            _event(
+                session,
+                "collaboration.work.delivered",
+                now,
+                data={"channel_id": channel_id, "turn_id": turn_id, "message_id": message_id},
+            )
+            return _message(row)
+
+    def message_exists(self, message_id: str) -> bool:
+        with self.dstore.read() as session:
+            return session.get(MessageRow, message_id) is not None
 
     def finish_turn(self, turn_id: str, *, error: str | None, now: float) -> Turn | None:
         with self.dstore.immediate_transaction() as session:

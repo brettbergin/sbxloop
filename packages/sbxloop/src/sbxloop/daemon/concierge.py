@@ -1822,8 +1822,13 @@ class Concierge:
         # operator console) gets a fresh key.
         key = self._turn_message_id or new_run_id()
         title = next((ln.strip() for ln in ask.splitlines() if ln.strip()), "workload")
+        item_id = chat_item_id(key)
+        existing = self.dstore.get(item_id)
+        if existing is not None:
+            profile_text = f"profile `{profile.name}`" if profile is not None else "no profile"
+            return f"`{item_id}` already exists ({existing.state}; {profile_text})."
         item = WorkItem(
-            item_id=chat_item_id(key),
+            item_id=item_id,
             source_key=key,
             title=title if len(title) <= 120 else title[:119] + "…",
             body=ask,
