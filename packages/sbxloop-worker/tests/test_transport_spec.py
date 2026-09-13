@@ -80,11 +80,33 @@ class TestTheDescriptor:
         assert spec.api_url == "https://gitlab.example.com/api/v4"
         assert spec.auth == "private-token" and spec.pagination == "x-next-page"
 
-    def test_an_unknown_style_or_a_plain_http_root_is_refused(self) -> None:
+    @pytest.mark.parametrize("scheme", ["http", "https"])
+    def test_a_plain_http_or_https_root_loads(self, scheme: str) -> None:
+        spec = transport_spec(
+            {"transport": {"api_url": f"{scheme}://gitlab.example.com:8080/api/v4/"}}
+        )
+        assert spec.api_url == f"{scheme}://gitlab.example.com:8080/api/v4"
+
+    @pytest.mark.parametrize(
+        "url",
+        [
+            "file:///api/v4",
+            "ftp://gitlab.example.com/api/v4",
+            "gitlab.example.com/api/v4",
+            "https:///api/v4",
+            "https://user:password@gitlab.example.com/api/v4",
+            "http://user@gitlab.example.com/api/v4",
+            "https://gitlab.example.com/api/v4?token=value",
+            "http://gitlab.example.com/api/v4#fragment",
+        ],
+    )
+    def test_an_invalid_api_root_is_refused(self, url: str) -> None:
+        with pytest.raises(GithubOpError, match="transport descriptor rejected"):
+            transport_spec({"transport": {"api_url": url}})
+
+    def test_an_unknown_style_or_descriptor_shape_is_refused(self) -> None:
         with pytest.raises(GithubOpError, match="transport descriptor rejected"):
             transport_spec({"transport": {"auth": "cookie"}})
-        with pytest.raises(GithubOpError, match="transport descriptor rejected"):
-            transport_spec({"transport": {"api_url": "http://gitlab.example.com"}})
         with pytest.raises(GithubOpError, match="must be an object"):
             transport_spec({"transport": "github"})
 
@@ -105,21 +127,55 @@ class TestAuthStyles:
         assert captured["headers"]["accept"] == "application/vnd.github+json"
         assert captured["headers"]["x-github-api-version"] == "2022-11-28"
 
-    def test_private_token_is_gitlab(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize("scheme", ["http", "https"])
+    def test_private_token_is_gitlab(self, monkeypatch: pytest.MonkeyPatch, scheme: str) -> None:
         captured = capture_request(monkeypatch)
         spec = TransportSpec(
-            api_url="https://gitlab.example.com/api/v4",
+            api_url=f"{scheme}://gitlab.example.com/api/v4",
             auth="private-token",
             accept="application/json",
             api_version_header=None,
             api_version=None,
         )
         RestTransport(token="glpat", spec=spec).request("GET", "/projects/1")
-        assert captured["url"] == "https://gitlab.example.com/api/v4/projects/1"
+        assert captured["url"] == f"{scheme}://gitlab.example.com/api/v4/projects/1"
         assert captured["headers"]["private-token"] == "glpat"
         assert "authorization" not in captured["headers"]
         assert captured["headers"]["accept"] == "application/json"
         assert "x-github-api-version" not in captured["headers"]
+
+    @pytest.mark.parametrize("scheme", ["http", "https"])
+    def test_response_headers_use_the_configured_scheme(
+        self, monkeypatch: pytest.MonkeyPatch, scheme: str
+    ) -> None:
+        captured = capture_request(monkeypatch)
+        root = f"{scheme}://gitlab.example.com/api/v4"
+        RestTransport(token="glpat", api_url=root).request_headers("GET", "/user")
+        assert captured["url"] == f"{root}/user"
+
+    @pytest.mark.parametrize("scheme", ["http", "https"])
+    def test_text_requests_use_the_configured_scheme(
+        self, monkeypatch: pytest.MonkeyPatch, scheme: str
+    ) -> None:
+        urls: list[str] = []
+
+        class DirectOpener:
+            def open(self, request: Any, timeout: float = 0) -> FakeResponse:
+                urls.append(request.full_url)
+                return FakeResponse(b"job log")
+
+        monkeypatch.setattr(githubops.urllib.request, "build_opener", lambda *h: DirectOpener())
+        root = f"{scheme}://gitlab.example.com/api/v4"
+        result = RestTransport(token="glpat", api_url=root).request_text("GET", "/jobs/1/trace")
+        assert result == "job log"
+        assert urls == [f"{root}/jobs/1/trace"]
+
+    @pytest.mark.parametrize("url", ["file:///etc/passwd", "ftp://gitlab.example.com/api/v4"])
+    def test_requests_reject_other_schemes(self, monkeypatch: pytest.MonkeyPatch, url: str) -> None:
+        captured = capture_request(monkeypatch)
+        with pytest.raises(GithubOpError, match="HTTP or HTTPS"):
+            RestTransport(token="glpat").request("GET", url)
+        assert captured == {}
 
     def test_token_is_gitea(self, monkeypatch: pytest.MonkeyPatch) -> None:
         captured = capture_request(monkeypatch)

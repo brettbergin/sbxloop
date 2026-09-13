@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import time
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -205,10 +206,20 @@ class TransportSpec(ProtocolModel):
 
     @field_validator("api_url")
     @classmethod
-    def _https_only(cls, value: str | None) -> str | None:
-        if value is not None and not value.startswith("https://"):
-            raise ValueError(f"transport api_url must be https, got {value!r}")
-        return value.rstrip("/") if value else value
+    def _http_root(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip().rstrip("/")
+        parts = urlsplit(value)
+        if (
+            parts.scheme not in ("http", "https")
+            or not parts.hostname
+            or parts.username is not None
+            or parts.query
+            or parts.fragment
+        ):
+            raise ValueError(f"transport api_url must be a plain HTTP or HTTPS URL, got {value!r}")
+        return value
 
 
 class ErrorInfo(ProtocolModel):

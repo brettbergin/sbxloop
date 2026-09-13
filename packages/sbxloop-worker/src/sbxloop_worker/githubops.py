@@ -284,11 +284,22 @@ class RestTransport:
         return headers
 
     def _url(self, path: str) -> str:
-        url = path if path.startswith("http") else f"{self.api_url}{path}"
-        # The token rides on every request: never let it travel over
-        # anything but HTTPS (also rules out file:// and custom schemes).
-        if not url.startswith("https://"):
-            raise GithubOpError(f"refusing non-HTTPS API URL: {url}")
+        try:
+            url = path if urllib.parse.urlsplit(path).scheme else f"{self.api_url}{path}"
+            parts = urllib.parse.urlsplit(url)
+        except ValueError as exc:
+            raise GithubOpError(f"malformed API URL: {path}") from exc
+        # Self-managed forges may use HTTP. Every API request still needs
+        # a web URL, including absolute pagination links and direct paths.
+        if (
+            parts.scheme not in ("http", "https")
+            or not parts.hostname
+            or parts.username is not None
+            or parts.fragment
+        ):
+            raise GithubOpError(
+                f"API URL must use HTTP or HTTPS without credentials or fragments: {url}"
+            )
         return url
 
     def request(self, method: str, path: str, body: dict[str, Any] | None = None) -> JsonValue:
@@ -307,7 +318,7 @@ class RestTransport:
             headers={**self._headers(), **({"Content-Type": "application/json"} if data else {})},
         )
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310 - https enforced above
+            with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310 - HTTP/HTTPS enforced above
                 raw = response.read().decode()
                 # A response always carries headers; a test's bare stream
                 # may not, and a pager that needs them asks for a style.
@@ -333,7 +344,7 @@ class RestTransport:
         url = self._url(path)
         request = urllib.request.Request(url, method=method, headers=self._headers())
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310 - https enforced above
+            with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310 - HTTP/HTTPS enforced above
                 return {name.lower(): value for name, value in response.headers.items()}
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")[:2000]
@@ -351,8 +362,8 @@ class RestTransport:
         if location is None:
             return body
         # The hop to storage: the URL carries its own signature, so the only
-        # header it gets is a User-Agent. Same https rule — that signature is
-        # a credential too, if a short-lived one.
+        # header it gets is a User-Agent. Storage redirects still require
+        # HTTPS: that signature is a credential too, if a short-lived one.
         if not location.startswith("https://"):
             raise GithubOpError(f"refusing non-HTTPS redirect target: {location}")
         follow = urllib.request.Request(location, method="GET", headers={"User-Agent": USER_AGENT})
@@ -373,7 +384,7 @@ class RestTransport:
         """
         method, url = request.get_method(), request.full_url
         try:
-            with opener.open(request, timeout=120) as response:  # nosec B310 - https enforced by caller
+            with opener.open(request, timeout=120) as response:  # nosec B310 - HTTP/HTTPS enforced by caller
                 return response.read().decode("utf-8", errors="replace"), None
         except urllib.error.HTTPError as exc:
             if exc.code in _REDIRECT_CODES:
