@@ -19,7 +19,14 @@ from pathlib import Path
 from typing import TypeVar
 
 from sbxloop.config import Config, VcsKind
-from sbxloop.errors import DaemonError, GithubOpsError, SbxError, SbxloopError, WorkerError
+from sbxloop.errors import (
+    DaemonError,
+    GithubOpsError,
+    SbxError,
+    SbxloopError,
+    SbxNotFoundError,
+    WorkerError,
+)
 from sbxloop.events import EventBus
 from sbxloop.log import get_logger
 from sbxloop.paths import SbxloopHome
@@ -98,11 +105,15 @@ class DaemonGithub:
         Run this before every provision so a failed cleanup is retried when
         authentication or the sandbox service recovers.
         """
-        if any(info.name == self.name for info in self.sbx.ls()):
+        if self._listed():
             Sandbox(self.sbx, self.name).rm()
             log.info("github_sandbox.stale_removed", sandbox=self.name)
         else:
             log.debug("github_sandbox.no_stale", sandbox=self.name)
+
+    def _listed(self) -> bool:
+        """Whether ``sbx ls`` lists this instance's box right now."""
+        return any(info.name == self.name for info in self.sbx.ls())
 
     def ops(self) -> VcsOps:
         # Polling and control requests can arrive together. Cleanup belongs
@@ -166,12 +177,35 @@ class DaemonGithub:
     def close(self) -> None:
         with self._lifecycle_lock:
             sandbox, self._sandbox, self._client, self._ops = self._sandbox, None, None, None
-            if sandbox is not None:
-                try:
-                    sandbox.rm()
-                    log.info("github_sandbox.removed", sandbox=self.name)
-                except SbxError:
-                    log.warning("github_sandbox.remove_failed", sandbox=self.name, exc_info=True)
+            if sandbox is None:
+                return
+            try:
+                sandbox.rm()
+            except SbxNotFoundError:
+                # The box this daemon was tearing down is gone already: the
+                # state the teardown wanted, not a fault to report. But the
+                # answer alone proves nothing (a Docker authentication
+                # failure also says "not found", see remove_stale), so only
+                # an inventory that no longer lists the name settles it;
+                # anything else stays the failure it looks like.
+                if self._absent():
+                    log.info("github_sandbox.already_gone", sandbox=self.name)
+                    return
+                log.warning("github_sandbox.remove_failed", sandbox=self.name, exc_info=True)
+            except SbxError:
+                log.warning("github_sandbox.remove_failed", sandbox=self.name, exc_info=True)
+            else:
+                log.info("github_sandbox.removed", sandbox=self.name)
+
+    def _absent(self) -> bool:
+        """Whether the inventory confirms this instance's box is gone.
+
+        Fails closed: an inventory that cannot be read confirms nothing.
+        """
+        try:
+            return not self._listed()
+        except SbxError:
+            return False
 
     def _provision(self) -> VcsOps:
         clients: list[WorkerClient] = []

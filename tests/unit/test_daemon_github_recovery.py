@@ -1,7 +1,9 @@
-"""Authentication outages must not strand the daemon's stable sandbox name."""
+"""Authentication outages must not strand the daemon's stable sandbox name,
+and a box already gone at teardown is not a fault."""
 
 from __future__ import annotations
 
+import logging
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -100,3 +102,58 @@ def test_concurrent_requests_share_one_provision(
             release.set()
         assert first.result(timeout=10) is second.result(timeout=10)
     assert len(fake_sbx.invocations("create")) == 1
+
+
+def test_close_takes_a_box_already_gone_as_removed(
+    fake_sbx: FakeSbx,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The daemon's box can vanish under it: an operator's `sbx rm`, a
+    backend that reaped a dead microVM. Tearing down what is already gone
+    reaches the state the teardown wanted; it used to be reported as a
+    failure, traceback and all, to the error tracker (#1087)."""
+    github = make_github(fake_sbx, tmp_path, monkeypatch)
+    github.ops()
+    github.sbx.rm(github.name)  # out from under the daemon
+
+    with caplog.at_level(logging.INFO, logger="sbxloop.daemon.github"):
+        github.close()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("github_sandbox.already_gone" in message for message in messages)
+    assert not any("github_sandbox.remove_failed" in message for message in messages)
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+    # Closed is closed: the next call provisions afresh, as after any close.
+    github.ops()
+    assert len(fake_sbx.invocations("create")) == 2
+
+
+@pytest.mark.parametrize("inventory", ["still lists it", "cannot be read"])
+def test_close_keeps_reporting_a_not_found_the_inventory_does_not_confirm(
+    fake_sbx: FakeSbx,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    inventory: str,
+) -> None:
+    """`sbx rm` answering "not found" is not proof of absence: a Docker
+    authentication failure says "secret not found" (#254). Only an
+    inventory that no longer lists the name settles it; a box still listed,
+    or an inventory that cannot be read, stays the failure it looks like."""
+    github = make_github(fake_sbx, tmp_path, monkeypatch)
+    github.ops()
+    fake_sbx.fail_next("rm", stderr=AUTH_ERROR)
+    if inventory == "cannot be read":
+        fake_sbx.fail_next("ls", stderr=AUTH_ERROR)
+
+    with caplog.at_level(logging.INFO, logger="sbxloop.daemon.github"):
+        github.close()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("github_sandbox.remove_failed" in message for message in messages)
+    assert not any("github_sandbox.already_gone" in message for message in messages)
+    failed = next(r for r in caplog.records if "github_sandbox.remove_failed" in r.getMessage())
+    assert failed.levelno == logging.WARNING
+    assert fake_sbx.sandbox_fs(github.name).is_dir()  # nothing was torn down behind the report

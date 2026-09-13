@@ -87,6 +87,17 @@
 
 ### Fixed
 
+- **A daemon GitHub sandbox that is already gone at shutdown no longer
+  reports a failure.** The daemon tears its long-lived github-ops box down
+  when it stops; when that box had vanished in the meantime (an operator's
+  `sbx rm`, a backend that reaped a dead microVM), the leftover `sbx rm`
+  answered "not found" and the daemon logged a warning with a traceback,
+  which the error tracker filed as an incident on every such restart. A
+  box the inventory no longer lists is now the state the teardown wanted
+  and is logged as such. A "not found" the inventory does not confirm (a
+  Docker authentication failure says "secret not found" too, and so does
+  a box still listed) is still reported as the failure it is.
+
 - **A setup command's output is now the command's, not the sandbox image's.**
   `[sandbox] setup_commands` run under a login shell, so the image's profile
   runs first — and an image is free to announce itself there: a version
