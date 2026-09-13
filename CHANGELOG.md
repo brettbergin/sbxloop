@@ -87,6 +87,16 @@
 
 ### Fixed
 
+- **A run sandbox that is already gone at cleanup no longer reports a
+  failure.** A run tears down each of its agent, github and service boxes at
+  context exit. When one vanished between its stop and remove calls, the
+  leftover `sbx rm` answered "not found" and cleanup logged a warning with a
+  traceback, which the error tracker filed as an incident. Cleanup now takes
+  an inventory-confirmed absence as the state it wanted and continues with
+  secret cleanup without a warning. A "not found" the inventory cannot
+  confirm — the box is still listed, or inventory cannot be read — remains a
+  reported failure.
+
 - **A daemon GitHub sandbox that is already gone at shutdown no longer
   reports a failure.** The daemon tears its long-lived github-ops box down
   when it stops; when that box had vanished in the meantime (an operator's

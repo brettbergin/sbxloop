@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from sbxloop.config import Config
+from sbxloop.errors import SbxError, SbxNotFoundError
 from sbxloop.log import get_logger
 from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.prune import remove_run_sandbox_secrets
@@ -31,6 +32,16 @@ from sbxloop.sbx.sandbox import WORK_DIR, Sandbox
 from sbxloop.toolchains import DEFAULT_LANGUAGES, LanguageResolution
 
 log = get_logger(__name__)
+
+
+def _inventory_confirms_absent(sandbox: Sandbox) -> bool:
+    """Whether a readable inventory proves ``sandbox`` no longer exists."""
+    try:
+        return not any(info.name == sandbox.name for info in sandbox.cli.ls())
+    except SbxError:
+        # Fail closed: an unreadable inventory proves nothing. In particular,
+        # Docker authentication failures can themselves contain "not found".
+        return False
 
 
 class SandboxPair:
@@ -109,14 +120,27 @@ class SandboxPair:
         for sandbox, role in roles:
             if sandbox is None:
                 continue
+            already_gone = False
             try:
                 sandbox.stop()
+            except SbxNotFoundError:
+                if _inventory_confirms_absent(sandbox):
+                    already_gone = True
+                    log.info("sandbox.already_gone", sandbox=sandbox.name, operation="stop")
+                else:
+                    log.warning("sandbox.stop_failed", sandbox=sandbox.name, exc_info=True)
             except Exception:
                 log.warning("sandbox.stop_failed", sandbox=sandbox.name, exc_info=True)
-            try:
-                sandbox.rm()
-            except Exception:
-                log.warning("sandbox.remove_failed", sandbox=sandbox.name, exc_info=True)
+            if not already_gone:
+                try:
+                    sandbox.rm()
+                except SbxNotFoundError:
+                    if _inventory_confirms_absent(sandbox):
+                        log.info("sandbox.already_gone", sandbox=sandbox.name, operation="remove")
+                    else:
+                        log.warning("sandbox.remove_failed", sandbox=sandbox.name, exc_info=True)
+                except Exception:
+                    log.warning("sandbox.remove_failed", sandbox=sandbox.name, exc_info=True)
             try:
                 remove_run_sandbox_secrets(sandbox.cli, sandbox.name, role, self.config)
             except Exception:

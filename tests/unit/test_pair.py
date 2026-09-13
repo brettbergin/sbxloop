@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import logging
 import os
 import signal
 import sqlite3
@@ -15,6 +16,7 @@ import pytest
 
 import sbxloop.sbx.pair as pair_mod
 from sbxloop.config import Config
+from sbxloop.errors import SbxNotFoundError
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.pair import CleanupRegistry, SandboxPair, cleanup_registry
@@ -72,6 +74,82 @@ def test_cleanup_is_idempotent_and_best_effort(fake_sbx: FakeSbx, tmp_path: Path
     assert gone(fake_sbx, "sbxloop-r1-agent")
     assert gone(fake_sbx, "sbxloop-r1-github")
     pair.cleanup()  # second call is a no-op, not an error
+
+
+def test_cleanup_takes_a_sandbox_gone_during_remove_as_removed(
+    fake_sbx: FakeSbx,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A run sandbox can vanish between stop and remove. When inventory
+    confirms it is gone, cleanup reached its intended state and must not send
+    a warning traceback to the error tracker (#1106)."""
+    pair = make_pair(fake_sbx, tmp_path)
+    assert pair.github is not None
+    remove = pair.github.rm
+
+    def vanish_during_remove() -> None:
+        remove()
+        raise SbxNotFoundError(
+            "sbx command failed: rm --force",
+            argv=["sbx", "rm", "--force", pair.github.name],
+            returncode=1,
+            stderr=f"sandbox {pair.github.name!r} not found",
+        )
+
+    monkeypatch.setattr(pair.github, "rm", vanish_during_remove)
+
+    with caplog.at_level(logging.INFO, logger="sbxloop.sbx.pair"):
+        pair.cleanup()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("sandbox.already_gone" in message for message in messages)
+    assert not any("sandbox.remove_failed" in message for message in messages)
+    assert not any(record.levelno >= logging.WARNING for record in caplog.records)
+
+
+@pytest.mark.parametrize("inventory", ["still lists it", "cannot be read"])
+def test_cleanup_keeps_reporting_a_not_found_the_inventory_does_not_confirm(
+    fake_sbx: FakeSbx,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    inventory: str,
+) -> None:
+    """Not-found text alone cannot prove removal: an unrelated authentication
+    failure can say the same thing. Keep reporting it unless inventory answers
+    that this sandbox is absent."""
+    pair = make_pair(fake_sbx, tmp_path)
+    assert pair.github is not None
+    fake_sbx.fail_next(
+        f"rm --force {pair.github.name}",
+        stderr="Docker credential secret not found",
+    )
+    if inventory == "cannot be read":
+        remove = pair.github.rm
+
+        def fail_inventory_after_remove() -> None:
+            # Queue this only when the github removal begins: the agent's
+            # successful removal settles with its own earlier `sbx ls`.
+            fake_sbx.fail_next("ls", stderr="Docker credential secret not found")
+            remove()
+
+        monkeypatch.setattr(pair.github, "rm", fail_inventory_after_remove)
+
+    with caplog.at_level(logging.INFO, logger="sbxloop.sbx.pair"):
+        pair.cleanup()
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert any("sandbox.remove_failed" in message for message in messages)
+    assert not any(
+        "sandbox.already_gone" in record.getMessage()
+        and getattr(record, "sandbox", None) == pair.github.name
+        for record in caplog.records
+    )
+    failed = next(r for r in caplog.records if "sandbox.remove_failed" in r.getMessage())
+    assert failed.levelno == logging.WARNING
+    assert fake_sbx.sandbox_fs(pair.github.name).is_dir()
 
 
 def test_registry_cleanup_all(fake_sbx: FakeSbx, tmp_path: Path) -> None:
