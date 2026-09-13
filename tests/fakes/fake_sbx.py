@@ -196,6 +196,8 @@ def cmd_create(root: Path, args: list[str]) -> int:
 
     name = None
     template = None
+    cpus = 0
+    memory = None
     rest: list[str] = []
     i = 0
     while i < len(args):
@@ -210,6 +212,12 @@ def cmd_create(root: Path, args: list[str]) -> int:
             template = args[i]
         elif arg.startswith("--template="):
             template = arg.split("=", 1)[1]
+        elif arg == "--cpus":
+            i += 1
+            cpus = int(args[i])
+        elif arg == "--memory":
+            i += 1
+            memory = args[i]
         else:
             rest.append(arg)
         i += 1
@@ -239,7 +247,14 @@ def cmd_create(root: Path, args: list[str]) -> int:
         if (fs / "workspace").is_symlink():
             (fs / "workspace").unlink()
         (fs / "workspace").symlink_to(workspace)
-    meta = {"agent": agent, "workspace": workspace, "template": template, "status": "running"}
+    meta = {
+        "agent": agent,
+        "workspace": workspace,
+        "template": template,
+        "status": "running",
+        "cpus": cpus,
+        "memory": memory,
+    }
     (path / "meta.json").write_text(json.dumps(meta))
     return 0
 
@@ -281,6 +296,48 @@ def fake_pkill(fs: Path, args: list[str]) -> int:
             os.kill(pid, signal.SIGTERM)
             killed = True
     return 0 if killed else 1
+
+
+# `sh -lc` is how the worker runs a job's commands and the operator's
+# `[sandbox] setup_commands`, and the fake execs them on the host — so a real
+# login shell would source the *host's* `/etc/profile` and `/etc/profile.d/*`.
+# Those belong to the developer's machine or the CI image, not to the guest,
+# and they are free to write to stdout: an image carrying nvm or rbenv prints
+# a line on every login, which then lands in the command's captured output as
+# if the command itself had written it. This shim keeps the part of login the
+# fake does model — the guest's own ~/.profile, under the guest HOME — and
+# drops the host's. Only `-lc` is rewritten, which is the spelling every call
+# site uses; anything else runs as asked.
+LOGIN_SHELL_SHIM = """#!/bin/sh
+# Written by tests/fakes/fake_sbx.py; see LOGIN_SHELL_SHIM there.
+case "$1" in
+-lc)
+    shift
+    script=$1
+    shift
+    exec /bin/sh -c '[ -r "$HOME/.profile" ] && . "$HOME/.profile"
+'"$script" "$@"
+    ;;
+esac
+exec /bin/sh "$@"
+"""
+
+
+def login_shell_dir(root: Path) -> Path:
+    """Directory whose ``sh`` stands in for the guest's login shell."""
+    shim_dir = root / "loginshell"
+    shim = shim_dir / "sh"
+    if not shim.exists():
+        shim_dir.mkdir(parents=True, exist_ok=True)
+        # Provisioning runs the pair on parallel threads (#127), so another
+        # fake process may be writing this at the same moment: stage the whole
+        # file aside and move it into place, so nobody execs a half-written
+        # shim.
+        staged = shim_dir / f"sh.{os.getpid()}"
+        staged.write_text(LOGIN_SHELL_SHIM)
+        staged.chmod(0o755)
+        staged.replace(shim)
+    return shim_dir
 
 
 def cmd_exec(root: Path, args: list[str], stdin: str = "") -> int:
@@ -330,6 +387,9 @@ def cmd_exec(root: Path, args: list[str], stdin: str = "") -> int:
     # and failing on every developer's Mac. Disabling copyfile(3) metadata
     # makes the host's tar/cp model the guest they stand in for.
     env["COPYFILE_DISABLE"] = "1"
+    # Resolve `sh` to the login-shell shim before the host's own; see
+    # login_shell_dir for what a real login shell would drag in here.
+    env["PATH"] = f"{login_shell_dir(root)}{os.pathsep}{env.get('PATH', '')}"
     try:
         # Whether stdin piped through `sbx exec` reaches the in-VM process is
         # an sbx semantic sbxloop field-probes (exec-stdin-env, #592). The

@@ -239,6 +239,18 @@ class TestCli:
         assert opener.payload["content"] == "deploying **1.2.3** on `db`"
         assert opener.timeouts == [5.0]
 
+    def test_notify_can_target_another_channel(
+        self, workdir: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        (workdir / "sbxloop.toml").write_text("[discord]\nchannel_id = 123\n")
+        monkeypatch.setenv("DISCORD_BOT_TOKEN", "tok")
+        opener = Recorder()
+        monkeypatch.setattr(notify, "_open_url", opener)
+        result = runner.invoke(app, ["daemon", "notify", "deploying", "--channel", "456"])
+        assert result.exit_code == 0, result.output
+        assert "posted to discord channel 456" in result.output
+        assert opener.only.full_url == "https://discord.com/api/v10/channels/456/messages"
+
     def test_notify_fails_closed_without_a_backend(
         self, workdir: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -284,6 +296,18 @@ class TestMattermost:
         assert payload["channel_id"] == "c" * 26
         # House dialect goes through untouched: Mattermost reads it as is.
         assert payload["message"] == "**deploy** starting"
+
+    def test_a_notice_can_override_the_configured_channel(self, tmp_path: Path) -> None:
+        opener = Recorder()
+        posted = post_notice(
+            _mattermost(tmp_path),
+            "deploying",
+            channel_id="d" * 26,
+            env={"MATTERMOST_BOT_TOKEN": "tok"},
+            open_url=opener,
+        )
+        assert posted == Posted("mattermost", "d" * 26)
+        assert opener.payload["channel_id"] == "d" * 26
 
     def test_a_notice_can_never_ping(self, tmp_path: Path) -> None:
         """Mattermost has no allowed-mentions control, so the guard is the

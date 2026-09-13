@@ -1501,6 +1501,7 @@ def secrets_rotate(
                 env=token_env,
                 workspace=workspace,
                 template=config.sandbox.template,
+                resources=config.sandbox_resources_for("service"),
             )
             if visible is True:
                 console.print(
@@ -3097,16 +3098,22 @@ def daemon_notify(
     timeout: Annotated[
         float, typer.Option("--timeout", help="Seconds to wait for the chat service.")
     ] = 30.0,
+    channel: Annotated[
+        str | None,
+        typer.Option(
+            "--channel", help="Channel id to use instead of the configured control channel."
+        ),
+    ] = None,
 ) -> None:
-    """Post one message to the daemon's control channel through the configured
-    `[chat] backend` — from the host, without the daemon, for deploy scripts
-    and cron. The bot token comes from the environment / .env, as for the
-    daemon; nothing else about the channel is read outside sbxloop.toml."""
+    """Post one message through the configured `[chat] backend` — from the
+    host, without the daemon, for deploy scripts and cron. The channel is the
+    configured control channel unless `--channel` selects another one. The bot
+    token comes from the environment / .env, as for the daemon."""
     from sbxloop.daemon.notify import post_notice
 
     try:
         config = load_config()
-        posted = post_notice(config, text, timeout_s=timeout)
+        posted = post_notice(config, text, channel_id=channel, timeout_s=timeout)
     except SbxloopError as exc:
         console.print(f"[bold red]notify failed:[/] {exc}")
         raise typer.Exit(2) from exc
