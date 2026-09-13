@@ -137,7 +137,9 @@ def bake_template(
                 languages=languages,
                 # The global list only: a `[[github.repos]]` override is
                 # paid at that repository's provision (#681).
-                apt_packages=config.sandbox.apt_packages,
+                # Archive extraction must work even when a later run adds
+                # a language that was not selected for this bake.
+                apt_packages=list(dict.fromkeys(["xz-utils", *config.sandbox.apt_packages])),
             )
             if client.python != VENV_PYTHON:
                 raise BakeError(

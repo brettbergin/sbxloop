@@ -1,0 +1,6 @@
+{
+  "name": "node-npm-fixture",
+  "private": true,
+  "engines": { "node": "24.x" },
+  "scripts": { "check": "node --test" }
+}

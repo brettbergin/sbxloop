@@ -584,6 +584,9 @@ def test_a_repo_entry_is_addressable_key_by_key(seeded: SbxloopHome, hermetic: N
             await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
+            # Mount precedes the background config load. Wait for its data,
+            # not just the screen, before inspecting the repository rows.
+            assert await until(pilot, lambda: "github.repos[1].repo" in screen.flat)
             assert screen.flat["github.repos[1].repo"] == "o/s"
             table = screen.query_one("#resolved", ConsoleTable)
             row = table.get_row_at(table.get_row_index("github.repos[1].repo"))

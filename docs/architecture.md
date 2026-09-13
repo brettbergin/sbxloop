@@ -569,7 +569,14 @@ reported as a `sandbox.setup` event with delivered secret values scrubbed from
 the tail and the login profile's own output cut from it — the script echoes a
 mark once the profile has run, and a stream without the mark is kept whole; the
 first failure raises out of provisioning like an install failure, so
-`keep_on_failure` applies. The bake installs the global package list only.
+`keep_on_failure` applies. The bake installs the global package list plus
+`xz-utils`, so a later language top-up can extract xz archives even when the
+bake did not select that language. All worker provisioning apt paths share
+bounded retries for confirmed lock contention (including the update lists
+lock): twelve retries, five seconds apart, within the caller's original
+timeout. Other apt errors return immediately. A toolchain installer is
+skipped when its pooled apt prerequisite install fails; the diagnostic
+distinguishes contention, permission, package and mirror failures.
 
 Worker venv repair probes the running sandbox `python3` and installs its
 matching `python3.X-venv` package, since the distro's `python3-venv`

@@ -182,6 +182,40 @@ def _after_mark(text: str, mark: str) -> str:
     return rest if separator else text
 
 
+def _apt_lock_contended(result: ExecResult) -> bool:
+    output = f"{result.stderr}\n{result.stdout}".lower()
+    return (
+        result.returncode == 100
+        and "lock" in output
+        and any(
+            marker in output
+            for marker in (
+                "held by process",
+                "resource temporarily unavailable",
+                "is another process using it",
+            )
+        )
+    )
+
+
+def _apt_failure_hint(result: ExecResult) -> str:
+    if _apt_lock_contended(result):
+        return "another apt/dpkg process still holds the lock; retry after it finishes"
+    output = f"{result.stderr}\n{result.stdout}".lower()
+    if "permission denied" in output or "are you root" in output:
+        return "check the sandbox user's sudo permissions"
+    if "unable to locate package" in output or "has no installation candidate" in output:
+        return "check the package name and the configured apt repositories"
+    if any(
+        marker in output
+        for marker in ("failed to fetch", "could not resolve", "temporary failure resolving")
+    ):
+        return "check the sandbox network policy, DNS and configured apt mirrors"
+    return (
+        "inspect apt's output; rc=100 alone does not distinguish locks, mirrors or package errors"
+    )
+
+
 def _output_tail(result: ExecResult, limit: int = 2000, *, mark: str | None = None) -> str:
     """Combined stderr+stdout tail: sbx exec surfaces some in-sandbox errors
     on stdout, so stderr alone can be empty exactly when it matters.
@@ -713,6 +747,38 @@ class WorkerClient:
             return
         self._provision_toolchains(missing, timeout)
 
+    def _install_apt(self, packages: Sequence[str], timeout: float) -> ExecResult:
+        """Retry confirmed apt lock contention, including the update lists lock.
+
+        All provisioning apt paths share this policy. Apt owns its locks;
+        never delete them or try to hold them on apt's behalf. Retry the
+        whole idempotent batch at most twelve times, five seconds apart,
+        within the caller's original timeout (including command runtime).
+        Other errors return immediately with their original diagnostics.
+        """
+        command = [
+            "sh",
+            "-c",
+            f"sudo -n apt-get update -q && sudo -n apt-get install -y -q {shlex.join(packages)}",
+        ]
+        deadline = time.monotonic() + timeout
+        result = self.sandbox.exec(command, timeout=timeout)
+        for attempt in range(12):
+            if not _apt_lock_contended(result) or deadline - time.monotonic() <= 5.0:
+                return result
+            log.info(
+                "worker.apt_lock_wait",
+                sandbox=self.sandbox.name,
+                retry=attempt + 1,
+                delay_s=5.0,
+            )
+            time.sleep(5.0)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return result
+            result = self.sandbox.exec(command, timeout=remaining)
+        return result
+
     def _provision_toolchains(
         self, missing: Sequence[toolchains.Toolchain], timeout: float
     ) -> None:
@@ -725,17 +791,11 @@ class WorkerClient:
             toolchains=[tc.name for tc in missing],
         )
         packages = toolchains.apt_packages(missing)
+        apt_ok = True
         if packages:
             apt_for = [tc for tc in missing if tc.apt_packages]
-            result = self.sandbox.exec(
-                [
-                    "sh",
-                    "-c",
-                    "sudo -n apt-get update -q && "
-                    f"sudo -n apt-get install -y -q {' '.join(packages)}",
-                ],
-                timeout=timeout,
-            )
+            result = self._install_apt(packages, timeout)
+            apt_ok = result.ok
             if not result.ok:
                 log.warning(
                     "worker.dev_tools_ensure_failed",
@@ -744,12 +804,19 @@ class WorkerClient:
                     rc=result.returncode,
                     wanted="; ".join(tc.wanted for tc in apt_for),
                     output=_output_tail(result),
-                    hint="the agent has to bootstrap these itself; rc=100 usually means apt "
-                    "could not reach its mirrors — check the sandbox network policy allows "
-                    "the Ubuntu/Debian apt hosts",
+                    hint=_apt_failure_hint(result),
                 )
         for toolchain in missing:
             if toolchain.install_script is None:
+                continue
+            if not apt_ok and toolchain.apt_packages:
+                log.warning(
+                    "worker.toolchain_installer_skipped",
+                    sandbox=self.sandbox.name,
+                    toolchain=toolchain.name,
+                    reason="apt prerequisites did not install; "
+                    "the agent must bootstrap this toolchain",
+                )
                 continue
             # A compile-from-source entry (ruby-build) declares how long it
             # needs; the caller's budget is a floor, never a cap on it.
@@ -803,19 +870,11 @@ class WorkerClient:
             log.debug("worker.apt_packages_present", sandbox=self.sandbox.name, packages=packages)
             return
         log.info("worker.apt_packages_installing", sandbox=self.sandbox.name, packages=missing)
-        result = self.sandbox.exec(
-            [
-                "sh",
-                "-c",
-                f"sudo -n apt-get update -q && sudo -n apt-get install -y -q {shlex.join(missing)}",
-            ],
-            timeout=timeout,
-        )
+        result = self._install_apt(missing, timeout)
         if not result.ok:
             raise WorkerError(
                 f"apt packages {missing} did not install (rc={result.returncode}); "
-                "rc=100 usually means apt could not reach its mirrors or knows no such "
-                f"package — check the name and the sandbox network policy: {_output_tail(result)}"
+                f"{_apt_failure_hint(result)}: {_output_tail(result)}"
             )
         self.apt_installed = missing
 
@@ -925,14 +984,7 @@ class WorkerClient:
         probe = self.sandbox.exec(["sh", "-c", self._SEARCH_FALLBACK_PROBE])
         if probe.ok:
             return
-        result = self.sandbox.exec(
-            [
-                "sh",
-                "-c",
-                "sudo -n apt-get update -q && sudo -n apt-get install -y -q ripgrep",
-            ],
-            timeout=timeout,
-        )
+        result = self._install_apt(["ripgrep"], timeout)
         if not result.ok:
             log.warning(
                 "worker.search_fallback_ensure_failed",
@@ -990,15 +1042,7 @@ class WorkerClient:
                 output=_output_tail(probe),
             )
             return False
-        result = self.sandbox.exec(
-            [
-                "sh",
-                "-c",
-                "sudo -n apt-get update -q && "
-                f"sudo -n apt-get install -y -q {shlex.quote(package)} python3-pip",
-            ],
-            timeout=timeout,
-        )
+        result = self._install_apt([package, "python3-pip"], timeout)
         if not result.ok:
             log.warning(
                 "worker.venv_repair_failed",
