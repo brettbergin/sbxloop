@@ -6,28 +6,62 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT" /></a>
 </p>
 
+## Infrastructure & Runtime
+
 <p>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.13%2B-3776AB?logo=python&amp;logoColor=white" alt="Python 3.13+" /></a>
   <a href="https://docs.docker.com/ai/sandboxes/"><img src="https://img.shields.io/badge/Docker-Sandboxes-2496ED?logo=docker&amp;logoColor=white" alt="Docker Sandboxes" /></a>
+</p>
+
+## Data & Configuration
+
+<p>
   <a href="https://www.sqlite.org/"><img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&amp;logoColor=white" alt="SQLite" /></a>
   <a href="https://docs.pydantic.dev/"><img src="https://img.shields.io/badge/Pydantic-E92063?logo=pydantic&amp;logoColor=white" alt="Pydantic" /></a>
+</p>
+
+## CLI & User Interface
+
+<p>
   <a href="https://typer.tiangolo.com/"><img src="https://img.shields.io/badge/Typer-009688" alt="Typer" /></a>
   <a href="https://rich.readthedocs.io/"><img src="https://img.shields.io/badge/Rich-4051B5" alt="Rich" /></a>
   <a href="https://textual.textualize.io/"><img src="https://img.shields.io/badge/Textual-181717" alt="Textual" /></a>
+</p>
+
+## Logging & Observability
+
+<p>
   <a href="https://www.structlog.org/"><img src="https://img.shields.io/badge/structlog-555555" alt="structlog" /></a>
 </p>
+
+## Agent & Language Model Support
 
 <p>
   <a href="https://github.com/github/copilot-sdk"><img src="https://img.shields.io/badge/GitHub_Copilot-SDK-000000?logo=githubcopilot&amp;logoColor=white" alt="GitHub Copilot SDK" /></a>
   <a href="https://github.com/anthropics/claude-agent-sdk-python"><img src="https://img.shields.io/badge/Claude-Agent_SDK-D97757?logo=claude&amp;logoColor=white" alt="Claude Agent SDK" /></a>
   <a href="https://developers.openai.com/codex/sdk/"><img src="https://img.shields.io/badge/OpenAI_Codex-SDK-000000?logo=openai&amp;logoColor=white" alt="OpenAI Codex SDK" /></a>
   <a href="https://platform.openai.com/docs/api-reference/chat"><img src="https://img.shields.io/badge/OpenAI-compatible_API-412991?logo=openai&amp;logoColor=white" alt="OpenAI-compatible API" /></a>
+</p>
+
+## Version Control & Forge Integration
+
+<p>
   <a href="https://github.com/"><img src="https://img.shields.io/badge/GitHub-supported-181717?logo=github&amp;logoColor=white" alt="GitHub supported" /></a>
   <a href="https://about.gitlab.com/"><img src="https://img.shields.io/badge/GitLab-config_preview-FC6D26?logo=gitlab&amp;logoColor=white" alt="GitLab configuration preview" /></a>
   <a href="https://about.gitea.com/"><img src="https://img.shields.io/badge/Gitea-config_preview-609926?logo=gitea&amp;logoColor=white" alt="Gitea configuration preview" /></a>
+</p>
+
+## Chat & Notifications
+
+<p>
   <a href="https://discordpy.readthedocs.io/"><img src="https://img.shields.io/badge/Discord-5865F2?logo=discord&amp;logoColor=white" alt="Discord" /></a>
   <a href="https://github.com/slackapi/python-slack-sdk"><img src="https://img.shields.io/badge/Slack-4A154B?logo=slack&amp;logoColor=white" alt="Slack" /></a>
   <a href="https://developers.mattermost.com/integrate/reference/"><img src="https://img.shields.io/badge/Mattermost-0058CC?logo=mattermost&amp;logoColor=white" alt="Mattermost" /></a>
+</p>
+
+## Toolchain & Automation
+
+<p>
   <a href="https://docs.astral.sh/uv/"><img src="https://img.shields.io/badge/uv-DE5FE9?logo=uv&amp;logoColor=white" alt="uv" /></a>
   <a href=".github/workflows/ci.yml"><img src="https://img.shields.io/badge/GitHub_Actions-2088FF?logo=githubactions&amp;logoColor=white" alt="GitHub Actions" /></a>
 </p>
@@ -35,27 +69,20 @@
 **Give sbxloop the work and ditch the steering wheel.**
 
 Built on [Docker Sandboxes (`sbx`)](https://docs.docker.com/ai/sandboxes/),
-sbxloop takes an ask from chat, a labeled issue, or your terminal and works
-it through to a merged pull request. It plans the change, writes the code,
-runs checks, handles review feedback, and follows CI through to the finish.
-For general [agentic workloads](docs/architecture.md#workloads), it can
-research a question, prepare a brief or report, or produce a set of files.
-It plans, executes, and checks the work, then publishes the result to chat
-or another configured destination.
-You can watch, steer, or stop it along the way.
+sbxloop automates code changes from chat, issues, or your terminal—planning,
+coding, testing, and handling feedback through to merge. For general
+[agentic workloads](docs/architecture.md#workloads), it researches, writes
+reports, or generates files. Watch, steer, or stop it anytime.
 
-Out-of-scope findings are checked against existing issues before becoming
-follow-up work. Already tracked problems link to their existing issue;
-uncertain or unchecked findings remain notes on the pull request.
+Out-of-scope findings are checked against existing issues; tracked problems
+link to their issue, while uncertain findings remain as PR notes.
 
-Docker's `sbx` CLI provides the isolated sandbox runtime. sbxloop provisions
-the sandboxes, coordinates the agents and GitHub operations, and cleans up
-when the run ends.
+Docker's `sbx` CLI provides the sandbox runtime. sbxloop provisions sandboxes,
+coordinates agents and GitHub operations, and cleans up when done.
 
-It's built for the work you want off your plate without spending the afternoon
-relaying messages between an agent, your terminal, and a pull request. Your
-repository's checks and review requirements still apply, and retry, time,
-and spending budgets put a limit on how long the agent can keep trying.
+Built to free you from relaying messages between agent, terminal, and pull
+request. Your repository's checks and review requirements still apply, with
+retry, time, and spending budgets limiting the agent's efforts.
 
 ## Why the secrets live elsewhere
 
@@ -66,22 +93,14 @@ could turn a coding task into a stolen credential. A sandbox limits where
 code runs; a secret inside it is still a secret that code can read.
 
 **sbxloop keeps the GitHub token out of the coding agent's sandbox.** The
-agent edits files in one Docker Sandbox. A separate sandbox holds the token
-and performs a fixed set of GitHub operations, with no model running there.
-The host moves the changes and mediates requests between them; the agent
-cannot connect directly to the credential sandbox or run arbitrary commands
-inside it. Service credentials follow the same pattern when needed.
+agent runs in one sandbox and edits files; a separate sandbox holds the token
+and performs GitHub operations. The host mediates between them—the agent
+cannot access the credential sandbox or run arbitrary commands there.
 
-The agent keeps its own model credential, but it doesn't need your repository
-or service keys to do its work. Its proposed changes still go through checks
-and review before they land. That's the point of the split: enough freedom
-to get the job done, without putting every key on the workbench.
-The [security architecture](docs/architecture.md#the-credential-split-in-one-picture)
-explains the boundaries and how credentials are handled.
-
-For browser verification with Copilot or Claude, use the
-[Playwright MCP preset](docs/user-guide.md#playwright-mcp-for-browser-verification):
-`sbxloop init --preset playwright` provisions the browser and exposes it to builders.
+The agent keeps its own model credential but doesn't need your repository or
+service keys. Its proposed changes still go through checks and review before
+landing. The [security architecture](docs/architecture.md#the-credential-split-in-one-picture)
+explains the boundaries and credential handling.
 
 Need a report or a set of files instead? [Workload runs](docs/architecture.md#workloads)
 use the same supervised loop and publish the result without a code merge.
@@ -92,10 +111,7 @@ You'll need a host that supports [Docker Sandboxes](https://docs.docker.com/ai/s
 and GitHub Copilot access, an Anthropic API key, or an OpenAI API key. sbxloop requires
 Python 3.13 or newer; the installer sets up Python and the sandbox CLI for you.
 
-The host brings the rest: curl, tar, git and e2fsprogs. Git is sbxloop's own dependency —
-it reads and clones checkouts on the host, and the git inside a sandbox does not stand in
-for it — so the installer checks for a usable one before it downloads anything and tells
-you what to install if there is none.
+The host needs curl, tar, git, and e2fsprogs; the installer checks for git and reports any missing dependencies.
 
 **Installing and preparing the host are two different jobs.** Everything sbxloop installs
 lands under `~/.sbxloop`, a directory your account already owns; nothing in the install
