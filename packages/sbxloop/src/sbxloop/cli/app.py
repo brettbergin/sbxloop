@@ -1940,6 +1940,18 @@ def config_policy() -> None:
 
 
 @app.command()
+def setup() -> None:
+    """Interactively configure the agent, chat and version-control backends."""
+    from sbxloop.cli.setup import SetupError, run_setup
+
+    try:
+        run_setup(SbxloopHome(resolve_home_root()), console=console)
+    except SetupError as exc:
+        console.print(f"[bold red]{rich_escape(str(exc))}[/]")
+        raise typer.Exit(2) from exc
+
+
+@app.command()
 def init(
     project: Annotated[
         bool,
@@ -2104,9 +2116,7 @@ def init(
     hint = path_hint(home, os.environ)
     if hint:
         console.print(f"add the launchers to your PATH: {hint}", markup=False, soft_wrap=True)
-    console.print(
-        "next: fill in config/secrets.env, edit config/sbxloop.toml, run `sbxloop doctor`"
-    )
+    console.print("next: run `sbxloop setup`, then `sbxloop doctor`")
 
 
 def _migrate_home(
