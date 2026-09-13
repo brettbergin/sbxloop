@@ -12,10 +12,12 @@ from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.sources import (
     CLAIM_MARKER,
     STATUS_MARKER,
+    ApiSource,
     ChatSource,
     CompositeSource,
     GitHubIssueSource,
     GitHubLabels,
+    MultiRepoIssueSource,
 )
 from sbxloop.engine.model import Published
 from sbxloop.errors import GithubOpsError
@@ -410,6 +412,50 @@ class TestGitHubSource:
         assert all(m == "GET" for m, _, _ in stale.raw_calls)  # no mutations
         closed = RecordingOps({"4": issue(4, "sbxloop:run", state="closed")})
         assert self.make(closed).claim(gh()) is False
+
+    def test_admit_labels_an_open_issue_and_builds_the_polled_item(self) -> None:
+        """The remote API's issue intake (#1036): the same admission a
+        person makes by labelling, so the next poll converges on it."""
+        ops = RecordingOps({"4": issue(4)})
+        item = self.make(ops).admit("o/r", "4", "code")
+        assert item.item_id == "gh:issue:4" and item.kind == "code" and item.repo == "o/r"
+        assert item.title == "Issue 4" and item.url == "https://x/issues/4"
+        assert ("POST", "/repos/o/r/issues/4/labels", {"labels": ["sbxloop:run"]}) in ops.raw_calls
+        assert [i.item_id for i in self.make(ops).poll()] == ["gh:issue:4"]
+        # Already labelled: nothing to write; a workload label queues a workload.
+        ops = RecordingOps({"4": issue(4, "sbxloop:run"), "5": issue(5)})
+        src = self.make(ops)
+        assert src.admit("O/R", "4", "code").kind == "code"
+        assert not any(m == "POST" for m, _, _ in ops.raw_calls)
+        assert src.admit("o/r", "5", "workload").kind == "workload"
+        assert [lb["name"] for lb in ops.issues["5"]["labels"]] == ["sbxloop:workload"]
+
+    def test_admit_refuses_what_a_poll_would_not_queue(self) -> None:
+        ops = RecordingOps(
+            {
+                "1": issue(1, state="closed"),
+                "2": issue(2, "sbxloop:in-progress"),
+                "3": issue(3, "sbxloop:workload"),
+                "4": {**issue(4), "pull_request": {"url": "x"}},
+            }
+        )
+        src = self.make(ops)
+        with pytest.raises(ValueError, match="not open"):
+            src.admit("o/r", "1", "code")
+        with pytest.raises(ValueError, match="already in progress"):
+            src.admit("o/r", "2", "code")
+        with pytest.raises(ValueError, match="queued as a workload run"):
+            src.admit("o/r", "3", "code")
+        with pytest.raises(ValueError, match="pull request"):
+            src.admit("o/r", "4", "code")
+        with pytest.raises(KeyError):
+            src.admit("o/other", "1", "code")
+        assert not any(m == "POST" for m, _, _ in ops.raw_calls)
+        # GitHub's own failure propagates: the caller decides what it means.
+        ops.issues["5"] = issue(5)
+        ops.fail_on = {"POST"}
+        with pytest.raises(GithubOpsError):
+            src.admit("o/r", "5", "code")
 
     def test_report_merged_labels_then_closes(self) -> None:
         """The merge settles the issue: completed label on, in-progress off,
@@ -1406,6 +1452,39 @@ class TestCompositeSource:
         assert src.report_completed(gh(6, kind="workload"), done) is True
         assert len(ops.comments) == 1
         assert [lb["name"] for lb in ops.issues["6"]["labels"]] == ["sbxloop:completed"]
+
+    def test_api_items_ride_the_api_source(self) -> None:
+        """An item the remote API admitted (#1036) routes to the API
+        source — never to GitHub, never to chat."""
+        ops = RecordingOps()
+        github = GitHubIssueSource(lambda: ops, "o/r", LABELS, host="db")  # type: ignore[arg-type]
+        api = ApiSource()
+        src = CompositeSource(github, ChatSource(), None, api)
+        assert src.name == "github+chat+api" and api.name == "api"
+        item = WorkItem(item_id="api:k1", source_key="k1", title="x", kind="workload")
+        assert src.for_item(item) is api
+        assert src.claim(item) is True and src.settle_claim(item) is False
+        src.report_abandoned(item, "boom")
+        assert ops.comments == [] and ops.raw_calls == []
+        # Without an API source the item falls to GitHub, as before.
+        assert CompositeSource(github, ChatSource()).for_item(item) is github
+
+    def test_admit_routes_to_the_repository_that_owns_the_issue(self) -> None:
+        one, two = RecordingOps({"4": issue(4)}), RecordingOps({"4": issue(4)})
+        multi = MultiRepoIssueSource(
+            [
+                GitHubIssueSource(lambda: one, "o/one", LABELS, host="db", qualify_ids=True),  # type: ignore[arg-type]
+                GitHubIssueSource(lambda: two, "o/two", LABELS, host="db", qualify_ids=True),  # type: ignore[arg-type]
+            ]
+        )
+        item = multi.admit("o/two", "4", "code")
+        assert item.item_id == "gh:o/two:issue:4" and item.repo == "o/two"
+        assert not any(m == "POST" for m, _, _ in one.raw_calls)
+        assert any(m == "POST" for m, _, _ in two.raw_calls)
+        with pytest.raises(KeyError):
+            multi.admit("o/three", "4", "code")
+        # The composite reaches it by name, as it does the other extras.
+        assert CompositeSource(multi, ChatSource()).admit("o/one", "4", "code").repo == "o/one"
 
     def test_the_github_extras_are_reachable_by_name(self) -> None:
         src = self.make(RecordingOps())

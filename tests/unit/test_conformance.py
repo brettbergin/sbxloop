@@ -13,6 +13,7 @@ from sbxloop.sbx import conformance
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.conformance import (
     CATALOG,
+    PROBE_API_HOST_UNREACHABLE,
     PROBE_CP_DIR_SEMANTICS,
     PROBE_EXEC_ERROR_CHANNEL,
     PROBE_LS_COLUMNS,
@@ -114,6 +115,45 @@ class TestDeepRun:
         assert outcome.verdict == "not-found"
         # flipped verdict vs what the codebase depends on -> loud drift
         assert outcome.drifts
+
+
+class TestApiHostProbe:
+    """The remote API's isolation claim is probed, not assumed (#1041):
+    the fake models the verdict the codebase is built against, and either
+    way a worker sandbox could reach the listener is loud drift."""
+
+    def test_the_fake_answers_unreachable_and_denied(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        report = run_conformance(make_cli(fake_sbx), SbxloopHome(tmp_path / "state"), deep=True)
+        outcome = by_id(report)[PROBE_API_HOST_UNREACHABLE]
+        assert outcome.verdict == "unreachable" and outcome.drifts == []
+        assert "policy denies 127.0.0.1, 10.0.2.2" in outcome.detail
+        # The policy was asked about both addresses, scoped to the sandbox.
+        checks = [p for p in fake_sbx.policies() if p[:3] == ["check", "network", "127.0.0.1"]]
+        assert checks and "--sandbox" in checks[0]
+
+    @pytest.mark.parametrize(
+        ("answer", "verdict"),
+        [
+            ("reachable 10.0.2.2", "reachable"),
+            ("policy-allows", "policy-allows"),
+            ("garbage", "unreachable"),
+        ],
+    )
+    def test_a_reachable_listener_or_a_permissive_policy_drifts(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        answer: str,
+        verdict: str,
+    ) -> None:
+        monkeypatch.setenv("SBX_FAKE_API_REACH", answer)
+        report = run_conformance(make_cli(fake_sbx), SbxloopHome(tmp_path / "state"), deep=True)
+        outcome = by_id(report)[PROBE_API_HOST_UNREACHABLE]
+        assert outcome.verdict == verdict
+        assert bool(outcome.drifts) == (verdict != "unreachable")
 
 
 class TestPageSizeProbe:

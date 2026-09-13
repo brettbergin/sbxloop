@@ -74,7 +74,9 @@ Each of these has broken a real run when violated.
     `homeinit.py` builds it, `homemigrate.py` moves an old installation
     into it, `backup.py` snapshots it.
   - `daemon/` — the always-on outer loop: sources, store, control, chat
-    bridges, the concierge.
+    bridges, the concierge. `daemon/controls/` is the typed layer beneath
+    the prose dispatcher: the principal, the service every surface calls,
+    what a control may do to a run right now.
   - `engine/` — one run: `engine.py` (stage machine), `phases.py`,
     `landing.py`, `review.py`, `checks.py`, `model.py`; `prompts/*.md` are
     what the agent is told.

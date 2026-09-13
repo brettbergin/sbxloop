@@ -7,11 +7,15 @@ import pytest
 from sbxloop.ghids import (
     FORGE_PREFIXES,
     GhId,
+    api_item_id,
     chat_item_id,
     format_gh_id,
     has_gh_prefix,
+    is_api_id,
     is_chat_id,
     is_gh_id,
+    is_local_id,
+    is_schedule_id,
     issue_item_id,
     normalize_item_id,
     parse_gh_id,
@@ -112,6 +116,23 @@ def test_chat_ids_are_keyed_by_the_message() -> None:
     for bad in ("", "  ", "a b"):
         with pytest.raises(ValueError, match="malformed chat item key"):
             chat_item_id(bad)
+
+
+def test_api_ids_are_keyed_by_the_admission() -> None:
+    """An ask the remote API admitted is `api:<key>` (#1036): local like a
+    chat ask — nothing on GitHub behind it — and never a chat or schedule
+    id, so the composite source routes it to the API source alone."""
+    assert api_item_id("r7x2") == "api:r7x2"
+    assert api_item_id(" k ") == "api:k"
+    assert is_api_id("api:r7x2") is True
+    assert is_api_id("api:") is False and is_api_id("chat:r7x2") is False
+    assert is_local_id("api:r7x2") is True
+    assert is_chat_id("api:r7x2") is False and is_schedule_id("api:r7x2") is False
+    assert is_gh_id("api:r7x2") is False
+    assert normalize_item_id("api:r7x2") == "api:r7x2"
+    for bad in ("", "  ", "a b"):
+        with pytest.raises(ValueError, match="malformed api item key"):
+            api_item_id(bad)
 
 
 class TestForgePrefixes:
