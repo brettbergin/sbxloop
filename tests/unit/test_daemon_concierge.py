@@ -305,6 +305,35 @@ class TestJobShape:
         assert dstore.get_value(STATE_SESSION_ID) == "sB"
         assert dstore.get_value(STATE_SESSION_TURNS) == "1"
 
+    def test_product_sessions_are_scoped_by_channel_and_role(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(
+            tmp_path,
+            [
+                {"session_id": "session-a"},
+                {"session_id": "session-b"},
+                {"session_id": "session-a"},
+            ],
+        )
+        for key in ("channel-a:angie", "channel-b:angie", "channel-a:angie"):
+            concierge.submit_turn("hello", author="owner", session_key=key).result(timeout=10)
+        assert [job.resume_session_id for job in client.jobs] == [None, None, "session-a"]
+
+    def test_conversation_turn_has_persona_but_no_action_tools(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(tmp_path, [{"session_id": "conversation"}])
+        concierge.submit_turn(
+            "hello",
+            author="owner",
+            session_key="channel-a:angie",
+            persona="\nYou are Angie.",
+            allow_actions=False,
+        ).result(timeout=10)
+        (job,) = client.jobs
+        assert job.host_tools == []
+        assert job.mcp_servers == []
+        assert job.system_message is not None
+        assert "You are Angie." in job.system_message
+        assert "ordinary conversation turn" in job.system_message
+
     def test_github_tool_present_when_repo_configured(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(tmp_path, [{}], github=FakeGithub())
         turn(concierge)

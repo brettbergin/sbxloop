@@ -304,6 +304,12 @@ class Concierge:
         # Effects the turn's tools promised for after the reply (#969).
         self._turn_after: list[Callable[[], None]] = []
         self._turn_message_id: str | None = None
+        # Product clients can keep several durable channels in the same
+        # installation. Turns are still serialized by this executor, so the
+        # current channel's session scope and prompt overlay need one slot.
+        self._turn_session_key: str | None = None
+        self._turn_persona: str | None = None
+        self._turn_allow_actions = True
 
         self.host = host
         self.bus = bus
@@ -372,6 +378,9 @@ class Concierge:
         on_tool: ToolCallback | None = None,
         via: str | None = None,
         message_id: str | None = None,
+        session_key: str | None = None,
+        persona: str | None = None,
+        allow_actions: bool = True,
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
@@ -390,9 +399,14 @@ class Concierge:
             self._turn_author_id = author_id
             self._turn_via = via
             self._turn_message_id = message_id
+            self._turn_session_key = session_key
+            self._turn_persona = persona
+            self._turn_allow_actions = allow_actions
             self._turn_after = []
             try:
-                reply = self._run_turn(text, author=author, on_tool=on_tool)
+                reply = self._run_turn(
+                    text, author=author, on_tool=on_tool, session_key=session_key
+                )
             except BaseException:
                 # No reply will be posted, so nothing is waiting on one:
                 # the effects the tools promised still happen.
@@ -403,16 +417,19 @@ class Concierge:
                 self._turn_author_id = None
                 self._turn_via = None
                 self._turn_message_id = None
+                self._turn_session_key = None
+                self._turn_persona = None
+                self._turn_allow_actions = True
             after, self._turn_after = self._turn_after, []
             return reply._replace(after=_sequence(after)) if after else reply
 
         return self._executor.submit(run)
 
-    def reset_session(self) -> None:
-        self.dstore.set_value(STATE_SESSION_ID, None)
-        self.dstore.set_value(STATE_SESSION_TURNS, None)
-        self.dstore.set_value(STATE_SESSION_MODEL, None)
-        log.info("concierge.session_reset")
+    def reset_session(self, session_key: str | None = None) -> None:
+        self.dstore.set_value(self._session_state_key(STATE_SESSION_ID, session_key), None)
+        self.dstore.set_value(self._session_state_key(STATE_SESSION_TURNS, session_key), None)
+        self.dstore.set_value(self._session_state_key(STATE_SESSION_MODEL, session_key), None)
+        log.info("concierge.session_reset", scope=session_key or "default")
 
     def close(self) -> None:
         with self._state_lock:
@@ -425,13 +442,21 @@ class Concierge:
 
     # -- one turn ---------------------------------------------------------------
 
-    def _run_turn(self, text: str, *, author: str, on_tool: ToolCallback | None) -> ConciergeReply:
+    def _run_turn(
+        self,
+        text: str,
+        *,
+        author: str,
+        on_tool: ToolCallback | None,
+        session_key: str | None = None,
+    ) -> ConciergeReply:
         started = time.monotonic()
         try:
             selection = model_for_phase(refreshed_models(self.config), "concierge")
         except SbxloopError as exc:
             return self._error_reply(exc, started)
-        recorded = self.dstore.get_value(STATE_SESSION_MODEL)
+        model_key = self._session_state_key(STATE_SESSION_MODEL, session_key)
+        recorded = self.dstore.get_value(model_key)
         identity = json.dumps([self.config.agent.backend, selection.model])
         recovering = ProviderRecovery(self.store, self.config.agent.backend).pending(
             CONCIERGE_RUN_ID
@@ -445,9 +470,9 @@ class Concierge:
                 return self._error_reply(ConfigError("concierge recovery backend changed"), started)
             selection = ModelSelection(old_model, "interrupted call")
         elif recorded != identity:
-            self.reset_session()
+            self.reset_session(session_key)
         self._turn_model = selection
-        session_id, turns = self._session()
+        session_id, turns = self._session(session_key)
         if turns >= self.config.concierge.session_turns:
             log.info("concierge.session_rotated", turns=turns)
             session_id, turns = None, 0
@@ -462,7 +487,7 @@ class Concierge:
                 # The sandbox forgot the session (rebuilt VM, expired
                 # store): start over rather than fail every message.
                 log.warning("concierge.session_lost", error=str(exc)[:200])
-                self.reset_session()
+                self.reset_session(session_key)
                 session_id, turns, retry = None, 0, True
             elif isinstance(exc, WorkerError | SbxError) and not isinstance(
                 exc, WorkerTimeoutError
@@ -471,7 +496,7 @@ class Concierge:
                 # (rate-limited) and the retry re-provisions — with a fresh
                 # session store, so the resume id is gone too.
                 if self.host.note_failure(exc):
-                    self.reset_session()
+                    self.reset_session(session_key)
                     session_id, turns, retry = None, 0, True
             if not retry:
                 return self._error_reply(exc, started)
@@ -481,8 +506,12 @@ class Concierge:
                 return self._error_reply(exc2, started)
         new_session, output = reply
         if new_session:
-            self.dstore.set_value(STATE_SESSION_ID, new_session)
-            self.dstore.set_value(STATE_SESSION_TURNS, str(turns + 1))
+            self.dstore.set_value(
+                self._session_state_key(STATE_SESSION_ID, session_key), new_session
+            )
+            self.dstore.set_value(
+                self._session_state_key(STATE_SESSION_TURNS, session_key), str(turns + 1)
+            )
         log.info(
             "concierge.turn",
             by=author,
@@ -508,15 +537,24 @@ class Concierge:
     ) -> tuple[str | None, str]:
         cfg = self.config.concierge
         self.dstore.set_value(
-            STATE_SESSION_MODEL, json.dumps([self.config.agent.backend, self._turn_model.model])
+            self._session_state_key(STATE_SESSION_MODEL, self._turn_session_key),
+            json.dumps([self.config.agent.backend, self._turn_model.model]),
         )
+        available_tools = self._tools if self._turn_allow_actions else {}
+        persona = self._turn_persona or ""
+        if not self._turn_allow_actions:
+            persona += (
+                "\n\nThis is an ordinary conversation turn. Do not perform or promise any "
+                "operation. No host or MCP tools are available. Explain that the person can "
+                "explicitly delegate work or mention an agent when action is wanted."
+            )
         job = JobRequest(
             job_id=new_job_id(),
             run_id=CONCIERGE_RUN_ID,
             kind="agent.session",
             prompt=self._preamble(author) + "\n---\n" + text,
-            recovery_key=json.dumps([author, text]),
-            system_message=self._system_message(),
+            recovery_key=json.dumps([self._turn_session_key, author, text]),
+            system_message=self._system_message(actions_allowed=self._turn_allow_actions) + persona,
             model=self._turn_model.model,
             resume_session_id=session_id,
             # Nothing to edit in the scratch sandbox: read-only, and no SDK
@@ -526,8 +564,10 @@ class Concierge:
             expect="text",
             timeout_s=cfg.timeout_s,
             max_tool_calls=cfg.max_tool_calls,
-            mcp_servers=self.config.mcp_specs_for("concierge"),
-            host_tools=[t.spec for t in self._tools.values()],
+            mcp_servers=(
+                self.config.mcp_specs_for("concierge") if self._turn_allow_actions else []
+            ),
+            host_tools=[t.spec for t in available_tools.values()],
             host_tool_timeout_s=min(cfg.timeout_s, 120.0),
         )
 
@@ -574,9 +614,18 @@ class Concierge:
         )
         return ConciergeReply("", ok=False, error=error)
 
-    def _session(self) -> tuple[str | None, int]:
-        session_id = self.dstore.get_value(STATE_SESSION_ID)
-        raw = self.dstore.get_value(STATE_SESSION_TURNS)
+    @staticmethod
+    def _session_state_key(base: str, session_key: str | None) -> str:
+        if not session_key:
+            return base
+        # A bounded digest keeps caller-provided channel ids out of the
+        # daemon-state key space and makes the mapping stable across restarts.
+        digest = hashlib.sha256(session_key.encode()).hexdigest()[:24]
+        return f"{base}:{digest}"
+
+    def _session(self, session_key: str | None = None) -> tuple[str | None, int]:
+        session_id = self.dstore.get_value(self._session_state_key(STATE_SESSION_ID, session_key))
+        raw = self.dstore.get_value(self._session_state_key(STATE_SESSION_TURNS, session_key))
         try:
             turns = int(raw) if raw else 0
         except ValueError:
@@ -640,7 +689,7 @@ class Concierge:
 
     # -- prompt --------------------------------------------------------------
 
-    def _system_message(self) -> str:
+    def _system_message(self, *, actions_allowed: bool = True) -> str:
         daemon = self.config.daemon
         notes = [
             f"poll interval {daemon.poll_interval_s:g}s; at most {daemon.max_runs_per_day} "
@@ -674,8 +723,12 @@ class Concierge:
             workloads=bullet_list(self._workload_lines())
             or "(no `[[workloads]]` profile declared: a workload runs with no profile and "
             "may declare no needs — chat is its only sink)",
-            tool_notes=bullet_list(
-                [f"`{t.spec.name}` — {t.spec.description}" for t in self._tools.values()]
+            tool_notes=(
+                bullet_list(
+                    [f"`{t.spec.name}` — {t.spec.description}" for t in self._tools.values()]
+                )
+                if actions_allowed
+                else "(none for this conversation turn)"
             ),
             daemon_notes=bullet_list(notes),
         )

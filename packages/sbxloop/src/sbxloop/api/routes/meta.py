@@ -39,6 +39,14 @@ FEATURES: tuple[str, ...] = (
     "daemon.lifecycle",
     "repositories.resume",
     "schedules",
+    "auth.local_user",
+    "collaboration.channels",
+    "collaboration.turns",
+    "collaboration.agents",
+    "collaboration.teams",
+    "collaboration.preferences",
+    "collaboration.workflows",
+    "collaboration.connections.read",
 )
 
 

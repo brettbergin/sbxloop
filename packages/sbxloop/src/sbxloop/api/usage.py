@@ -30,7 +30,7 @@ from sbxloop.engine.store import StateStore
 from sbxloop_worker.protocol import Usage
 
 #: How wide a usage window may be, so a fold stays bounded.
-WINDOW_MAX_S = 31 * 86400.0
+WINDOW_MAX_S = 90 * 86400.0
 
 
 def totals(usage: Usage) -> UsageTotals:

@@ -33,6 +33,9 @@ Capability = Literal[
     "credentials:manage",
     "audit:read",
     "diagnostics:read",
+    "collaboration:read",
+    "collaboration:write",
+    "collaboration:delegate",
 ]
 
 #: Every capability, in the order the spike lists them.

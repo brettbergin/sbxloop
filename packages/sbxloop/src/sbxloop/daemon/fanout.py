@@ -34,6 +34,7 @@ class FanoutFrontend:
         # close, no concierge, no watch — the remote API's chronology is
         # one. Added after construction, since the listener comes up later.
         self.observers: list[Any] = []
+        self.concierge: Concierge | None = None
 
     def add_observer(self, observer: Any) -> None:
         self.observers.append(observer)
@@ -84,6 +85,7 @@ class FanoutFrontend:
                 log.warning("frontend.close_failed", backend=bridge.backend, exc_info=True)
 
     def set_concierge(self, concierge: Concierge | None) -> None:
+        self.concierge = concierge
         for bridge in self.bridges:
             bridge.concierge = concierge
 

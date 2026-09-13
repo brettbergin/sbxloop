@@ -24,6 +24,7 @@ from sbxloop.api.routes import (
     artifacts,
     auth,
     catalog,
+    collaboration,
     control,
     diagnostics,
     events,
@@ -117,7 +118,7 @@ def create_app(ctx: ApiContext) -> FastAPI:
         app.add_middleware(
             CORSMiddleware,
             allow_origins=list(ctx.api.cors_origins),
-            allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+            allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
             allow_headers=["Authorization", "Content-Type", "Idempotency-Key", "X-Request-Id"],
             expose_headers=["X-Request-Id", "Location", "Retry-After"],
             allow_credentials=False,
@@ -140,4 +141,5 @@ def create_app(ctx: ApiContext) -> FastAPI:
     app.include_router(events.router)
     app.include_router(ws.router)
     app.include_router(auth.router)
+    app.include_router(collaboration.router)
     return app
