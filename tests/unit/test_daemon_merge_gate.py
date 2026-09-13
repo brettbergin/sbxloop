@@ -257,6 +257,38 @@ class TestApprove:
         with pytest.raises(ValueError, match="no merge gate"):
             h.loop.approve_merge("gh:issue:404")
 
+    def test_a_revision_bound_approval_binds_to_the_gate_it_saw(self, tmp_path: Path) -> None:
+        """#1038: a remote approval carries the gate revision the person
+        read; a gate that moved loses the swap, typed, and a second
+        approval at the same revision is told who got there first — while
+        the prose edge keeps its sentence."""
+        from sbxloop.daemon.controls import ControlError
+
+        h, _fake, run_id = self.approve_ready(tmp_path)
+        gate = h.dstore.merge_gate_for(run_id)
+        assert gate is not None
+        assert not h.dstore.claim_merge_gate(run_id, "x", expected_revision=gate.revision + 1)
+        with pytest.raises(ControlError) as stale:
+            h.loop.approve_merge(run_id, by="one", expected_revision=gate.revision + 1)
+        assert (
+            stale.value.code == "stale_revision" and stale.value.detail["revision"] == gate.revision
+        )
+        assert h.dstore.merge_gate_for(run_id).state == "open"  # type: ignore[union-attr]
+        text = h.loop.approve_merge(run_id, by="one", expected_revision=gate.revision)
+        assert "approved by one" in text
+        with pytest.raises(ControlError) as lost:
+            h.loop.approve_merge(run_id, by="two", expected_revision=gate.revision)
+        assert lost.value.code in ("stale_revision", "already_in_progress")
+        # No revision: the prose caller hears the sentence it always heard —
+        # "being merged" while the landing thread runs, "already merged" once
+        # it has finished; which one depends on the thread, not the caller.
+        try:
+            text = h.loop.approve_merge(run_id, by="three")
+        except ValueError as done:
+            assert "already merged" in str(done)
+        else:
+            assert "already being merged" in text
+
     def test_a_failed_merge_reopens_the_gate(self, tmp_path: Path) -> None:
         h, fake, run_id = self.approve_ready(tmp_path)
         fake.merge_outcomes = [BLOCKED_405]

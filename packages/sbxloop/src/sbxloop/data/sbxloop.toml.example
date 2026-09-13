@@ -863,6 +863,26 @@ service_memory = "2g"
 # refresh_s = 0.5                  # how often a live screen re-reads the store
 # retention_days = 14              # mailbox rows pruned past this (0 keeps them)
 
+# [api]
+# The remote operations API, served by `sbxloop daemon` in-process: REST
+# under /v1 with generated OpenAPI, for a client that admits work, watches
+# it, steers it and fetches results without parsing CLI prose. Off by
+# default; needs the `sbxloop[api]` extra. Clients authenticate with a
+# short-lived access token minted from credentials created with
+# `sbxloop api client create`. TLS is your reverse proxy's job.
+# enabled = false
+# bind = "127.0.0.1"               # loopback unless a proxy in front needs more
+# port = 8420                      # the listener's TCP port
+# trusted_proxies = []             # proxies whose X-Forwarded-* headers are believed
+# access_token_ttl_s = 900         # an access token lives 15 minutes
+# refresh_token_ttl_s = 604800     # a refresh token a week; rotated on every use
+# cors_origins = []                # browser origins allowed; empty disables CORS
+# max_body_bytes = 262144          # larger request bodies are refused (413)
+# max_stream_clients = 32          # live SSE/WebSocket streams served at once
+# replay_retention_s = 604800      # public chronology kept a week for replay
+# idempotency_retention_s = 86400  # an Idempotency-Key answers the same for a day
+# operation_deadline_s = 300       # an unclaimed command expires after this
+
 # [concierge]
 # The control channel's agent: @mention the bot (or reply to it) to ask
 # about runs, PRs and diffs, operate the daemon (every !sbx verb) or queue

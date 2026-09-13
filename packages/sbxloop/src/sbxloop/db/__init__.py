@@ -1,9 +1,11 @@
 """The data layer: one SQLite file, SQLAlchemy models, Alembic migrations.
 
 ``<home>/state/state.db`` holds every table sbxloop persists — the engine's
-five and the daemon's fourteen. :mod:`sbxloop.db.session` builds the
-connections, :mod:`sbxloop.db.schema` applies the migrations, and
-:mod:`sbxloop.db.base` carries the metadata the models hang off.
+five, the daemon's fifteen and the five behind the remote API (operations,
+the public chronology, clients and their tokens).
+:mod:`sbxloop.db.session` builds the connections, :mod:`sbxloop.db.schema`
+applies the migrations, and :mod:`sbxloop.db.base` carries the metadata the
+models hang off.
 """
 
 from __future__ import annotations
