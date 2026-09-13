@@ -381,29 +381,6 @@ jobs:
           mkdir -p "${SBXLOOP_HOME}/logs/deploy"
           echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) ${{ steps.installed.outputs.current }} -> ${VERSION} run=${{ github.run_id }}" >> "${SBXLOOP_HOME}/logs/deploy/history.log"
 
-      - name: Snapshot the holds to restore
-        id: state
-        if: steps.final.outputs.changed == 'true'
-        run: |
-          set -euo pipefail
-          # Holds are in-memory (#308), so the restart drops every one of
-          # them. Read them *now*, not at the start of the job: an operator
-          # who paused during the wait must still be paused afterwards.
-          # Ours is dropped from the list — the restart releases it.
-          status="$("${SBXLOOP}" daemon ctl status --json --timeout 30 || true)"
-          echo "${status}"
-          holds="$(jq -r '.holds // [] | .[]' <<<"${status}" 2>/dev/null | tr '\n' ' ' || true)"
-          keep=""
-          for h in ${holds}; do
-            [ "${h}" = "${HOLD}" ] && continue
-            keep="${keep} ${h}"
-          done
-          keep="${keep# }"
-          echo "holds=${keep}" >> "$GITHUB_OUTPUT"
-          if [ -n "${keep}" ]; then
-            echo "::notice::holds to restore after the restart: ${keep}"
-          fi
-
       - name: Restart the daemon
         if: steps.final.outputs.changed == 'true'
         run: |
@@ -493,26 +470,12 @@ jobs:
         run: |
           "${VENV_PYTHON}" "${PIPELINE}" deploy-finish
 
-      - name: Restore the other holds
-        # Runs after a rollback too: whatever version is live, the operator's
-        # intent must survive. Required because holds are in-memory only
-        # (#308), so the daemon always comes back claiming work.
-        if: always() && steps.final.outputs.changed == 'true' && steps.state.outcome == 'success'
-        env:
-          HOLDS: ${{ steps.state.outputs.holds }}
-        run: |
-          set -euo pipefail
-          # Must run AFTER the restart: ControlServer refuses any request
-          # stamped before the daemon started ("resend it").
-          for h in ${HOLDS}; do
-            "${SBXLOOP}" daemon ctl pause --hold "${h}" --timeout 60 \
-              || echo "::warning::could not restore hold ${h}"
-          done
-
       - name: Release the deploy hold
-        # Whatever happened — timed out waiting, failed before the restart —
-        # our hold must not outlive the job. After a restart it is already
-        # gone (in-memory) and this is a no-op.
+        # Whatever happened — timed out waiting, failed before the restart,
+        # rolled back — our hold must not outlive the job. Holds survive the restart,
+        # so a job that died after it would otherwise leave the daemon paused
+        # until someone noticed. An operator's own hold is theirs and stands on
+        # its own; nothing here touches it.
         if: always() && steps.hold.outcome == 'success'
         run: |
           set -euo pipefail

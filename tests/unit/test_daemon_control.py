@@ -300,7 +300,8 @@ class TestDispatch:
         assert reply.text == usage("sbxloop daemon ctl")
         assert (
             "sbxloop daemon ctl status|pause [--hold NAME]|resume [<item|run>|--hold NAME|--all]|"
-            "cancel [<item|run>|--retry]|queue|items|" in reply.text
+            "cancel [<item|run>|--retry]|cancel-run <run> [--retry]|resume-run <run>|queue|items|"
+            in reply.text
         )
         assert "log [--tail N] [--level LEVEL] [--grep TEXT]|stop|restart [--now]" in reply.text
 

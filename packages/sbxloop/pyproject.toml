@@ -72,6 +72,11 @@ slack = ["slack-sdk>=3.44.1", "aiohttp>=3.9"]
 # Mattermost's API is plain REST plus a websocket, so the bridge speaks it
 # directly (see daemon/mattermost.py) rather than through a driver.
 mattermost = ["aiohttp>=3.9"]
+api = [
+    "fastapi>=0.115",
+    "pyjwt[crypto]>=2.9",
+    "uvicorn[standard]>=0.30",
+]
 
 [project.scripts]
 sbxloop = "sbxloop.cli.app:main"

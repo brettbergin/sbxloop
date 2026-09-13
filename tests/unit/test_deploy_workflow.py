@@ -184,11 +184,9 @@ class TestNeverRestartUnderARun:
             "Take the deploy hold",
             "Wait for the daemon to go idle",
             "Upgrade",
-            "Snapshot the holds to restore",
             "Restart the daemon",
             "Health check",
             "Roll back",
-            "Restore the other holds",
             "Release the deploy hold",
         ]
         positions = [deploy.index(f"      - name: {name}\n") for name in order]
@@ -223,12 +221,14 @@ class TestNamedHolds:
         assert not re.search(r"ctl pause( --timeout|\s*\|\|)", deploy)
         assert not re.search(r"ctl resume( --timeout|\s*\|\|)", deploy)
 
-    def test_other_holds_are_snapshotted_right_before_the_restart(self, deploy: str) -> None:
-        snapshot = _step(deploy, "Snapshot the holds to restore")
-        assert "jq -r '.holds // [] | .[]'" in snapshot
-        assert '[ "${h}" = "${HOLD}" ] && continue' in snapshot
-        restore = _step(deploy, "Restore the other holds")
-        assert "if: always()" in restore and 'ctl pause --hold "${h}"' in restore
+    def test_holds_are_not_snapshotted_since_they_survive_the_restart(self, deploy: str) -> None:
+        """Holds are persisted: an operator's pause survives the restart on
+        its own, so the pipeline neither reads nor re-takes them — and its
+        own hold must be released whatever happened, or it outlives the job."""
+        assert "Snapshot the holds" not in deploy and "Restore the other holds" not in deploy
+        assert "jq -r '.holds" not in deploy
+        release = _step(deploy, "Release the deploy hold")
+        assert "survive the restart" in release
 
 
 class TestSecurityInvariant:
@@ -307,7 +307,6 @@ class TestStructuredControl:
         text = request.getfixturevalue(fixture)
         for name in ("Take the deploy hold", "Wait for the daemon to go idle"):
             assert "daemon ctl status --json" in _step(text, name), name
-        assert "daemon ctl status --json" in _step(text, "Snapshot the holds to restore")
         assert 'jq -r "${CURRENT_JQ}"' in _step(text, "Wait for the daemon to go idle")
         for name in ("Announce", "Report"):
             step = _step(text, name)
