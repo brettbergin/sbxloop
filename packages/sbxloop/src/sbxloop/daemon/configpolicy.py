@@ -27,6 +27,7 @@ NEVER_FROM_CHAT: dict[str, str] = {
     "slack": "it configures the chat channel the outcome is reported on",
     "mattermost": "it configures the chat channel the outcome is reported on",
     "tui": "it configures the operator console's own bridge",
+    "api": "it opens the host's remote listener and sets who it trusts",
     "concierge.enabled": "it is the concierge's own switch",
     "concierge.edit_config": "it is the gate on these tools — no self-widening",
     "concierge.config_locked": "it is the lock list these tools honour — no self-widening",

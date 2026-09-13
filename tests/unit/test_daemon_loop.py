@@ -2503,12 +2503,13 @@ class TestPauseHolds:
 
 class TestDeployChoreography:
     """The deploy pipeline's steps (`.github/workflows/deploy.yml`), played
-    against the loop: take a hold, wait for idle, snapshot the *other*
-    holds right before the restart, restart (holds are in-memory: a fresh
-    loop has none), re-take the snapshot, release the deploy's own hold.
-    Covers the two 2026-08-29 pause/restore races (#534): an operator pause
-    issued before the deploy (18:36) and during its wait (21:10) both
-    survive it."""
+    against the loop: take a hold, wait for idle, restart, release the
+    deploy's own hold. Holds are persisted (#1034), so the restart keeps
+    every hold standing and the pipeline no longer snapshots and re-takes
+    them; the choreography here still re-takes what it saw, as an older
+    pipeline would, to show that is harmless. Covers the two 2026-08-29
+    pause/restore races (#534): an operator pause issued before the deploy
+    (18:36) and during its wait (21:10) both survive it."""
 
     HOLD = "deploy-123"
 
@@ -2536,10 +2537,11 @@ class TestDeployChoreography:
             loop.tick()
         if operator_pauses_during_wait:
             assert dispatch(loop, "pause", by="brett").ok
-        # Snapshot the holds immediately before the restart, minus our own.
+        # An older pipeline snapshots the holds before the restart, minus
+        # its own; re-taking them afterwards is idempotent now.
         holds = self._status(loop)["text"]["holds"]
         keep = [x.strip() for x in holds.split(",") if x.strip() not in ("none", self.HOLD)]
-        # Restart: a new process has no holds at all.
+        # Restart: a new process loads the holds the store kept.
         again = DaemonLoop(
             h.config,
             store=h.store,
@@ -2550,7 +2552,7 @@ class TestDeployChoreography:
         )
         for hold in keep:
             assert dispatch(again, f"pause --hold {hold}", by="github-actions").ok
-        # Release our hold: already gone with the restart; a no-op.
+        # Release our hold: it survived the restart, so this is what ends it.
         assert dispatch(again, f"resume --hold {self.HOLD}", by="github-actions").ok
         return again
 
