@@ -7,18 +7,21 @@
 </p>
 
 ## Infrastructure & Runtime
+
 <p>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.13%2B-3776AB?logo=python&amp;logoColor=white" alt="Python 3.13+" /></a>
   <a href="https://docs.docker.com/ai/sandboxes/"><img src="https://img.shields.io/badge/Docker-Sandboxes-2496ED?logo=docker&amp;logoColor=white" alt="Docker Sandboxes" /></a>
 </p>
 
 ## Data & Configuration
+
 <p>
   <a href="https://www.sqlite.org/"><img src="https://img.shields.io/badge/SQLite-003B57?logo=sqlite&amp;logoColor=white" alt="SQLite" /></a>
   <a href="https://docs.pydantic.dev/"><img src="https://img.shields.io/badge/Pydantic-E92063?logo=pydantic&amp;logoColor=white" alt="Pydantic" /></a>
 </p>
 
 ## CLI & User Interface
+
 <p>
   <a href="https://typer.tiangolo.com/"><img src="https://img.shields.io/badge/Typer-009688" alt="Typer" /></a>
   <a href="https://rich.readthedocs.io/"><img src="https://img.shields.io/badge/Rich-4051B5" alt="Rich" /></a>
@@ -26,11 +29,13 @@
 </p>
 
 ## Logging & Observability
+
 <p>
   <a href="https://www.structlog.org/"><img src="https://img.shields.io/badge/structlog-555555" alt="structlog" /></a>
 </p>
 
 ## Agent & Language Model Support
+
 <p>
   <a href="https://github.com/github/copilot-sdk"><img src="https://img.shields.io/badge/GitHub_Copilot-SDK-000000?logo=githubcopilot&amp;logoColor=white" alt="GitHub Copilot SDK" /></a>
   <a href="https://github.com/anthropics/claude-agent-sdk-python"><img src="https://img.shields.io/badge/Claude-Agent_SDK-D97757?logo=claude&amp;logoColor=white" alt="Claude Agent SDK" /></a>
@@ -39,6 +44,7 @@
 </p>
 
 ## Version Control & Forge Integration
+
 <p>
   <a href="https://github.com/"><img src="https://img.shields.io/badge/GitHub-supported-181717?logo=github&amp;logoColor=white" alt="GitHub supported" /></a>
   <a href="https://about.gitlab.com/"><img src="https://img.shields.io/badge/GitLab-config_preview-FC6D26?logo=gitlab&amp;logoColor=white" alt="GitLab configuration preview" /></a>
@@ -46,6 +52,7 @@
 </p>
 
 ## Chat & Notifications
+
 <p>
   <a href="https://discordpy.readthedocs.io/"><img src="https://img.shields.io/badge/Discord-5865F2?logo=discord&amp;logoColor=white" alt="Discord" /></a>
   <a href="https://github.com/slackapi/python-slack-sdk"><img src="https://img.shields.io/badge/Slack-4A154B?logo=slack&amp;logoColor=white" alt="Slack" /></a>
@@ -53,6 +60,7 @@
 </p>
 
 ## Toolchain & Automation
+
 <p>
   <a href="https://docs.astral.sh/uv/"><img src="https://img.shields.io/badge/uv-DE5FE9?logo=uv&amp;logoColor=white" alt="uv" /></a>
   <a href=".github/workflows/ci.yml"><img src="https://img.shields.io/badge/GitHub_Actions-2088FF?logo=githubactions&amp;logoColor=white" alt="GitHub Actions" /></a>
