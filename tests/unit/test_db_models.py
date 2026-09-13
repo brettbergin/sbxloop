@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 from sqlalchemy import Engine, inspect
 
+import sbxloop.db.api_models
 import sbxloop.db.daemon_models
 import sbxloop.db.engine_models  # noqa: F401  - registers the models on Base
 from sbxloop.daemon.store import DaemonStore
@@ -44,8 +45,19 @@ DAEMON_TABLES = (
     "daemon_pending_clarifications",
     "daemon_local_messages",
     "daemon_schedules",
+    "daemon_holds",
 )
-ALL_TABLES = ENGINE_TABLES + DAEMON_TABLES
+API_TABLES = (
+    "api_operations",
+    "api_events",
+    "api_clients",
+    "api_refresh_tokens",
+    "api_token_revocations",
+    "api_public_ids",
+    "api_steering",
+    "api_artifacts",
+)
+ALL_TABLES = ENGINE_TABLES + DAEMON_TABLES + API_TABLES
 
 
 @pytest.fixture

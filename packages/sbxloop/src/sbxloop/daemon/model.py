@@ -117,6 +117,10 @@ class WorkItem(BaseModel):
     # a row that will not load.
     recipe: str | None = None
     recipe_target: str | None = None
+    # Bumped on every write of the row (a trigger, revision 0010); what a
+    # remote command's `expected_revision` is checked against. Not a
+    # column a caller sets.
+    revision: int = 0
 
     @field_validator("recipe")
     @classmethod
@@ -244,6 +248,7 @@ NoticeKind = Literal[
     "daemon.stopped",
     "daemon.paused",
     "daemon.resumed",
+    "daemon.holds_restored",
     "daemon.daily_cap",
     "daemon.gc",
     "daemon.state_archived",
@@ -277,6 +282,7 @@ NoticeKind = Literal[
     "item.requeue_cancelling",
     "item.requeue_unpinned",
     "run.resuming",
+    "run.resume_requested",
     "run.resume_budget_exhausted",
     "run.exhausted",
     "run.rounds_granted",

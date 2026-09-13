@@ -247,7 +247,9 @@ class FakeLoop:
             "repos": list(self.repos),
         }
 
-    def pause(self, hold: str = "operator", *, by: str | None = None) -> list[str]:
+    def pause(self, hold: str = "operator", *, by: str | None = None, **fields: Any) -> list[str]:
+        # `via` / `operation_id` ride along on a loop that keeps holds
+        # durably; the fake records who and ignores the rest.
         self.hold_calls.append(("pause", hold, by))
         self.holds.add(hold)
         return sorted(self.holds)

@@ -42,10 +42,12 @@ from sqlalchemy import (
     Result,
     Select,
     Text,
+    and_,
     delete,
     func,
     insert,
     inspect,
+    or_,
     select,
     text,
     update,
@@ -55,6 +57,7 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import InstrumentedAttribute, Session, aliased
 
+import sbxloop.db.api_models  # noqa: F401  - registers the operations tables on Base
 from sbxloop.config import ScheduleConfig
 from sbxloop.daemon.model import ItemState, PendingReport, WorkItem
 from sbxloop.daemon.schedule import ScheduleRow
@@ -64,6 +67,7 @@ from sbxloop.db.daemon_models import (
     DaemonRunRow,
     DaemonStateRow,
     GatePromptRow,
+    HoldRow,
     LocalMessageRow,
     MergeGateRow,
     PendingClarificationRow,
@@ -78,6 +82,7 @@ from sbxloop.db.daemon_models import (
 from sbxloop.engine.model import RunKind
 from sbxloop.errors import DaemonError
 from sbxloop.ghids import (
+    API_PREFIX,
     CHAT_PREFIX,
     SCHED_PREFIX,
     format_gh_id,
@@ -154,18 +159,21 @@ _REQUESTERS_BODY = """(
 _REQUESTERS_COLUMNS = "source_key, requester_id, created_at"
 
 
-# The repo-less rows that are repo-less by design (#760, #761): a
-# chat-started or scheduled workload has no repository to backfill,
-# attribute or drop it for. The ids are literal-prefixed, so the clause is
-# a constant, not a parameter.
+# The repo-less rows that are repo-less by design (#760, #761, #1036): a
+# chat-started, scheduled or API-admitted workload has no repository to
+# backfill, attribute or drop it for. The ids are literal-prefixed, so the
+# clause is a constant, not a parameter.
 def _not_local() -> ColumnElement[bool]:
     """Rows that belong to a repository at all.
 
-    A chat item or a schedule's item has no repository by design, not by
-    age, so the multi-repo settling passes must leave them alone.
+    A chat item, a schedule's item or an API-admitted item has no
+    repository by design, not by age, so the multi-repo settling passes
+    must leave them alone.
     """
-    return ~WorkItemRow.item_id.like(f"{CHAT_PREFIX}%") & ~WorkItemRow.item_id.like(
-        f"{SCHED_PREFIX}%"
+    return (
+        ~WorkItemRow.item_id.like(f"{CHAT_PREFIX}%")
+        & ~WorkItemRow.item_id.like(f"{SCHED_PREFIX}%")
+        & ~WorkItemRow.item_id.like(f"{API_PREFIX}%")
     )
 
 
@@ -475,6 +483,8 @@ class MergeGate(NamedTuple):
     resolved_by: str | None
     detail: str | None
     kind: str = "merge"  # merge | publish
+    #: Bumped on every write; what an `expected_revision` is checked against.
+    revision: int = 0
 
 
 class ReviewHold(NamedTuple):
@@ -499,6 +509,32 @@ class ReviewHold(NamedTuple):
     resolved_at: float | None
     resolved_by: str | None
     detail: str | None
+    #: Bumped on every write; what an `expected_revision` is checked against.
+    revision: int = 0
+
+
+class HoldRecord(NamedTuple):
+    """One named pause hold and whose it is (revision 0010)."""
+
+    name: str
+    owner_id: str | None
+    owner_display: str | None
+    via: str
+    reason: str
+    created_at: float
+    operation_id: str | None
+
+
+def _row_to_pause_hold(row: HoldRow) -> HoldRecord:
+    return HoldRecord(
+        name=str(row.name),
+        owner_id=None if row.owner_id is None else str(row.owner_id),
+        owner_display=None if row.owner_display is None else str(row.owner_display),
+        via=str(row.via or ""),
+        reason=str(row.reason or ""),
+        created_at=float(row.created_at),
+        operation_id=None if row.operation_id is None else str(row.operation_id),
+    )
 
 
 def _row_to_hold(row: ReviewHoldRow) -> ReviewHold:
@@ -527,6 +563,7 @@ def _row_to_hold(row: ReviewHoldRow) -> ReviewHold:
         resolved_at=row.resolved_at,
         resolved_by=row.resolved_by,
         detail=row.detail,
+        revision=int(row.revision or 0),
     )
 
 
@@ -587,6 +624,7 @@ def _row_to_gate(row: MergeGateRow) -> MergeGate:
         resolved_by=row.resolved_by,
         detail=row.detail,
         kind=str(row.kind or "merge"),
+        revision=int(row.revision or 0),
     )
 
 
@@ -816,6 +854,7 @@ def _row_to_item(row: WorkItemRow) -> WorkItem:
         profile=row.profile,
         recipe=row.recipe,
         recipe_target=row.recipe_target,
+        revision=int(row.revision or 0),
     )
 
 
@@ -1338,6 +1377,20 @@ class DaemonStore:
     def _read(self) -> Iterator[Session]:
         """A session for a query, held under the lock for the same reason."""
         with self._lock, Session(self._engine) as session:
+            yield session
+
+    @contextmanager
+    def transaction(self) -> Iterator[Session]:
+        """One transaction under the store's lock, for a record that must
+        land with a domain write (an operation and its effect): the
+        operations store writes its rows through here."""
+        with self._write() as session:
+            yield session
+
+    @contextmanager
+    def read(self) -> Iterator[Session]:
+        """A query session under the store's lock, for the same callers."""
+        with self._read() as session:
             yield session
 
     def backfill_repo(self, repo: str | None) -> int:
@@ -2103,6 +2156,38 @@ class DaemonStore:
             stmt = stmt.where(WorkItemRow.state.in_(list(states)))
         with self._read() as session:
             return [_row_to_item(row) for row in session.scalars(stmt)]
+
+    def page_items(
+        self,
+        *,
+        states: Sequence[str] | None = None,
+        kinds: Sequence[str] | None = None,
+        repo: str | None = None,
+        after: tuple[float, str] | None = None,
+        limit: int = 50,
+    ) -> list[WorkItem]:
+        """A page of items, newest first, keyed on ``(created_at, item_id)``
+        so a reader paging while discovery inserts sees no gap and no
+        repeat (#1036). ``after`` is the key of the last item read."""
+        stmt = select(WorkItemRow).order_by(
+            WorkItemRow.created_at.desc(), WorkItemRow.item_id.desc()
+        )
+        if states:
+            stmt = stmt.where(WorkItemRow.state.in_(list(states)))
+        if kinds:
+            stmt = stmt.where(WorkItemRow.run_kind.in_(list(kinds)))
+        if repo is not None:
+            stmt = stmt.where(WorkItemRow.repo == repo)
+        if after is not None:
+            created_at, item_id = after
+            stmt = stmt.where(
+                or_(
+                    WorkItemRow.created_at < created_at,
+                    and_(WorkItemRow.created_at == created_at, WorkItemRow.item_id < item_id),
+                )
+            )
+        with self._read() as session:
+            return [_row_to_item(row) for row in session.scalars(stmt.limit(limit))]
 
     # -- operator controls (#229) ------------------------------------------------
 
@@ -2995,12 +3080,17 @@ class DaemonStore:
                 )
             ]
 
-    def claim_merge_gate(self, run_id: str, by: str | None = None) -> bool:
+    def claim_merge_gate(
+        self, run_id: str, by: str | None = None, *, expected_revision: int | None = None
+    ) -> bool:
         """CAS ``open → approving``: exactly one click/command wins; a
         double-click loses here instead of double-merging. ``by`` records
-        who won, for the resolution that follows to name."""
+        who won, for the resolution that follows to name. With
+        ``expected_revision`` the swap also requires the gate row to be at
+        that revision, so an approval given for an earlier state of the
+        gate loses here too (#1038)."""
         with self._write() as session:
-            result = session.execute(
+            stmt = (
                 update(MergeGateRow)
                 .where(MergeGateRow.run_id == run_id, MergeGateRow.state == "open")
                 .values(
@@ -3008,7 +3098,21 @@ class DaemonStore:
                     resolved_by=func.coalesce(by, MergeGateRow.resolved_by),
                 )
             )
+            if expected_revision is not None:
+                stmt = stmt.where(MergeGateRow.revision == expected_revision)
+            result = session.execute(stmt)
             return _rowcount(result) == 1
+
+    def merge_gates(self, states: Sequence[str] | None = None) -> list[MergeGate]:
+        """Every gate, newest first, optionally only in ``states`` — the
+        remote API's listing."""
+        stmt = select(MergeGateRow).order_by(
+            MergeGateRow.created_at.desc(), MergeGateRow.run_id.desc()
+        )
+        if states:
+            stmt = stmt.where(MergeGateRow.state.in_(list(states)))
+        with self._read() as session:
+            return [_row_to_gate(row) for row in session.scalars(stmt)]
 
     def reopen_merge_gate(self, run_id: str, detail: str | None = None) -> None:
         """A failed or interrupted approval puts the gate back up; the
@@ -3276,6 +3380,81 @@ class DaemonStore:
         log.info("store.review_hold_resolved", run=run_id, state=state, by=by)
 
     # -- circuit breaker ---------------------------------------------------------
+
+    # -- pause holds (revision 0010) --------------------------------------------
+
+    def holds(self) -> list[HoldRecord]:
+        """Every standing hold, by name."""
+        with self._read() as session:
+            return [
+                _row_to_pause_hold(row)
+                for row in session.scalars(select(HoldRow).order_by(HoldRow.name.asc()))
+            ]
+
+    def take_hold(
+        self,
+        name: str,
+        now: float,
+        *,
+        owner_id: str | None = None,
+        owner_display: str | None = None,
+        via: str = "",
+        reason: str = "",
+        operation_id: str | None = None,
+    ) -> bool:
+        """Record a hold. Idempotent per name: ``True`` when it is new, so
+        the caller narrates the transition once."""
+        with self._write() as session:
+            result = session.execute(
+                insert(HoldRow)
+                .prefix_with("OR IGNORE")
+                .values(
+                    name=name,
+                    owner_id=owner_id,
+                    owner_display=owner_display,
+                    via=via,
+                    reason=reason,
+                    created_at=now,
+                    operation_id=operation_id,
+                )
+            )
+            return _rowcount(result) == 1
+
+    def release_hold(self, name: str | None) -> list[str]:
+        """Release one hold (``None``: every hold). Returns what was released."""
+        with self._write() as session:
+            stmt = select(HoldRow.name)
+            if name is not None:
+                stmt = stmt.where(HoldRow.name == name)
+            released = sorted(str(n) for n in session.scalars(stmt))
+            if released:
+                session.execute(delete(HoldRow).where(HoldRow.name.in_(released)))
+            return released
+
+    def admit_resume(self, item_id: str, run_id: str, now: float) -> WorkItem:
+        """An operator's resume of a pinned run: the item goes back to the
+        queue with the run kept, eligible at once, and the next tick resumes
+        it through the same gates a fresh dispatch faces — never a second
+        engine. A compare-and-set on the pin: ``KeyError`` when the item no
+        longer carries the run or is not settled."""
+        stored = item_id
+        item_id = normalize_item_id(item_id)
+        with self._write() as session:
+            result = session.execute(
+                update(WorkItemRow)
+                .where(
+                    _id_where(stored),
+                    WorkItemRow.run_id == run_id,
+                    WorkItemRow.state.in_(("queued", "cancelled", "failed")),
+                )
+                .values(state="queued", not_before=None, updated_at=now)
+            )
+            if _rowcount(result) != 1:
+                raise KeyError(f"{item_id} does not carry run {run_id} in a resumable state")
+            row = session.scalars(select(WorkItemRow).where(_id_where(stored))).one()
+            fresh = _row_to_item(row)
+        log.info("store.resume_admitted", item=item_id, run=run_id)
+        return fresh
 
     def breaker(self) -> tuple[float | None, int]:
         """(opened_at, consecutive_failures) as last persisted. Kept in the

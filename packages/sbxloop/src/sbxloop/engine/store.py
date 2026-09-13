@@ -30,7 +30,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, NamedTuple, cast
 
-from sqlalchemy import Result, case, func, insert, select, text, update
+from sqlalchemy import Result, and_, case, func, insert, or_, select, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
@@ -697,6 +697,7 @@ class StateStore:
             published=[
                 Published.model_validate(entry) for entry in json.loads(row.published or "[]")
             ],
+            revision=int(row.revision or 0),
         )
 
     def non_terminal_runs(self) -> list[RunRecord]:
@@ -956,6 +957,43 @@ class StateStore:
             )
             if _rowcount(result) == 0:
                 raise StateError(f"unknown task {task.spec.id} in run {run_id}")
+
+    def page_runs(
+        self,
+        *,
+        states: Sequence[str] | None = None,
+        kinds: Sequence[str] | None = None,
+        after: tuple[float, str] | None = None,
+        limit: int = 50,
+    ) -> list[RunRecord]:
+        """A page of runs in :meth:`recent_runs` order (touched most
+        recently first), keyed on ``(updated_at, run_id)`` so a reader
+        paging while runs move sees no gap and no repeat (#1036).
+        ``states`` are matched on the record, after the legacy spellings
+        are remapped, so the filter is applied in Python on a bounded
+        over-read rather than trusted to the column."""
+        stmt = select(Run).order_by(Run.updated_at.desc(), Run.run_id.desc())
+        if kinds:
+            stmt = stmt.where(Run.kind.in_(list(kinds)))
+        if after is not None:
+            updated_at, run_id = after
+            stmt = stmt.where(
+                or_(
+                    Run.updated_at < updated_at,
+                    and_(Run.updated_at == updated_at, Run.run_id < run_id),
+                )
+            )
+        wanted = set(states or ())
+        out: list[RunRecord] = []
+        with self._read() as session:
+            for row in session.scalars(stmt):
+                record = self._run_record(row)
+                if wanted and record.state not in wanted:
+                    continue
+                out.append(record)
+                if len(out) >= limit:
+                    break
+        return out
 
     def get_tasks(self, run_id: str) -> list[TaskRecord]:
         with self._read() as session:
