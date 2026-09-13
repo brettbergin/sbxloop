@@ -79,6 +79,7 @@ from sbxloop.errors import (
     ProvisionError,
     SbxError,
     SbxloopError,
+    ToolRejectedError,
     WorkerError,
     WorkerTimeoutError,
 )
@@ -856,7 +857,7 @@ class Concierge:
             raise ValueError("No collaboration turn is active.")
         agent, message = args.get("agent_slug"), args.get("message")
         if not isinstance(agent, str) or not isinstance(message, str):
-            raise ValueError("An agent slug and message are required.")
+            raise ToolRejectedError("An agent slug and message are required.")
         return self._turn_handoff(agent, message)
 
     def _tool_handler(self, call: HostToolCall, *, author: str) -> HostToolResponse:
@@ -870,6 +871,19 @@ class Concierge:
         try:
             with self._tool_lock:
                 text = tool.impl(dict(call.arguments), by)
+        except ToolRejectedError as exc:
+            log.info(
+                "concierge.tool_rejected",
+                tool=call.name,
+                by=author,
+                error=str(exc)[:300],
+            )
+            return HostToolResponse(
+                call_id=call.call_id,
+                ok=False,
+                text=f"tool {call.name} rejected: {exc}",
+                error=str(exc),
+            )
         except Exception as exc:
             log.warning(
                 "concierge.tool_failed",
