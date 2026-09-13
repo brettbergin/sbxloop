@@ -2232,6 +2232,22 @@ single connections and the loop's locks are never touched from the event
 loop thread. Refusals are `application/problem+json` with the `ControlError`
 code mapped to a status; every response carries an `X-Request-Id`.
 
+The additive collaboration layer gives local product clients durable users,
+channels, messages, turns, teams, preferences, workflow definitions, and a
+redacted connection view. Its ORM rows share `DaemonStore` and every read and
+write goes through the same store lock and API executor; it never opens a
+second SQLite connection. Accepting a turn appends its user message and
+idempotency key in one immediate transaction. The concierge then runs outside
+the HTTP loop in a role-scoped session and appends immutable reply messages.
+Channel tombstones are checked again at reply time, so late work cannot
+resurrect a deleted channel. Each collaboration mutation also records a
+`collaboration.*` row in the existing public chronology transaction.
+
+The tool boundary follows explicit work intent. An ordinary conversation gets
+no host or MCP action tools. A known agent/team mention, explicit target, or
+`delegate` intent enables action tools for that role. This keeps conversation
+and delegated work visibly distinct while reusing the same concierge runtime.
+
 Authentication is the daemon's own. `sbxloop api client create` registers a
 client (`api_clients`: a name, the scrypt verifier of a secret shown once,
 the capabilities granted); `POST /v1/auth/token` exchanges the secret for an
@@ -2347,7 +2363,7 @@ attachments, and never served as a type a browser would run. Usage
 client: `null` stays `null`, `recorded` says whether anything was
 reported, and `spend` is `null` by construction with the basis stated —
 telemetry, not an invoice. A window folds every run touched in it from the
-samples' own timestamps and is at most 31 days wide.
+samples' own timestamps and is at most 90 days wide.
 
 **Diagnostics and administration (#1040).** `api/diagnostics.py` reads the
 same in-process log ring `ctl log` and the concierge read

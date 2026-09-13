@@ -46,7 +46,7 @@ def _failed(ctx: ApiContext, keys: list[str]) -> None:
         ctx.limiter.record_failure(key, now)
 
 
-def _grant(ctx: ApiContext, client: Client, *, family_id: str | None) -> TokenResponse:
+def grant_tokens(ctx: ApiContext, client: Client, *, family_id: str | None) -> TokenResponse:
     now = ctx.clock()
     api = ctx.api
     access, claims = mint_access(
@@ -82,7 +82,7 @@ def _client_credentials(ctx: ApiContext, body: TokenRequest, address: str) -> To
         raise Problem(401, exc.code, exc.message) from exc
     for key in keys:
         ctx.limiter.reset(key)
-    return _grant(ctx, client, family_id=None)
+    return grant_tokens(ctx, client, family_id=None)
 
 
 def _refresh(ctx: ApiContext, body: TokenRequest, address: str) -> TokenResponse:

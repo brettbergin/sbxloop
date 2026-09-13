@@ -47,6 +47,7 @@ class Projector:
         #: Runs whose artifacts are to be catalogued, drained on this
         #: thread so the loop's finish path never hashes a tree.
         self._catalog: Callable[[str], None] | None = None
+        self._deliver_work: Callable[[], object] | None = None
         self._pending: deque[str] = deque()
 
     def wake(self) -> None:
@@ -56,6 +57,9 @@ class Projector:
     def catalog_with(self, fn: Callable[[str], None]) -> None:
         """What to call, on this thread, for each run queued for cataloguing."""
         self._catalog = fn
+
+    def deliver_work_with(self, fn: Callable[[], object]) -> None:
+        self._deliver_work = fn
 
     def catalog(self, run_id: str) -> None:
         """From any thread: catalog this run's artifacts when convenient."""
@@ -75,6 +79,11 @@ class Projector:
     def step(self) -> int:
         """One pass: project, notify, prune when due. Returns rows projected."""
         now = self.clock()
+        if self._deliver_work is not None:
+            try:
+                self._deliver_work()
+            except Exception:
+                log.warning("api.work_delivery_failed", exc_info=True)
         try:
             copied = self.chronology.project(now)
         except Exception:

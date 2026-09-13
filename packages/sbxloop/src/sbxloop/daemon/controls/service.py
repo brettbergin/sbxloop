@@ -785,6 +785,37 @@ class ControlService:
         )
         return self._record(record, apply)
 
+    def update_schedule(
+        self,
+        principal: Principal,
+        name: str,
+        spec: ScheduleConfig,
+        *,
+        source: str,
+        idempotency: tuple[str, str] | None = None,
+    ) -> ScheduleOutcome:
+        require(principal, "daemon:manage")
+
+        def apply(_: str | None) -> ScheduleOutcome:
+            try:
+                message = self.loop.update_schedule(
+                    name, spec, principal.attribution(), source=source
+                )
+            except ValueError as exc:
+                raise ControlError(_code_for(exc), str(exc)) from exc
+            return ScheduleOutcome(verb="update", name=spec.name, message=message)
+
+        record = self._spec(
+            "schedule.update",
+            principal,
+            "schedule",
+            name,
+            idempotency=idempotency,
+            source=source,
+            replacement=spec.model_dump(),
+        )
+        return self._record(record, apply)
+
     def schedule_control(
         self,
         principal: Principal,

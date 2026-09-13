@@ -21,6 +21,7 @@ from sbxloop.api.models import (
     Schedule,
     ScheduleCreate,
     ScheduleResult,
+    ScheduleUpdate,
 )
 from sbxloop.api.pagination import Page
 from sbxloop.api.projections import holds_view, schedule_by_name, schedules_view
@@ -170,6 +171,19 @@ async def create_schedule(
     next tick."""
     pair = idempotency(request, auth.principal, "/v1/schedules", required=False)
     return await admin.create_schedule(ctx, auth, body, pair)
+
+
+@router.patch("/schedules/{name}", response_model=ScheduleResult)
+async def update_schedule(
+    name: str,
+    body: ScheduleUpdate,
+    request: Request,
+    ctx: ApiContext = Depends(ready_daemon),  # noqa: B008
+    auth: Authenticated = Depends(require("daemon:manage")),  # noqa: B008
+) -> ScheduleResult:
+    """Atomically replace a schedule while preserving its pause and firing history."""
+    pair = idempotency(request, auth.principal, f"/v1/schedules/{name}", required=False)
+    return await admin.update_schedule(ctx, auth, name, body, pair)
 
 
 @router.post("/schedules/{name}/pause", response_model=ScheduleResult)

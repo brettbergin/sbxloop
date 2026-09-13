@@ -2984,6 +2984,7 @@ def _start_api(config: Config, loop: Any, frontend: Any) -> Any:
         auth=ApiAuthStore(loop.dstore),
         keys=load_or_create(config.paths),
         clock=loop.clock,
+        concierge=getattr(frontend, "concierge", None),
     )
     server = ApiServer(create_app(ctx), config.api, ctx=ctx)
     frontend.add_observer(ApiFrontend(ctx.chronology, ctx.hub, ctx.projector, clock=ctx.clock))

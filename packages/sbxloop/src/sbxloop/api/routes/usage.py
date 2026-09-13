@@ -44,7 +44,7 @@ async def get_usage(
 ) -> UsageWindow:
     """Reported usage across the runs touched in a window (RFC 3339 or
     epoch bounds; the daemon's current calendar day when omitted; at most
-    31 days wide)."""
+    90 days wide)."""
     now = ctx.clock()
     day_start, day_end = day_window(now, ctx.config.daemon.run_cap_timezone)
     try:
@@ -55,7 +55,7 @@ async def get_usage(
     if end <= start:
         raise Problem(422, "invalid_request", "until must be after since")
     if end - start > WINDOW_MAX_S:
-        raise Problem(422, "invalid_request", "a usage window is at most 31 days wide")
+        raise Problem(422, "invalid_request", "a usage window is at most 90 days wide")
 
     def read() -> UsageWindow:
         views = Views(ctx)

@@ -2069,7 +2069,7 @@ directory without following a link out of it — a link that would escape the
 run is never catalogued. Once the retention sweep has pruned a run the entry
 stays with `available: false` and the download answers `410 artifact_gone`.
 `GET /v1/runs/{id}/usage` and `GET /v1/usage?since&until` (RFC 3339 or epoch;
-the daemon's calendar day when omitted; at most 31 days) are what the agent
+the daemon's calendar day when omitted; at most 90 days) are what the agent
 backend reported — tokens and turns by persona and by phase and model — with
 unknowns kept as `null` and `recorded: false` when nothing was reported, which
 is not zero. `spend` is always `null`, and `spend_basis` says why: no backend

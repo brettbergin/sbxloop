@@ -1842,6 +1842,34 @@ class DaemonLoop:
         )
         return f"schedule {name} removed; no further ticks (a tick already queued still runs)."
 
+    def update_schedule(
+        self, name: str, spec: ScheduleConfig, by: str | None, *, source: str
+    ) -> str:
+        """Atomically replace a stored schedule while retaining its pause and history."""
+        profile = next((p for p in self.config.workloads if p.name == spec.profile), None)
+        if profile is None:
+            known = ", ".join(p.name for p in self.config.workloads) or "none"
+            raise ValueError(
+                f"profile {spec.profile!r} is not declared under [[workloads]] (declared: {known})"
+            )
+        self._ensure_config_schedules()
+        if self.dstore.schedule(name) is None:
+            raise ValueError(self._unknown_schedule(name))
+        if not self.dstore.update_schedule(name, spec, now=self.clock()):
+            raise ValueError(f"a schedule called {spec.name!r} already exists")
+        who = by or "operator"
+        self._notice(
+            "daemon.schedule_updated",
+            f"📅 schedule {name} updated by {who}: {spec.cadence_text}, profile `{spec.profile}`",
+            schedule=spec.name,
+            previous_name=name,
+            by=by,
+            source=source,
+            cadence=spec.cadence_text,
+            profile=spec.profile,
+        )
+        return f"schedule {spec.name} updated: {spec.cadence_text}, profile `{spec.profile}`."
+
     def _fire_schedules(self, now: float) -> int:
         """Queue every schedule tick that has come due since the last one
         handled — at most one per schedule, the latest, recorded at its

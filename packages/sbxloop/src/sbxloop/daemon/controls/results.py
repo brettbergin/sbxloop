@@ -146,7 +146,7 @@ class ScheduleListOutcome(Outcome):
 
 
 class ScheduleOutcome(Outcome):
-    verb: Literal["add", "remove", "pause", "resume"]
+    verb: Literal["add", "update", "remove", "pause", "resume"]
     name: str
     message: str
 
