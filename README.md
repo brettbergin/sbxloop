@@ -122,9 +122,18 @@ initializing if you want it somewhere else. The two files you'll edit are:
 ```
 
 The generated `sbxloop.toml` includes commented settings and their defaults.
-Uncomment the section header and the settings you want to change. For the
-default Copilot backend, put a fine-grained token with **Copilot Requests**
-permission in `secrets.env`:
+The interactive setup assistant asks for an agent backend, a chat backend and
+a VCS, then writes their settings and credentials to the right files:
+
+```bash
+sbxloop setup
+```
+
+It hides secret input, validates the complete configuration before saving it,
+and safely upserts existing values, so rerunning it does not append duplicate
+settings or credentials. You can also edit the files by hand. For the default
+Copilot backend, put a fine-grained token with **Copilot Requests** permission
+in `secrets.env`:
 
 ```dotenv
 COPILOT_GITHUB_TOKEN=your_copilot_token

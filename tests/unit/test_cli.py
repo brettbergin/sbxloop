@@ -107,6 +107,7 @@ class TestBasics:
             "doctor",
             "sandbox",
             "config",
+            "setup",
         ):
             assert command in result.output
 
