@@ -1388,6 +1388,19 @@ class DaemonStore:
             yield session
 
     @contextmanager
+    def immediate_transaction(self) -> Iterator[Session]:
+        """One transaction that reserves SQLite's write lock before reading.
+
+        This is for a read-then-write decision against tables another store
+        can change through its own connection. A deferred WAL transaction
+        cannot upgrade a stale read snapshot after that other writer commits;
+        taking the write lock first makes the decision and its write atomic.
+        """
+        with self._lock, begin_immediate(self._engine) as conn, Session(bind=conn) as session:
+            yield session
+            session.flush()
+
+    @contextmanager
     def read(self) -> Iterator[Session]:
         """A query session under the store's lock, for the same callers."""
         with self._read() as session:
