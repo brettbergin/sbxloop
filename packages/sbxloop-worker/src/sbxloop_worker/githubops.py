@@ -597,6 +597,24 @@ def _raw_api(t: Transport, p: dict[str, Any]) -> JsonValue:
         raise
 
 
+def _raw_text(t: Transport, p: dict[str, Any]) -> JsonValue:
+    """One REST call whose answer is a text body, not JSON: a GitLab job
+    trace (``GET /projects/:id/jobs/:id/trace`` is ``text/plain``), the
+    generic form of what ``checks.failed_logs`` reads for GitHub Actions.
+    The body comes back under ``text``; a status in ``allow_missing_statuses``
+    (#558) is an answer, ``{"missing": true, "http_status": N}``, rather
+    than a failed job."""
+    _require(p, "method", "path")
+    allowed = p.get("allow_missing_statuses") or ()
+    statuses = {int(s) for s in allowed} if isinstance(allowed, list | tuple) else set()
+    try:
+        return {"text": t.request_text(str(p["method"]).upper(), str(p["path"]))}
+    except GithubOpError as exc:
+        if exc.http_status in statuses:
+            return {"missing": True, "http_status": exc.http_status}
+        raise
+
+
 # The header a classic (OAuth-scoped) PAT answers every request with. A
 # fine-grained PAT and a GitHub App installation token carry no such header:
 # their permissions are per-resource, and the header's absence is the
@@ -866,6 +884,7 @@ OPS: dict[str, OpImpl] = {
     "label.get": _label_get,
     "search.issues": _search_issues,
     "raw.api": _raw_api,
+    "raw.text": _raw_text,
     "token.scopes": _token_scopes,
     "checks.failed_logs": _checks_failed_logs,
 }

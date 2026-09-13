@@ -1,0 +1,87 @@
+# Live GitLab CE and Gitea for field verification and the conformance
+# suite's live backends. Brought up by `python -m tests.live.harness up`,
+# which writes the TLS material and the compose env file under `.state/`
+# first; see README.md. Both forges serve HTTPS only, from a throwaway CA the
+# harness mints, because the worker transport refuses a plain-http API root.
+name: sbxloop-live
+
+services:
+  gitea:
+    image: gitea/gitea:1.24.7
+    container_name: sbxloop-live-gitea
+    environment:
+      USER_UID: "1000"
+      USER_GID: "1000"
+      GITEA__security__INSTALL_LOCK: "true"
+      GITEA__service__DISABLE_REGISTRATION: "true"
+      GITEA__server__PROTOCOL: https
+      GITEA__server__HTTP_PORT: "3000"
+      GITEA__server__DOMAIN: localhost
+      GITEA__server__ROOT_URL: https://localhost:3000/
+      GITEA__server__CERT_FILE: /certs/server.crt
+      GITEA__server__KEY_FILE: /certs/server.key
+      GITEA__server__DISABLE_SSH: "true"
+      GITEA__server__START_SSH_SERVER: "false"
+      GITEA__database__DB_TYPE: sqlite3
+      GITEA__actions__ENABLED: "true"
+      GITEA__log__LEVEL: warn
+    ports:
+      - "127.0.0.1:3000:3000"
+    volumes:
+      - gitea-data:/data
+      - ./.state/certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsk", "https://localhost:3000/api/healthz"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+
+  gitlab:
+    image: gitlab/gitlab-ce:19.3.2-ce.0
+    container_name: sbxloop-live-gitlab
+    hostname: localhost
+    shm_size: 256m
+    environment:
+      GITLAB_ROOT_PASSWORD: ${GITLAB_ROOT_PASSWORD:?run harness.py up, which writes .state/compose.env}
+      GITLAB_OMNIBUS_CONFIG: |
+        external_url 'https://localhost:8929'
+        letsencrypt['enable'] = false
+        nginx['ssl_certificate'] = '/certs/server.crt'
+        nginx['ssl_certificate_key'] = '/certs/server.key'
+        nginx['listen_port'] = 8929
+        gitlab_rails['gitlab_shell_ssh_port'] = 0
+        gitlab_sshd['enable'] = false
+        prometheus_monitoring['enable'] = false
+        alertmanager['enable'] = false
+        gitlab_exporter['enable'] = false
+        node_exporter['enable'] = false
+        redis_exporter['enable'] = false
+        postgres_exporter['enable'] = false
+        registry['enable'] = false
+        gitlab_rails['registry_enabled'] = false
+        gitlab_pages['enable'] = false
+        gitlab_kas['enable'] = false
+        mattermost['enable'] = false
+        puma['worker_processes'] = 0
+        sidekiq['concurrency'] = 5
+        gitlab_rails['usage_ping_enabled'] = false
+        gitlab_rails['initial_shared_runners_registration_token'] = nil
+    ports:
+      - "127.0.0.1:8929:8929"
+    volumes:
+      - gitlab-config:/etc/gitlab
+      - gitlab-logs:/var/log/gitlab
+      - gitlab-data:/var/opt/gitlab
+      - ./.state/certs:/certs:ro
+    healthcheck:
+      test: ["CMD", "curl", "-fsk", "https://localhost:8929/-/readiness"]
+      interval: 15s
+      timeout: 10s
+      retries: 40
+      start_period: 240s
+
+volumes:
+  gitea-data:
+  gitlab-config:
+  gitlab-logs:
+  gitlab-data:

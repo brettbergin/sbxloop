@@ -150,9 +150,13 @@ STATUS_MARKER = {"added": "A", "modified": "M", "deleted": "D"}
 
 def _is_ref_collision(exc: GithubOpsError) -> bool:
     """Whether a refs POST failed because the branch already exists —
-    GitHub's documented answer is HTTP 422 "Reference already exists"."""
+    GitHub's documented answer is HTTP 422 "Reference already exists";
+    GitLab answers "Branch already exists" with a 400 (#1020, observed
+    on CE 19.3.2)."""
     text = str(exc)
-    return "HTTP 422" in text and "already exists" in text.lower()
+    if "already exists" not in text.lower():
+        return False
+    return "HTTP 422" in text or exc.http_status in (400, 422)
 
 
 def _is_ref_refusal(exc: GithubOpsError) -> bool:
@@ -273,8 +277,10 @@ def _is_pr_collision(exc: GithubOpsError) -> bool:
     an open PR. GitHub's answer is HTTP 422 "A pull request already exists
     for owner:branch" — but the `gh` transport used to hand back only
     "Validation Failed (HTTP 422)" (field run r8tzse1qa, #387), so the
-    status alone is the test and the caller confirms with a lookup."""
-    return exc.http_status == 422 or "HTTP 422" in str(exc)
+    status alone is the test and the caller confirms with a lookup. GitLab
+    answers the same collision with HTTP 409 ("Another open merge request
+    already exists for this source branch", #1018), confirmed the same way."""
+    return exc.http_status in (409, 422) or "HTTP 422" in str(exc)
 
 
 class RepositoryProbe(NamedTuple):

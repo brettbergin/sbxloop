@@ -2821,6 +2821,15 @@ class Config(_ConfigModel):
             return None
         return self.vcs.token_env or FORGE_TOKEN_ENVS[kind]
 
+    def vcs_api_url_for(self, kind: VcsKind) -> str | None:
+        """The API root a backend of ``kind`` speaks to: ``[github] api_url``
+        (which ``[vcs] api_url`` fills) for GitHub, else ``[vcs] api_url``
+        — ``None`` when a GitLab or Gitea configuration has not named one,
+        which the backend factory and the doctor refuse by name."""
+        if kind == "github":
+            return self.github.api_url
+        return self.vcs.api_url
+
     def vcs_kinds(self) -> tuple[VcsKind, ...]:
         """Every forge an enabled repository lives on, in first-seen order
         — ``[vcs] kind`` alone when no repository is configured."""

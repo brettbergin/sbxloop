@@ -42,7 +42,10 @@ operation on a backend object, and the operation runs inside the sandbox
 that holds the credential (the [credential split](#the-credential-split-in-one-picture)).
 What those operations are, and what they answer in, is fixed in two
 forge-neutral modules under `sbxloop/vcs/`; a backend package beside them
-(`vcs/github/` today) implements them against its own API.
+(`vcs/github/`, and `vcs/gitlab/` for the read paths) implements them
+against its own API, and `vcs/backends.py` is the registry that turns a
+`[vcs] kind` into a backend object over a worker client, with the transport
+descriptor the worker needs.
 
 - **`vcs/protocol.py` — the roles.** Six role protocols plus one for the
   commit path, because they have different consumers and different
@@ -57,6 +60,7 @@ forge-neutral modules under `sbxloop/vcs/`; a backend package beside them
   GitHub backend's `_implements` function is the type checker's proof that
   it answers every role, and `tests/unit/test_vcs_protocol.py` holds that
   every public operation on it belongs to exactly one.
+
 - **`vcs/model.py` — the shared types.** An issue or change reference, a
   folded `ChecksVerdict`, a `ReviewThread`, the base's `BaseRequirements`:
   the shapes the engine, the daemon and the doctor read. They carry no path,
@@ -71,6 +75,7 @@ forge-neutral modules under `sbxloop/vcs/`; a backend package beside them
   base's `blockers()` are phrased in the reading forge's own terms
   (`BLOCKER_WORDING`), the GitHub wording being the one the loop has
   always used.
+
 - **Capabilities are three-state, never a boolean.** A backend reports each
   of `vcs.protocol.CAPABILITIES` (a merge queue, resolvable review threads,
   draft changes, a request-changes review the forge enforces, a
@@ -83,6 +88,7 @@ forge-neutral modules under `sbxloop/vcs/`; a backend package beside them
   already follows. GitHub reports everything `SUPPORTED` except signed API
   commits, which depend on the credential (a GitHub App's arrive signed, a
   PAT's do not) and so are the doctor's to answer, not the transport's.
+
 - **The generic transport is private to the backend package.** `GithubOps.raw`,
   `raw_lookup` and the `raw_pages` walker spell a path by hand, and fifty
   such sites had accumulated across the host before #1010 named them. If
@@ -91,11 +97,77 @@ forge-neutral modules under `sbxloop/vcs/`; a backend package beside them
   outside `vcs/`. Without that rule the roles are decorative — callers
   route around them the moment something is missing.
 
+- **Records are the first backend's spelling.** Several operations return
+  the forge's payload as a plain mapping rather than a typed model
+  (`repo_get`, `issue_get`, `issues_list`, `issue_comments`,
+  `issue_events`, `pr_get`, `pr_reviews`, ...). The keys the engine and
+  the daemon read off them are the contract, spelt as GitHub spelt them
+  (`html_url`, `state` as `open`/`closed`, `labels[].name`, `user.login`,
+  a `pull_request` key present only on a pull request, `created_at` as
+  `YYYY-MM-DDTHH:MM:SSZ`); a second backend folds its own payloads into
+  exactly those keys, inside the backend, and never hands a consumer its
+  forge's shape. Turning the mappings into typed models is the design
+  revision the conformance work anticipated and is left open.
+
+- **An operation a backend has not landed yet raises `RoleNotImplemented`.**
+  A backend lists such operations in `UNIMPLEMENTED_OPERATIONS`; each
+  raises a typed error naming the backend, the role and the operation, so
+  a run on that forge fails closed at the first of them, and `sbxloop doctor` lists the same operations before any run starts. The conformance
+  suite reads that error as a skip naming the operation, the way an
+  `UNSUPPORTED` capability skips with its name. The GitLab backend's list
+  is empty since #1020; the mechanism stays for the next backend.
+
+- **A delivery on GitLab is one changeset.** `deliver.py` speaks GitHub's
+  blob, tree, commit and ref steps, and GitLab has none of those objects
+  (#1016 V5): its commits API takes a whole changeset and writes the commit
+  on a branch, atomically. So the GitLab backend stages: a blob is hashed as
+  git would and kept, a tree is the list of actions that turns the base
+  commit's tree into it (create versus update decided against a listing of
+  each touched directory, because GitLab refuses either in the other's
+  place), and the commit is written when it is created, on a pending
+  branch, because the API writes no commit that no branch points at. The
+  ref step creates the run's branch at that commit and drops the pending
+  one. A branch that already exists (a fix round) is never deleted and
+  recreated, because deleting the source branch of an open merge request
+  closes it (field-verified on CE 19.3.2); it is written again under
+  `force` from the same parent with the same actions, a new commit of the
+  same tree that the merge request follows. Only a commit the same backend
+  object wrote can be written again, which every delivery satisfies, since
+  it builds its blobs, tree and commit in one process. `deliver.py` is
+  unchanged but for reading GitLab's "Branch already exists" (a 400) as
+  the collision GitHub answers with a 422.
+
+- **A landing reads the forge's refusals as data.** On GitLab the merge
+  endpoint's 405 (not mergeable now: a red pipeline, an unresolved
+  discussion, a draft), 406 (a conflict) and 401 are a blocked
+  `MergeOutcome` with the forge's words, and a 409 is a stale head, the
+  same shapes the landing already reads off GitHub; the rebase is the
+  branch update and runs asynchronously, so the next poll sees the new
+  head; the `Draft:` title prefix is the whole of a draft, so retitling
+  is the un-draft. Merge trains are a paid tier and a per-project
+  setting, so `merge_queue` is read off the project payload every landing
+  reads anyway (`true` a train, `false` or the free tier's `null` a direct
+  merge, an unreadable project `unknown`); their shapes past the free
+  tier's 404 are field-unverified. The one rule GitLab has that GitHub
+  does not, who may merge into the protected branch, arrives as an
+  `extra_blockers` entry the backend phrased, so the landing's blocker
+  list needs no forge branch. `PolicyOps.credential_info` lets a token
+  that can read its own record (GitLab's) tell the doctor its name,
+  scopes, expiry and whether it is still active; GitHub answers `None`,
+  because there the credential is the provisioner's knowledge.
+
 `[vcs] kind` (and a `[[github.repos]]` entry's own `kind`) names the forge;
-`Config.vcs_kind_for` resolves it per repository and `sbxloop doctor` prints
+`Config.vcs_kind_for` resolves it per repository, `Config.vcs_api_url_for`
+the API root a backend of that kind speaks to, and `sbxloop doctor` prints
 one `vcs backend <kind>` row per forge with each capability's state, or a
 failing row for a kind no backend answers yet. `[github]` stays the section
-a repository is declared in and reads as `kind = "github"`.
+a repository is declared in and reads as `kind = "github"`. The github-role
+sandbox for a repository on another forge holds that forge's token under
+the forge's own variable (`GITLAB_TOKEN`), delivered by the env-file road
+because sbx's secret proxy knows only GitHub's service, and reaches only
+that forge's host; the daemon's shared polling box follows `[vcs] kind`, so
+a `[[github.repos]] kind` that differs from it is honoured by a run's own
+box and not by the daemon's.
 
 The decision logic sits above the roles and knows no forge: the baseline
 comparison in `engine/checks.py` takes a folded verdict, not a payload; the

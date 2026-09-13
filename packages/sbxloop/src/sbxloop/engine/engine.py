@@ -195,13 +195,11 @@ from sbxloop.sbx.sandbox import SBXLOOP_DIR
 from sbxloop.vcs.github.labels import FOLLOWUP_DESCRIPTOR, LabelSpec, ensure_label
 from sbxloop.vcs.github.ops import (
     FailedCheck,
-    GithubOps,
     Identity,
     MalformedResponse,
     PostedFinding,
     ReviewComment,
     SubmittedReview,
-    github_transport,
     identities_match,
     user_identity,
 )
@@ -1466,10 +1464,15 @@ class LoopEngine:
             **extra,
         )
 
-    def _default_github_ops(self, client: WorkerClient, run_id: str) -> GithubOps:
-        """The GitHub backend for a run, carrying the transport descriptor
-        derived from the configuration (#1015)."""
-        return GithubOps(client, run_id, transport=github_transport(self.config.github.api_url))
+    def _default_github_ops(self, client: WorkerClient, run_id: str) -> VcsOps:
+        """The backend for a run — the forge its repository lives on
+        (#1017) — carrying the transport descriptor derived from the
+        configuration (#1015)."""
+        from sbxloop.vcs.backends import backend_for
+
+        entry = self.config.github.effective_repo(None)
+        kind = self.config.vcs_kind_for(entry.repo if entry is not None else None)
+        return backend_for(kind, client, run_id, api_url=self.config.vcs_api_url_for(kind))
 
     def _ensure_delivery_repo(self, run_id: str, ops: VcsOps | None) -> bool | None:
         """Probe (and, when allowed, create) the delivery repo up front.
@@ -3005,6 +3008,11 @@ class LoopEngine:
         (``None``) and GitHub's 403 decides at the tree."""
 
         def check() -> bool | None:
+            if getattr(p.ops, "KIND", "github") != "github":
+                # `.github/workflows/` is GitHub's own guarded path (#752);
+                # another forge holds nothing to that permission, and the
+                # backend knows which forge it speaks to (#1017).
+                return True
             permissions = (
                 p.provisioner.gh_app_permissions(p.repo) if p.provisioner is not None else None
             )

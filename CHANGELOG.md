@@ -2,6 +2,55 @@
 
 ### Added
 
+- **A GitLab backend for the read paths.** `[vcs] kind = "gitlab"` with
+  `[vcs] api_url` now selects a backend that answers the repository,
+  issue, checks and policy roles against GitLab's REST API from the
+  github-role sandbox, which holds the project token under `GITLAB_TOKEN`
+  and reaches only the GitLab host. The base's rules are read the way
+  GitLab CE expresses them: "pipeline must succeed" gates every check the
+  head reports rather than a named list. `sbxloop doctor` prints the
+  verified capability matrix for GitLab and names the roles that have not
+  landed yet; a run that reaches one of those (a merge request, a review,
+  a remote commit) fails closed naming the operation. The conformance
+  suite runs the read scenarios against a GitLab fake and, with the live
+  harness, against a real GitLab CE.
+
+- **GitLab review threads and merge requests.** The GitLab backend opens
+  and reads merge requests and answers the review role: each inline
+  finding is a discussion anchored on the diff, a reply is a note on it,
+  resolving it is the discussion's own flag, and the loop's opaque thread
+  id addresses it again. Approvals and reviewer states fold into the
+  standing verdicts the landing reads; a reviewer's bot flag is looked up
+  once per user, so one-round-for-bots holds unchanged. A request-changes
+  review degrades to a comment with the finding count, because the free
+  tier records a requested change without holding the merge for it.
+
+- **A GitLab merge request lands.** The GitLab backend now takes a draft
+  request out of draft, requests reviewers by username, rebases the
+  branch as the update, and merges with the judged head, reading the
+  forge's refusals (not mergeable, a conflict, a moved head, no merge
+  access) as the same blocked and stale outcomes the landing reads off
+  GitHub. Merge trains are a per-project capability: the landing enters
+  one where the project has it and merges directly where it does not,
+  which is everywhere on the free tier. `sbxloop doctor` prints what the
+  GitLab token reports about itself (name, scopes, expiry), warns on a
+  token that never expires, fails the repository's row on a revoked one,
+  and names a base only Maintainers may merge into as a blocker for a
+  Developer token. Only the remote commit (the content role) is left for
+  the GitLab backend to answer.
+
+- **A GitLab delivery without a checkout.** The GitLab backend answers the
+  content role, so a run on a GitLab repository now goes end to end: the
+  blob, tree, commit and ref steps the delivery speaks are staged in the
+  backend and written as one commits-API changeset on a pending branch,
+  then the run's branch is created at that commit. A fix round rewrites
+  the branch under `force` with a new commit of the same tree, because
+  GitLab has no call that moves a branch and deleting one closes its open
+  merge request. A submodule pointer and a symlink are refused by name
+  (the commits API writes neither), an executable keeps its mode, and a
+  deletion the base no longer has is dropped rather than failing the
+  commit. `sbxloop doctor` lists nothing as not implemented for GitLab.
+
 - **Playwright MCP setup for Copilot and Claude builders.**
   `sbxloop init --preset playwright` configures Node, a pinned MCP package,
   its matching headless Chromium installation, download hosts and builder

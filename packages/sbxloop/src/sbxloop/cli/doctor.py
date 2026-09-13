@@ -45,7 +45,6 @@ from sbxloop.sbx.conformance import ConformanceReport, run_conformance
 from sbxloop.sbx.provision import gh_credential_status
 from sbxloop.sbx.prune import count_orphans
 from sbxloop.vcs.github.labels import lifecycle_specs, missing_labels
-from sbxloop.vcs.github.ops import GithubOps
 from sbxloop.vcs.github.permissions import (
     NEEDS,
     READ_PROBES,
@@ -190,6 +189,11 @@ class RepoProbe:
     # fine-grained PAT that lives until someone revokes it. Empty = not
     # determined.
     credential: str = ""
+    # A soft row's worth of warning about the credential (#1019): a token
+    # that never expires. Empty = nothing to warn about.
+    credential_warning: str = ""
+    # A failing verdict on the credential itself: revoked or inactive.
+    credential_problem: str = ""
 
 
 def _repo_token_status(
@@ -291,26 +295,53 @@ def vcs_backend_checks(config: Config) -> list[Check]:
     kind the configuration names but no backend answers is a failing row:
     the run would fail closed at its first operation, and this says so
     before it starts."""
+    from sbxloop.vcs.backends import (
+        BACKENDS,
+        capabilities_for,
+        capability_note,
+        unimplemented_operations,
+    )
+
     rows: list[Check] = []
     for kind in config.vcs_kinds():
         name = f"vcs backend {kind}"
-        if kind != "github":
+        report = capabilities_for(kind)
+        if report is None:
             rows.append(
                 Check(
                     name,
                     False,
                     f'[vcs] kind = "{kind}" names a backend that is not implemented yet; '
-                    'only "github" answers a run today',
+                    f"the backends that answer a run today are {', '.join(sorted(BACKENDS))}",
                 )
             )
             continue
-        report = GithubOps.CAPABILITIES
         by_state: dict[str, list[str]] = {}
         for capability, state in report.items():
             by_state.setdefault(str(state), []).append(capability)
         parts = [f"{state}: {', '.join(names)}" for state, names in by_state.items()]
         if Capability.UNKNOWN in report.values():
-            parts.append("(signed API commits depend on the credential: a GitHub App's are)")
+            note = capability_note(kind)
+            parts.append(
+                f"({note})"
+                if note
+                else "(signed API commits depend on the credential: a GitHub App's are)"
+            )
+        if kind != "github" and config.vcs_api_url_for(kind) is None:
+            rows.append(
+                Check(
+                    name,
+                    False,
+                    f"[vcs] api_url is not set: the {kind} backend needs the API root it speaks to",
+                )
+            )
+            continue
+        missing = unimplemented_operations(kind)
+        if missing:
+            parts.append(
+                f"not implemented yet: {', '.join(missing)} — a run on this forge stops at "
+                "the first of them, naming it"
+            )
         rows.append(Check(name, True, "; ".join(parts), hard=False))
     return rows
 
@@ -399,6 +430,9 @@ def repo_checks(
             )
             rows.append(Check(name, False, "; ".join(notes)))
             continue
+        if result.credential_problem:
+            rows.append(Check(name, False, "; ".join([*notes, result.credential_problem])))
+            continue
         notes.append(result.detail or "reachable, token has the required permissions")
         if result.credential:
             notes.append(f"credential: {result.credential}")
@@ -407,6 +441,8 @@ def repo_checks(
         rows.append(Check(name, True, "; ".join(notes)))
         if merge_row is not None:
             rows.append(merge_row)
+        if result.credential_warning:
+            rows.append(Check(f"{name} credential", False, result.credential_warning, hard=False))
         if result.optional_permissions:
             rows.append(
                 Check(
@@ -708,6 +744,8 @@ def _credential_needs(
     repo: str,
     base: str,
     data: dict[str, Any],
+    *,
+    kind: str = "github",
 ) -> tuple[tuple[Need, ...], tuple[Need, ...], str, str]:
     """``(required, optional, source, credential)`` — what the credential
     lacks of :data:`NEEDS`, judged from whichever source describes it
@@ -718,7 +756,25 @@ def _credential_needs(
     within the hour; a PAT lives until it is revoked, and GitHub does not
     let the token read its own expiry.
     """
-    if app_permissions is not None:
+    if kind == "gitlab":
+        from sbxloop.vcs.gitlab.permissions import missing_from_scopes as gitlab_missing
+
+        scopes = ops.token_scopes()
+        if scopes is not None:
+            found = (*gitlab_missing(scopes), *_missing_from_push_bit(data))
+            source = f"the token's scopes {', '.join(scopes) or '(none)'} and its project access"
+        else:
+            found = (*_missing_from_push_bit(data), *_missing_from_probes(ops, repo, base))
+            source = "a token that cannot read its own scopes, asked endpoint by endpoint"
+        info = ops.credential_info()
+        credential = (
+            info.summary()
+            if info is not None
+            else "GitLab access token (long-lived; it cannot read its own record)"
+        )
+        lacking = {n.permission for n in found}
+        missing = tuple(n for n in NEEDS if n.permission in lacking)
+    elif app_permissions is not None:
         # The installation's grant is the whole story: it is not a user.
         missing = missing_from_app(app_permissions)
         source = "the App installation's permissions"
@@ -855,9 +911,16 @@ def sandbox_repo_probe(
                 reachable=False, detail="not found with this token", creatable=creatable
             )
         base = entry.deliver_base or str(data.get("default_branch") or "")
+        kind = config.vcs_kind_for(entry.repo)
         required, optional, source, credential = _credential_needs(
-            ops, box.provisioner.gh_app_permissions(entry.repo), entry.repo, base, data
+            ops,
+            box.provisioner.gh_app_permissions(entry.repo) if kind == "github" else None,
+            entry.repo,
+            base,
+            data,
+            kind=kind,
         )
+        warning, problem = _credential_verdict(ops, kind)
         has_issues = data.get("has_issues")
         blockers, unread = (
             _base_blockers(
@@ -888,9 +951,36 @@ def sandbox_repo_probe(
             missing_labels=_missing_repo_labels(ops, config, entry),
             issues_enabled=has_issues if isinstance(has_issues, bool) else None,
             credential=credential,
+            credential_warning=warning,
+            credential_problem=problem,
         )
 
     return probe
+
+
+def _credential_verdict(ops: VcsOps, kind: str) -> tuple[str, str]:
+    """``(warning, problem)`` about the token itself (#1019), from what it
+    reports (:meth:`~sbxloop.vcs.protocol.PolicyOps.credential_info`): a
+    token that never expires is a warning: the reduction the spike
+    accepts for a forge with no host-minted token, made visible; a
+    revoked or inactive one is a problem no run survives."""
+    if kind == "github":
+        return "", ""
+    try:
+        info = ops.credential_info()
+    except GithubOpsError:
+        return "", ""
+    if info is None:
+        return "", ""
+    if info.active is False:
+        return "", f"the {info.kind} is revoked or inactive; mint a new one"
+    if info.never_expires:
+        return (
+            f"the {info.kind} never expires: a leaked token is useful until someone revokes "
+            "it; set an expiry when creating it and rotate it on a schedule",
+            "",
+        )
+    return "", ""
 
 
 def _missing_repo_labels(ops: VcsOps, config: Config, entry: RepoConfig) -> tuple[str, ...] | None:
