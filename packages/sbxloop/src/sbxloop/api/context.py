@@ -25,11 +25,18 @@ from sbxloop.api.auth.keys import SigningKeys
 from sbxloop.api.auth.ratelimit import FailureLimiter
 from sbxloop.api.auth.store import ApiAuthStore
 from sbxloop.api.chronology import Chronology
-from sbxloop.api.collaboration import CollaborationStore, LocalUser, Message, Turn
+from sbxloop.api.collaboration import (
+    CollaborationError,
+    CollaborationStore,
+    LocalUser,
+    Message,
+    Turn,
+)
 from sbxloop.api.publicids import PublicIds
 from sbxloop.api.stream import StreamHub
 from sbxloop.config import Config
 from sbxloop.daemon.controls.service import ControlService
+from sbxloop.errors import ToolRejectedError
 
 T = TypeVar("T")
 
@@ -264,15 +271,18 @@ class ApiContext:
                 )
 
             def handoff(agent_slug: str, message: str, source_index: int = index) -> str:
-                result = store.queue_handoff(
-                    user.id,
-                    turn.channel_id,
-                    turn.id,
-                    source_index,
-                    agent_slug,
-                    message,
-                    self.clock(),
-                )
+                try:
+                    result = store.queue_handoff(
+                        user.id,
+                        turn.channel_id,
+                        turn.id,
+                        source_index,
+                        agent_slug,
+                        message,
+                        self.clock(),
+                    )
+                except CollaborationError as exc:
+                    raise ToolRejectedError(exc.message) from exc
                 self.hub.notify()
                 return result
 
