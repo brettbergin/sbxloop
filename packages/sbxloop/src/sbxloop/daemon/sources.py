@@ -40,7 +40,7 @@ from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.engine.model import RunKind
 from sbxloop.engine.sinks import published_line
 from sbxloop.errors import GithubOpsError, SbxError, WorkerError
-from sbxloop.ghids import is_chat_id, is_schedule_id, issue_item_id, try_parse_gh_id
+from sbxloop.ghids import is_api_id, is_chat_id, is_schedule_id, issue_item_id, try_parse_gh_id
 from sbxloop.log import get_logger
 from sbxloop.vcs.github.ops import (
     Identity,
@@ -503,6 +503,62 @@ class GitHubIssueSource:
                 rows[str(number)] = issue
         return rows
 
+    def admit(self, repo: str, number: str, kind: RunKind) -> WorkItem:
+        """Admit one existing issue as work of ``kind`` without waiting for
+        a poll: the remote API's issue intake (#1036).
+
+        The same admission rules as a human's: the issue must be open and
+        an issue (not a pull request), and it is *labelled* — the queueing
+        label for ``kind`` is added when it is missing — so the next poll
+        finds it too and converges on the row the caller upserts. An issue
+        already claimed (in progress) or already queued for the other kind
+        is refused, named, rather than relabelled behind the person who
+        labelled it. ``KeyError`` for a repository this source does not
+        tend; ``ValueError`` for an issue the rules refuse; GitHub's own
+        failures propagate (the caller decides what a 404 means).
+        """
+        if repo.casefold() != self.repo.casefold():
+            raise KeyError(repo)
+        ops = self._ops()
+        issue = ops.issue_get(self.repo, number)
+        if "pull_request" in issue:
+            raise ValueError(f"{self.repo}#{number} is a pull request, not an issue")
+        if issue.get("state") != "open":
+            raise ValueError(f"{self.repo}#{number} is not open")
+        names = {
+            str(label.get("name"))
+            for label in issue.get("labels") or []
+            if isinstance(label, dict) and label.get("name")
+        }
+        wanted = self.labels.workload if kind == "workload" else self.labels.trigger
+        other = self.labels.trigger if kind == "workload" else self.labels.workload
+        if self.labels.in_progress in names:
+            raise ValueError(f"{self.repo}#{number} is already in progress")
+        if other in names:
+            other_kind = "code" if kind == "workload" else "workload"
+            raise ValueError(
+                f"{self.repo}#{number} already carries `{other}`: it is queued as a "
+                f"{other_kind} run, not a {kind} run"
+            )
+        if wanted not in names:
+            self._add_labels(ops, number, [wanted])
+            log.info(
+                "github.admitted",
+                repo=self.repo,
+                issue=number,
+                label=wanted,
+                kind=kind,
+            )
+        return WorkItem(
+            item_id=issue_item_id(int(number), repo=self.repo if self.qualify_ids else None),
+            source_key=number,
+            title=str(issue.get("title") or f"issue #{number}"),
+            body=str(issue.get("body") or ""),
+            url=str(issue.get("html_url") or ""),
+            repo=self.repo,
+            kind=kind,
+        )
+
     def _refuse_conflict(self, ops: IssueOps, number: str) -> None:
         """An issue wearing both queueing labels asks for two different
         runs; neither starts. Both labels come off so the human's fix (re-add
@@ -832,7 +888,7 @@ class GitHubIssueSource:
             return
         self._guard(
             "claim comment removal",
-            lambda ops: ops.issue_comment_delete(self.repo, comment_id),
+            lambda ops: ops.issue_comment_delete(self.repo, comment_id, number=int(number)),
         )
 
     def report_started(self, item: WorkItem, run_id: str) -> None:
@@ -1186,6 +1242,14 @@ class MultiRepoIssueSource:
             )
         return self._sources[0]
 
+    def admit(self, repo: str, number: str, kind: RunKind) -> WorkItem:
+        """Admit an issue through the source that tends ``repo``
+        (``KeyError`` when none does)."""
+        found = self._by_repo.get(repo.casefold())
+        if found is None:
+            raise KeyError(repo)
+        return found.admit(repo, number, kind)
+
     # -- per-repository health ------------------------------------------------
 
     @property
@@ -1491,6 +1555,17 @@ class ChatSource:
         return True
 
 
+class ApiSource(ChatSource):
+    """The queue the remote API feeds (#1036): an inline workload or a
+    recipe admitted by a client. Like a chat ask there is nothing to poll
+    or label and every report is a log line; unlike one, no chat thread
+    stands behind the item — its chronology is the operations record and
+    the public event stream. Its items carry ``api:`` ids so the composite
+    routes them here and never to GitHub."""
+
+    name = "api"
+
+
 class ScheduleSource(ChatSource):
     """The queue a schedule feeds (#761): the loop's ``_fire_schedules``
     writes each due tick straight into the store, so — as for a chat ask
@@ -1507,9 +1582,10 @@ class CompositeSource:
 
     Polling is GitHub's; everything keyed on an item goes to the source its
     id names — ``chat:`` ids to the chat source, ``sched:`` ids to the
-    schedule source, the rest to GitHub. The multi-repo extras the loop
-    and the CLI reach for by name (``repo_health``, ``resume_repo``,
-    ``issue_context``, ``notify``) are GitHub's, and only there when
+    schedule source, ``api:`` ids to the API source, the rest to GitHub.
+    The multi-repo extras the loop and the CLI reach for by name
+    (``repo_health``, ``resume_repo``, ``issue_context``, ``notify``) are
+    GitHub's, and only there when
     GitHub provides them. A daemon with no repository to poll (chat
     intake or schedules alone) passes ``github=None``.
     """
@@ -1519,11 +1595,13 @@ class CompositeSource:
         github: WorkSource | None,
         chat: WorkSource | None = None,
         schedule: WorkSource | None = None,
+        api: WorkSource | None = None,
     ) -> None:
         self.github = github
         self.chat = chat
         self.schedule = schedule
-        parts = [p for p in (github, chat, schedule) if p is not None]
+        self.api = api
+        parts = [p for p in (github, chat, schedule, api) if p is not None]
         if not parts:
             raise ValueError("CompositeSource needs at least one source")
         self.name = "+".join(p.name for p in parts)
@@ -1534,6 +1612,8 @@ class CompositeSource:
             return self.chat
         if is_schedule_id(item.item_id) and self.schedule is not None:
             return self.schedule
+        if is_api_id(item.item_id) and self.api is not None:
+            return self.api
         return self.github if self.github is not None else self._parts[0]
 
     def __getattr__(self, name: str) -> Any:

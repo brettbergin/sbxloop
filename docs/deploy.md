@@ -23,8 +23,9 @@ pause hold, waits for the daemon to be idle, and only then installs and restarts
   never timed into the window between the claim comment landing and the claim being
   persisted.
 - `holds` is the set of named pause holds; `paused` is whether any stand. Holds are
-  in-memory only: **every restart comes back unpaused**, so an operator's hold has to be
-  snapshotted before the restart and re-taken after it.
+  persisted: **a restart comes back with every hold still standing**, and `hold_details`
+  says whose each one is. A hold ends only when its owner releases it or an operator runs
+  `resume --all`.
 - `source_failures` counts consecutive failed discovery polls, independently of failed
   runs. `source_retry_in_s` gives the remaining polling backoff. A successful poll resets
   both; plain status and the chat status card warn while polling is failing.
@@ -101,6 +102,19 @@ a sandbox cannot boot. Off Linux, and in a `--no-systemd` install, the rows that
 apply are not shown, so a supported mode is never judged against a capability it never
 wanted.
 
+## The remote API behind a proxy
+
+`[api] enabled = true` makes the daemon serve its remote API on `127.0.0.1:8420`.
+It speaks plain HTTP and never terminates TLS itself: put a reverse proxy in front
+(Caddy, nginx, your ingress), let it terminate TLS and forward to loopback, and
+list the proxy's address in `[api] trusted_proxies` so the client address behind
+`X-Forwarded-For` is the one the authentication limiter keys on. Nothing else on
+the host needs to change: the listener runs inside `sbxloop daemon`, under the same
+unit, and stops with it. `sbxloop api client create` registers a client and prints
+its secret once; `sbxloop api key rotate` replaces the token signing key (restart
+the daemon for the listener to sign with it — tokens signed by the old key still
+verify until they expire).
+
 ## Upgrading by hand
 
 Two commands as the service user, once the daemon is idle:
@@ -125,7 +139,8 @@ On a host installed under a custom `SBXLOOP_HOME`, read `~/.sbxloop` above as th
 `sbxloop` itself already honours the variable, so only the two explicit `~/.sbxloop/…`
 paths change. `reset-failed` matters: `StartLimitBurst=5` per 600 s leaves a unit that
 crash-looped in `failed`, where a plain `restart` will not revive it. The daemon comes back
-unpaused (holds are in-memory), so re-take any hold you want to keep. Pin the version
+with the `upgrade` hold still standing, so release it (`ctl resume --hold upgrade`) once
+the checks below pass. Pin the version
 exactly — a downgrade is the same two commands with an older `X.Y.Z`. Then check it:
 
 ```bash
@@ -149,9 +164,9 @@ schedule / workflow_dispatch → self-hosted runner on the daemon host
                                 ├─ take a named pause hold (deploy-<run id>)
                                 ├─ wait — no cap — for the in-flight run to finish
                                 ├─ snapshot, then install the exact version into the home's venv
-                                ├─ snapshot the operator's holds; restart the unit
+                                ├─ restart the unit (the standing holds survive it)
                                 ├─ health check, or roll back to the previous version
-                                └─ restore the other holds; release its own; tell the control channel
+                                └─ release its own hold; tell the control channel
 ```
 
 Step by step:
@@ -167,17 +182,17 @@ Step by step:
 3. **Snapshots** (`sbxloop backup`) and **upgrades** with both distributions pinned to the
    same version, then re-runs `sbxloop init --systemd --no-sbx` so the launchers and units
    match while preserving the installed sandbox runtime. Rollback also preserves sbx.
-4. **Restarts** after `systemctl --user reset-failed`, having first snapshotted the standing
-   holds — immediately before the restart, not at the start of the job, so an operator who
-   paused *during* the wait is still paused afterwards.
+4. **Restarts** after `systemctl --user reset-failed`. Holds are persisted, so an operator
+   who paused before the deploy or *during* its wait is still paused afterwards without
+   the pipeline doing anything.
 5. **Health-checks**: unit active, `--version` matches, `sbxloop doctor` exits 0, the daemon
    answers `ctl status --json`, then a 45 s settle to prove it is not crash-looping.
 6. **Rolls back** to the previously installed version on any failed check, restarts, and
    fails the job. Rollback only runs once the upgrade step has — a failure before that
    changed nothing on the host, and a rollback restart would be the needless restart this
    whole procedure exists to avoid.
-7. **Restores the other holds** (after a rollback too — whatever version is live, operator
-   intent survives), **releases its own** on `always()`, and **reports** with
+7. **Releases its own hold** on `always()` — it survives the restart, so a job that died
+   after restarting would otherwise leave the daemon paused — and **reports** with
    `sbxloop daemon notify`, including how long it waited and whether a failure happened
    before anything was installed.
 
@@ -187,7 +202,7 @@ An sbxloop deployment or rollback leaves sbx unchanged. Upgrade that runtime sep
 with an explicit version, using `sbxloop init --sbx-version X.Y.Z` after checking
 compatibility on a CI runner. Take a named hold and drain the current run first, then stop
 `sbxloop-daemon` followed by `sbx-sandboxd` before installing. Restart the sandbox backend
-before the sbxloop daemon, check health, and restore any holds that should remain.
+before the sbxloop daemon, check health, and release the hold you took.
 
 Before the first start of the new runtime, keep a matching backup of the old binaries and
 the stopped sandbox state, configuration and credentials. `sbxloop backup` does not include
@@ -257,13 +272,15 @@ a custom `SBXLOOP_HOME` needs the job to be told, and there are two ways:
 
 ### `sbxloop daemon notify`
 
-Posts one message to the control channel through the configured `[chat] backend`, from the
-host and without the daemon — so a script can say "rollback also failed" while the daemon
-is down. It reads the channel from the home's `sbxloop.toml` and the bot token from the
-environment (`DISCORD_BOT_TOKEN`, `SLACK_BOT_TOKEN` or `MATTERMOST_BOT_TOKEN`, from the home's `secrets.env`), so
-the workflow never sources a secrets file or parses the config itself. The text is the
-chat's Markdown; on Slack it is re-dialected the way the bridge does it. Link previews and
-pings are suppressed. A headless daemon (no chat backend) cannot notify, and says so.
+Posts one message through the configured `[chat] backend`, from the host and without the
+daemon — so a script can say "rollback also failed" while the daemon is down. By default it
+reads the control channel from the home's `sbxloop.toml`; `--channel <id>` can route a
+purpose-specific notice elsewhere through the same backend. It reads the bot token from the
+environment (`DISCORD_BOT_TOKEN`, `SLACK_BOT_TOKEN` or `MATTERMOST_BOT_TOKEN`, from the home's
+`secrets.env`), so the workflow never sources a secrets file or parses the config itself.
+The text is the chat's Markdown; on Slack it is re-dialected the way the bridge does it.
+Link previews and pings are suppressed. A headless daemon (no chat backend) cannot notify,
+and says so.
 
 ### The runner
 

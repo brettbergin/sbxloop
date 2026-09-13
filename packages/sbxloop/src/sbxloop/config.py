@@ -53,6 +53,7 @@ from sbxloop.errors import ConfigError
 from sbxloop.ids import DEFAULT_BRANCH_PREFIX
 from sbxloop.log import LogFormat, LogLevel, get_logger
 from sbxloop.paths import SbxloopHome, home_root_from_env, resolve_home_root
+from sbxloop.resources import CpuCount, MemoryLimit, ResourcePurpose, SandboxResources
 from sbxloop.toolchains import DEFAULT_LANGUAGES, normalize_language, supported_languages
 from sbxloop_worker.protocol import (
     OPENAI_BASE_URL_ENV,
@@ -296,6 +297,21 @@ class OpenAIEndpointOverride(_ConfigModel):
         return base.model_copy(update=self.model_dump(exclude_none=True))
 
 
+#: Names that resolve to the host from inside a sandbox: a loopback name,
+#: the container runtimes' host aliases, and the `.internal`/`.localhost`
+#: zones they live in. Never grantable to a sandbox.
+_HOST_ALIASES = frozenset({"localhost", "host.docker.internal", "gateway.docker.internal"})
+
+
+def _names_the_host(domain: str) -> bool:
+    bare = domain.removeprefix("*.")
+    return (
+        bare in _HOST_ALIASES
+        or bare.endswith((".localhost", ".internal"))
+        or (domain.startswith("*.") and bare in ("localhost", "internal"))
+    )
+
+
 class SandboxConfig(_ConfigModel):
     """Sandbox provisioning: which template, where the workspace lives, what
     egress every run gets, and which language toolchains the agent sandbox is
@@ -319,6 +335,15 @@ class SandboxConfig(_ConfigModel):
     behavior — runs mutate the workspace directly, no git involved.
     """
 
+    # Mandatory per-VM allocations. Zero/auto is deliberately unsupported.
+    cpus: CpuCount = 6
+    memory: MemoryLimit = "12g"
+    concierge_cpus: CpuCount = 2
+    concierge_memory: MemoryLimit = "4g"
+    github_cpus: CpuCount = 1
+    github_memory: MemoryLimit = "2g"
+    service_cpus: CpuCount = 1
+    service_memory: MemoryLimit = "2g"
     template: str | None = None
     workspace: Path | None = None
     workspace_isolation: WorkspaceIsolation = "auto"
@@ -428,6 +453,25 @@ class SandboxConfig(_ConfigModel):
     # the evidence it sees for such a suite (`verify.services_detected`)
     # and changes nothing on its own.
     verify_mode: VerifyMode = "full"
+
+    @field_validator("extra_allow_domains")
+    @classmethod
+    def _check_extra_allow_domains(cls, value: list[str]) -> list[str]:
+        """A domain, or a `*.domain` wildcard: never a bare address, never
+        a name for the host itself, never `*` — this list is handed to the
+        agent sandbox's network policy as it is, and the host's own
+        listener (the remote API among it) must stay out of reach of
+        every sandbox by construction (#1041)."""
+        from sbxloop.policy import valid_pattern
+
+        value = [d.strip().lower() for d in value]
+        bad = [d for d in value if not valid_pattern(d) or _names_the_host(d)]
+        if bad:
+            raise ValueError(
+                f"sandbox.extra_allow_domains {bad}: use a domain or a *.domain wildcard — "
+                "never an address, a loopback name, a host alias or a bare *"
+            )
+        return value
 
     @field_validator("env")
     @classmethod
@@ -958,6 +1002,9 @@ class RepoConfig(_ConfigModel):
     """
 
     repo: str
+    # Only the run agent: helpers and the concierge keep their own sizing.
+    cpus: CpuCount | None = None
+    memory: MemoryLimit | None = None
     # Which forge holds this repository (#1009); None → `[vcs] kind`.
     # `Config.vcs_kind_for` resolves the effective one.
     kind: VcsKind | None = None
@@ -2608,6 +2655,61 @@ class TelemetryConfig(_ConfigModel):
         return value
 
 
+class ApiConfig(_ConfigModel):
+    """The remote operations API, served by ``sbxloop daemon`` in-process.
+
+    Off by default: a daemon without ``enabled = true`` opens no listener
+    and behaves exactly as before. On, the daemon serves ``/v1`` (REST,
+    generated OpenAPI) on ``bind:port`` — loopback unless told otherwise —
+    and a remote client authenticates with a short-lived access token
+    minted from client credentials (``sbxloop api client create``) or a
+    refresh token. TLS is the operator's reverse proxy; ``trusted_proxies``
+    says whose forwarded headers the listener believes. Needs the
+    ``sbxloop[api]`` extra; the daemon refuses to start without it.
+    """
+
+    enabled: bool = False
+    # Loopback by default: a broader bind is an explicit choice, and local
+    # binding alone never establishes identity — every request authenticates.
+    bind: str = "127.0.0.1"
+    port: int = Field(default=8420, ge=1, le=65535)
+    # Proxies (addresses or CIDRs) whose X-Forwarded-* headers are believed;
+    # empty means none are.
+    trusted_proxies: list[str] = Field(default_factory=list)
+    # A minted access token lives this long; a refresh token this long.
+    access_token_ttl_s: int = Field(default=900, ge=60, le=3600)
+    refresh_token_ttl_s: int = Field(default=604800, ge=300)
+    # Browser origins allowed to call the API; empty disables CORS entirely.
+    cors_origins: list[str] = Field(default_factory=list)
+    # Request bodies above this are refused with 413.
+    max_body_bytes: int = Field(default=262144, ge=1024)
+    # Live streams (SSE and WebSocket) served at once.
+    max_stream_clients: int = Field(default=32, ge=1)
+    # Public chronology rows older than this are pruned; a client resuming
+    # from a pruned cursor is told so (410) rather than skipped ahead.
+    replay_retention_s: int = Field(default=604800, ge=3600)
+    # How long an idempotency key keeps returning the same operation.
+    idempotency_retention_s: int = Field(default=86400, ge=60)
+    # A command accepted but not claimed within this expires rather than
+    # applying stale intent later.
+    operation_deadline_s: int = Field(default=300, ge=10)
+
+    @field_validator("bind")
+    @classmethod
+    def _bind_is_an_address(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("api.bind must be a host address")
+        return value
+
+    @field_validator("cors_origins")
+    @classmethod
+    def _no_wildcard_origin(cls, value: list[str]) -> list[str]:
+        if "*" in value:
+            raise ValueError("api.cors_origins must list origins; '*' is refused")
+        return value
+
+
 class Config(_ConfigModel):
     model: str = "auto"
     # Runtime provenance, not operator knobs. Persisted so CLI precedence
@@ -2668,6 +2770,7 @@ class Config(_ConfigModel):
     mattermost: MattermostConfig = Field(default_factory=MattermostConfig)
     tui: TuiConfig = Field(default_factory=TuiConfig)
     concierge: ConciergeConfig = Field(default_factory=ConciergeConfig)
+    api: ApiConfig = Field(default_factory=ApiConfig)
     entrygraph: EntrygraphConfig = Field(default_factory=EntrygraphConfig)
     # Named bounds for workload runs (#758) and the one a run gets by
     # default; a code run ignores both.
@@ -2717,6 +2820,15 @@ class Config(_ConfigModel):
         if kind == "github":
             return None
         return self.vcs.token_env or FORGE_TOKEN_ENVS[kind]
+
+    def vcs_api_url_for(self, kind: VcsKind) -> str | None:
+        """The API root a backend of ``kind`` speaks to: ``[github] api_url``
+        (which ``[vcs] api_url`` fills) for GitHub, else ``[vcs] api_url``
+        — ``None`` when a GitLab or Gitea configuration has not named one,
+        which the backend factory and the doctor refuse by name."""
+        if kind == "github":
+            return self.github.api_url
+        return self.vcs.api_url
 
     def vcs_kinds(self) -> tuple[VcsKind, ...]:
         """Every forge an enabled repository lives on, in first-seen order
@@ -2898,6 +3010,21 @@ class Config(_ConfigModel):
         the default repository, and a repository with no entry gets the
         daemon-wide set."""
         return self.daemon.labels_for(self.github.effective_repo(repo))
+
+    def sandbox_resources_for(
+        self, purpose: ResourcePurpose, repo: str | None = None
+    ) -> SandboxResources:
+        """Resolve a VM's allocation; no repository means the global default."""
+        if purpose == "agent":
+            entry = self.github.find_repo(repo) if repo is not None else None
+            return SandboxResources(
+                cpus=entry.cpus if entry and entry.cpus is not None else self.sandbox.cpus,
+                memory=entry.memory if entry and entry.memory is not None else self.sandbox.memory,
+            )
+        return SandboxResources(
+            cpus=getattr(self.sandbox, f"{purpose}_cpus"),
+            memory=getattr(self.sandbox, f"{purpose}_memory"),
+        )
 
     def sandbox_env_for(self, repo: str | None = None) -> dict[str, str]:
         """The plain environment ``repo``'s agent sandbox gets (#679): the

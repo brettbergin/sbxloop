@@ -95,6 +95,24 @@ class GithubOpsError(SbxloopError):
         self.http_status = http_status
 
 
+class RoleNotImplemented(GithubOpsError):
+    """A backend was asked for an operation of a role it does not implement
+    yet (#1009): the forge is configured and the read paths answer, but
+    this write path has not landed. Raised, never guessed around, so a run
+    that reaches it fails closed naming the backend, the role and the
+    operation; ``sbxloop doctor`` lists the same roles as not implemented
+    before any run starts."""
+
+    def __init__(self, kind: str, role: str, operation: str) -> None:
+        super().__init__(
+            f"the {kind} backend does not implement {role}.{operation} yet; "
+            f"a run on a {kind} repository cannot go past this operation"
+        )
+        self.kind = kind
+        self.role = role
+        self.operation = operation
+
+
 class DeliveryError(SbxloopError):
     """Delivering a run's workspace as a GitHub PR failed."""
 

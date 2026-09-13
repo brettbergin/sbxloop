@@ -101,6 +101,16 @@ EXPECTATIONS: dict[str, Expectation] = {
             ("pnpm exec tsc -b packages/web", False),
         ),
     ),
+    # A plain npm project whose Node bootstrap needs xz archive extraction.
+    "node-npm": Expectation(
+        ("javascript",),
+        "detected",
+        versions={"javascript": ("24", "package.json")},
+        allowed=("nodejs.org", "registry.npmjs.org"),
+        not_allowed=("go.dev", "static.rust-lang.org"),
+        gate="npm run check",
+        lint=(("npm run check", False),),
+    ),
     # yarn rides on the corepack shim the javascript toolchain enables; the
     # lockfile alone selects the client (#684)
     "node-yarn": Expectation(

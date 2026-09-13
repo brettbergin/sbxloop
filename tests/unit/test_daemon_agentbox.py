@@ -81,6 +81,31 @@ class TestNaming:
 
 
 class TestLifecycle:
+    @pytest.mark.parametrize("old_vm", [False, True])
+    def test_changed_or_unknown_allocation_preserves_concierge_history(
+        self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, old_vm: bool
+    ) -> None:
+        from sbxloop.errors import ProvisionError
+
+        first = make_agent(fake_sbx, tmp_path, monkeypatch)
+        first.client()
+        history = fake_sbx.sandbox_fs(first.name) / "home/agent/history.txt"
+        history.write_text("conversation to preserve")
+        first.close()
+        if old_vm:
+            for record in first.config.paths.sandbox_allocations.glob("*.json"):
+                record.unlink()
+        second = make_agent(fake_sbx, tmp_path, monkeypatch)
+        if not old_vm:
+            second.config.sandbox.concierge_cpus = 3
+        with pytest.raises(ProvisionError, match="needs recreation"):
+            second.call(lambda client: client)
+        assert history.read_text() == "conversation to preserve"
+        assert fake_sbx.invocations("rm") == []
+        assert created_names(fake_sbx) == [first.name]
+        assert fake_sbx.meta(first.name)["cpus"] == 2
+        assert fake_sbx.meta(first.name)["memory"] == "4g"
+
     def test_first_client_provisions_an_agent_sandbox(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:

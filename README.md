@@ -278,6 +278,11 @@ For ongoing work, run `sbxloop daemon` with configured repositories and a
 [Discord or Slack bridge](docs/user-guide.md#the-daemon-an-always-on-outer-loop).
 It picks up labeled issues and lets you follow and steer runs from chat.
 
+Working from somewhere else? Switch on the [remote API](docs/api.md): the
+same daemon serves REST, server-sent events and a WebSocket, so a client with
+a scoped token can admit work, follow a run, steer it, approve a held merge
+and fetch its artifacts without a shell on the host.
+
 Prefer the terminal? Run `sbxloop tui` on the daemon host. The
 [TUI](docs/tui.md) puts the queue, live runs, logs, and chat in one place,
 so you can steer work and approve held merges without switching to Discord

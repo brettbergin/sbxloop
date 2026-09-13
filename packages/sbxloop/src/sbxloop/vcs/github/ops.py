@@ -24,6 +24,7 @@ from sbxloop.vcs.model import (
     CheckState as CheckState,
     ChecksVerdict as ChecksVerdict,
     CloseReason as CloseReason,
+    CredentialInfo as CredentialInfo,
     FailedCheck as FailedCheck,
     Identity as Identity,
     IssueRef as IssueRef,
@@ -536,6 +537,9 @@ def github_transport(api_url: str) -> TransportSpec:
 
 
 class GithubOps:
+    #: The forge kind this backend answers for; the loop's ``[vcs] kind``.
+    KIND: ClassVar[str] = "github"
+
     def __init__(
         self,
         client: WorkerClient,
@@ -1583,8 +1587,12 @@ class GithubOps:
             {"state": "closed", "state_reason": reason},
         )
 
-    def issue_comment_delete(self, repo: str, comment_id: int) -> None:
-        """Delete one issue comment by its id."""
+    def issue_comment_delete(
+        self, repo: str, comment_id: int, *, number: int | None = None
+    ) -> None:
+        """Delete one issue comment by its id. ``number`` is the issue it is
+        on, which a forge that addresses comments under their issue needs
+        (#1017); GitHub addresses them by id alone."""
         self.raw("DELETE", f"/repos/{repo}/issues/comments/{comment_id}")
 
     # -- pull requests -------------------------------------------------------
@@ -1782,6 +1790,13 @@ class GithubOps:
         if isinstance(data, dict) and data.get("missing") is True:
             return None
         return data
+
+    def credential_info(self) -> CredentialInfo | None:
+        """``None``: what a GitHub credential is (an App installation, a
+        classic or fine-grained PAT) and how long it lives is the
+        provisioner's knowledge, and GitHub lets no token read its own
+        expiry (#1009); the doctor composes that row itself."""
+        return None
 
     def token_scopes(self) -> tuple[str, ...] | None:
         """The credential's classic OAuth scopes (``repo``, ``workflow``,

@@ -145,10 +145,13 @@ class TestPresets:
             Config.model_validate(tomllib.loads(fragment))
             merged = tomllib.loads(render_config_template(name))
             Config.model_validate(merged)
-            # the template's own tables are all commented, so the preset's
-            # live sections are the only ones and survive the merge intact
+            # Preset values override the template while retaining its live
+            # resource defaults for keys the preset does not specify.
             for table, values in tomllib.loads(fragment).items():
-                assert merged[table] == values, (name, table)
+                if isinstance(values, dict):
+                    assert all(merged[table][key] == value for key, value in values.items())
+                else:
+                    assert merged[table] == values, (name, table)
 
     def test_large_repo_preset_sizes_for_a_slow_gate(self) -> None:
         config = Config.model_validate(tomllib.loads(render_config_template("large-repo")))
@@ -439,12 +442,20 @@ def test_examples_use_only_placeholder_repositories() -> None:
                 assert candidate in PLACEHOLDER_REPOS, f"{name}: real repository {candidate!r}"
 
 
-def test_example_ships_sections_commented_out() -> None:
-    """A fresh copy is exactly the built-in defaults: only the top-level keys
-    are live, every `[section]` and its keys ship commented out. This also
-    keeps the parsed document flat, which the drift check relies on."""
+def test_example_ships_resource_defaults_live() -> None:
+    """A fresh copy explicitly bounds every VM and matches built-in defaults."""
     parsed = tomllib.loads(EXAMPLE.read_text())
-    assert not [k for k, v in parsed.items() if isinstance(v, dict)]
+    assert [k for k, v in parsed.items() if isinstance(v, dict)] == ["sandbox"]
+    assert parsed["sandbox"] == {
+        "cpus": 6,
+        "memory": "12g",
+        "concierge_cpus": 2,
+        "concierge_memory": "4g",
+        "github_cpus": 1,
+        "github_memory": "2g",
+        "service_cpus": 1,
+        "service_memory": "2g",
+    }
     assert set(parsed) == {
         "model",
         "app_name",
@@ -452,6 +463,7 @@ def test_example_ships_sections_commented_out() -> None:
         "keep_on_failure",
         "worker_transport",
         "secret_strategy",
+        "sandbox",
     }
     assert Config.model_validate(parsed).model_dump() == Config().model_dump()
 

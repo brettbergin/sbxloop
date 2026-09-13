@@ -1965,3 +1965,39 @@ class TestVerificationSection:
             verification="  ",
         )
         assert "Verification" not in ops.pr_kwargs["body"]
+
+
+class TestPullRequestCollision:
+    """A create refused because the head already has an open change (#387,
+    #1018): GitHub's 422, GitLab's 409, either way confirmed by a lookup;
+    any other status is not a collision."""
+
+    def test_each_forges_status_counts_and_others_do_not(self) -> None:
+        from sbxloop.deliver import _is_pr_collision
+        from sbxloop.errors import GithubOpsError
+
+        assert _is_pr_collision(github_error("pr_exists_422"))
+        assert _is_pr_collision(
+            GithubOpsError("Another open merge request already exists", http_status=409)
+        )
+        assert not _is_pr_collision(GithubOpsError("Not Found", http_status=404))
+        assert not _is_pr_collision(GithubOpsError("Forbidden", http_status=403))
+
+
+class TestRefCollision:
+    """A branch create refused because the branch exists (#1020): GitHub's
+    recorded 422, GitLab's 400 "Branch already exists" (observed on CE
+    19.3.2); a 400 that says anything else is not a collision."""
+
+    def test_each_forges_words_count_and_others_do_not(self) -> None:
+        from sbxloop.deliver import _is_ref_collision
+        from sbxloop.errors import GithubOpsError
+
+        assert _is_ref_collision(github_error("ref_exists_422"))
+        assert _is_ref_collision(
+            GithubOpsError('{"message":"Branch already exists"}', http_status=400)
+        )
+        assert not _is_ref_collision(
+            GithubOpsError('{"message":"Invalid reference name"}', http_status=400)
+        )
+        assert not _is_ref_collision(github_error("ref_locked_422"))

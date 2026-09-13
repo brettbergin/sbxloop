@@ -43,6 +43,7 @@ from pydantic import BaseModel, ConfigDict
 
 from sbxloop.errors import SbxError, SbxloopError, SbxNotFoundError
 from sbxloop.paths import SbxloopHome
+from sbxloop.resources import SandboxResources
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 from sbxloop.sbx.parse import _CELL_SPLIT, parse_version
@@ -66,6 +67,7 @@ PROBE_SECRET_ENV_VISIBILITY = "secret-env-visibility"  # nosec B105 - probe name
 PROBE_SECRET_EXISTS_ERROR = "secret-exists-error"  # nosec B105 - probe name
 PROBE_SECRET_VALUE_STDIN = "secret-value-stdin"  # nosec B105 - probe name
 PROBE_EXEC_STDIN_ENV = "exec-stdin-env"
+PROBE_API_HOST_UNREACHABLE = "api-host-unreachable"
 
 # The exec-stdin-env verdicts (importable so provisioning can't typo them).
 VERDICT_STDIN_DELIVERS = "delivers"
@@ -412,6 +414,74 @@ def _probe_secret_exists_error(ctx: ProbeContext) -> tuple[str, str]:
         _cleanup_probe_secret(ctx.cli, _DUP_PROBE_ENV, name)
 
 
+# The remote API's default port (`[api] port`), and the marker the in-VM
+# script carries so a fake sbx can answer it without touching a network.
+API_PROBE_PORT = 8420
+API_PROBE_MARKER = "SBXLOOP_API_REACH_PROBE"
+_API_PROBE_SCRIPT = f"""\
+# {API_PROBE_MARKER}
+import socket
+PORT = {API_PROBE_PORT}
+def gateway():
+    try:
+        for line in open("/proc/net/route").read().splitlines()[1:]:
+            fields = line.split()
+            if len(fields) > 2 and fields[1] == "00000000":
+                raw = fields[2]
+                return ".".join(str(int(raw[i : i + 2], 16)) for i in (6, 4, 2, 0))
+    except (OSError, ValueError):
+        return None
+    return None
+gw = gateway()
+targets = [("127.0.0.1", PORT)] + ([(gw, PORT)] if gw else [])
+reached = []
+for host, port in targets:
+    try:
+        socket.create_connection((host, port), timeout=3).close()
+        reached.append(host)
+    except OSError:
+        pass
+if reached:
+    print("reachable " + ",".join(reached))
+else:
+    print("unreachable " + ("gateway=" + gw if gw else "no-gateway"))
+"""
+
+
+def _probe_api_host_unreachable(ctx: ProbeContext) -> tuple[str, str]:
+    """Whether a worker sandbox can reach the host's remote API (#1041).
+
+    Two facts, from inside the scratch sandbox and from the policy: a TCP
+    connect to the API's default port on the guest's own loopback and on
+    its default gateway (the host side of the VM's network), and the
+    network policy's answer for those two addresses. ``unreachable`` is
+    both refused; ``reachable`` a connect that succeeded; ``policy-allows``
+    nothing listening but a policy that would let a connection through —
+    the listener would be reachable the day it binds beyond loopback.
+    """
+    assert ctx.sandbox is not None
+    result = ctx.sandbox.exec(["python3", "-c", _API_PROBE_SCRIPT])
+    line = result.stdout.strip().splitlines()[-1] if result.stdout.strip() else ""
+    verdict, _, detail = line.partition(" ")
+    if verdict == "reachable":
+        return "reachable", f"connected to the API port from the sandbox: {detail}"
+    if verdict != "unreachable":
+        return "unknown", f"the in-sandbox probe answered {line!r} (rc={result.returncode})"
+    hosts = ["127.0.0.1"]
+    if detail.startswith("gateway="):
+        hosts.append(detail.removeprefix("gateway="))
+    allowed: list[str] = []
+    for host in hosts:
+        try:
+            if ctx.cli.policy_check(host, sandbox=ctx.sandbox.name):
+                allowed.append(host)
+        except SbxError as exc:
+            return "unknown", f"policy check for {host} failed: {exc}"
+    if allowed:
+        return "policy-allows", f"no listener answered, but the policy allows {', '.join(allowed)}"
+    return "unreachable", f"connect refused and policy denies {', '.join(hosts)}"
+
+
 CATALOG: tuple[Probe, ...] = (
     Probe(
         id=PROBE_CLI_SURFACE,
@@ -533,6 +603,17 @@ CATALOG: tuple[Probe, ...] = (
         depends="the replace-on-exists secret flow parses the owning scope out of sbx's "
         "stderr to remove stale secrets from previous runs",
         run=_probe_secret_exists_error,
+    ),
+    Probe(
+        id=PROBE_API_HOST_UNREACHABLE,
+        summary="the host's remote API port is unreachable from inside a worker sandbox",
+        tier="sandbox",
+        expected="unreachable",
+        depends="the remote API's isolation claim: a worker sandbox can never call the "
+        "listener the daemon serves beside it (the sandbox network policy never names "
+        "the host, and the listener binds loopback) — a reachable or policy-allows "
+        "verdict means an agent could steer its own daemon",
+        run=_probe_api_host_unreachable,
     ),
 )
 
@@ -706,14 +787,23 @@ def _apply_drift(
         )
 
 
-def _scratch_sandbox(cli: SbxCLI, home: SbxloopHome, template: str | None) -> tuple[Sandbox, Path]:
+def _scratch_sandbox(
+    cli: SbxCLI,
+    home: SbxloopHome,
+    template: str | None,
+    resources: SandboxResources | None = None,
+) -> tuple[Sandbox, Path]:
     nonce = _secrets.token_hex(4)
     # Resolve like provisioning does: sbx mounts the workspace by path.
     workspace = _conformance_dir(home) / f"scratch-{nonce}"
     workspace.mkdir(parents=True, exist_ok=True)
     workspace = workspace.resolve()
     spec = SandboxSpec(
-        name=f"sbxloop-doctor-{nonce}", role="agent", workspace=workspace, template=template
+        name=f"sbxloop-doctor-{nonce}",
+        role="agent",
+        workspace=workspace,
+        template=template,
+        resources=resources or SandboxResources(cpus=1, memory="2g"),
     )
     cli.create(spec)
     return Sandbox(cli, spec.name), workspace
@@ -725,6 +815,7 @@ def run_conformance(
     *,
     deep: bool = False,
     template: str | None = None,
+    resources: SandboxResources | None = None,
     progress: ProgressFn | None = None,
 ) -> ConformanceReport:
     """Run the probe catalog and reconcile with the version-keyed cache.
@@ -758,7 +849,7 @@ def run_conformance(
     sandbox_probes = [p for p in CATALOG if p.tier == "sandbox"]
     if deep:
         report_progress("creating scratch sandbox for deep probes (first boot can be slow)")
-        sandbox, workspace = _scratch_sandbox(cli, home, template)
+        sandbox, workspace = _scratch_sandbox(cli, home, template, resources)
         try:
             ctx = ProbeContext(cli, sandbox=sandbox, workspace=workspace)
             for probe in sandbox_probes:

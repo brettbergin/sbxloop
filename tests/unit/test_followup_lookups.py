@@ -108,6 +108,24 @@ def existing(**changes):
     }
 
 
+def test_issue_evidence_accepts_each_forges_issue_path():
+    """The URL an issue lives at is the forge's to spell (#1017): GitHub
+    and Gitea serve ``/<repo>/issues/<n>``, GitLab ``/<repo>/-/issues/<n>``;
+    a path from another repository, or not an issue at all, is refused."""
+    from sbxloop.engine.issue_lookup import issue_evidence
+
+    assert issue_evidence(existing(), "o/r").url == "https://github.com/o/r/issues/12"
+    on_gitlab = existing(html_url="https://gitlab.example.com/o/r/-/issues/12")
+    assert issue_evidence(on_gitlab, "o/r").number == 12
+    for wrong in (
+        "https://gitlab.example.com/o/other/-/issues/12",
+        "https://github.com/o/r/pull/12",
+        "http://github.com/o/r/issues/12",
+    ):
+        with pytest.raises(LookupUnavailable):
+            issue_evidence(existing(html_url=wrong), "o/r")
+
+
 def test_no_lookup_cannot_authorize_creation(lookup):
     with pytest.raises(LookupUnavailable, match="no completed"):
         lookup.check(proposed())

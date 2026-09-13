@@ -43,6 +43,7 @@ from sbxloop.config import Config
 from sbxloop.endpoint import host_kind
 from sbxloop.errors import SbxError, SecretStateError
 from sbxloop.log import get_logger
+from sbxloop.resources import SandboxResources
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
 
@@ -427,7 +428,12 @@ def replace_registration(cli: SbxCLI, *, env: str, host: str, token: str) -> Non
 
 
 def verify_secret_visibility(
-    cli: SbxCLI, *, env: str, workspace: Path, template: str | None = None
+    cli: SbxCLI,
+    *,
+    env: str,
+    workspace: Path,
+    template: str | None = None,
+    resources: SandboxResources | None = None,
 ) -> bool | None:
     """Boot a throwaway sandbox and check whether the proxy-injected env is
     visible to exec'd processes (the same probe provisioning runs per-run).
@@ -437,7 +443,13 @@ def verify_secret_visibility(
     sandbox is always removed.
     """
     name = f"sbxloop-secretcheck-{token_hex(4)}"
-    spec = SandboxSpec(name=name, role="agent", workspace=workspace, template=template)
+    spec = SandboxSpec(
+        name=name,
+        role="agent",
+        workspace=workspace,
+        template=template,
+        resources=resources or SandboxResources(cpus=1, memory="2g"),
+    )
     try:
         cli.create(spec)
     except SbxError:

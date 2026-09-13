@@ -956,10 +956,31 @@ def resume(
             help="Give a run that exhausted its fix rounds this many more before resuming.",
         ),
     ] = 0,
+    force: Annotated[
+        bool,
+        typer.Option(
+            "--force",
+            help="Resume here even though a daemon owns the run (the daemon is down).",
+        ),
+    ] = False,
 ) -> None:
-    """Resume an unfinished run (fresh sandboxes, persisted state and config)."""
+    """Resume an unfinished run (fresh sandboxes, persisted state and config).
+
+    A run the daemon dispatched is the daemon's to resume: `sbxloop daemon
+    ctl resume-run <run>` queues it there, so one engine owns it. This
+    command resumes it in this process instead only with `--force`, for a
+    daemon that is not coming back.
+    """
     _require_supported_host()
     config = _run_config()
+    owner = _daemon_item_for(config, run_id)
+    if owner is not None and not force:
+        console.print(
+            f"[bold red]resume refused:[/] run {run_id} belongs to the daemon's work item "
+            f"{owner} — `sbxloop daemon ctl resume-run {run_id}` resumes it under the daemon; "
+            "`--force` resumes it here anyway (only when the daemon is down)."
+        )
+        raise typer.Exit(2)
     engine = LoopEngine(config)
     try:
         if grant_rounds:
@@ -973,6 +994,26 @@ def resume(
         raise typer.Exit(2) from exc
     # engine.config is the run's rehydrated config, which is what drove the run.
     _finish(result, engine.config)
+
+
+def _daemon_item_for(config: Config, run_id: str) -> str | None:
+    """The daemon work item a run is pinned to, or ``None`` when no daemon
+    ledger knows it — a home with no daemon database has none."""
+    path = config.paths.state_db
+    if not path.exists():
+        return None
+    try:
+        dstore = DaemonStore(path, readonly=True)
+    except SbxloopError:
+        return None
+    try:
+        item_id = dstore.item_for_run(run_id)
+        if item_id is None:
+            return None
+        item = dstore.get(item_id)
+        return item_id if item is not None and item.run_id == run_id else None
+    finally:
+        dstore.close()
 
 
 @app.command()
@@ -1501,6 +1542,7 @@ def secrets_rotate(
                 env=token_env,
                 workspace=workspace,
                 template=config.sandbox.template,
+                resources=config.sandbox_resources_for("service"),
             )
             if visible is True:
                 console.print(
@@ -2176,6 +2218,15 @@ backup_app = typer.Typer(
 app.add_typer(backup_app, name="backup")
 
 
+def _api_app() -> typer.Typer:
+    from sbxloop.cli.api import api_app
+
+    return api_app
+
+
+app.add_typer(_api_app(), name="api")
+
+
 @backup_app.callback()
 def backup_default(
     ctx: typer.Context,
@@ -2353,6 +2404,7 @@ def daemon(
     from sbxloop.daemon.model import DaemonNotice, WorkItem
     from sbxloop.daemon.sources import (
         REPO_HEALTH_KEY,
+        ApiSource,
         ChatSource,
         CompositeSource,
         GitHubLabels,
@@ -2434,6 +2486,20 @@ def daemon(
     configure_logging(
         config.daemon.log_level, fmt=config.daemon.log_format, file=config.paths.daemon_log
     )
+    if config.api.enabled and not once:
+        # Before any sandbox work: a missing extra is a configuration
+        # error to fix, not something to discover after recovery.
+        from sbxloop.api import require_available
+
+        try:
+            require_available()
+        except ConfigError as exc:
+            log.error(
+                "api.unavailable",
+                error=str(exc),
+                hint="install the extra into the daemon's venv, or set [api] enabled = false",
+            )
+            raise typer.Exit(2) from exc
 
     # Work comes from the labelled issues of the configured repositories,
     # or (#760) from workloads asked for in chat — a daemon with a chat
@@ -2578,9 +2644,15 @@ def daemon(
         # queue; the composite routes each item back to where it came
         # from. The schedule source always rides: a schedule may be
         # created from chat while the daemon runs (#818).
-        source = CompositeSource(source, ChatSource() if chat_intake else None, ScheduleSource())
+        # The API source always rides too: an item the remote API admitted
+        # must route back to it whether or not the listener is up now.
+        source = CompositeSource(
+            source, ChatSource() if chat_intake else None, ScheduleSource(), ApiSource()
+        )
     else:
-        source = CompositeSource(None, ChatSource() if chat_intake else None, ScheduleSource())
+        source = CompositeSource(
+            None, ChatSource() if chat_intake else None, ScheduleSource(), ApiSource()
+        )
 
     # One line an operator can read back from the journal to know exactly
     # what this daemon is: its home, what it polls, and every guardrail.
@@ -2735,6 +2807,9 @@ def daemon(
         )
 
     ctl = ControlServer(loop, config.paths)
+    api_server = None
+    if config.api.enabled and not once:
+        api_server = _start_api(config, loop, frontend)
     cleanup_registry.install_handlers()
     cleanup_registry.set_quiesce(loop.quiesce)
     stop_reason = "finished"
@@ -2745,6 +2820,10 @@ def daemon(
         # own verdict. Requests submitted before this point are refused as
         # stale, never executed.
         ctl.start()
+        if api_server is not None:
+            # The listener answered liveness through recovery; commands are
+            # taken from here, the same moment the ctl queue takes them.
+            api_server.ctx.ready.set()
         if once:
             result = loop.tick()
             # --once is a smoke/cron probe: its one-line verdict stays on
@@ -2768,6 +2847,9 @@ def daemon(
         raise
     finally:
         cleanup_registry.set_quiesce(None)
+        if api_server is not None:
+            log.debug("daemon.shutdown", step="api listener")
+            api_server.close()
         log.debug("daemon.shutdown", step="control server")
         ctl.close()
         log.debug("daemon.shutdown", step="chat bridges")
@@ -2881,6 +2963,32 @@ def concierge_wanted(config: Config, *, once: bool) -> bool:
 def _home() -> SbxloopHome:
     """The home the daemon runs against — the same one every command sees."""
     return load_config().paths
+
+
+def _start_api(config: Config, loop: Any, frontend: Any) -> Any:
+    """The remote API listener beside the daemon: built over the daemon's
+    own stores, started before recovery (liveness answers at once), told
+    it is ready after the control queue is. Its chronology observes the
+    daemon's frontend so notices, run lifecycle and gates reach the
+    public event stream."""
+    from sbxloop.api.app import create_app
+    from sbxloop.api.auth.keys import load_or_create
+    from sbxloop.api.auth.store import ApiAuthStore
+    from sbxloop.api.context import ApiContext
+    from sbxloop.api.frontend import ApiFrontend
+    from sbxloop.api.server import ApiServer
+
+    ctx = ApiContext(
+        config,
+        loop=loop,
+        auth=ApiAuthStore(loop.dstore),
+        keys=load_or_create(config.paths),
+        clock=loop.clock,
+    )
+    server = ApiServer(create_app(ctx), config.api, ctx=ctx)
+    frontend.add_observer(ApiFrontend(ctx.chronology, ctx.hub, ctx.projector, clock=ctx.clock))
+    server.start()
+    return server
 
 
 def _daemon_store() -> DaemonStore:
@@ -3097,16 +3205,22 @@ def daemon_notify(
     timeout: Annotated[
         float, typer.Option("--timeout", help="Seconds to wait for the chat service.")
     ] = 30.0,
+    channel: Annotated[
+        str | None,
+        typer.Option(
+            "--channel", help="Channel id to use instead of the configured control channel."
+        ),
+    ] = None,
 ) -> None:
-    """Post one message to the daemon's control channel through the configured
-    `[chat] backend` — from the host, without the daemon, for deploy scripts
-    and cron. The bot token comes from the environment / .env, as for the
-    daemon; nothing else about the channel is read outside sbxloop.toml."""
+    """Post one message through the configured `[chat] backend` — from the
+    host, without the daemon, for deploy scripts and cron. The channel is the
+    configured control channel unless `--channel` selects another one. The bot
+    token comes from the environment / .env, as for the daemon."""
     from sbxloop.daemon.notify import post_notice
 
     try:
         config = load_config()
-        posted = post_notice(config, text, timeout_s=timeout)
+        posted = post_notice(config, text, channel_id=channel, timeout_s=timeout)
     except SbxloopError as exc:
         console.print(f"[bold red]notify failed:[/] {exc}")
         raise typer.Exit(2) from exc

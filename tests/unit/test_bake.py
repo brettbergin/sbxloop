@@ -66,6 +66,7 @@ def script_install(
         stdout="".join(f"{name}\n" for name in missing or []),
     )
     fake_sbx.script(f"exec {BOX} sh -c sudo -n apt-get", returncode=0)
+    fake_sbx.script(f'exec {BOX} sh -c for p in "$@"', stdout="")
     fake_sbx.script(f"exec {BOX} python3 -m venv", returncode=0)
     fake_sbx.script(f"exec {BOX} /home/agent/.sbxloop/venv/bin/pip", returncode=0)
     fake_sbx.script(f"exec {BOX} {VENV_PY} -c", stdout=f"{sbxloop.__version__}\n")
@@ -74,6 +75,53 @@ def script_install(
 
 
 class TestBakeHappyPath:
+    @pytest.mark.parametrize("apt_rc", [0, 100])
+    def test_xz_is_required_even_without_javascript(
+        self,
+        cli: SbxCLI,
+        config: Config,
+        fake_sbx: FakeSbx,
+        apt_rc: int,
+    ) -> None:
+        fake_sbx.script(f'exec {BOX} sh -c for p in "$@"', stdout="xz-utils\n")
+        fake_sbx.script(f"exec {BOX} sh -c sudo -n apt-get", returncode=apt_rc)
+        script_install(fake_sbx)
+        if apt_rc:
+            with pytest.raises(BakeError, match="xz-utils"):
+                bake_template(cli, config, name=BOX)
+            assert fake_sbx.invocations("template") == []
+        else:
+            bake_template(cli, config, name=BOX)
+            assert any(
+                "apt-get install -y -q xz-utils" in " ".join(c)
+                for c in fake_sbx.invocations("exec")
+            )
+
+    def test_bake_repairs_worker_venv_without_a_python_toolchain(
+        self, cli: SbxCLI, tmp_path: Path, fake_sbx: FakeSbx
+    ) -> None:
+        languages = ["go"]
+        config = Config.model_validate(
+            {"home": str(tmp_path / "state"), "sandbox": {"languages": languages}}
+        )
+        fake_sbx.script(
+            f"exec {BOX} python3 -m venv", returncode=1, stderr="no ensurepip", once=True
+        )
+        fake_sbx.script(f"exec {BOX} python3 -c import sys", stdout="python3.14-venv\n")
+        script_install(fake_sbx, languages=languages)
+
+        record = bake_template(cli, config, name=BOX, cache_runtime=False)
+
+        assert record.python == VENV_PY
+        assert record.languages == tuple(languages)
+        execs = fake_sbx.invocations("exec")
+        apt = [c[-1] for c in execs if "apt-get" in c[-1]]
+        assert len(apt) == 1 and "python3.14-venv" in apt[0].split()
+        assert not [c for c in execs if c[2:6] == ["python3", "-m", "pip", "install"]]
+        saved = fake_sbx.state / "templates" / "sbxloop-baked_latest" / "fs"
+        manifest = json.loads((saved / "home/agent/.sbxloop/bake.json").read_text())
+        assert manifest["python"] == VENV_PY
+
     def test_bake_saves_template_and_records(
         self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx
     ) -> None:
@@ -230,6 +278,24 @@ class TestBakeOptions:
 
 
 class TestBakeFailure:
+    def test_bake_refuses_a_user_site_worker(
+        self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx
+    ) -> None:
+        fake_sbx.script(f"exec {BOX} python3 -m venv", returncode=1, stderr="no ensurepip")
+        fake_sbx.script(f"exec {BOX} python3 -c import sys", stdout="python3.14-venv\n")
+        fake_sbx.script(f"exec {BOX} sh -c sudo -n apt-get", returncode=100)
+        fake_sbx.script(f"exec {BOX} python3 -m pip install", returncode=0)
+        fake_sbx.script(f"exec {BOX} python3 -c import sbxloop_worker", stdout=sbxloop.__version__)
+        fake_sbx.script(f"exec {BOX} python3 -m sbxloop_worker", returncode=64)
+        script_install(fake_sbx)
+
+        with pytest.raises(BakeError, match="isolated worker virtualenv"):
+            bake_template(cli, config, name=BOX, cache_runtime=False)
+
+        assert not fake_sbx.invocations("template")
+        assert not bake_record_path(config).exists()
+        assert not (fake_sbx.state / "sandboxes" / BOX).exists()
+
     def test_install_failure_cleans_up_and_raises(
         self, cli: SbxCLI, config: Config, fake_sbx: FakeSbx
     ) -> None:

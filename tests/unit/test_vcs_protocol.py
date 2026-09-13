@@ -11,6 +11,7 @@ names every capability with one of the three states, never a boolean."""
 from __future__ import annotations
 
 import inspect
+from typing import ClassVar
 
 from sbxloop.vcs.github.ops import GithubOps
 from sbxloop.vcs.protocol import (
@@ -66,6 +67,33 @@ class TestTheGithubBackendAnswersEveryRole:
 
     def test_a_stand_in_inherits_the_roles(self) -> None:
         assert isinstance(OpsStub(), VcsOps)
+
+
+class TestTheGitlabBackendAnswersEveryRole:
+    """The second backend (#1017) is held to the same partition: every
+    public operation on it belongs to exactly one role, and it answers
+    every role structurally — the roles it has not implemented yet raise,
+    but they exist with the role's signature."""
+
+    # GitLab's own transport words, and the per-user bot lookup the review
+    # roles will read (#1016 V3): the backend's business, no role's.
+    GITLAB_PRIVATE: ClassVar[set[str]] = {"raw_text", "raw_pages", "user_is_bot"}
+
+    def test_every_operation_belongs_to_exactly_one_role(self) -> None:
+        from sbxloop.vcs.gitlab.ops import GitlabOps
+
+        placed = set().union(*(_role_methods(role) for role in ROLES))
+        operations = _public_methods(GitlabOps) - TRANSPORT - self.GITLAB_PRIVATE
+        assert sorted(operations - placed) == [], "operations on no role"
+        assert sorted(placed - operations) == [], "role methods the backend lacks"
+
+    def test_structurally_at_runtime(self) -> None:
+        from tests.fakes.fake_gitlab import FakeGitlab
+
+        fake = FakeGitlab()
+        for role in ROLES:
+            assert isinstance(fake, role), role.__name__
+        assert isinstance(fake, VcsOps)
 
 
 class TestCapabilities:

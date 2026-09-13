@@ -195,13 +195,11 @@ from sbxloop.sbx.sandbox import SBXLOOP_DIR
 from sbxloop.vcs.github.labels import FOLLOWUP_DESCRIPTOR, LabelSpec, ensure_label
 from sbxloop.vcs.github.ops import (
     FailedCheck,
-    GithubOps,
     Identity,
     MalformedResponse,
     PostedFinding,
     ReviewComment,
     SubmittedReview,
-    github_transport,
     identities_match,
     user_identity,
 )
@@ -676,6 +674,8 @@ class LoopEngine:
         (``keep_sandboxes``, ``keep_on_failure``) also stay resume-time
         choices — they are operator intent about THIS attempt, not run
         identity, and flipping keep on to debug a crashing run must work.
+        Sandbox CPU/memory limits also come from the current operator config:
+        a saved run cannot retain an allocation the operator has reduced.
         Model settings refresh separately at each new phase from the original
         config location; the run's explicit --model override remains pinned.
         Drift from the config this engine was built with is reported via a
@@ -720,11 +720,26 @@ class LoopEngine:
         drift = self._config_drift(stored, current)
         if drift:
             message = (
-                "resuming with the run's original config; the current config "
+                "resuming with the run's original config except current sandbox "
+                "CPU/memory limits; the current config "
                 "differs (model settings refresh before each new phase): " + "; ".join(drift)
             )
             log.warning("run.config_drift", run=run_id, drift=drift)
             self.bus.emit(HostEventTypes.RUN_CONFIG_DRIFT, run_id, message=message)
+        resource_keys = {"cpus", "memory"} | {
+            f"{purpose}_{key}"
+            for purpose in ("concierge", "github", "service")
+            for key in ("cpus", "memory")
+        }
+        stored.sandbox = stored.sandbox.model_copy(
+            update={key: getattr(current.sandbox, key) for key in resource_keys}
+        )
+        # An override removed from the live config must disappear from the
+        # resumed allocation too. The repository's other pinned rules survive.
+        for entry in stored.github.repos:
+            live = current.github.find_repo(entry.repo)
+            entry.cpus = live.cpus if live is not None else None
+            entry.memory = live.memory if live is not None else None
         self.config = stored
         if self._worker_python_from_config:
             self.worker_python = stored.worker_python
@@ -1449,10 +1464,15 @@ class LoopEngine:
             **extra,
         )
 
-    def _default_github_ops(self, client: WorkerClient, run_id: str) -> GithubOps:
-        """The GitHub backend for a run, carrying the transport descriptor
-        derived from the configuration (#1015)."""
-        return GithubOps(client, run_id, transport=github_transport(self.config.github.api_url))
+    def _default_github_ops(self, client: WorkerClient, run_id: str) -> VcsOps:
+        """The backend for a run — the forge its repository lives on
+        (#1017) — carrying the transport descriptor derived from the
+        configuration (#1015)."""
+        from sbxloop.vcs.backends import backend_for
+
+        entry = self.config.github.effective_repo(None)
+        kind = self.config.vcs_kind_for(entry.repo if entry is not None else None)
+        return backend_for(kind, client, run_id, api_url=self.config.vcs_api_url_for(kind))
 
     def _ensure_delivery_repo(self, run_id: str, ops: VcsOps | None) -> bool | None:
         """Probe (and, when allowed, create) the delivery repo up front.
@@ -2988,6 +3008,11 @@ class LoopEngine:
         (``None``) and GitHub's 403 decides at the tree."""
 
         def check() -> bool | None:
+            if getattr(p.ops, "KIND", "github") != "github":
+                # `.github/workflows/` is GitHub's own guarded path (#752);
+                # another forge holds nothing to that permission, and the
+                # backend knows which forge it speaks to (#1017).
+                return True
             permissions = (
                 p.provisioner.gh_app_permissions(p.repo) if p.provisioner is not None else None
             )

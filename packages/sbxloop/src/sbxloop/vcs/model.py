@@ -328,6 +328,36 @@ class ChecksVerdict(NamedTuple):
         return f"{len(self.failed)} of {self.total} check(s) failed: {', '.join(self.failed)}"
 
 
+class CredentialInfo(NamedTuple):
+    """What a forge token reports about itself (#1019): the kind of token,
+    its name, its scopes, when it expires (``None`` when it never does)
+    and whether it is still active (``None`` when the forge does not
+    say). The doctor prints it on the repository's row and warns on a
+    token that never expires. A backend whose credential is the
+    provisioner's business (GitHub's App installation, a PAT that cannot
+    read itself) answers ``None`` from ``credential_info`` instead."""
+
+    kind: str
+    name: str = ""
+    scopes: tuple[str, ...] = ()
+    expires_at: str | None = None
+    active: bool | None = None
+
+    @property
+    def never_expires(self) -> bool:
+        return self.expires_at is None
+
+    def summary(self) -> str:
+        head = f"{self.kind} {self.name!r}" if self.name else self.kind
+        details = []
+        if self.scopes:
+            details.append(f"scopes {', '.join(self.scopes)}")
+        details.append(f"expires {self.expires_at}" if self.expires_at else "never expires")
+        if self.active is False:
+            details.append("INACTIVE")
+        return f"{head} ({'; '.join(details)})"
+
+
 class ReviewVerdict(NamedTuple):
     """One reviewer's standing verdict on a pull request (#675)."""
 
@@ -397,6 +427,18 @@ class BaseRequirements(NamedTuple):
 
     ``forge`` names the backend that read them, so :meth:`blockers` can
     phrase each rule in that forge's own terms (:data:`BLOCKER_WORDING`).
+    ``extra_blockers`` are rules only that forge has, already phrased by
+    the backend that read them (a GitLab base only Maintainers may merge
+    into, #1019); :meth:`blockers` appends them as they are.
+
+    ``all_checks_required`` is a forge that gates on the whole pipeline
+    rather than on named contexts (GitLab's "pipeline must succeed",
+    field-verified on CE 19.3 for #1016): ``required_contexts`` is then
+    ``()`` — nothing is *named* — and every check the head reports is
+    required. A caller judging checks treats the reported set as the
+    gating set (:func:`sbxloop.engine.checks.judge_checks`), and a red the
+    base already had still refuses the merge, which the landing hands to a
+    person rather than looping on.
     """
 
     required_contexts: tuple[str, ...] | None
@@ -412,6 +454,8 @@ class BaseRequirements(NamedTuple):
     required_deployments: tuple[str, ...] = ()
     unread: tuple[str, ...] = ()
     forge: str = "github"
+    all_checks_required: bool = False
+    extra_blockers: tuple[str, ...] = ()
 
     @property
     def requires_reviews(self) -> bool | None:
@@ -475,6 +519,7 @@ class BaseRequirements(NamedTuple):
                 f"the base requires a successful deployment to {envs} before merging, which "
                 "the loop does not run"
             )
+        out.extend(self.extra_blockers)
         return out
 
 
@@ -496,7 +541,11 @@ GENERIC_WORDING = BlockerWording(
 )
 
 # One entry per backend, keyed by its kind. The GitHub wording is the one
-# the loop has always used; a reader who learnt it keeps it.
+# the loop has always used; a reader who learnt it keeps it. The GitLab
+# wording names the settings a GitLab reader knows (#1017): approvals of
+# the latest pipeline's author, the CODEOWNERS file GitLab also reads, and
+# the fact that commits made through the commits API arrive unsigned
+# (field-verified on CE 19.3: the signature read is a 404).
 BLOCKER_WORDING: dict[str, BlockerWording] = {
     "github": BlockerWording(
         last_push_rule="require_last_push_approval",
@@ -505,5 +554,10 @@ BLOCKER_WORDING: dict[str, BlockerWording] = {
             "GitHub signs commits the loop creates through its API only when it "
             "authenticates as a GitHub App"
         ),
+    ),
+    "gitlab": BlockerWording(
+        last_push_rule="the approval-settings rule that removes approvals on a new push",
+        code_owners_file="CODEOWNERS",
+        signing="GitLab does not sign commits created through its commits API",
     ),
 }

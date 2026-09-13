@@ -159,6 +159,26 @@ class TestOpRegistry:
         assert out == {"ok": True}
         assert t.calls[0] == ("PATCH", "/anything", {"a": 1})
 
+    def test_raw_text_answers_a_text_body(self) -> None:
+        """A forge endpoint that answers text rather than JSON (a GitLab job
+        trace) rides the same generic transport as ``raw.api``, under
+        ``text``; nothing is parsed."""
+        trace = "line one\nAssertionError\n"
+        t = RecordingTransport(texts={"/projects/1/jobs/9/trace": trace})
+        out = execute_op("raw.text", {"method": "get", "path": "/projects/1/jobs/9/trace"}, t)
+        assert out == {"text": trace}
+        assert t.text_calls == [("GET", "/projects/1/jobs/9/trace")]
+        assert t.calls == []
+
+    def test_raw_text_answers_a_listed_miss_as_data(self) -> None:
+        t = RecordingTransport(texts={"/gone": GithubOpError("no trace", http_status=404)})
+        out = execute_op(
+            "raw.text", {"method": "GET", "path": "/gone", "allow_missing_statuses": [404]}, t
+        )
+        assert out == {"missing": True, "http_status": 404}
+        with pytest.raises(GithubOpError):
+            execute_op("raw.text", {"method": "GET", "path": "/gone"}, t)
+
     def test_token_scopes_reads_the_classic_pat_header(self) -> None:
         """A classic PAT names its scopes on every response (#696); the op
         asks /rate_limit, which costs nothing and every token may call."""

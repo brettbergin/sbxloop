@@ -13,10 +13,9 @@
 # In pyproject.toml the loader reads only the `[tool.sbxloop]` table, so the
 # same sections must be spelled `[tool.sbxloop.budgets]` and
 # `[tool.sbxloop.limits]` there — a top-level `[budgets]` in pyproject.toml
-# is silently ignored. Nothing here changes the sandbox's CPU/memory: sbxloop
-# passes no sizing flags to `sbx create` — the microVM is whatever size sbx
-# gives every sandbox — so the [limits] section is how memory pressure is
-# made visible instead of surfacing as a confusing test failure.
+# is silently ignored. This preset inherits the bounded [sandbox] CPU/memory
+# allocations. Raise [sandbox] cpus/memory or the repository's overrides if
+# its gate needs more; [limits] reports pressure inside that allocation.
 
 [budgets]
 max_revisions_per_task = 2

@@ -18,7 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
 
-from sbxloop.config import Config
+from sbxloop.config import Config, VcsKind
 from sbxloop.errors import DaemonError, GithubOpsError, SbxError, SbxloopError, WorkerError
 from sbxloop.events import EventBus
 from sbxloop.log import get_logger
@@ -26,7 +26,8 @@ from sbxloop.paths import SbxloopHome
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner
 from sbxloop.sbx.sandbox import Sandbox
-from sbxloop.vcs.github.ops import GithubOps, github_transport
+from sbxloop.vcs.backends import backend_for
+from sbxloop.vcs.protocol import VcsOps
 from sbxloop.worker.client import WorkerClient
 
 log = get_logger(__name__)
@@ -82,7 +83,7 @@ class DaemonGithub:
         self.provisioner = Provisioner(sbx, config, bus=bus)
         self._sandbox: Sandbox | None = None
         self._client: WorkerClient | None = None
-        self._ops: GithubOps | None = None
+        self._ops: VcsOps | None = None
         self._lifecycle_lock = threading.RLock()
 
     @property
@@ -103,7 +104,7 @@ class DaemonGithub:
         else:
             log.debug("github_sandbox.no_stale", sandbox=self.name)
 
-    def ops(self) -> GithubOps:
+    def ops(self) -> VcsOps:
         # Polling and control requests can arrive together. Cleanup belongs
         # to one provision, never to a competing request's new sandbox.
         with self._lifecycle_lock:
@@ -115,7 +116,7 @@ class DaemonGithub:
                 self._ops = self._provision()
             return self._ops
 
-    def call(self, fn: Callable[[GithubOps], T]) -> T:
+    def call(self, fn: Callable[[VcsOps], T]) -> T:
         """Run ``fn(ops)``; on failure drop the sandbox (rate-limited, see
         :meth:`note_failure`) and retry once, so a dead microVM costs one
         hiccup, not the daemon."""
@@ -172,7 +173,7 @@ class DaemonGithub:
                 except SbxError:
                     log.warning("github_sandbox.remove_failed", sandbox=self.name, exc_info=True)
 
-    def _provision(self) -> GithubOps:
+    def _provision(self) -> VcsOps:
         clients: list[WorkerClient] = []
 
         def install(sandbox: Sandbox, _role: str) -> None:
@@ -227,6 +228,16 @@ class DaemonGithub:
             sandbox=self.name,
             duration_s=round(time.monotonic() - started, 1),
         )
-        return GithubOps(
-            clients[0], DAEMON_RUN_ID, transport=github_transport(self.config.github.api_url)
-        )
+        return self.backend(clients[0])
+
+    @property
+    def kind(self) -> VcsKind:
+        """The forge this box speaks to (#1017): the one its repository
+        lives on, else ``[vcs] kind``."""
+        return self.config.vcs_kind_for(self.repo)
+
+    def backend(self, client: WorkerClient) -> VcsOps:
+        """The backend for this box's forge over ``client``, with the
+        transport descriptor the configuration derives."""
+        kind = self.kind
+        return backend_for(kind, client, DAEMON_RUN_ID, api_url=self.config.vcs_api_url_for(kind))

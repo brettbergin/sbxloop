@@ -31,6 +31,7 @@ from sqlalchemy import REAL, Index, Integer, Text, text as sql_text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sbxloop.db.base import Base
+from sbxloop.db.revisions import attach as attach_revision_trigger
 
 
 class ProviderHoldRow(Base):
@@ -121,6 +122,9 @@ class Run(Base):
     kind: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'code'"))
     # Where a workload's result went; nothing published before it existed.
     published: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'[]'"))
+    # Bumped by a trigger on every UPDATE (revision 0010): what a remote
+    # command's `expected_revision` is checked against.
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
 
 
 class Task(Base):
@@ -236,3 +240,8 @@ class EventRow(Base):
     type: Mapped[str] = mapped_column(Text, nullable=False)
     job_id: Mapped[str | None] = mapped_column(Text)
     data_json: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("'{}'"))
+
+
+# The revision trigger rides with the table it bumps, so a database built
+# from the metadata carries it like a migrated one does.
+attach_revision_trigger(Run.__table__, "run_id")

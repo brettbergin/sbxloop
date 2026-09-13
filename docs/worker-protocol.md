@@ -263,7 +263,9 @@ API root the sandbox's environment names, exactly as before the descriptor
 existed. Ops: `issue.create`, `issue.comment`, `pr.create`, `pr.comment`,
 `contents.read`, `status.create`, `repo.get`, `ref.get`, `label.get`,
 `search.issues`,
-`raw.api`, `blobs.create_many`, `checks.failed_logs` (the failing check runs on a
+`raw.api`, `raw.text` (one call whose answer is a text body rather than JSON,
+returned under `text` — a GitLab job trace; `allow_missing_statuses` as on
+`raw.api`), `blobs.create_many`, `checks.failed_logs` (the failing check runs on a
 commit with their Actions job logs, head+tail clipped; the REST transport fetches
 the log's blob-storage redirect without the bearer token), `token.scopes` (the
 classic PAT's `X-OAuth-Scopes` from `GET /rate_limit`, or `null` for a

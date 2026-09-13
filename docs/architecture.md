@@ -42,7 +42,10 @@ operation on a backend object, and the operation runs inside the sandbox
 that holds the credential (the [credential split](#the-credential-split-in-one-picture)).
 What those operations are, and what they answer in, is fixed in two
 forge-neutral modules under `sbxloop/vcs/`; a backend package beside them
-(`vcs/github/` today) implements them against its own API.
+(`vcs/github/`, and `vcs/gitlab/` for the read paths) implements them
+against its own API, and `vcs/backends.py` is the registry that turns a
+`[vcs] kind` into a backend object over a worker client, with the transport
+descriptor the worker needs.
 
 - **`vcs/protocol.py` — the roles.** Six role protocols plus one for the
   commit path, because they have different consumers and different
@@ -57,6 +60,7 @@ forge-neutral modules under `sbxloop/vcs/`; a backend package beside them
   GitHub backend's `_implements` function is the type checker's proof that
   it answers every role, and `tests/unit/test_vcs_protocol.py` holds that
   every public operation on it belongs to exactly one.
+
 - **`vcs/model.py` — the shared types.** An issue or change reference, a
   folded `ChecksVerdict`, a `ReviewThread`, the base's `BaseRequirements`:
   the shapes the engine, the daemon and the doctor read. They carry no path,
@@ -71,6 +75,7 @@ forge-neutral modules under `sbxloop/vcs/`; a backend package beside them
   base's `blockers()` are phrased in the reading forge's own terms
   (`BLOCKER_WORDING`), the GitHub wording being the one the loop has
   always used.
+
 - **Capabilities are three-state, never a boolean.** A backend reports each
   of `vcs.protocol.CAPABILITIES` (a merge queue, resolvable review threads,
   draft changes, a request-changes review the forge enforces, a
@@ -83,6 +88,7 @@ forge-neutral modules under `sbxloop/vcs/`; a backend package beside them
   already follows. GitHub reports everything `SUPPORTED` except signed API
   commits, which depend on the credential (a GitHub App's arrive signed, a
   PAT's do not) and so are the doctor's to answer, not the transport's.
+
 - **The generic transport is private to the backend package.** `GithubOps.raw`,
   `raw_lookup` and the `raw_pages` walker spell a path by hand, and fifty
   such sites had accumulated across the host before #1010 named them. If
@@ -91,11 +97,77 @@ forge-neutral modules under `sbxloop/vcs/`; a backend package beside them
   outside `vcs/`. Without that rule the roles are decorative — callers
   route around them the moment something is missing.
 
+- **Records are the first backend's spelling.** Several operations return
+  the forge's payload as a plain mapping rather than a typed model
+  (`repo_get`, `issue_get`, `issues_list`, `issue_comments`,
+  `issue_events`, `pr_get`, `pr_reviews`, ...). The keys the engine and
+  the daemon read off them are the contract, spelt as GitHub spelt them
+  (`html_url`, `state` as `open`/`closed`, `labels[].name`, `user.login`,
+  a `pull_request` key present only on a pull request, `created_at` as
+  `YYYY-MM-DDTHH:MM:SSZ`); a second backend folds its own payloads into
+  exactly those keys, inside the backend, and never hands a consumer its
+  forge's shape. Turning the mappings into typed models is the design
+  revision the conformance work anticipated and is left open.
+
+- **An operation a backend has not landed yet raises `RoleNotImplemented`.**
+  A backend lists such operations in `UNIMPLEMENTED_OPERATIONS`; each
+  raises a typed error naming the backend, the role and the operation, so
+  a run on that forge fails closed at the first of them, and `sbxloop doctor` lists the same operations before any run starts. The conformance
+  suite reads that error as a skip naming the operation, the way an
+  `UNSUPPORTED` capability skips with its name. The GitLab backend's list
+  is empty since #1020; the mechanism stays for the next backend.
+
+- **A delivery on GitLab is one changeset.** `deliver.py` speaks GitHub's
+  blob, tree, commit and ref steps, and GitLab has none of those objects
+  (#1016 V5): its commits API takes a whole changeset and writes the commit
+  on a branch, atomically. So the GitLab backend stages: a blob is hashed as
+  git would and kept, a tree is the list of actions that turns the base
+  commit's tree into it (create versus update decided against a listing of
+  each touched directory, because GitLab refuses either in the other's
+  place), and the commit is written when it is created, on a pending
+  branch, because the API writes no commit that no branch points at. The
+  ref step creates the run's branch at that commit and drops the pending
+  one. A branch that already exists (a fix round) is never deleted and
+  recreated, because deleting the source branch of an open merge request
+  closes it (field-verified on CE 19.3.2); it is written again under
+  `force` from the same parent with the same actions, a new commit of the
+  same tree that the merge request follows. Only a commit the same backend
+  object wrote can be written again, which every delivery satisfies, since
+  it builds its blobs, tree and commit in one process. `deliver.py` is
+  unchanged but for reading GitLab's "Branch already exists" (a 400) as
+  the collision GitHub answers with a 422.
+
+- **A landing reads the forge's refusals as data.** On GitLab the merge
+  endpoint's 405 (not mergeable now: a red pipeline, an unresolved
+  discussion, a draft), 406 (a conflict) and 401 are a blocked
+  `MergeOutcome` with the forge's words, and a 409 is a stale head, the
+  same shapes the landing already reads off GitHub; the rebase is the
+  branch update and runs asynchronously, so the next poll sees the new
+  head; the `Draft:` title prefix is the whole of a draft, so retitling
+  is the un-draft. Merge trains are a paid tier and a per-project
+  setting, so `merge_queue` is read off the project payload every landing
+  reads anyway (`true` a train, `false` or the free tier's `null` a direct
+  merge, an unreadable project `unknown`); their shapes past the free
+  tier's 404 are field-unverified. The one rule GitLab has that GitHub
+  does not, who may merge into the protected branch, arrives as an
+  `extra_blockers` entry the backend phrased, so the landing's blocker
+  list needs no forge branch. `PolicyOps.credential_info` lets a token
+  that can read its own record (GitLab's) tell the doctor its name,
+  scopes, expiry and whether it is still active; GitHub answers `None`,
+  because there the credential is the provisioner's knowledge.
+
 `[vcs] kind` (and a `[[github.repos]]` entry's own `kind`) names the forge;
-`Config.vcs_kind_for` resolves it per repository and `sbxloop doctor` prints
+`Config.vcs_kind_for` resolves it per repository, `Config.vcs_api_url_for`
+the API root a backend of that kind speaks to, and `sbxloop doctor` prints
 one `vcs backend <kind>` row per forge with each capability's state, or a
 failing row for a kind no backend answers yet. `[github]` stays the section
-a repository is declared in and reads as `kind = "github"`.
+a repository is declared in and reads as `kind = "github"`. The github-role
+sandbox for a repository on another forge holds that forge's token under
+the forge's own variable (`GITLAB_TOKEN`), delivered by the env-file road
+because sbx's secret proxy knows only GitHub's service, and reaches only
+that forge's host; the daemon's shared polling box follows `[vcs] kind`, so
+a `[[github.repos]] kind` that differs from it is honoured by a run's own
+box and not by the daemon's.
 
 The decision logic sits above the roles and knows no forge: the baseline
 comparison in `engine/checks.py` takes a folded verdict, not a payload; the
@@ -233,6 +305,26 @@ how much plumbing it removes. See [docs/worker-protocol.md](worker-protocol.md)
 for the transport-level statement of the same rules.
 
 ## The security primitive: one run = two sandboxes (three, with credentials)
+
+All creation paths pass explicit CPU and memory allocations through
+`SandboxSpec.resources` to `SbxCLI.create`. The run agent defaults to 6 CPUs
+and 12 GiB (also used by bake), the concierge to 2 CPUs and 4 GiB, and each
+GitHub/service helper to 1 CPU and 2 GiB. Diagnostics use the service
+allocation. These are per-VM limits, not an aggregate host scheduler.
+`Config.sandbox_resources_for` resolves operator settings and sparse
+per-repository run-agent overrides. Zero CPU and automatic memory are
+invalid; creation never retries without the limits.
+On resume, CPU/memory settings and repository allocation overrides come
+from the current operator config, while other run rules stay pinned to the
+snapshot. The ordinary config-drift event explains this exception.
+
+Provisioning writes the requested allocation to a host receipt under
+`SbxloopHome.sandbox_allocations`, paired with a random nonce in the VM.
+Before reusing a run pair or concierge VM, it checks both the requested
+allocation and the nonce. Unknown or changed allocations fail closed before
+mutating the existing VMs; operators preserve any needed state and recreate
+them. This is creation provenance, not telemetry or independent verification
+of the backend's resource enforcement.
 
 Every run provisions a **pair** of microVM sandboxes via `Provisioner.ensure_pair`
 — and a run granted `[[credentials]]`, or whose repository has a credentialed
@@ -549,7 +641,22 @@ reported as a `sandbox.setup` event with delivered secret values scrubbed from
 the tail and the login profile's own output cut from it — the script echoes a
 mark once the profile has run, and a stream without the mark is kept whole; the
 first failure raises out of provisioning like an install failure, so
-`keep_on_failure` applies. The bake installs the global package list only.
+`keep_on_failure` applies. The bake installs the global package list plus
+`xz-utils`, so a later language top-up can extract xz archives even when the
+bake did not select that language. All worker provisioning apt paths share
+bounded retries for confirmed lock contention (including the update lists
+lock): twelve retries, five seconds apart, within the caller's original
+timeout. Other apt errors return immediately. A toolchain installer is
+skipped when its pooled apt prerequisite install fails; the diagnostic
+distinguishes contention, permission, package and mirror failures.
+
+Worker venv repair probes the running sandbox `python3` and installs its
+matching `python3.X-venv` package, since the distro's `python3-venv`
+metapackage may target a different minor version. An unknown interpreter or
+failed apt repair is logged before ordinary provisioning falls back to a
+user-site install. `sbxloop bake` requires the isolated worker interpreter
+and refuses to save a template or bake record after that fallback, so a
+missing venv prerequisite cannot be persisted as a successful bake.
 
 ### Verify mode (#682)
 
@@ -1355,11 +1462,12 @@ ask ─▶ PLAN (task DAG, needs declared) ─▶ grant needs against the profil
   name them. `publish = "hold"` parks the judged result `held`, and the
   release is a resume at the publishing stage — the daemon's publish gate,
   a *Release result* button in chat, `sbxloop resume` from the CLI.
-- **Intake.** Three sources, one item shape: a `[daemon] workload_label`
+- **Intake.** Four sources, one item shape: a `[daemon] workload_label`
   issue, a chat ask the concierge turns into a `chat:<message>` item
-  through its `start_workload` tool, and `[[schedules]]` ticks
+  through its `start_workload` tool, `[[schedules]]` ticks
   (`sched:<name>:<due minute>`) the daemon fires by itself on an `every`
-  or `cron` cadence. `sbxloop run --kind workload` is the same run from the
+  or `cron` cadence, and an ask a remote client admits through the API
+  as an `api:<key>` item (#1036). `sbxloop run --kind workload` is the same run from the
   CLI; `sbxloop init --preset workload` writes a config with one of each
   section, and `sbxloop doctor` lists the profiles, schedules and where
   the daemon would get its work. See [The daemon](#the-daemon) for the
@@ -1486,13 +1594,15 @@ cannot disagree with the home the process runs out of.
 ## Persistence and resume
 
 `~/.sbxloop/state/state.db` (the home's `state/`, see *The home* below) is one
-WAL-mode SQLite database holding **nineteen** tables, and two stores read it
+WAL-mode SQLite database holding **twenty-six** tables, and two stores read it
 through separate connections. `StateStore` owns five — `runs`, `tasks`,
 `phase_attempts`, `reconciliations`, `events` — and `DaemonStore` the
-fourteen `daemon_*` ones (the queue, the run ledger, the resume budget,
+fifteen `daemon_*` ones (the queue, the run ledger, the resume budget,
 key/value state, run watches, requesters, prior attempts, chat threads,
 merge gates and their prompts, review holds, pending clarifications, the
-operator console's mailbox and the schedules).
+operator console's mailbox, the schedules and the pause holds) plus the six
+`api_*` tables behind the remote API (operations, the public chronology,
+clients, refresh tokens, revoked tokens, public ids).
 
 Both are SQLAlchemy models under `sbxloop/db/` (#539), and Alembic owns the
 upgrade path — one revision chain for the whole file, applied when a store
@@ -1539,6 +1649,29 @@ persisting — a crash and a `kill -9` look identical to the store — and
    is idempotent: the branch is force-moved and the open PR reused; a
    review that never committed its verdict runs again). A phase whose
    result was never committed re-runs from its start; nothing is replayed.
+
+**Two resumes, one owner.** `sbxloop resume <run>` builds an engine in the
+calling process and continues the run there; `sbxloop daemon ctl resume <item|run>`
+re-arms a *review wait*. A run the daemon dispatched has a third path, and it
+is the only right one while a daemon owns it: `resume-run <run>` (ctl, chat,
+the remote API) admits the pinned run to the daemon's queue
+(`DaemonStore.admit_resume`, a compare-and-set on the pin) and the next tick
+resumes it through the breaker, the daily cap, the holds and the per-item
+resume budget, exactly as an interrupted run recovered at start is — never a
+second engine beside the daemon's. `DaemonLoop.resume_run` refuses by name
+what cannot be resumed (in flight, finished, unpinned, past its resume
+budget, exhausted, workspace pruned), and the CLI's `resume` refuses a
+daemon-owned run and points at it, `--force` being the override for a daemon
+that is not coming back. `cancel-run <run>` is the same idea for cancellation:
+one run by identity, wherever the daemon holds it — in flight (the engine
+stops at its next boundary), parked on a provider outage, or pinned to a
+queued item awaiting resume — with `expected_revision` checked under the same
+lock as the request is recorded, so a cancel meant for an earlier state is
+`stale_revision` rather than applied. `runs`, `daemon_work_items`,
+`daemon_merge_gates` and `daemon_review_holds` carry that `revision`, bumped by
+a trigger on every write whichever release wrote it (`db/revisions.py`,
+revision 0010). Pause holds are persisted in `daemon_holds` with their owner and
+survive a restart; `recover()` says which ones still stand.
 
 ### Model policy at phase boundaries
 
@@ -1985,6 +2118,268 @@ operator's own list on top (egress, tool grants and credential names by
 default). Model keys apply live (`refreshed_models`); everything else at
 the next start, which is why the restart is part of the write rather than
 advice after it.
+
+### Typed controls
+
+Every operator verb — `!sbx` in chat, `sbxloop daemon ctl`, the console,
+the concierge's `sbx_control` tool — used to land in one prose dispatcher
+(`daemon/control.py::_dispatch`) that called the loop and composed a
+sentence, taking a free-form `by` string for the source-facing attribution.
+A surface that speaks JSON cannot parse a sentence to learn whether a
+command succeeded, and a free-form `by` is not an identity. The controls
+package (`daemon/controls/`) is the layer beneath that dispatcher, and the
+remote API spike's first delivery stage (`docs/spikes/remote-api.md`).
+
+`ControlService` has one method per verb. Each takes a `Principal` first —
+who is asking (`kind`, `id`, `display`, the surface it came `via`) and the
+capabilities it holds (`runs:read`, `runs:control`, `gates:approve`,
+`daemon:manage`, …) — checks the capability the verb needs, hands the loop
+the principal's attribution as the `by` it always took, and returns a typed
+outcome (`PauseOutcome`, `CancelOutcome`, `ItemOutcome`, …). A refusal is a
+`ControlError` with a stable code (`unknown_target`, `not_eligible`,
+`unsupported_for_kind`, `capability_unknown`, `forbidden`, `unsupervised`,
+…) and the loop's own sentence kept verbatim, so the prose edge renders
+exactly what it rendered before the layer existed. The loop's prose replies
+(`resume_review`, `approve_merge`, the schedule verbs) ride inside the
+outcome as `message` until the loop grows structured results of its own; a
+JSON surface exposes the structured fields and never parses the message.
+
+The attribution is derived from the principal, never the reverse: the
+surfaces that exist today are trusted completely, as they always were, and
+`dispatch` builds them a `Principal.trusted(by, via)` holding every
+capability with the legacy string byte-for-byte. A principal with fewer
+capabilities can only come from a surface that authenticated it, and such
+a surface calls the service directly — it never goes through the prose
+dispatcher.
+
+`controls/eligibility.py` is the pure function a surface can answer
+*before* asking: given a run's kind and state, its item's state, the gate
+or review hold parked on it and the backend's answer about the forge,
+`available_actions` says which controls apply and `check` refuses the rest
+by name. It is stricter than the loop, not looser: a fixed `tool` recipe
+never has `steer`, `grant_rounds` or `gate_approve` (no agent to steer, no
+fix rounds, no gate); an action that acts on the forge is refused with
+`capability_unknown` when the backend could not tell whether it can — a
+"could not tell" is a refusal, never a guess. The loop keeps its own
+refusals (it holds the locks); the two agree by test.
+
+### Operations: one record for every surface
+
+A reply that got lost and a command that never ran look the same to whoever
+sent it; so do a command the daemon claimed and one it finished. From
+`ctl pause` to a remote client's cancel, every mutating control is an
+**operation** (`daemon/controls/operations.py`) — a row in `api_operations`
+written *before* the effect and finished *after* it, with its transitions in
+`api_events`, the public chronology a remote client replays by `seq`. Reads
+(`status`, `queue`, `items`, the schedule listing) leave no record.
+
+`OperationRunner.run_sync` drives one command: **accept** (the row, its
+idempotency record and its `operation.accepted` event in one transaction,
+under the daemon store's lock — only then is acceptance acknowledged),
+**claim** under the daemon's generation, apply through `ControlService`,
+**finish** with the typed outcome as `result_json` or the `ControlError` code
+and the loop's sentence. A `stop` or `restart` stays `running` until its
+deferred effect has run; a cancel of the run in flight stays `running` until
+the run settles, and the loop finishes it from what the run did — `succeeded`
+when the item settled as cancelled, `failed target_already_terminal` naming
+the state the run reached when the cancel came too late, `superseded` when a
+later cancel replaced it. Success means exactly the effect the row's `effect`
+column promises and no more: the source's report, the gate's merge, the
+process exit are separate outcomes with their own events.
+
+An idempotency pair — a scope (the principal) and the client's key — makes a
+retry return the same operation when the request fingerprint matches, and a
+conflict when it does not; the `ctl` queue and chat pass none, since their
+transport already answers each request once. The bus is never the transaction
+coordinator: an event published to it proves nothing about durability, so
+nothing about an operation rides on it.
+
+Every daemon process is a **generation** (`daemon/controls/generation.py`),
+stamped into `daemon_state` at the top of `recover()` and named in
+`status()`. Recovery then settles the operations a dead generation left, from
+evidence, before anything else changes it: an `accepted` row was never claimed
+and is `expired` (stale intent is never applied at boot — the same rule the
+`ctl` queue enforces on its files); a `running` row claimed by another
+generation is judged per action from the domain — the run's state for a
+cancel, the gate's state for an approval, the item's state for an item verb,
+the fact that a new generation is answering for a stop or restart. What the
+evidence cannot decide is `reconciling` with the reason, for an operator; it is
+never guessed `succeeded`, and a timeout is never evidence.
+
+### The remote API listener
+
+The operator's and integrator's reference is [docs/api.md](api.md); the
+contract of record is the OpenAPI document the listener publishes, kept
+byte-for-byte at [docs/openapi.json](openapi.json) by
+`tests/api/test_openapi_snapshot.py` and regenerated with
+`sbxloop api openapi --snapshot --write docs/openapi.json`. The remote loop
+is proved end to end by `tests/api/conformance/` — every scenario through
+the public contract alone — and the isolation claim by
+`tests/unit/test_api_isolation.py` plus the `api-host-unreachable`
+conformance probe `doctor --deep` runs in a live sandbox.
+
+`sbxloop.api` is the one package that imports FastAPI, lazily: an install
+without the `sbxloop[api]` extra imports it fine and learns by name what it
+lacks when `[api] enabled = true` asks for the listener. `ApiServer` runs
+uvicorn on a thread inside `sbxloop daemon` — started before `recover()` so
+liveness answers through recovery, told it is ready the moment the control
+queue is, closed in the daemon's shutdown sequence. uvicorn on a thread
+captures no signals, so the daemon's own handlers stand. One daemon owns
+execution; the API is a second way in, never a second scheduler: every route
+authenticates a `Principal` from a bearer token, builds a `ControlService`
+over the loop, and calls it on the context's bounded executor — the stores'
+single connections and the loop's locks are never touched from the event
+loop thread. Refusals are `application/problem+json` with the `ControlError`
+code mapped to a status; every response carries an `X-Request-Id`.
+
+Authentication is the daemon's own. `sbxloop api client create` registers a
+client (`api_clients`: a name, the scrypt verifier of a secret shown once,
+the capabilities granted); `POST /v1/auth/token` exchanges the secret for an
+Ed25519-signed access token (`iss=sbxloop`, `aud=sbxloop-api`, `scope`, a
+`jti`; the algorithm list is exactly `EdDSA`) and a refresh token stored by
+digest in a *family* — one grant and every rotation descended from it, so a
+refresh token presented twice revokes the family and the client
+re-authenticates with its secret. Expiry is judged by the daemon's clock. A
+token's scope is what its client still holds: a grant narrowed after minting
+narrows the live token at once, and a revoked client is refused on its next
+request. The signing key lives at `config/api-signing.key` (0600); a rotation
+keeps the previous key until its tokens expire. Authentication failures are
+limited per client id and per source address, apart from work admission.
+
+**Public ids and the read side (#1036).** A client never sees an issue
+number or an `owner/name` as an identifier. `api_public_ids` maps an opaque
+`itm_…` or `repo_…` to the resource behind it — for a work item the
+repository *and* the item id together, so two repositories' issue numbers
+never alias one id — assigned lazily the first time a resource is read and
+stable from then on; a run is `run_<run id>`, already random. Unknown ids
+of every kind answer the same `404`. `api/projections.py` builds every
+public shape on the executor from the stores' own records: items and runs
+page by keyset (`DaemonStore.page_items`, `StateStore.page_runs`) so a
+reader paging while the daemon works sees no gap and no repeat; the queue
+is `queued_in_order` with `dispatch_eligible_at` — the rule dispatch itself
+uses, not the prose helper's; `available_actions` is the eligibility
+module's answer for the resource as it stands, which the command that
+follows rechecks.
+
+**Intake (#1036).** `POST /v1/items` is one `ControlService.admit` and one
+`item.admit` operation, keyed by the client's `Idempotency-Key` under a
+scope of workspace, principal, method and route, so a retried request
+returns the operation it already has and a changed body under the same
+key is a conflict. `daemon/controls/intake.py` holds the rules and knows
+no HTTP. An **issue** is admitted by the GitHub source itself
+(`GitHubIssueSource.admit`, routed by repository through the multi-repo
+source): it reads the issue, refuses one that is closed, a pull request,
+already in progress or labelled for the other kind, and otherwise adds the
+queueing label a person would have — so the next poll finds the same
+issue and `upsert_new` converges on the row the API wrote. A **workload**
+is the concierge's `start_workload` shape under an `api:` id; a **tool**
+is a registered recipe with only the parameters `RECIPE_PARAMETERS` names
+for it, resolved by the recipe's own target rules. `ApiSource` rides the
+composite beside chat and schedules (always, so an admitted item routes
+back to it whether or not the listener is up): nothing to poll, every
+report a log line, and the store's repo-attribution passes skip `api:`
+rows as they skip `chat:` and `sched:` ones. Direct inline code admission
+is not offered: an issue is the code run's source contract.
+
+**The public chronology (#1037).** `api_events` is one durable cursor space
+(`seq`, never reused) that every transport replays from: the operation
+transitions the operation store writes in the same transaction as the
+operation, the daemon's notices, run lifecycle and gate transitions
+(`api/frontend.py`, an *observer* on the fan-out frontend — it hears the
+Frontend calls and nothing else), and a *projection* of the engine's own
+`events` table: `api/chronology.py` copies each engine event past a
+watermark into a thin row carrying `source_seq`, and moves the watermark
+(`daemon_state`) in the same transaction, so a crash between the two leaves
+nothing half-projected and a re-run copies each event once; delivery joins
+back to the engine row for the data, so the run's chronology is referenced,
+never duplicated. A read projects before it reads, which makes the
+projection consistent from the reader's side; the projector thread
+(`api/projector.py`, woken by the engine's bus through a subscriber that
+only sets an event) exists for the streams' latency and the retention
+prune. `GET /v1/status` reports the high-water mark; `/v1/events`,
+`/v1/runs/{id}/events`, the SSE stream and the WebSocket all read by `seq`
+from the store when the hub (`api/stream.py`, a thread-safe "something
+changed") says there may be more — a stream's whole state is a cursor, so
+a slow client blocks nobody and a dropped one resumes where it was. Pruned
+history is refused as `cursor_expired` from the highest `seq` ever pruned,
+never skipped past. The WebSocket's commands go through `api/commands.py`,
+the same functions the REST routes call, with the same idempotency scope.
+
+**Steering and gates (#1038).** A remote instruction is a record before it
+is an effect: `api_steering` (`daemon/controls/steering.py`) holds who, for
+which run at which revision, the text and what it cites, and its fate.
+`ControlService.steer` writes the row, then `DaemonLoop.steer_run` hands
+the text to the run in flight under the current-run lock — the same
+`post_user_message` a chat thread uses — after the eligibility check (a
+tool run has nothing to steer) and the revision check; the row is
+`delivered` with the engine's message id, or `failed` with the refusal.
+The agent's `chat.reply` carries that message id, and the chronology's
+projection settles the row `handled` (or `failed`) in the same transaction
+as the event; the API frontend marks whatever a finished run never answered
+`undelivered`, and the listener's start does the same for rows a previous
+process left waiting. No arbitration between directions: each is handed
+over in order and answered in turn. A gate approval binds to the gate's
+revision: `claim_merge_gate` takes the revision into its compare-and-swap,
+so an approval for a gate that moved loses the swap and is refused
+`stale_revision`, a second approval `already_in_progress` — typed, because
+the caller is not a person reading prose; the prose edge keeps its
+sentences. The API checks the gate's eligibility first, including whether
+the forge backend can complete the landing, read from the backend's static
+capability table (never by provisioning a sandbox in the request path):
+`UNKNOWN` refuses rather than guesses. What the approval promises is the
+recorded decision and the committed release; the landing thread merges (or
+the next tick publishes) afterwards, and a base that requires an approving
+review still parks the run awaiting one.
+
+**Artifacts and usage (#1039).** `api_artifacts` (`api/artifacts.py`) is
+built once per finished run, on the projector thread (the API frontend
+queues the run on `run_finished`; a read catalogs a terminal run itself
+when the pass has not got to it), from the same `scan_artifacts` under
+`artifacts_dir` that `sbxloop artifacts` shows, each file opened through
+`repofiles.open_file` — relative to the run's directory, never following a
+link out of it — for its digest, so an escaping link is refused at catalog
+time and downloads take the same road. The catalog is bounded per run; a
+row survives the retention sweep with `available` off, tombstoned the
+first time a read finds the bytes gone, so history still says what was
+delivered. Downloads are bounded, streamed off the executor, always
+attachments, and never served as a type a browser would run. Usage
+(`api/usage.py`) is the concierge's fold (`usage_for_run`) shaped for a
+client: `null` stays `null`, `recorded` says whether anything was
+reported, and `spend` is `null` by construction with the basis stated —
+telemetry, not an invoice. A window folds every run touched in it from the
+samples' own timestamps and is at most 31 days wide.
+
+**Diagnostics and administration (#1040).** `api/diagnostics.py` reads the
+same in-process log ring `ctl log` and the concierge read
+(`ControlService.log_records`, bounded by `LOG_TAIL_MAX`) and masks every
+credential shape it knows before a line leaves the host — the upstream rule
+that secrets never reach the log still holds; this is the belt over it. The
+configuration read is the daemon's own loaded `Config`, flattened, filtered
+to an allowlist of sections and with every key segment that names a host
+location or could carry a credential dropped by name (`_env` suffixes name
+variables and stay); provenance comes from running the loader again for
+the home (`load_config_with_sources`) so each key says which layer answers
+for it now, whether a change applies live (`applies_for`) and what keeps
+the daemon's tools from changing it (`configpolicy`), and `pending` marks a
+key the file on disk now resolves differently from what the daemon runs on
+— a loader that cannot read the file leaves provenance `None` rather than
+guessed. Administration (`api/admin.py`) is the service's own verbs: a hold
+taken through the API carries the principal's id as its owner
+(`DaemonLoop.pause(owner_id=)`), and `ControlService.release(only_own=True)`
+— the remote default — refuses another principal's hold as `hold_owned`
+unless the caller forces the override, while the prose surfaces keep the
+operator's unconditional release. A stop or restart is recorded before it
+acts: the service returns the effect as `after`, the route sends the reply
+and fires it as a background task (the WebSocket after its reply frame), the
+chronology carries `daemon.stop_requested` / `daemon.restart_requested` so a
+stream can reconnect to the next generation, and the operation closes with
+the effect — acceptance is the durable fact, the exit is observed through
+readiness, and the restart reuses the loop's supervisor check and marker
+unchanged. Schedules and a suspended repository's resume go through the
+same service verbs ctl and chat use, each an operation. Not published, by
+design: configuration writes, repository registration, backup and restore,
+garbage collection and sandbox deletion — each needs its own attribution,
+conflict and active-run story before it has a remote adapter.
 
 ### Repositories
 

@@ -69,9 +69,10 @@ class TestIssues:
         assert ops.issue_get(repo, ref.number)["state"] == "closed"
 
     def test_listing_by_label_finds_a_seeded_issue(self, subject: Subject) -> None:
-        subject.seeds.existing_issue(41, "queued work", ["sbxloop:run"])
+        number = subject.seeds.existing_issue("queued work", ["sbxloop:run"])
         listed = subject.ops.issues_list(subject.repo, labels=["sbxloop:run"])
-        assert any(entry.get("number") == 41 for entry in listed)
+        assert any(entry.get("number") == number for entry in listed)
+        assert all("pull_request" not in entry for entry in listed if isinstance(entry, dict))
 
 
 class TestChange:
@@ -155,18 +156,20 @@ class TestChecks:
 class TestPolicy:
     @pytest.mark.needs("required_checks_introspection")
     def test_base_requirements_from_the_bases_rules(self, subject: Subject) -> None:
-        subject.seeds.base_rules(required=["ci", "lint"], approvals=1)
+        seeded = subject.seeds.base_rules(required=["ci", "lint"], approvals=1)
         requirements = subject.ops.base_requirements(subject.repo, subject.base)
         assert isinstance(requirements, BaseRequirements)
         assert requirements.required_contexts is not None
-        assert set(requirements.required_contexts) == {"ci", "lint"}
-        assert requirements.approvals_required == 1
+        assert set(requirements.required_contexts) == set(seeded.required)
+        assert requirements.all_checks_required is seeded.all_checks_required
+        assert requirements.approvals_required == seeded.approvals
         assert requirements.source != "unknown"
         assert requirements.forge == subject.kind
 
-    def test_an_unprotected_base_is_an_answer(self, subject: Subject) -> None:
+    def test_a_base_with_no_named_check_is_an_answer(self, subject: Subject) -> None:
         requirements = subject.ops.base_requirements(subject.repo, subject.base)
         assert requirements.required_contexts == ()
+        assert requirements.source != "unknown"
         assert requirements.blockers() == []
 
 
@@ -190,9 +193,28 @@ class TestContent:
         commit = ops.commit_create(
             repo, message="sbxloop run r1: deliver", tree=str(tree["sha"]), parents=[base_sha]
         )
-        ops.ref_create(repo, "refs/heads/sbxloop/r1", str(commit["sha"]))
-        assert ops.ref_lookup(repo, "heads/sbxloop/r1") == commit["sha"]
-        ops.ref_force_update(repo, "sbxloop/r1", str(commit["sha"]))
+        ops.ref_create(repo, "refs/heads/sbxloop/r2", str(commit["sha"]))
+        assert ops.ref_lookup(repo, "heads/sbxloop/r2") == commit["sha"]
+        ops.ref_force_update(repo, "sbxloop/r2", str(commit["sha"]))
+        assert ops.ref_lookup(repo, "heads/sbxloop/r2") == commit["sha"]
+        # A fix round: the same branch carries a second commit of the base
+        # plus a changed file, however the forge moves a branch.
+        again = base64.b64encode(b"hello again\n").decode()
+        shas = ops.blobs_create_many(repo, [{"path": "hello.txt", "content_b64": again}])
+        tree = ops.tree_create(
+            repo,
+            base_tree=base_tree,
+            entries=[
+                {"path": "hello.txt", "mode": "100644", "type": "blob", "sha": shas["hello.txt"]}
+            ],
+        )
+        second = ops.commit_create(
+            repo, message="sbxloop run r1: deliver again", tree=str(tree["sha"]), parents=[base_sha]
+        )
+        ops.ref_force_update(repo, "sbxloop/r2", str(second["sha"]))
+        head = ops.ref_lookup(repo, "heads/sbxloop/r2")
+        assert head and head != commit["sha"]
+        assert ops.commit_get(repo, head)["tree"]["sha"]
 
     @pytest.mark.needs("remote_commit")
     def test_a_file_on_a_branch_through_the_contents_path(self, subject: Subject) -> None:
@@ -201,6 +223,14 @@ class TestContent:
             "README.md",
             message="initialize",
             content_b64=base64.b64encode(b"# r\n").decode(),
-            branch=subject.base,
+            branch="sbxloop/r1",
         )
         assert written
+        replaced = subject.ops.contents_put(
+            subject.repo,
+            "README.md",
+            message="initialize again",
+            content_b64=base64.b64encode(b"# r again\n").decode(),
+            branch="sbxloop/r1",
+        )
+        assert replaced

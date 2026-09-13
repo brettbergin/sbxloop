@@ -6,12 +6,12 @@ The deploy pipeline used to post its notices by sourcing the daemon's
 ``channel_id`` and curling Discord's REST API by hand — Discord-only, and
 CI reading the daemon's secrets file. ``sbxloop daemon notify "<text>"``
 replaces that: it reads the *configured* ``[chat] backend`` and its
-section, takes the bot token from the environment exactly as the bridge
-does, and posts once over the service's plain HTTPS API. No gateway, no
-socket, no SDK — stdlib ``urllib`` only, so it works on a host that has
-neither chat extra installed and, above all, while the daemon is down:
-the notice that matters most ("rollback also failed") is sent when
-nothing else is running.
+section (with an optional channel override for purpose-specific notices),
+takes the bot token from the environment exactly as the bridge does, and
+posts once over the service's plain HTTPS API. No gateway, no socket, no
+SDK — stdlib ``urllib`` only, so it works on a host that has neither chat
+extra installed and, above all, while the daemon is down: the notice that
+matters most ("rollback also failed") is sent when nothing else is running.
 
 Text is written in the house dialect (Discord-flavoured Markdown, the
 same one every bridge message is shaped in) and re-dialected per service
@@ -91,14 +91,18 @@ def post_notice(
     config: Config,
     text: str,
     *,
+    channel_id: str | None = None,
     env: Mapping[str, str] | None = None,
     timeout_s: float = 30.0,
     open_url: OpenUrl | None = None,
 ) -> Posted:
-    """Post ``text`` to the configured control channel; returns where it
-    went. Raises :class:`SbxloopError` when the daemon is headless, the
-    backend's bot token is unset, the text is too long, or the service
-    refuses — every case names what to fix."""
+    """Post ``text`` to the configured or explicitly selected channel.
+
+    Returns where it went. Raises :class:`SbxloopError` when the daemon is
+    headless, the backend's bot token is unset, the text is too long, the
+    selected channel is empty, or the service refuses — every case names
+    what to fix.
+    """
     env = os.environ if env is None else env
     opener = open_url or _open_url
     backend = config.chat_backend
@@ -113,7 +117,9 @@ def post_notice(
     if len(text) > MAX_CHARS:
         raise SbxloopError(f"notice is {len(text)} characters; the limit is {MAX_CHARS}")
     section = config.chat_section(backend)
-    channel_id = section.channel_ref
+    channel_id = section.channel_ref if channel_id is None else channel_id.strip()
+    if not channel_id:
+        raise SbxloopError("notice channel override is empty")
     token_env = NOTICE_TOKEN_ENVS[backend]
     token = env.get(token_env, "")
     if not token:
