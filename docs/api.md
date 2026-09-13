@@ -10,6 +10,7 @@ the internals are in [architecture.md](architecture.md#the-remote-api-listener).
 
 - [Installation](#installation)
 - [Clients and tokens](#clients-and-tokens)
+- [Local collaboration](#local-collaboration)
 - [Capability discovery](#capability-discovery)
 - [Resources and ids](#resources-and-ids)
 - [Endpoint catalog](#endpoint-catalog)
@@ -51,6 +52,104 @@ Every `[api]` key is in the [user guide's knob table](user-guide.md#configuratio
 answers `503` until recovery has established execution ownership and the
 daemon takes commands, then `200` with the daemon's `generation` and the
 public chronology's lag.
+
+## Local collaboration
+
+The API can also serve a single-user local product such as Angie. This is an
+additive layer around the existing run API: it uses the daemon's store,
+concierge, operation controls, schedules, events, artifacts, and usage instead
+of starting another scheduler or opening another SQLite writer.
+
+The installation has at most one local user. `POST /v1/auth/local/register`
+creates that profile and its scoped API principal; `/v1/auth/local/login` returns
+the same short-lived access and rotating refresh tokens as the existing client
+credential flow. Existing machine clients and all existing routes keep their
+original behavior.
+
+| Resource    | Routes                                           | Purpose                                                      |
+| ----------- | ------------------------------------------------ | ------------------------------------------------------------ |
+| Profile     | `GET/PATCH /v1/users/me`                         | Local identity and timezone                                  |
+| Agents      | `GET /v1/agents[/{slug}]`                        | Native roles, backend, and configured models                 |
+| Teams       | `/v1/teams[/{id}]`                               | Durable named groups of agent roles                          |
+| Channels    | `/v1/channels[/{id}]`                            | Revisioned conversation containers; deletion tombstones them |
+| Messages    | `GET /v1/channels/{id}/messages`                 | Immutable, monotonically sequenced history                   |
+| Turns       | `POST /v1/channels/{id}/turns`, `GET .../{turn}` | Idempotent input acceptance and durable completion state     |
+| Preferences | `/v1/prompts`, `/v1/prompts/definitions`         | Prompt context saved for the local user                      |
+| Workflows   | `/v1/workflows[/{id}]`                           | Workflow metadata used by the Angie management screen        |
+| Connections | `/v1/connections`, `/v1/connections/services`    | Redacted view of operator-managed sbxloop integrations       |
+
+An ordinary turn talks to Angie without host or MCP action tools. A known
+`@agent`, an enabled `@team`, explicit `target_slugs`, or `intent=delegate`
+records work intent and enables the corresponding concierge tools. Team members
+receive separate role-scoped sessions and their replies are persisted as
+separate messages. Repeating a `client_turn_id` returns the accepted turn;
+reusing it for different text, targets, intent, or message identity is rejected.
+
+Discovery lists sbxloop's five native roles: `concierge`, `planner`, `builder`,
+`critic`, and `operator`. Chat resolves their models through the existing
+configuration, using the `concierge`, `decompose`, `build`, `review`, and
+`operator_plan` phases respectively. `phase_models` also reports the remaining
+engine phases for each role. The same refreshed model settings drive dispatch.
+Legacy product role names remain addressable for existing saved teams and clients
+but are excluded from discovery.
+
+Native chat shares the concierge transport and its host-tool boundary. Actual
+code changes and workload execution use managed runs; a chat session has no
+checkout, editor, or shell. Critic chat receives only explicitly allowed read-only
+host tools and no MCP servers. The host rejects tools outside that allowlist.
+
+Delegated chat also exposes `handoff_agent(agent_slug, message)`. An agent can
+ask any other native role for help; plain `@mentions` in its prose do not
+dispatch work. The tool queues a peer response in the same turn after already
+queued participants, without waiting inside the current response. The peer
+receives the original user request, the scoped peer request, and prior chat
+replies. It may explicitly hand back to the sender for synthesis.
+
+Handoffs append durable `agent_handoff` messages and
+`collaboration.handoff.queued` events. Per-member progress includes
+`requested_by`, `parent_index`, `request`, and `read_only`. Handoff events and
+concierge tool logs omit the peer request text. Repeating the same sender/recipient/request
+within one response returns the original receipt without another invocation.
+The user's original targets and idempotency identity remain unchanged.
+
+Each response can request two peers, with six additional responses total and
+three handoff levels per user turn. A role cannot hand off to itself. Critic
+and every descendant of a read-only response retain the read-only host-tool
+allowlist and no MCP servers, regardless of the recipient role. A peer request
+does not grant new human approval. Ordinary conversation has no handoff tool.
+Stop skips queued peers as well as team members. Restart recovery considers all
+dynamic participants, and never replays an interrupted handoff.
+
+`GET /v1/channels/{id}/turns?active_only=true` reports active turns and per-member
+progress. `POST /v1/channels/{id}/turns/{turn}/cancel` stops queued responses.
+An in-flight member may finish and its result is preserved; remaining members
+are skipped. This does not undo effects or cancel previously dispatched runs.
+Interrupted cancellation settles durably as cancelled on restart.
+
+`GET /v1/events?latest=true&limit=200` reads the newest bounded snapshot, in
+ascending sequence order, including after retention has pruned earlier events.
+It cannot be combined with `after`; existing cursor replay and streams retain
+their behavior. HTTP requests produce structured `api.request` logs with route
+templates, status, generated trace IDs, and duration. Request bodies, query
+strings, authorization headers, and caller-provided request IDs are not logged.
+
+Turns execute in admission order through the single concierge. A team's members
+run sequentially, each receiving durable channel history and the earlier members'
+replies. The context is bounded to the latest 200 messages and 60,000 characters;
+it excludes other channels and later queued user inputs. History also rebuilds
+context after a provider session is lost or the daemon restarts.
+
+Before serving requests after a restart, the API resumes accepted turns that
+never started. A running turn with every expected reply already persisted is
+completed without another invocation. Other interrupted running turns fail with
+a durable explanation: their actions may already have occurred, so they are not
+automatically replayed. Provider failures also appear in channel history.
+Deleting a channel prevents queued turns and remaining team members from starting
+and discards late replies. It does not undo an action already running.
+
+Connection credentials remain in sbxloop's environment and configuration.
+These routes report redacted readiness and deliberately reject browser-supplied
+secret mutation until protected credential intake is implemented (#1043).
 
 ## Clients and tokens
 
@@ -95,18 +194,21 @@ Rules a client can rely on:
 
 ### Capabilities
 
-| Capability         | Grants                                                                                  |
-| ------------------ | --------------------------------------------------------------------------------------- |
-| `runs:read`        | Every read: status, items, queue, runs, tasks, events, streams, gates, holds, schedules |
-| `items:create`     | `POST /v1/items`                                                                        |
-| `runs:control`     | Cancel, resume, retry, requeue, abandon, re-arm the review wait                         |
-| `runs:steer`       | `POST /v1/runs/{id}/steering`                                                           |
-| `budgets:grant`    | `POST /v1/runs/{id}/round-grants`                                                       |
-| `gates:approve`    | `POST /v1/gates/{id}/approve`                                                           |
-| `daemon:manage`    | Holds, stop, restart, repository resume, schedules                                      |
-| `artifacts:read`   | Artifact catalogs and downloads                                                         |
-| `audit:read`       | `GET /v1/operations`                                                                    |
-| `diagnostics:read` | `GET /v1/logs`, `GET /v1/configuration`                                                 |
+| Capability               | Grants                                                                                      |
+| ------------------------ | ------------------------------------------------------------------------------------------- |
+| `runs:read`              | Every read: status, items, queue, runs, tasks, events, streams, gates, holds, schedules     |
+| `items:create`           | `POST /v1/items`                                                                            |
+| `runs:control`           | Cancel, resume, retry, requeue, abandon, re-arm the review wait                             |
+| `runs:steer`             | `POST /v1/runs/{id}/steering`                                                               |
+| `budgets:grant`          | `POST /v1/runs/{id}/round-grants`                                                           |
+| `gates:approve`          | `POST /v1/gates/{id}/approve`                                                               |
+| `daemon:manage`          | Holds, stop, restart, repository resume, schedules                                          |
+| `artifacts:read`         | Artifact catalogs and downloads                                                             |
+| `audit:read`             | `GET /v1/operations`                                                                        |
+| `diagnostics:read`       | `GET /v1/logs`, `GET /v1/configuration`                                                     |
+| `collaboration:read`     | Local profile, agent/team catalogs, channels, messages, preferences, workflows, connections |
+| `collaboration:write`    | Local profile, teams, channels, preferences, and workflow mutations                         |
+| `collaboration:delegate` | Accept a conversational or delegated channel turn                                           |
 
 A refusal names the capability it needed (`403 forbidden` with
 `"capability"`), before the target is looked at.
@@ -146,41 +248,47 @@ rechecked when it arrives) and a `revision` a command may pin.
 
 ## Endpoint catalog
 
-| Method   | Path                                        | Capability         | Purpose                                                               |
-| -------- | ------------------------------------------- | ------------------ | --------------------------------------------------------------------- |
-| `GET`    | `/health/live`, `/health/ready`             | none               | Liveness; readiness with generation and projection lag                |
-| `GET`    | `/v1/capabilities`, `/v1/me`                | any                | Contract, features, limits; the client's own grant                    |
-| `GET`    | `/v1/openapi.json`                          | none               | The contract of record                                                |
-| `POST`   | `/v1/auth/token`, `/v1/auth/revoke`         | none / any         | Mint and refresh; revoke the presented token                          |
-| `GET`    | `/v1/status`                                | `runs:read`        | Live state: current run, queue, holds, breaker, stopping, watermark   |
-| `GET`    | `/v1/items[/{id}]`, `/v1/queue`             | `runs:read`        | Work items; the queue in dispatch order                               |
-| `POST`   | `/v1/items`                                 | `items:create`     | Admit an issue, a workload ask or a tool recipe                       |
-| `POST`   | \`/v1/items/{id}/retry                      | requeue            | abandon\`                                                             |
-| `GET`    | `/v1/runs[/{id}]`, `…/tasks`                | `runs:read`        | Runs and their tasks                                                  |
-| `POST`   | \`/v1/runs/{id}/cancel                      | resume\`           | `runs:control`                                                        |
-| `POST`   | `/v1/runs/{id}/steering`                    | `runs:steer`       | Direction for the run in flight                                       |
-| `GET`    | `/v1/runs/{id}/steering`                    | `runs:read`        | Every instruction and its fate                                        |
-| `POST`   | `/v1/runs/{id}/round-grants`                | `budgets:grant`    | More review rounds for an exhausted run                               |
-| `POST`   | `/v1/runs/{id}/review-wait/resume`          | `runs:control`     | Re-arm a run parked for review                                        |
-| `GET`    | `/v1/gates[/{id}]`                          | `runs:read`        | Merge and publication gates                                           |
-| `POST`   | `/v1/gates/{id}/approve`                    | `gates:approve`    | Endorse and release a gate at a revision                              |
-| `GET`    | `/v1/events`, `/v1/runs/{id}/events`        | `runs:read`        | The chronology after a cursor                                         |
-| `GET`    | `/v1/events/stream`                         | `runs:read`        | The same, as server-sent events                                       |
-| `WS`     | `/v1/ws`                                    | `runs:read`        | Events and commands on one socket                                     |
-| `GET`    | `/v1/runs/{id}/artifacts`                   | `artifacts:read`   | The run's artifact catalog and where it published                     |
-| `GET`    | `/v1/artifacts/{id}[/content]`              | `artifacts:read`   | One entry; its bytes as an attachment                                 |
-| `GET`    | `/v1/runs/{id}/usage`, `/v1/usage`          | `runs:read`        | Reported tokens and turns; never a bill                               |
-| `GET`    | `/v1/operations[/{id}]`                     | `audit:read`       | Every command any surface recorded                                    |
-| `GET`    | `/v1/repositories`, `/profiles`, `/recipes` | `runs:read`        | What work may be admitted against                                     |
-| `POST`   | `/v1/repositories/{id}/resume`              | `daemon:manage`    | Poll a suspended repository again                                     |
-| `GET`    | `/v1/daemon/holds`                          | `runs:read`        | Standing holds and whose they are                                     |
-| `POST`   | `/v1/daemon/holds`                          | `daemon:manage`    | Take a hold attributed to this client                                 |
-| `DELETE` | `/v1/daemon/holds/{name}`                   | `daemon:manage`    | Release your hold; `?force=true` overrides another's                  |
-| `POST`   | `/v1/daemon/stop`, `/v1/daemon/restart`     | `daemon:manage`    | Graceful stop; a stop the supervisor undoes                           |
-| `GET`    | `/v1/schedules[/{name}]`                    | `runs:read`        | Schedules with cadence, last and next due                             |
-| `POST`   | \`/v1/schedules\[/{name}/pause              | resume\]\`         | `daemon:manage`                                                       |
-| `DELETE` | `/v1/schedules/{name}`                      | `daemon:manage`    | Remove                                                                |
-| `GET`    | `/v1/logs`, `/v1/configuration`             | `diagnostics:read` | The log ring, redacted; the allowlisted configuration with provenance |
+| Method   | Path                                         | Capability             | Purpose                                                               |
+| -------- | -------------------------------------------- | ---------------------- | --------------------------------------------------------------------- |
+| `GET`    | `/health/live`, `/health/ready`              | none                   | Liveness; readiness with generation and projection lag                |
+| `GET`    | `/v1/capabilities`, `/v1/me`                 | any                    | Contract, features, limits; the client's own grant                    |
+| `GET`    | `/v1/openapi.json`                           | none                   | The contract of record                                                |
+| `POST`   | `/v1/auth/token`, `/v1/auth/revoke`          | none / any             | Mint and refresh; revoke the presented token                          |
+| `POST`   | `/v1/auth/local/register`, `/login`          | none                   | One local user's onboarding and login                                 |
+| `GET`    | `/v1/users/me`, `/v1/agents[/{slug}]`        | collaboration read     | Local profile and product agent catalog                               |
+| CRUD     | `/v1/teams`, `/v1/channels`, `/v1/workflows` | collaboration          | Local teams, durable conversations, and workflow definitions          |
+| `GET`    | `/v1/channels/{id}/messages`                 | collaboration read     | Immutable ordered conversation history                                |
+| `POST`   | `/v1/channels/{id}/turns`                    | collaboration delegate | Accept an idempotent conversation/delegation turn                     |
+| CRUD     | `/v1/prompts`, `/v1/connections`             | collaboration          | User preferences; redacted operator-managed connection status         |
+| `GET`    | `/v1/status`                                 | `runs:read`            | Live state: current run, queue, holds, breaker, stopping, watermark   |
+| `GET`    | `/v1/items[/{id}]`, `/v1/queue`              | `runs:read`            | Work items; the queue in dispatch order                               |
+| `POST`   | `/v1/items`                                  | `items:create`         | Admit an issue, a workload ask or a tool recipe                       |
+| `POST`   | \`/v1/items/{id}/retry                       | requeue                | abandon\`                                                             |
+| `GET`    | `/v1/runs[/{id}]`, `…/tasks`                 | `runs:read`            | Runs and their tasks                                                  |
+| `POST`   | \`/v1/runs/{id}/cancel                       | resume\`               | `runs:control`                                                        |
+| `POST`   | `/v1/runs/{id}/steering`                     | `runs:steer`           | Direction for the run in flight                                       |
+| `GET`    | `/v1/runs/{id}/steering`                     | `runs:read`            | Every instruction and its fate                                        |
+| `POST`   | `/v1/runs/{id}/round-grants`                 | `budgets:grant`        | More review rounds for an exhausted run                               |
+| `POST`   | `/v1/runs/{id}/review-wait/resume`           | `runs:control`         | Re-arm a run parked for review                                        |
+| `GET`    | `/v1/gates[/{id}]`                           | `runs:read`            | Merge and publication gates                                           |
+| `POST`   | `/v1/gates/{id}/approve`                     | `gates:approve`        | Endorse and release a gate at a revision                              |
+| `GET`    | `/v1/events`, `/v1/runs/{id}/events`         | `runs:read`            | The chronology after a cursor                                         |
+| `GET`    | `/v1/events/stream`                          | `runs:read`            | The same, as server-sent events                                       |
+| `WS`     | `/v1/ws`                                     | `runs:read`            | Events and commands on one socket                                     |
+| `GET`    | `/v1/runs/{id}/artifacts`                    | `artifacts:read`       | The run's artifact catalog and where it published                     |
+| `GET`    | `/v1/artifacts/{id}[/content]`               | `artifacts:read`       | One entry; its bytes as an attachment                                 |
+| `GET`    | `/v1/runs/{id}/usage`, `/v1/usage`           | `runs:read`            | Reported tokens and turns; never a bill                               |
+| `GET`    | `/v1/operations[/{id}]`                      | `audit:read`           | Every command any surface recorded                                    |
+| `GET`    | `/v1/repositories`, `/profiles`, `/recipes`  | `runs:read`            | What work may be admitted against                                     |
+| `POST`   | `/v1/repositories/{id}/resume`               | `daemon:manage`        | Poll a suspended repository again                                     |
+| `GET`    | `/v1/daemon/holds`                           | `runs:read`            | Standing holds and whose they are                                     |
+| `POST`   | `/v1/daemon/holds`                           | `daemon:manage`        | Take a hold attributed to this client                                 |
+| `DELETE` | `/v1/daemon/holds/{name}`                    | `daemon:manage`        | Release your hold; `?force=true` overrides another's                  |
+| `POST`   | `/v1/daemon/stop`, `/v1/daemon/restart`      | `daemon:manage`        | Graceful stop; a stop the supervisor undoes                           |
+| `GET`    | `/v1/schedules[/{name}]`                     | `runs:read`            | Schedules with cadence, last and next due                             |
+| `POST`   | \`/v1/schedules\[/{name}/pause               | resume\]\`             | `daemon:manage`                                                       |
+| `DELETE` | `/v1/schedules/{name}`                       | `daemon:manage`        | Remove                                                                |
+| `GET`    | `/v1/logs`, `/v1/configuration`              | `diagnostics:read`     | The log ring, redacted; the allowlisted configuration with provenance |
 
 Every collection pages by an opaque `cursor` bound to its filters
 (`limit` up to 200; `{"data": […], "next_cursor": …, "has_more": …}`). The
@@ -273,7 +381,7 @@ request's `X-Request-Id`, and the fields a client needs to act:
 | Concurrent artifact downloads  | 4                                                  |
 | Artifact catalog per run       | 2000 files                                         |
 | Log tail                       | 500 records                                        |
-| Usage window                   | 31 days                                            |
+| Usage window                   | 90 days                                            |
 | Access token                   | `[api] access_token_ttl_s` (15 minutes)            |
 | Refresh token                  | `[api] refresh_token_ttl_s` (7 days)               |
 | Auth failures                  | 10 per minute per client and address, 60 s lockout |

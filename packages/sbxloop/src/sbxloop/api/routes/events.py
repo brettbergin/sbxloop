@@ -19,7 +19,7 @@ from sbxloop.api.errors import Problem
 from sbxloop.api.models import EventOut
 from sbxloop.api.pagination import Page
 from sbxloop.api.projections import Views, not_found
-from sbxloop.api.replay import cursor_after, read_after
+from sbxloop.api.replay import cursor_after, envelope_page, read_after
 
 router = APIRouter(prefix="/v1", tags=["events"])
 
@@ -41,14 +41,25 @@ async def list_events(
     run_id: Annotated[str | None, Query()] = None,
     type_prefix: Annotated[str | None, Query(max_length=64)] = None,
     limit: Annotated[int, Query(ge=1, le=PAGE_MAX)] = PAGE_DEFAULT,
+    latest: bool = False,
 ) -> Page[EventOut]:
     """Every public event after ``after`` (an event id, or omitted for
-    the oldest held), oldest first, in the order it was recorded."""
+    the oldest held), oldest first, in the order it was recorded.
+    ``latest`` instead returns the newest bounded snapshot, oldest first;
+    it works after retention and cannot be combined with ``after``."""
+    if latest and after is not None:
+        raise Problem(400, "invalid_cursor", "latest cannot be combined with after")
     start = cursor_after(after)
 
     def read() -> Page[EventOut]:
         views = Views(ctx)
         internal_run = views.run_by_public_id(run_id).run_id if run_id else None
+        if latest:
+            ctx.chronology.project(views.now)
+            rows = ctx.chronology.read(
+                run_id=internal_run, type_prefix=type_prefix, limit=limit, newest_first=True
+            )
+            return envelope_page(views, list(reversed(rows)), more=False)
         return read_after(views, start, run_id=internal_run, type_prefix=type_prefix, limit=limit)
 
     return await ctx.call(read)

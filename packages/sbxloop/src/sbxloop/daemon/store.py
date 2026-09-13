@@ -57,7 +57,8 @@ from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import InstrumentedAttribute, Session, aliased
 
-import sbxloop.db.api_models  # noqa: F401  - registers the operations tables on Base
+import sbxloop.db.api_models  # registers the operations tables on Base
+import sbxloop.db.collaboration_models  # noqa: F401 - registers collaboration tables on Base
 from sbxloop.config import ScheduleConfig
 from sbxloop.daemon.model import ItemState, PendingReport, WorkItem
 from sbxloop.daemon.schedule import ScheduleRow

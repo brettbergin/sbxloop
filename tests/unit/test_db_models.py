@@ -15,6 +15,7 @@ import pytest
 from sqlalchemy import Engine, inspect
 
 import sbxloop.db.api_models
+import sbxloop.db.collaboration_models
 import sbxloop.db.daemon_models
 import sbxloop.db.engine_models  # noqa: F401  - registers the models on Base
 from sbxloop.daemon.store import DaemonStore
@@ -57,7 +58,16 @@ API_TABLES = (
     "api_steering",
     "api_artifacts",
 )
-ALL_TABLES = ENGINE_TABLES + DAEMON_TABLES + API_TABLES
+COLLABORATION_TABLES = (
+    "collaboration_users",
+    "collaboration_channels",
+    "collaboration_messages",
+    "collaboration_turns",
+    "collaboration_teams",
+    "collaboration_preferences",
+    "collaboration_workflows",
+)
+ALL_TABLES = ENGINE_TABLES + DAEMON_TABLES + API_TABLES + COLLABORATION_TABLES
 
 
 @pytest.fixture

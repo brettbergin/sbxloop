@@ -102,6 +102,6 @@ class TestWindow:
             == 422
         )
         wide = api.client.get(
-            "/v1/usage", params={"since": 0, "until": 40 * 86400}, headers=headers
+            "/v1/usage", params={"since": 0, "until": 91 * 86400}, headers=headers
         )
-        assert wide.status_code == 422 and "31 days" in wide.json()["detail"]
+        assert wide.status_code == 422 and "90 days" in wide.json()["detail"]
