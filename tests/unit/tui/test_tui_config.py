@@ -46,6 +46,32 @@ def _config_text(home: SbxloopHome) -> str:
     return home.config_toml.read_text()
 
 
+async def _loaded(pilot: Any, screen: ConfigScreen) -> None:
+    """The screen mounts before its worker has resolved the config: the
+    table, the policy and the workload panes fill in some time after
+    ``app.screen`` is a ConfigScreen. Wait for the data, not the screen."""
+    assert await until(pilot, lambda: screen.config is not None), screen.error
+
+
+def _cell(screen: ConfigScreen, key: str) -> str | None:
+    """The value column of ``key`` as the table shows it, or None while
+    the row is not there, so a refresh can be waited for as a predicate."""
+    table = screen.query_one("#resolved", ConsoleTable)
+    if key not in table.rows:
+        return None
+    return str(table.get_row_at(table.get_row_index(key))[1])
+
+
+async def _open_key(pilot: Any, screen: ConfigScreen, key: str) -> None:
+    """Put the cursor on ``key`` once the resolved table holds it. The
+    table is filled from a worker on mount and again after every save,
+    so a row is something to wait for, never to assume."""
+    table = screen.query_one("#resolved", ConsoleTable)
+    assert await until(pilot, lambda: key in table.rows), f"{key} never reached the table"
+    table.focus()
+    table.move_cursor(row=table.get_row_index(key))
+
+
 def test_model_setting_opens_a_picker(seeded: SbxloopHome, hermetic: None) -> None:
     _seed_config(seeded, '[agent.models]\nbuild = "first"\n')
 
@@ -56,6 +82,7 @@ def test_model_setting_opens_a_picker(seeded: SbxloopHome, hermetic: None) -> No
             await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
+            await _loaded(pilot, screen)
             screen.edit_key("agent.models.build")
             await pilot.pause(0.2)
             assert app.screen.query_one("#model-options", OptionList).option_count >= 2
@@ -139,6 +166,7 @@ def test_config_screen_resolves_filters_and_shows_the_policy(
             await pilot.press("7")
             await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
+            await _loaded(pilot, app.screen)
             table = app.screen.query_one("#resolved", ConsoleTable)
             row = table.get_row_at(table.get_row_index("daemon.poll_interval_s"))
             assert str(row[1]) == "7" and str(row[2]) == FILE_LAYER
@@ -192,6 +220,7 @@ def test_config_screen_shows_the_workload_profiles(seeded: SbxloopHome, hermetic
             await pilot.press("7")
             await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
+            await _loaded(pilot, app.screen)
             text = app.screen.query_one("#workloads", TextPanel).content_text
             assert "research (default)" in text and "reads the web" in text
             assert "*.example.com" in text
@@ -255,7 +284,7 @@ def test_a_save_that_cannot_be_written_offers_no_restart(
 
             with pytest.MonkeyPatch.context() as mp:
                 mp.setattr("sbxloop.tui.actions.save_text", refuse)
-                _open_key(screen, "daemon.poll_interval_s")
+                await _open_key(pilot, screen, "daemon.poll_interval_s")
                 await pilot.press("enter")
                 await until(pilot, lambda: isinstance(app.screen, ValueScreen))
                 assert isinstance(app.screen, ValueScreen)
@@ -278,7 +307,7 @@ def test_a_saved_key_keeps_a_backup(seeded: SbxloopHome, hermetic: None) -> None
             await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
-            _open_key(screen, "daemon.poll_interval_s")
+            await _open_key(pilot, screen, "daemon.poll_interval_s")
             await pilot.press("enter")
             await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
@@ -292,8 +321,7 @@ def test_a_saved_key_keeps_a_backup(seeded: SbxloopHome, hermetic: None) -> None
             await pilot.press("n")
             await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
-            table = app.screen.query_one("#resolved", ConsoleTable)
-            assert str(table.get_row_at(table.get_row_index("daemon.poll_interval_s"))[1]) == "9"
+            assert await until(pilot, lambda: _cell(screen, "daemon.poll_interval_s") == "9")
 
     drive(scenario)
 
@@ -321,6 +349,7 @@ def test_the_editor_is_the_homes_config_wherever_the_console_ran(
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
             assert screen.path == seeded.config_toml
+            await _loaded(pilot, screen)
             status = screen.query_one("#file-status", TextPanel).content_text
             assert str(seeded.config_toml) in status
             assert screen.flat["daemon.poll_interval_s"] == 3.0
@@ -350,7 +379,7 @@ def test_a_sbxloop_toml_in_the_home_is_named_as_shadowing(
             status = screen.query_one("#file-status", TextPanel).content_text
             assert "sbxloop.toml sits in the home" in status
             # And an edit to a key it holds is written, then flagged.
-            _open_key(screen, "daemon.poll_interval_s")
+            await _open_key(pilot, screen, "daemon.poll_interval_s")
             await pilot.press("enter")
             await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
@@ -482,12 +511,6 @@ def test_writing_one_key_keeps_every_other_line() -> None:
         configtoml.set_value("[daemon\n", parts, 1.0)
 
 
-def _open_key(screen: ConfigScreen, key: str) -> None:
-    table = screen.query_one("#resolved", ConsoleTable)
-    table.focus()
-    table.move_cursor(row=table.get_row_index(key))
-
-
 def test_model_edit_applies_without_offering_restart(seeded: SbxloopHome, hermetic: None) -> None:
     _seed_config(seeded, '[agent.models]\nbuild = "first"\n')
     save_catalog(seeded, backend_named("copilot"), [row("first"), row("second")])
@@ -499,7 +522,7 @@ def test_model_edit_applies_without_offering_restart(seeded: SbxloopHome, hermet
             await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
-            _open_key(screen, "agent.models.build")
+            await _open_key(pilot, screen, "agent.models.build")
             await pilot.press("enter")
             await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
@@ -526,7 +549,7 @@ def test_a_key_is_edited_from_the_resolved_view(seeded: SbxloopHome, hermetic: N
             assert isinstance(screen, ConfigScreen)
 
             # A number: Enter opens the key, Enter applies it.
-            _open_key(screen, "daemon.poll_interval_s")
+            await _open_key(pilot, screen, "daemon.poll_interval_s")
             await pilot.press("enter")
             await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
@@ -541,11 +564,10 @@ def test_a_key_is_edited_from_the_resolved_view(seeded: SbxloopHome, hermetic: N
             await pilot.press("n")
             await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
-            table = app.screen.query_one("#resolved", ConsoleTable)
-            assert str(table.get_row_at(table.get_row_index("daemon.poll_interval_s"))[1]) == "9"
+            assert await until(pilot, lambda: _cell(screen, "daemon.poll_interval_s") == "9")
 
             # A value the loader refuses is named and never written.
-            _open_key(app.screen, "daemon.poll_interval_s")
+            await _open_key(pilot, screen, "daemon.poll_interval_s")
             await pilot.press("e")
             await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
@@ -557,7 +579,7 @@ def test_a_key_is_edited_from_the_resolved_view(seeded: SbxloopHome, hermetic: N
             assert "poll_interval_s = 9.0" in _config_text(seeded)
 
             # A bool is two choices, applied as soon as one is picked.
-            _open_key(app.screen, "keep_sandboxes")
+            await _open_key(pilot, screen, "keep_sandboxes")
             await pilot.press("enter")
             await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
@@ -602,7 +624,7 @@ def test_a_repo_entry_is_addressable_key_by_key(seeded: SbxloopHome, hermetic: N
             assert screen.query_one("#tabs", TabbedContent).active == "resolved-pane"
             assert 0 < table.row_count < len(screen.flat)
 
-            _open_key(screen, "github.repos[1].deliver_base")
+            await _open_key(pilot, screen, "github.repos[1].deliver_base")
             await pilot.press("enter")
             await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
@@ -627,7 +649,7 @@ def test_unsetting_a_key_says_what_answers_instead(seeded: SbxloopHome, hermetic
             await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
-            _open_key(screen, "sandbox.template")
+            await _open_key(pilot, screen, "sandbox.template")
             await pilot.press("enter")
             await pilot.pause(0.5)
             assert isinstance(app.screen, ValueScreen) and app.screen.can_unset
@@ -658,7 +680,7 @@ def test_a_key_the_environment_also_sets_is_written_and_flagged(
             await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
-            _open_key(screen, "daemon.poll_interval_s")
+            await _open_key(pilot, screen, "daemon.poll_interval_s")
             await pilot.press("enter")
             await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
@@ -705,7 +727,7 @@ def test_a_key_can_be_added_by_path(seeded: SbxloopHome, hermetic: None) -> None
             await pilot.press("n")
             await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             assert isinstance(app.screen, ConfigScreen)
-            assert app.screen.flat["sandbox.env.RAILS_ENV"] == "test"
+            assert await until(pilot, lambda: screen.flat.get("sandbox.env.RAILS_ENV") == "test")
 
     drive(scenario)
 
@@ -720,7 +742,7 @@ def test_read_only_console_cannot_edit_a_key(seeded: SbxloopHome, hermetic: None
             await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
-            _open_key(screen, "daemon.poll_interval_s")
+            await _open_key(pilot, screen, "daemon.poll_interval_s")
             await pilot.press("enter")
             await pilot.pause(0.5)
             assert isinstance(app.screen, ConfigScreen), "no dialog for a console that cannot write"
@@ -744,7 +766,7 @@ def test_a_key_the_environment_owns_is_refused(seeded: SbxloopHome, hermetic: No
             await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
-            _open_key(screen, "home")
+            await _open_key(pilot, screen, "home")
             await pilot.press("enter")
             await pilot.pause(0.5)
             assert isinstance(app.screen, ConfigScreen), "no dialog for a key a file cannot set"
@@ -779,9 +801,10 @@ def test_an_edit_shows_up_in_the_resolved_view_at_once(
             await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
             screen = app.screen
             assert isinstance(screen, ConfigScreen)
+            await _loaded(pilot, screen)
             assert screen.flat["model"] == "claude-sonnet-5"
 
-            _open_key(screen, "model")
+            await _open_key(pilot, screen, "model")
             await pilot.press("enter")
             await until(pilot, lambda: isinstance(app.screen, ValueScreen))
             assert isinstance(app.screen, ValueScreen)
@@ -795,12 +818,8 @@ def test_an_edit_shows_up_in_the_resolved_view_at_once(
             assert not (seeded.root / "sbxloop.toml").exists(), "nothing written beside the home"
             # … and the row says so without another keystroke.
             assert isinstance(app.screen, ConfigScreen)
-            assert app.screen.flat["model"] == "claude-haiku-4-5-20251001"
-            table = app.screen.query_one("#resolved", ConsoleTable)
-            assert (
-                str(table.get_row_at(table.get_row_index("model"))[1])
-                == "claude-haiku-4-5-20251001"
-            )
+            assert await until(pilot, lambda: _cell(screen, "model") == "claude-haiku-4-5-20251001")
+            assert screen.flat["model"] == "claude-haiku-4-5-20251001"
 
     drive(scenario)
 
@@ -847,17 +866,16 @@ def test_the_resolved_table_shows_values_not_reprs(seeded: SbxloopHome, hermetic
         app = make_app(seeded, **REFRESH)
         async with app.run_test(size=(160, 50)) as pilot:
             await pilot.press("7")
-            await pilot.pause(1.5)
-            table = app.screen.query_one("#resolved", ConsoleTable)
-
-            def cell(key: str) -> str:
-                return str(table.get_row_at(table.get_row_index(key))[1])
-
-            assert cell("daemon.poll_interval_s") == "60"
-            assert cell("github.repo") == "o/r"
-            assert cell("policy.allow") == "a.com, b.com"
-            assert cell("sandbox.template") == "—"
-            assert cell("keep_sandboxes") == "false"
+            await until(pilot, lambda: isinstance(app.screen, ConfigScreen))
+            screen = app.screen
+            assert isinstance(screen, ConfigScreen)
+            await _loaded(pilot, screen)
+            table = screen.query_one("#resolved", ConsoleTable)
+            assert _cell(screen, "daemon.poll_interval_s") == "60"
+            assert _cell(screen, "github.repo") == "o/r"
+            assert _cell(screen, "policy.allow") == "a.com, b.com"
+            assert _cell(screen, "sandbox.template") == "—"
+            assert _cell(screen, "keep_sandboxes") == "false"
             # The filter matches what is on screen, not the repr behind it:
             # `a.com, b.com` is the display, `['a.com', 'b.com']` the repr,
             # and this needle exists only in the first.
