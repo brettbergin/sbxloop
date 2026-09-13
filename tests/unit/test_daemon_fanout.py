@@ -159,3 +159,43 @@ def test_a_failed_start_names_the_bridge() -> None:
     frontend = FanoutFrontend([Broken()])  # type: ignore[list-item]
     with pytest.raises(DaemonError, match="slack bridge failed to start: socket refused"):
         frontend.start()
+
+
+def test_an_observer_hears_the_frontend_calls_and_nothing_else() -> None:
+    """The remote API's chronology observes the fan-out (#1037): every
+    Frontend call reaches it, its failure is isolated, and it is never
+    started, closed or handed the concierge."""
+
+    class Observer:
+        def __init__(self) -> None:
+            self.calls: list[str] = []
+
+        def daemon_notice(self, notice: DaemonNotice) -> None:
+            self.calls.append("daemon_notice")
+
+        def run_started(self, item: WorkItem, run_id: str, engine: Any, bus: EventBus) -> None:
+            self.calls.append("run_started")
+            raise RuntimeError("boom")
+
+        def run_finished(self, item: WorkItem, report: RunReport) -> None:
+            self.calls.append("run_finished")
+
+        def merge_gate_opened(self, item: WorkItem, run_id: str, gate: Any) -> None:
+            self.calls.append("merge_gate_opened")
+
+        def merge_gate_resolved(self, *args: Any) -> None:
+            self.calls.append("merge_gate_resolved")
+
+    bridge, observer = Recorder(), Observer()
+    front = FanoutFrontend([bridge])
+    front.add_observer(observer)
+    item = WorkItem(item_id="gh:issue:1", source_key="1", title="x")
+    front.start()
+    front.daemon_notice(DaemonNotice("run.done", "hi"))
+    front.run_started(item, "r1", None, EventBus())
+    front.run_finished(item, RunReport(run_id="r1", state="merged", task_summary=""))
+    front.set_concierge("c")
+    front.close()
+    assert observer.calls == ["daemon_notice", "run_started", "run_finished"]
+    assert [c[0] for c in bridge.calls] == ["start", "daemon_notice", "run_started", "run_finished"]
+    assert not hasattr(observer, "concierge") and bridge.closed

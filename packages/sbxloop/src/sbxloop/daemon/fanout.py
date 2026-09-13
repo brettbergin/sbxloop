@@ -30,6 +30,13 @@ class FanoutFrontend:
 
     def __init__(self, bridges: Sequence[ChatBridge]) -> None:
         self.bridges: tuple[ChatBridge, ...] = tuple(bridges)
+        # Observers hear the Frontend calls and nothing else: no start, no
+        # close, no concierge, no watch — the remote API's chronology is
+        # one. Added after construction, since the listener comes up later.
+        self.observers: list[Any] = []
+
+    def add_observer(self, observer: Any) -> None:
+        self.observers.append(observer)
 
     def bridge_for(self, backend: str) -> ChatBridge | None:
         return next((b for b in self.bridges if b.backend == backend), None)
@@ -83,12 +90,15 @@ class FanoutFrontend:
     # -- Frontend protocol -------------------------------------------------------
 
     def _each(self, call: str, *args: Any) -> None:
-        for bridge in self.bridges:
+        for bridge in (*self.bridges, *self.observers):
             try:
                 getattr(bridge, call)(*args)
             except Exception:
                 log.warning(
-                    "frontend.fanout_failed", backend=bridge.backend, call=call, exc_info=True
+                    "frontend.fanout_failed",
+                    backend=getattr(bridge, "backend", type(bridge).__name__),
+                    call=call,
+                    exc_info=True,
                 )
 
     def daemon_notice(self, notice: DaemonNotice) -> None:

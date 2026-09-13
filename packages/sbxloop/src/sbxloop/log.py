@@ -46,7 +46,7 @@ import re
 import sys
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal, NamedTuple, TextIO
+from typing import Any, Literal, NamedTuple, TextIO, get_args
 
 import structlog
 
@@ -307,9 +307,16 @@ def clear_run() -> None:
     structlog.contextvars.clear_contextvars()
 
 
+#: The daemon's own levels, as a closed set: a name another library
+#: registered with ``logging`` (uvicorn adds ``TRACE`` on import) is not
+#: one an operator can ask for.
+_KNOWN_LEVELS: frozenset[str] = frozenset(get_args(LogLevel))
+
+
 def _level_no(level: str) -> int:
-    value = logging.getLevelName(level.upper())
-    if not isinstance(value, int):
+    name = level.upper()
+    value = logging.getLevelName(name)
+    if name not in _KNOWN_LEVELS or not isinstance(value, int):
         raise ValueError(f"unknown log level {level!r}")
     return value
 

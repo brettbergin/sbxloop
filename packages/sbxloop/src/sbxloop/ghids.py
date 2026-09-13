@@ -36,6 +36,7 @@ GH_PREFIX = FORGE_PREFIXES["gh"]
 DEFAULT_FORGE = "gh"
 CHAT_PREFIX = "chat:"
 SCHED_PREFIX = "sched:"
+API_PREFIX = "api:"
 
 _KINDS: tuple[GhKind, ...] = get_args(GhKind)
 _NUMBER_RE = re.compile(r"^[0-9]+$")
@@ -140,10 +141,25 @@ def parse_schedule_id(value: str) -> tuple[str, str]:
     return name, due
 
 
+def api_item_id(key: str) -> str:
+    """The work item id for an ask admitted through the remote API, keyed
+    by the opaque token the API minted for it."""
+    key = key.strip()
+    if not key or any(ch.isspace() for ch in key):
+        raise ValueError(f"malformed api item key: {key!r}")
+    return f"{API_PREFIX}{key}"
+
+
+def is_api_id(value: str) -> bool:
+    """True when ``value`` is the item id of an ask the remote API admitted."""
+    return value.startswith(API_PREFIX) and len(value) > len(API_PREFIX)
+
+
 def is_local_id(value: str) -> bool:
-    """True for an id with nothing on GitHub behind it — a chat ask or a
-    schedule tick: no issue to read, comment on or label."""
-    return is_chat_id(value) or is_schedule_id(value)
+    """True for an id with nothing on GitHub behind it — a chat ask, a
+    schedule tick or a remote API ask: no issue to read, comment on or
+    label."""
+    return is_chat_id(value) or is_schedule_id(value) or is_api_id(value)
 
 
 def is_gh_id(value: str) -> bool:
@@ -221,6 +237,7 @@ def normalize_item_id(value: str) -> str:
 
 
 __all__ = [
+    "API_PREFIX",
     "CHAT_PREFIX",
     "DEFAULT_FORGE",
     "FORGE_PREFIXES",
@@ -228,9 +245,11 @@ __all__ = [
     "SCHED_PREFIX",
     "GhId",
     "GhKind",
+    "api_item_id",
     "chat_item_id",
     "format_gh_id",
     "has_gh_prefix",
+    "is_api_id",
     "is_chat_id",
     "is_gh_id",
     "is_local_id",

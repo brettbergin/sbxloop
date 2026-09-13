@@ -1,4 +1,4 @@
-"""The daemon's fourteen tables: the queue, the ledger, and what it is holding.
+"""The daemon's fifteen tables: the queue, the ledger, and what it is holding.
 
 The same rules as :mod:`sbxloop.db.engine_models` apply — this describes the
 schema that is on disk rather than the one anyone would design now, because
@@ -38,6 +38,7 @@ from sqlalchemy import (
 from sqlalchemy.orm import Mapped, mapped_column
 
 from sbxloop.db.base import Base
+from sbxloop.db.revisions import attach as attach_revision_trigger
 
 #: ``text`` under a second name. ``LocalMessageRow`` has a column called
 #: ``text``, which shadows the import for every line after it in that class
@@ -92,6 +93,9 @@ class WorkItemRow(Base):
     profile: Mapped[str | None] = mapped_column(Text)
     recipe: Mapped[str | None] = mapped_column(Text)
     recipe_target: Mapped[str | None] = mapped_column(Text)
+    # Bumped by a trigger on every UPDATE (revision 0010): what a remote
+    # command's `expected_revision` is checked against.
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
 
 
 class DaemonRunRow(Base):
@@ -243,6 +247,7 @@ class MergeGateRow(Base):
     resolved_at: Mapped[float | None] = mapped_column(REAL)
     resolved_by: Mapped[str | None] = mapped_column(Text)
     detail: Mapped[str | None] = mapped_column(Text)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
 
 
 class GatePromptRow(Base):
@@ -298,6 +303,27 @@ class ReviewHoldRow(Base):
     resolved_at: Mapped[float | None] = mapped_column(REAL)
     resolved_by: Mapped[str | None] = mapped_column(Text)
     detail: Mapped[str | None] = mapped_column(Text)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
+
+
+class HoldRow(Base):
+    """A named pause hold, kept across restarts (revision 0010).
+
+    Holds used to be a set in the loop's memory, so every restart came back
+    unpaused and a deploy had to snapshot and re-take them. A hold now
+    stands until the side that took it — or an operator's ``resume --all``
+    — releases it; ``owner_display`` and ``via`` say whose it is.
+    """
+
+    __tablename__ = "daemon_holds"
+
+    name: Mapped[str] = mapped_column(Text, primary_key=True, nullable=True)
+    owner_id: Mapped[str | None] = mapped_column(Text)
+    owner_display: Mapped[str | None] = mapped_column(Text)
+    via: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("''"))
+    reason: Mapped[str] = mapped_column(Text, nullable=False, server_default=sql_text("''"))
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    operation_id: Mapped[str | None] = mapped_column(Text)
 
 
 class PendingClarificationRow(Base):
@@ -404,3 +430,10 @@ class ScheduleRowModel(Base):
     source: Mapped[str | None] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[float | None] = mapped_column(REAL)
+
+
+# The revision triggers ride with the tables they bump, so a database built
+# from the metadata carries them like a migrated one does.
+attach_revision_trigger(WorkItemRow.__table__, "item_id")
+attach_revision_trigger(MergeGateRow.__table__, "run_id")
+attach_revision_trigger(ReviewHoldRow.__table__, "run_id")

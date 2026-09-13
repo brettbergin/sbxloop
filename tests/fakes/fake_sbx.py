@@ -369,6 +369,17 @@ def cmd_exec(root: Path, args: list[str], stdin: str = "") -> int:
             rewritten = [c.replace(workspace, unmounted) for c in rewritten]
     if rewritten[0] == "pkill":
         return fake_pkill(fs, rewritten[1:])
+    if any("SBXLOOP_API_REACH_PROBE" in c for c in rewritten):
+        # The api-host-unreachable probe: the fake never opens a socket.
+        # It models the verdict sbxloop is built against — the host's API
+        # port refuses from inside the VM — unless a test flips it.
+        answer = os.environ.get("SBX_FAKE_API_REACH", "")
+        print(
+            answer
+            if answer.startswith(("reachable", "unreachable"))
+            else "unreachable gateway=10.0.2.2"
+        )
+        return 0
     home = fs / "home/agent"
     home.mkdir(parents=True, exist_ok=True)
     # The worker runs under `sh -lc`, so this home's ~/.profile is the one
@@ -524,7 +535,17 @@ def cmd_rm(root: Path, args: list[str]) -> int:
 def cmd_policy(root: Path, args: list[str]) -> int:
     append_jsonl(root / "policies.jsonl", {"args": args, "ts": time.time()})
     if args[:1] == ["check"]:
-        print("allowed")
+        # A domain allowlist never admits a bare address: loopback and the
+        # host gateway read as denied (the verdict the api-host-unreachable
+        # probe depends on; SBX_FAKE_API_REACH flips it for drift tests).
+        host = args[2] if len(args) > 2 else ""
+        literal = host.replace(".", "").isdigit()
+        if literal and not os.environ.get("SBX_FAKE_API_REACH", "").startswith("policy"):
+            print(f"network access to {host} denied by policy")
+        elif literal:
+            print("allowed")
+        else:
+            print("allowed")
     elif args[:1] == ["ls"]:
         print("RULE  DECISION\n(fake)  allow")
     return 0

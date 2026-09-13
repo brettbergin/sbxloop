@@ -554,6 +554,9 @@ class RunRecord(_Model):
     # empty for a code run (its result is the pull request) and for a
     # workload that has not published yet.
     published: list[Published] = Field(default_factory=list)
+    # Bumped on every write of the row (a trigger, revision 0010); what a
+    # remote command's `expected_revision` is checked against.
+    revision: int = 0
 
 
 class RunResult(_Model):
