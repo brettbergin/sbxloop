@@ -39,6 +39,7 @@ from sbxloop.config import (
     GithubConfig,
     RepoConfig,
     SlackConfig,
+    VcsKind,
     load_config,
     load_config_with_sources,
     load_secrets_env,
@@ -70,7 +71,7 @@ from sbxloop.sbx.bake import DEFAULT_TEMPLATE_REF, bake_template
 from sbxloop.sbx.cli import INTERACTIVE_SHELL_ARGV, SbxCLI
 from sbxloop.sbx.models import SandboxRole
 from sbxloop.sbx.pair import cleanup_registry
-from sbxloop.sbx.provision import sandbox_name
+from sbxloop.sbx.provision import sandbox_name, sandbox_name_candidates
 from sbxloop.sbx.prune import (
     classify_sandboxes,
     format_age,
@@ -282,6 +283,15 @@ def _run_repo(store: StateStore, run_id: str) -> str:
     if not isinstance(github, dict):
         return ""
     return str(github.get("repo") or "")
+
+
+def _run_vcs_kind(store: StateStore, config: Config, run_id: str, repo: str) -> VcsKind:
+    """The run snapshot's forge, falling back for pre-snapshot runs."""
+    try:
+        saved = Config.model_validate_json(store.get_run_config(run_id))
+        return saved.vcs_kind_for(repo or None)
+    except (ValueError, SbxloopError):
+        return config.vcs_kind_for(repo or None)
 
 
 def _item_repo(item: Any) -> str:
@@ -1128,6 +1138,7 @@ def status(
     console.print(f"run [bold cyan]{record.run_id}[/]  state: [bold]{record.state}[/]")
     console.print(f"kind: {record.kind}")
     repo = _run_repo(store, record.run_id)
+    vcs_kind = _run_vcs_kind(store, config, run_id, repo)
     if repo:
         console.print(f"repo: [bold]{repo}[/]")
     if record.reason:
@@ -1182,14 +1193,18 @@ def status(
     except SbxloopError:
         for role in roles:
             console.print(
-                f"  {sandbox_name(run_id, role)}  [dim](liveness unknown: sbx ls failed)[/]"
+                f"  {sandbox_name(run_id, role, vcs_kind=vcs_kind)}  "
+                "[dim](liveness unknown: sbx ls failed)[/]"
             )
         return
     any_live = False
     for role in roles:
-        name = sandbox_name(run_id, role)
+        candidates = sandbox_name_candidates(run_id, role, vcs_kind=vcs_kind)
+        name = next((candidate for candidate in candidates if candidate in live), candidates[0])
         any_live = any_live or name in live
         state_note = "[green]running[/]" if name in live else "[dim]not running[/]"
+        if name != candidates[0]:
+            state_note += " [yellow](legacy name)[/]"
         console.print(f"  {name}  {state_note}")
     if any_live:
         console.print(f"  inspect: [cyan]sbxloop shell {run_id}[/] (--role github)")
@@ -1275,13 +1290,19 @@ def shell(
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
     cli = SbxCLI(app_name=config.app_name or None)
-    name = sandbox_name(run_id, "agent" if role == "agent" else "github")
+    repo = _run_repo(store, run_id)
+    vcs_kind = _run_vcs_kind(store, config, run_id, repo)
+    sandbox_role: SandboxRole = (
+        "agent" if role == "agent" else "service" if role == "service" else "github"
+    )
+    candidates = sandbox_name_candidates(run_id, sandbox_role, vcs_kind=vcs_kind)
     try:
-        live = any(info.name == name for info in cli.ls())
+        live_names = {info.name for info in cli.ls()}
     except SbxloopError as exc:
         console.print(f"[bold red]{exc}[/]")
         raise typer.Exit(2) from exc
-    if not live:
+    name = next((candidate for candidate in candidates if candidate in live_names), candidates[0])
+    if name not in live_names:
         console.print(
             f"[bold red]sandbox {name} is not running.[/] Sandboxes are removed at run end "
             "unless kept (keep_on_failure, --keep-sandboxes), and kept ones may have been "
@@ -1366,7 +1387,11 @@ def sandbox_rm(
     if name:
         targets.append(name)
     if run_id:
-        targets += [sandbox_name(run_id, "agent"), sandbox_name(run_id, "github")]
+        store = _store(config)
+        repo = _run_repo(store, run_id)
+        vcs_kind = _run_vcs_kind(store, config, run_id, repo)
+        targets.append(sandbox_name(run_id, "agent"))
+        targets.extend(sandbox_name_candidates(run_id, "github", vcs_kind=vcs_kind))
     if all_:
         targets += [i.name for i in cli.ls() if i.name.startswith("sbxloop-")]
     if not targets:

@@ -3072,6 +3072,26 @@ class TestMultiRepoCli:
         assert result.exit_code == 0
         assert "repo: acme/beta" in re.sub(r"\x1b\[[0-9;]*m", "", result.output)
 
+    def test_status_names_the_vcs_sandbox_for_the_runs_forge(
+        self, workdir: Path, fake_sbx: FakeSbx
+    ) -> None:
+        store = seed_store(workdir)
+        from sbxloop.config import Config
+
+        config = Config.model_validate(
+            {
+                "vcs": {"kind": "gitlab", "api_url": "https://gitlab.example/api/v4"},
+                "github": {"repo": "acme/widgets"},
+            }
+        )
+        store.create_run("rmulti003", "gitlab outcome", config.model_dump_json())
+
+        result = runner.invoke(app, ["status", "rmulti003"])
+
+        assert result.exit_code == 0
+        assert "sbxloop-rmulti003-gitlab" in result.output
+        assert "sbxloop-rmulti003-github" not in result.output
+
     def test_status_single_repo_shape_unchanged(self, workdir: Path) -> None:
         seed_store(workdir)
         result = runner.invoke(app, ["status"])

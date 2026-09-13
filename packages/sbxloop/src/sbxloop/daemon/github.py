@@ -41,7 +41,10 @@ log = get_logger(__name__)
 
 T = TypeVar("T")
 
-SANDBOX_NAME_PREFIX = "sbxloop-daemon-github"
+DAEMON_SANDBOX_PREFIX = "sbxloop-daemon"
+# Backwards-compatible export for callers that identify the default GitHub
+# box. Non-GitHub boxes use ``DAEMON_SANDBOX_PREFIX`` plus their forge kind.
+SANDBOX_NAME_PREFIX = f"{DAEMON_SANDBOX_PREFIX}-github"
 # Ops issued from the daemon (not from a run) carry this run id in events.
 DAEMON_RUN_ID = "daemon"
 # A dead github sandbox costs one re-provision; a GitHub outage must not
@@ -51,7 +54,7 @@ DAEMON_RUN_ID = "daemon"
 REPROVISION_MIN_INTERVAL_S = 300.0
 
 
-def sandbox_name_for(home: SbxloopHome) -> str:
+def sandbox_name_for(home: SbxloopHome, kind: VcsKind = "github") -> str:
     """Per-instance sandbox name. The name used to be fixed, and
     ``remove_stale`` deletes a same-named sandbox before provisioning: a second
     daemon on the same host (another home) killed
@@ -59,7 +62,7 @@ def sandbox_name_for(home: SbxloopHome) -> str:
     would also share a run store, which nothing supports, so the home is
     the instance identity."""
     digest = hashlib.sha256(str(home.root.resolve()).encode()).hexdigest()[:8]
-    return f"{SANDBOX_NAME_PREFIX}-{digest}"
+    return f"{DAEMON_SANDBOX_PREFIX}-{kind}-{digest}"
 
 
 class DaemonGithub:
@@ -84,7 +87,13 @@ class DaemonGithub:
         self.bus = bus
         self.worker_python = worker_python
         self.install_workers = install_workers
-        self.name = name or sandbox_name_for(config.paths)
+        kind = config.vcs_kind_for(repo)
+        self.name = name or sandbox_name_for(config.paths, kind)
+        self._legacy_names = (
+            ()
+            if name is not None or kind == "github"
+            else (sandbox_name_for(config.paths, "github"),)
+        )
         self.clock = clock
         self._last_reprovision_at: float | None = None
         self.provisioner = Provisioner(sbx, config, bus=bus)
@@ -105,15 +114,17 @@ class DaemonGithub:
         Run this before every provision so a failed cleanup is retried when
         authentication or the sandbox service recovers.
         """
-        if self._listed():
-            Sandbox(self.sbx, self.name).rm()
-            log.info("github_sandbox.stale_removed", sandbox=self.name)
-        else:
-            log.debug("github_sandbox.no_stale", sandbox=self.name)
+        for name in (self.name, *self._legacy_names):
+            if self._listed(name):
+                Sandbox(self.sbx, name).rm()
+                log.info("github_sandbox.stale_removed", sandbox=name)
+            else:
+                log.debug("github_sandbox.no_stale", sandbox=name)
 
-    def _listed(self) -> bool:
+    def _listed(self, name: str | None = None) -> bool:
         """Whether ``sbx ls`` lists this instance's box right now."""
-        return any(info.name == self.name for info in self.sbx.ls())
+        wanted = name or self.name
+        return any(info.name == wanted for info in self.sbx.ls())
 
     def ops(self) -> VcsOps:
         # Polling and control requests can arrive together. Cleanup belongs
