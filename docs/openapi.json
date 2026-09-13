@@ -61,6 +61,11 @@
       "AgentOut": {
         "additionalProperties": false,
         "properties": {
+          "backend": {
+            "default": "",
+            "title": "Backend",
+            "type": "string"
+          },
           "capabilities": {
             "items": {
               "type": "string"
@@ -76,9 +81,24 @@
             "title": "Description",
             "type": "string"
           },
+          "execution_mode": {
+            "default": "chat_and_managed_runs",
+            "title": "Execution Mode",
+            "type": "string"
+          },
           "instructions": {
             "default": "",
             "title": "Instructions",
+            "type": "string"
+          },
+          "model": {
+            "default": "",
+            "title": "Model",
+            "type": "string"
+          },
+          "model_source": {
+            "default": "",
+            "title": "Model Source",
             "type": "string"
           },
           "module_path": {
@@ -89,6 +109,18 @@
           "name": {
             "title": "Name",
             "type": "string"
+          },
+          "phase_models": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "title": "Phase Models",
+            "type": "object"
+          },
+          "read_only": {
+            "default": false,
+            "title": "Read Only",
+            "type": "boolean"
           },
           "slug": {
             "title": "Slug",
@@ -2621,6 +2653,43 @@
         "title": "Page[Steering]",
         "type": "object"
       },
+      "ParticipantOut": {
+        "additionalProperties": false,
+        "properties": {
+          "agent_slug": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Slug"
+          },
+          "error": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Error"
+          },
+          "status": {
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_slug",
+          "status"
+        ],
+        "title": "ParticipantOut",
+        "type": "object"
+      },
       "PreferenceDefinitionOut": {
         "additionalProperties": false,
         "properties": {
@@ -4676,6 +4745,13 @@
             "title": "Input Message Id",
             "type": "string"
           },
+          "participants": {
+            "items": {
+              "$ref": "#/components/schemas/ParticipantOut"
+            },
+            "title": "Participants",
+            "type": "array"
+          },
           "started_at": {
             "anyOf": [
               {
@@ -5844,6 +5920,60 @@
       }
     },
     "/v1/channels/{channel_id}/turns": {
+      "get": {
+        "operationId": "list_turns_v1_channels__channel_id__turns_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "active_only",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Active Only",
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "items": {
+                    "$ref": "#/components/schemas/TurnOut"
+                  },
+                  "title": "Response List Turns V1 Channels  Channel Id  Turns Get",
+                  "type": "array"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Turns",
+        "tags": [
+          "collaboration"
+        ]
+      },
       "post": {
         "operationId": "create_turn_v1_channels__channel_id__turns_post",
         "parameters": [
@@ -5941,6 +6071,57 @@
           }
         },
         "summary": "Get Turn",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/turns/{turn_id}/cancel": {
+      "post": {
+        "operationId": "cancel_turn_v1_channels__channel_id__turns__turn_id__cancel_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "turn_id",
+            "required": true,
+            "schema": {
+              "title": "Turn Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TurnOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Turn",
         "tags": [
           "collaboration"
         ]
@@ -6412,7 +6593,7 @@
     },
     "/v1/events": {
       "get": {
-        "description": "Every public event after ``after`` (an event id, or omitted for\nthe oldest held), oldest first, in the order it was recorded.",
+        "description": "Every public event after ``after`` (an event id, or omitted for\nthe oldest held), oldest first, in the order it was recorded.\n``latest`` instead returns the newest bounded snapshot, oldest first;\nit works after retention and cannot be combined with ``after``.",
         "operationId": "list_events_v1_events_get",
         "parameters": [
           {
@@ -6474,6 +6655,16 @@
               "minimum": 1,
               "title": "Limit",
               "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "latest",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Latest",
+              "type": "boolean"
             }
           }
         ],

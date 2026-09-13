@@ -48,6 +48,12 @@ class AgentOut(ApiModel):
     instructions: str = ""
     system_prompt: str = ""
     module_path: str = "sbxloop.api.agents"
+    backend: str = ""
+    model: str = ""
+    model_source: str = ""
+    phase_models: dict[str, str] = Field(default_factory=dict)
+    execution_mode: str = "chat_and_managed_runs"
+    read_only: bool = False
 
 
 class TeamCreate(ApiModel):
@@ -214,12 +220,19 @@ class TurnCreate(ApiModel):
     intent: Literal["conversation", "delegate"] = "conversation"
 
 
+class ParticipantOut(ApiModel):
+    agent_slug: str | None
+    status: str
+    error: str | None = None
+
+
 class TurnOut(ApiModel):
     id: str
     channel_id: str
     input_message_id: str
     status: str
     targets: list[str]
+    participants: list[ParticipantOut] = Field(default_factory=list)
     error: str | None
     created_at: str
     started_at: str | None

@@ -91,6 +91,7 @@ class Turn:
     started_at: float | None
     completed_at: float | None
     intent: str = "conversation"
+    participants: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,6 +187,7 @@ def _turn(row: TurnRow) -> Turn:
         started_at=None if row.started_at is None else float(row.started_at),
         completed_at=None if row.completed_at is None else float(row.completed_at),
         intent=str(row.intent),
+        participants=tuple(json.loads(row.participants_json)),
     )
 
 
@@ -529,6 +531,12 @@ class CollaborationStore:
                     status="accepted",
                     targets_json=json.dumps(list(targets)),
                     intent=intent,
+                    participants_json=json.dumps(
+                        [
+                            {"agent_slug": target, "status": "queued", "error": None}
+                            for target in (targets or (None,))
+                        ]
+                    ),
                     created_at=now,
                 )
             )
@@ -584,10 +592,11 @@ class CollaborationStore:
         content: str,
         agent_slug: str | None,
         now: float,
+        participant_index: int | None = None,
     ) -> Message | None:
         with self.dstore.immediate_transaction() as session:
             turn = session.get(TurnRow, turn_id)
-            if turn is None or turn.status not in {"accepted", "running"}:
+            if turn is None or turn.status not in {"accepted", "running", "cancelling"}:
                 return None
             channel = session.get(ChannelRow, turn.channel_id)
             if channel is None or channel.state != "active":
@@ -610,6 +619,10 @@ class CollaborationStore:
             )
             channel.updated_at = now
             channel.revision += 1
+            if participant_index is not None:
+                progress = json.loads(turn.participants_json)
+                progress[participant_index]["status"] = "completed"
+                turn.participants_json = json.dumps(progress)
             row = session.get(MessageRow, message_id)
             assert row is not None  # nosec B101
             _event(
@@ -631,7 +644,17 @@ class CollaborationStore:
             row = session.get(TurnRow, turn_id)
             if row is None or row.status in {"completed", "failed", "cancelled"}:
                 return None if row is None else _turn(row)
-            row.status = "failed" if error else "completed"
+            cancelled = row.status == "cancelling"
+            row.status = "cancelled" if cancelled else ("failed" if error else "completed")
+            if cancelled:
+                error = "Stopped remaining responses. Work already started may still have effects."
+            progress = json.loads(row.participants_json)
+            for participant in progress:
+                if participant["status"] in {"queued", "running"}:
+                    participant["status"] = (
+                        "cancelled" if cancelled else ("failed" if error else "completed")
+                    )
+            row.participants_json = json.dumps(progress)
             row.error = error
             row.completed_at = now
             channel = session.get(ChannelRow, row.channel_id)
@@ -645,7 +668,7 @@ class CollaborationStore:
                         turn_id=turn_id,
                         sequence=sequence,
                         role="assistant",
-                        kind="turn_error",
+                        kind="turn_cancelled" if cancelled else "turn_error",
                         content=error,
                         created_at=now,
                     )
@@ -680,12 +703,14 @@ class CollaborationStore:
         """
         with self.dstore.read() as session:
             rows = list(
-                session.scalars(select(TurnRow).where(TurnRow.status.in_(("accepted", "running"))))
+                session.scalars(
+                    select(TurnRow).where(TurnRow.status.in_(("accepted", "running", "cancelling")))
+                )
             )
             interrupted: list[tuple[str, bool]] = []
             queued: list[tuple[int, Turn, LocalUser, str]] = []
             for row in rows:
-                if row.status == "running":
+                if row.status in {"running", "cancelling"}:
                     replies = set(
                         session.scalars(
                             select(MessageRow.agent_slug).where(
@@ -773,6 +798,86 @@ class CollaborationStore:
             ):
                 return None
             return _turn(row)
+
+    def list_turns(self, user_id: str, channel_id: str, *, active_only: bool = False) -> list[Turn]:
+        with self.dstore.read() as session:
+            channel = session.get(ChannelRow, channel_id)
+            if channel is None or channel.user_id != user_id or channel.state != "active":
+                raise CollaborationError("channel_not_found", "channel not found")
+            statement = (
+                select(TurnRow)
+                .join(MessageRow, MessageRow.id == TurnRow.input_message_id)
+                .where(TurnRow.channel_id == channel_id)
+            )
+            if active_only:
+                statement = statement.where(
+                    TurnRow.status.in_(("accepted", "running", "cancelling"))
+                )
+            return [
+                _turn(row)
+                for row in session.scalars(statement.order_by(MessageRow.sequence).limit(200))
+            ]
+
+    def participant_started(self, turn_id: str, index: int, now: float) -> bool:
+        with self.dstore.immediate_transaction() as session:
+            row = session.get(TurnRow, turn_id)
+            if row is None or row.status != "running":
+                return False
+            progress = json.loads(row.participants_json)
+            if not progress:
+                progress = [
+                    {"agent_slug": target, "status": "queued", "error": None}
+                    for target in (json.loads(row.targets_json) or [None])
+                ]
+            progress[index]["status"] = "running"
+            row.participants_json = json.dumps(progress)
+            _event(
+                session,
+                "collaboration.participant.running",
+                now,
+                data={"channel_id": row.channel_id, "turn_id": turn_id, "index": index},
+            )
+            return True
+
+    def participant_failed(self, turn_id: str, index: int, error: str) -> None:
+        with self.dstore.immediate_transaction() as session:
+            row = session.get(TurnRow, turn_id)
+            if row is None or row.status not in {"running", "cancelling"}:
+                return
+            progress = json.loads(row.participants_json)
+            progress[index].update(status="failed", error=error)
+            row.participants_json = json.dumps(progress)
+
+    def cancel_turn(self, user_id: str, channel_id: str, turn_id: str, now: float) -> Turn | None:
+        settle = False
+        with self.dstore.immediate_transaction() as session:
+            channel = session.get(ChannelRow, channel_id)
+            row = session.get(TurnRow, turn_id)
+            if (
+                channel is None
+                or channel.user_id != user_id
+                or channel.state != "active"
+                or row is None
+                or row.channel_id != channel_id
+            ):
+                return None
+            if row.status not in {"accepted", "running"}:
+                return _turn(row)
+            settle = row.status == "accepted"
+            row.status = "cancelling"
+            progress = json.loads(row.participants_json)
+            for participant in progress:
+                if participant["status"] == "queued":
+                    participant["status"] = "cancelled"
+            row.participants_json = json.dumps(progress)
+            _event(
+                session,
+                "collaboration.turn.cancelling",
+                now,
+                data={"channel_id": channel_id, "turn_id": turn_id},
+            )
+            result = _turn(row)
+        return self.finish_turn(turn_id, error=None, now=now) if settle else result
 
     # -- teams ---------------------------------------------------------------------
 

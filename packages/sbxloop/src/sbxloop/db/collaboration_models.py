@@ -82,6 +82,9 @@ class TurnRow(Base):
     started_at: Mapped[float | None] = mapped_column(REAL)
     completed_at: Mapped[float | None] = mapped_column(REAL)
     intent: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'conversation'"))
+    participants_json: Mapped[str] = mapped_column(
+        Text, nullable=False, server_default=text("'[]'")
+    )
 
 
 class TeamRow(Base):

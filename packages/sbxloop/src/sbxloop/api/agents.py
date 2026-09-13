@@ -1,12 +1,10 @@
-"""Angie's initial agent catalog, expressed as sbxloop collaboration roles.
-
-The roles are prompt overlays on sbxloop's one sandboxed concierge runtime;
-they do not duplicate execution backends or bypass its host-tool boundary.
-"""
+"""Native sbxloop roles exposed through its collaboration transport."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from sbxloop.engine.harness import ROLE_BY_PHASE, Role
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,18 +15,25 @@ class AgentDefinition:
     category: str
     capabilities: tuple[str, ...]
     instructions: str
+    role: Role = "concierge"
+
+    @property
+    def phase(self) -> str:
+        return next(
+            (phase for phase, role in ROLE_BY_PHASE.items() if role == self.role), "concierge"
+        )
 
     @property
     def persona(self) -> str:
         return (
             "\n\n## Collaboration role\n\n"
-            f"You are responding as Angie's **{self.name}** (`@{self.slug}`). "
+            f"You are sbxloop's **{self.name}**, responding in Angie as `@{self.slug}`. "
             f"{self.instructions} Keep the answer useful in a shared chat, state any "
             "action you took, and never imply that another agent or person approved it."
         )
 
 
-AGENTS: tuple[AgentDefinition, ...] = (
+LEGACY_AGENTS: tuple[AgentDefinition, ...] = (
     AgentDefinition(
         "cron",
         "Cron Manager",
@@ -95,7 +100,62 @@ AGENTS: tuple[AgentDefinition, ...] = (
     ),
 )
 
-AGENTS_BY_SLUG = {agent.slug: agent for agent in AGENTS}
+AGENTS: tuple[AgentDefinition, ...] = (
+    AgentDefinition(
+        "concierge",
+        "Concierge",
+        "Chat with sbxloop and direct its managed runs.",
+        "SBXLOOP Agents",
+        ("chat", "run controls", "coordination"),
+        "Help the person direct the loop through the available tools.",
+        "concierge",
+    ),
+    AgentDefinition(
+        "planner",
+        "Planner",
+        "Scope work and prepare a plan for the builder.",
+        "SBXLOOP Agents",
+        ("planning", "decomposition", "handoffs"),
+        "Plan within the ask. Use earlier team replies as context. "
+        "Do not claim to have built the result.",
+        "planner",
+    ),
+    AgentDefinition(
+        "builder",
+        "Builder",
+        "Discuss implementation and dispatch code work through sbxloop.",
+        "SBXLOOP Agents",
+        ("implementation", "verification", "code runs"),
+        "Help implement the ask through sbxloop's managed code runs. "
+        "This chat session has no checkout, editor or shell; actual file changes "
+        "and verification occur in a managed run. Report its status honestly.",
+        "builder",
+    ),
+    AgentDefinition(
+        "critic",
+        "Critic",
+        "Review plans, results, and evidence without changing work.",
+        "SBXLOOP Agents",
+        ("review", "evidence", "read only"),
+        "Inspect and judge the evidence and prior team replies. This role is read-only. "
+        "Never modify work or dispatch a run. State any evidence you cannot access.",
+        "critic",
+    ),
+    AgentDefinition(
+        "operator",
+        "Operator",
+        "Discuss and dispatch research, data, and document workloads.",
+        "SBXLOOP Agents",
+        ("research", "workloads", "deliverables"),
+        "Use managed workload runs for execution and deliverables. "
+        "This chat session has host tools but no editor or shell. Report what the run "
+        "actually did and distinguish it from advice.",
+        "operator",
+    ),
+)
+
+# Existing saved teams and API clients may still address these names.
+AGENTS_BY_SLUG = {agent.slug: agent for agent in (*LEGACY_AGENTS, *AGENTS)}
 
 ANGIE_PERSONA = """
 

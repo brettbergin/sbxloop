@@ -223,10 +223,16 @@ class ApiContext:
         targets: tuple[str | None, ...] = tuple(turn.targets) or (None,)
         errors: list[str] = []
         author = user.full_name or user.username
-        for target in targets:
+        for index, target in enumerate(targets):
             current = store.get_turn(user.id, turn.channel_id, turn.id)
-            if self.stopping.is_set() or current is None or current.status != "running":
+            if self.stopping.is_set() or current is None:
                 return
+            if current.status != "running" or not store.participant_started(
+                turn.id, index, self.clock()
+            ):
+                break
+            self.hub.notify()
+            previous_errors = len(errors)
             definition = AGENTS_BY_SLUG.get(target) if target else None
             persona = (definition.persona if definition else ANGIE_PERSONA) + preference_context
             # Mentioning a role is explicit delegation in Angie's UI.
@@ -242,6 +248,7 @@ class ApiContext:
                     persona=persona,
                     allow_actions=allow_actions,
                     history=store.turn_history(turn),
+                    agent_role=definition.role if definition else "concierge",
                 )
                 reply = future.result()
                 if reply.ok and reply.text:
@@ -250,6 +257,7 @@ class ApiContext:
                         content=reply.text,
                         agent_slug=target,
                         now=self.clock(),
+                        participant_index=index,
                     )
                     if delivered is not None and reply.after is not None:
                         reply.after()
@@ -257,6 +265,8 @@ class ApiContext:
                     errors.append(reply.error or f"@{target or 'angie'} did not answer")
             except Exception:
                 errors.append(f"@{target or 'angie'} could not finish. Check the daemon logs.")
+            if len(errors) > previous_errors:
+                store.participant_failed(turn.id, index, errors[-1])
             self.hub.notify()
         store.finish_turn(
             turn.id,

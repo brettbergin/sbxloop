@@ -66,7 +66,7 @@ from sbxloop.daemon.usage import (
     usage_rows,
 )
 from sbxloop.daemon.versions import VersionProbe
-from sbxloop.engine.harness import harness_context
+from sbxloop.engine.harness import ROLE_BY_PHASE, Role, harness_context
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunState
 from sbxloop.engine.prompts import bullet_list, render
 from sbxloop.engine.skilltools import SKILL_TOOL_NAME, answer_skill_call, skill_tool_spec
@@ -311,6 +311,7 @@ class Concierge:
         self._turn_history: str | None = None
         self._turn_persona: str | None = None
         self._turn_allow_actions = True
+        self._turn_role: Role = "concierge"
 
         self.host = host
         self.bus = bus
@@ -383,6 +384,7 @@ class Concierge:
         persona: str | None = None,
         allow_actions: bool = True,
         history: str | None = None,
+        agent_role: Role = "concierge",
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
@@ -390,6 +392,8 @@ class Concierge:
         the bridge the message came in on, so the reply is worded for it;
         ``message_id`` is the transport's id for the message, the key of a
         workload this turn starts (#760) so asking twice queues once."""
+        if agent_role not in {*ROLE_BY_PHASE.values(), "concierge"}:
+            raise ValueError("unknown chat agent role")
         with self._state_lock:
             if self._closed:
                 raise RuntimeError("concierge is closed")
@@ -405,6 +409,7 @@ class Concierge:
             self._turn_history = history
             self._turn_persona = persona
             self._turn_allow_actions = allow_actions
+            self._turn_role = agent_role
             self._turn_after = []
             try:
                 reply = self._run_turn(
@@ -424,6 +429,7 @@ class Concierge:
                 self._turn_history = None
                 self._turn_persona = None
                 self._turn_allow_actions = True
+                self._turn_role = "concierge"
             after, self._turn_after = self._turn_after, []
             return reply._replace(after=_sequence(after)) if after else reply
 
@@ -456,7 +462,8 @@ class Concierge:
     ) -> ConciergeReply:
         started = time.monotonic()
         try:
-            selection = model_for_phase(refreshed_models(self.config), "concierge")
+            phase = next((p for p, r in ROLE_BY_PHASE.items() if r == self._turn_role), "concierge")
+            selection = model_for_phase(refreshed_models(self.config), phase)
         except SbxloopError as exc:
             return self._error_reply(exc, started)
         model_key = self._session_state_key(STATE_SESSION_MODEL, session_key)
@@ -522,6 +529,8 @@ class Concierge:
             chars=len(output),
             session=new_session,
             duration_s=round(time.monotonic() - started, 1),
+            agent_role=self._turn_role,
+            model=self._turn_model.model,
         )
         clean, question = parse_choice_question(output)
         clean, pending = parse_pending_filing(clean)
@@ -544,7 +553,7 @@ class Concierge:
             self._session_state_key(STATE_SESSION_MODEL, self._turn_session_key),
             json.dumps([self.config.agent.backend, self._turn_model.model]),
         )
-        available_tools = self._tools if self._turn_allow_actions else {}
+        available_tools = self._chat_tools()
         persona = self._turn_persona or ""
         if not self._turn_allow_actions:
             persona += (
@@ -579,7 +588,9 @@ class Concierge:
             timeout_s=cfg.timeout_s,
             max_tool_calls=cfg.max_tool_calls,
             mcp_servers=(
-                self.config.mcp_specs_for("concierge") if self._turn_allow_actions else []
+                self.config.mcp_specs_for(self._turn_role)
+                if self._turn_allow_actions and self._turn_role != "critic"
+                else []
             ),
             host_tools=[t.spec for t in available_tools.values()],
             host_tool_timeout_s=min(cfg.timeout_s, 120.0),
@@ -597,7 +608,7 @@ class Concierge:
         client = self.host.client()
         result = client.submit(
             job,
-            agent=CONCIERGE_AGENT,
+            agent=CONCIERGE_AGENT if self._turn_role == "concierge" else self._turn_role,
             tool_handler=handler,
             agent_phase="concierge",
             model_source=self._turn_model.source,
@@ -770,8 +781,32 @@ class Concierge:
 
     # -- tools ---------------------------------------------------------------
 
+    def _chat_tools(self) -> dict[str, HostTool]:
+        if not self._turn_allow_actions:
+            return {}
+        if self._turn_role != "critic":
+            return self._tools
+        # Explicit allowlist: new tools cannot silently grant a reviewer write access.
+        reads = {
+            "list_runs",
+            "run_detail",
+            "run_events",
+            "item_detail",
+            "version_status",
+            "run_usage",
+            "usage_today",
+            "agent_rate_limits",
+            "daemon_log",
+            "config_keys",
+            "list_repos",
+            "github_get",
+            "pr_status",
+            "list_issues",
+        }
+        return {name: tool for name, tool in self._tools.items() if name in reads}
+
     def _tool_handler(self, call: HostToolCall, *, author: str) -> HostToolResponse:
-        tool = self._tools.get(call.name)
+        tool = self._chat_tools().get(call.name)
         if tool is None:
             return HostToolResponse(
                 call_id=call.call_id, ok=False, error=f"unknown tool {call.name!r}"

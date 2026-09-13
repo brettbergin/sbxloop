@@ -9,11 +9,13 @@ are off — a remote client reads the contract, not a page.
 from __future__ import annotations
 
 import json
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
+import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -40,6 +42,7 @@ from sbxloop.api.routes import (
 from sbxloop.config import ApiConfig
 
 _BODY_METHODS = frozenset({"POST", "PUT", "PATCH"})
+log = structlog.get_logger(__name__)
 
 #: The version the committed contract snapshot carries: the document is
 #: compared without the build's own version string.
@@ -78,15 +81,29 @@ def create_app(ctx: ApiContext) -> FastAPI:
     app.state.ctx = ctx
     max_body = int(ctx.api.max_body_bytes)
 
-    @app.middleware("http")
     async def _request_id(
         request: Request, call_next: Callable[[Request], Awaitable[Response]]
     ) -> Response:
         # A client's own id is echoed so it can correlate; otherwise one is
         # minted. Either way it rides every problem body and log line.
         given = request.headers.get("x-request-id", "").strip()
-        request.state.request_id = given[:64] if given else "req_" + uuid.uuid4().hex[:16]
-        response = await call_next(request)
+        trace_id = "req_" + uuid.uuid4().hex[:16]
+        request.state.request_id = given[:64] if given else trace_id
+        started = time.monotonic()
+        status = 500
+        try:
+            response = await call_next(request)
+            status = response.status_code
+        finally:
+            # Templates exclude user-supplied paths; never log headers, query or body.
+            log.info(
+                "api.request",
+                method=request.method,
+                route=getattr(request.scope.get("route"), "path", "unmatched"),
+                status=status,
+                trace_id=trace_id,
+                duration_ms=round((time.monotonic() - started) * 1000, 1),
+            )
         response.headers["X-Request-Id"] = request.state.request_id
         return response
 
@@ -132,6 +149,7 @@ def create_app(ctx: ApiContext) -> FastAPI:
             max_age=600,
         )
 
+    app.middleware("http")(_request_id)
     errors.install(app)
     app.include_router(health.router)
     app.include_router(meta.router)

@@ -8,6 +8,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Depends, Query, Request
 
+from sbxloop.agentmodels import model_for_phase, refreshed_models
 from sbxloop.api.agents import AGENTS, AGENTS_BY_SLUG
 from sbxloop.api.auth.deps import Authenticated, current, get_ctx, require
 from sbxloop.api.auth.store import AuthError
@@ -36,6 +37,7 @@ from sbxloop.api.collaboration_schemas import (
     LocalUserOut,
     LocalUserUpdate,
     MessageOut,
+    ParticipantOut,
     PreferenceDefinitionOut,
     PreferenceOut,
     PreferenceUpdate,
@@ -54,6 +56,8 @@ from sbxloop.api.context import PAGE_MAX, ApiContext
 from sbxloop.api.errors import Problem
 from sbxloop.api.models import TokenResponse, rfc3339
 from sbxloop.api.routes.auth import grant_tokens
+from sbxloop.config import Config
+from sbxloop.engine.harness import ROLE_BY_PHASE
 
 router = APIRouter(prefix="/v1", tags=["collaboration"])
 MENTION = re.compile(r"(?<![\w@])@([a-z0-9][a-z0-9_-]{0,63})\b", re.IGNORECASE)
@@ -212,6 +216,7 @@ def _turn_out(turn: Turn) -> TurnOut:
         input_message_id=turn.input_message_id,
         status=turn.status,
         targets=list(turn.targets),
+        participants=[ParticipantOut.model_validate(p) for p in turn.participants],
         error=turn.error,
         created_at=rfc3339(turn.created_at) or "",
         started_at=rfc3339(turn.started_at),
@@ -257,8 +262,9 @@ def _local_user(ctx: ApiContext, auth: Authenticated) -> LocalUser:
     return user
 
 
-def _agent_out(slug: str) -> AgentOut:
+def _agent_out(slug: str, config: Config) -> AgentOut:
     agent = AGENTS_BY_SLUG[slug]
+    selection = model_for_phase(config, agent.phase)
     return AgentOut(
         slug=agent.slug,
         name=agent.name,
@@ -267,6 +273,15 @@ def _agent_out(slug: str) -> AgentOut:
         category=agent.category,
         instructions=agent.instructions,
         system_prompt=agent.persona.strip(),
+        backend=config.agent.backend,
+        model=selection.model,
+        model_source=selection.source,
+        phase_models={
+            phase: model_for_phase(config, phase).model
+            for phase in (*ROLE_BY_PHASE, "concierge")
+            if ROLE_BY_PHASE.get(phase, "concierge") == agent.role
+        },
+        read_only=agent.role == "critic",
     )
 
 
@@ -363,19 +378,22 @@ async def update_local_user(
 
 @router.get("/agents", response_model=list[AgentOut])
 async def list_agents(
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
 ) -> list[AgentOut]:
-    return [_agent_out(agent.slug) for agent in AGENTS]
+    config = await ctx.call(refreshed_models, ctx.config)
+    return [_agent_out(agent.slug, config) for agent in AGENTS]
 
 
 @router.get("/agents/{slug}", response_model=AgentOut)
 async def get_agent(
     slug: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
 ) -> AgentOut:
     if slug not in AGENTS_BY_SLUG:
         raise Problem(404, "agent_not_found", "agent not found")
-    return _agent_out(slug)
+    return _agent_out(slug, await ctx.call(refreshed_models, ctx.config))
 
 
 def _validate_agents(slugs: list[str]) -> tuple[str, ...]:
@@ -940,6 +958,38 @@ async def get_turn(
     turn = await ctx.call(ctx.collaboration.get_turn, user.id, channel_id, turn_id)
     if turn is None:
         raise Problem(404, "turn_not_found", "turn not found")
+    return _turn_out(turn)
+
+
+@router.get("/channels/{channel_id}/turns", response_model=list[TurnOut])
+async def list_turns(
+    channel_id: str,
+    active_only: bool = False,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+) -> list[TurnOut]:
+    user = await ctx.call(_local_user, ctx, auth)
+    try:
+        turns = await ctx.call(
+            ctx.collaboration.list_turns, user.id, channel_id, active_only=active_only
+        )
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
+    return [_turn_out(turn) for turn in turns]
+
+
+@router.post("/channels/{channel_id}/turns/{turn_id}/cancel", response_model=TurnOut)
+async def cancel_turn(
+    channel_id: str,
+    turn_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:delegate")),  # noqa: B008
+) -> TurnOut:
+    user = await ctx.call(_local_user, ctx, auth)
+    turn = await ctx.call(ctx.collaboration.cancel_turn, user.id, channel_id, turn_id, ctx.clock())
+    if turn is None:
+        raise Problem(404, "turn_not_found", "turn not found")
+    ctx.hub.notify()
     return _turn_out(turn)
 
 

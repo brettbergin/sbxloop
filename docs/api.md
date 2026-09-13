@@ -69,7 +69,7 @@ original behavior.
 | Resource    | Routes                                           | Purpose                                                      |
 | ----------- | ------------------------------------------------ | ------------------------------------------------------------ |
 | Profile     | `GET/PATCH /v1/users/me`                         | Local identity and timezone                                  |
-| Agents      | `GET /v1/agents[/{slug}]`                        | Product-facing agent roles and personas                      |
+| Agents      | `GET /v1/agents[/{slug}]`                        | Native roles, backend, and configured models                 |
 | Teams       | `/v1/teams[/{id}]`                               | Durable named groups of agent roles                          |
 | Channels    | `/v1/channels[/{id}]`                            | Revisioned conversation containers; deletion tombstones them |
 | Messages    | `GET /v1/channels/{id}/messages`                 | Immutable, monotonically sequenced history                   |
@@ -84,6 +84,32 @@ records work intent and enables the corresponding concierge tools. Team members
 receive separate role-scoped sessions and their replies are persisted as
 separate messages. Repeating a `client_turn_id` returns the accepted turn;
 reusing it for different text, targets, intent, or message identity is rejected.
+
+Discovery lists sbxloop's five native roles: `concierge`, `planner`, `builder`,
+`critic`, and `operator`. Chat resolves their models through the existing
+configuration, using the `concierge`, `decompose`, `build`, `review`, and
+`operator_plan` phases respectively. `phase_models` also reports the remaining
+engine phases for each role. The same refreshed model settings drive dispatch.
+Legacy product role names remain addressable for existing saved teams and clients
+but are excluded from discovery.
+
+Native chat shares the concierge transport and its host-tool boundary. Actual
+code changes and workload execution use managed runs; a chat session has no
+checkout, editor, or shell. Critic chat receives only explicitly allowed read-only
+host tools and no MCP servers. The host rejects tools outside that allowlist.
+
+`GET /v1/channels/{id}/turns?active_only=true` reports active turns and per-member
+progress. `POST /v1/channels/{id}/turns/{turn}/cancel` stops queued responses.
+An in-flight member may finish and its result is preserved; remaining members
+are skipped. This does not undo effects or cancel previously dispatched runs.
+Interrupted cancellation settles durably as cancelled on restart.
+
+`GET /v1/events?latest=true&limit=200` reads the newest bounded snapshot, in
+ascending sequence order, including after retention has pruned earlier events.
+It cannot be combined with `after`; existing cursor replay and streams retain
+their behavior. HTTP requests produce structured `api.request` logs with route
+templates, status, generated trace IDs, and duration. Request bodies, query
+strings, authorization headers, and caller-provided request IDs are not logged.
 
 Turns execute in admission order through the single concierge. A team's members
 run sequentially, each receiving durable channel history and the earlier members'
