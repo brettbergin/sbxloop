@@ -85,20 +85,21 @@ class TestConfigDefault:
 
 class TestDaemonClonesOnFirstUse:
     @pytest.mark.parametrize("empty_directory", [False, True])
+    @pytest.mark.parametrize("repo", ["o/n", "group/subgroup/project"])
     def test_gitlab_bootstrap_uses_its_configured_origin(
-        self, tmp_path, monkeypatch, empty_directory
+        self, tmp_path, monkeypatch, empty_directory, repo
     ):
         loop, home = self.make_loop(tmp_path)
         loop.config = Config.model_validate(
             {
                 "home": str(home.root),
                 "vcs": {"kind": "gitlab", "api_url": "http://forge.example:8929/api/v4"},
-                "github": {"repo": "o/n"},
+                "github": {"repo": repo},
             }
         )
         calls = []
         if empty_directory:
-            (home.workspaces / "o" / "n").mkdir(parents=True)
+            (home.workspaces / repo).mkdir(parents=True)
         monkeypatch.setattr(hostgit, "find_git", lambda: "git")
 
         def clone(url, target, **kwargs):
@@ -106,8 +107,8 @@ class TestDaemonClonesOnFirstUse:
             return "a" * 40
 
         monkeypatch.setattr(hostgit, "clone_workspace", clone)
-        loop._ensure_workspace("o/n")
-        assert calls == [("http://forge.example:8929/o/n", home.workspaces / "o" / "n")]
+        loop._ensure_workspace(repo)
+        assert calls == [(f"http://forge.example:8929/{repo}", home.workspaces / repo)]
 
     def make_loop(self, tmp_path: Path, repo: str = "o/n") -> tuple[DaemonLoop, SbxloopHome]:
         home = SbxloopHome(tmp_path / "h")

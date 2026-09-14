@@ -336,7 +336,7 @@ def ensure_repository(
             "--create-repo (config: [github] create_repo = true) to have "
             "sbxloop create it"
         )
-    owner = repo.split("/", 1)[0]
+    owner = repo.rsplit("/", 1)[0]
     try:
         user = ops.authenticated_user()
     except GithubOpsError as exc:
@@ -887,7 +887,7 @@ def _bootstrap_empty_repo(ops: VcsOps, repo: str, base: str, *, run_id: str, out
     README it writes is superseded by the delivery PR whenever the
     workspace ships its own.
     """
-    readme = f"# {repo.split('/', 1)[1]}\n\nInitialized by sbxloop run {run_id}.\n"
+    readme = f"# {repo.rsplit('/', 1)[1]}\n\nInitialized by sbxloop run {run_id}.\n"
     ops.contents_put(
         repo,
         "README.md",

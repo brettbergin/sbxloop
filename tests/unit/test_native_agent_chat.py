@@ -7,7 +7,11 @@ from tests.unit.test_daemon_concierge import make
 
 def test_worker_can_request_a_peer_only_inside_an_authorized_turn(tmp_path: Path) -> None:
     requests: list[tuple[str, str]] = []
-    args = {"agent_slug": "critic", "message": "Review this plan"}
+    args = {
+        "agent_slug": "critic",
+        "message": "Review this plan",
+        "work_product": "The completed plan",
+    }
     concierge, client, _, _, _ = make(
         tmp_path,
         [

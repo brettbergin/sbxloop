@@ -125,8 +125,27 @@ class TestLayout:
         assert home.run_workspace("rabc") == home.root / "runs" / "rabc" / "workspace"
         assert home.ctl == home.root / "state" / "daemon" / "ctl"
         assert home.workspace_for("owner/name") == home.root / "workspaces" / "owner" / "name"
+        assert (
+            home.workspace_for("group/subgroup/project")
+            == home.workspaces / "group/subgroup/project"
+        )
 
-    @pytest.mark.parametrize("repo", ["", "owner", "owner/", "/name", "a/b/c", "../x", "o/.."])
+    @pytest.mark.parametrize(
+        "repo",
+        [
+            "",
+            "owner",
+            "owner/",
+            "/name",
+            "a//c",
+            "../x",
+            "o/..",
+            "a/../c",
+            "a/./c",
+            "C:/repo",
+            "a/b/",
+        ],
+    )
     def test_workspace_for_rejects_non_repos(self, tmp_path: Path, repo: str) -> None:
         with pytest.raises(ValueError):
             SbxloopHome(tmp_path).workspace_for(repo)

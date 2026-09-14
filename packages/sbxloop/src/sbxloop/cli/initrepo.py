@@ -37,7 +37,7 @@ def init_repo(config: Config, cli: SbxCLI, repo: str, *, console: Console) -> bo
     """
     from sbxloop.daemon.github import DaemonGithub
 
-    if not _valid_repo(repo):
+    if not _valid_repo(repo, config.vcs_kind_for(repo)):
         console.print(f"[bold red]not a repository:[/] {repo!r} — expected owner/name")
         return False
     entry = config.github.find_repo(repo)

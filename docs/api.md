@@ -66,17 +66,17 @@ the same short-lived access and rotating refresh tokens as the existing client
 credential flow. Existing machine clients and all existing routes keep their
 original behavior.
 
-| Resource    | Routes                                           | Purpose                                                      |
-| ----------- | ------------------------------------------------ | ------------------------------------------------------------ |
-| Profile     | `GET/PATCH /v1/users/me`                         | Local identity and timezone                                  |
-| Agents      | `GET /v1/agents[/{slug}]`                        | Native roles, backend, and configured models                 |
-| Teams       | `/v1/teams[/{id}]`                               | Durable named groups of agent roles                          |
-| Channels    | `/v1/channels[/{id}]`                            | Revisioned conversation containers; deletion tombstones them |
-| Messages    | `GET /v1/channels/{id}/messages`                 | Immutable, monotonically sequenced history                   |
-| Turns       | `POST /v1/channels/{id}/turns`, `GET .../{turn}` | Idempotent input acceptance and durable completion state     |
-| Preferences | `/v1/prompts`, `/v1/prompts/definitions`         | Prompt context saved for the local user                      |
-| Workflows   | `/v1/workflows[/{id}]`                           | Workflow metadata used by the Angie management screen        |
-| Connections | `/v1/connections`, `/v1/connections/services`    | Redacted view of operator-managed sbxloop integrations       |
+| Resource    | Routes                                                         | Purpose                                                      |
+| ----------- | -------------------------------------------------------------- | ------------------------------------------------------------ |
+| Profile     | `GET/PATCH /v1/users/me`                                       | Local identity and timezone                                  |
+| Agents      | `GET /v1/agents[/{slug}]`                                      | Native roles, backend, and configured models                 |
+| Teams       | `/v1/teams[/{id}]`                                             | Durable named groups of agent roles                          |
+| Channels    | `/v1/channels[/{id}]`                                          | Revisioned conversation containers; deletion tombstones them |
+| Messages    | `GET /v1/channels/{id}/messages`, `PUT .../{message}/reaction` | Ordered history and persistent message feedback              |
+| Turns       | `POST /v1/channels/{id}/turns`, `GET .../{turn}`               | Idempotent input acceptance and durable completion state     |
+| Preferences | `/v1/prompts`, `/v1/prompts/definitions`                       | Prompt context saved for the local user                      |
+| Workflows   | `/v1/workflows[/{id}]`                                         | Workflow metadata used by the Angie management screen        |
+| Connections | `/v1/connections`, `/v1/connections/services`                  | Redacted view of operator-managed sbxloop integrations       |
 
 An ordinary turn talks to Angie without host or MCP action tools. A known
 `@agent`, an enabled `@team`, explicit `target_slugs`, or `intent=delegate`
@@ -84,6 +84,13 @@ records work intent and enables the corresponding concierge tools. Team members
 receive separate role-scoped sessions and their replies are persisted as
 separate messages. Repeating a `client_turn_id` returns the accepted turn;
 reusing it for different text, targets, intent, or message identity is rejected.
+
+Messages include a `reactions` array. User inputs receive `⏳` when accepted,
+then `✅` after successful completion or `⚠` after failure or cancellation.
+Clients can persist user feedback on any message with
+`PUT /v1/channels/{id}/messages/{message}/reaction` and a body such as
+`{"emoji": "👍", "active": true}`. Repeating the same request is idempotent;
+set `active` to false to remove the reaction.
 
 Discovery lists sbxloop's five native roles: `concierge`, `planner`, `builder`,
 `critic`, and `operator`. Chat resolves their models through the existing

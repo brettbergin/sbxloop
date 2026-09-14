@@ -2813,7 +2813,7 @@ class LoopEngine:
         repo = sinks.repo_of(carried)
         if repo is None:
             raise sinks.PublishError("the pr sink needs one repository declared on its tasks")
-        checkout = p.pair.workspace / repo.split("/", 1)[1]
+        checkout = p.pair.workspace / repo.rsplit("/", 1)[1]
         if not (checkout / ".git").exists():
             raise sinks.PublishError(f"no checkout of {repo} in the data directory")
         gh = self.config.github
@@ -2838,7 +2838,7 @@ class LoopEngine:
         label = sinks.result_label(self.config.workload.result_label)
         try:
             ensure_label(p.ops, repo, label)
-            p.ops.issue_labels_add(repo, pr.number, [label.name])
+            p.ops.pr_labels_add(repo, pr.number, [label.name])
         except GithubOpsError:
             # The result is delivered; a label it could not carry is not a
             # reason to fail the run (the same rule as `_label_pr`).
@@ -3207,7 +3207,7 @@ class LoopEngine:
         if not labels or p.ops is None or p.repo is None:
             return
         try:
-            p.ops.issue_labels_add(p.repo, number, labels)
+            p.ops.pr_labels_add(p.repo, number, labels)
         except GithubOpsError:
             log.warning(
                 "deliver.pr_labels_failed", run=p.run_id, pr=number, labels=labels, exc_info=True
@@ -4116,6 +4116,7 @@ class LoopEngine:
                 ops,
                 repo,
                 run.head_sha,
+                number=run.pr_number,
                 cfg=self.config.landing,
                 tick=partial(self._tick, p),
                 emit=emit,
@@ -4141,7 +4142,13 @@ class LoopEngine:
                 "ci",
                 checks.summary(),
                 failed_checks=tuple(
-                    c for c in ops.checks_failed_logs(repo, run.head_sha) if c.name in checks.fix
+                    c
+                    for c in (
+                        ops.change_failed_logs(repo, run.pr_number, run.head_sha)
+                        if run.pr_number is not None
+                        else ops.checks_failed_logs(repo, run.head_sha)
+                    )
+                    if c.name in checks.fix
                 ),
                 checks=checks,
             )

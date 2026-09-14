@@ -62,6 +62,7 @@ class MessageRow(Base):
     agent_slug: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
     work_json: Mapped[str | None] = mapped_column(Text)
+    reactions_json: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'[]'"))
 
 
 class TurnRow(Base):

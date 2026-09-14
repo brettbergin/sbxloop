@@ -43,7 +43,8 @@ from typing import Any
 from urllib.parse import parse_qs, unquote
 
 from sbxloop.errors import GithubOpsError
-from sbxloop.vcs.gitlab.ops import GitlabOps
+from sbxloop.vcs.gitlab.content import blob_sha
+from sbxloop.vcs.gitlab.ops import GitlabOps, gitlab_transport
 from sbxloop.vcs.model import ChecksVerdict, FailedCheck
 
 WEB = "https://gitlab.example"
@@ -64,7 +65,13 @@ class FakeGitlab(GitlabOps):
         # Deliberately no super().__init__: there is no worker client.
         self.run_id = "fake"
         self.timeout_s = 0.0
-        self.transport = None
+        self.transport = gitlab_transport(f"{WEB}/api/v4")
+        self._request_change_support = {}
+        self.blocking_reviews = False
+        self.request_changes_ok = True
+        self.request_changes_recorded = True
+        self.graphql_errors: list[dict[str, Any]] = []
+        self.change_requesters: dict[int, list[str]] = {}
         self._projects = {}
         self._note_issue = {}
         self._bots = {}
@@ -75,6 +82,7 @@ class FakeGitlab(GitlabOps):
         self._pending: dict[tuple[str, str], Any] = {}
         self._listings: dict[tuple[str, str, str], Any] = {}
         self.repo = repo
+        self.groups: dict[str, int] = {"acme": 10}
         self.user_login = "sbxloop-bot"
         self.user_id = 2
         self.users: dict[int, dict[str, Any]] = {
@@ -95,6 +103,7 @@ class FakeGitlab(GitlabOps):
         self.missing_project = False
         self.empty_repo = False
         self.protected: dict[str, Any] | None = None
+        self.protected_rules: list[dict[str, Any]] = []
         self.protected_forbidden = False
         self.enterprise: bool | None = False
         self.approval_rules: list[dict[str, Any]] = []
@@ -109,6 +118,7 @@ class FakeGitlab(GitlabOps):
             "base123": {"id": "base123", "parent_ids": [], "message": "initial", "title": "initial"}
         }
         self._commit_count = 0
+        self.lose_commit_response = False
         self.ci_file = False
         self.issues: dict[int, dict[str, Any]] = {}
         self.notes: dict[int, list[dict[str, Any]]] = {}
@@ -361,6 +371,7 @@ class FakeGitlab(GitlabOps):
         status: str,
         *,
         allow_failure: bool = False,
+        pipeline_id: int = 1,
         description: str = "",
         target_url: str = "",
         trace: str | None = None,
@@ -376,7 +387,7 @@ class FakeGitlab(GitlabOps):
                 "allow_failure": allow_failure,
                 "description": description or None,
                 "target_url": target_url or None,
-                "pipeline_id": 1,
+                "pipeline_id": pipeline_id,
             }
         )
         if trace is not None:
@@ -418,11 +429,13 @@ class FakeGitlab(GitlabOps):
             "project_id": PROJECT_ID,
             "title": mr["title"],
             "description": mr.get("description"),
+            "labels": list(mr.get("labels", [])),
             "state": mr["state"],
             "draft": mr["title"].startswith("Draft:"),
             "source_branch": mr["source_branch"],
             "target_branch": mr["target_branch"],
             "sha": mr["sha"],
+            "head_pipeline": mr.get("head_pipeline"),
             "merge_commit_sha": mr.get("merge_commit_sha"),
             "squash_commit_sha": None,
             "author": self._user(mr.get("author_id", self.user_id)),
@@ -569,6 +582,11 @@ class FakeGitlab(GitlabOps):
         if tail == "" and method == "PUT":
             assert body is not None
             self.mr_updates.append((iid, dict(body)))
+            if "add_labels" in body:
+                labels = mr.setdefault("labels", [])
+                for label in str(body["add_labels"]).split(","):
+                    if label and label not in labels:
+                        labels.append(label)
             if "title" in body:
                 mr["title"] = str(body["title"])
             if "description" in body:
@@ -668,6 +686,10 @@ class FakeGitlab(GitlabOps):
             if body["resolved"]:
                 return {"id": discussion_id, "notes": [dict(n) for n in found["notes"]]}
             return {"id": discussion_id}
+        if tail == "/approval_state":
+            if self.enterprise is not True:
+                raise self._failed(method, path, 404, "404 Not Found")
+            return mr.get("approval_state", {"rules": []})
         if tail == "/approvals":
             return {
                 "approved": bool(mr["approvals"]),
@@ -691,6 +713,15 @@ class FakeGitlab(GitlabOps):
                     method, path, 409, "409 SHA does not match HEAD of source branch"
                 )
             self.seed_approval(iid, self.user_id)
+            self.seed_reviewer_state(iid, self.user_id, "approved")
+            self.change_requesters[iid] = [
+                name for name in self.change_requesters.get(iid, []) if name != self.user_login
+            ]
+            if (
+                not self.change_requesters[iid]
+                and mr["detailed_merge_status"] == "requested_changes"
+            ):
+                mr["detailed_merge_status"] = "mergeable"
             return {"approved": True, "user_has_approved": True}
         raise AssertionError(f"FakeGitlab: unexpected merge request call {method} {path}")
 
@@ -720,7 +751,11 @@ class FakeGitlab(GitlabOps):
             return {"name": name, "commit": {"id": sha}, "protected": False}
         if rest == "/repository/commits" and method == "POST":
             assert body is not None
-            return self._commit_with_actions(method, path, dict(body))
+            result = self._commit_with_actions(method, path, dict(body))
+            if self.lose_commit_response:
+                self.lose_commit_response = False
+                raise GithubOpsError("connection lost after GitLab accepted the commit")
+            return result
         if (match := re.fullmatch(r"/repository/commits/([^/]+)", rest)) and method == "GET":
             sha = unquote(match.group(1))
             if sha in self.commits:
@@ -740,10 +775,18 @@ class FakeGitlab(GitlabOps):
             directory = params.get("path", [""])[0]
             rows: list[dict[str, Any]] = []
             seen: set[str] = set()
-            for file_path, (mode, _) in sorted(tree.items()):
+            for file_path, (mode, raw) in sorted(tree.items()):
                 head, name = posixpath.split(file_path)
-                if head == directory:
-                    rows.append({"name": name, "type": "blob", "path": file_path, "mode": mode})
+                if head == directory or params.get("recursive") == ["true"]:
+                    rows.append(
+                        {
+                            "name": name,
+                            "type": "commit" if mode == "160000" else "blob",
+                            "path": file_path,
+                            "mode": mode,
+                            "id": blob_sha(raw),
+                        }
+                    )
                     continue
                 prefix = f"{directory}/" if directory else ""
                 if file_path.startswith(prefix) and "/" in file_path[len(prefix) :]:
@@ -953,6 +996,54 @@ class FakeGitlab(GitlabOps):
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         self.raw_calls.append((method, path, body))
         self._maybe_fail("raw")
+        if path == f"{WEB}/api/graphql" and method == "POST":
+            assert body is not None
+            if self.graphql_errors:
+                return {"errors": self.graphql_errors}
+            variables = body["variables"]
+            iid = int(variables["iid"])
+            assert variables["projectPath"] == self.repo
+            if "mutation" in body["query"]:
+                if not self.request_changes_ok:
+                    return {
+                        "data": {
+                            "mergeRequestRequestChanges": {
+                                "errors": ["Invalid permissions"],
+                                "mergeRequest": None,
+                            }
+                        }
+                    }
+                if self.request_changes_recorded:
+                    self.seed_reviewer_state(iid, self.user_id, "requested_changes")
+                    self.change_requesters.setdefault(iid, []).append(self.user_login)
+                    self.merge_requests[iid]["approvals"] = [
+                        uid for uid in self.merge_requests[iid]["approvals"] if uid != self.user_id
+                    ]
+                    if self.blocking_reviews:
+                        self.merge_requests[iid]["detailed_merge_status"] = "requested_changes"
+                return {
+                    "data": {
+                        "mergeRequestRequestChanges": {
+                            "errors": [],
+                            "mergeRequest": {"iid": str(iid)},
+                        }
+                    }
+                }
+            self._maybe_fail("change_requesters")
+            start = int(variables.get("after") or 0)
+            names = self.change_requesters.get(iid, [])
+            requesters = (
+                {
+                    "nodes": [{"username": name} for name in names[start : start + 100]],
+                    "pageInfo": {
+                        "hasNextPage": len(names) > start + 100,
+                        "endCursor": str(start + 100),
+                    },
+                }
+                if self.blocking_reviews
+                else None
+            )
+            return {"data": {"project": {"mergeRequest": {"changeRequesters": requesters}}}}
         full = path
         path, _, query = path.partition("?")
         params = parse_qs(query)
@@ -988,10 +1079,15 @@ class FakeGitlab(GitlabOps):
                 raise self._failed(method, path, 404, "404 Not Found")
             return dict(self.token_self)
         if re.fullmatch(r"/groups/[^/]+", path):
-            return {"id": 10, "full_path": unquote(path.rsplit("/", 1)[1])}
+            group = unquote(path.rsplit("/", 1)[1])
+            return {"id": self.groups[group], "full_path": group}
         if method == "POST" and path == "/projects":
             assert body is not None
-            self.repo = f"{'acme' if body.get('namespace_id') else self.user_login}/{body['path']}"
+            namespace = next(
+                (name for name, gid in self.groups.items() if gid == body.get("namespace_id")),
+                self.user_login,
+            )
+            self.repo = f"{namespace}/{body['path']}"
             return self._project_json()
         if project is None:
             raise AssertionError(f"FakeGitlab: unexpected raw call {method} {full}")
@@ -1003,16 +1099,33 @@ class FakeGitlab(GitlabOps):
         if rest == "":
             self._maybe_fail("repo_get")
             return self._project_json()
+        if rest == "/protected_branches":
+            if self.protected_forbidden:
+                raise self._failed(method, path, 403, "403 Forbidden")
+            rows = [*self.protected_rules]
+            if self.protected is not None:
+                rows.append({"name": "main", **self.protected})
+            per_page, page = (
+                int(params.get("per_page", ["20"])[0]),
+                int(params.get("page", ["1"])[0]),
+            )
+            return rows[(page - 1) * per_page : page * per_page]
         if rest == "/protected_branches/main" or re.fullmatch(r"/protected_branches/[^/]+", rest):
             if self.protected_forbidden:
                 raise self._failed(method, path, 403, "403 Forbidden")
-            if self.protected is None or unquote(rest.rsplit("/", 1)[1]) != "main":
+            if self.protected is None or unquote(rest.rsplit("/", 1)[1]) != self.protected.get(
+                "name", "main"
+            ):
                 raise self._failed(method, path, 404, "404 Not found")
             return dict(self.protected)
         if rest == "/approval_rules":
             if self.enterprise is not True:
                 raise self._failed(method, path, 404, "404 Not Found")
-            return list(self.approval_rules)
+            per_page, page = (
+                int(params.get("per_page", ["20"])[0]),
+                int(params.get("page", ["1"])[0]),
+            )
+            return self.approval_rules[(page - 1) * per_page : page * per_page]
         content = self._content_routes(method, path, rest, params, body)
         if content is not None:
             return content
@@ -1077,7 +1190,11 @@ class FakeGitlab(GitlabOps):
             return [p for p in self.pipelines if p.get("ref") == ref]
         if match := re.fullmatch(r"/repository/commits/([^/]+)/statuses", rest):
             sha = match.group(1)
-            return list(self.statuses.get(sha, []))
+            rows = self.statuses.get(sha, [])
+            pipeline = params.get("pipeline_id")
+            return [
+                row for row in rows if not pipeline or str(row.get("pipeline_id")) == pipeline[0]
+            ]
         if match := re.fullmatch(r"/statuses/([^/]+)", rest):
             assert body is not None
             self.statuses_posted.append((match.group(1), dict(body)))

@@ -334,6 +334,24 @@ class TestJobShape:
         assert "You are Angie." in job.system_message
         assert "ordinary conversation turn" in job.system_message
 
+    def test_handoff_requires_a_completed_deliverable(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(tmp_path, [{"text": "done"}])
+        concierge.submit_turn(
+            "draft a release checklist and ask the critic to review it",
+            author="owner",
+            allow_actions=True,
+            agent_role="planner",
+            handoff=lambda agent, message: f"queued @{agent}: {message}",
+        ).result(timeout=10)
+        (job,) = client.jobs
+        assert job.system_message is not None
+        assert "Complete your assigned work before handing it off" in job.system_message
+        assert "does not replace your deliverable" in job.system_message
+        handoff = next(tool for tool in job.host_tools if tool.name == "handoff_agent")
+        assert "work you complete in this response" in handoff.description
+        assert "exact completed artifact" in handoff.description
+        assert handoff.parameters["required"] == ["agent_slug", "message", "work_product"]
+
     def test_github_tool_present_when_repo_configured(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(tmp_path, [{}], github=FakeGithub())
         turn(concierge)

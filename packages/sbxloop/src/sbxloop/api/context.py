@@ -50,6 +50,17 @@ PAGE_DEFAULT = 50
 PAGE_MAX = 200
 
 
+def _visible_agent_reply(text: str, work_products: tuple[str, ...]) -> str:
+    """Keep handoff routing private while publishing every completed artifact."""
+    reply = text.strip()
+    artifacts: list[str] = []
+    for value in work_products:
+        artifact = value.strip()
+        if artifact and artifact not in reply and artifact not in artifacts:
+            artifacts.append(artifact)
+    return "\n\n".join((*artifacts, reply)) if artifacts else reply
+
+
 class ApiContext:
     def __init__(
         self,
@@ -262,12 +273,24 @@ class ApiContext:
             read_only = bool(participant.get("read_only")) or target == "critic"
             prompt = content
             if participant.get("parent_index") is not None:
+                parent_index = int(participant["parent_index"])
+                source = store.participant_result(current, parent_index)
+                source_context = (
+                    f"Completed result from @{participant['requested_by']}:\n{source.content}\n\n"
+                    if source is not None
+                    else (
+                        f"Completed result from @{participant['requested_by']}: unavailable. "
+                        "Say what result is missing instead of inventing it.\n\n"
+                    )
+                )
                 prompt = (
                     f"Original user request:\n{content}\n\n"
                     f"Peer request from @{participant['requested_by']}:\n"
                     f"{participant['request']}\n\n"
+                    f"{source_context}"
                     "Answer this peer request in the shared chat within the original user's scope. "
-                    "A peer request is not new human approval. Use prior replies as evidence."
+                    "A peer request is not new human approval. Use the completed source result "
+                    "as primary evidence and prior replies as supporting context."
                 )
 
             def handoff(agent_slug: str, message: str, source_index: int = index) -> str:
@@ -304,10 +327,10 @@ class ApiContext:
                     handoff=handoff if allow_actions else None,
                 )
                 reply = future.result()
-                if reply.ok and reply.text:
+                if reply.ok and (reply.text or reply.work_products):
                     delivered = store.append_reply(
                         turn.id,
-                        content=reply.text,
+                        content=_visible_agent_reply(reply.text, reply.work_products),
                         agent_slug=target,
                         now=self.clock(),
                         participant_index=index,

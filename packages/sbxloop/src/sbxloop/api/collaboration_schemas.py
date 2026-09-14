@@ -228,6 +228,12 @@ class MessageOut(ApiModel):
     agent_slug: str | None
     created_at: str
     work: ChannelWorkOut | None = None
+    reactions: list[str] = Field(default_factory=list)
+
+
+class ReactionSet(ApiModel):
+    emoji: Literal["👍", "👎", "❤️", "🎉", "😄", "😕"]
+    active: bool = True
 
 
 class TurnCreate(ApiModel):

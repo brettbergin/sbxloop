@@ -28,6 +28,33 @@ def cfg(**doc: object) -> Config:
 
 
 class TestKind:
+    @pytest.mark.parametrize("legacy", [False, True])
+    def test_gitlab_subgroups_survive_selection_and_round_trip(self, legacy: bool) -> None:
+        repo = "acme/platform/tools/widgets"
+        github = {"repo": repo} if legacy else {"repos": [{"repo": repo}]}
+        config = cfg(vcs={"kind": "gitlab"}, github=github)
+        entry = config.github.find_repo("widgets")
+        assert entry is not None and (entry.owner, entry.name) == ("acme/platform/tools", "widgets")
+        assert config.github.find_repo(repo) == entry
+        assert Config.model_validate(config.model_dump()).vcs_kind_for(repo) == "gitlab"
+        assert config.github.for_repo(repo).repo == repo
+
+    def test_subgroups_use_the_effective_forge_and_reject_invalid_components(self) -> None:
+        config = cfg(github={"repos": [{"repo": "acme/team/widgets", "kind": "gitlab"}]})
+        assert config.vcs_kind_for("widgets") == "gitlab"
+        for kind in ("github", "gitea"):
+            with pytest.raises(ValueError, match="owner/name"):
+                cfg(vcs={"kind": kind}, github={"repo": "acme/team/widgets"})
+        for repo in (
+            "acme//widgets",
+            "acme/../widgets",
+            "acme/./widgets",
+            "/acme/widgets",
+            "acme/widgets/",
+        ):
+            with pytest.raises(ValueError):
+                cfg(vcs={"kind": "gitlab"}, github={"repo": repo})
+
     def test_github_is_the_default(self) -> None:
         assert cfg().vcs.kind == "github"
         assert cfg().vcs_kind_for() == "github"

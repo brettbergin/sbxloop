@@ -177,6 +177,10 @@ class ConciergeReply(NamedTuple):
     #: it — a restart the daemon would otherwise begin under its own
     #: answer (#969). The bridge runs it once the reply is posted.
     after: Callable[[], None] | None = None
+    #: Completed artifacts supplied to ``handoff_agent`` during this turn.
+    #: Product clients publish these with the agent's prose so a peer handoff
+    #: can never hide the work that the peer was asked to inspect.
+    work_products: tuple[str, ...] = ()
 
 
 class SessionHost(Protocol):
@@ -315,6 +319,7 @@ class Concierge:
         self._turn_role: Role = "concierge"
         self._turn_read_only = False
         self._turn_handoff: Callable[[str, str], str] | None = None
+        self._turn_work_products: list[str] = []
 
         self.host = host
         self.bus = bus
@@ -417,6 +422,8 @@ class Concierge:
             self._turn_role = agent_role
             self._turn_read_only = read_only
             self._turn_handoff = handoff
+            turn_work_products: list[str] = []
+            self._turn_work_products = turn_work_products
             self._turn_after = []
             try:
                 reply = self._run_turn(
@@ -439,8 +446,14 @@ class Concierge:
                 self._turn_role = "concierge"
                 self._turn_read_only = False
                 self._turn_handoff = None
+                self._turn_work_products = []
             after, self._turn_after = self._turn_after, []
-            return reply._replace(after=_sequence(after)) if after else reply
+            updates: dict[str, Any] = {}
+            if after:
+                updates["after"] = _sequence(after)
+            if turn_work_products:
+                updates["work_products"] = tuple(dict.fromkeys(turn_work_products))
+            return reply._replace(**updates) if updates else reply
 
         return self._executor.submit(run)
 
@@ -571,7 +584,12 @@ class Concierge:
                 "\n\nUse handoff_agent to ask a native peer for help when needed. "
                 "An @mention in prose does not invoke an agent. Handoffs are asynchronous: "
                 "the peer runs after this response and answers in the shared chat. "
-                "Finish your response after queuing; do not poll or invent the peer's reply. "
+                "Complete your assigned work before handing it off, and put the concrete result "
+                "in your final response so the peer can inspect it. A handoff asks a peer to "
+                "review or extend completed work; it does not replace your deliverable. Never "
+                "answer only with coordination status such as 'queued' or 'nothing to do until'. "
+                "After queuing, finish your response without polling or inventing the "
+                "peer's reply. "
                 "You may ping the sender back if they need to synthesize the result. "
                 "Stay within the user's request. Each response can ask two peers, with at "
                 "most six handoffs and three levels per user turn. Read-only access is inherited."
@@ -830,12 +848,18 @@ class Concierge:
             else dict(self._tools)
         )
         if self._turn_handoff is not None:
+            required = ["agent_slug", "message"]
+            if self._turn_role != "concierge":
+                required.append("work_product")
             available["handoff_agent"] = HostTool(
                 HostToolSpec(
                     name="handoff_agent",
                     description=(
-                        "Ask a native agent for help in this chat. "
-                        "Queues a peer response after yours; does not wait for it."
+                        "Ask a native agent to review or extend work you complete in this "
+                        "response. "
+                        "work_product is the exact completed artifact that will be shown in your "
+                        "response and given to the peer. message is only the peer's brief task. "
+                        "Queues a peer response after yours; does not wait."
                     ),
                     parameters=_schema(
                         {
@@ -843,9 +867,25 @@ class Concierge:
                                 "type": "string",
                                 "enum": ["concierge", "planner", "builder", "critic", "operator"],
                             },
-                            "message": {"type": "string", "minLength": 1, "maxLength": 4000},
+                            "message": {
+                                "type": "string",
+                                "description": (
+                                    "Brief instruction describing what the peer should do."
+                                ),
+                                "minLength": 1,
+                                "maxLength": 4000,
+                            },
+                            "work_product": {
+                                "type": "string",
+                                "description": (
+                                    "Your completed artifact or analysis for the user and peer. "
+                                    "Do not put routing or queued-status prose here."
+                                ),
+                                "minLength": 1,
+                                "maxLength": 4000,
+                            },
                         },
-                        ["agent_slug", "message"],
+                        required,
                     ),
                 ),
                 self._tool_handoff,
@@ -858,7 +898,19 @@ class Concierge:
         agent, message = args.get("agent_slug"), args.get("message")
         if not isinstance(agent, str) or not isinstance(message, str):
             raise ToolRejectedError("An agent slug and message are required.")
-        return self._turn_handoff(agent, message)
+        supplied_work_product = args.get("work_product")
+        if supplied_work_product is None and self._turn_role != "concierge":
+            raise ToolRejectedError("A completed work product is required.")
+        if supplied_work_product is not None and (
+            not isinstance(supplied_work_product, str) or not supplied_work_product.strip()
+        ):
+            raise ToolRejectedError("A completed work product is required.")
+        if isinstance(supplied_work_product, str) and len(supplied_work_product.strip()) > 4000:
+            raise ToolRejectedError("Keep the completed work product to 4000 characters.")
+        result = self._turn_handoff(agent, message)
+        if isinstance(supplied_work_product, str):
+            self._turn_work_products.append(supplied_work_product.strip())
+        return result
 
     def _tool_handler(self, call: HostToolCall, *, author: str) -> HostToolResponse:
         tool = self._chat_tools().get(call.name)

@@ -2280,6 +2280,9 @@ existing checkouts, not clone destinations. Keep
 Clone URLs preserve the configured scheme, port and installation prefix.
 For example, a GitLab API root of `http://forge.example:8929/gitlab/api/v4`
 resolves `group/project` to `http://forge.example:8929/gitlab/group/project`.
+GitLab subgroup paths such as `group/subgroup/project` stay intact in both
+clone URLs and managed workspace paths. Workload checkouts use the final
+project name inside the data directory.
 GitHub Enterprise uses `/api/v3` and Gitea URL mapping uses `/api/v1`;
 Gitea's run backend remains unimplemented. An unrecognized API path fails
 with a configuration error instead of guessing a clone destination.

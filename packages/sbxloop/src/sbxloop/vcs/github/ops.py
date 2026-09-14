@@ -648,6 +648,15 @@ class GithubOps:
             raise GithubOpsError(f"pr_get returned a malformed result: {data!r}")
         return data
 
+    def change_checks(self, repo: str, number: int, sha: str) -> ChecksVerdict:
+        """GitHub attaches a change's checks to its source head."""
+        return self.pr_checks(repo, sha)
+
+    def change_failed_logs(
+        self, repo: str, number: int, sha: str, *, max_chars: int = 6000
+    ) -> list[FailedCheck]:
+        return self.checks_failed_logs(repo, sha, max_chars=max_chars)
+
     def pr_checks(self, repo: str, sha: str) -> ChecksVerdict:
         """Every check run AND commit status on ``sha``, folded to one
         verdict (#610). "No CI" means both lists empty — a repository
@@ -1571,6 +1580,10 @@ class GithubOps:
         """Put ``labels`` on the issue or pull request (existing ones stay)."""
         self.raw("POST", f"/repos/{repo}/issues/{number}/labels", {"labels": list(labels)})
 
+    def pr_labels_add(self, repo: str, number: int, labels: Sequence[str]) -> None:
+        """GitHub shares the labels endpoint between issues and pull requests."""
+        self.issue_labels_add(repo, number, labels)
+
     def issue_label_remove(self, repo: str, number: int | str, label: str) -> None:
         """Take ``label`` off the issue; one that is not there is a success,
         not a failed job (#558)."""
@@ -1712,6 +1725,11 @@ class GithubOps:
         data = self.raw("GET", f"/repos/{repo}/actions/runs?branch={branch}&per_page={per_page}")
         runs = data.get("workflow_runs") if isinstance(data, dict) else None
         return self._list(f"GET /repos/{repo}/actions/runs", runs)
+
+    def change_requirements(
+        self, repo: str, number: int, requirements: BaseRequirements
+    ) -> BaseRequirements:
+        return requirements
 
     def base_requirements(self, repo: str, base: str) -> BaseRequirements:
         """What ``base`` requires before a merge, read from classic

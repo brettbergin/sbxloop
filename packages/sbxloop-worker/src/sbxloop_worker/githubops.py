@@ -22,14 +22,17 @@ from __future__ import annotations
 import base64
 import json
 import os
+import random
 import re
 import shutil
 import subprocess
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
-from http.client import HTTPMessage
+from email.utils import parsedate_to_datetime
+from http.client import HTTPException, HTTPMessage
 from typing import IO, Any, Protocol
 
 from sbxloop_worker.protocol import TransportSpec
@@ -248,6 +251,57 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _REDIRECT_CODES = frozenset({301, 302, 303, 307, 308})
 
 
+def _retry_after(headers: Any) -> float:
+    value = headers.get("Retry-After") if headers is not None else None
+    if not value:
+        return 0.0
+    try:
+        return max(0.0, float(value))
+    except (ValueError, TypeError):
+        try:
+            return max(0.0, parsedate_to_datetime(str(value)).timestamp() - time.time())
+        except (ValueError, TypeError, OverflowError):
+            return 0.0
+
+
+def _read_response(
+    request: urllib.request.Request,
+    open_request: Callable[..., Any],
+    *,
+    timeout: float,
+    headers_only: bool = False,
+) -> tuple[bytes, dict[str, str]]:
+    """At most three safe reads, within the original request's time budget."""
+    deadline = time.monotonic() + timeout
+    safe = request.get_method() in ("GET", "HEAD")
+    for attempt in range(3):
+        retry_after = 0.0
+        try:
+            remaining = max(0.001, deadline - time.monotonic())
+            with open_request(request, timeout=remaining) as response:
+                raw = b"" if headers_only else response.read()
+                headers = getattr(response, "headers", None)
+                return raw, {
+                    name.lower(): value for name, value in headers.items()
+                } if headers is not None else {}
+        except urllib.error.HTTPError as exc:
+            if not safe or exc.code not in (408, 429, 500, 502, 503, 504) or attempt == 2:
+                raise
+            retry_after = _retry_after(exc.headers)
+            delay = max(retry_after, (2**attempt) + random.uniform(0, 0.25))  # nosec B311 - retry jitter
+            if delay >= deadline - time.monotonic():
+                raise
+            exc.close()
+        except (urllib.error.URLError, TimeoutError, ConnectionError, HTTPException) as exc:
+            delay = (2**attempt) + random.uniform(0, 0.25)  # nosec B311 - retry jitter
+            if not safe or attempt == 2 or delay >= deadline - time.monotonic():
+                if isinstance(exc, urllib.error.URLError):
+                    raise
+                raise urllib.error.URLError(str(exc)) from exc
+        time.sleep(delay)
+    raise AssertionError("unreachable retry state")
+
+
 class RestTransport:
     """Pure-stdlib REST client for whatever forge ``spec`` describes,
     using the token the sandbox holds under the variable the spec names."""
@@ -318,16 +372,8 @@ class RestTransport:
             headers={**self._headers(), **({"Content-Type": "application/json"} if data else {})},
         )
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310 - HTTP/HTTPS enforced above
-                raw = response.read().decode()
-                # A response always carries headers; a test's bare stream
-                # may not, and a pager that needs them asks for a style.
-                message = getattr(response, "headers", None)
-                headers = (
-                    {name.lower(): value for name, value in message.items()}
-                    if message is not None
-                    else {}
-                )
+            content, headers = _read_response(request, urllib.request.urlopen, timeout=60)
+            raw = content.decode()
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")[:2000]
             raise GithubOpError(
@@ -344,8 +390,10 @@ class RestTransport:
         url = self._url(path)
         request = urllib.request.Request(url, method=method, headers=self._headers())
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:  # nosec B310 - HTTP/HTTPS enforced above
-                return {name.lower(): value for name, value in response.headers.items()}
+            _, headers = _read_response(
+                request, urllib.request.urlopen, timeout=60, headers_only=True
+            )
+            return headers
         except urllib.error.HTTPError as exc:
             detail = exc.read().decode(errors="replace")[:2000]
             raise GithubOpError(
@@ -384,8 +432,8 @@ class RestTransport:
         """
         method, url = request.get_method(), request.full_url
         try:
-            with opener.open(request, timeout=120) as response:  # nosec B310 - HTTP/HTTPS enforced by caller
-                return response.read().decode("utf-8", errors="replace"), None
+            raw, _ = _read_response(request, opener.open, timeout=120)
+            return raw.decode("utf-8", errors="replace"), None
         except urllib.error.HTTPError as exc:
             if exc.code in _REDIRECT_CODES:
                 location = exc.headers.get("Location")

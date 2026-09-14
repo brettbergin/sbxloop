@@ -203,3 +203,35 @@ def test_configured_tool_repository_url_resolves_to_its_authenticated_clone():
     assert resolve_targets(config, url="https://forge.example/gitlab/owner/project.git") == [
         "owner/project"
     ]
+
+
+def test_nested_gitlab_project_has_a_managed_workspace_and_preserves_its_url(tmp_path, monkeypatch):
+    repo = "group/subgroup/project"
+    config = Config.model_validate(
+        {
+            "home": str(tmp_path / "home"),
+            "vcs": {"kind": "gitlab", "api_url": "http://forge.example:8929/api/v4"},
+            "github": {"repos": [{"repo": repo}]},
+        }
+    )
+    assert (
+        config.default_workspace_for_repo(repo)
+        == config.paths.workspaces / "group/subgroup/project"
+    )
+    calls = []
+
+    def clone(url, target, branch, **kwargs):
+        calls.append((url, target))
+        return "a" * 40
+
+    monkeypatch.setattr(hostgit, "find_git", lambda: "git")
+    monkeypatch.setattr(hostgit, "clone_from_remote", clone)
+    provisioner = Provisioner(SbxCLI(), config, env={"GITLAB_TOKEN": "selected"})
+    path = provisioner.clone_repo_into_data_dir("r1", tmp_path, repo)
+    assert path == tmp_path / "project"
+    assert calls == [("http://forge.example:8929/group/subgroup/project", path)]
+
+
+def test_clone_url_does_not_accept_gitlab_namespaces_for_github():
+    with pytest.raises(ConfigError, match="invalid repository"):
+        Config().clone_url_for_repo("group/subgroup/project")

@@ -2170,6 +2170,13 @@
             "title": "Kind",
             "type": "string"
           },
+          "reactions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Reactions",
+            "type": "array"
+          },
           "role": {
             "enum": [
               "user",
@@ -3130,6 +3137,33 @@
           "observed_at"
         ],
         "title": "QueuePage",
+        "type": "object"
+      },
+      "ReactionSet": {
+        "additionalProperties": false,
+        "properties": {
+          "active": {
+            "default": true,
+            "title": "Active",
+            "type": "boolean"
+          },
+          "emoji": {
+            "enum": [
+              "\ud83d\udc4d",
+              "\ud83d\udc4e",
+              "\u2764\ufe0f",
+              "\ud83c\udf89",
+              "\ud83d\ude04",
+              "\ud83d\ude15"
+            ],
+            "title": "Emoji",
+            "type": "string"
+          }
+        },
+        "required": [
+          "emoji"
+        ],
+        "title": "ReactionSet",
         "type": "object"
       },
       "Readiness": {
@@ -6134,6 +6168,67 @@
           }
         },
         "summary": "List Messages",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/messages/{message_id}/reaction": {
+      "put": {
+        "operationId": "set_message_reaction_v1_channels__channel_id__messages__message_id__reaction_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "message_id",
+            "required": true,
+            "schema": {
+              "title": "Message Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ReactionSet"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Message Reaction",
         "tags": [
           "collaboration"
         ]

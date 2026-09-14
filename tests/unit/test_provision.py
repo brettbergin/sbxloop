@@ -747,10 +747,13 @@ class TestWorkspaceIsolation:
         with pytest.raises(ProvisionError, match="not a git repository"):
             provisioner.ensure_pair("r1")
 
-    def test_clone_mode_without_workspace_errors(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
-        provisioner, _events = make_isolation_provisioner(
-            fake_sbx, tmp_path, None, isolation="clone"
+    def test_clone_mode_without_workspace_or_repository_errors(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        config = Config.model_validate(
+            {"home": str(tmp_path / "state"), "sandbox": {"workspace_isolation": "clone"}}
         )
+        provisioner = make_provisioner(fake_sbx, tmp_path, config=config)
         with pytest.raises(ProvisionError, match="requires \\[sandbox\\] workspace"):
             provisioner.ensure_pair("r1")
 
