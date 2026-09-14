@@ -74,8 +74,9 @@ class FakeClient:
         script = self.scripts.pop(0)
         if "raise" in script:
             raise script["raise"]
-        assert tool_handler is not None
+        assert bool(job.host_tools) == (tool_handler is not None)
         for i, (name, args) in enumerate(script.get("calls", [])):
+            assert tool_handler is not None
             response = tool_handler(HostToolCall(call_id=f"c{i}", name=name, arguments=args))
             self.responses.append(response)
         if "error" in script:
@@ -240,8 +241,11 @@ def turn(
     text: str = "hello",
     author: str = "Discord user `brett`",
     author_id: str | None = None,
+    on_code_work: Callable[[str, int, str], None] | None = None,
 ) -> ConciergeReply:
-    return concierge.submit_turn(text, author=author, author_id=author_id).result(timeout=10)
+    return concierge.submit_turn(
+        text, author=author, author_id=author_id, on_code_work=on_code_work
+    ).result(timeout=10)
 
 
 class TestJobShape:
@@ -320,13 +324,14 @@ class TestJobShape:
 
     def test_conversation_turn_has_persona_but_no_action_tools(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(tmp_path, [{"session_id": "conversation"}])
-        concierge.submit_turn(
+        reply = concierge.submit_turn(
             "hello",
             author="owner",
             session_key="channel-a:angie",
             persona="\nYou are Angie.",
             allow_actions=False,
         ).result(timeout=10)
+        assert reply.ok
         (job,) = client.jobs
         assert job.host_tools == []
         assert job.mcp_servers == []
@@ -1336,6 +1341,7 @@ class TestTools:
         assert "no queued open issues in" in listing.text
 
     def test_create_issue_files_and_queues_in_one_hop(self, tmp_path: Path) -> None:
+        origins: list[tuple[str, int, str]] = []
         github = FakeGithub()
         concierge, client, _, _, dstore = make(
             tmp_path,
@@ -1354,7 +1360,14 @@ class TestTools:
             ],
             github=github,
         )
-        turn(concierge, "add retries to fetch", author="Discord user `ana`", author_id="777")
+        turn(
+            concierge,
+            "add retries to fetch",
+            author="Discord user `ana`",
+            author_id="777",
+            on_code_work=lambda repo, number, title: origins.append((repo, number, title)),
+        )
+        assert origins == [("owner/repo", 41, "Add retries to fetch")]
         created, bad = client.responses
         assert created.ok and created.text.startswith(
             "created and queued issue #41 https://gh/i/41"
@@ -1374,12 +1387,19 @@ class TestTools:
         )
         assert dstore.get("gh:issue:41").requested_by == "777"  # type: ignore[union-attr]
         # An issue that already exists is queued with label_issue_for_run.
-        turn(concierge, "run #12 too", author="Discord user `ana`")
+        turn(
+            concierge,
+            "run #12 too",
+            author="Discord user `ana`",
+            on_code_work=lambda repo, number, title: origins.append((repo, number, title)),
+        )
+        assert origins[-1] == ("owner/repo", 12, "Issue #12")
         (labelled,) = client.responses[2:]
         assert labelled.ok and labelled.text.startswith("added `sbxloop:run` to #12")
         assert github.paths[-1] == "/repos/owner/repo/issues/12/labels"
 
     def test_create_issue_can_file_without_queueing(self, tmp_path: Path) -> None:
+        origins: list[tuple[str, int, str]] = []
         github = FakeGithub()
         concierge, client, _, _, dstore = make(
             tmp_path,
@@ -1395,7 +1415,14 @@ class TestTools:
             ],
             github=github,
         )
-        turn(concierge, "note this for the backlog", author="Discord user `ana`", author_id="777")
+        turn(
+            concierge,
+            "note this for the backlog",
+            author="Discord user `ana`",
+            author_id="777",
+            on_code_work=lambda repo, number, title: origins.append((repo, number, title)),
+        )
+        assert origins == []
         (filed,) = client.responses
         assert filed.ok and filed.text.startswith("filed issue #41 https://gh/i/41")
         assert "NOT queued" in filed.text and "label_issue_for_run" in filed.text
@@ -1853,6 +1880,38 @@ class TestTools:
             "x", author="a", on_tool=lambda name, args, resp: seen.append((name, args, resp.ok))
         ).result(timeout=10)
         assert seen == [("sbx_control", {"command": "queue"}, True), ("teleport", {}, False)]
+
+    def test_tool_activity_brackets_execution_without_arguments(self, tmp_path: Path) -> None:
+        concierge, *_ = make(tmp_path, [{"calls": [("sbx_control", {"command": "queue"})]}])
+        activity: list[tuple[str, str, bool | None]] = []
+        concierge.submit_turn(
+            "show queue",
+            author="owner",
+            on_tool_activity=lambda name, phase, ok: activity.append((name, phase, ok)),
+            on_tool=lambda *_: activity.append(("response", "delivered", True)),
+        ).result(timeout=10)
+        assert activity == [
+            ("sbx_control", "started", None),
+            ("sbx_control", "completed", True),
+            ("response", "delivered", True),
+        ]
+
+    def test_activity_observer_cannot_break_tools_or_leak_to_next_turn(
+        self, tmp_path: Path
+    ) -> None:
+        concierge, *_ = make(
+            tmp_path, [{"calls": [("sbx_control", {"command": "queue"})]}, {"text": "hello"}]
+        )
+
+        def broken(*_args: Any) -> None:
+            raise RuntimeError("observer offline")
+
+        assert (
+            concierge.submit_turn("queue", author="a", on_tool_activity=broken)
+            .result(timeout=10)
+            .ok
+        )
+        assert concierge.submit_turn("hello", author="a", allow_actions=False).result(timeout=10).ok
 
     def test_run_events_renders_old_and_new_shape_tool_events(self, tmp_path: Path) -> None:
         """`output_lines`/`duration_ms`/`tool_call_id` are additive: a stored

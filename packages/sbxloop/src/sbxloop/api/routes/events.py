@@ -180,7 +180,8 @@ async def stream_events(
     return StreamingResponse(
         body(),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        # Compressing proxies otherwise buffer small frames and idle pings.
+        headers={"Cache-Control": "no-cache, no-transform", "X-Accel-Buffering": "no"},
     )
 
 

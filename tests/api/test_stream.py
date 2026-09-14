@@ -172,6 +172,7 @@ class TestTransport:
                 with httpx.stream("GET", url, headers={**headers, **extra}, timeout=10) as r:
                     assert r.status_code == 200
                     assert r.headers["content-type"].startswith("text/event-stream")
+                    assert "no-transform" in r.headers["cache-control"]
                     got = 0
                     for line in r.iter_lines():
                         yield line

@@ -235,7 +235,7 @@ def test_tombstone_cancels_queued_work_and_drops_late_reply(api: Any) -> None:
         assert cancelled is not None and cancelled.status == "cancelled"
         assert cancelled.error == "The channel was deleted before this turn finished."
         assert input_message is not None
-        assert input_message.reactions_json == '["⏳", "⚠"]'
+        assert input_message.reactions_json == '["⚠"]'
     assert api.client.get("/v1/channels", headers=headers).json()["items"] == []
 
 
@@ -266,7 +266,7 @@ def test_tombstone_settles_a_turn_when_a_late_reply_arrives(api: Any) -> None:
         input_message = session.get(MessageRow, turn.input_message_id)
         assert cancelled is not None and cancelled.status == "cancelled"
         assert input_message is not None
-        assert input_message.reactions_json == '["⏳", "⚠"]'
+        assert input_message.reactions_json == '["⚠"]'
 
 
 def test_deleting_channel_stops_remaining_team_members(api: Any) -> None:

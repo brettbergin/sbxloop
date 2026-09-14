@@ -160,7 +160,7 @@ def test_chat_messages_carry_turn_status_and_user_feedback_reactions(api: Any) -
         time.sleep(0.01)
     assert turn["status"] == "completed"
     messages = api.client.get(f"/v1/channels/{channel_id}/messages", headers=headers).json()
-    assert messages[0]["reactions"] == ["⏳", "✅"]
+    assert messages[0]["reactions"] == ["✅"]
 
     reply = messages[1]
     route = f"/v1/channels/{channel_id}/messages/{reply['id']}/reaction"
@@ -201,7 +201,7 @@ def test_failed_and_cancelled_turns_receive_warning_reactions(api: Any) -> None:
         time.sleep(0.01)
     assert turn["status"] == "failed"
     messages = api.client.get(f"/v1/channels/{channel_id}/messages", headers=headers).json()
-    assert messages[0]["reactions"] == ["⏳", "⚠"]
+    assert messages[0]["reactions"] == ["⚠"]
 
     user = api.ctx.collaboration.user_by_username("owner")
     assert user is not None
@@ -221,7 +221,7 @@ def test_failed_and_cancelled_turns_receive_warning_reactions(api: Any) -> None:
     cancelled_input = next(
         message for message in messages if message["id"] == cancelled.input_message_id
     )
-    assert cancelled_input["reactions"] == ["⏳", "⚠"]
+    assert cancelled_input["reactions"] == ["⚠"]
 
 
 def test_ordinary_conversation_cannot_use_action_tools(api: Any) -> None:

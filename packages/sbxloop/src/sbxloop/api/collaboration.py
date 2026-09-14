@@ -477,7 +477,11 @@ class CollaborationStore:
         turn.participants_json = json.dumps(progress)
         input_message = session.get(MessageRow, turn.input_message_id)
         if input_message is not None:
-            reactions = [str(value) for value in json.loads(input_message.reactions_json or "[]")]
+            reactions = [
+                str(value)
+                for value in json.loads(input_message.reactions_json or "[]")
+                if value != "⏳"
+            ]
             if "⚠" not in reactions:
                 reactions.append("⚠")
             input_message.reactions_json = json.dumps(reactions, ensure_ascii=False)
@@ -812,7 +816,9 @@ class CollaborationStore:
             input_message = session.get(MessageRow, row.input_message_id)
             if input_message is not None:
                 reactions = [
-                    str(value) for value in json.loads(input_message.reactions_json or "[]")
+                    str(value)
+                    for value in json.loads(input_message.reactions_json or "[]")
+                    if value != "⏳"
                 ]
                 outcome = "⚠" if error else "✅"
                 if outcome not in reactions:
@@ -1024,9 +1030,72 @@ class CollaborationStore:
                 session,
                 "collaboration.participant.running",
                 now,
-                data={"channel_id": row.channel_id, "turn_id": turn_id, "index": index},
+                data={
+                    "channel_id": row.channel_id,
+                    "turn_id": turn_id,
+                    "index": index,
+                    "agent_slug": progress[index]["agent_slug"],
+                },
             )
             return True
+
+    def link_code_work(
+        self, turn_id: str, index: int, repo: str, number: int, title: str, now: float
+    ) -> None:
+        """Keep successful issue dispatch identity with its originating participant."""
+        with self.dstore.immediate_transaction() as session:
+            row = session.get(TurnRow, turn_id)
+            if row is None or row.status not in {"running", "cancelling"}:
+                return
+            channel = session.get(ChannelRow, row.channel_id)
+            if channel is None or channel.state != "active":
+                return
+            progress = json.loads(row.participants_json)
+            if not 0 <= index < len(progress):
+                return
+            refs = progress[index].setdefault("code_work", [])
+            if any(ref["repo"] == repo and ref["source_key"] == str(number) for ref in refs):
+                return
+            refs.append({"repo": repo, "source_key": str(number), "title": title})
+            row.participants_json = json.dumps(progress)
+            _event(
+                session,
+                "collaboration.work.linked",
+                now,
+                data={
+                    "channel_id": row.channel_id,
+                    "turn_id": turn_id,
+                    "index": index,
+                    "kind": "code",
+                },
+            )
+
+    def record_tool_activity(
+        self, turn_id: str, index: int, tool: str, phase: str, ok: bool | None, now: float
+    ) -> None:
+        """Publish tool lifecycle only, never tool arguments, output, or credentials."""
+        if phase not in {"started", "completed"}:
+            return
+        with self.dstore.immediate_transaction() as session:
+            row = session.get(TurnRow, turn_id)
+            if row is None or row.status not in {"running", "cancelling"}:
+                return
+            progress = json.loads(row.participants_json)
+            if not 0 <= index < len(progress) or progress[index]["status"] != "running":
+                return
+            _event(
+                session,
+                f"collaboration.tool.{phase}",
+                now,
+                data={
+                    "channel_id": row.channel_id,
+                    "turn_id": turn_id,
+                    "index": index,
+                    "agent_slug": progress[index]["agent_slug"],
+                    "tool": tool,
+                    "ok": ok,
+                },
+            )
 
     def participant_failed(self, turn_id: str, index: int, error: str) -> None:
         with self.dstore.immediate_transaction() as session:

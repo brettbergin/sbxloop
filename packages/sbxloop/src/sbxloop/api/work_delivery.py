@@ -24,6 +24,8 @@ class WorkLink:
     input_message_id: str
     targets: tuple[str, ...]
     participants: tuple[dict[str, Any], ...]
+    code_title: str | None = None
+    code_agent: str | None = None
 
 
 def _links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
@@ -70,6 +72,8 @@ def _links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
 
 
 def _agent(link: WorkLink) -> str | None:
+    if link.code_title is not None:
+        return link.code_agent
     suffix = link.source_key[len(link.input_message_id) :]
     index = 0
     if suffix.startswith(":"):
@@ -82,7 +86,56 @@ def _agent(link: WorkLink) -> str | None:
     return link.targets[index] if index < len(link.targets) else None
 
 
+def _code_links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
+    """Join exact repository/issue identities; never infer links from agent prose."""
+    conditions = [
+        TurnRow.channel_id == ChannelRow.id,
+        ChannelRow.state == "active",
+        TurnRow.participants_json.contains('"code_work"'),
+    ]
+    if channel_id is not None:
+        conditions.append(ChannelRow.id == channel_id)
+    links: list[WorkLink] = []
+    seen: set[tuple[str, str, str]] = set()
+    with ctx.loop.dstore.read() as session:
+        turns = session.scalars(
+            select(TurnRow).where(and_(*conditions)).order_by(TurnRow.created_at.desc())
+        ).all()
+        for turn in turns:
+            participants = tuple(json.loads(turn.participants_json))
+            for index, participant in enumerate(participants):
+                for ref_index, ref in enumerate(participant.get("code_work", [])):
+                    key = (turn.channel_id, ref["repo"], ref["source_key"])
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    item_id = session.scalar(
+                        select(WorkItemRow.item_id).where(
+                            WorkItemRow.repo == ref["repo"],
+                            WorkItemRow.source_key == ref["source_key"],
+                            WorkItemRow.run_kind == "code",
+                        )
+                    )
+                    links.append(
+                        WorkLink(
+                            item_id=item_id or f"pending_code:{turn.id}:{index}:{ref_index}",
+                            source_key=ref["source_key"],
+                            channel_id=turn.channel_id,
+                            turn_id=turn.id,
+                            input_message_id=turn.input_message_id,
+                            targets=tuple(json.loads(turn.targets_json)),
+                            participants=participants,
+                            code_title=ref["title"],
+                            code_agent=participant.get("agent_slug"),
+                        )
+                    )
+    return links
+
+
 def _result(ctx: Any, run_id: str, state: str, fallback: str | None) -> str:
+    if state == "merged":
+        run = ctx.loop.store.get_run(run_id)
+        return "Changes merged." + (f"\n\n[View pull request]({run.pr_url})" if run.pr_url else "")
     if state == "completed":
         parts: list[str] = []
         for task in ctx.loop.store.get_tasks(run_id):
@@ -99,9 +152,26 @@ def _result(ctx: Any, run_id: str, state: str, fallback: str | None) -> str:
 def project_work(ctx: Any, channel_id: str | None = None) -> list[dict[str, Any]]:
     views = Views(ctx)
     snapshots: list[dict[str, Any]] = []
-    for link in _links(ctx, channel_id):
+    for link in [*_links(ctx, channel_id), *_code_links(ctx, channel_id)]:
         item = ctx.loop.dstore.get(link.item_id)
         if item is None:
+            if link.code_title is not None and channel_id is not None:
+                snapshots.append(
+                    {
+                        "item_id": link.item_id,
+                        "turn_id": link.turn_id,
+                        "agent_slug": link.code_agent,
+                        "title": link.code_title,
+                        "kind": "code",
+                        "state": "awaiting_dispatch",
+                        "run_id": None,
+                        "stage": None,
+                        "item_revision": 0,
+                        "run_revision": None,
+                        "item_actions": [],
+                        "run_actions": [],
+                    }
+                )
             continue
         public_item = views.item(item)
         run = None
@@ -113,7 +183,7 @@ def project_work(ctx: Any, channel_id: str | None = None) -> list[dict[str, Any]
             except SbxloopError:
                 pass
         state = run.state if run is not None else item.state
-        terminal = state in {"completed", "failed", "blocked", "cancelled", "gated"}
+        terminal = state in {"merged", "completed", "failed", "blocked", "cancelled", "gated"}
         terminal_key = run.run_id if run is not None else f"item:{item.attempts}:{state}"
         digest = hashlib.sha256(
             f"{link.channel_id}\0{link.item_id}\0{terminal_key}".encode()
