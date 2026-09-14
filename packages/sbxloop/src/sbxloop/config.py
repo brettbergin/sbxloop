@@ -2857,6 +2857,35 @@ class Config(_ConfigModel):
                 kinds.append(kind)
         return tuple(kinds) or (self.vcs.kind,)
 
+    def forge_web_url(self, repo: str | None = None) -> str:
+        """The configured forge's web root, including its scheme, port and prefix.
+
+        Only known API suffixes are translated; an ambiguous API path must
+        not send a repository's credentials to a guessed clone endpoint.
+        """
+        kind = self.vcs_kind_for(repo)
+        api = self.vcs_api_url_for(kind)
+        if api is None:
+            raise ConfigError(f"cannot construct a {kind} clone URL: set [vcs] api_url")
+        parsed = urlsplit(api)
+        path = parsed.path.rstrip("/")
+        if kind == "github" and parsed.netloc == "api.github.com" and not path:
+            return "https://github.com"
+        suffix = {"github": "/api/v3", "gitlab": "/api/v4", "gitea": "/api/v1"}[kind]
+        if path and not path.endswith(suffix):
+            raise ConfigError(
+                f"cannot construct a {kind} clone URL from {api}: expected an API root "
+                f"ending in {suffix} or a bare server root"
+            )
+        prefix = path.removesuffix(suffix)
+        return parsed._replace(path=prefix, query="", fragment="").geturl().rstrip("/")
+
+    def clone_url_for_repo(self, repo: str) -> str:
+        """Resolve a repository against its selected forge, never an agent URL."""
+        if not _valid_repo(repo, self.vcs_kind_for(repo)):
+            raise ConfigError(f"cannot construct clone URL: invalid repository {repo!r}")
+        return f"{self.forge_web_url(repo)}/{repo}"
+
     @field_validator("home", mode="after")
     @classmethod
     def _expand_home(cls, value: Path) -> Path:
@@ -3380,7 +3409,8 @@ class Config(_ConfigModel):
     def default_workspace_for_repo(self, repo: str | None) -> Path | None:
         """Where the daemon keeps ``repo``'s dedicated clone when the operator
         has not pointed it at one: ``workspaces/<owner>/<name>`` under the
-        home. None for no repository, or one that is not ``owner/name``."""
+        home, including nested GitLab namespaces. None for no repository
+        or an invalid path."""
         target = repo or self.github.repo
         if not target:
             return None

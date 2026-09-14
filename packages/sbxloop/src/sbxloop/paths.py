@@ -41,6 +41,7 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -350,11 +351,13 @@ class SbxloopHome:
         return self.run_dir(run_id) / "data"
 
     def workspace_for(self, repo: str) -> Path:
-        """The dedicated clone of ``owner/name``: ``workspaces/owner/name``."""
-        owner, _, name = repo.partition("/")
-        if not owner or not name or "/" in name or ".." in (owner, name):
-            raise ValueError(f"not an owner/name repository: {repo!r}")
-        return self.workspaces / owner / name
+        """The dedicated clone, preserving the repository's namespace hierarchy."""
+        parts = repo.split("/")
+        if not re.fullmatch(r"[\w.-]+(?:/[\w.-]+)+", repo) or any(
+            part in (".", "..") for part in parts
+        ):
+            raise ValueError(f"not a namespaced repository: {repo!r}")
+        return self.workspaces.joinpath(*parts)
 
     # -- laying it out --------------------------------------------------------
 

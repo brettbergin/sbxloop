@@ -2451,6 +2451,21 @@ token never enters the agent sandbox.
 
 #### Workspaces are per repository
 
+Remote clone URLs come from `Config.clone_url_for_repo`: the selected
+repository's forge determines the API-to-web mapping, preserving scheme,
+port and any installation prefix. The daemon's first checkout, per-run
+remote clones, workload checkouts, base-branch fetches, tags, submodules
+and LFS share that resolution. GitHub uses its PAT/App credential path;
+other forges use their configured token variable, including per-repository
+overrides. The Git helper answers only the explicitly configured HTTP(S)
+scheme, host and port; an HTTPS scope never authorizes an HTTP downgrade.
+
+With no workspace override, the daemon creates its managed checkout on
+first use. An empty managed directory can be initialized, but configured
+directories and managed directories containing files are never replaced.
+Explicit clone isolation can also clone directly from the selected remote
+when no source checkout exists.
+
 A workspace is the host git checkout a run's tree comes from: the
 provisioner clones it into `runs/<run_id>/workspace` on the run's branch,
 and the daemon fast-forwards it from `origin` immediately before dispatch.
@@ -2474,8 +2489,8 @@ repository:
 Remote URLs are compared as normalised `owner/name` (scp-style ssh, https
 with or without embedded userinfo, `.git` suffix, case). A repository with
 no workspace at all clones **from its own remote** into the run directory,
-authenticating with the run's GitHub credential (#683): the same PAT or App
-installation token the github sandbox delivers with, handed to git through
+authenticating with the run's forge credential (#683): the same token the
+VCS sandbox delivers with, handed to git through
 a `credential.helper` set in the clone's environment (`GIT_CONFIG_COUNT`,
 git ≥ 2.31) so it never touches argv, `.git/config` or the URL, with the
 host user's own helpers cleared for that process. The host still holds no

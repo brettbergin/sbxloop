@@ -79,6 +79,33 @@ def test_default_github_https_authentication_still_works(tmp_path: Path) -> None
     assert f"password={TOKEN}" in result.stdout
 
 
+def test_explicit_http_forge_scope_authenticates_only_that_scheme_host_and_port(tmp_path: Path):
+    url = "http://forge.example:8929/gitlab"
+    result = credential_fill(tmp_path, "http", "forge.example:8929", credential_url=url)
+    assert result.returncode == 0
+    assert f"password={TOKEN}" in result.stdout
+    for protocol, host in [
+        ("https", "forge.example:8929"),
+        ("http", "forge.example"),
+        ("http", "other.example:8929"),
+    ]:
+        rejected = credential_fill(tmp_path, protocol, host, credential_url=url)
+        assert TOKEN not in rejected.stdout + rejected.stderr
+
+
+def test_private_clone_uses_the_explicit_http_forge_credentials(tmp_path: Path):
+    with PrivateGitServer(
+        tmp_path / "server", username="x-access-token", token=TOKEN, tls=False
+    ) as server:
+        source = make_repo(tmp_path, "source")
+        bare_from(source, server.root, "project.git")
+        target = tmp_path / "checkout"
+        sha = hostgit.clone_workspace(f"{server.url}/project.git", target, token=TOKEN)
+        assert sha == hostgit.head_commit(source)
+        assert any(value is not None for value in server.requests)
+        assert TOKEN not in (target / ".git/config").read_text()
+
+
 @pytest.mark.parametrize("host", ["ghe.example.invalid", "ghe.example.invalid:8443"])
 def test_enterprise_authority_is_explicit_and_does_not_grant_dotcom(
     tmp_path: Path, host: str

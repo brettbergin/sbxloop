@@ -3560,12 +3560,27 @@ class DaemonLoop:
         first time it is needed, when the operator pointed the daemon at no
         checkout of their own. Never fatal: without the checkout the run
         clones from the remote itself, as it always could."""
-        if repo is None or self.config.workspace_for_repo(repo) is not None:
+        if repo is None:
             return
         target = self.config.default_workspace_for_repo(repo)
-        if target is None or target.exists() or hostgit.find_git() is None:
+        if target is None or target.is_symlink() or hostgit.find_git() is None:
             return
-        url = f"{self.config.github.web_url}/{repo}"
+        source = self.config.workspace_for_repo(repo)
+        if source is not None:
+            entry = self.config.github.find_repo(repo)
+            # Only an empty managed directory may be initialized. A configured
+            # checkout or any existing files remain the operator's responsibility.
+            if (
+                source != target
+                or self.config.sandbox.workspace is not None
+                or (entry is not None and entry.workspace is not None)
+                or not target.is_dir()
+                or any(target.iterdir())
+            ):
+                return
+        if target.exists() and not target.is_dir():
+            return
+        url = self.config.clone_url_for_repo(repo)
         token = self.github.provisioner.clone_token(repo) if self.github is not None else None
         started = time.monotonic()
         try:

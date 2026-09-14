@@ -4061,7 +4061,7 @@ class LoopEngine:
         base = self._base_branch(p)
         try:
             assert p.provisioner is not None
-            url = f"{self.config.github.web_url}/{p.repo}.git"
+            url = self.config.clone_url_for_repo(p.repo) + ".git"
             with hostgit.base_bundle(
                 workspace, url, base, token=p.provisioner.clone_token(p.repo)
             ) as (sha, bundle):

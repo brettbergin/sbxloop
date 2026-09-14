@@ -104,7 +104,7 @@ def resolve_targets(
     if url is not None:
         canonical = _public_url(url)
         for entry in config.github.repo_list():
-            known = f"{config.github.web_url}/{entry.repo}"
+            known = config.clone_url_for_repo(entry.repo)
             if canonical.removesuffix(".git").casefold() == known.casefold():
                 if not entry.enabled:
                     raise ValueError("entrygraph target is not an enabled configured repository")
