@@ -241,8 +241,11 @@ def turn(
     text: str = "hello",
     author: str = "Discord user `brett`",
     author_id: str | None = None,
+    on_code_work: Callable[[str, int, str], None] | None = None,
 ) -> ConciergeReply:
-    return concierge.submit_turn(text, author=author, author_id=author_id).result(timeout=10)
+    return concierge.submit_turn(
+        text, author=author, author_id=author_id, on_code_work=on_code_work
+    ).result(timeout=10)
 
 
 class TestJobShape:
@@ -1338,6 +1341,7 @@ class TestTools:
         assert "no queued open issues in" in listing.text
 
     def test_create_issue_files_and_queues_in_one_hop(self, tmp_path: Path) -> None:
+        origins: list[tuple[str, int, str]] = []
         github = FakeGithub()
         concierge, client, _, _, dstore = make(
             tmp_path,
@@ -1356,7 +1360,14 @@ class TestTools:
             ],
             github=github,
         )
-        turn(concierge, "add retries to fetch", author="Discord user `ana`", author_id="777")
+        turn(
+            concierge,
+            "add retries to fetch",
+            author="Discord user `ana`",
+            author_id="777",
+            on_code_work=lambda repo, number, title: origins.append((repo, number, title)),
+        )
+        assert origins == [("owner/repo", 41, "Add retries to fetch")]
         created, bad = client.responses
         assert created.ok and created.text.startswith(
             "created and queued issue #41 https://gh/i/41"
@@ -1376,12 +1387,19 @@ class TestTools:
         )
         assert dstore.get("gh:issue:41").requested_by == "777"  # type: ignore[union-attr]
         # An issue that already exists is queued with label_issue_for_run.
-        turn(concierge, "run #12 too", author="Discord user `ana`")
+        turn(
+            concierge,
+            "run #12 too",
+            author="Discord user `ana`",
+            on_code_work=lambda repo, number, title: origins.append((repo, number, title)),
+        )
+        assert origins[-1] == ("owner/repo", 12, "Issue #12")
         (labelled,) = client.responses[2:]
         assert labelled.ok and labelled.text.startswith("added `sbxloop:run` to #12")
         assert github.paths[-1] == "/repos/owner/repo/issues/12/labels"
 
     def test_create_issue_can_file_without_queueing(self, tmp_path: Path) -> None:
+        origins: list[tuple[str, int, str]] = []
         github = FakeGithub()
         concierge, client, _, _, dstore = make(
             tmp_path,
@@ -1397,7 +1415,14 @@ class TestTools:
             ],
             github=github,
         )
-        turn(concierge, "note this for the backlog", author="Discord user `ana`", author_id="777")
+        turn(
+            concierge,
+            "note this for the backlog",
+            author="Discord user `ana`",
+            author_id="777",
+            on_code_work=lambda repo, number, title: origins.append((repo, number, title)),
+        )
+        assert origins == []
         (filed,) = client.responses
         assert filed.ok and filed.text.startswith("filed issue #41 https://gh/i/41")
         assert "NOT queued" in filed.text and "label_issue_for_run" in filed.text

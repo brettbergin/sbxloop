@@ -320,6 +320,7 @@ class Concierge:
         self._turn_read_only = False
         self._turn_handoff: Callable[[str, str], str] | None = None
         self._turn_tool_activity: Callable[[str, str, bool | None], None] | None = None
+        self._turn_code_work: Callable[[str, int, str], None] | None = None
         self._turn_work_products: list[str] = []
 
         self.host = host
@@ -397,6 +398,7 @@ class Concierge:
         read_only: bool = False,
         handoff: Callable[[str, str], str] | None = None,
         on_tool_activity: Callable[[str, str, bool | None], None] | None = None,
+        on_code_work: Callable[[str, int, str], None] | None = None,
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
@@ -425,6 +427,7 @@ class Concierge:
             self._turn_read_only = read_only
             self._turn_handoff = handoff
             self._turn_tool_activity = on_tool_activity
+            self._turn_code_work = on_code_work
             turn_work_products: list[str] = []
             self._turn_work_products = turn_work_products
             self._turn_after = []
@@ -450,6 +453,7 @@ class Concierge:
                 self._turn_read_only = False
                 self._turn_handoff = None
                 self._turn_tool_activity = None
+                self._turn_code_work = None
                 self._turn_work_products = []
             after, self._turn_after = self._turn_after, []
             updates: dict[str, Any] = {}
@@ -2445,6 +2449,8 @@ class Concierge:
                 f"`{trigger}` label, so the daemon will not claim it. Use "
                 "`label_issue_for_run` with that number to start it later."
             )
+        if self._turn_code_work is not None:
+            self._turn_code_work(repo, ref.number, title)
         status = self.loop.status()
         note = ""
         if status.get("paused"):
@@ -2580,6 +2586,8 @@ class Concierge:
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             return f"labelling #{number} failed: {_one_line(str(exc), 300)}"
         log.info("concierge.issue_labelled_for_run", number=number, by=by, label=trigger)
+        if self._turn_code_work is not None:
+            self._turn_code_work(repo, number, f"Issue #{number}")
         return (
             f"added `{trigger}` to #{number} — the daemon claims it on its next poll "
             f"(every {self.config.daemon.poll_interval_s:g}s) and runs it after anything "

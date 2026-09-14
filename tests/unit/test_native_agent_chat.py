@@ -16,7 +16,7 @@ def test_worker_can_request_a_peer_only_inside_an_authorized_turn(tmp_path: Path
         tmp_path,
         [
             {"calls": [("handoff_agent", args)], "text": "Peer requested"},
-            {"calls": [("handoff_agent", args)], "text": "Ordinary reply"},
+            {"text": "Ordinary reply"},
             {"calls": [("sbx_control", {"text": "pause"})], "text": "Read-only advice"},
         ],
     )
@@ -36,7 +36,8 @@ def test_worker_can_request_a_peer_only_inside_an_authorized_turn(tmp_path: Path
         assert requests == [("critic", "Review this plan")]
         assert "handoff_agent" in {t.name for t in client.jobs[0].host_tools}
         assert "handoff_agent" not in {t.name for t in client.jobs[1].host_tools}
-        assert [r.ok for r in client.responses] == [True, False, False]
+        assert not client.jobs[1].host_tools
+        assert [r.ok for r in client.responses] == [True, False]
         assert "sbx_control" not in {t.name for t in client.jobs[2].host_tools}
         assert not client.jobs[2].mcp_servers
     finally:

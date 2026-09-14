@@ -110,6 +110,17 @@ Clients can use these events to refresh the channel's authoritative active
 turns and messages, rather than infer progress from message text. Ordinary
 conversation with no advertised host tools submits no host tool handler.
 
+Successful Code issue creation or queueing records its exact repository and
+issue identity on the originating participant. `GET /v1/channels/{id}/work`
+projects that association even after the conversation turn finishes. Before
+the source admits the issue, its state is `awaiting_dispatch`, its item ID is
+a provisional `pending_code:` identity, and no controls are offered. After
+admission it reports the public item/run IDs, actual stage and available
+controls. Completion delivers the recorded PR link or failure to that channel.
+The association is durable turn data, independent of event retention; unrelated
+repositories with the same issue number do not match. No source polling or
+runner behavior changes.
+
 Discovery lists sbxloop's five native roles: `concierge`, `planner`, `builder`,
 `critic`, and `operator`. Chat resolves their models through the existing
 configuration, using the `concierge`, `decompose`, `build`, `review`, and

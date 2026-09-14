@@ -1039,6 +1039,37 @@ class CollaborationStore:
             )
             return True
 
+    def link_code_work(
+        self, turn_id: str, index: int, repo: str, number: int, title: str, now: float
+    ) -> None:
+        """Keep successful issue dispatch identity with its originating participant."""
+        with self.dstore.immediate_transaction() as session:
+            row = session.get(TurnRow, turn_id)
+            if row is None or row.status not in {"running", "cancelling"}:
+                return
+            channel = session.get(ChannelRow, row.channel_id)
+            if channel is None or channel.state != "active":
+                return
+            progress = json.loads(row.participants_json)
+            if not 0 <= index < len(progress):
+                return
+            refs = progress[index].setdefault("code_work", [])
+            if any(ref["repo"] == repo and ref["source_key"] == str(number) for ref in refs):
+                return
+            refs.append({"repo": repo, "source_key": str(number), "title": title})
+            row.participants_json = json.dumps(progress)
+            _event(
+                session,
+                "collaboration.work.linked",
+                now,
+                data={
+                    "channel_id": row.channel_id,
+                    "turn_id": turn_id,
+                    "index": index,
+                    "kind": "code",
+                },
+            )
+
     def record_tool_activity(
         self, turn_id: str, index: int, tool: str, phase: str, ok: bool | None, now: float
     ) -> None:
