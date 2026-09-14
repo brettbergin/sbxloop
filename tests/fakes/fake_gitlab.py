@@ -76,6 +76,7 @@ class FakeGitlab(GitlabOps):
         self._pending: dict[tuple[str, str], Any] = {}
         self._listings: dict[tuple[str, str, str], Any] = {}
         self.repo = repo
+        self.groups: dict[str, int] = {"acme": 10}
         self.user_login = "sbxloop-bot"
         self.user_id = 2
         self.users: dict[int, dict[str, Any]] = {
@@ -997,10 +998,15 @@ class FakeGitlab(GitlabOps):
                 raise self._failed(method, path, 404, "404 Not Found")
             return dict(self.token_self)
         if re.fullmatch(r"/groups/[^/]+", path):
-            return {"id": 10, "full_path": unquote(path.rsplit("/", 1)[1])}
+            group = unquote(path.rsplit("/", 1)[1])
+            return {"id": self.groups[group], "full_path": group}
         if method == "POST" and path == "/projects":
             assert body is not None
-            self.repo = f"{'acme' if body.get('namespace_id') else self.user_login}/{body['path']}"
+            namespace = next(
+                (name for name, gid in self.groups.items() if gid == body.get("namespace_id")),
+                self.user_login,
+            )
+            self.repo = f"{namespace}/{body['path']}"
             return self._project_json()
         if project is None:
             raise AssertionError(f"FakeGitlab: unexpected raw call {method} {full}")

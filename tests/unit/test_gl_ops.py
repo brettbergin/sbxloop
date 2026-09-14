@@ -38,6 +38,22 @@ def calls(fake: FakeGitlab) -> list[tuple[str, str, Any]]:
 
 
 class TestTransportDescriptor:
+    def test_create_a_project_in_a_nested_namespace(self) -> None:
+        repo = "acme/platform/tools/widgets"
+        fake = FakeGitlab(repo=repo)
+        fake.groups["acme/platform/tools"] = 42
+        fake.repo_create(repo)
+        assert fake.repo == repo
+        assert ("GET", "/groups/acme%2Fplatform%2Ftools", None) in fake.raw_calls
+        post = next(
+            body
+            for method, path, body in fake.raw_calls
+            if method == "POST" and path == "/projects"
+        )
+        assert post is not None and post["namespace_id"] == 42 and post["path"] == "widgets"
+        fake.repo_lookup(repo)
+        assert ("GET", "/projects/acme%2Fplatform%2Ftools%2Fwidgets", None) in fake.raw_calls
+
     def test_every_job_names_gitlabs_transport(self) -> None:
         client = StubWorkerClient({"raw.api": {"version": "19.3.2"}})
         ops = GitlabOps(client, "r1", transport=gitlab_transport("https://gl.example/api/v4"))  # type: ignore[arg-type]

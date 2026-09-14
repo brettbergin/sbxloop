@@ -39,7 +39,30 @@ def test_normalise_repo_url_case_insensitive() -> None:
 
 @pytest.mark.parametrize(
     "url",
-    [None, "", "   ", "https://github.com/", "https://github.com/owner", "not a url"],
+    [
+        "https://gitlab.example/acme/platform/widgets.git",
+        "git@gitlab.example:acme/platform/widgets.git",
+        "acme/platform/widgets",
+    ],
+)
+def test_subgroup_origins_keep_the_full_namespace(url: str) -> None:
+    assert hostgit.normalise_repo_url(url) == "acme/platform/widgets"
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        None,
+        "",
+        "   ",
+        "https://github.com/",
+        "https://github.com/owner",
+        "not a url",
+        "/tmp/local/repo",
+        "C:/code/local/repo",
+        "acme//widgets",
+        "acme/../widgets",
+    ],
 )
 def test_normalise_repo_url_rejects(url: str | None) -> None:
     assert hostgit.normalise_repo_url(url) is None

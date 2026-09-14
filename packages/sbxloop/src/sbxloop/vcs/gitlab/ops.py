@@ -287,7 +287,7 @@ class GitlabOps(JobBackend):
         namespace. **Field-unverified**: #1016 created its project as the
         administrator; a Developer needs the group's create-project
         permission."""
-        namespace, name = repo.split("/", 1)
+        namespace, name = repo.rsplit("/", 1)
         body: dict[str, Any] = {
             "name": name,
             "path": name,

@@ -813,11 +813,16 @@ class PolicyConfig(_ConfigModel):
         return value
 
 
-_REPO_RE = re.compile(r"[\w.-]+/[\w.-]+")
+_REPO_RE = re.compile(r"[\w.-]+(?:/[\w.-]+)+")
 
 
-def _valid_repo(value: str) -> bool:
-    return bool(_REPO_RE.fullmatch(value))
+def _valid_repo(value: str, kind: VcsKind | None = None) -> bool:
+    """Validate path syntax; the containing Config resolves an inherited forge."""
+    return (
+        bool(_REPO_RE.fullmatch(value))
+        and all(part not in (".", "..") for part in value.split("/"))
+        and (kind in (None, "gitlab") or value.count("/") == 1)
+    )
 
 
 # What a PR title / commit message template may interpolate (#621).
@@ -1138,11 +1143,11 @@ class RepoConfig(_ConfigModel):
 
     @property
     def owner(self) -> str:
-        return self.repo.split("/", 1)[0]
+        return self.repo.rsplit("/", 1)[0]
 
     @property
     def name(self) -> str:
-        return self.repo.split("/", 1)[1]
+        return self.repo.rsplit("/", 1)[1]
 
 
 class GithubConfig(_ConfigModel):
@@ -2810,6 +2815,14 @@ class Config(_ConfigModel):
         if entry is not None and entry.kind is not None:
             return entry.kind
         return self.vcs.kind
+
+    @model_validator(mode="after")
+    def _check_repo_paths_for_forge(self) -> Config:
+        for entry in self.github.repos:
+            kind = entry.kind or self.vcs.kind
+            if not _valid_repo(entry.repo, kind):
+                raise ValueError(f"{kind} repository must be owner/name, got {entry.repo!r}")
+        return self
 
     def vcs_token_env_for(self, repo: str | None = None) -> str | None:
         """The host variable ``repo``'s forge token is read from: the

@@ -2813,7 +2813,7 @@ class LoopEngine:
         repo = sinks.repo_of(carried)
         if repo is None:
             raise sinks.PublishError("the pr sink needs one repository declared on its tasks")
-        checkout = p.pair.workspace / repo.split("/", 1)[1]
+        checkout = p.pair.workspace / repo.rsplit("/", 1)[1]
         if not (checkout / ".git").exists():
             raise sinks.PublishError(f"no checkout of {repo} in the data directory")
         gh = self.config.github
