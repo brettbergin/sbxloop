@@ -319,6 +319,7 @@ class Concierge:
         self._turn_role: Role = "concierge"
         self._turn_read_only = False
         self._turn_handoff: Callable[[str, str], str] | None = None
+        self._turn_tool_activity: Callable[[str, str, bool | None], None] | None = None
         self._turn_work_products: list[str] = []
 
         self.host = host
@@ -395,6 +396,7 @@ class Concierge:
         agent_role: Role = "concierge",
         read_only: bool = False,
         handoff: Callable[[str, str], str] | None = None,
+        on_tool_activity: Callable[[str, str, bool | None], None] | None = None,
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
@@ -422,6 +424,7 @@ class Concierge:
             self._turn_role = agent_role
             self._turn_read_only = read_only
             self._turn_handoff = handoff
+            self._turn_tool_activity = on_tool_activity
             turn_work_products: list[str] = []
             self._turn_work_products = turn_work_products
             self._turn_after = []
@@ -446,6 +449,7 @@ class Concierge:
                 self._turn_role = "concierge"
                 self._turn_read_only = False
                 self._turn_handoff = None
+                self._turn_tool_activity = None
                 self._turn_work_products = []
             after, self._turn_after = self._turn_after, []
             updates: dict[str, Any] = {}
@@ -654,7 +658,20 @@ class Concierge:
         )
 
         def handler(call: HostToolCall) -> HostToolResponse:
-            response = self._tool_handler(call, author=author)
+            def activity(phase: str, ok: bool | None) -> None:
+                if self._turn_tool_activity is not None and call.name in available_tools:
+                    try:
+                        self._turn_tool_activity(call.name, phase, ok)
+                    except Exception:
+                        log.debug("concierge.activity_callback_failed", exc_info=True)
+
+            activity("started", None)
+            try:
+                response = self._tool_handler(call, author=author)
+            except Exception:
+                activity("completed", False)
+                raise
+            activity("completed", response.ok)
             if on_tool is not None:
                 try:
                     on_tool(call.name, _visible_tool_arguments(call), response)
@@ -666,7 +683,7 @@ class Concierge:
         result = client.submit(
             job,
             agent=CONCIERGE_AGENT if self._turn_role == "concierge" else self._turn_role,
-            tool_handler=handler,
+            tool_handler=handler if available_tools else None,
             agent_phase="concierge",
             model_source=self._turn_model.source,
         )

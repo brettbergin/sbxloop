@@ -340,6 +340,14 @@ class ApiContext:
                 self.hub.notify()
                 return result
 
+            def tool_activity(
+                name: str, phase: str, ok: bool | None, participant_index: int = index
+            ) -> None:
+                store.record_tool_activity(
+                    turn.id, participant_index, name, phase, ok, self.clock()
+                )
+                self.hub.notify()
+
             try:
                 future = concierge.submit_turn(
                     prompt,
@@ -356,6 +364,7 @@ class ApiContext:
                     agent_role=definition.role if definition else "concierge",
                     read_only=read_only,
                     handoff=handoff if allow_actions else None,
+                    on_tool_activity=tool_activity,
                 )
                 reply = future.result()
                 if reply.ok and (reply.text or reply.work_products):

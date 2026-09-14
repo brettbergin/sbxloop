@@ -74,8 +74,9 @@ class FakeClient:
         script = self.scripts.pop(0)
         if "raise" in script:
             raise script["raise"]
-        assert tool_handler is not None
+        assert bool(job.host_tools) == (tool_handler is not None)
         for i, (name, args) in enumerate(script.get("calls", [])):
+            assert tool_handler is not None
             response = tool_handler(HostToolCall(call_id=f"c{i}", name=name, arguments=args))
             self.responses.append(response)
         if "error" in script:
@@ -320,13 +321,14 @@ class TestJobShape:
 
     def test_conversation_turn_has_persona_but_no_action_tools(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(tmp_path, [{"session_id": "conversation"}])
-        concierge.submit_turn(
+        reply = concierge.submit_turn(
             "hello",
             author="owner",
             session_key="channel-a:angie",
             persona="\nYou are Angie.",
             allow_actions=False,
         ).result(timeout=10)
+        assert reply.ok
         (job,) = client.jobs
         assert job.host_tools == []
         assert job.mcp_servers == []
@@ -1853,6 +1855,38 @@ class TestTools:
             "x", author="a", on_tool=lambda name, args, resp: seen.append((name, args, resp.ok))
         ).result(timeout=10)
         assert seen == [("sbx_control", {"command": "queue"}, True), ("teleport", {}, False)]
+
+    def test_tool_activity_brackets_execution_without_arguments(self, tmp_path: Path) -> None:
+        concierge, *_ = make(tmp_path, [{"calls": [("sbx_control", {"command": "queue"})]}])
+        activity: list[tuple[str, str, bool | None]] = []
+        concierge.submit_turn(
+            "show queue",
+            author="owner",
+            on_tool_activity=lambda name, phase, ok: activity.append((name, phase, ok)),
+            on_tool=lambda *_: activity.append(("response", "delivered", True)),
+        ).result(timeout=10)
+        assert activity == [
+            ("sbx_control", "started", None),
+            ("sbx_control", "completed", True),
+            ("response", "delivered", True),
+        ]
+
+    def test_activity_observer_cannot_break_tools_or_leak_to_next_turn(
+        self, tmp_path: Path
+    ) -> None:
+        concierge, *_ = make(
+            tmp_path, [{"calls": [("sbx_control", {"command": "queue"})]}, {"text": "hello"}]
+        )
+
+        def broken(*_args: Any) -> None:
+            raise RuntimeError("observer offline")
+
+        assert (
+            concierge.submit_turn("queue", author="a", on_tool_activity=broken)
+            .result(timeout=10)
+            .ok
+        )
+        assert concierge.submit_turn("hello", author="a", allow_actions=False).result(timeout=10).ok
 
     def test_run_events_renders_old_and_new_shape_tool_events(self, tmp_path: Path) -> None:
         """`output_lines`/`duration_ms`/`tool_call_id` are additive: a stored
