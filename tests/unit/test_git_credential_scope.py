@@ -106,6 +106,49 @@ def test_private_clone_uses_the_explicit_http_forge_credentials(tmp_path: Path):
         assert TOKEN not in (target / ".git/config").read_text()
 
 
+@pytest.mark.parametrize("tls", [False, True])
+def test_private_workspace_refresh_authenticates_and_advances(tmp_path: Path, tls: bool):
+    with PrivateGitServer(
+        tmp_path / "server", username="x-access-token", token=TOKEN, tls=tls
+    ) as server:
+        source = make_repo(tmp_path, "source")
+        remote = bare_from(source, server.root, "project.git")
+        target = tmp_path / "checkout"
+        url = f"{server.url}/project.git"
+        before = hostgit.clone_workspace(url, target, token=TOKEN)
+        (source / "next.txt").write_text("new upstream work\n")
+        git("add", ".", cwd=source)
+        git("commit", "-m", "advance upstream", cwd=source)
+        git("push", str(remote), "main", cwd=source)
+        server.requests.clear()
+
+        result = hostgit.refresh_from_origin(target, token=TOKEN, credential_url=server.url)
+
+        assert result.advanced
+        assert result.before == before
+        assert result.after == hostgit.head_commit(source)
+        assert (target / "next.txt").read_text() == "new upstream work\n"
+        assert any(value is not None for value in server.requests)
+        assert TOKEN not in (target / ".git/config").read_text() + repr(result)
+
+
+def test_refresh_never_sends_configured_token_to_foreign_tracking_remote(tmp_path: Path):
+    with PrivateGitServer(
+        tmp_path / "foreign", username="x-access-token", token=TOKEN, tls=False
+    ) as foreign:
+        source = make_repo(tmp_path, "source")
+        git("remote", "add", "upstream", f"{foreign.url}/project.git", cwd=source)
+        git("config", "branch.main.remote", "upstream", cwd=source)
+        git("config", "branch.main.merge", "refs/heads/main", cwd=source)
+
+        with pytest.raises(ProvisionError, match="git fetch upstream failed"):
+            hostgit.refresh_from_origin(
+                source, token=TOKEN, credential_url="https://configured.example"
+            )
+
+        assert foreign.requests and all(value is None for value in foreign.requests)
+
+
 @pytest.mark.parametrize("host", ["ghe.example.invalid", "ghe.example.invalid:8443"])
 def test_enterprise_authority_is_explicit_and_does_not_grant_dotcom(
     tmp_path: Path, host: str

@@ -1513,7 +1513,9 @@ def _fetch_branch_from_source(clone: Repo, source: Path, branch: str) -> None:
     ) from last
 
 
-def refresh_from_origin(repo_path: Path) -> RefreshResult:
+def refresh_from_origin(
+    repo_path: Path, *, token: str | None = None, credential_url: str = ""
+) -> RefreshResult:
     """``git fetch`` and fast-forward the checked-out branch to its
     upstream, so an unattended run starts from current ``<remote>/<branch>``
     rather than whatever HEAD the checkout was last left at (#255).
@@ -1521,6 +1523,11 @@ def refresh_from_origin(repo_path: Path) -> RefreshResult:
     The remote fetched is the one the branch tracks (``upstream/main`` in a
     fork layout, not necessarily ``origin``); a branch with no upstream
     falls back to ``origin/<branch>``, the convention everyone expects.
+
+    HTTP(S) authentication uses the selected repository's token, scoped to
+    the operator's ``credential_url`` rather than the checkout's remote.
+    Like cloning, fetching disables prompts and ambient credential helpers;
+    SSH authentication continues to use the host's SSH configuration.
 
     Strictly non-destructive: fast-forward only. A detached HEAD, a branch
     with no upstream, a diverged local branch, or a working tree whose
@@ -1542,7 +1549,7 @@ def refresh_from_origin(repo_path: Path) -> RefreshResult:
             if remote_name not in remotes:
                 return RefreshResult(False, before, before, f"{repo_path}: no {remote_name} remote")
             try:
-                repo.remote(remote_name).fetch()
+                repo.remote(remote_name).fetch(env=_clone_env(token, credential_url=credential_url))
             except GitCommandError as exc:
                 raise ProvisionError(
                     f"git fetch {remote_name} failed in {repo_path}: {_describe(exc)}"

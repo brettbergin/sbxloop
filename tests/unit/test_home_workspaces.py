@@ -4,6 +4,7 @@ daemon on first use when the operator pointed it at no checkout."""
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -17,6 +18,8 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.engine.store import StateStore
 from sbxloop.errors import ProvisionError
 from sbxloop.paths import SbxloopHome
+from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.provision import Provisioner
 from tests.unit.test_daemon_loop import FakeSource
 
 
@@ -84,6 +87,45 @@ class TestConfigDefault:
 
 
 class TestDaemonClonesOnFirstUse:
+    @pytest.mark.parametrize(
+        "repo,origin,token",
+        [
+            ("o/n", "http://forge.example:8929", "gitlab-token"),
+            ("other/project", "https://github.com", "github-token"),
+        ],
+    )
+    def test_refresh_uses_the_selected_repositories_forge_credential(
+        self, tmp_path, monkeypatch, repo, origin, token
+    ):
+        loop, home = self.make_loop(tmp_path)
+        loop.config = Config.model_validate(
+            {
+                "home": str(home.root),
+                "vcs": {"kind": "gitlab", "api_url": "http://forge.example:8929/api/v4"},
+                "github": {"repos": [{"repo": "other/project", "kind": "github"}]},
+            }
+        )
+        loop.github = SimpleNamespace(
+            provisioner=Provisioner(
+                SbxCLI(),
+                loop.config,
+                env={"GITLAB_TOKEN": "gitlab-token", "GH_TOKEN": "github-token"},
+            )
+        )
+        checkout = home.workspaces / repo
+        monkeypatch.setattr(loop, "_ensure_workspace", lambda repo: None)
+        monkeypatch.setattr(loop, "_workspace_checkout", lambda repo: checkout)
+        monkeypatch.setattr(hostgit, "origin_matches_repo", lambda *a: True)
+        calls = []
+
+        def refresh(path, **kwargs):
+            calls.append((path, kwargs))
+            return hostgit.RefreshResult(False, "head", "head", "up to date")
+
+        monkeypatch.setattr(hostgit, "refresh_from_origin", refresh)
+        loop._refresh_workspace(repo)
+        assert calls == [(checkout, {"token": token, "credential_url": origin})]
+
     @pytest.mark.parametrize("empty_directory", [False, True])
     @pytest.mark.parametrize("repo", ["o/n", "group/subgroup/project"])
     def test_gitlab_bootstrap_uses_its_configured_origin(

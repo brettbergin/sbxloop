@@ -65,7 +65,10 @@ def read_base_requirements(ops: Any, repo: str, base: str) -> BaseRequirements:
     settings = project if isinstance(project, dict) else {}
     rule = {
         "merge_access_levels": [
-            level for match in matches for level in match.get("merge_access_levels", [])
+            level
+            for match in matches
+            for field in ("merge_access_levels", "push_access_levels")
+            for level in match.get(field, [])
         ]
     }
     all_checks = settings.get("only_allow_merge_if_pipeline_succeeds") is True
@@ -125,9 +128,10 @@ _LEVEL_NAMES = {
 
 def _merge_access_blockers(settings: Mapping[str, Any], rule: Mapping[str, Any]) -> tuple[str, ...]:
     """The one rule GitLab has that GitHub does not (#1019): who may merge
-    into the protected branch. A token below the lowest ``merge_access_levels``
-    entry can never land the change, whatever else is green; the reason is
-    phrased with the branch's own description (field-verified shape:
+    into the protected branch. GitLab grants that through either
+    ``merge_access_levels`` or ``push_access_levels``; a token below the
+    lowest entry across both can never land the change, whatever else is
+    green. The reason is phrased with the branch's own description (field-verified shape:
     ``[{"access_level": 30, "access_level_description": "Developers + Maintainers"}]``)."""
     levels = rule.get("merge_access_levels")
     if not isinstance(levels, list) or not levels:
