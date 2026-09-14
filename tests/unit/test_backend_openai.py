@@ -285,6 +285,43 @@ def test_expect_json_reasks_once_then_fails(endpoint_env: Path, tmp_path: Path) 
     assert len(transport.requests) == 2  # one reask, never a loop
 
 
+# A workload plan the way a hosted model wrote one (field failure): a key that
+# names a credential, whose empty value the text redactor turned into `***`.
+PLAN = {
+    "title": "Hacker News scraper",
+    "tasks": [
+        {
+            "id": "t1",
+            "verify_commands": ["python3 -m py_compile hn.py"],
+            "needs": {"hosts": ["news.ycombinator.com"], "credentials": [], "sink": "artifact"},
+        }
+    ],
+}
+
+
+def plan_answer() -> str:
+    plan = json.loads(json.dumps(PLAN))
+    plan["tasks"][0]["note"] = f"the key {KEY} must not leak"
+    return "```json\n" + json.dumps(plan, indent=2) + "\n```"
+
+
+def assert_plan_parsed(result: Any) -> None:
+    assert isinstance(result.output_json, dict), result.output_json
+    needs = result.output_json["tasks"][0]["needs"]
+    assert needs["credentials"] == [] and needs["hosts"] == ["news.ycombinator.com"]
+    # Still redacted: as values in the parsed JSON, and in the display text.
+    assert KEY not in json.dumps(result.output_json)
+    assert KEY not in result.output_text
+
+
+def test_expect_json_parses_before_redaction(endpoint_env: Path, tmp_path: Path) -> None:
+    transport = FakeTransport([text_chunks(plan_answer())])
+    result, events = run(transport, make_job(tmp_path, expect="json"))
+    assert_plan_parsed(result)
+    assert len(transport.requests) == 1  # parsed first time: no reask
+    assert KEY not in json.dumps([data for _, data in events])
+
+
 def test_tool_call_ceiling_nudges_in_session(endpoint_env: Path, tmp_path: Path) -> None:
     transport = FakeTransport(
         [
@@ -834,6 +871,15 @@ def test_responses_credential_never_reaches_an_event_the_model_or_the_transcript
     assert KEY not in result.output_text and "[REDACTED]" in result.output_text
     assert KEY not in json.dumps([data for _, data in events])
     assert KEY not in json.dumps(transport.requests[1]["input"])
+    assert KEY not in next(responses_env.glob("*.json")).read_text()
+
+
+def test_responses_expect_json_parses_before_redaction(responses_env: Path, tmp_path: Path) -> None:
+    transport = FakeTransport([responses_text(plan_answer())])
+    result, events = run(transport, make_job(tmp_path, expect="json"))
+    assert_plan_parsed(result)
+    assert len(transport.requests) == 1
+    assert KEY not in json.dumps([data for _, data in events])
     assert KEY not in next(responses_env.glob("*.json")).read_text()
 
 

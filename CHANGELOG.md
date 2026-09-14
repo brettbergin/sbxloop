@@ -103,6 +103,16 @@
 
 ### Fixed
 
+- **Structured answers from the openai backend parse again when they name a
+  credential.** Under `[agent] backend = "openai"` the answer was redacted as
+  text before its JSON was extracted, and the redactor rewrites the value of a
+  key that names a credential: a workload plan's `"credentials": []` became
+  `"credentials": ***`, which does not parse, so extraction fell back to a
+  fragment nested inside the plan and `operator_plan` failed twice, reading
+  the plan as `['news.ycombinator.com']`. The JSON is now extracted from the
+  model's own text and redacted value by value, as the codex backend does;
+  the displayed text and every event stay redacted as before.
+
 - **A daemon run for a repository no longer starts in an empty directory.**
   When the home's clone of a repository had failed, or left an empty or
   non-git directory behind, a daemon run under the default
