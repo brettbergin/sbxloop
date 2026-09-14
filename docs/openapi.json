@@ -4938,7 +4938,9 @@
             "default": "conversation",
             "enum": [
               "conversation",
-              "delegate"
+              "delegate",
+              "code",
+              "workload"
             ],
             "title": "Intent",
             "type": "string"

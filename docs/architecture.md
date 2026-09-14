@@ -2247,6 +2247,18 @@ The tool boundary follows explicit work intent. An ordinary conversation gets
 no host or MCP action tools. A known agent/team mention, explicit target, or
 `delegate` intent enables action tools for that role. This keeps conversation
 and delegated work visibly distinct while reusing the same concierge runtime.
+The `code` and `workload` intents are stronger product-level choices: they route
+through Angie to the existing managed runner selected by the person, and agent
+mentions remain part of the runner's ask instead of starting parallel chat
+participants. The code and workload engines retain their own planning, review,
+revision, budget, and publication contracts.
+
+Peer chat remains a bounded deliberation surface rather than another execution
+engine. Agents decide when another role's judgment is useful and may return a
+review to an earlier author or coordinator for revision and synthesis. Four
+handoff levels admit that return path, while the per-response and per-turn caps
+bound cycles. Read-only inheritance blocks external mutations without blocking
+textual critique, revision, or synthesis.
 
 Authentication is the daemon's own. `sbxloop api client create` registers a
 client (`api_clients`: a name, the scrypt verifier of a secret shown once,
