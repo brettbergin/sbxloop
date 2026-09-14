@@ -288,6 +288,8 @@ def test_doctor_names_the_credential_endpoint_and_policy_host(
     assert endpoint.ok and not endpoint.hard
     assert endpoint.detail.startswith("answers from the host (served https://models.example.com")
     assert "agent sandbox can reach it is a separate question" in endpoint.detail
+    calls = "model calls go to https://models.example.com/v1/chat/completions"
+    assert f'{calls} ([agent.openai] api = "auto")' in endpoint.detail
     assert not any("copilot" in name.lower() for name in rows)
     assert "OPENAI_API_KEY (agent backend: openai)" not in rows
 

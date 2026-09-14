@@ -78,12 +78,52 @@ def _clean_json(value: Any) -> Any:
     return value
 
 
-def _session_fingerprint(job: JobRequest, specs: list[HostToolSpec]) -> str:
+_WRITE_TOOLS = ("write_file", "shell")
+
+
+def _tool_boundary(job: JobRequest, local: list[str]) -> str | None:
+    """Describe the worker workspace as the governed local tools see it.
+
+    Every native Codex tool is disabled and the runtime keeps the
+    ``read-only`` sandbox as defense in depth, so a native executor that
+    slipped through could still not write. Codex renders that sandbox label
+    into the model's environment context, and a capable model obeys it: it
+    refuses to call ``write_file`` and reports that it needs a writable
+    session. The label is accurate only for the disabled native tools, so
+    say which governed tools can change the workspace. Sessions without
+    local tools (the concierge, response-only corrections) act only through
+    host tools, which describe themselves; they get no note.
+    """
+    if not local:
+        return None
+    writers = [name for name in _WRITE_TOOLS if name in local]
+    if job.permission_mode != "read_only" and writers:
+        names = " and ".join(writers)
+        return (
+            "Workspace access in this session: the workspace is writable. If your "
+            "environment context describes a read-only sandbox, that describes only "
+            "Codex's native tools, which are disabled here. The function tools "
+            f"{names} are provided by the sbxloop worker, run directly in the "
+            "workspace, and can create, modify and delete files there. When the task "
+            f"requires changing files, make the changes with {names}; do not stop "
+            "or report that the session is read-only."
+        )
+    return (
+        "Workspace access in this session: the workspace is read-only. The function "
+        f"tools {', '.join(local)} can inspect it; no function tool in this session "
+        "writes workspace files or runs commands in the workspace. Do not attempt "
+        "to modify the workspace."
+    )
+
+
+def _session_fingerprint(job: JobRequest, specs: list[HostToolSpec], boundary: str | None) -> str:
     """Bind persisted SDK tools to the capabilities currently authorized.
 
     Codex cannot replace dynamic tool definitions when resuming a thread.
     The protocol's opaque session handle carries their fingerprint so a
     changed tool roster/schema, persona or workspace starts fresh instead.
+    The workspace-access note is bound too: a thread opened without it (or
+    with different wording) may already have concluded it cannot write.
     """
     manifest = {
         "sdk": SDK_VERSION,
@@ -93,6 +133,7 @@ def _session_fingerprint(job: JobRequest, specs: list[HostToolSpec]) -> str:
         "system_message": job.system_message,
         "cwd": job.cwd,
         "model": job.model,
+        "tool_boundary": boundary,
     }
     return hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
 
@@ -129,13 +170,21 @@ class CodexBackend:
         self.ensure_available()
         deadline = time.monotonic() + job.timeout_s
         state = _SessionState(job, emit, deadline)
-        fingerprint = _session_fingerprint(job, state.specs)
+        boundary = _tool_boundary(job, list(state.local))
+        fingerprint = _session_fingerprint(job, state.specs, boundary)
         resume_id = _resume_thread_id(job.resume_session_id, fingerprint)
         with authenticated_client(
             job.cwd,
             timeout_s=max(0.0, deadline - time.monotonic()),
             approval_handler=state.handle_request,
         ) as client:
+            # The native sandbox stays read-only for every session. The SDK's
+            # other modes (workspace-write, danger-full-access, and the turn
+            # level externalSandbox policy) would make the rendered label
+            # match what write_file and shell can do, but each widens what a
+            # native executor could do if one were ever re-enabled. The
+            # governed tools run outside Codex's sandbox either way; the
+            # developer note from _tool_boundary corrects the model instead.
             params: dict[str, Any] = {
                 "modelProvider": "openai",
                 "approvalPolicy": "never",
@@ -145,11 +194,15 @@ class CodexBackend:
                 params["cwd"] = job.cwd
             if job.model and job.model != "auto":
                 params["model"] = job.model
-            if job.system_preset:
-                if job.system_message:
-                    params["developerInstructions"] = job.system_message
-            else:
+            # baseInstructions replaces Codex's base prompt, so only a
+            # system_preset=False job sets it. The workspace-access note is a
+            # developer instruction in both cases, after the job's own brief,
+            # and is sent on resume as well as on start.
+            if not job.system_preset:
                 params["baseInstructions"] = job.system_message or ""
+            brief = job.system_message if job.system_preset else None
+            if developer := "\n\n".join(text for text in (brief, boundary) if text):
+                params["developerInstructions"] = developer
             opened = None
             if resume_id:
                 try:

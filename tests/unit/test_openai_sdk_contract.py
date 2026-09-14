@@ -16,10 +16,16 @@ from typing import Any
 
 import pytest
 
-from sbxloop_worker.backends.openai import SESSION_DIR_ENV, OpenAIBackend
+from sbxloop_worker.backends.openai import (
+    SESSION_DIR_ENV,
+    EndpointRequestRejected,
+    OpenAIBackend,
+)
 from sbxloop_worker.protocol import (
+    OPENAI_API_ENV,
     OPENAI_BASE_URL_ENV,
     OPENAI_KEY_NAME_ENV,
+    OPENAI_REASONING_EFFORT_ENV,
     OPENAI_RETRIES_ENV,
     OPENAI_TIMEOUT_ENV,
     EventTypes,
@@ -38,7 +44,9 @@ class Stub:
         self.headers: list[dict[str, str]] = []
         self.models_status = 200
         self.reject_stream_options = False
+        self.reject_chat_tools = False
         self.replies: list[list[dict[str, Any]]] = []
+        self.responses_replies: list[list[dict[str, Any]]] = []
 
     def next_reply(self) -> list[dict[str, Any]]:
         return self.replies.pop(0)
@@ -47,6 +55,15 @@ class Stub:
 def sse(chunks: list[dict[str, Any]]) -> bytes:
     body = b"".join(f"data: {json.dumps(chunk)}\n\n".encode() for chunk in chunks)
     return body + b"data: [DONE]\n\n"
+
+
+def responses_sse(events: list[dict[str, Any]]) -> bytes:
+    """The responses stream: each event named on its own ``event:`` line,
+    numbered, with no ``[DONE]`` sentinel."""
+    return b"".join(
+        f"event: {event['type']}\ndata: {json.dumps({**event, 'sequence_number': n})}\n\n".encode()
+        for n, event in enumerate(events)
+    )
 
 
 def make_handler(stub: Stub) -> type[BaseHTTPRequestHandler]:
@@ -79,11 +96,29 @@ def make_handler(stub: Stub) -> type[BaseHTTPRequestHandler]:
             length = int(self.headers.get("Content-Length") or 0)
             request = json.loads(self.rfile.read(length))
             stub.requests.append(request)
+            if self.path == "/v1/responses" and stub.responses_replies:
+                self._send(200, responses_sse(stub.responses_replies.pop(0)), "text/event-stream")
+                return
             if self.path != "/v1/chat/completions":
                 self._send(404, b'{"error": {"message": "no such route"}}', "application/json")
                 return
             if stub.reject_stream_options and "stream_options" in request:
                 body = b'{"error": {"message": "stream_options is not supported", "type": "x"}}'
+                self._send(400, body, "application/json")
+                return
+            if stub.reject_chat_tools and request.get("tools"):
+                body = json.dumps(
+                    {
+                        "error": {
+                            "message": "Function tools with reasoning_effort are not supported "
+                            "for stub-model in /v1/chat/completions. To use function tools, "
+                            "use /v1/responses or set reasoning_effort to 'none'.",
+                            "type": "invalid_request_error",
+                            "param": "reasoning_effort",
+                            "code": None,
+                        }
+                    }
+                ).encode()
                 self._send(400, body, "application/json")
                 return
             if not stub.replies:
@@ -274,3 +309,134 @@ def test_real_sdk_reduces_a_server_error_to_a_named_failure(
     assert result.failure is not None
     assert result.failure.category == "unavailable" and result.failure.http_status == 503
     assert "'stub-model'" in result.failure.reason
+
+
+def test_real_sdk_reduces_the_field_400_to_a_rejected_request(
+    tmp_path: Path, stub: tuple[Stub, str]
+) -> None:
+    state, _ = stub
+    state.reject_chat_tools = True
+    with pytest.raises(EndpointRequestRejected) as raised:
+        OpenAIBackend().run_session(make_job(tmp_path), lambda event, **data: None)
+    assert raised.value.http_status == 400
+    assert 'api = "responses"' in str(raised.value)
+    assert KEY not in str(raised.value)
+
+
+RESPONSE = {"object": "response", "model": "stub-model", "status": "completed"}
+
+
+def responses_tool_reply(call_id: str, name: str, arguments: str) -> list[dict[str, Any]]:
+    reasoning = {
+        "id": "rs_1",
+        "type": "reasoning",
+        "summary": [],
+        "content": [],
+        "encrypted_content": "opaque-reasoning-blob",
+    }
+    call = {
+        "id": "fc_1",
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+        "status": "completed",
+    }
+    usage = {
+        "input_tokens": 15,
+        "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+        "output_tokens": 6,
+        "output_tokens_details": {"reasoning_tokens": 4},
+        "total_tokens": 21,
+    }
+    return [
+        {"type": "response.created", "response": {**RESPONSE, "id": "r1", "output": []}},
+        {"type": "response.output_item.done", "output_index": 0, "item": reasoning},
+        {
+            "type": "response.function_call_arguments.delta",
+            "output_index": 1,
+            "item_id": "fc_1",
+            "delta": arguments,
+        },
+        {"type": "response.output_item.done", "output_index": 1, "item": call},
+        {
+            "type": "response.completed",
+            "response": {**RESPONSE, "id": "r1", "output": [reasoning, call], "usage": usage},
+        },
+    ]
+
+
+def responses_text_reply(text: str) -> list[dict[str, Any]]:
+    message = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": text, "annotations": [], "logprobs": []}],
+    }
+    usage = {
+        "input_tokens": 30,
+        "input_tokens_details": {"cached_tokens": 4, "cache_write_tokens": 0},
+        "output_tokens": 5,
+        "output_tokens_details": {"reasoning_tokens": 0},
+        "total_tokens": 35,
+    }
+    return [
+        {"type": "response.created", "response": {**RESPONSE, "id": "r2", "output": []}},
+        {
+            "type": "response.output_text.delta",
+            "output_index": 0,
+            "content_index": 0,
+            "item_id": "msg_1",
+            "delta": text,
+            "logprobs": [],
+        },
+        {"type": "response.output_item.done", "output_index": 0, "item": message},
+        {
+            "type": "response.completed",
+            "response": {**RESPONSE, "id": "r2", "output": [message], "usage": usage},
+        },
+    ]
+
+
+def test_real_sdk_streams_the_responses_api_over_the_wire(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stub: tuple[Stub, str]
+) -> None:
+    state, _ = stub
+    monkeypatch.setenv(OPENAI_API_ENV, "responses")
+    monkeypatch.setenv(OPENAI_REASONING_EFFORT_ENV, "low")
+    state.responses_replies = [
+        responses_tool_reply("call_read", "read_file", '{"path": "input.txt"}'),
+        responses_text_reply('{"verified": true}'),
+    ]
+    events: list[tuple[str, dict[str, Any]]] = []
+    result = OpenAIBackend().run_session(
+        make_job(tmp_path), lambda event, **data: events.append((event, data))
+    )
+    assert result.failure is None
+    assert result.output_json == {"verified": True}
+    assert result.usage is not None
+    assert (result.usage.input_tokens, result.usage.output_tokens) == (45, 11)
+    assert result.usage.cache_read_tokens == 4 and result.usage.model == "stub-model"
+    assert [e for e, _ in events].count(EventTypes.AGENT_TOOL_END) == 1
+
+    first, second = state.requests
+    assert first["model"] == "stub-model" and first["stream"] is True
+    assert first["store"] is False and first["include"] == ["reasoning.encrypted_content"]
+    assert first["reasoning"] == {"effort": "low"}
+    assert first["tools"][0]["type"] == "function" and first["tools"][0]["strict"] is False
+    assert "messages" not in first and "stream_options" not in first
+    reasoning, call, output = second["input"][1:]
+    assert reasoning["type"] == "reasoning"
+    assert reasoning["encrypted_content"] == "opaque-reasoning-blob"
+    assert (call["type"], call["call_id"], call["arguments"]) == (
+        "function_call",
+        "call_read",
+        '{"path": "input.txt"}',
+    )
+    # What the SDK's own models add on the way in (None-valued optional
+    # fields, python-side aliases) never goes back out.
+    assert "async_" not in call and None not in call.values()
+    assert output["type"] == "function_call_output" and output["call_id"] == "call_read"
+    assert "fixture evidence" in output["output"]
+    assert all(h.get("authorization") == f"Bearer {KEY}" for h in state.headers)

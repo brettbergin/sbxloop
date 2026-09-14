@@ -85,7 +85,61 @@
   `[budgets] max_verify_reauthors_per_task` (default 1); 0 restores the old
   behaviour.
 
+- **The `openai` backend speaks the Responses API.** `[agent.openai] api`
+  selects the wire API: `chat` calls `/v1/chat/completions`, `responses`
+  calls `/v1/responses`, and `auto` (the default) picks `responses` when
+  `base_url`'s host is `api.openai.com` and `chat` for every other host, so
+  self-hosted servers keep the API they serve. The responses loop is the
+  same governed loop as chat (tool-call ceiling, deadline, events,
+  redaction): it sends the tools as responses function tools with
+  `store: false`, keeps the model's reasoning items with their encrypted
+  content in the worker-held transcript and sends them back on the next
+  call, and maps its usage into the same token counts. A transcript made
+  under one API is never replayed under the other; a resume that requires
+  it fails closed naming both. `[agent.openai] reasoning_effort`, unset by
+  default, sends a reasoning effort when set. Both keys have a
+  `[github.repos.openai]` override, and doctor's endpoint row names the
+  path the model calls go to.
+
 ### Fixed
+
+- **A daemon run for a repository no longer starts in an empty directory.**
+  When the home's clone of a repository had failed, or left an empty or
+  non-git directory behind, a daemon run under the default
+  `workspace_isolation = "auto"` was provisioned into a bare per-run
+  directory: the agent reported no repository history and built the ask
+  from nothing. A code run for a repository with no host checkout now
+  clones the repository from its remote (authenticated with the run's
+  credential) or fails naming why. The home's `workspaces/<owner>/<name>`
+  counts as the repository's workspace only when it is the root of a git
+  checkout, and a leftover directory with files in it is never cloned over
+  or removed. A configured workspace that is not a git checkout is refused
+  for a repository run under `auto`, naming the path and the fix (point it
+  at a checkout, remove the setting, or set `in-place`), instead of being
+  mounted as the repository.
+
+- **A request the OpenAI endpoint rejects no longer parks the run as a
+  provider hold.** Under `[agent] backend = "openai"`, an HTTP 400 or 422
+  (for example a model that refuses function tools with reasoning on
+  `/v1/chat/completions`) was reported as a provider failure of unknown
+  kind, so every phase parked the run with "reset unknown; explicit
+  operator recovery required" although no recovery could make the same
+  request succeed. It now fails the phase with the endpoint's own reason,
+  the model, the API the request went to, and the `api` setting to change
+  when the reason points at the other API. Throttles, outages and refused
+  credentials keep their provider handling.
+
+- **Codex build sessions write to the workspace again.** With
+  `[agent] backend = "codex"` a builder could refuse every change, saying the
+  session permits only filesystem reads and needs a new session with write
+  access, while its verify commands still ran. The adapter keeps Codex's own
+  sandbox read-only because every native Codex tool is disabled, and Codex
+  tells the model about that sandbox; nothing told it that the worker's
+  `write_file` and `shell` tools are the writable path. Sessions that expose
+  those tools now carry a developer instruction saying the workspace is
+  writable through them and that changes must be made with them; read-only
+  sessions are told plainly that they cannot modify the workspace. A Codex
+  thread opened before this change starts fresh instead of resuming.
 
 - **A run sandbox that is already gone at cleanup no longer reports a
   failure.** A run tears down each of its agent, github and service boxes at

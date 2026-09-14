@@ -17,10 +17,13 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.provision import Provisioner, agent_policy_allows
 from sbxloop.sbx.secretstate import parse_secret_ls_entry, tracked_custom_secrets
 from sbxloop_worker.protocol import (
+    OPENAI_API_ENV,
     OPENAI_BASE_URL_ENV,
     OPENAI_KEY_NAME_ENV,
+    OPENAI_REASONING_EFFORT_ENV,
     OPENAI_RETRIES_ENV,
     OPENAI_TIMEOUT_ENV,
+    resolve_openai_api,
 )
 from tests.conftest import FakeSbx
 
@@ -199,7 +202,89 @@ def test_worker_env_names_are_not_config_settings(
     monkeypatch.setenv(OPENAI_KEY_NAME_ENV, "OPENAI_API_KEY")
     monkeypatch.setenv(OPENAI_TIMEOUT_ENV, "600")
     monkeypatch.setenv(OPENAI_RETRIES_ENV, "2")
+    monkeypatch.setenv(OPENAI_API_ENV, "responses")
+    monkeypatch.setenv(OPENAI_REASONING_EFFORT_ENV, "high")
     assert load_config().agent.backend == "copilot"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "api", "resolved"),
+    [
+        ("https://api.openai.com/v1", "auto", "responses"),
+        ("https://API.OpenAI.com/v1", "auto", "responses"),
+        ("https://models.example.com/v1", "auto", "chat"),
+        ("http://vllm:8000/v1", "auto", "chat"),
+        ("https://api.openai.com.proxy.example/v1", "auto", "chat"),
+        ("https://api.openai.com/v1", "chat", "chat"),
+        ("http://vllm:8000/v1", "responses", "responses"),
+    ],
+)
+def test_api_auto_is_responses_only_on_the_hosted_api(
+    tmp_path: Path, base_url: str, api: str, resolved: str
+) -> None:
+    config = openai_config(tmp_path, base_url, api=api)
+    assert config.agent.openai.api == api
+    assert config.agent.openai.resolved_api() == resolved
+    assert resolve_openai_api(api, base_url) == resolved
+
+
+def test_api_and_reasoning_effort_default_to_auto_and_unset(tmp_path: Path) -> None:
+    settings = openai_config(tmp_path).agent.openai
+    assert (settings.api, settings.reasoning_effort) == ("auto", None)
+
+
+@pytest.mark.parametrize(
+    "openai",
+    [
+        {"api": "completions"},
+        {"reasoning_effort": "extreme"},
+        {"reasoning_effort": ""},
+    ],
+)
+def test_api_and_reasoning_effort_are_validated_at_load(
+    tmp_path: Path, openai: dict[str, str]
+) -> None:
+    with pytest.raises(ValidationError):
+        openai_config(tmp_path, **openai)
+    key = next(iter(openai))
+    with pytest.raises(ValidationError, match=key):
+        Config.model_validate(
+            {"github": {"repos": [{"repo": "o/r", "openai": openai}]}},
+        )
+
+
+def test_api_and_reasoning_effort_reach_the_worker_per_repository(tmp_path: Path) -> None:
+    config = Config.model_validate(
+        {
+            "home": str(tmp_path / "state"),
+            "agent": {
+                "backend": "openai",
+                "openai": {"base_url": "https://api.openai.com/v1", "reasoning_effort": "high"},
+            },
+            "github": {
+                "repos": [
+                    {
+                        "repo": "o/private",
+                        "openai": {"base_url": "https://p.internal:8443/v1"},
+                    },
+                    {"repo": "o/pinned", "openai": {"api": "chat", "reasoning_effort": "low"}},
+                    {"repo": "o/other"},
+                ]
+            },
+        }
+    )
+    provisioner = Provisioner(SbxCLI(binary="unused"), config, env={"OPENAI_API_KEY": "key"})
+    delivered = {
+        repo: provisioner.build_specs(f"r-{repo}", tmp_path, repo=repo)[0].persistent_env
+        for repo in ("o/private", "o/pinned", "o/other")
+    }
+    assert delivered["o/other"][OPENAI_API_ENV] == "responses"
+    assert delivered["o/other"][OPENAI_REASONING_EFFORT_ENV] == "high"
+    # The override's own host settles auto again: a private box speaks chat.
+    assert delivered["o/private"][OPENAI_API_ENV] == "chat"
+    assert delivered["o/private"][OPENAI_REASONING_EFFORT_ENV] == "high"
+    assert delivered["o/pinned"][OPENAI_API_ENV] == "chat"
+    assert delivered["o/pinned"][OPENAI_REASONING_EFFORT_ENV] == "low"
 
 
 # -- the descriptor ----------------------------------------------------------
@@ -335,7 +420,9 @@ def test_spec_routes_the_worker_to_the_endpoint_and_keeps_the_key_off_the_agent_
         OPENAI_KEY_NAME_ENV: "VLLM_KEY",
         OPENAI_TIMEOUT_ENV: "42.5",
         OPENAI_RETRIES_ENV: "0",
+        OPENAI_API_ENV: "chat",
     }
+    assert OPENAI_REASONING_EFFORT_ENV not in agent.persistent_env  # unset sends nothing
     assert "key" not in json.dumps(agent.persistent_env)
     assert "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC" not in agent.persistent_env
     assert "VLLM_KEY" not in github.persistent_env

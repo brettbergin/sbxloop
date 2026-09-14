@@ -84,6 +84,8 @@ def test_openai_endpoint_selection_is_documented_in_the_shipped_examples() -> No
         "# request_timeout_s = ",
         "# max_retries = ",
         "# allow_insecure_endpoint = ",
+        "# api = ",
+        "# reasoning_effort = ",
         "# [github.repos.openai]",
     ):
         assert key in DEFAULT_CONFIG_TOML, key
@@ -93,6 +95,8 @@ def test_openai_endpoint_selection_is_documented_in_the_shipped_examples() -> No
         "`[agent.openai] api_key_env`",
         "`[agent.openai] request_timeout_s` / `max_retries`",
         "`[agent.openai] allow_insecure_endpoint`",
+        "`[agent.openai] api`",
+        "`[agent.openai] reasoning_effort`",
         "`[github.repos.openai] base_url`",
     ):
         assert key in guide, key
