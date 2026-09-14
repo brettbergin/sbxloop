@@ -50,6 +50,17 @@ PAGE_DEFAULT = 50
 PAGE_MAX = 200
 
 
+def _visible_agent_reply(text: str, work_products: tuple[str, ...]) -> str:
+    """Keep handoff routing private while publishing every completed artifact."""
+    reply = text.strip()
+    artifacts: list[str] = []
+    for value in work_products:
+        artifact = value.strip()
+        if artifact and artifact not in reply and artifact not in artifacts:
+            artifacts.append(artifact)
+    return "\n\n".join((*artifacts, reply)) if artifacts else reply
+
+
 class ApiContext:
     def __init__(
         self,
@@ -316,10 +327,10 @@ class ApiContext:
                     handoff=handoff if allow_actions else None,
                 )
                 reply = future.result()
-                if reply.ok and reply.text:
+                if reply.ok and (reply.text or reply.work_products):
                     delivered = store.append_reply(
                         turn.id,
-                        content=reply.text,
+                        content=_visible_agent_reply(reply.text, reply.work_products),
                         agent_slug=target,
                         now=self.clock(),
                         participant_index=index,
