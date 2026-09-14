@@ -42,6 +42,7 @@ from sbxloop.api.collaboration_schemas import (
     PreferenceDefinitionOut,
     PreferenceOut,
     PreferenceUpdate,
+    ReactionSet,
     ServiceDefinitionOut,
     TeamCreate,
     TeamOut,
@@ -236,6 +237,7 @@ def _message_out(message: Message) -> MessageOut:
         agent_slug=message.agent_slug,
         created_at=rfc3339(message.created_at) or "",
         work=ChannelWorkOut.model_validate(message.work) if message.work else None,
+        reactions=list(message.reactions),
     )
 
 
@@ -930,6 +932,33 @@ async def list_messages(
     if messages is None:
         raise Problem(404, "channel_not_found", "channel not found")
     return [_message_out(message) for message in messages]
+
+
+@router.put("/channels/{channel_id}/messages/{message_id}/reaction", response_model=MessageOut)
+async def set_message_reaction(
+    channel_id: str,
+    message_id: str,
+    body: ReactionSet,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+) -> MessageOut:
+    user = await ctx.call(_local_user, ctx, auth)
+    try:
+        message = await ctx.call(
+            ctx.collaboration.set_message_reaction,
+            user.id,
+            channel_id,
+            message_id,
+            emoji=body.emoji,
+            active=body.active,
+            now=ctx.clock(),
+        )
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
+    if message is None:
+        raise Problem(404, "message_not_found", "message not found")
+    ctx.hub.notify()
+    return _message_out(message)
 
 
 @router.get("/channels/{channel_id}/work", response_model=list[ChannelWorkOut])
