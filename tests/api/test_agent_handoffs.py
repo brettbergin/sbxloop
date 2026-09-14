@@ -12,6 +12,7 @@ import pytest
 
 from sbxloop import telemetry
 from sbxloop.api.collaboration import CollaborationError
+from sbxloop.api.context import _visible_agent_reply
 from sbxloop.daemon.concierge import ConciergeReply
 from sbxloop.errors import ToolRejectedError
 from sbxloop.log import configure_logging
@@ -109,6 +110,25 @@ def test_handoff_work_product_is_visible_and_reaches_the_peer(api: Any, tmp_path
         assert checklist in client.jobs[1].prompt
     finally:
         concierge.close()
+
+
+def test_visible_reply_does_not_repeat_a_reformatted_work_product() -> None:
+    artifact = (
+        "## Angie Release Checklist\n"
+        "- [ ] Verify the intended version is running.\n"
+        "- [ ] Exercise one canary workload from intake through publication.\n"
+        "- [ ] Confirm the rollback trigger and responsible owner."
+    )
+    reply = (
+        "Here is the completed checklist.\n\n"
+        "## Angie Release Checklist\n"
+        "- Verify the intended version is running.\n"
+        "- Exercise one canary workload from intake through publication.\n"
+        "- Confirm the rollback trigger and responsible owner.\n\n"
+        "The critic is reviewing it now."
+    )
+
+    assert _visible_agent_reply(reply, (artifact,)) == reply
 
 
 @pytest.fixture

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -48,6 +49,20 @@ IN_FLIGHT_LIMIT = 8
 #: Page sizes for every collection.
 PAGE_DEFAULT = 50
 PAGE_MAX = 200
+_CONTENT_WORD = re.compile(r"\w+")
+
+
+def _work_product_is_visible(artifact: str, reply: str) -> bool:
+    """Recognize the same artifact despite ordinary Markdown presentation changes."""
+    if artifact in reply:
+        return True
+    artifact_words = _CONTENT_WORD.findall(artifact.casefold())
+    reply_words = _CONTENT_WORD.findall(reply.casefold())
+    if len(artifact_words) < 12 or len(reply_words) < len(artifact_words) * 0.5:
+        return False
+    artifact_vocabulary = set(artifact_words)
+    overlap = artifact_vocabulary.intersection(reply_words)
+    return len(overlap) / len(artifact_vocabulary) >= 0.8
 
 
 def _visible_agent_reply(text: str, work_products: tuple[str, ...]) -> str:
@@ -56,7 +71,7 @@ def _visible_agent_reply(text: str, work_products: tuple[str, ...]) -> str:
     artifacts: list[str] = []
     for value in work_products:
         artifact = value.strip()
-        if artifact and artifact not in reply and artifact not in artifacts:
+        if artifact and not _work_product_is_visible(artifact, reply) and artifact not in artifacts:
             artifacts.append(artifact)
     return "\n\n".join((*artifacts, reply)) if artifacts else reply
 
