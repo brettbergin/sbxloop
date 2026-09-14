@@ -227,7 +227,46 @@ def test_tombstone_cancels_queued_work_and_drops_late_reply(api: Any) -> None:
     assert api.client.delete(f"/v1/channels/{channel}", headers=headers).status_code == 204
     assert not store.start_turn(turn.id, api.clock())
     assert store.append_reply(turn.id, content="late", agent_slug=None, now=api.clock()) is None
+    from sbxloop.db.collaboration_models import MessageRow, TurnRow
+
+    with api.loop.dstore.read() as session:
+        cancelled = session.get(TurnRow, turn.id)
+        input_message = session.get(MessageRow, turn.input_message_id)
+        assert cancelled is not None and cancelled.status == "cancelled"
+        assert cancelled.error == "The channel was deleted before this turn finished."
+        assert input_message is not None
+        assert input_message.reactions_json == '["⏳", "⚠"]'
     assert api.client.get("/v1/channels", headers=headers).json()["items"] == []
+
+
+def test_tombstone_settles_a_turn_when_a_late_reply_arrives(api: Any) -> None:
+    headers = bearer(register(api))
+    channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    user = api.ctx.collaboration.user_by_username("owner")
+    assert user is not None
+    store = api.ctx.collaboration
+    turn = store.accept_turn(
+        user.id,
+        channel,
+        content="hello",
+        targets=(),
+        client_turn_id="late-reply-race",
+        client_message_id=None,
+        actor=None,
+        now=api.clock(),
+    )[0]
+    assert store.start_turn(turn.id, api.clock())
+    assert api.client.delete(f"/v1/channels/{channel}", headers=headers).status_code == 204
+    assert store.append_reply(turn.id, content="late", agent_slug=None, now=api.clock()) is None
+
+    from sbxloop.db.collaboration_models import MessageRow, TurnRow
+
+    with api.loop.dstore.read() as session:
+        cancelled = session.get(TurnRow, turn.id)
+        input_message = session.get(MessageRow, turn.input_message_id)
+        assert cancelled is not None and cancelled.status == "cancelled"
+        assert input_message is not None
+        assert input_message.reactions_json == '["⏳", "⚠"]'
 
 
 def test_deleting_channel_stops_remaining_team_members(api: Any) -> None:

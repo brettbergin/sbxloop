@@ -456,6 +456,31 @@ class CollaborationStore:
         )
         return int(newest or 0) + 1
 
+    @staticmethod
+    def _cancel_deleted_channel_turn(session: Any, turn: TurnRow, now: float) -> None:
+        """Settle a turn whose channel was tombstoned during dispatch."""
+        reason = "The channel was deleted before this turn finished."
+        turn.status = "cancelled"
+        turn.error = reason
+        turn.completed_at = now
+        progress = json.loads(turn.participants_json)
+        for participant in progress:
+            if participant["status"] in {"queued", "running"}:
+                participant["status"] = "cancelled"
+        turn.participants_json = json.dumps(progress)
+        input_message = session.get(MessageRow, turn.input_message_id)
+        if input_message is not None:
+            reactions = [str(value) for value in json.loads(input_message.reactions_json or "[]")]
+            if "⚠" not in reactions:
+                reactions.append("⚠")
+            input_message.reactions_json = json.dumps(reactions, ensure_ascii=False)
+        _event(
+            session,
+            "collaboration.turn.cancelled",
+            now,
+            data={"channel_id": turn.channel_id, "turn_id": turn.id, "error": reason},
+        )
+
     def list_messages(
         self, user_id: str, channel_id: str, *, after: int = 0
     ) -> list[Message] | None:
@@ -584,8 +609,7 @@ class CollaborationStore:
                 return False
             channel = session.get(ChannelRow, turn.channel_id)
             if channel is None or channel.state != "active":
-                turn.status = "cancelled"
-                turn.completed_at = now
+                self._cancel_deleted_channel_turn(session, turn, now)
                 return False
             turn.status = "running"
             turn.started_at = now
@@ -612,8 +636,7 @@ class CollaborationStore:
                 return None
             channel = session.get(ChannelRow, turn.channel_id)
             if channel is None or channel.state != "active":
-                turn.status = "cancelled"
-                turn.completed_at = now
+                self._cancel_deleted_channel_turn(session, turn, now)
                 return None
             message_id = "msg_" + _token(16)
             session.execute(

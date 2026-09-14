@@ -172,6 +172,56 @@ def test_chat_messages_carry_turn_status_and_user_feedback_reactions(api: Any) -
     assert api.client.put(route, headers=headers, json={"emoji": "not-emoji"}).status_code == 422
 
 
+def test_failed_and_cancelled_turns_receive_warning_reactions(api: Any) -> None:
+    class FailingConcierge(FakeConcierge):
+        def submit_turn(self, text: str, **kwargs: Any) -> Future[ConciergeReply]:
+            self.calls.append({"text": text, **kwargs})
+            future: Future[ConciergeReply] = Future()
+            future.set_result(ConciergeReply("", ok=False, error="provider unavailable"))
+            return future
+
+    api.ctx.concierge = FailingConcierge()
+    headers = bearer(register(api))
+    channel_id = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    failed = api.client.post(
+        f"/v1/channels/{channel_id}/turns",
+        headers=headers,
+        json={"content": "fail"},
+    ).json()
+
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        turn = api.client.get(
+            f"/v1/channels/{channel_id}/turns/{failed['turn']['id']}", headers=headers
+        ).json()
+        if turn["status"] == "failed":
+            break
+        time.sleep(0.01)
+    assert turn["status"] == "failed"
+    messages = api.client.get(f"/v1/channels/{channel_id}/messages", headers=headers).json()
+    assert messages[0]["reactions"] == ["⏳", "⚠"]
+
+    user = api.ctx.collaboration.user_by_username("owner")
+    assert user is not None
+    cancelled, _, _ = api.ctx.collaboration.accept_turn(
+        user.id,
+        channel_id,
+        content="cancel",
+        targets=(),
+        client_turn_id="cancel-reaction",
+        client_message_id=None,
+        actor=None,
+        now=api.clock(),
+    )
+    result = api.ctx.collaboration.cancel_turn(user.id, channel_id, cancelled.id, api.clock())
+    assert result is not None and result.status == "cancelled"
+    messages = api.client.get(f"/v1/channels/{channel_id}/messages", headers=headers).json()
+    cancelled_input = next(
+        message for message in messages if message["id"] == cancelled.input_message_id
+    )
+    assert cancelled_input["reactions"] == ["⏳", "⚠"]
+
+
 def test_ordinary_conversation_cannot_use_action_tools(api: Any) -> None:
     concierge = FakeConcierge()
     api.ctx.concierge = concierge
