@@ -241,7 +241,7 @@ class TurnCreate(ApiModel):
     target_slugs: list[str] = Field(default_factory=list, max_length=16)
     client_turn_id: str | None = Field(default=None, max_length=128)
     client_message_id: str | None = Field(default=None, max_length=128)
-    intent: Literal["conversation", "delegate"] = "conversation"
+    intent: Literal["conversation", "delegate", "code", "workload"] = "conversation"
 
 
 class ParticipantOut(ApiModel):

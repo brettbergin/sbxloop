@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import re
 import threading
 import time
 from collections.abc import Callable
@@ -48,6 +49,35 @@ IN_FLIGHT_LIMIT = 8
 #: Page sizes for every collection.
 PAGE_DEFAULT = 50
 PAGE_MAX = 200
+_CONTENT_WORD = re.compile(r"\w+")
+_RUNNER_INTENT = {
+    "code": (
+        "\n\nThe person explicitly selected sbxloop's Code runner for this turn. "
+        "Coordinate the request into one managed repository run through the existing issue "
+        "intake tools. Do not simulate its planner, builder, reviewer, fix rounds, CI, or merge "
+        "stages with chat handoffs. If the configured repository or observed symptom is genuinely "
+        "ambiguous, ask only for the missing intake fact required by the existing code-run policy."
+    ),
+    "workload": (
+        "\n\nThe person explicitly selected sbxloop's Workload runner for this turn. "
+        "Call start_workload once with their request and let the existing plan, execute, judge, "
+        "revision, and publish stages carry it to completion. Do not simulate those stages with "
+        "chat handoffs."
+    ),
+}
+
+
+def _work_product_is_visible(artifact: str, reply: str) -> bool:
+    """Recognize the same artifact despite ordinary Markdown presentation changes."""
+    if artifact in reply:
+        return True
+    artifact_words = _CONTENT_WORD.findall(artifact.casefold())
+    reply_words = _CONTENT_WORD.findall(reply.casefold())
+    if len(artifact_words) < 12 or len(reply_words) < len(artifact_words) * 0.5:
+        return False
+    artifact_vocabulary = set(artifact_words)
+    overlap = artifact_vocabulary.intersection(reply_words)
+    return len(overlap) / len(artifact_vocabulary) >= 0.8
 
 
 def _visible_agent_reply(text: str, work_products: tuple[str, ...]) -> str:
@@ -56,7 +86,7 @@ def _visible_agent_reply(text: str, work_products: tuple[str, ...]) -> str:
     artifacts: list[str] = []
     for value in work_products:
         artifact = value.strip()
-        if artifact and artifact not in reply and artifact not in artifacts:
+        if artifact and not _work_product_is_visible(artifact, reply) and artifact not in artifacts:
             artifacts.append(artifact)
     return "\n\n".join((*artifacts, reply)) if artifacts else reply
 
@@ -268,8 +298,9 @@ class ApiContext:
             previous_errors = len(errors)
             definition = AGENTS_BY_SLUG.get(target) if target else None
             persona = (definition.persona if definition else ANGIE_PERSONA) + preference_context
+            persona += _RUNNER_INTENT.get(intent, "")
             # Mentioning a role is explicit delegation in Angie's UI.
-            allow_actions = intent == "delegate" or definition is not None
+            allow_actions = intent in {"delegate", "code", "workload"} or definition is not None
             read_only = bool(participant.get("read_only")) or target == "critic"
             prompt = content
             if participant.get("parent_index") is not None:

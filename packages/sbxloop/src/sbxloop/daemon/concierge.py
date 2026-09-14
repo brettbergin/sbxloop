@@ -578,10 +578,20 @@ class Concierge:
         available_tools = self._chat_tools()
         persona = self._turn_persona or ""
         if self._turn_read_only:
-            persona += "\n\nThis peer request inherits read-only access. Inspect and advise only."
+            persona += (
+                "\n\nThis peer request inherits read-only tool access. You may analyze, "
+                "critique, revise, and synthesize text or artifacts already present in the "
+                "chat. Do not mutate external state, dispatch managed work, or claim to have "
+                "verified evidence you cannot access."
+            )
         if "handoff_agent" in available_tools:
             persona += (
-                "\n\nUse handoff_agent to ask a native peer for help when needed. "
+                "\n\nUse handoff_agent for a bounded discussion or refinement when a native "
+                "peer's distinct judgment will materially improve the answer. Do not recreate "
+                "sbxloop's execution pipelines with chat handoffs: repository work belongs in "
+                "its code runner, and research, documents, data, or other deliverables belong "
+                "in start_workload, whose own planner, executor, judge, revision budget, and "
+                "publisher carry the work to completion. "
                 "An @mention in prose does not invoke an agent. Handoffs are asynchronous: "
                 "the peer runs after this response and answers in the shared chat. "
                 "Complete your assigned work before handing it off, and put the concrete result "
@@ -589,10 +599,16 @@ class Concierge:
                 "review or extend completed work; it does not replace your deliverable. Never "
                 "answer only with coordination status such as 'queued' or 'nothing to do until'. "
                 "After queuing, finish your response without polling or inventing the "
-                "peer's reply. "
-                "You may ping the sender back if they need to synthesize the result. "
-                "Stay within the user's request. Each response can ask two peers, with at "
-                "most six handoffs and three levels per user turn. Read-only access is inherited."
+                "peer's reply. Own the original user's outcome as well as your immediate peer "
+                "request. Use the original request and shared transcript to decide whether the "
+                "result is ready for the person. If feedback requires an earlier artifact to be "
+                "revised, or a coordinating peer to synthesize the final answer, hand your "
+                "concrete result to the peer best equipped for that next step and say exactly "
+                "what remains. When you receive review feedback, incorporate it into revised "
+                "work before handing that work onward. Stop when the user's requested result is "
+                "consumable; do not follow a fixed role order or hand off merely to report status. "
+                "Stay within the user's request. Each response can ask two peers, with at most "
+                "six handoffs and four levels per user turn. Read-only tool access is inherited."
             )
         if not self._turn_allow_actions:
             persona += (

@@ -1007,7 +1007,16 @@ async def create_turn(
             "the sbxloop concierge is disabled or still starting",
         )
     user = await ctx.call(_local_user, ctx, auth)
-    targets = await _targets(ctx, user, body.content, body.target_slugs)
+    runner_selected = body.intent in {"code", "workload"}
+    if runner_selected and body.target_slugs:
+        raise Problem(
+            422,
+            "runner_target_conflict",
+            "Code and workload runner turns are coordinated by Angie; omit target_slugs.",
+        )
+    # Agent mentions remain part of an explicit runner ask, but do not seed
+    # parallel chat participants. The runner owns its own internal roles.
+    targets = () if runner_selected else await _targets(ctx, user, body.content, body.target_slugs)
     intent = "delegate" if targets else body.intent
     try:
         turn, message, created = await ctx.call(

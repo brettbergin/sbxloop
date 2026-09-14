@@ -6,6 +6,8 @@ import time
 from concurrent.futures import Future
 from typing import Any
 
+import pytest
+
 from sbxloop.daemon.concierge import ConciergeReply
 
 
@@ -240,6 +242,51 @@ def test_ordinary_conversation_cannot_use_action_tools(api: Any) -> None:
         time.sleep(0.01)
     assert concierge.calls[0]["allow_actions"] is False
     assert concierge.calls[0]["session_key"] == f"{channel_id}:angie"
+
+
+@pytest.mark.parametrize(
+    ("intent", "contract"),
+    [
+        ("code", "selected sbxloop's Code runner"),
+        ("workload", "selected sbxloop's Workload runner"),
+    ],
+)
+def test_explicit_runner_selection_uses_angie_and_existing_pipeline(
+    api: Any, intent: str, contract: str
+) -> None:
+    concierge = FakeConcierge()
+    api.ctx.concierge = concierge
+    headers = bearer(register(api))
+    channel_id = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+
+    response = api.client.post(
+        f"/v1/channels/{channel_id}/turns",
+        headers=headers,
+        json={"content": "@critic prepare this result", "intent": intent},
+    )
+    assert response.status_code == 202, response.text
+    assert response.json()["turn"]["targets"] == []
+
+    deadline = time.monotonic() + 2
+    while not concierge.calls and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert concierge.calls[0]["agent_role"] == "concierge"
+    assert concierge.calls[0]["allow_actions"] is True
+    assert contract in concierge.calls[0]["persona"]
+    assert "Do not simulate" in concierge.calls[0]["persona"]
+
+
+def test_runner_selection_rejects_explicit_chat_targets(api: Any) -> None:
+    api.ctx.concierge = FakeConcierge()
+    headers = bearer(register(api))
+    channel_id = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    response = api.client.post(
+        f"/v1/channels/{channel_id}/turns",
+        headers=headers,
+        json={"content": "ship this", "intent": "code", "target_slugs": ["builder"]},
+    )
+    assert response.status_code == 422
+    assert response.json()["code"] == "runner_target_conflict"
 
 
 def test_preferences_are_durable_and_injected_into_new_turns(api: Any) -> None:

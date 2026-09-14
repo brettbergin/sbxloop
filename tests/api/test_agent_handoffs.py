@@ -12,6 +12,7 @@ import pytest
 
 from sbxloop import telemetry
 from sbxloop.api.collaboration import CollaborationError
+from sbxloop.api.context import _visible_agent_reply
 from sbxloop.daemon.concierge import ConciergeReply
 from sbxloop.errors import ToolRejectedError
 from sbxloop.log import configure_logging
@@ -29,6 +30,29 @@ class HandoffConcierge(FakeConcierge):
             assert kwargs["handoff"]("critic", "Check the proposed plan") == first
         elif role == "critic":
             kwargs["handoff"]("builder", "Explain how you would address the concern")
+        return super().submit_turn(text, **kwargs)
+
+
+class RevisionLoopConcierge(FakeConcierge):
+    """Agents choose a review return path; the transport only runs the queue."""
+
+    def submit_turn(self, text: str, **kwargs: Any) -> Any:
+        index = len(self.calls)
+        role = kwargs["agent_role"]
+        if index == 0:
+            assert role == "concierge"
+            kwargs["handoff"]("planner", "Draft the requested artifact.")
+        elif index == 1:
+            assert role == "planner"
+            kwargs["handoff"]("critic", "Review this draft and identify material gaps.")
+        elif index == 2:
+            assert role == "critic"
+            kwargs["handoff"]("planner", "Revise the draft to address these findings.")
+        elif index == 3:
+            assert role == "planner"
+            kwargs["handoff"]("concierge", "Give the person this revised final artifact.")
+        else:
+            assert index == 4 and role == "concierge"
         return super().submit_turn(text, **kwargs)
 
 
@@ -57,6 +81,38 @@ def test_tool_handoffs_run_with_peer_context_and_inherited_read_only(api: Any) -
     assert done["targets"] == ["planner"]
     messages = api.client.get(f"/v1/channels/{channel}/messages", headers=headers).json()
     assert len([m for m in messages if m["kind"] == "agent_handoff"]) == 2
+
+
+def test_agents_can_choose_a_bounded_review_revision_and_synthesis_loop(api: Any) -> None:
+    concierge = RevisionLoopConcierge()
+    api.ctx.concierge = concierge
+    headers = bearer(register(api))
+    channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    accepted = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "@concierge prepare and review a release checklist"},
+    ).json()
+    done = settled(api.client, headers, channel, accepted["turn"]["id"])
+
+    assert done["status"] == "completed", done
+    assert [call["agent_role"] for call in concierge.calls] == [
+        "concierge",
+        "planner",
+        "critic",
+        "planner",
+        "concierge",
+    ]
+    assert [call["read_only"] for call in concierge.calls] == [
+        False,
+        False,
+        True,
+        True,
+        True,
+    ]
+    assert "Completed result from @critic:\nreply from critic" in concierge.calls[3]["text"]
+    assert "Completed result from @planner:\nreply from planner" in concierge.calls[4]["text"]
+    assert all(participant["status"] == "completed" for participant in done["participants"])
 
 
 def test_handoff_work_product_is_visible_and_reaches_the_peer(api: Any, tmp_path: Path) -> None:
@@ -109,6 +165,25 @@ def test_handoff_work_product_is_visible_and_reaches_the_peer(api: Any, tmp_path
         assert checklist in client.jobs[1].prompt
     finally:
         concierge.close()
+
+
+def test_visible_reply_does_not_repeat_a_reformatted_work_product() -> None:
+    artifact = (
+        "## Angie Release Checklist\n"
+        "- [ ] Verify the intended version is running.\n"
+        "- [ ] Exercise one canary workload from intake through publication.\n"
+        "- [ ] Confirm the rollback trigger and responsible owner."
+    )
+    reply = (
+        "Here is the completed checklist.\n\n"
+        "## Angie Release Checklist\n"
+        "- Verify the intended version is running.\n"
+        "- Exercise one canary workload from intake through publication.\n"
+        "- Confirm the rollback trigger and responsible owner.\n\n"
+        "The critic is reviewing it now."
+    )
+
+    assert _visible_agent_reply(reply, (artifact,)) == reply
 
 
 @pytest.fixture
@@ -311,11 +386,13 @@ def test_handoff_limits_scope_cancellation_and_restart(api: Any) -> None:
     store.participant_started(turn, 3, api.clock())
     ask(3, "critic")
     store.participant_started(turn, 4, api.clock())
+    ask(4, "operator")
+    store.participant_started(turn, 5, api.clock())
     with pytest.raises(CollaborationError, match="depth"):
-        ask(4, "operator")
+        ask(5, "builder")
     store.cancel_turn(user, channel, turn, api.clock())
     with pytest.raises(CollaborationError):
-        ask(4, "builder")
+        ask(5, "builder")
     assert store.recover_turns(api.clock()) == []
     assert store.get_turn(user, channel, turn).status == "cancelled"
 

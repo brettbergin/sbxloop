@@ -80,10 +80,20 @@ original behavior.
 
 An ordinary turn talks to Angie without host or MCP action tools. A known
 `@agent`, an enabled `@team`, explicit `target_slugs`, or `intent=delegate`
-records work intent and enables the corresponding concierge tools. Team members
-receive separate role-scoped sessions and their replies are persisted as
-separate messages. Repeating a `client_turn_id` returns the accepted turn;
-reusing it for different text, targets, intent, or message identity is rejected.
+records work intent and enables the corresponding concierge tools. Product
+clients can instead send `intent=code` or `intent=workload` to select one of
+sbxloop's managed runners explicitly. Angie coordinates that turn without
+seeding agent mentions as parallel chat participants: the code runner owns its
+decompose/build/review/fix/CI/merge lifecycle, and the workload runner owns its
+plan/execute/judge/revise/publish lifecycle. Explicit runner intents cannot be
+combined with `target_slugs`.
+
+Team members receive separate role-scoped sessions and their replies are
+persisted as separate messages. Conversational peers choose their own bounded
+handoffs and may return review findings to an author or coordinator for revision
+and final synthesis; the transport does not encode a role sequence. Repeating a
+`client_turn_id` returns the accepted turn; reusing it for different text,
+targets, intent, or message identity is rejected.
 
 Messages include a `reactions` array. User inputs receive `⏳` when accepted,
 then `✅` after successful completion or `⚠` after failure or cancellation.

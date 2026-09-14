@@ -32,6 +32,13 @@ from sbxloop.db.collaboration_models import (
 )
 from sbxloop.ids import _token
 
+MAX_HANDOFFS_PER_TURN = 6
+MAX_HANDOFFS_PER_RESPONSE = 2
+# Four hops admit a bounded review return path such as coordinator -> author
+# -> reviewer -> author -> coordinator. The agents choose the path; this is a
+# circuit breaker, not a workflow definition.
+MAX_HANDOFF_DEPTH = 4
+
 
 class CollaborationError(Exception):
     def __init__(self, code: str, message: str) -> None:
@@ -1112,16 +1119,19 @@ class CollaborationStore:
             if agent_slug == source_slug:
                 raise CollaborationError("invalid_handoff", "Address a different agent.")
             handed = [p for p in progress if p.get("parent_index") is not None]
-            if len(handed) >= 6:
+            if len(handed) >= MAX_HANDOFFS_PER_TURN:
                 raise CollaborationError(
                     "handoff_limit", "This turn has reached its six-handoff limit."
                 )
-            if sum(p.get("parent_index") == source_index for p in handed) >= 2:
+            if (
+                sum(p.get("parent_index") == source_index for p in handed)
+                >= MAX_HANDOFFS_PER_RESPONSE
+            ):
                 raise CollaborationError(
                     "handoff_limit", "Each response can request at most two peers."
                 )
             depth = int(source.get("depth", 0)) + 1
-            if depth > 3:
+            if depth > MAX_HANDOFF_DEPTH:
                 raise CollaborationError(
                     "handoff_limit", "This turn has reached its handoff depth limit."
                 )
