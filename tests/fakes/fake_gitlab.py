@@ -429,6 +429,7 @@ class FakeGitlab(GitlabOps):
             "project_id": PROJECT_ID,
             "title": mr["title"],
             "description": mr.get("description"),
+            "labels": list(mr.get("labels", [])),
             "state": mr["state"],
             "draft": mr["title"].startswith("Draft:"),
             "source_branch": mr["source_branch"],
@@ -581,6 +582,11 @@ class FakeGitlab(GitlabOps):
         if tail == "" and method == "PUT":
             assert body is not None
             self.mr_updates.append((iid, dict(body)))
+            if "add_labels" in body:
+                labels = mr.setdefault("labels", [])
+                for label in str(body["add_labels"]).split(","):
+                    if label and label not in labels:
+                        labels.append(label)
             if "title" in body:
                 mr["title"] = str(body["title"])
             if "description" in body:

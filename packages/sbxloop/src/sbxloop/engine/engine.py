@@ -2838,7 +2838,7 @@ class LoopEngine:
         label = sinks.result_label(self.config.workload.result_label)
         try:
             ensure_label(p.ops, repo, label)
-            p.ops.issue_labels_add(repo, pr.number, [label.name])
+            p.ops.pr_labels_add(repo, pr.number, [label.name])
         except GithubOpsError:
             # The result is delivered; a label it could not carry is not a
             # reason to fail the run (the same rule as `_label_pr`).
@@ -3207,7 +3207,7 @@ class LoopEngine:
         if not labels or p.ops is None or p.repo is None:
             return
         try:
-            p.ops.issue_labels_add(p.repo, number, labels)
+            p.ops.pr_labels_add(p.repo, number, labels)
         except GithubOpsError:
             log.warning(
                 "deliver.pr_labels_failed", run=p.run_id, pr=number, labels=labels, exc_info=True

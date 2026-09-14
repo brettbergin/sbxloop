@@ -1426,6 +1426,33 @@ class TestSinks:
         assert harness.run_states() == WORKLOAD_STATES
         assert [e for e in harness.events if e.type == HostEventTypes.RUN_DELIVER] == []
 
+    def test_gitlab_pr_sink_labels_the_merge_request(
+        self, harness: Harness, profiled: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tests.fakes.fake_gitlab import FakeGitlab
+
+        monkeypatch.setenv("GITLAB_TOKEN", "fake-gitlab-token")
+        self._upstream(harness, monkeypatch)
+        fake = FakeGitlab(repo="o/docs")
+        fake.seed_issue(1, "Unrelated issue", labels=["triage"])
+        harness.script(
+            [
+                plan(needing("t1", sink="pr", repo="o/docs")),
+                {"text": "## Result\nupdated", "files": {"docs/new.md": "# new\n"}},
+                PASS,
+            ]
+        )
+        engine = harness.engine(
+            **{**profiled, "workloads": [{**PUBLISHING, "repo": True}]},
+            ops=fake,
+            github={"repo": "o/docs"},
+            vcs={"kind": "gitlab", "api_url": "https://gitlab.example/api/v4"},
+        )
+        result = engine.start("update the docs", kind="workload")
+        assert result.state == "completed", result.reason
+        assert fake.merge_requests[1]["labels"] == ["sbxloop:result"]
+        assert fake.issues[1]["labels"] == ["triage"]
+
     def test_the_pr_sink_needs_the_tasks_own_checkout(
         self, harness: Harness, profiled: dict[str, Any]
     ) -> None:

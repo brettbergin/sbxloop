@@ -1580,6 +1580,10 @@ class GithubOps:
         """Put ``labels`` on the issue or pull request (existing ones stay)."""
         self.raw("POST", f"/repos/{repo}/issues/{number}/labels", {"labels": list(labels)})
 
+    def pr_labels_add(self, repo: str, number: int, labels: Sequence[str]) -> None:
+        """GitHub shares the labels endpoint between issues and pull requests."""
+        self.issue_labels_add(repo, number, labels)
+
     def issue_label_remove(self, repo: str, number: int | str, label: str) -> None:
         """Take ``label`` off the issue; one that is not there is a success,
         not a failed job (#558)."""

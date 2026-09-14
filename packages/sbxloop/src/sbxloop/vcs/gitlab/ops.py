@@ -551,6 +551,10 @@ class GitlabOps(JobBackend):
     def issue_labels_add(self, repo: str, number: int | str, labels: Sequence[str]) -> None:
         self.raw("PUT", self._issue_path(repo, number), {"add_labels": ",".join(labels)})
 
+    def pr_labels_add(self, repo: str, number: int, labels: Sequence[str]) -> None:
+        """Add MR labels without replacing existing labels or touching an issue."""
+        self.raw("PUT", self._mr_path(repo, number), {"add_labels": ",".join(labels)})
+
     def issue_label_remove(self, repo: str, number: int | str, label: str) -> None:
         """Take ``label`` off the issue; one that is not there is a success."""
         self.raw("PUT", self._issue_path(repo, number), {"remove_labels": label})
