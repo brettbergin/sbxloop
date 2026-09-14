@@ -4116,6 +4116,7 @@ class LoopEngine:
                 ops,
                 repo,
                 run.head_sha,
+                number=run.pr_number,
                 cfg=self.config.landing,
                 tick=partial(self._tick, p),
                 emit=emit,
@@ -4141,7 +4142,13 @@ class LoopEngine:
                 "ci",
                 checks.summary(),
                 failed_checks=tuple(
-                    c for c in ops.checks_failed_logs(repo, run.head_sha) if c.name in checks.fix
+                    c
+                    for c in (
+                        ops.change_failed_logs(repo, run.pr_number, run.head_sha)
+                        if run.pr_number is not None
+                        else ops.checks_failed_logs(repo, run.head_sha)
+                    )
+                    if c.name in checks.fix
                 ),
                 checks=checks,
             )

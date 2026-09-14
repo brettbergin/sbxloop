@@ -209,6 +209,7 @@ def poll_checks(
     settle_from: float | None = None,
     policy: CheckPolicy = NO_POLICY,
     policy_for: PolicyFor | None = None,
+    number: int | None = None,
 ) -> CheckJudgment:
     """Wait for the checks on ``head_sha`` to reach a final state, judged
     under ``policy`` (:mod:`sbxloop.engine.checks`, #611) — or, when
@@ -233,7 +234,11 @@ def poll_checks(
     settle_from = started if settle_from is None else settle_from
     last: CheckJudgment | None = None
     while True:
-        verdict = ops.pr_checks(repo, head_sha)
+        verdict = (
+            ops.pr_checks(repo, head_sha)
+            if number is None
+            else ops.change_checks(repo, number, head_sha)
+        )
         checks = judge_checks(verdict, policy_for(head_sha) if policy_for else policy)
         if checks != last:
             emit(
@@ -796,7 +801,7 @@ def land(
             bots_named.add(bot_reviewers)
             emit("land.bot_standing", pr=number, reviewers=list(bot_reviewers))
         policy = policy_for(head)
-        checks = judge_checks(ops.pr_checks(repo, head), policy)
+        checks = judge_checks(ops.change_checks(repo, number, head), policy)
         if (
             checks.state == "green"
             and checks.verdict.total == 0
@@ -812,6 +817,7 @@ def land(
                     ops,
                     repo,
                     head,
+                    number=number,
                     cfg=cfg,
                     tick=tick,
                     emit=functools.partial(emit, "landing.checks", pr=number, head=head),
@@ -842,7 +848,7 @@ def land(
                 "ci",
                 checks.summary(),
                 failed_checks=tuple(
-                    c for c in ops.checks_failed_logs(repo, head) if c.name in checks.fix
+                    c for c in ops.change_failed_logs(repo, number, head) if c.name in checks.fix
                 ),
                 checks=checks,
             )

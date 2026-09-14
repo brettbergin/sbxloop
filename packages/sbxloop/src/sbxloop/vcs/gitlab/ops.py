@@ -581,6 +581,62 @@ class GitlabOps(JobBackend):
     def _statuses(self, repo: str, sha: str) -> list[Any]:
         return self.raw_pages(f"{self._project(repo)}/repository/commits/{sha}/statuses")
 
+    def _change_statuses(self, repo: str, number: int, sha: str) -> tuple[str, list[Any]]:
+        """Follow this MR's current pipeline, including its temporary merge commit."""
+        mr = self._merge_request(repo, number)
+        waiting = [{"name": "GitLab pipeline", "status": "pending"}]
+        if mr.get("sha") != sha:
+            return repo, waiting
+        pipeline = mr.get("head_pipeline")
+        if pipeline is None:
+            if mr.get("detailed_merge_status") in ("ci_still_running", "checking", "preparing"):
+                return repo, waiting
+            return repo, self._statuses(repo, sha)
+        if not isinstance(pipeline, dict):
+            raise GithubOpsError("GitLab returned an unreadable merge request pipeline")
+        pipeline_id, tested = pipeline.get("id"), pipeline.get("sha")
+        if (
+            type(pipeline_id) is not int
+            or pipeline_id <= 0
+            or not isinstance(tested, str)
+            or not tested
+        ):
+            raise GithubOpsError("GitLab returned an incomplete merge request pipeline")
+        project = str(pipeline.get("project_id") or repo)
+        if tested != sha:
+            commit = self.commit_get(project, tested)
+            if sha not in [p["sha"] for p in commit["parents"]]:
+                return repo, waiting
+        query = urlencode({"pipeline_id": pipeline_id})
+        path = (
+            f"{self._project(project)}/repository/commits/{quote(tested, safe='')}/statuses?{query}"
+        )
+        rows = self.raw_pages(path)
+        status = str(pipeline.get("status") or "")
+        verdict = fold_statuses(rows)
+        if not rows or (status not in ("success", "skipped") and verdict.state == "green"):
+            rows.append(
+                {
+                    "name": "GitLab pipeline",
+                    "status": status,
+                    "description": str(
+                        pipeline.get("yaml_errors") or f"Pipeline {pipeline_id}: {status}"
+                    ),
+                    "target_url": pipeline.get("web_url"),
+                }
+            )
+        return project, rows
+
+    def change_checks(self, repo: str, number: int, sha: str) -> ChecksVerdict:
+        _, rows = self._change_statuses(repo, number, sha)
+        return fold_statuses(rows)
+
+    def change_failed_logs(
+        self, repo: str, number: int, sha: str, *, max_chars: int = 6000
+    ) -> list[FailedCheck]:
+        project, rows = self._change_statuses(repo, number, sha)
+        return self._failed_logs(project, rows, max_chars=max_chars)
+
     def pr_checks(self, repo: str, sha: str) -> ChecksVerdict:
         """Every commit status on ``sha`` — CI jobs and external statuses
         alike, the one namespace GitLab keeps — folded to one verdict."""
@@ -599,10 +655,13 @@ class GitlabOps(JobBackend):
         job — GitLab's status rows are its job rows — **field-unverified**
         beyond the API's documented shape (#1016 posted external statuses,
         which have no trace and answer 404, the fallback here)."""
+        return self._failed_logs(repo, self._statuses(repo, sha), max_chars=max_chars)
+
+    def _failed_logs(self, repo: str, rows: Sequence[Any], *, max_chars: int) -> list[FailedCheck]:
         head = min(1500, max_chars)
         tail = max_chars - head
         failed: list[FailedCheck] = []
-        for row in latest_statuses(self._statuses(repo, sha)):
+        for row in latest_statuses(rows):
             record = check_run_record(row)
             if record["conclusion"] in (None, "success", "skipped", "neutral", "action_required"):
                 continue

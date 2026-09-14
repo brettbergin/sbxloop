@@ -363,6 +363,7 @@ class FakeGitlab(GitlabOps):
         status: str,
         *,
         allow_failure: bool = False,
+        pipeline_id: int = 1,
         description: str = "",
         target_url: str = "",
         trace: str | None = None,
@@ -378,7 +379,7 @@ class FakeGitlab(GitlabOps):
                 "allow_failure": allow_failure,
                 "description": description or None,
                 "target_url": target_url or None,
-                "pipeline_id": 1,
+                "pipeline_id": pipeline_id,
             }
         )
         if trace is not None:
@@ -425,6 +426,7 @@ class FakeGitlab(GitlabOps):
             "source_branch": mr["source_branch"],
             "target_branch": mr["target_branch"],
             "sha": mr["sha"],
+            "head_pipeline": mr.get("head_pipeline"),
             "merge_commit_sha": mr.get("merge_commit_sha"),
             "squash_commit_sha": None,
             "author": self._user(mr.get("author_id", self.user_id)),
@@ -1092,7 +1094,11 @@ class FakeGitlab(GitlabOps):
             return [p for p in self.pipelines if p.get("ref") == ref]
         if match := re.fullmatch(r"/repository/commits/([^/]+)/statuses", rest):
             sha = match.group(1)
-            return list(self.statuses.get(sha, []))
+            rows = self.statuses.get(sha, [])
+            pipeline = params.get("pipeline_id")
+            return [
+                row for row in rows if not pipeline or str(row.get("pipeline_id")) == pipeline[0]
+            ]
         if match := re.fullmatch(r"/statuses/([^/]+)", rest):
             assert body is not None
             self.statuses_posted.append((match.group(1), dict(body)))

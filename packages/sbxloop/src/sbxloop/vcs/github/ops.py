@@ -648,6 +648,15 @@ class GithubOps:
             raise GithubOpsError(f"pr_get returned a malformed result: {data!r}")
         return data
 
+    def change_checks(self, repo: str, number: int, sha: str) -> ChecksVerdict:
+        """GitHub attaches a change's checks to its source head."""
+        return self.pr_checks(repo, sha)
+
+    def change_failed_logs(
+        self, repo: str, number: int, sha: str, *, max_chars: int = 6000
+    ) -> list[FailedCheck]:
+        return self.checks_failed_logs(repo, sha, max_chars=max_chars)
+
     def pr_checks(self, repo: str, sha: str) -> ChecksVerdict:
         """Every check run AND commit status on ``sha``, folded to one
         verdict (#610). "No CI" means both lists empty — a repository
