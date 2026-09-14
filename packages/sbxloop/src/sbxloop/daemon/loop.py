@@ -3647,7 +3647,14 @@ class DaemonLoop:
         log.debug("workspace.refresh_start", path=str(source))
         started = time.monotonic()
         try:
-            result = hostgit.refresh_from_origin(source)
+            token = (
+                self.github.provisioner.clone_token(repo)
+                if self.github is not None and repo is not None
+                else None
+            )
+            result = hostgit.refresh_from_origin(
+                source, token=token, credential_url=self.config.forge_web_url(repo)
+            )
         except ProvisionError as exc:
             self._notice(
                 "workspace.refresh_failed",
