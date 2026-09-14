@@ -32,6 +32,7 @@ from sbxloop.errors import GithubOpsError, RoleNotImplemented
 from sbxloop.log import get_logger
 from sbxloop.vcs.github.ops import fold_review_verdicts, fold_reviews, user_identity
 from sbxloop.vcs.github.review_locations import right_side_ranges
+from sbxloop.vcs.gitlab import request_changes
 from sbxloop.vcs.gitlab.changes import (
     change_record,
     file_record,
@@ -171,16 +172,15 @@ class GitlabOps(JobBackend):
     # a paid tier and a per-project setting: the free tier has none
     # (verified) and a Premium instance is field-unverified, so the
     # backend cannot decide from the class alone — the landing probes
-    # the project (#1019). ``request_changes_review`` is UNSUPPORTED
-    # because CE records the state and does not enforce it: reading a
-    # recorded state as a merge gate would wait on something the forge
-    # ignores. ``signed_api_commits`` is the default install's answer;
+    # the project (#1019). Blocking reviews are also a licensed feature:
+    # a GraphQL read confirms it per merge request before submission.
+    # ``signed_api_commits`` is the default install's answer;
     # an instance with signing configured is field-unverified.
     CAPABILITIES: ClassVar[dict[str, Capability]] = {
         "merge_queue": Capability.UNKNOWN,
         "review_threads": Capability.SUPPORTED,
         "draft_changes": Capability.SUPPORTED,
-        "request_changes_review": Capability.UNSUPPORTED,
+        "request_changes_review": Capability.UNKNOWN,
         "short_lived_token": Capability.UNSUPPORTED,
         "remote_commit": Capability.SUPPORTED,
         "required_checks_introspection": Capability.SUPPORTED,
@@ -188,7 +188,8 @@ class GitlabOps(JobBackend):
         "signed_api_commits": Capability.UNSUPPORTED,
     }
     CAPABILITY_NOTE: ClassVar[str] = (
-        "merge trains are a paid tier and a per-project setting; the landing asks the project"
+        "merge trains and blocking reviews depend on the project; "
+        "landing and review submission probe their support"
     )
     #: The operations this backend does not answer yet, as ``Role.operation``;
     #: each raises :class:`RoleNotImplemented`, and the doctor lists them.
@@ -211,6 +212,7 @@ class GitlabOps(JobBackend):
         # this object made, so a reply and a url need no second read.
         self._note_discussion: dict[tuple[str, int, int], str] = {}
         self._mr_urls: dict[tuple[str, int], str] = {}
+        self._request_change_support: dict[tuple[str, int], Capability] = {}
         # The content role's staging (#1020): blobs by sha, trees by
         # handle, commits written on a pending branch, and each base
         # directory listed once, all per repository.
@@ -249,6 +251,9 @@ class GitlabOps(JobBackend):
         answers = {self._trains_of(payload) for payload in self._projects.values()}
         if len(answers) == 1:
             report["merge_queue"] = answers.pop()
+        review_answers = set(self._request_change_support.values())
+        if len(review_answers) == 1:
+            report["request_changes_review"] = review_answers.pop()
         return report
 
     @staticmethod
@@ -1230,6 +1235,41 @@ class GitlabOps(JobBackend):
             )
         return tuple(posted)
 
+    def _request_changes(self, repo: str, number: int) -> bool:
+        key = (repo, number)
+        self._request_change_support[key] = Capability.UNKNOWN
+        try:
+            api_url = self.transport.api_url if self.transport is not None else None
+            if not api_url or not api_url.rstrip("/").endswith("/api/v4"):
+                raise GithubOpsError("GitLab GraphQL API root is unavailable")
+            url = api_url.rstrip("/").removesuffix("/v4") + "/graphql"
+            before = request_changes.requesters(self.raw, url, repo, number)
+            if before is None:
+                self._request_change_support[key] = Capability.UNSUPPORTED
+                return False
+            login = self.authenticated_user().get("login")
+            if not isinstance(login, str) or not login:
+                raise GithubOpsError("GitLab review author could not be identified")
+            request_changes.submit(self.raw, url, repo, number)
+            after = request_changes.requesters(self.raw, url, repo, number)
+            if after is None or login not in after:
+                raise GithubOpsError("GitLab did not confirm this author's blocking review")
+            self._request_change_support[key] = Capability.SUPPORTED
+            return True
+        except GithubOpsError as exc:
+            log.warning(
+                "gitlab.request_changes_unconfirmed", repo=repo, mr=number, error=str(exc)[:300]
+            )
+            # CE schemas can omit the licensed field entirely. A successful
+            # metadata read can distinguish that from unread EE support.
+            try:
+                metadata = self.raw("GET", "/metadata")
+                if isinstance(metadata, dict) and metadata.get("enterprise") is False:
+                    self._request_change_support[key] = Capability.UNSUPPORTED
+            except GithubOpsError:
+                pass
+            return False
+
     def pr_review_create(
         self,
         repo: str,
@@ -1245,22 +1285,21 @@ class GitlabOps(JobBackend):
         so a push in between refuses it); an approval GitLab refuses (a
         Premium rule against the author approving, a stale head) falls
         back to a plain comment, and the returned ``event`` says so.
-        ``REQUEST_CHANGES`` is a comment with the finding count: the free
-        tier records a reviewer's requested changes and does not enforce
-        them (#1016), so the loop never claims a gate the forge does not
-        hold. A caller reads ``event`` to learn what was accepted.
+        ``REQUEST_CHANGES`` uses GraphQL and verifies the author appears
+        in the licensed blocking-review list. Unsupported or unconfirmed
+        submissions fall back to a comment. No pending drafts are published.
         """
         posted: tuple[PostedFinding, ...] = ()
         if comments:
             posted = self._post_discussions(repo, number, comments, self._diff_refs(repo, number))
         accepted: ReviewEvent = event
         text = body
-        if event == "REQUEST_CHANGES":
+        if event == "REQUEST_CHANGES" and not self._request_changes(repo, number):
             accepted = "COMMENT"
             text = (
-                f"{body}\n\n_Changes requested: {len(comments)} finding(s) inline. GitLab's "
-                "free tier records a requested change without holding the merge for it, "
-                "so this review does not gate._"
+                f"{body}\n\n_Changes requested: {len(comments)} finding(s) inline. "
+                "A blocking GitLab review was not confirmed; this feedback is recorded "
+                "as a comment. A maintainer should check the merge request's review gate._"
             )
         note = self._mr_note(repo, number, text)
         if event == "APPROVE":

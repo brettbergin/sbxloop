@@ -44,7 +44,7 @@ from urllib.parse import parse_qs, unquote
 
 from sbxloop.errors import GithubOpsError
 from sbxloop.vcs.gitlab.content import blob_sha
-from sbxloop.vcs.gitlab.ops import GitlabOps
+from sbxloop.vcs.gitlab.ops import GitlabOps, gitlab_transport
 from sbxloop.vcs.model import ChecksVerdict, FailedCheck
 
 WEB = "https://gitlab.example"
@@ -65,7 +65,13 @@ class FakeGitlab(GitlabOps):
         # Deliberately no super().__init__: there is no worker client.
         self.run_id = "fake"
         self.timeout_s = 0.0
-        self.transport = None
+        self.transport = gitlab_transport(f"{WEB}/api/v4")
+        self._request_change_support = {}
+        self.blocking_reviews = False
+        self.request_changes_ok = True
+        self.request_changes_recorded = True
+        self.graphql_errors: list[dict[str, Any]] = []
+        self.change_requesters: dict[int, list[str]] = {}
         self._projects = {}
         self._note_issue = {}
         self._bots = {}
@@ -701,6 +707,15 @@ class FakeGitlab(GitlabOps):
                     method, path, 409, "409 SHA does not match HEAD of source branch"
                 )
             self.seed_approval(iid, self.user_id)
+            self.seed_reviewer_state(iid, self.user_id, "approved")
+            self.change_requesters[iid] = [
+                name for name in self.change_requesters.get(iid, []) if name != self.user_login
+            ]
+            if (
+                not self.change_requesters[iid]
+                and mr["detailed_merge_status"] == "requested_changes"
+            ):
+                mr["detailed_merge_status"] = "mergeable"
             return {"approved": True, "user_has_approved": True}
         raise AssertionError(f"FakeGitlab: unexpected merge request call {method} {path}")
 
@@ -975,6 +990,54 @@ class FakeGitlab(GitlabOps):
     def raw(self, method: str, path: str, body: dict[str, Any] | None = None) -> Any:
         self.raw_calls.append((method, path, body))
         self._maybe_fail("raw")
+        if path == f"{WEB}/api/graphql" and method == "POST":
+            assert body is not None
+            if self.graphql_errors:
+                return {"errors": self.graphql_errors}
+            variables = body["variables"]
+            iid = int(variables["iid"])
+            assert variables["projectPath"] == self.repo
+            if "mutation" in body["query"]:
+                if not self.request_changes_ok:
+                    return {
+                        "data": {
+                            "mergeRequestRequestChanges": {
+                                "errors": ["Invalid permissions"],
+                                "mergeRequest": None,
+                            }
+                        }
+                    }
+                if self.request_changes_recorded:
+                    self.seed_reviewer_state(iid, self.user_id, "requested_changes")
+                    self.change_requesters.setdefault(iid, []).append(self.user_login)
+                    self.merge_requests[iid]["approvals"] = [
+                        uid for uid in self.merge_requests[iid]["approvals"] if uid != self.user_id
+                    ]
+                    if self.blocking_reviews:
+                        self.merge_requests[iid]["detailed_merge_status"] = "requested_changes"
+                return {
+                    "data": {
+                        "mergeRequestRequestChanges": {
+                            "errors": [],
+                            "mergeRequest": {"iid": str(iid)},
+                        }
+                    }
+                }
+            self._maybe_fail("change_requesters")
+            start = int(variables.get("after") or 0)
+            names = self.change_requesters.get(iid, [])
+            requesters = (
+                {
+                    "nodes": [{"username": name} for name in names[start : start + 100]],
+                    "pageInfo": {
+                        "hasNextPage": len(names) > start + 100,
+                        "endCursor": str(start + 100),
+                    },
+                }
+                if self.blocking_reviews
+                else None
+            )
+            return {"data": {"project": {"mergeRequest": {"changeRequesters": requesters}}}}
         full = path
         path, _, query = path.partition("?")
         params = parse_qs(query)

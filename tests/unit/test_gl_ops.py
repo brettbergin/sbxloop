@@ -473,7 +473,7 @@ class TestPolicy:
         assert report["remote_commit"] is Capability.SUPPORTED
         assert report["bot_identity"] is Capability.SUPPORTED
         assert report["required_checks_introspection"] is Capability.SUPPORTED
-        assert report["request_changes_review"] is Capability.UNSUPPORTED
+        assert report["request_changes_review"] is Capability.UNKNOWN
         assert report["short_lived_token"] is Capability.UNSUPPORTED
         assert report["signed_api_commits"] is Capability.UNSUPPORTED
         assert report["merge_queue"] is Capability.UNKNOWN
