@@ -482,6 +482,11 @@ class _Session:
         self.samples = 0
         self.turns = 0
         self.final_text = ""
+        # The final answer as the model sent it. ``final_text`` is redacted
+        # for display; JSON is extracted from this, then redacted as values
+        # (``_output_json``), because a text-level redaction of a key such as
+        # ``"credentials": []`` leaves ``***`` where the JSON needs a value.
+        self.final_raw = ""
         self.messages: list[dict[str, Any]] = []
         self.session_id: str | None = None
 
@@ -498,13 +503,13 @@ class _Session:
             self._converse()
             output_json = None
             if self.job.expect == "json":
-                output_json = extract_json(self.final_text)
+                output_json = self._output_json()
                 if output_json is None:
                     # One reask, then the runner's ExpectedJsonMissing:
                     # never an unbounded retry.
                     self.messages.append({"role": "user", "content": JSON_REASK})
                     self._converse()
-                    output_json = extract_json(self.final_text)
+                    output_json = self._output_json()
         except EndpointError as exc:
             self._persist()
             if exc.status in REJECTED_STATUSES:
@@ -562,6 +567,7 @@ class _Session:
                 self.messages.append(assistant)
             if not calls:
                 self.final_text = content
+                self.final_raw = reply["raw"]
                 return
             for call in calls:
                 text = self._dispatch(call["id"], call["name"], call["arguments"])
@@ -617,7 +623,8 @@ class _Session:
         ordered = [calls[index] for index in sorted(calls)]
         for call in ordered:
             call["id"] = safe_call_id(call["id"])
-        return {"content": self._clean("".join(content)), "tool_calls": ordered}
+        raw = "".join(content)
+        return {"content": self._clean(raw), "raw": raw, "tool_calls": ordered}
 
     def _respond(self) -> dict[str, Any]:
         """One streamed ``/v1/responses`` call: the output items to append
@@ -680,6 +687,7 @@ class _Session:
         items: list[dict[str, Any]] = []
         calls: list[dict[str, Any]] = []
         text: list[str] = []
+        unredacted: list[str] = []
         for entry in raw:
             if not isinstance(entry, dict):
                 continue
@@ -703,14 +711,16 @@ class _Session:
                         and part.get("type") == "output_text"
                         and isinstance(part.get("text"), str)
                     ):
+                        unredacted.append(part["text"])
                         part = {**part, "text": self._clean(part["text"])}
                         text.append(part["text"])
                     parts.append(part)
                 item["content"] = parts
             items.append(item)
         has_message = any(item.get("type") == "message" for item in items)
-        content = "".join(text) if has_message else self._clean("".join(deltas))
-        return {"content": content, "tool_calls": calls, "items": items}
+        raw_text = "".join(unredacted) if has_message else "".join(deltas)
+        content = "".join(text) if has_message else self._clean(raw_text)
+        return {"content": content, "raw": raw_text, "tool_calls": calls, "items": items}
 
     def _stream_error(self, error: dict[str, Any]) -> EndpointError:
         """A failure the endpoint reported inside the stream (``error`` or
@@ -1042,6 +1052,25 @@ class _Session:
         if self.settings.api_key:
             text = text.replace(self.settings.api_key, "[REDACTED]")
         return redact_secrets(text)
+
+    def _output_json(self) -> dict[str, Any] | list[Any] | None:
+        """The answer's JSON, extracted from the unredacted text and then
+        redacted value by value, the way the codex backend does it. The
+        text-level redactor rewrites ``"credentials": []`` (a key that names
+        a credential) to ``"credentials": ***``, which no longer parses:
+        extraction then fell back to a fragment nested inside the plan
+        (field failure: a WorkloadPlan read as ``['news.ycombinator.com']``)."""
+        cleaned: dict[str, Any] | list[Any] | None = self._clean_json(extract_json(self.final_raw))
+        return cleaned
+
+    def _clean_json(self, value: Any) -> Any:
+        if isinstance(value, str):
+            return self._clean(value)
+        if isinstance(value, list):
+            return [self._clean_json(item) for item in value]
+        if isinstance(value, dict):
+            return {self._clean(key): self._clean_json(item) for key, item in value.items()}
+        return value
 
     def _args(self, arguments: dict[str, Any]) -> str | None:
         if not arguments:
