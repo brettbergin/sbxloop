@@ -4,8 +4,9 @@ merge, as :class:`~sbxloop.vcs.model.BaseRequirements` (#1017).
 Field-verified on GitLab CE 19.3.2 (#1016, V2), with the credential a run
 holds — a Developer:
 
-- the protected branch (``GET /projects/:id/protected_branches/:name``)
-  is readable, and a 404 is "not protected": an answer;
+- protected branches are readable. The paginated collection is matched
+  against the base, including wildcard and inherited rules; a literal
+  branch's 404 alone does not prove that the base is unprotected;
 - the project's merge settings (``GET /projects/:id``) are readable:
   ``only_allow_merge_if_pipeline_succeeds`` means the *whole* pipeline
   must be green — CE names no required context, so the requirements
@@ -27,12 +28,14 @@ everything and the doctor says "unverifiable" rather than "fine".
 from __future__ import annotations
 
 from collections.abc import Mapping
+from fnmatch import fnmatchcase
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import quote, urlencode
 
 from sbxloop.errors import GithubOpsError
 from sbxloop.log import get_logger
-from sbxloop.vcs.model import BaseRequirements
+from sbxloop.vcs.jobs import MAX_PAGES, PAGE_SIZE
+from sbxloop.vcs.model import ApprovalRule, BaseRequirements
 
 log = get_logger(__name__)
 
@@ -45,9 +48,13 @@ def read_base_requirements(ops: Any, repo: str, base: str) -> BaseRequirements:
     ``raw_lookup``; the project path is spelt here."""
     project_path = f"/projects/{quote(repo, safe='')}"
     project = _read(ops, project_path)
-    protected = _read(
-        ops, f"{project_path}/protected_branches/{quote(base, safe='')}", missing=(404,)
-    )
+    protected = _read_pages(ops, f"{project_path}/protected_branches")
+    matches = []
+    if isinstance(protected, list):
+        if any(not isinstance(rule.get("name"), str) for rule in protected):
+            protected = _UNREAD
+        else:
+            matches = [rule for rule in protected if fnmatchcase(base, rule["name"])]
     enterprise = _enterprise(ops)
 
     unread = tuple(
@@ -56,10 +63,14 @@ def read_base_requirements(ops: Any, repo: str, base: str) -> BaseRequirements:
         if reading is _UNREAD
     )
     settings = project if isinstance(project, dict) else {}
-    rule = protected if isinstance(protected, dict) else {}
+    rule = {
+        "merge_access_levels": [
+            level for match in matches for level in match.get("merge_access_levels", [])
+        ]
+    }
     all_checks = settings.get("only_allow_merge_if_pipeline_succeeds") is True
     conversation = settings.get("only_allow_merge_if_all_discussions_are_resolved") is True
-    code_owners = rule.get("code_owner_approval_required") is True
+    code_owners = any(match.get("code_owner_approval_required") is True for match in matches)
     # Merge trains are a paid tier and a per-project setting (#1019):
     # ``true`` is a train the landing enters; ``false`` and the free tier's
     # ``null`` (field-verified) are a direct merge.
@@ -70,9 +81,11 @@ def read_base_requirements(ops: Any, repo: str, base: str) -> BaseRequirements:
     if enterprise is False:
         approvals = 0
     elif enterprise is True:
-        approvals = _approvals_required(ops, project_path, base)
+        approvals = _approvals_required(ops, project_path, base, protected=bool(matches))
     else:
         approvals = None
+    if approvals is None:
+        unread = (*unread, "approval_rules")
     if unread:
         return BaseRequirements(
             None,
@@ -84,12 +97,12 @@ def read_base_requirements(ops: Any, repo: str, base: str) -> BaseRequirements:
             unread=unread,
             forge=FORGE,
             all_checks_required=all_checks,
-            extra_blockers=extra,
+            extra_blockers=(*extra, f"GitLab requirements could not be read: {', '.join(unread)}"),
         )
     return BaseRequirements(
         (),
         approvals,
-        "protected_branch+project" if protected is not None else "project",
+        "protected_branch+project" if matches else "project",
         code_owner_review=code_owners,
         conversation_resolution=conversation,
         merge_queue=trains,
@@ -126,7 +139,16 @@ def _merge_access_blockers(settings: Mapping[str, Any], rule: Mapping[str, Any])
     ]
     if not numeric:
         return ()
-    required = min(numeric)
+    positive = [level for level in numeric if level > 0]
+    if not positive:
+        if any(
+            entry.get("user_id") or entry.get("group_id")
+            for entry in levels
+            if isinstance(entry, dict)
+        ):
+            return ()
+        return ("the base permits no direct merges through its protected branch rules",)
+    required = min(positive)
     permissions = settings.get("permissions")
     held = 0
     if isinstance(permissions, dict):
@@ -182,25 +204,97 @@ def _enterprise(ops: Any) -> bool | None:
     return flag if isinstance(flag, bool) else None
 
 
-def _approvals_required(ops: Any, project_path: str, base: str) -> int | None:
+def _approvals_required(ops: Any, project_path: str, base: str, *, protected: bool) -> int | None:
     """The approvals an enterprise project requires for ``base``: the
     largest ``approvals_required`` among the rules that apply to it —
     every rule with no branch restriction, plus the ones naming the
     branch. **Field-unverified** (no Premium instance in #1016)."""
-    rules = _read(ops, f"{project_path}/approval_rules")
+    rules = _read_pages(ops, f"{project_path}/approval_rules")
     if not isinstance(rules, list):
         return None
     required = 0
     for rule in rules:
-        if not isinstance(rule, dict):
-            continue
         branches = rule.get("protected_branches")
-        applies = not branches or any(
-            isinstance(b, dict) and b.get("name") == base for b in branches
-        )
+        if branches is not None and (
+            not isinstance(branches, list)
+            or any(not isinstance(b, dict) or not isinstance(b.get("name"), str) for b in branches)
+        ):
+            return None
+        applies = (
+            protected if rule.get("applies_to_all_protected_branches") else not branches
+        ) or any(fnmatchcase(base, b["name"]) for b in branches or [])
         if applies:
-            try:
-                required = max(required, int(rule.get("approvals_required") or 0))
-            except (TypeError, ValueError):
-                continue
+            count = rule.get("approvals_required")
+            if type(count) is not int or count < 0:
+                return None
+            required = max(required, count)
     return required
+
+
+def _read_pages(ops: Any, path: str) -> list[dict[str, Any]] | object:
+    rows: list[dict[str, Any]] = []
+    for page in range(1, MAX_PAGES + 1):
+        query = urlencode({"per_page": PAGE_SIZE, "page": page})
+        data = _read(ops, f"{path}?{query}")
+        if not isinstance(data, list) or any(not isinstance(row, dict) for row in data):
+            return _UNREAD
+        rows.extend(data)
+        if len(data) < PAGE_SIZE:
+            return rows
+    return _UNREAD
+
+
+def read_change_requirements(
+    ops: Any, repo: str, number: int, requirements: BaseRequirements
+) -> BaseRequirements:
+    """MR rules include overrides, code owners, and policy-generated requirements."""
+    if _enterprise(ops) is False:
+        return requirements
+    path = f"/projects/{quote(repo, safe='')}/merge_requests/{number}/approval_state"
+    data = _read(ops, path)
+    rows = data.get("rules") if isinstance(data, dict) else None
+    rules: list[ApprovalRule] = []
+    if isinstance(rows, list):
+        for row in rows:
+            if not isinstance(row, dict):
+                break
+            count, approved = row.get("approvals_required"), row.get("approved")
+            if type(count) is not int or count < 0 or not isinstance(approved, bool):
+                break
+            approvers = row.get("approved_by")
+            if not isinstance(approvers, list) or any(
+                not isinstance(user, dict) or not user.get("id") for user in approvers
+            ):
+                break
+            have = len({user["id"] for user in approvers})
+            rules.append(
+                ApprovalRule(str(row.get("name") or "Unnamed approval rule"), count, have, approved)
+            )
+        else:
+            unread = tuple(name for name in requirements.unread if name != "approval_rules")
+            extra = tuple(
+                b
+                for b in requirements.extra_blockers
+                if not b.startswith("GitLab requirements could not be read:")
+            )
+            if unread:
+                extra = (*extra, f"GitLab requirements could not be read: {', '.join(unread)}")
+            return requirements._replace(
+                approvals_required=max((rule.required for rule in rules), default=0),
+                code_owner_review=any(
+                    row.get("rule_type") == "code_owner" and row["approvals_required"] > 0
+                    for row in rows
+                ),
+                approval_rules=tuple(rules),
+                unread=unread,
+                extra_blockers=extra,
+            )
+    return requirements._replace(
+        approvals_required=None,
+        approval_rules=None,
+        unread=tuple(dict.fromkeys((*requirements.unread, "merge_request_approval_state"))),
+        extra_blockers=(
+            *requirements.extra_blockers,
+            "GitLab merge request approval rules could not be read",
+        ),
+    )

@@ -299,8 +299,11 @@ def check_policy_reader(
                 requirements=requirements,
             )
         policy = policies[head]
-        if number is not None and requirements.required_contexts is None:
-            return policy._replace(requirements=with_pr_rollup(ops, repo, number, requirements))
+        if number is not None:
+            effective = ops.change_requirements(repo, number, requirements)
+            if effective.required_contexts is None:
+                effective = with_pr_rollup(ops, repo, number, effective)
+            policy = policy._replace(requirements=effective)
         return policy
 
     return policy_for

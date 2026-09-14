@@ -52,7 +52,7 @@ from sbxloop.vcs.gitlab.content import (
     tree_handle,
 )
 from sbxloop.vcs.gitlab.permissions import READ_PROBES
-from sbxloop.vcs.gitlab.protection import read_base_requirements
+from sbxloop.vcs.gitlab.protection import read_base_requirements, read_change_requirements
 from sbxloop.vcs.gitlab.records import (
     APPROVAL_STATUSES as APPROVAL_STATUSES,
     DEVELOPER as DEVELOPER,
@@ -749,6 +749,11 @@ class GitlabOps(JobBackend):
         return runs
 
     # -- PolicyOps ------------------------------------------------------------
+
+    def change_requirements(
+        self, repo: str, number: int, requirements: BaseRequirements
+    ) -> BaseRequirements:
+        return read_change_requirements(self, repo, number, requirements)
 
     def base_requirements(self, repo: str, base: str) -> BaseRequirements:
         """What ``base`` requires before a merge, read from the protected

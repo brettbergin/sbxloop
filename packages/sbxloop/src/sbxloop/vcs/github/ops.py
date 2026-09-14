@@ -1722,6 +1722,11 @@ class GithubOps:
         runs = data.get("workflow_runs") if isinstance(data, dict) else None
         return self._list(f"GET /repos/{repo}/actions/runs", runs)
 
+    def change_requirements(
+        self, repo: str, number: int, requirements: BaseRequirements
+    ) -> BaseRequirements:
+        return requirements
+
     def base_requirements(self, repo: str, base: str) -> BaseRequirements:
         """What ``base`` requires before a merge, read from classic
         protection and rulesets (:func:`read_base_requirements`); never

@@ -115,6 +115,7 @@ class AwaitingReview(NamedTuple):
     code_owners: bool
     head: str
     draft: bool = False
+    rules: tuple[str, ...] = ()
 
     @property
     def wanted(self) -> str:
@@ -123,6 +124,8 @@ class AwaitingReview(NamedTuple):
         the PR marked ready for review."""
         if self.draft:
             return "the pull request marked ready for review (a person converted it to draft)"
+        if self.rules:
+            return "reviews satisfying " + ", ".join(self.rules)
         if self.approvals_required <= 1 and not self.code_owners:
             return "an approving review"
         count = (
@@ -1213,6 +1216,26 @@ def refused_by_base(
     far along it is. Anything else the loop cannot supply, or rules it
     could not read, is :func:`blocked_by_base` as before."""
     can_sign = bool(is_bot)
+    if requirements.approval_rules is not None:
+        pending = [
+            rule for rule in requirements.approval_rules if rule.required and not rule.satisfied
+        ]
+        if not pending:
+            return blocked_by_base(
+                requirements._replace(approvals_required=0, code_owner_review=False),
+                cfg,
+                detail=detail,
+                can_sign=can_sign,
+            )
+        if not base_blockers(requirements, cfg, can_sign=can_sign, can_approve=True):
+            limiting = max(pending, key=lambda rule: rule.required - rule.have)
+            return AwaitingReview(
+                limiting.required,
+                limiting.have,
+                requirements.code_owner_review,
+                head,
+                rules=tuple(f"{rule.name} ({rule.have}/{rule.required})" for rule in pending),
+            )
     if (requirements.approvals_required or requirements.code_owner_review) and not base_blockers(
         requirements, cfg, can_sign=can_sign, can_approve=True
     ):

@@ -394,6 +394,15 @@ def approval_summary(names: Sequence[str]) -> str:
     )
 
 
+class ApprovalRule(NamedTuple):
+    """One effective review rule; have counts only its eligible approvals."""
+
+    name: str
+    required: int
+    have: int
+    satisfied: bool
+
+
 class BaseRequirements(NamedTuple):
     """The merge requirements of one base branch.
 
@@ -456,6 +465,7 @@ class BaseRequirements(NamedTuple):
     forge: str = "github"
     all_checks_required: bool = False
     extra_blockers: tuple[str, ...] = ()
+    approval_rules: tuple[ApprovalRule, ...] | None = None
 
     @property
     def requires_reviews(self) -> bool | None:

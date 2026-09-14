@@ -97,6 +97,7 @@ class FakeGitlab(GitlabOps):
         self.missing_project = False
         self.empty_repo = False
         self.protected: dict[str, Any] | None = None
+        self.protected_rules: list[dict[str, Any]] = []
         self.protected_forbidden = False
         self.enterprise: bool | None = False
         self.approval_rules: list[dict[str, Any]] = []
@@ -672,6 +673,10 @@ class FakeGitlab(GitlabOps):
             if body["resolved"]:
                 return {"id": discussion_id, "notes": [dict(n) for n in found["notes"]]}
             return {"id": discussion_id}
+        if tail == "/approval_state":
+            if self.enterprise is not True:
+                raise self._failed(method, path, 404, "404 Not Found")
+            return mr.get("approval_state", {"rules": []})
         if tail == "/approvals":
             return {
                 "approved": bool(mr["approvals"]),
@@ -1020,16 +1025,33 @@ class FakeGitlab(GitlabOps):
         if rest == "":
             self._maybe_fail("repo_get")
             return self._project_json()
+        if rest == "/protected_branches":
+            if self.protected_forbidden:
+                raise self._failed(method, path, 403, "403 Forbidden")
+            rows = [*self.protected_rules]
+            if self.protected is not None:
+                rows.append({"name": "main", **self.protected})
+            per_page, page = (
+                int(params.get("per_page", ["20"])[0]),
+                int(params.get("page", ["1"])[0]),
+            )
+            return rows[(page - 1) * per_page : page * per_page]
         if rest == "/protected_branches/main" or re.fullmatch(r"/protected_branches/[^/]+", rest):
             if self.protected_forbidden:
                 raise self._failed(method, path, 403, "403 Forbidden")
-            if self.protected is None or unquote(rest.rsplit("/", 1)[1]) != "main":
+            if self.protected is None or unquote(rest.rsplit("/", 1)[1]) != self.protected.get(
+                "name", "main"
+            ):
                 raise self._failed(method, path, 404, "404 Not found")
             return dict(self.protected)
         if rest == "/approval_rules":
             if self.enterprise is not True:
                 raise self._failed(method, path, 404, "404 Not Found")
-            return list(self.approval_rules)
+            per_page, page = (
+                int(params.get("per_page", ["20"])[0]),
+                int(params.get("page", ["1"])[0]),
+            )
+            return self.approval_rules[(page - 1) * per_page : page * per_page]
         content = self._content_routes(method, path, rest, params, body)
         if content is not None:
             return content
