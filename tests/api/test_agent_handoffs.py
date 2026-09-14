@@ -48,6 +48,8 @@ def test_tool_handoffs_run_with_peer_context_and_inherited_read_only(api: Any) -
     assert [c["read_only"] for c in concierge.calls] == [False, True, True]
     assert "reply from planner" in concierge.calls[1]["history"]
     assert "Check the proposed plan" in concierge.calls[1]["text"]
+    assert "Completed result from @planner:\nreply from planner" in concierge.calls[1]["text"]
+    assert "Completed result from @critic:\nreply from critic" in concierge.calls[2]["text"]
     assert "@planner assess this idea" in concierge.calls[1]["text"]
     assert [p["requested_by"] for p in done["participants"]] == [None, "planner", "critic"]
     assert all(p["status"] == "completed" for p in done["participants"])

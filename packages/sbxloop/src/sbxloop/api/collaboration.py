@@ -856,6 +856,24 @@ class CollaborationStore:
                 remaining -= len(chunk) + 1
         return "\n".join(reversed(chunks))
 
+    def participant_result(self, turn: Turn, index: int) -> Message | None:
+        """Return a completed participant's reply, scoped to this exact turn."""
+        if index < 0 or index >= len(turn.participants):
+            return None
+        message_id = turn.participants[index].get("message_id")
+        if not isinstance(message_id, str):
+            return None
+        with self.dstore.read() as session:
+            row = session.get(MessageRow, message_id)
+            if (
+                row is None
+                or row.channel_id != turn.channel_id
+                or row.turn_id != turn.id
+                or row.role != "assistant"
+            ):
+                return None
+            return _message(row)
+
     def get_turn(self, user_id: str, channel_id: str, turn_id: str) -> Turn | None:
         with self.dstore.read() as session:
             channel = session.get(ChannelRow, channel_id)
