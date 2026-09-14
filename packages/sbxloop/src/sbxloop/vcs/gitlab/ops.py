@@ -1501,6 +1501,96 @@ class GitlabOps(JobBackend):
             raise GithubOpsError(f"POST {path} returned no commit id: {data!r}")
         return sha
 
+    def _tree_entries(self, repo: str, ref: str) -> dict[str, tuple[str, str]]:
+        """Read a complete tree for a restart, failing closed on malformed pages."""
+        found: dict[str, tuple[str, str]] = {}
+        for page in range(1, MAX_PAGES + 1):
+            query = urlencode(
+                {"ref": ref, "recursive": "true", "per_page": PAGE_SIZE, "page": page}
+            )
+            data = self.raw("GET", f"{self._project(repo)}/repository/tree?{query}")
+            if not isinstance(data, list):
+                raise GithubOpsError(f"GitLab returned no tree listing for {repo}:{ref}")
+            for row in data:
+                if not isinstance(row, dict) or not all(
+                    row.get(k) for k in ("path", "id", "mode", "type")
+                ):
+                    raise GithubOpsError(
+                        f"GitLab returned an incomplete tree entry for {repo}:{ref}"
+                    )
+                if row["type"] == "tree":
+                    continue
+                found[str(row["path"])] = (str(row["mode"]), str(row["id"]))
+            if len(data) < PAGE_SIZE:
+                return found
+        raise PaginationError(f"{repo}:{ref} tree exceeds {MAX_PAGES * PAGE_SIZE} entries")
+
+    def _actions_from_parent(
+        self, repo: str, staged: Staged, parent: str
+    ) -> tuple[dict[str, Any], ...]:
+        """Recompute the delta when commit history and the reviewed base differ."""
+        target = self._tree_entries(repo, staged.base)
+        actual = self._tree_entries(repo, parent)
+        blobs = {sha: raw for (owner, sha), raw in self._blobs.items() if owner == repo}
+        for action in staged.actions:
+            path = str(action["file_path"])
+            kind = action["action"]
+            if kind == "delete":
+                target.pop(path, None)
+            elif kind == "chmod":
+                target[path] = (
+                    "100755" if action["execute_filemode"] else REGULAR_MODE,
+                    target[path][1],
+                )
+            else:
+                staged_bytes = base64.b64decode(action["content"], validate=True)
+                sha = blob_sha(staged_bytes)
+                blobs[sha] = staged_bytes
+                mode = target.get(path, (REGULAR_MODE, ""))[0]
+                if action.get("execute_filemode"):
+                    mode = "100755"
+                target[path] = (mode, sha)
+        actions: list[dict[str, Any]] = []
+        for path in sorted(actual.keys() - target.keys()):
+            actions.append({"action": "delete", "file_path": path})
+        for path, (mode, sha) in sorted(target.items()):
+            previous = actual.get(path)
+            if previous == (mode, sha):
+                continue
+            if mode not in (REGULAR_MODE, "100755") or (
+                previous and previous[0] not in (REGULAR_MODE, "100755")
+            ):
+                raise GithubOpsError(
+                    f"GitLab cannot restore the file type at {path!r} from an adopted parent"
+                )
+            raw = blobs.get(sha)
+            if raw is None:
+                query = urlencode({"ref": staged.base})
+                url = f"{self._project(repo)}/repository/files/{quote(path, safe='')}?{query}"
+                data = self._dict(f"GET {url}", self.raw("GET", url))
+                try:
+                    raw = base64.b64decode(str(data.get("content") or ""), validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise GithubOpsError(f"GitLab returned invalid content for {path!r}") from exc
+                if data.get("encoding") != "base64" or blob_sha(raw) != sha:
+                    raise GithubOpsError(
+                        f"GitLab returned content that does not match the reviewed tree at {path!r}"
+                    )
+            write_action: dict[str, Any] = {
+                "action": "update" if previous else "create",
+                "file_path": path,
+                "content": base64.b64encode(raw).decode("ascii"),
+                "encoding": "base64",
+            }
+            actions.append(write_action)
+            if previous is None and mode == "100755":
+                write_action["execute_filemode"] = True
+            elif previous and previous[0] != mode:
+                actions.append(
+                    {"action": "chmod", "file_path": path, "execute_filemode": mode == "100755"}
+                )
+        return tuple(actions)
+
     def commit_create(
         self, repo: str, *, message: str, tree: str, parents: list[str]
     ) -> dict[str, Any]:
@@ -1517,11 +1607,14 @@ class GitlabOps(JobBackend):
         if len(parents) > 1:
             raise GithubOpsError("GitLab's commits API writes a commit with one parent")
         start = parents[0] if parents else staged.base
-        branch = f"sbxloop/pending/{uuid4().hex[:12]}"
-        sha = self._commit(
-            repo, branch=branch, message=message, actions=staged.actions, start_sha=start
+        actions = (
+            staged.actions
+            if start == staged.base
+            else self._actions_from_parent(repo, staged, start)
         )
-        self._pending[(repo, sha)] = Pending(message, start, staged.actions, branch)
+        branch = f"sbxloop/pending/{uuid4().hex[:12]}"
+        sha = self._commit(repo, branch=branch, message=message, actions=actions, start_sha=start)
+        self._pending[(repo, sha)] = Pending(message, start, actions, branch)
         return {"sha": sha, "tree": {"sha": sha}, "parents": [{"sha": start}], "message": message}
 
     def _drop_pending(self, repo: str, sha: str) -> None:

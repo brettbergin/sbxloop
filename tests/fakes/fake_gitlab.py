@@ -43,6 +43,7 @@ from typing import Any
 from urllib.parse import parse_qs, unquote
 
 from sbxloop.errors import GithubOpsError
+from sbxloop.vcs.gitlab.content import blob_sha
 from sbxloop.vcs.gitlab.ops import GitlabOps
 from sbxloop.vcs.model import ChecksVerdict, FailedCheck
 
@@ -740,10 +741,18 @@ class FakeGitlab(GitlabOps):
             directory = params.get("path", [""])[0]
             rows: list[dict[str, Any]] = []
             seen: set[str] = set()
-            for file_path, (mode, _) in sorted(tree.items()):
+            for file_path, (mode, raw) in sorted(tree.items()):
                 head, name = posixpath.split(file_path)
-                if head == directory:
-                    rows.append({"name": name, "type": "blob", "path": file_path, "mode": mode})
+                if head == directory or params.get("recursive") == ["true"]:
+                    rows.append(
+                        {
+                            "name": name,
+                            "type": "commit" if mode == "160000" else "blob",
+                            "path": file_path,
+                            "mode": mode,
+                            "id": blob_sha(raw),
+                        }
+                    )
                     continue
                 prefix = f"{directory}/" if directory else ""
                 if file_path.startswith(prefix) and "/" in file_path[len(prefix) :]:

@@ -114,6 +114,46 @@ class TestPureParts:
 
 
 class TestStaging:
+    def test_restart_preserves_unchanged_symlinks_and_refuses_changed_types(self) -> None:
+        fake = FakeGitlab()
+        fake.trees["base123"]["link"] = ("120000", b"target")
+        fake.trees["prior"] = dict(fake.trees["base123"])
+        fake.trees["prior"]["extra"] = ("100644", b"remove")
+        tree = fake.tree_create(REPO, base_tree="base123", entries=[])
+        commit = fake.commit_create(
+            REPO, message="restart", tree=str(tree["sha"]), parents=["prior"]
+        )
+        assert fake.trees[str(commit["sha"])] == fake.trees["base123"]
+        fake.trees["prior"]["link"] = ("120000", b"other")
+        with pytest.raises(GithubOpsError, match="file type at 'link'"):
+            fake.commit_create(REPO, message="restart", tree=str(tree["sha"]), parents=["prior"])
+        assert len(fake.commit_posts) == 1
+
+    def test_adopted_parent_keeps_history_but_uses_the_reviewed_tree(self) -> None:
+        fake = FakeGitlab()
+        fake.trees["base123"]["restore.txt"] = ("100755", b"base content")
+        fake.trees["prior"] = {
+            "README.md": ("100755", b"unreviewed change"),
+            "obsolete.txt": ("100644", b"old attempt"),
+            "new.txt": ("100644", b"old attempt collision"),
+        }
+        fake.branches["sbxloop/restart"] = "prior"
+        fake.seed_mr(1, source_branch="sbxloop/restart", head_sha="prior")
+        shas = fake.blobs_create_many(REPO, [{"path": "new.txt", "content_b64": b64(b"reviewed")}])
+        tree = fake.tree_create(
+            REPO,
+            base_tree="base123",
+            entries=[{"path": "new.txt", "mode": "100644", "type": "blob", "sha": shas["new.txt"]}],
+        )
+        commit = fake.commit_create(
+            REPO, message="restart", tree=str(tree["sha"]), parents=["prior"]
+        )
+        fake.ref_force_update(REPO, "sbxloop/restart", str(commit["sha"]))
+        head = fake.branches["sbxloop/restart"]
+        assert fake.trees[head] == {**fake.trees["base123"], "new.txt": ("100644", b"reviewed")}
+        assert fake.commits[head]["parent_ids"] == ["prior"]
+        assert fake.merge_requests[1]["state"] == "opened"
+
     def test_blobs_never_reach_gitlab(self) -> None:
         fake = FakeGitlab()
         shas = fake.blobs_create_many(REPO, [{"path": "hello.txt", "content_b64": b64(b"hello\n")}])
