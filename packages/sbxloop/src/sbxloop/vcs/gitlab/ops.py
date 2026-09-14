@@ -32,6 +32,7 @@ from sbxloop.errors import GithubOpsError, RoleNotImplemented
 from sbxloop.log import get_logger
 from sbxloop.vcs.github.ops import fold_review_verdicts, fold_reviews, user_identity
 from sbxloop.vcs.github.review_locations import right_side_ranges
+from sbxloop.vcs.gitlab import request_changes
 from sbxloop.vcs.gitlab.changes import (
     change_record,
     file_record,
@@ -49,10 +50,11 @@ from sbxloop.vcs.gitlab.content import (
     blob_sha,
     commit_record,
     plan_actions,
+    tree_after_actions,
     tree_handle,
 )
 from sbxloop.vcs.gitlab.permissions import READ_PROBES
-from sbxloop.vcs.gitlab.protection import read_base_requirements
+from sbxloop.vcs.gitlab.protection import read_base_requirements, read_change_requirements
 from sbxloop.vcs.gitlab.records import (
     APPROVAL_STATUSES as APPROVAL_STATUSES,
     DEVELOPER as DEVELOPER,
@@ -170,16 +172,15 @@ class GitlabOps(JobBackend):
     # a paid tier and a per-project setting: the free tier has none
     # (verified) and a Premium instance is field-unverified, so the
     # backend cannot decide from the class alone — the landing probes
-    # the project (#1019). ``request_changes_review`` is UNSUPPORTED
-    # because CE records the state and does not enforce it: reading a
-    # recorded state as a merge gate would wait on something the forge
-    # ignores. ``signed_api_commits`` is the default install's answer;
+    # the project (#1019). Blocking reviews are also a licensed feature:
+    # a GraphQL read confirms it per merge request before submission.
+    # ``signed_api_commits`` is the default install's answer;
     # an instance with signing configured is field-unverified.
     CAPABILITIES: ClassVar[dict[str, Capability]] = {
         "merge_queue": Capability.UNKNOWN,
         "review_threads": Capability.SUPPORTED,
         "draft_changes": Capability.SUPPORTED,
-        "request_changes_review": Capability.UNSUPPORTED,
+        "request_changes_review": Capability.UNKNOWN,
         "short_lived_token": Capability.UNSUPPORTED,
         "remote_commit": Capability.SUPPORTED,
         "required_checks_introspection": Capability.SUPPORTED,
@@ -187,7 +188,8 @@ class GitlabOps(JobBackend):
         "signed_api_commits": Capability.UNSUPPORTED,
     }
     CAPABILITY_NOTE: ClassVar[str] = (
-        "merge trains are a paid tier and a per-project setting; the landing asks the project"
+        "merge trains and blocking reviews depend on the project; "
+        "landing and review submission probe their support"
     )
     #: The operations this backend does not answer yet, as ``Role.operation``;
     #: each raises :class:`RoleNotImplemented`, and the doctor lists them.
@@ -210,6 +212,7 @@ class GitlabOps(JobBackend):
         # this object made, so a reply and a url need no second read.
         self._note_discussion: dict[tuple[str, int, int], str] = {}
         self._mr_urls: dict[tuple[str, int], str] = {}
+        self._request_change_support: dict[tuple[str, int], Capability] = {}
         # The content role's staging (#1020): blobs by sha, trees by
         # handle, commits written on a pending branch, and each base
         # directory listed once, all per repository.
@@ -248,6 +251,9 @@ class GitlabOps(JobBackend):
         answers = {self._trains_of(payload) for payload in self._projects.values()}
         if len(answers) == 1:
             report["merge_queue"] = answers.pop()
+        review_answers = set(self._request_change_support.values())
+        if len(review_answers) == 1:
+            report["request_changes_review"] = review_answers.pop()
         return report
 
     @staticmethod
@@ -287,7 +293,7 @@ class GitlabOps(JobBackend):
         namespace. **Field-unverified**: #1016 created its project as the
         administrator; a Developer needs the group's create-project
         permission."""
-        namespace, name = repo.split("/", 1)
+        namespace, name = repo.rsplit("/", 1)
         body: dict[str, Any] = {
             "name": name,
             "path": name,
@@ -545,6 +551,10 @@ class GitlabOps(JobBackend):
     def issue_labels_add(self, repo: str, number: int | str, labels: Sequence[str]) -> None:
         self.raw("PUT", self._issue_path(repo, number), {"add_labels": ",".join(labels)})
 
+    def pr_labels_add(self, repo: str, number: int, labels: Sequence[str]) -> None:
+        """Add MR labels without replacing existing labels or touching an issue."""
+        self.raw("PUT", self._mr_path(repo, number), {"add_labels": ",".join(labels)})
+
     def issue_label_remove(self, repo: str, number: int | str, label: str) -> None:
         """Take ``label`` off the issue; one that is not there is a success."""
         self.raw("PUT", self._issue_path(repo, number), {"remove_labels": label})
@@ -581,6 +591,62 @@ class GitlabOps(JobBackend):
     def _statuses(self, repo: str, sha: str) -> list[Any]:
         return self.raw_pages(f"{self._project(repo)}/repository/commits/{sha}/statuses")
 
+    def _change_statuses(self, repo: str, number: int, sha: str) -> tuple[str, list[Any]]:
+        """Follow this MR's current pipeline, including its temporary merge commit."""
+        mr = self._merge_request(repo, number)
+        waiting = [{"name": "GitLab pipeline", "status": "pending"}]
+        if mr.get("sha") != sha:
+            return repo, waiting
+        pipeline = mr.get("head_pipeline")
+        if pipeline is None:
+            if mr.get("detailed_merge_status") in ("ci_still_running", "checking", "preparing"):
+                return repo, waiting
+            return repo, self._statuses(repo, sha)
+        if not isinstance(pipeline, dict):
+            raise GithubOpsError("GitLab returned an unreadable merge request pipeline")
+        pipeline_id, tested = pipeline.get("id"), pipeline.get("sha")
+        if (
+            type(pipeline_id) is not int
+            or pipeline_id <= 0
+            or not isinstance(tested, str)
+            or not tested
+        ):
+            raise GithubOpsError("GitLab returned an incomplete merge request pipeline")
+        project = str(pipeline.get("project_id") or repo)
+        if tested != sha:
+            commit = self.commit_get(project, tested)
+            if sha not in [p["sha"] for p in commit["parents"]]:
+                return repo, waiting
+        query = urlencode({"pipeline_id": pipeline_id})
+        path = (
+            f"{self._project(project)}/repository/commits/{quote(tested, safe='')}/statuses?{query}"
+        )
+        rows = self.raw_pages(path)
+        status = str(pipeline.get("status") or "")
+        verdict = fold_statuses(rows)
+        if not rows or (status not in ("success", "skipped") and verdict.state == "green"):
+            rows.append(
+                {
+                    "name": "GitLab pipeline",
+                    "status": status,
+                    "description": str(
+                        pipeline.get("yaml_errors") or f"Pipeline {pipeline_id}: {status}"
+                    ),
+                    "target_url": pipeline.get("web_url"),
+                }
+            )
+        return project, rows
+
+    def change_checks(self, repo: str, number: int, sha: str) -> ChecksVerdict:
+        _, rows = self._change_statuses(repo, number, sha)
+        return fold_statuses(rows)
+
+    def change_failed_logs(
+        self, repo: str, number: int, sha: str, *, max_chars: int = 6000
+    ) -> list[FailedCheck]:
+        project, rows = self._change_statuses(repo, number, sha)
+        return self._failed_logs(project, rows, max_chars=max_chars)
+
     def pr_checks(self, repo: str, sha: str) -> ChecksVerdict:
         """Every commit status on ``sha`` — CI jobs and external statuses
         alike, the one namespace GitLab keeps — folded to one verdict."""
@@ -599,10 +665,13 @@ class GitlabOps(JobBackend):
         job — GitLab's status rows are its job rows — **field-unverified**
         beyond the API's documented shape (#1016 posted external statuses,
         which have no trace and answer 404, the fallback here)."""
+        return self._failed_logs(repo, self._statuses(repo, sha), max_chars=max_chars)
+
+    def _failed_logs(self, repo: str, rows: Sequence[Any], *, max_chars: int) -> list[FailedCheck]:
         head = min(1500, max_chars)
         tail = max_chars - head
         failed: list[FailedCheck] = []
-        for row in latest_statuses(self._statuses(repo, sha)):
+        for row in latest_statuses(rows):
             record = check_run_record(row)
             if record["conclusion"] in (None, "success", "skipped", "neutral", "action_required"):
                 continue
@@ -690,6 +759,11 @@ class GitlabOps(JobBackend):
         return runs
 
     # -- PolicyOps ------------------------------------------------------------
+
+    def change_requirements(
+        self, repo: str, number: int, requirements: BaseRequirements
+    ) -> BaseRequirements:
+        return read_change_requirements(self, repo, number, requirements)
 
     def base_requirements(self, repo: str, base: str) -> BaseRequirements:
         """What ``base`` requires before a merge, read from the protected
@@ -1165,6 +1239,41 @@ class GitlabOps(JobBackend):
             )
         return tuple(posted)
 
+    def _request_changes(self, repo: str, number: int) -> bool:
+        key = (repo, number)
+        self._request_change_support[key] = Capability.UNKNOWN
+        try:
+            api_url = self.transport.api_url if self.transport is not None else None
+            if not api_url or not api_url.rstrip("/").endswith("/api/v4"):
+                raise GithubOpsError("GitLab GraphQL API root is unavailable")
+            url = api_url.rstrip("/").removesuffix("/v4") + "/graphql"
+            before = request_changes.requesters(self.raw, url, repo, number)
+            if before is None:
+                self._request_change_support[key] = Capability.UNSUPPORTED
+                return False
+            login = self.authenticated_user().get("login")
+            if not isinstance(login, str) or not login:
+                raise GithubOpsError("GitLab review author could not be identified")
+            request_changes.submit(self.raw, url, repo, number)
+            after = request_changes.requesters(self.raw, url, repo, number)
+            if after is None or login not in after:
+                raise GithubOpsError("GitLab did not confirm this author's blocking review")
+            self._request_change_support[key] = Capability.SUPPORTED
+            return True
+        except GithubOpsError as exc:
+            log.warning(
+                "gitlab.request_changes_unconfirmed", repo=repo, mr=number, error=str(exc)[:300]
+            )
+            # CE schemas can omit the licensed field entirely. A successful
+            # metadata read can distinguish that from unread EE support.
+            try:
+                metadata = self.raw("GET", "/metadata")
+                if isinstance(metadata, dict) and metadata.get("enterprise") is False:
+                    self._request_change_support[key] = Capability.UNSUPPORTED
+            except GithubOpsError:
+                pass
+            return False
+
     def pr_review_create(
         self,
         repo: str,
@@ -1180,22 +1289,21 @@ class GitlabOps(JobBackend):
         so a push in between refuses it); an approval GitLab refuses (a
         Premium rule against the author approving, a stale head) falls
         back to a plain comment, and the returned ``event`` says so.
-        ``REQUEST_CHANGES`` is a comment with the finding count: the free
-        tier records a reviewer's requested changes and does not enforce
-        them (#1016), so the loop never claims a gate the forge does not
-        hold. A caller reads ``event`` to learn what was accepted.
+        ``REQUEST_CHANGES`` uses GraphQL and verifies the author appears
+        in the licensed blocking-review list. Unsupported or unconfirmed
+        submissions fall back to a comment. No pending drafts are published.
         """
         posted: tuple[PostedFinding, ...] = ()
         if comments:
             posted = self._post_discussions(repo, number, comments, self._diff_refs(repo, number))
         accepted: ReviewEvent = event
         text = body
-        if event == "REQUEST_CHANGES":
+        if event == "REQUEST_CHANGES" and not self._request_changes(repo, number):
             accepted = "COMMENT"
             text = (
-                f"{body}\n\n_Changes requested: {len(comments)} finding(s) inline. GitLab's "
-                "free tier records a requested change without holding the merge for it, "
-                "so this review does not gate._"
+                f"{body}\n\n_Changes requested: {len(comments)} finding(s) inline. "
+                "A blocking GitLab review was not confirmed; this feedback is recorded "
+                "as a comment. A maintainer should check the merge request's review gate._"
             )
         note = self._mr_note(repo, number, text)
         if event == "APPROVE":
@@ -1495,11 +1603,135 @@ class GitlabOps(JobBackend):
         if not actions:
             body["allow_empty"] = True
         path = f"{self._project(repo)}/repository/commits"
-        data = self._dict(f"POST {path}", self.raw("POST", path, body))
+        try:
+            data = self._dict(f"POST {path}", self.raw("POST", path, body))
+        except GithubOpsError as exc:
+            if start_sha and exc.http_status in (None, 500, 502, 503, 504):
+                try:
+                    recovered = self._recover_commit(
+                        repo, branch=branch, start=start_sha, message=message, actions=actions
+                    )
+                except (GithubOpsError, ValueError, KeyError):
+                    recovered = None
+                if recovered:
+                    log.info("gitlab.commit_recovered", repo=repo, branch=branch, commit=recovered)
+                    return recovered
+            raise
         sha = str(data.get("id") or "")
         if not sha:
             raise GithubOpsError(f"POST {path} returned no commit id: {data!r}")
         return sha
+
+    def _recover_commit(
+        self,
+        repo: str,
+        *,
+        branch: str,
+        start: str,
+        message: str,
+        actions: Sequence[Mapping[str, Any]],
+    ) -> str | None:
+        """Accept an uncertain write only when parent, message, and complete tree match."""
+        head = self.ref_lookup(repo, f"heads/{branch}")
+        if head is None:
+            return None
+        commit = self.commit_get(repo, head)
+        if commit["parents"] != [{"sha": start}] or str(commit["message"]).rstrip(
+            "\n"
+        ) != message.rstrip("\n"):
+            return None
+        expected = tree_after_actions(self._tree_entries(repo, start), actions)
+        return head if self._tree_entries(repo, head) == expected else None
+
+    def _tree_entries(self, repo: str, ref: str) -> dict[str, tuple[str, str]]:
+        """Read a complete tree for a restart, failing closed on malformed pages."""
+        found: dict[str, tuple[str, str]] = {}
+        for page in range(1, MAX_PAGES + 1):
+            query = urlencode(
+                {"ref": ref, "recursive": "true", "per_page": PAGE_SIZE, "page": page}
+            )
+            data = self.raw("GET", f"{self._project(repo)}/repository/tree?{query}")
+            if not isinstance(data, list):
+                raise GithubOpsError(f"GitLab returned no tree listing for {repo}:{ref}")
+            for row in data:
+                if not isinstance(row, dict) or not all(
+                    row.get(k) for k in ("path", "id", "mode", "type")
+                ):
+                    raise GithubOpsError(
+                        f"GitLab returned an incomplete tree entry for {repo}:{ref}"
+                    )
+                if row["type"] == "tree":
+                    continue
+                found[str(row["path"])] = (str(row["mode"]), str(row["id"]))
+            if len(data) < PAGE_SIZE:
+                return found
+        raise PaginationError(f"{repo}:{ref} tree exceeds {MAX_PAGES * PAGE_SIZE} entries")
+
+    def _actions_from_parent(
+        self, repo: str, staged: Staged, parent: str
+    ) -> tuple[dict[str, Any], ...]:
+        """Recompute the delta when commit history and the reviewed base differ."""
+        target = self._tree_entries(repo, staged.base)
+        actual = self._tree_entries(repo, parent)
+        blobs = {sha: raw for (owner, sha), raw in self._blobs.items() if owner == repo}
+        for action in staged.actions:
+            path = str(action["file_path"])
+            kind = action["action"]
+            if kind == "delete":
+                target.pop(path, None)
+            elif kind == "chmod":
+                target[path] = (
+                    "100755" if action["execute_filemode"] else REGULAR_MODE,
+                    target[path][1],
+                )
+            else:
+                staged_bytes = base64.b64decode(action["content"], validate=True)
+                sha = blob_sha(staged_bytes)
+                blobs[sha] = staged_bytes
+                mode = target.get(path, (REGULAR_MODE, ""))[0]
+                if action.get("execute_filemode"):
+                    mode = "100755"
+                target[path] = (mode, sha)
+        actions: list[dict[str, Any]] = []
+        for path in sorted(actual.keys() - target.keys()):
+            actions.append({"action": "delete", "file_path": path})
+        for path, (mode, sha) in sorted(target.items()):
+            previous = actual.get(path)
+            if previous == (mode, sha):
+                continue
+            if mode not in (REGULAR_MODE, "100755") or (
+                previous and previous[0] not in (REGULAR_MODE, "100755")
+            ):
+                raise GithubOpsError(
+                    f"GitLab cannot restore the file type at {path!r} from an adopted parent"
+                )
+            raw = blobs.get(sha)
+            if raw is None:
+                query = urlencode({"ref": staged.base})
+                url = f"{self._project(repo)}/repository/files/{quote(path, safe='')}?{query}"
+                data = self._dict(f"GET {url}", self.raw("GET", url))
+                try:
+                    raw = base64.b64decode(str(data.get("content") or ""), validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise GithubOpsError(f"GitLab returned invalid content for {path!r}") from exc
+                if data.get("encoding") != "base64" or blob_sha(raw) != sha:
+                    raise GithubOpsError(
+                        f"GitLab returned content that does not match the reviewed tree at {path!r}"
+                    )
+            write_action: dict[str, Any] = {
+                "action": "update" if previous else "create",
+                "file_path": path,
+                "content": base64.b64encode(raw).decode("ascii"),
+                "encoding": "base64",
+            }
+            actions.append(write_action)
+            if previous is None and mode == "100755":
+                write_action["execute_filemode"] = True
+            elif previous and previous[0] != mode:
+                actions.append(
+                    {"action": "chmod", "file_path": path, "execute_filemode": mode == "100755"}
+                )
+        return tuple(actions)
 
     def commit_create(
         self, repo: str, *, message: str, tree: str, parents: list[str]
@@ -1517,11 +1749,14 @@ class GitlabOps(JobBackend):
         if len(parents) > 1:
             raise GithubOpsError("GitLab's commits API writes a commit with one parent")
         start = parents[0] if parents else staged.base
-        branch = f"sbxloop/pending/{uuid4().hex[:12]}"
-        sha = self._commit(
-            repo, branch=branch, message=message, actions=staged.actions, start_sha=start
+        actions = (
+            staged.actions
+            if start == staged.base
+            else self._actions_from_parent(repo, staged, start)
         )
-        self._pending[(repo, sha)] = Pending(message, start, staged.actions, branch)
+        branch = f"sbxloop/pending/{uuid4().hex[:12]}"
+        sha = self._commit(repo, branch=branch, message=message, actions=actions, start_sha=start)
+        self._pending[(repo, sha)] = Pending(message, start, actions, branch)
         return {"sha": sha, "tree": {"sha": sha}, "parents": [{"sha": start}], "message": message}
 
     def _drop_pending(self, repo: str, sha: str) -> None:

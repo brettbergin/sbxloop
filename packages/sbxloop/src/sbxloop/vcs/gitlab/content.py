@@ -144,6 +144,36 @@ def plan_actions(
     return actions, skipped
 
 
+def tree_after_actions(
+    entries: Mapping[str, tuple[str, str]], actions: Sequence[Mapping[str, Any]]
+) -> dict[str, tuple[str, str]]:
+    """The exact tree a commits-API write must produce, for lost-response recovery."""
+    tree = dict(entries)
+    for action in actions:
+        path, kind = str(action["file_path"]), action["action"]
+        if kind == "delete":
+            tree.pop(path, None)
+        elif kind == "chmod":
+            tree[path] = (
+                EXECUTABLE_MODE if action["execute_filemode"] else REGULAR_MODE,
+                tree[path][1],
+            )
+        elif kind in ("create", "update"):
+            mode = tree.get(path, (REGULAR_MODE, ""))[0] if kind == "update" else REGULAR_MODE
+            if action.get("execute_filemode"):
+                mode = EXECUTABLE_MODE
+            content = str(action.get("content") or "")
+            raw = (
+                base64.b64decode(content, validate=True)
+                if action.get("encoding") == "base64"
+                else content.encode()
+            )
+            tree[path] = (mode, blob_sha(raw))
+        else:
+            raise GithubOpsError(f"cannot reconcile GitLab commit action {kind!r}")
+    return tree
+
+
 def commit_record(data: Mapping[str, Any]) -> dict[str, Any]:
     """A GitLab commit as the commit record the loop reads: ``sha``, a
     ``tree`` whose sha is the commit's own (GitLab addresses a tree by the

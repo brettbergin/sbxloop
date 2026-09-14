@@ -55,7 +55,7 @@ class TestBackendRows:
         )
         assert row.ok and not row.hard
         assert "supported: review_threads" in row.detail
-        assert "unsupported: request_changes_review" in row.detail
+        assert "unknown: merge_queue, request_changes_review" in row.detail
         assert "unknown: merge_queue" in row.detail and "merge trains" in row.detail
         assert "not implemented" not in row.detail
 

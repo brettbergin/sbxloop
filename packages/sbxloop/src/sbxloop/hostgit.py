@@ -341,12 +341,12 @@ def public_remote_url(url: str) -> str:
 
 
 def normalise_repo_url(url: str | None) -> str | None:
-    """Canonical lowercased ``owner/name`` for a GitHub remote URL, or None.
+    """Canonical lowercased namespace/project for a forge remote URL, or None.
 
     Accepts scp-style ssh (``git@github.com:owner/name.git``), https/git
     scheme URLs with or without embedded credentials, a trailing slash or a
     ``.git`` suffix, and a bare ``owner/name`` slug. Anything that does not
-    yield exactly an owner and a name is None.
+    yield a namespace and a project name is None.
     """
     if url is None:
         return None
@@ -357,16 +357,19 @@ def normalise_repo_url(url: str | None) -> str | None:
     if sep:
         _authority, _slash, path = rest.partition("/")
     else:
+        if text.startswith(("/", "\\")) or (len(text) > 1 and text[1] == ":"):
+            return None
         _userinfo, at, remainder = text.rpartition("@")
         path = remainder.partition(":")[2] if at else text
     path = path.strip("/")
     if path.endswith(".git"):
         path = path[: -len(".git")]
-    parts = [part for part in path.strip("/").split("/") if part]
-    if len(parts) != 2:
+    parts = path.split("/")
+    if len(parts) < 2 or any(
+        not part or part in (".", "..") or any(c.isspace() for c in part) for part in parts
+    ):
         return None
-    owner, name = parts
-    return f"{owner.lower()}/{name.lower()}"
+    return "/".join(parts).lower()
 
 
 def origin_matches_repo(path: Path, repo: str) -> bool | None:

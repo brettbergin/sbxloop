@@ -98,12 +98,17 @@ class TestChange:
 
 
 class TestReview:
-    @pytest.mark.needs("review_threads", "request_changes_review")
+    @pytest.mark.needs("review_threads")
     def test_submit_reply_and_resolve(self, subject: Subject) -> None:
         ops, repo = subject.ops, subject.repo
         ref = ops.pr_create(repo, subject.base, "sbxloop/r1", "sbxloop: ship it")
         finding = ReviewComment(path="a.py", line=3, body="[major] this leaks")
         review = ops.pr_review_create(repo, ref.number, "REQUEST_CHANGES", "one leak", [finding])
+        # GitLab discovers this licensed feature on the MR during submission.
+        # Unknown or unread support still fails the same capability gate.
+        from tests.conformance.gate import check_needs
+
+        check_needs(subject.kind, ops.capabilities(), ["request_changes_review"])
         assert isinstance(review, SubmittedReview) and review.gates_merge
         (posted,) = review.posted
         assert isinstance(posted, PostedFinding)

@@ -1825,7 +1825,7 @@ class Provisioner:
         publishing to a repository is the pr sink's (#759). An existing
         checkout (a resume) is reused as it stands.
         """
-        clone_dir = workspace / repo.split("/", 1)[1]
+        clone_dir = workspace / repo.rsplit("/", 1)[1]
         if (clone_dir / ".git").exists():
             self.bus.emit(
                 "sandbox.workspace_clone",

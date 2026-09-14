@@ -219,7 +219,8 @@ def fold_statuses(rows: Sequence[Any]) -> ChecksVerdict:
     for row in entries:
         name = str(row.get("name") or "status")
         status = str(row.get("status") or "").lower()
-        if status in PASSING_STATUSES:
+        optional_manual = status in APPROVAL_STATUSES and row.get("allow_failure") is True
+        if status in PASSING_STATUSES or optional_manual:
             passed.append(name)
         elif status in PENDING_STATUSES:
             pending.append(name)
@@ -249,6 +250,8 @@ def check_run_record(row: Mapping[str, Any]) -> dict[str, Any]:
         conclusion = None
     elif status in PASSING_STATUSES:
         conclusion = "success" if status == "success" else "skipped"
+    elif status in APPROVAL_STATUSES and row.get("allow_failure") is True:
+        conclusion = "neutral"
     elif status in APPROVAL_STATUSES:
         conclusion = "action_required"
     elif status in RED_STATUSES and row.get("allow_failure") is True:
