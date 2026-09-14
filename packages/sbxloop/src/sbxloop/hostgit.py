@@ -547,7 +547,7 @@ def _clone_env(token: str | None, *, credential_url: str = "https://github.com")
     ``credential.helper`` that clears whatever helpers the host user has
     (a keychain must not answer for the run), then the one-shot helper
     that answers with the token from :data:`CLONE_TOKEN_ENV`, only for
-    ``credential_url``'s exact HTTPS authority. The scope is supplied by
+    ``credential_url``'s exact configured HTTP(S) origin. The scope is supplied by
     host configuration, never a submodule URL. Neither the
     helper nor the token touches argv, ``.git/config`` or the URL.
     """

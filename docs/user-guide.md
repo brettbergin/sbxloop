@@ -2268,10 +2268,26 @@ back to another repository's tree, ever — silently building `you/two` from
 
 **No workspace.** An entry with no `workspace` (and no legacy one that
 belongs to it) has no host tree, so its runs clone the repository from its
-own remote into the run directory (from the server `[github] api_url`
-names, single-branch, optionally blob-filtered — see
+own remote into the run directory (from the selected forge's API root,
+single-branch, optionally blob-filtered — see
 [Working against an existing checkout](#working-against-an-existing-checkout)).
-The clone authenticates with the run's own GitHub credential — the
+The daemon first creates a managed checkout under `workspaces/<owner>/<name>`
+when no workspace was supplied. To let it clone automatically, omit both
+the entry's `workspace` and `[sandbox] workspace`; these settings name
+existing checkouts, not clone destinations. Keep
+`[daemon] workspace_isolation = "clone"` for isolation between runs.
+
+Clone URLs preserve the configured scheme, port and installation prefix.
+For example, a GitLab API root of `http://forge.example:8929/gitlab/api/v4`
+resolves `group/project` to `http://forge.example:8929/gitlab/group/project`.
+GitHub Enterprise uses `/api/v3` and Gitea URL mapping uses `/api/v1`;
+Gitea's run backend remains unimplemented. An unrecognized API path fails
+with a configuration error instead of guessing a clone destination.
+GitLab uses `GITLAB_TOKEN` by default, or `[vcs] token_env` / the repository's
+`token_env` override. Git credentials are restricted to the configured
+scheme, host and port, including an explicitly configured HTTP server.
+
+For GitHub, the clone authenticates with the run's own credential — the
 daemon-wide `GH_TOKEN`, the entry's `token_env`, or a GitHub App
 installation token minted on the host — so **private repositories clone
 like public ones**. The token reaches git through a one-shot credential

@@ -1,4 +1,4 @@
-"""One-shot Git authentication scoped to the operator's HTTPS authority."""
+"""One-shot Git authentication scoped to the operator's HTTP(S) origin."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ TOKEN_ENV = "SBXLOOP_GIT_TOKEN"  # nosec B105 - environment variable name
 AUTHORITY_ENV = "SBXLOOP_GIT_AUTHORITY"
 
 # Git appends the operation (get/store/erase). Parse credential-protocol
-# input as data and answer only get requests for this exact HTTPS host and
+# input as data and answer only get requests for this exact configured scheme, host and
 # port. No repository imports or startup hooks can run in this interpreter.
 _HELPER = """\
 import os, sys
@@ -32,12 +32,16 @@ for line in sys.stdin:
             sys.exit(0)
         fields[key] = value
 host = fields.get('host', '')
+protocol = fields.get('protocol', '')
+if protocol not in ('http', 'https'):
+    sys.exit(0)
 try:
-    url = urlsplit('https://' + host)
-    authority = (url.hostname or '').lower() + ':' + str(url.port or 443)
+    url = urlsplit(protocol + '://' + host)
+    port = url.port or (443 if protocol == 'https' else 80)
+    authority = protocol + '://' + (url.hostname or '').lower() + ':' + str(port)
 except ValueError:
     sys.exit(0)
-if (fields.get('protocol') == 'https' and url.netloc == host
+if (url.netloc == host
         and not url.username and not url.password and not url.path
         and not url.query and not url.fragment
         and authority == os.environ.get('SBXLOOP_GIT_AUTHORITY')):
@@ -51,11 +55,12 @@ HELPER = f"!{shlex.quote(sys.executable)} -I -S -c {shlex.quote(_HELPER)}"
 
 
 def authority(credential_url: str) -> str:
-    """Empty scope for non-HTTPS URLs; never authorize a transport downgrade."""
+    """Bind credentials to an explicit HTTP(S) origin; never follow a downgrade."""
     try:
         url = urlsplit(credential_url)
-        if url.scheme != "https" or not url.hostname or url.username or url.password:
+        if url.scheme not in ("http", "https") or not url.hostname or url.username or url.password:
             return ""
-        return f"{url.hostname.lower()}:{url.port or 443}"
+        port = url.port or (443 if url.scheme == "https" else 80)
+        return f"{url.scheme}://{url.hostname.lower()}:{port}"
     except ValueError:
         return ""

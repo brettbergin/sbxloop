@@ -1089,7 +1089,7 @@ class Provisioner:
             configured = self.config.sandbox.workspace is not None or any(
                 entry.workspace is not None for entry in self.config.github.repos
             )
-            if configured and run_repo is not None:
+            if run_repo is not None and (configured or mode == "clone"):
                 # A workspace is configured somewhere, but none of it belongs
                 # to this repository. Its tree must come from its own remote
                 # or not at all — never from another repo's checkout.
@@ -1214,7 +1214,7 @@ class Provisioner:
                 f"no workspace is configured for {repo} and no git binary is on "
                 "PATH to clone it from its remote"
             )
-        url = f"{self.config.github.web_url}/{repo}"
+        url = self.config.clone_url_for_repo(repo)
         continuing = self._continue
         continue_branch = continuing.branch if continuing is not None else None
         branch = continue_branch or self._branch_name(run_id, repo)
@@ -1241,11 +1241,15 @@ class Provisioner:
                     url, clone_dir, branch, clone_filter=clone_filter, token=token
                 )
                 self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
-                self._populate_submodules(run_id, clone_dir, source=None, token=lambda: token)
+                self._populate_submodules(
+                    run_id, clone_dir, source=None, repo=repo, token=lambda: token
+                )
                 self._populate_lfs(run_id, clone_dir, source=None, repo=repo, token=lambda: token)
-                self._fetch_tags(run_id, clone_dir, source=None, token=lambda: token)
+                self._fetch_tags(run_id, clone_dir, source=None, repo=repo, token=lambda: token)
                 return clone_dir
-            if token:
+            if self.forge_kind(repo) != "github":
+                why = self._forge_clone_hint(repo, bool(token))
+            elif token:
                 why = (
                     "The clone authenticated with the run's GitHub credential; check "
                     "that it has contents:read on this repository"
@@ -1262,9 +1266,9 @@ class Provisioner:
                 "repository in its [[github.repos]] entry"
             ) from exc
         self._emit_clone(run_id, url, clone_dir, sha, branch, authenticated=bool(token))
-        self._populate_submodules(run_id, clone_dir, source=None, token=lambda: token)
+        self._populate_submodules(run_id, clone_dir, source=None, repo=repo, token=lambda: token)
         self._populate_lfs(run_id, clone_dir, source=None, repo=repo, token=lambda: token)
-        self._fetch_tags(run_id, clone_dir, source=None, token=lambda: token)
+        self._fetch_tags(run_id, clone_dir, source=None, repo=repo, token=lambda: token)
         return clone_dir
 
     def _fetch_tags(
@@ -1273,6 +1277,7 @@ class Provisioner:
         clone_dir: Path,
         *,
         source: Path | None,
+        repo: str | None = None,
         token: Callable[[], str | None],
     ) -> None:
         """Give a fresh ``--no-tags`` clone the repository's tags when its
@@ -1291,7 +1296,7 @@ class Provisioner:
             clone_dir,
             source=source,
             token=None if source_tags else token(),
-            credential_url=self.config.github.web_url,
+            credential_url=self.config.forge_web_url(repo),
         )
         evidence = [f"{m.path}: {m.marker}" for m in markers]
         self.bus.emit(
@@ -1338,9 +1343,7 @@ class Provisioner:
             )
             return
         lfs_url = (
-            hostgit.lfs_endpoint(f"{self.config.github.web_url}/{repo}")
-            if repo is not None
-            else None
+            hostgit.lfs_endpoint(self.config.clone_url_for_repo(repo)) if repo is not None else None
         )
         population = hostgit.populate_lfs(
             clone_dir,
@@ -1369,6 +1372,7 @@ class Provisioner:
         clone_dir: Path,
         *,
         source: Path | None,
+        repo: str | None = None,
         token: Callable[[], str | None],
     ) -> None:
         """Check out a fresh clone's submodules (#692) and say which came
@@ -1387,7 +1391,7 @@ class Provisioner:
             )
             return
         populated = hostgit.populate_submodules(
-            clone_dir, source=source, token=token(), credential_url=self.config.github.web_url
+            clone_dir, source=source, token=token(), credential_url=self.config.forge_web_url(repo)
         )
         if not populated:
             return
@@ -1398,6 +1402,15 @@ class Provisioner:
             submodules=[{"path": path, "source": how} for path, how in populated],
             message="populated submodules: "
             + ", ".join(f"{path} ({how})" for path, how in populated),
+        )
+
+    def _forge_clone_hint(self, repo: str, authenticated: bool) -> str:
+        kind = self.forge_kind(repo)
+        name = self.config.vcs_token_env_for(repo)
+        if authenticated:
+            return f"check that the {kind} credential has read access to this repository"
+        return (
+            f"only public repositories can clone without credentials; configure {name} for {kind}"
         )
 
     def clone_token(self, repo: str) -> str | None:
@@ -1413,6 +1426,13 @@ class Provisioner:
         raised here exactly as it would be for the github sandbox, so the
         run fails naming the fix instead of at the remote."""
         entry = self.config.github.effective_repo(repo)
+        if self.forge_kind(repo) != "github":
+            name = self.config.vcs_token_env_for(repo)
+            if name and self.env.get(name):
+                return self.gh_token(repo)
+            if (entry is not None and entry.token_env) or self.config.vcs.token_env:
+                return self.gh_token(repo)  # an explicitly selected missing token is an error
+            return None  # no credentials configured: a public repository may still clone
         status = gh_credential_status(self.env, token_env=entry.token_env if entry else None)
         if status.mode == "none":
             return None
@@ -1530,6 +1550,7 @@ class Provisioner:
             run_id,
             clone_dir,
             source=source,
+            repo=repo,
             token=lambda: self._clone_token(repo) if repo is not None else None,
         )
         self._populate_lfs(
@@ -1543,6 +1564,7 @@ class Provisioner:
             run_id,
             clone_dir,
             source=source,
+            repo=repo,
             token=lambda: self._clone_token(repo) if repo is not None else None,
         )
         return clone_dir
@@ -1841,7 +1863,7 @@ class Provisioner:
             return clone_dir
         if hostgit.find_git() is None:
             raise ProvisionError(f"no git binary is on PATH to clone {repo} for the workload")
-        url = f"{self.config.github.web_url}/{repo}"
+        url = self.config.clone_url_for_repo(repo)
         branch = self._branch_name(run_id, repo)
         token = self._clone_token(repo)
         try:
@@ -1855,6 +1877,8 @@ class Provisioner:
                 else "no GitHub credential is configured on the host, so only a public "
                 "repository can be cloned; export GH_TOKEN or configure a GitHub App"
             )
+            if self.forge_kind(repo) != "github":
+                why = self._forge_clone_hint(repo, bool(token))
             raise ProvisionError(
                 f"cloning {repo} from {url} into the workload's data directory failed: {exc}. {why}"
             ) from exc
