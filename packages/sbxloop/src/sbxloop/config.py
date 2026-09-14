@@ -56,12 +56,18 @@ from sbxloop.paths import SbxloopHome, home_root_from_env, resolve_home_root
 from sbxloop.resources import CpuCount, MemoryLimit, ResourcePurpose, SandboxResources
 from sbxloop.toolchains import DEFAULT_LANGUAGES, normalize_language, supported_languages
 from sbxloop_worker.protocol import (
+    OPENAI_API_ENV,
     OPENAI_BASE_URL_ENV,
     OPENAI_KEY_NAME_ENV,
+    OPENAI_REASONING_EFFORT_ENV,
     OPENAI_RETRIES_ENV,
     OPENAI_TIMEOUT_ENV,
     McpServerSpec,
     McpTransport,
+    OpenAIApi,
+    OpenAIReasoningEffort,
+    ResolvedOpenAIApi,
+    resolve_openai_api,
 )
 
 log = get_logger(__name__)
@@ -80,7 +86,13 @@ RESERVED_ENV_KEYS = frozenset(
         # sandbox's worker as plain env (`sbx.provision`), never a setting.
         *(
             name[len(ENV_PREFIX) :].lower()
-            for name in (OPENAI_KEY_NAME_ENV, OPENAI_TIMEOUT_ENV, OPENAI_RETRIES_ENV)
+            for name in (
+                OPENAI_KEY_NAME_ENV,
+                OPENAI_TIMEOUT_ENV,
+                OPENAI_RETRIES_ENV,
+                OPENAI_API_ENV,
+                OPENAI_REASONING_EFFORT_ENV,
+            )
         ),
     }
 )
@@ -244,6 +256,14 @@ class OpenAIBackendConfig(_ConfigModel):
     for a hosted API. ``allow_insecure_endpoint`` must be set for an
     ``http://`` URL: a credential bound to it goes on the wire in cleartext,
     which is never something a config does by accident.
+
+    ``api`` picks the wire API: ``chat`` (``/v1/chat/completions``, what
+    self-hosted servers serve), ``responses`` (``/v1/responses``, which the
+    hosted API needs for function tools with reasoning on newer models), or
+    ``auto`` (default): ``responses`` when ``base_url``'s host is
+    ``api.openai.com``, ``chat`` otherwise. ``reasoning_effort``, unset by
+    default, is sent as the request's reasoning effort when set; unset sends
+    nothing.
     """
 
     base_url: str | None = None
@@ -251,6 +271,8 @@ class OpenAIBackendConfig(_ConfigModel):
     request_timeout_s: float = Field(default=600.0, gt=0)
     max_retries: int = Field(default=2, ge=0)
     allow_insecure_endpoint: bool = False
+    api: OpenAIApi = "auto"
+    reasoning_effort: OpenAIReasoningEffort | None = None
 
     @field_validator("base_url")
     @classmethod
@@ -274,6 +296,10 @@ class OpenAIBackendConfig(_ConfigModel):
                 "allow_insecure_endpoint = true to do that on purpose, or use https://"
             )
 
+    def resolved_api(self) -> ResolvedOpenAIApi:
+        """The wire API ``api`` settles to for this endpoint."""
+        return resolve_openai_api(self.api, self.base_url or "")
+
 
 class OpenAIEndpointOverride(_ConfigModel):
     """`[github.repos.openai]`: sparse overrides of `[agent.openai]` for one
@@ -286,6 +312,8 @@ class OpenAIEndpointOverride(_ConfigModel):
     request_timeout_s: float | None = Field(default=None, gt=0)
     max_retries: int | None = Field(default=None, ge=0)
     allow_insecure_endpoint: bool | None = None
+    api: OpenAIApi | None = None
+    reasoning_effort: OpenAIReasoningEffort | None = None
 
     @field_validator("base_url")
     @classmethod
@@ -3379,7 +3407,10 @@ class Config(_ConfigModel):
            unchanged single-repo deployment) it applies as before; with
            several, only when the checkout's ``origin`` names this entry;
         3. the home's own checkout, ``workspaces/<owner>/<name>``, once the
-           daemon has cloned it (:meth:`default_workspace_for_repo`);
+           daemon has cloned it (:meth:`default_workspace_for_repo`), and only
+           when that directory is the root of a git checkout: a leftover or
+           empty directory there (a clone that never finished) is not the
+           repository, and a run handed it would start from nothing;
         4. otherwise ``None``.
 
         It never returns a checkout that belongs to a different repository:
@@ -3404,7 +3435,12 @@ class Config(_ConfigModel):
             ):
                 return legacy
         default = self.default_workspace_for_repo(repo)
-        return default if default is not None and default.is_dir() else None
+        if default is None or not default.is_dir():
+            return None
+        top = hostgit.repo_toplevel(default)
+        if top is None or top.resolve() != default.resolve():
+            return None
+        return default
 
     def default_workspace_for_repo(self, repo: str | None) -> Path | None:
         """Where the daemon keeps ``repo``'s dedicated clone when the operator

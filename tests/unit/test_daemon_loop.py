@@ -1740,16 +1740,38 @@ class TestWorkspacePosture:
         assert h.loop._item_config(gh_item()).sandbox.workspace_isolation == "in-place"
 
     def test_plain_directory_workspace_is_not_forced_to_clone(self, tmp_path: Path) -> None:
-        """`clone` on a non-git dir is a provisioning error; a plain dir must
-        keep `auto`'s in-place fallback or every daemon run would fail."""
+        """`clone` on a non-git dir is a provisioning error with the wrong
+        remedy; the operator's `auto` stays, and provisioning refuses the
+        plain directory for a repository run naming the fix."""
         plain = tmp_path / "plain"
         plain.mkdir()
         h = Harness(tmp_path, self._config(tmp_path, plain))
         assert h.loop._item_config(gh_item()).sandbox.workspace_isolation == "auto"
 
-    def test_no_workspace_leaves_sandbox_config_alone(self, tmp_path: Path) -> None:
+    def test_daemon_in_place_reaches_a_plain_directory_workspace(self, tmp_path: Path) -> None:
+        """An explicit daemon 'in-place' is the one mode that runs in a plain
+        directory as it is, so it must reach the run's config."""
+        plain = tmp_path / "plain"
+        plain.mkdir()
+        cfg = self._config(tmp_path, plain, workspace_isolation="in-place")
+        h = Harness(tmp_path, cfg)
+        assert h.loop._item_config(gh_item()).sandbox.workspace_isolation == "in-place"
+
+    def test_no_checkout_pins_a_remote_clone(self, tmp_path: Path) -> None:
+        """A code run for a repository with no host checkout (the home's
+        clone failed or never finished) must take its tree from the remote,
+        never start in an empty directory: only the isolation changes."""
         h = Harness(tmp_path)
-        assert h.loop._item_config(gh_item()).sandbox == h.config.sandbox
+        pinned = h.loop._item_config(gh_item()).sandbox
+        assert pinned.workspace_isolation == "clone"
+        assert pinned.model_copy(update={"workspace_isolation": "auto"}) == h.config.sandbox
+        assert h.config.sandbox.workspace_isolation == "auto"  # operator config untouched
+
+    def test_no_checkout_workload_keeps_its_sandbox_config(self, tmp_path: Path) -> None:
+        """A workload works in its own data directory, never a checkout."""
+        h = Harness(tmp_path)
+        item = gh_item(kind="workload")
+        assert h.loop._item_config(item).sandbox == h.config.sandbox
 
     def test_fresh_dispatch_fast_forwards_the_checkout(self, tmp_path: Path) -> None:
         upstream, checkout = make_upstream_and_clone(tmp_path)

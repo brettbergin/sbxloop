@@ -3522,21 +3522,38 @@ class DaemonLoop:
             # (#760) rather than filing a new one.
             update["workload"] = self.config.workload.model_copy(update={"result_issue": issue})
         sandbox = self.config.sandbox
-        if (
+        daemon_mode = self.config.daemon.workspace_isolation
+        if sandbox.workspace_isolation != daemon_mode and (
             self._workspace_checkout(item_repo) is not None
-            and sandbox.workspace_isolation != self.config.daemon.workspace_isolation
+            or (daemon_mode == "in-place" and self.config.workspace_for_repo(item_repo) is not None)
         ):
             # Unattended runs answer the dirty-tree question by config
             # (#255): `auto`'s refusal has no human to act on it and would
             # fail every issue while someone has uncommitted work in the
-            # checkout. Only a git checkout gets the override — for a plain
-            # directory `auto` already means in-place, and forcing `clone`
-            # there would turn every run into a provisioning error.
+            # checkout. Only a git checkout gets the override, except an
+            # explicit 'in-place', which is the one mode that runs in a
+            # plain directory as it is. Forcing `clone` on a plain directory
+            # would turn every run into a provisioning error, and under
+            # `auto` a repository run refuses one with the fix named.
             update["sandbox"] = SandboxConfig.model_validate(
                 {
                     **sandbox.model_dump(),
                     "workspace_isolation": self.config.daemon.workspace_isolation,
                 }
+            )
+        elif (
+            item.kind == "code"
+            and gh.repo is not None
+            and self.config.workspace_for_repo(gh.repo) is None
+        ):
+            # A code run for a repository with no host checkout of it (the
+            # home's clone failed, or never finished): its tree comes from
+            # the repository's remote, or the run fails naming why. Under
+            # `auto` it would otherwise start in an empty directory and
+            # build the ask without the repository at all. `clone` is the
+            # mode whose no-checkout path is exactly that remote clone.
+            update["sandbox"] = SandboxConfig.model_validate(
+                {**sandbox.model_dump(), "workspace_isolation": "clone"}
             )
         return self.config.model_copy(update=update)
 
@@ -3559,27 +3576,34 @@ class DaemonLoop:
         """Clone ``repo`` into the home's ``workspaces/<owner>/<name>`` the
         first time it is needed, when the operator pointed the daemon at no
         checkout of their own. Never fatal: without the checkout the run
-        clones from the remote itself, as it always could."""
+        clones from the remote itself (:meth:`_item_config` pins that for a
+        code run with no checkout). An empty directory there is cloned into;
+        one with files in it that is not a checkout is left alone."""
         if repo is None:
             return
         target = self.config.default_workspace_for_repo(repo)
         if target is None or target.is_symlink() or hostgit.find_git() is None:
             return
-        source = self.config.workspace_for_repo(repo)
-        if source is not None:
-            entry = self.config.github.find_repo(repo)
-            # Only an empty managed directory may be initialized. A configured
-            # checkout or any existing files remain the operator's responsibility.
-            if (
-                source != target
-                or self.config.sandbox.workspace is not None
-                or (entry is not None and entry.workspace is not None)
-                or not target.is_dir()
-                or any(target.iterdir())
-            ):
-                return
-        if target.exists() and not target.is_dir():
+        if self.config.workspace_for_repo(repo) is not None:
+            # A checkout already resolves for this repository: the
+            # operator's own, or the home's clone from an earlier run.
             return
+        if target.exists():
+            if not target.is_dir():
+                return
+            if any(target.iterdir()):
+                # A directory with files in it that is not a checkout (a
+                # leftover, or something the operator put there) is never
+                # cloned over or removed. Only an empty one is initialized.
+                self._notice(
+                    "workspace.refresh_failed",
+                    f"{target} exists but is not a git checkout of {repo}; move it "
+                    f"aside so {repo} can be cloned there. Runs clone from the "
+                    "remote meanwhile",
+                    level="warning",
+                    path=str(target),
+                )
+                return
         url = self.config.clone_url_for_repo(repo)
         token = self.github.provisioner.clone_token(repo) if self.github is not None else None
         started = time.monotonic()

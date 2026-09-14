@@ -667,10 +667,27 @@ class TestWorkspaceIsolation:
         assert fake_sbx.invocations("create") == []
         assert not (tmp_path / "state" / "runs" / "r1" / "workspace").exists()
 
-    def test_auto_non_git_workspace_stays_in_place(self, fake_sbx: FakeSbx, tmp_path: Path) -> None:
+    def test_auto_non_git_workspace_is_refused_for_a_repository_run(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        """With a repository configured, a plain directory is not that
+        repository: `auto` refuses it (naming the fix) instead of mounting
+        it, and nothing is provisioned or cloned."""
         source = tmp_path / "plain-ws"
         source.mkdir()
         provisioner, events = make_isolation_provisioner(fake_sbx, tmp_path, source)
+        with pytest.raises(ProvisionError, match="is not a git checkout"):
+            provisioner.ensure_pair("r1")
+        assert clone_events(events) == []
+        boxes = fake_sbx.state / "sandboxes"
+        assert not boxes.is_dir() or not any(boxes.iterdir())
+
+    def test_in_place_non_git_workspace_stays_in_place(
+        self, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        source = tmp_path / "plain-ws"
+        source.mkdir()
+        provisioner, events = make_isolation_provisioner(fake_sbx, tmp_path, source, "in-place")
         pair = provisioner.ensure_pair("r1")
         try:
             assert pair.workspace == source.resolve()
@@ -1201,7 +1218,9 @@ class TestMountExpected:
         source = tmp_path / "checkout"
         source.mkdir()
         (source / "README").write_text("the repo\n")
-        return make_isolation_provisioner(fake_sbx, tmp_path, source)
+        # A plain directory is mounted as it is only under an explicit
+        # 'in-place'; `auto` refuses one for a repository run.
+        return make_isolation_provisioner(fake_sbx, tmp_path, source, "in-place")
 
     def test_configured_workspace_that_never_mounts_fails_closed(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

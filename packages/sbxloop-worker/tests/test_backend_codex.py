@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -16,6 +17,7 @@ import pytest
 from sbxloop_worker.backends import BackendUnavailableError, codex_runtime, get_backend
 from sbxloop_worker.backends.codex import CodexBackend
 from sbxloop_worker.backends.codex_runtime import authenticated_client
+from sbxloop_worker.backends.codex_tools import local_tools
 from sbxloop_worker.protocol import Event, HostToolResponse, HostToolSpec, JobRequest, McpServerSpec
 
 
@@ -279,6 +281,114 @@ def test_workload_replaces_persona_and_returns_final_json(sdk: Any, emitted: Any
     assert sdk.clients[0].thread_params[0]["baseInstructions"] == "You are an operator."
 
 
+def tool_names(params: dict[str, Any]) -> list[str]:
+    return [spec["name"] for spec in params["dynamicTools"]]
+
+
+def test_build_session_is_told_its_governed_tools_are_writable(
+    sdk: Any, emitted: Any, tmp_path: Path
+) -> None:
+    # Codex describes its read-only native sandbox to the model; without
+    # this note a build session refused to call write_file at all.
+    CodexBackend().run_session(job(cwd=str(tmp_path), system_message="Build brief."), emitted[1])
+    params = sdk.clients[0].thread_params[0]
+    assert {"write_file", "shell"} <= set(tool_names(params))
+    developer = params["developerInstructions"]
+    assert developer.startswith("Build brief.\n\n")
+    assert "the workspace is writable" in developer
+    assert "make the changes with write_file and shell" in developer
+    assert "baseInstructions" not in params
+    # The note is the only change: native tools stay disabled and the
+    # native sandbox stays read-only.
+    assert params["sandbox"] == "read-only"
+    assert params["approvalPolicy"] == "never"
+    assert params["environments"] == []
+    assert sdk.clients[0].turn_params[0]["environments"] == []
+
+
+def test_workload_executor_keeps_its_persona_and_gets_the_writable_note(
+    sdk: Any, emitted: Any, tmp_path: Path
+) -> None:
+    CodexBackend().run_session(
+        job(cwd=str(tmp_path), system_preset=False, system_message="You are an operator."),
+        emitted[1],
+    )
+    params = sdk.clients[0].thread_params[0]
+    assert params["baseInstructions"] == "You are an operator."
+    assert params["developerInstructions"].startswith("Workspace access in this session:")
+    assert "the workspace is writable" in params["developerInstructions"]
+
+
+def test_read_only_session_has_no_write_tools_and_is_told_so(
+    sdk: Any, emitted: Any, tmp_path: Path
+) -> None:
+    CodexBackend().run_session(
+        job(cwd=str(tmp_path), permission_mode="read_only", system_message="Review brief."),
+        emitted[1],
+    )
+    params = sdk.clients[0].thread_params[0]
+    assert tool_names(params) == ["read_file", "list_files", "search_files"]
+    developer = params["developerInstructions"]
+    assert developer.startswith("Review brief.\n\n")
+    assert "the workspace is read-only" in developer
+    assert "Do not attempt to modify the workspace" in developer
+    assert "writable" not in developer
+    assert "write_file" not in developer and "shell" not in developer
+    assert params["sandbox"] == "read-only"
+
+
+def test_auto_session_limited_to_read_tools_is_not_told_it_can_write(
+    sdk: Any, emitted: Any, tmp_path: Path
+) -> None:
+    CodexBackend().run_session(
+        job(cwd=str(tmp_path), available_tools=["read_file", "search_files"]), emitted[1]
+    )
+    developer = sdk.clients[0].thread_params[0]["developerInstructions"]
+    assert "the workspace is read-only" in developer
+    assert "read_file, search_files" in developer
+
+
+def test_resume_sends_the_same_workspace_note(sdk: Any, emitted: Any, tmp_path: Path) -> None:
+    build = job(cwd=str(tmp_path), system_message="Build brief.")
+    previous = CodexBackend().run_session(build, emitted[1]).session_id
+    started = sdk.clients[0].thread_params[0]
+    sdk.clients.clear()
+    result = CodexBackend().run_session(
+        build.model_copy(update={"resume_session_id": previous}), emitted[1]
+    )
+    assert result.session_id == previous
+    assert sdk.clients[0].thread_params == []
+    resumed = sdk.clients[0].resume_params[0]
+    assert resumed["developerInstructions"] == started["developerInstructions"]
+    assert "the workspace is writable" in resumed["developerInstructions"]
+    assert resumed["sandbox"] == "read-only"
+
+
+def test_thread_opened_without_the_workspace_note_starts_fresh(
+    sdk: Any, emitted: Any, tmp_path: Path
+) -> None:
+    # A handle minted before the note existed may name a thread that has
+    # already concluded it cannot write; it must not be resumed.
+    build = job(cwd=str(tmp_path))
+    specs = [tool.spec for tool in local_tools(build)]
+    manifest = {
+        "sdk": codex_runtime.SDK_VERSION,
+        "tools": [spec.model_dump(mode="json") for spec in specs],
+        "permission_mode": build.permission_mode,
+        "system_preset": build.system_preset,
+        "system_message": build.system_message,
+        "cwd": build.cwd,
+        "model": build.model,
+    }
+    old = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+    result = CodexBackend().run_session(
+        build.model_copy(update={"resume_session_id": f"codex-v1:refused-thread:{old}"}),
+        emitted[1],
+    )
+    assert sdk.clients[0].resume_params == []
+    assert result.session_id and result.session_id.startswith("codex-v1:fresh:")
+
+
 @pytest.mark.parametrize(
     "server",
     [
@@ -329,6 +439,8 @@ def test_concierge_exposes_only_host_tools_and_denies_stale_builtins(
     )
     specs = sdk.clients[0].thread_params[0]["dynamicTools"]
     assert [spec["name"] for spec in specs] == ["inspect_run"]
+    # Host tools describe themselves; a workspace note would be noise.
+    assert "developerInstructions" not in sdk.clients[0].thread_params[0]
     assert sdk.clients[0].response["success"] is False
     assert result.health and result.health.permission_denials == {"shell": 1}
 

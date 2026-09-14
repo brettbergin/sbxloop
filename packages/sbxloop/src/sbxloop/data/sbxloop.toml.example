@@ -98,6 +98,14 @@ secret_strategy = "proxy"
 # A plain http:// base_url refuses to load unless this is set: the credential
 # would travel in cleartext, which is never done by accident.
 # allow_insecure_endpoint = false
+# Which wire API the model calls use: "chat" (/v1/chat/completions, what
+# self-hosted servers serve), "responses" (/v1/responses, which the hosted API
+# needs for function tools with reasoning on newer models), or "auto":
+# "responses" when base_url's host is api.openai.com, "chat" otherwise.
+# api = "auto"
+# Reasoning effort sent with every request (none, minimal, low, medium, high,
+# xhigh, max; the model decides which it accepts). Unset sends none at all.
+# reasoning_effort = "medium"
 
 # [agent.models]
 # Omit a key to inherit top-level model. Explicit "auto" asks the backend
@@ -571,6 +579,8 @@ service_memory = "2g"
 # request_timeout_s = 900
 # max_retries = 2
 # allow_insecure_endpoint = true
+# api = "chat"                 # auto settles against this repository's own base_url
+# reasoning_effort = "low"     # overrides [agent.openai] reasoning_effort here
 # [[github.repos]]
 # repo = "you/other-repo"
 # enabled = false              # registered but not polled

@@ -107,6 +107,39 @@ fresh provision starts fresh, as it does under codex.
 single-model box serves. An endpoint that lists nothing cannot pick, and
 says so rather than guessing a name.
 
+### Chat completions or responses
+
+`[agent.openai] api` selects the wire API. `chat` is the shape described
+above. `responses` calls `/v1/responses`: the hosted API requires it for
+function tools combined with reasoning on its newer models, and refuses
+that combination on `/v1/chat/completions` with a 400. `auto`, the default,
+is `responses` when `base_url`'s host is `api.openai.com` and `chat` for
+every other host, because self-hosted servers generally serve only chat
+completions. The host settles the value (a repository override settles it
+against its own `base_url`) and delivers it as `SBXLOOP_OPENAI_API` beside
+the endpoint.
+
+The responses loop is the chat loop with a different wire shape: the same
+governor, deadline, events and redaction. Each request carries `model`,
+the transcript as `input` items, the system prompt as `instructions`, the
+tools as flat function tools with `strict: false`, `store: false`, and
+`include: ["reasoning.encrypted_content"]`. The stream is assembled from
+`response.output_text.delta` (the status line), `response.output_item.done`
+(the completed items: messages, `function_call` items with `call_id`,
+`name` and `arguments`, and reasoning items) and `response.completed` (the
+usage: input, output with reasoning counted inside it, cached tokens). The
+model's output items are appended to the transcript verbatim, message text
+redacted and reasoning's encrypted content untouched, followed by one
+`function_call_output` per call, so the next stateless request carries the
+reasoning the calls were made with. An `error` or `response.failed` event
+is classified by its code like the same failure answered over HTTP.
+
+The persisted transcript records the API it was made under. A transcript
+from the other API is never replayed: a plain resume starts fresh, and a
+`require_resume` job fails closed naming both APIs. `reasoning_effort`,
+unset by default, is sent as `reasoning_effort` on chat and
+`reasoning: {"effort": ...}` on responses; unset sends nothing.
+
 ### Chronology and human control
 
 The backend emits the same events as the others, attributed to `openai`:
@@ -119,7 +152,12 @@ unsupported, as it is for codex.
 
 Failures name the endpoint and the model, never the key: a refused
 connection, a 404 on the base URL or the model, a refused credential (by
-its variable's name), a throttle with its retry hint, a server error. An
+its variable's name), a throttle with its retry hint, a server error.
+Those are provider failures the run's recovery holds and retries. A
+request the endpoint rejects as malformed or unsupported (HTTP 400 or 422)
+is not: the same request cannot succeed later, so it ends the job with the
+endpoint's reason, the model and the API it went to, and the phase fails
+instead of parking the run. An
 `expect="json"` reply that will not parse gets one reask and then the
 runner's own missing-JSON error — never an unbounded retry.
 

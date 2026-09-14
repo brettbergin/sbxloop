@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import json
 import time
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
@@ -36,6 +36,34 @@ OPENAI_BASE_URL_ENV = "OPENAI_BASE_URL"
 OPENAI_KEY_NAME_ENV = "SBXLOOP_OPENAI_API_KEY_ENV"
 OPENAI_TIMEOUT_ENV = "SBXLOOP_OPENAI_REQUEST_TIMEOUT_S"
 OPENAI_RETRIES_ENV = "SBXLOOP_OPENAI_MAX_RETRIES"
+# Which wire API the openai backend speaks (``chat`` or ``responses``, as
+# ``resolve_openai_api`` settles ``[agent.openai] api``) and the reasoning
+# effort it asks for, when one is configured.
+OPENAI_API_ENV = "SBXLOOP_OPENAI_API"
+OPENAI_REASONING_EFFORT_ENV = "SBXLOOP_OPENAI_REASONING_EFFORT"
+
+OpenAIApi = Literal["auto", "chat", "responses"]
+ResolvedOpenAIApi = Literal["chat", "responses"]
+#: The reasoning efforts ``[agent.openai] reasoning_effort`` accepts: the
+#: values the pinned ``openai`` client's ``ReasoningEffort`` names.
+OpenAIReasoningEffort = Literal["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+OPENAI_REASONING_EFFORTS: tuple[str, ...] = get_args(OpenAIReasoningEffort)
+#: The hosted API, the one endpoint ``api = "auto"`` sends to /v1/responses:
+#: self-hosted servers generally serve only /v1/chat/completions.
+OPENAI_HOSTED_API_HOST = "api.openai.com"
+
+
+def resolve_openai_api(api: str, base_url: str) -> ResolvedOpenAIApi:
+    """``chat`` or ``responses`` for an ``[agent.openai] api`` value and the
+    endpoint it applies to: an explicit choice wins, and ``auto`` is
+    ``responses`` only on the hosted API."""
+    if api == "chat":
+        return "chat"
+    if api == "responses":
+        return "responses"
+    host = (urlsplit(base_url).hostname or "").lower().rstrip(".")
+    return "responses" if host == OPENAI_HOSTED_API_HOST else "chat"
+
 
 JobKind = Literal[
     "agent.session",

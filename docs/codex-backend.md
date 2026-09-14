@@ -56,6 +56,15 @@ nested local or host tool call; pure computation and response formatting
 do not consume tool calls. This is a curated tool surface rather than the
 complete interactive Codex tool catalog.
 
+Codex's own sandbox stays `read-only` in every session, as defense in depth
+for the disabled native tools, and Codex describes that sandbox to the model.
+A session that exposes `write_file` or `shell` therefore also carries a
+developer instruction saying the workspace is writable through those tools
+and that file changes must be made with them; a session with only the read
+tools is told the workspace is read-only. Sessions with no local tools get
+no such note. The SDK's writable sandbox modes would make the description
+match, but each would widen what a re-enabled native executor could do.
+
 The VM remains the execution boundary. Shell commands execute inside the
 agent VM, where the only delivered credential is the inference key.
 Reviewers inspect the existing evidence and files; mechanical verification

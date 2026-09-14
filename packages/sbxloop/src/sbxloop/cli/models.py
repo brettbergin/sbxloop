@@ -470,7 +470,15 @@ def probe_openai_endpoint(
     if env.get(key_env):
         headers["Authorization"] = f"Bearer {env[key_env]}"
     opener = _open_url if open_url is None else open_url
-    caveat = "; whether the agent sandbox can reach it is a separate question doctor cannot answer"
+    # The listing is the same under either API; the model calls are not, so
+    # the row names the path the selected API sends them to.
+    settings = config.openai_for()
+    path = "responses" if settings.resolved_api() == "responses" else "chat/completions"
+    caveat = (
+        f"; model calls go to {url.removesuffix('/models')}/{path} ([agent.openai] api = "
+        f'"{settings.api}"); whether the agent sandbox can reach it is a separate question '
+        "doctor cannot answer"
+    )
     try:
         opener(urllib.request.Request(url, headers=headers), timeout_s)
     except urllib.error.HTTPError as exc:

@@ -59,16 +59,33 @@ class TestCloneWorkspace:
 
 
 class TestConfigDefault:
-    def test_default_counts_only_once_it_exists(self, tmp_path: Path) -> None:
+    def test_default_counts_only_once_it_is_a_checkout(self, tmp_path: Path) -> None:
         home = SbxloopHome(tmp_path / "h")
         config = Config.model_validate({"home": str(home.root), "github": {"repo": "Acme/Widget"}})
         default = config.default_workspace_for_repo("Acme/Widget")
         assert default == home.workspaces / "Acme" / "Widget"
         assert config.workspace_for_repo("Acme/Widget") is None
         assert config.workspace_source("Acme/Widget") == "none"
+        # An existing directory is not yet the repository: a clone that never
+        # finished leaves one behind, and a run handed it starts from nothing.
         default.mkdir(parents=True)
+        assert config.workspace_for_repo("Acme/Widget") is None
+        (default / "leftover.txt").write_text("not a checkout\n")
+        assert config.workspace_for_repo("Acme/Widget") is None
+        Repo.init(default)
         assert config.workspace_for_repo("Acme/Widget") == default
         assert config.workspace_source("Acme/Widget") == "configured"
+
+    def test_a_subdirectory_of_another_checkout_is_not_the_default(self, tmp_path: Path) -> None:
+        """A home that happens to live inside some git checkout: the default
+        directory is inside a work tree, but it is not the repository's own."""
+        Repo.init(tmp_path)
+        home = SbxloopHome(tmp_path / "h")
+        config = Config.model_validate({"home": str(home.root), "github": {"repo": "o/n"}})
+        default = config.default_workspace_for_repo("o/n")
+        assert default is not None
+        default.mkdir(parents=True)
+        assert config.workspace_for_repo("o/n") is None
 
     def test_operators_checkout_wins(self, tmp_path: Path) -> None:
         home = SbxloopHome(tmp_path / "h")
@@ -210,6 +227,36 @@ class TestDaemonClonesOnFirstUse:
         ]
         assert not (home.workspaces / "o" / "n").exists()
 
+    def test_a_leftover_directory_is_never_cloned_over_or_removed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The home default exists with files in it but is not a checkout: it
+        no longer passes for the repository's workspace, and the clone that
+        would replace it must not run (a failed clone removes its target)."""
+        loop, home = self.make_loop(tmp_path)
+        target = home.workspaces / "o" / "n"
+        target.mkdir(parents=True)
+        (target / "notes.txt").write_text("keep me\n")
+        monkeypatch.setattr(
+            hostgit, "clone_workspace", lambda *a, **k: pytest.fail("must not clone")
+        )
+        notices: list[tuple[str, str]] = []
+        monkeypatch.setattr(loop, "_notice", lambda kind, text, **kw: notices.append((kind, text)))
+        loop._ensure_workspace("o/n")
+        assert (target / "notes.txt").read_text() == "keep me\n"
+        assert [kind for kind, _ in notices] == ["workspace.refresh_failed"]
+        assert "is not a git checkout of o/n" in notices[0][1]
+
+    def test_home_clone_already_present_is_left_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        loop, home = self.make_loop(tmp_path)
+        Repo.init(home.workspaces / "o" / "n", mkdir=True)
+        monkeypatch.setattr(
+            hostgit, "clone_workspace", lambda *a, **k: pytest.fail("must not clone")
+        )
+        loop._ensure_workspace("o/n")
+
     def test_operators_checkout_is_never_cloned_over(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -250,7 +297,7 @@ class TestDoctor:
                 },
             }
         )
-        (home.workspaces / "o" / "c").mkdir(parents=True)
+        Repo.init(home.workspaces / "o" / "c", mkdir=True)
         rows = {c.name: c for c in workspace_checks(config)}
         assert rows["workspace o/a"].ok and "operator's" in rows["workspace o/a"].detail
         assert rows["workspace o/b"].ok and "clones it into" in rows["workspace o/b"].detail

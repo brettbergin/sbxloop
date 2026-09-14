@@ -112,8 +112,10 @@ from sbxloop.vcs.github.appauth import (
     app_credentials,
 )
 from sbxloop_worker.protocol import (
+    OPENAI_API_ENV,
     OPENAI_BASE_URL_ENV,
     OPENAI_KEY_NAME_ENV,
+    OPENAI_REASONING_EFFORT_ENV,
     OPENAI_RETRIES_ENV,
     OPENAI_TIMEOUT_ENV,
 )
@@ -740,6 +742,9 @@ class Provisioner:
             env[OPENAI_KEY_NAME_ENV] = settings.api_key_env
             env[OPENAI_TIMEOUT_ENV] = f"{settings.request_timeout_s:g}"
             env[OPENAI_RETRIES_ENV] = str(settings.max_retries)
+            env[OPENAI_API_ENV] = settings.resolved_api()
+            if settings.reasoning_effort is not None:
+                env[OPENAI_REASONING_EFFORT_ENV] = settings.reasoning_effort
         return env
 
     def _endpoint(self, repo: str | None = None) -> Endpoint:
@@ -1073,7 +1078,10 @@ class Provisioner:
         Everywhere else the tree carries the repository the ask is about,
         and the agent sandbox must see it — a mount that cannot be found is
         then a provisioning failure, not a quiet fall back to an empty
-        directory (#670).
+        directory (#670). For the same reason a run for a repository refuses
+        a configured workspace that is not a git checkout under ``auto``
+        rather than mounting it as the repository; ``in-place`` is the
+        explicit way to work in such a directory as it is.
 
         The clone source is resolved per repository
         (:meth:`Config.workspace_for_repo`), never from a daemon-wide path:
@@ -1115,6 +1123,21 @@ class Provisioner:
             if mode == "clone":
                 raise ProvisionError(
                     f"workspace_isolation = 'clone' but {source} is not a git repository"
+                )
+            if run_repo is not None:
+                # A run for a repository handed a plain (or missing, or
+                # empty) directory would start from a tree with none of the
+                # repository in it and build the ask from nothing. Only an
+                # explicit 'in-place' (handled above) means "that directory,
+                # as it is".
+                raise ProvisionError(
+                    f"workspace {source} configured for {run_repo} is not a git "
+                    f"checkout, so the run would start without {run_repo}'s "
+                    "files or history. Point that workspace at a git checkout "
+                    f"of {run_repo}, remove the setting so the run clones "
+                    f"{run_repo} from its remote, or set [sandbox] "
+                    "workspace_isolation = 'in-place' to run in that directory "
+                    "as it is"
                 )
             return source, True
         if root != source:

@@ -118,7 +118,7 @@ backend = "claude"   # default: "copilot"
 | `copilot` | `COPILOT_GITHUB_TOKEN` (PAT, *Copilot Requests*)                                                                      | `github-copilot-sdk` (worker `[copilot]` extra; wheels bundle the Copilot CLI)                                                                                                                 |
 | `claude`  | `ANTHROPIC_API_KEY` ([console](https://console.anthropic.com/settings/keys))                                          | `claude-agent-sdk` (worker `[claude]` extra) + the Claude Code CLI, which provisioning installs (Node + `@anthropic-ai/claude-code`)                                                           |
 | `codex`   | `OPENAI_API_KEY` ([API keys](https://platform.openai.com/api-keys))                                                   | Python `openai-codex==0.147.0` (worker `[codex]` extra), including its matching Codex CLI runtime and Code Mode helper; no Node dependency                                                     |
-| `openai`  | the variable `[agent.openai] api_key_env` names (`OPENAI_API_KEY` by default), bound to the endpoint `base_url` names | Python `openai` client (worker `[openai]` extra) driving `/v1/chat/completions` on a self-hosted server, a gateway or the hosted API, with the worker's own governed tools; no Node dependency |
+| `openai`  | the variable `[agent.openai] api_key_env` names (`OPENAI_API_KEY` by default), bound to the endpoint `base_url` names | Python `openai` client (worker `[openai]` extra) driving `/v1/chat/completions` or `/v1/responses` on a self-hosted server, gateway or the hosted API, with governed tools; no Node dependency |
 
 The run protocol is shared across backends: the top-level `model` key supplies
 the default model (`"auto"` lets the backend pick). Each agent can override it
@@ -204,6 +204,8 @@ allow_insecure_endpoint = true              # plain http:// refuses to load with
 # api_key_env = "OPENAI_API_KEY"            # the variable holding the key, never the key
 # request_timeout_s = 600                   # client patience, sized for a slow local box
 # max_retries = 2
+# api = "auto"                              # "chat", "responses", or auto by host
+# reasoning_effort = "medium"               # unset sends no reasoning effort at all
 ```
 
 The credential goes in the home's secrets file under whatever
@@ -236,10 +238,31 @@ literal is **field-unverified**; provisioning stops naming the endpoint if
 sbx refuses the allow or the binding, rather than leaving a sandbox to
 fail later.
 
+`api` picks the wire API the model calls use. `chat` calls
+`/v1/chat/completions`, which self-hosted servers such as vLLM, Ollama and
+LM Studio serve; `responses` calls `/v1/responses`, which the hosted API
+requires for function tools combined with reasoning on its newer models;
+`auto` (the default) picks `responses` when `base_url`'s host is
+`api.openai.com` and `chat` for every other host. A gateway in front of the
+hosted API is another host, so set `api = "responses"` there explicitly if
+it forwards `/v1/responses`. `reasoning_effort` is unset by default and
+then nothing is sent; set it (`none`, `minimal`, `low`, `medium`, `high`,
+`xhigh`, `max`, as the model accepts) to send it as `reasoning_effort` on
+chat or `reasoning.effort` on responses.
+
+A request the endpoint refuses as malformed or unsupported (HTTP 400 or
+422\) fails the phase with the endpoint's own reason, naming the endpoint,
+the model and the API it went to (and the `api` setting to change when the
+reason points at the other API). It does not park the run as a provider
+hold: sending the same request again cannot succeed. Throttles, outages
+and refused credentials keep their provider handling.
+
 The backend runs the worker's own governed tools — the same read-only
 reviewers, tool-call ceiling and host-tool relay as codex — against
-`/v1/chat/completions`, with a session held as a transcript the worker
-keeps. Native MCP servers are refused by name; credentialed HTTP MCP works
+the selected API, with a session held as a transcript the worker keeps.
+Under `responses` the transcript keeps the model's reasoning items with
+their encrypted content (requests go out with `store: false`), and a
+transcript made under one API is never replayed under the other. Native MCP servers are refused by name; credentialed HTTP MCP works
 through host mediation as it does under codex. Token counts are reported
 and no cost is invented: a served endpoint has no price. See the
 [design and implementation plan](openai-backend.md) for the contract and
@@ -1018,7 +1041,11 @@ Dirty-tree rules: `auto` **refuses to start** when the checkout has
 uncommitted changes (a clone takes committed HEAD, so they would silently not
 travel — commit or stash first). `workspace_isolation = "clone"` isolates the
 same way but proceeds from HEAD with a warning; `"in-place"` skips isolation
-entirely and mutates the workspace directly. Clones hardlink git objects on
+entirely and mutates the workspace directly. A workspace that is not a git
+checkout, for a run with a repository configured, is refused under `auto`
+(the run would start without the repository's files or history): point it at
+a checkout, remove the setting so the run clones the repository, or set
+`"in-place"` to work in that directory as it is. Clones hardlink git objects on
 the same filesystem, so isolation is cheap; the working tree itself is
 copied. If the agent commits inside the VM it needs `git config user.name` /
 `user.email` — agents typically set these themselves.
@@ -2275,7 +2302,13 @@ The daemon first creates a managed checkout under `workspaces/<owner>/<name>`
 when no workspace was supplied. To let it clone automatically, omit both
 the entry's `workspace` and `[sandbox] workspace`; these settings name
 existing checkouts, not clone destinations. Keep
-`[daemon] workspace_isolation = "clone"` for isolation between runs.
+`[daemon] workspace_isolation = "clone"` for isolation between runs. The
+managed directory counts only once it is the root of a git checkout; when
+the daemon's clone fails, or leaves an empty or non-git directory behind,
+each daemon run clones the repository from its remote itself (or fails
+naming why), whatever the isolation setting, and never starts in an empty
+directory. A directory there with files in it is not cloned over; move it
+aside.
 
 Clone URLs preserve the configured scheme, port and installation prefix.
 For example, a GitLab API root of `http://forge.example:8929/gitlab/api/v4`
@@ -3073,7 +3106,9 @@ The notable knobs:
 | `[agent.openai] api_key_env`                                                                       | `OPENAI_API_KEY`                                                                                | The env var **name** holding the endpoint's credential, never the key; registered with sbx bound to the endpoint's host. An endpoint wanting no credential still needs a placeholder value in it. Not also settable through `[sandbox] env`, a registry `auth_env` or `[[credentials]]`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
 | `[agent.openai] request_timeout_s` / `max_retries`                                                 | `600` / `2`                                                                                     | Client patience for one request and how many retries a failed one gets, passed to the SDK client — sized for a local box that may generate slowly.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `[agent.openai] allow_insecure_endpoint`                                                           | `false`                                                                                         | A plain `http://` `base_url` refuses to load unless this is set: the credential would travel in cleartext.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `[github.repos.openai] base_url` / `request_timeout_s` / `max_retries` / `allow_insecure_endpoint` | unset                                                                                           | Sparse per-repository overrides of `[agent.openai]` for a repository whose code must stay on a private endpoint; unset keys inherit. The endpoint only — `api_key_env` is one per host.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `[agent.openai] api`                                                                               | `auto`                                                                                          | The wire API the model calls use: `chat` (`/v1/chat/completions`), `responses` (`/v1/responses`), or `auto`: `responses` when `base_url`'s host is `api.openai.com`, `chat` for any other host. The hosted API needs `responses` for function tools with reasoning on its newer models; most self-hosted servers serve only `chat`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `[agent.openai] reasoning_effort`                                                                  | unset                                                                                           | Reasoning effort sent with every model call (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`): `reasoning_effort` on chat, `reasoning.effort` on responses. Unset sends nothing.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| `[github.repos.openai] base_url` / `request_timeout_s` / `max_retries` / `allow_insecure_endpoint` | unset                                                                                           | Sparse per-repository overrides of `[agent.openai]` for a repository whose code must stay on a private endpoint; unset keys inherit. `api` and `reasoning_effort` override the same way, and `api = "auto"` settles against the repository's own `base_url`. The endpoint only — `api_key_env` is one per host.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | `keep_sandboxes` / `keep_on_failure`                                                               | `false`                                                                                         | Sandbox retention for debugging (see above).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
 | `secret_strategy`                                                                                  | `proxy`                                                                                         | `proxy` keeps token values out of the VM; `plain-env` skips the sbx proxy — tokens are piped per job over worker stdin when this sbx supports it, else written to an in-VM env file. On current sbx the cached exec-visibility verdict makes the non-proxy / env-file fallback the common case even under `proxy`, not an edge case (#46; interim hardening #592).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
 | `[sandbox] cpus`                                                                                   | `6`                                                                                             | Positive integer CPUs for each run agent and bake VM; per-repository cpus override. See Sandbox CPU and memory for cutover and recreation.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |

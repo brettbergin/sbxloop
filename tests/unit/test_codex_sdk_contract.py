@@ -112,6 +112,7 @@ def test_real_sdk_preserves_dynamic_tools_and_typed_turn_events(
     thread = requests["thread/start"]
     assert thread["environments"] == []
     assert thread["baseInstructions"] == "Workload instructions"
+    assert "the workspace is read-only" in thread["developerInstructions"]
     assert {tool["name"] for tool in thread["dynamicTools"]} == {
         "read_file",
         "list_files",

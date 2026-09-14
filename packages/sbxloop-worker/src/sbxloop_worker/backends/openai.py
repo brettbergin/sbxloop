@@ -1,11 +1,14 @@
-"""The ``openai`` backend: a governed chat-completions loop the worker owns.
+"""The ``openai`` backend: a governed model loop the worker owns.
 
 The other backends hand the model loop, tool execution and session state
 to a vendor SDK. The ``openai`` Python SDK is a client, not an agent
-harness: it gives one ``/v1/chat/completions`` call and nothing else, so
-the worker owns the loop — call, dispatch every tool call the model made
-through the governor, append the results, call again — until the model
-answers with content or the tool-call ceiling is reached. It owns no new
+harness: it gives one model call and nothing else, so the worker owns the
+loop — call, dispatch every tool call the model made through the
+governor, append the results, call again — until the model answers with
+content or the tool-call ceiling is reached. The call is
+``/v1/chat/completions`` or ``/v1/responses``, as ``OPENAI_API_ENV``
+names (``[agent.openai] api``); the loop, the governor, the deadline and
+the redaction are the same for both, only the wire shape differs. It owns no new
 tools: the governed layer that already exists (``codex_tools.local_tools``
 and the copilot backend's governor, registry and health tracker) is what
 every call goes through, so read-only sessions, per-phase ceilings and the
@@ -17,19 +20,28 @@ variable ``SBXLOOP_OPENAI_API_KEY_ENV`` names holds the credential, and the
 client's patience rides beside them. The credential value is replaced in
 everything that reaches an event.
 
-Chat completions is stateless — there is no server-side thread to resume —
-so a session is a worker-held transcript beside the sandbox's home, keyed
-by a session id this backend mints. ``resume_session_id`` continues from
-it; a ``require_resume`` job whose transcript is gone fails closed with a
+Both APIs are driven statelessly (chat completions has no server-side
+thread, and responses is called with ``store: false`` and asked for the
+reasoning items' ``encrypted_content`` so they can be sent back), so a
+session is a worker-held transcript beside the sandbox's home, keyed by a
+session id this backend mints and marked with the API it was made under.
+``resume_session_id`` continues from it; a ``require_resume`` job whose
+transcript is gone, or was made under the other API, fails closed with a
 named reason rather than replaying tools in a fresh session.
 
 No native MCP: a job carrying ``mcp_servers`` is refused by name. No cost
 accounting: a served endpoint has no price, so ``Usage`` keeps token counts
 and cost stays unset. The endpoint's wire behaviour (streaming with usage
-in the final chunk, a ``/v1/models`` listing) is exercised against a stub
-speaking the wire shape and the SDK against a local server; behaviour
-against a real served endpoint is FIELD-UNVERIFIED until it runs on a CI
-runner.
+in the final chunk, a ``/v1/models`` listing, the responses event stream)
+is exercised against a stub speaking the wire shape and the SDK against a
+local server; behaviour against a real served endpoint is FIELD-UNVERIFIED
+until it runs on a CI runner.
+
+A request the endpoint rejects as malformed or unsupported (HTTP 400 or
+422) is not a provider outage: sending it again cannot succeed, so it ends
+the job as :class:`EndpointRequestRejected` naming the endpoint, the model
+and the endpoint's own reason, rather than a provider hold waiting on a
+recovery that will not come.
 """
 
 from __future__ import annotations
@@ -56,8 +68,11 @@ from sbxloop_worker.backends.copilot import (
 )
 from sbxloop_worker.hosttools import HostToolTimeout, request_tool, safe_call_id
 from sbxloop_worker.protocol import (
+    OPENAI_API_ENV,
     OPENAI_BASE_URL_ENV,
     OPENAI_KEY_NAME_ENV,
+    OPENAI_REASONING_EFFORT_ENV,
+    OPENAI_REASONING_EFFORTS,
     OPENAI_RETRIES_ENV,
     OPENAI_TIMEOUT_ENV,
     EventTypes,
@@ -65,7 +80,9 @@ from sbxloop_worker.protocol import (
     HostToolSpec,
     JobRequest,
     ProviderFailure,
+    ResolvedOpenAIApi,
     Usage,
+    resolve_openai_api,
 )
 from sbxloop_worker.rate_limits import RateLimitReport
 from sbxloop_worker.secrets import redact_secrets
@@ -79,6 +96,14 @@ DEFAULT_KEY_ENV = "OPENAI_API_KEY"  # nosec B105 - env var name, not a secret
 DEFAULT_TIMEOUT_S = 600.0
 DEFAULT_MAX_RETRIES = 2
 SESSION_PREFIX = "openai-v1"
+#: What a responses request asks back so reasoning replays with ``store: false``.
+RESPONSES_INCLUDE = ("reasoning.encrypted_content",)
+#: Statuses that mean the request itself will not do: resending it cannot
+#: succeed, so they end the job instead of holding the provider.
+REJECTED_STATUSES = frozenset({400, 422})
+#: The HTTP status an error code reported inside a stream stands for, so
+#: it is classified like the same failure answered as a status.
+STREAM_ERROR_STATUS = {"rate_limit_exceeded": 429, "server_error": 500, "invalid_prompt": 400}
 
 # The coding-agent framing a code job gets ahead of its system message
 # (``system_preset``), the way the vendor SDKs frame theirs. Neutral: it
@@ -117,13 +142,29 @@ class EndpointError(Exception):
         self.connection = connection
 
 
+class EndpointRequestRejected(Exception):
+    """The endpoint refused the request as malformed or unsupported (HTTP
+    400/422): a configuration or capability problem, not an outage. Raised
+    out of the session so the job fails with the endpoint's reason instead
+    of parking the provider; ``http_status`` rides to the job's error."""
+
+    def __init__(self, message: str, *, http_status: int | None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+
+
 class ChatTransport(Protocol):
-    """The one seam to the wire: a streamed chat completion, and the
-    endpoint's model listing. The SDK-backed transport implements it; a
-    stub speaking the same chunk shape stands in for tests."""
+    """The one seam to the wire: a streamed chat completion or response,
+    and the endpoint's model listing. The SDK-backed transport implements
+    it; a stub speaking the same chunk and event shapes stands in for
+    tests."""
 
     def stream(self, request: dict[str, Any]) -> Iterator[dict[str, Any]]:
         """Yield each ``chat.completion.chunk`` as a plain dict."""
+        ...
+
+    def stream_responses(self, request: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        """Yield each ``/v1/responses`` stream event as a plain dict."""
         ...
 
     def list_models(self) -> list[str]:
@@ -141,6 +182,8 @@ class EndpointSettings:
     api_key: str
     timeout_s: float
     max_retries: int
+    api: ResolvedOpenAIApi = "chat"
+    reasoning_effort: str | None = None
 
     @property
     def authority(self) -> str:
@@ -175,12 +218,28 @@ def endpoint_settings(env: dict[str, str] | None = None) -> EndpointSettings:
         raise BackendUnavailableError(
             f"malformed openai client settings in the env: {exc}"
         ) from exc
+    # Unset is ``auto``: the host always delivers the settled value, and a
+    # sandbox provisioned before the setting existed settles it the same way.
+    api = env.get(OPENAI_API_ENV, "").strip() or "auto"
+    if api not in ("auto", "chat", "responses"):
+        raise BackendUnavailableError(
+            f'{OPENAI_API_ENV} is {api!r}; the openai backend speaks "chat" or "responses" '
+            "([agent.openai] api)"
+        )
+    effort = env.get(OPENAI_REASONING_EFFORT_ENV, "").strip() or None
+    if effort is not None and effort not in OPENAI_REASONING_EFFORTS:
+        raise BackendUnavailableError(
+            f"{OPENAI_REASONING_EFFORT_ENV} is {effort!r}; expected one of "
+            f"{', '.join(OPENAI_REASONING_EFFORTS)} ([agent.openai] reasoning_effort)"
+        )
     return EndpointSettings(
         base_url=base_url,
         key_env=key_env,
         api_key=api_key,
         timeout_s=timeout_s,
         max_retries=max_retries,
+        api=resolve_openai_api(api, base_url),
+        reasoning_effort=effort,
     )
 
 
@@ -194,6 +253,18 @@ def _function_spec(spec: HostToolSpec) -> dict[str, Any]:
             "description": spec.description,
             "parameters": spec.parameters,
         },
+    }
+
+
+def _responses_function_spec(spec: HostToolSpec) -> dict[str, Any]:
+    """The responses tool shape: the same function, flat, and not strict
+    (the governed tools' schemas are not written for strict mode)."""
+    return {
+        "type": "function",
+        "name": spec.name,
+        "description": spec.description,
+        "parameters": spec.parameters,
+        "strict": False,
     }
 
 
@@ -237,6 +308,12 @@ def _session_fingerprint(job: JobRequest, specs: list[HostToolSpec], base_url: s
         "base_url": base_url,
     }
     return hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()[:32]
+
+
+def _count(payload: Any, key: str) -> int | None:
+    """A token count from a usage object, or None when it is not one."""
+    value = payload.get(key) if isinstance(payload, dict) else None
+    return value if type(value) is int and value >= 0 else None
 
 
 def _resume_id(handle: str | None) -> str | None:
@@ -285,6 +362,11 @@ class _SdkTransport:
             if isinstance(raw, str) and raw.strip().replace(".", "", 1).isdigit():
                 retry_after = float(raw)
             return EndpointError(message, status=exc.status_code, retry_after_s=retry_after)
+        if isinstance(exc, openai.APIError):
+            # An error the server put in the stream body after a 200: no
+            # HTTP status, but its code says which failure it is.
+            code = getattr(exc, "code", None)
+            return EndpointError(message, status=STREAM_ERROR_STATUS.get(str(code)))
         return EndpointError(message)
 
     def stream(self, request: dict[str, Any]) -> Iterator[dict[str, Any]]:
@@ -302,6 +384,15 @@ class _SdkTransport:
                 response = self._client.chat.completions.create(**params)
             for chunk in response:
                 yield chunk.model_dump(mode="json")
+        except Exception as exc:
+            if isinstance(exc, EndpointError):
+                raise
+            raise self._error(exc) from exc
+
+    def stream_responses(self, request: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        try:
+            for event in self._client.responses.create(**{**request, "stream": True}):
+                yield event.model_dump(mode="json")
         except Exception as exc:
             if isinstance(exc, EndpointError):
                 raise
@@ -381,7 +472,10 @@ class _Session:
         if self.host and not job.host_tools_dir:
             raise ValueError("host_tools need host_tools_dir")
         self.specs = [*(tool.spec for tool in local), *job.host_tools]
-        self.tools = [_function_spec(spec) for spec in self.specs]
+        self.api = settings.api
+        self.responses = settings.api == "responses"
+        shape = _responses_function_spec if self.responses else _function_spec
+        self.tools = [shape(spec) for spec in self.specs]
         self.fingerprint = _session_fingerprint(job, self.specs, settings.base_url)
         self.model = job.model if job.model and job.model != "auto" else None
         self.usage = Usage(backend=BACKEND_NAME)
@@ -413,6 +507,10 @@ class _Session:
                     output_json = extract_json(self.final_text)
         except EndpointError as exc:
             self._persist()
+            if exc.status in REJECTED_STATUSES:
+                raise EndpointRequestRejected(
+                    self._rejection(exc), http_status=exc.status
+                ) from None
             return BackendResult(
                 output_text=self.final_text,
                 session_id=self._handle(),
@@ -435,7 +533,7 @@ class _Session:
         """Call until the model answers without tool calls."""
         while True:
             self._check_deadline()
-            reply = self._complete()
+            reply = self._respond() if self.responses else self._complete()
             self.turns += 1
             content, calls = reply["content"], reply["tool_calls"]
             if content:
@@ -445,23 +543,36 @@ class _Session:
                     model=self.model,
                     backend=BACKEND_NAME,
                 )
-            assistant: dict[str, Any] = {"role": "assistant", "content": content or None}
-            if calls:
-                assistant["tool_calls"] = [
-                    {
-                        "id": call["id"],
-                        "type": "function",
-                        "function": {"name": call["name"], "arguments": call["arguments"]},
-                    }
-                    for call in calls
-                ]
-            self.messages.append(assistant)
+            if self.responses:
+                # The model's own output items, reasoning included, go back
+                # verbatim: that is what lets the next stateless request
+                # carry the reasoning the calls were made with.
+                self.messages.extend(reply["items"])
+            else:
+                assistant: dict[str, Any] = {"role": "assistant", "content": content or None}
+                if calls:
+                    assistant["tool_calls"] = [
+                        {
+                            "id": call["id"],
+                            "type": "function",
+                            "function": {"name": call["name"], "arguments": call["arguments"]},
+                        }
+                        for call in calls
+                    ]
+                self.messages.append(assistant)
             if not calls:
                 self.final_text = content
                 return
             for call in calls:
                 text = self._dispatch(call["id"], call["name"], call["arguments"])
-                self.messages.append({"role": "tool", "tool_call_id": call["id"], "content": text})
+                if self.responses:
+                    self.messages.append(
+                        {"type": "function_call_output", "call_id": call["id"], "output": text}
+                    )
+                else:
+                    self.messages.append(
+                        {"role": "tool", "tool_call_id": call["id"], "content": text}
+                    )
 
     def _complete(self) -> dict[str, Any]:
         """One streamed completion: the assembled content, the tool calls
@@ -469,6 +580,8 @@ class _Session:
         request: dict[str, Any] = {"model": self.model, "messages": self.messages}
         if self.tools:
             request["tools"] = self.tools
+        if self.settings.reasoning_effort is not None:
+            request["reasoning_effort"] = self.settings.reasoning_effort
         content: list[str] = []
         calls: dict[int, dict[str, Any]] = {}
         usage: dict[str, Any] | None = None
@@ -505,6 +618,109 @@ class _Session:
         for call in ordered:
             call["id"] = safe_call_id(call["id"])
         return {"content": self._clean("".join(content)), "tool_calls": ordered}
+
+    def _respond(self) -> dict[str, Any]:
+        """One streamed ``/v1/responses`` call: the output items to append
+        (reasoning verbatim, message text redacted), the function calls
+        they carry, the assembled text and the usage. The instructions ride
+        every request rather than the transcript, and ``store: false`` with
+        the reasoning's ``encrypted_content`` keeps the endpoint stateless."""
+        request: dict[str, Any] = {
+            "model": self.model,
+            "input": self.messages,
+            "store": False,
+            "include": list(RESPONSES_INCLUDE),
+        }
+        instructions = self._system_prompt()
+        if instructions:
+            request["instructions"] = instructions
+        if self.tools:
+            request["tools"] = self.tools
+        if self.settings.reasoning_effort is not None:
+            request["reasoning"] = {"effort": self.settings.reasoning_effort}
+        deltas: list[str] = []
+        done: dict[int, dict[str, Any]] = {}
+        final: list[Any] = []
+        usage: dict[str, Any] | None = None
+        for event in self.transport.stream_responses(request):
+            self._check_deadline()
+            kind = event.get("type")
+            response = event.get("response")
+            response = response if isinstance(response, dict) else {}
+            served = response.get("model")
+            if isinstance(served, str) and served:
+                self.model = served
+            if kind == "response.output_text.delta":
+                piece = event.get("delta")
+                if isinstance(piece, str) and piece:
+                    deltas.append(piece)
+                    self.emit(
+                        EventTypes.AGENT_MESSAGE_DELTA,
+                        delta=self._clean(piece),
+                        backend=BACKEND_NAME,
+                    )
+            elif kind == "response.output_item.done" and isinstance(event.get("item"), dict):
+                index = event.get("output_index")
+                done[index if type(index) is int else len(done)] = event["item"]
+            elif kind in ("response.completed", "response.incomplete"):
+                if isinstance(response.get("usage"), dict):
+                    usage = response["usage"]
+                if isinstance(response.get("output"), list):
+                    final = response["output"]
+            elif kind == "response.failed":
+                error = response.get("error")
+                raise self._stream_error(error if isinstance(error, dict) else {})
+            elif kind == "error":
+                raise self._stream_error(event)
+        if usage is not None:
+            self._responses_usage(usage)
+        # The completed items are authoritative; the terminal response's
+        # output list stands in for a server that sends no per-item events.
+        raw = [done[index] for index in sorted(done)] if done else final
+        items: list[dict[str, Any]] = []
+        calls: list[dict[str, Any]] = []
+        text: list[str] = []
+        for entry in raw:
+            if not isinstance(entry, dict):
+                continue
+            item = {key: value for key, value in entry.items() if value is not None}
+            if item.get("type") == "function_call":
+                raw_id = item.get("call_id")
+                item["call_id"] = safe_call_id(raw_id if isinstance(raw_id, str) else None)
+                arguments = item.get("arguments")
+                calls.append(
+                    {
+                        "id": item["call_id"],
+                        "name": str(item.get("name") or ""),
+                        "arguments": arguments if isinstance(arguments, str) else "",
+                    }
+                )
+            elif item.get("type") == "message" and isinstance(item.get("content"), list):
+                parts: list[Any] = []
+                for part in item["content"]:
+                    if (
+                        isinstance(part, dict)
+                        and part.get("type") == "output_text"
+                        and isinstance(part.get("text"), str)
+                    ):
+                        part = {**part, "text": self._clean(part["text"])}
+                        text.append(part["text"])
+                    parts.append(part)
+                item["content"] = parts
+            items.append(item)
+        has_message = any(item.get("type") == "message" for item in items)
+        content = "".join(text) if has_message else self._clean("".join(deltas))
+        return {"content": content, "tool_calls": calls, "items": items}
+
+    def _stream_error(self, error: dict[str, Any]) -> EndpointError:
+        """A failure the endpoint reported inside the stream (``error`` or
+        ``response.failed``), given the status its code stands for so it
+        is classified like the same failure answered as HTTP."""
+        code = error.get("code")
+        message = error.get("message")
+        detail = str(message) if message else "the response failed"
+        status = STREAM_ERROR_STATUS.get(code if isinstance(code, str) else "")
+        return EndpointError(self._clean(f"{code}: {detail}" if code else detail), status=status)
 
     def _dispatch(self, call_id: str, name: str, raw_arguments: str) -> str:
         """One tool call through the governor: the ceiling first, then the
@@ -600,19 +816,33 @@ class _Session:
         return listed[0]
 
     def _usage(self, payload: dict[str, Any]) -> None:
-        def count(key: str) -> int | None:
-            value = payload.get(key)
-            return value if type(value) is int and value >= 0 else None
-
         details = payload.get("prompt_tokens_details")
-        cached = details.get("cached_tokens") if isinstance(details, dict) else None
-        sample = Usage(
-            backend=BACKEND_NAME,
-            model=self.model,
-            input_tokens=count("prompt_tokens"),
-            output_tokens=count("completion_tokens"),
-            cache_read_tokens=cached if type(cached) is int and cached >= 0 else None,
+        self._record_usage(
+            Usage(
+                backend=BACKEND_NAME,
+                model=self.model,
+                input_tokens=_count(payload, "prompt_tokens"),
+                output_tokens=_count(payload, "completion_tokens"),
+                cache_read_tokens=_count(details, "cached_tokens"),
+            )
         )
+
+    def _responses_usage(self, payload: dict[str, Any]) -> None:
+        """The responses usage in the same ``Usage``: reasoning tokens are
+        part of ``output_tokens`` as the endpoint counts them."""
+        details = payload.get("input_tokens_details")
+        self._record_usage(
+            Usage(
+                backend=BACKEND_NAME,
+                model=self.model,
+                input_tokens=_count(payload, "input_tokens"),
+                output_tokens=_count(payload, "output_tokens"),
+                cache_read_tokens=_count(details, "cached_tokens"),
+                cache_write_tokens=_count(details, "cache_write_tokens"),
+            )
+        )
+
+    def _record_usage(self, sample: Usage) -> None:
         self.samples += 1
         self.usage = self.usage.merged(sample)
         self.emit(EventTypes.AGENT_USAGE, **sample.model_dump(exclude_none=True))
@@ -630,6 +860,12 @@ class _Session:
                 partial_progress=self.turns > 0,
             )
         if exc.status == 404:
+            api = (
+                ', or it does not serve /v1/responses ([agent.openai] api = "chat" '
+                "calls /v1/chat/completions)"
+                if self.responses
+                else ""
+            )
             return ProviderFailure(
                 backend=BACKEND_NAME,
                 category="unavailable",
@@ -637,7 +873,7 @@ class _Session:
                 reason=(
                     f"{where} answered 404 for model {model!r}: either the base URL "
                     f"({self.settings.base_url}) is not an OpenAI-compatible root or the "
-                    f"endpoint does not serve that model — {message}"
+                    f"endpoint does not serve that model{api} — {message}"
                 ),
                 partial_progress=self.turns > 0,
             )
@@ -678,6 +914,25 @@ class _Session:
             partial_progress=self.turns > 0,
         )
 
+    def _rejection(self, exc: EndpointError) -> str:
+        """Why a 400/422 ends the job: the endpoint, the model, the API the
+        request went to, the endpoint's own reason, and (when that reason
+        points at the other API) the setting that selects it."""
+        model = self.model or self.job.model or "(unset)"
+        path = "/v1/responses" if self.responses else "/v1/chat/completions"
+        message = self._clean(str(exc))
+        reason = (
+            f"the endpoint at {self.settings.authority} rejected the {path} request for "
+            f"model {model!r} (HTTP {exc.status}): {message}. The request itself was "
+            "refused, which retrying cannot fix: this is a model or [agent.openai] "
+            "configuration problem, not a provider outage"
+        )
+        if not self.responses and "/v1/responses" in message:
+            reason += '; set [agent.openai] api = "responses" to call /v1/responses'
+        elif self.responses and "/v1/chat/completions" in message:
+            reason += '; set [agent.openai] api = "chat" to call /v1/chat/completions'
+        return reason
+
     # -- sessions ---------------------------------------------------------
 
     def _system_prompt(self) -> str:
@@ -692,7 +947,7 @@ class _Session:
         requires the resume, in which case a missing or unmatched
         transcript is the named failure it should be."""
         resume_id = _resume_id(self.job.resume_session_id)
-        transcript = self._load(resume_id) if resume_id else None
+        transcript, mismatch = self._load(resume_id) if resume_id else (None, None)
         if transcript is not None:
             self.session_id = resume_id
             self.messages = transcript
@@ -703,7 +958,8 @@ class _Session:
                 if resume_id and not self._path(resume_id).is_file()
                 else "no session to resume was recorded"
                 if not resume_id
-                else "the session's transcript was made with other tools, instructions, "
+                else mismatch
+                or "the session's transcript was made with other tools, instructions, "
                 "workspace, model or endpoint"
             )
             return BackendResult(
@@ -719,7 +975,11 @@ class _Session:
                 ),
             )
         self.session_id = uuid.uuid4().hex
-        self.messages = [{"role": "system", "content": self._system_prompt()}]
+        # Responses carries the system prompt as each request's
+        # ``instructions``, so its transcript holds the conversation only.
+        self.messages = (
+            [] if self.responses else [{"role": "system", "content": self._system_prompt()}]
+        )
         return None
 
     def _handle(self) -> str:
@@ -729,15 +989,27 @@ class _Session:
     def _path(self, session_id: str) -> Path:
         return session_dir() / f"{session_id}.json"
 
-    def _load(self, session_id: str) -> list[dict[str, Any]] | None:
+    def _load(self, session_id: str) -> tuple[list[dict[str, Any]] | None, str | None]:
+        """The transcript when it binds to this session, else None and,
+        when the reason is one worth naming, why it does not."""
         try:
             data = json.loads(self._path(session_id).read_text())
         except (OSError, ValueError):
-            return None
-        if not isinstance(data, dict) or data.get("fingerprint") != self.fingerprint:
-            return None
+            return None, None
+        if not isinstance(data, dict):
+            return None, None
+        # A transcript from before the API was selectable is a chat one.
+        made_under = str(data.get("api") or "chat")
+        if made_under != self.api:
+            return None, (
+                f"the session's transcript was made under the {made_under} API and this "
+                f"session speaks {self.api} ([agent.openai] api); a transcript is never "
+                "replayed across APIs"
+            )
+        if data.get("fingerprint") != self.fingerprint:
+            return None, None
         messages = data.get("messages")
-        return messages if isinstance(messages, list) else None
+        return (messages if isinstance(messages, list) else None), None
 
     def _persist(self) -> None:
         if self.session_id is None:
@@ -745,7 +1017,12 @@ class _Session:
         path = self._path(self.session_id)
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            payload = {"v": 1, "fingerprint": self.fingerprint, "messages": self.messages}
+            payload = {
+                "v": 1,
+                "api": self.api,
+                "fingerprint": self.fingerprint,
+                "messages": self.messages,
+            }
             scratch = path.with_suffix(".tmp")
             scratch.write_text(json.dumps(payload))
             scratch.replace(path)

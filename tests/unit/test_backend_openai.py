@@ -1,6 +1,7 @@
 """The openai worker backend against a stub speaking the chat-completions
-wire shape — the tool round trip, streaming, sessions, failures — the way
-GitHub behaviour is tested against the fake, never a live endpoint."""
+and responses wire shapes — the tool round trip, streaming, sessions,
+failures — the way GitHub behaviour is tested against the fake, never a
+live endpoint."""
 
 from __future__ import annotations
 
@@ -21,6 +22,7 @@ from sbxloop_worker.backends.openai import (
     JSON_REASK,
     SESSION_DIR_ENV,
     EndpointError,
+    EndpointRequestRejected,
     EndpointSettings,
     OpenAIBackend,
     endpoint_settings,
@@ -28,8 +30,10 @@ from sbxloop_worker.backends.openai import (
 )
 from sbxloop_worker.hosttools import response_path
 from sbxloop_worker.protocol import (
+    OPENAI_API_ENV,
     OPENAI_BASE_URL_ENV,
     OPENAI_KEY_NAME_ENV,
+    OPENAI_REASONING_EFFORT_ENV,
     OPENAI_RETRIES_ENV,
     OPENAI_TIMEOUT_ENV,
     EventTypes,
@@ -95,6 +99,9 @@ class FakeTransport:
         if isinstance(reply, Exception):
             raise reply
         yield from reply
+
+    def stream_responses(self, request: dict[str, Any]) -> Iterator[dict[str, Any]]:
+        yield from self.stream(request)
 
     def list_models(self) -> list[str]:
         if isinstance(self.models, Exception):
@@ -521,3 +528,440 @@ def test_registry_resolves_the_backend_and_limits_are_unsupported() -> None:
     report = backend.rate_limits(timeout_s=1.0)
     assert report.status == "unsupported" and report.backend == "openai"
     assert openai_backend.BACKEND_NAME == "openai"
+
+
+# -- the responses API -------------------------------------------------------------
+
+REASONING = {
+    "id": "rs_1",
+    "type": "reasoning",
+    "summary": [],
+    "content": None,
+    "status": None,
+    "encrypted_content": "gAAAAB-opaque-reasoning-state==",
+}
+
+
+def responses_text(
+    text: str,
+    *,
+    usage: dict[str, Any] | None = None,
+    model: str = "served-model",
+    reasoning: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """A text answer the way /v1/responses streams one: deltas, then the
+    completed items, then the terminal response carrying the usage."""
+    message = {
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "status": "completed",
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
+    }
+    output = [*([reasoning] if reasoning else []), message]
+    events: list[dict[str, Any]] = [
+        {"type": "response.created", "response": {"model": model, "status": "in_progress"}}
+    ]
+    for piece in (text[: len(text) // 2], text[len(text) // 2 :]):
+        if piece:
+            events.append(
+                {
+                    "type": "response.output_text.delta",
+                    "output_index": len(output) - 1,
+                    "delta": piece,
+                }
+            )
+    for index, item in enumerate(output):
+        events.append({"type": "response.output_item.done", "output_index": index, "item": item})
+    events.append(
+        {
+            "type": "response.completed",
+            "response": {
+                "model": model,
+                "status": "completed",
+                "output": output,
+                "usage": usage or {"input_tokens": 10, "output_tokens": 4},
+            },
+        }
+    )
+    return events
+
+
+def responses_calls(
+    calls: list[tuple[str, str, str]],
+    *,
+    reasoning: dict[str, Any] | None = None,
+    model: str = "served-model",
+) -> list[dict[str, Any]]:
+    output: list[dict[str, Any]] = [*([reasoning] if reasoning else [])]
+    output += [
+        {
+            "id": f"fc_{call_id}",
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": arguments,
+            "status": "completed",
+        }
+        for call_id, name, arguments in calls
+    ]
+    events: list[dict[str, Any]] = [
+        {"type": "response.created", "response": {"model": model, "status": "in_progress"}}
+    ]
+    for index, item in enumerate(output):
+        if item["type"] == "function_call":
+            for piece in (item["arguments"][:3], item["arguments"][3:]):
+                events.append(
+                    {
+                        "type": "response.function_call_arguments.delta",
+                        "output_index": index,
+                        "delta": piece,
+                    }
+                )
+        events.append({"type": "response.output_item.done", "output_index": index, "item": item})
+    events.append(
+        {
+            "type": "response.completed",
+            "response": {
+                "model": model,
+                "status": "completed",
+                "output": output,
+                "usage": {
+                    "input_tokens": 20,
+                    "input_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 0},
+                    "output_tokens": 8,
+                    "output_tokens_details": {"reasoning_tokens": 6},
+                },
+            },
+        }
+    )
+    return events
+
+
+def without_none(item: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in item.items() if value is not None}
+
+
+@pytest.fixture
+def responses_env(endpoint_env: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    monkeypatch.setenv(OPENAI_API_ENV, "responses")
+    return endpoint_env
+
+
+def test_responses_text_answer_and_usage(responses_env: Path, tmp_path: Path) -> None:
+    usage = {
+        "input_tokens": 50,
+        "input_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 5},
+        "output_tokens": 30,
+        "output_tokens_details": {"reasoning_tokens": 12},
+    }
+    transport = FakeTransport([responses_text("The notes are fine.", usage=usage)])
+    result, events = run(transport, make_job(tmp_path, model="gpt-test"))
+
+    assert result.output_text == "The notes are fine." and result.failure is None
+    assert result.turns == 1
+    assert result.usage is not None
+    assert (
+        result.usage.input_tokens,
+        result.usage.output_tokens,
+        result.usage.cache_read_tokens,
+        result.usage.cache_write_tokens,
+    ) == (50, 30, 20, 5)
+    assert result.usage.model == "served-model" and result.usage.backend == "openai"
+
+    (request,) = transport.requests
+    assert request["model"] == "gpt-test"
+    assert request["input"] == [{"role": "user", "content": "Read the notes and report."}]
+    assert request["instructions"] == CODING_AGENT_PRESET
+    assert request["store"] is False
+    assert request["include"] == ["reasoning.encrypted_content"]
+    assert "messages" not in request and "reasoning" not in request
+    assert {tool["name"] for tool in request["tools"]} == {
+        "read_file",
+        "list_files",
+        "search_files",
+    }
+    tool = request["tools"][0]
+    assert tool["type"] == "function" and tool["strict"] is False
+    assert tool["parameters"]["type"] == "object" and "function" not in tool
+
+    kinds = [event for event, _ in events]
+    assert kinds.count(EventTypes.AGENT_MESSAGE) == 1
+    assert kinds.count(EventTypes.AGENT_MESSAGE_DELTA) == 2
+    assert kinds.count(EventTypes.AGENT_USAGE) == 1
+
+
+def test_responses_function_call_round_trip(responses_env: Path, tmp_path: Path) -> None:
+    transport = FakeTransport(
+        [
+            responses_calls([("call_1", "read_file", '{"path": "notes.txt"}')]),
+            responses_text("The notes say: fixture evidence."),
+        ]
+    )
+    result, events = run(transport, make_job(tmp_path))
+
+    assert result.output_text == "The notes say: fixture evidence."
+    assert result.turns == 2
+    assert result.usage is not None
+    assert (result.usage.input_tokens, result.usage.output_tokens) == (30, 12)
+    _, second = transport.requests
+    user, call, output = second["input"]
+    assert user == {"role": "user", "content": "Read the notes and report."}
+    assert call == {
+        "id": "fc_call_1",
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "read_file",
+        "arguments": '{"path": "notes.txt"}',
+        "status": "completed",
+    }
+    assert output["type"] == "function_call_output" and output["call_id"] == "call_1"
+    assert "fixture evidence" in json.loads(output["output"])["text"]
+    start = next(data for event, data in events if event == EventTypes.AGENT_TOOL_START)
+    assert (start["tool"], start["tool_call_id"], start["args"]) == (
+        "read_file",
+        "call_1",
+        "notes.txt",
+    )
+    end = next(data for event, data in events if event == EventTypes.AGENT_TOOL_END)
+    assert end["success"] is True
+
+
+def test_responses_reasoning_items_are_replayed_verbatim(
+    responses_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv(OPENAI_REASONING_EFFORT_ENV, "high")
+    transport = FakeTransport(
+        [
+            responses_calls([("call_1", "list_files", "{}")], reasoning=REASONING),
+            responses_text("Done.", reasoning={**REASONING, "id": "rs_2"}),
+        ]
+    )
+    result, _ = run(transport, make_job(tmp_path))
+    assert result.output_text == "Done."
+    first, second = transport.requests
+    assert first["reasoning"] == {"effort": "high"}
+    reasoning = second["input"][1]
+    assert reasoning == without_none(REASONING)
+    assert reasoning["encrypted_content"] == "gAAAAB-opaque-reasoning-state=="
+    assert [item.get("type") for item in second["input"]] == [
+        None,
+        "reasoning",
+        "function_call",
+        "function_call_output",
+    ]
+
+
+def test_responses_tool_call_ceiling_nudges_in_session(responses_env: Path, tmp_path: Path) -> None:
+    transport = FakeTransport(
+        [
+            responses_calls([("c1", "read_file", '{"path": "notes.txt"}')]),
+            responses_calls([("c2", "list_files", "{}")]),
+            responses_text("Stopping here."),
+        ]
+    )
+    result, events = run(transport, make_job(tmp_path, max_tool_calls=1))
+    assert result.output_text == "Stopping here."
+    caps = [data for event, data in events if event == EventTypes.AGENT_TOOL_CAP]
+    assert caps == [{"cap": 1, "calls": 2, "tool": "list_files"}]
+    last = transport.requests[2]["input"][-1]
+    assert last["type"] == "function_call_output" and last["call_id"] == "c2"
+    assert "Tool-call ceiling reached" in last["output"]
+    assert result.health is not None
+    assert (result.health.tool_calls, result.health.tool_cap_denials) == (2, 1)
+
+
+def test_responses_resume_round_trips_the_transcript(responses_env: Path, tmp_path: Path) -> None:
+    first = FakeTransport(
+        [
+            responses_calls([("c1", "list_files", "{}")], reasoning=REASONING),
+            responses_text("First answer."),
+        ]
+    )
+    result, _ = run(first, make_job(tmp_path))
+    stored = json.loads(next(responses_env.glob("*.json")).read_text())
+    assert stored["api"] == "responses"
+    assert stored["messages"][1] == without_none(REASONING)
+
+    second = FakeTransport([responses_text("Second answer.")])
+    job = make_job(tmp_path, prompt="And then?", resume_session_id=result.session_id)
+    resumed, _ = run(second, job)
+    assert resumed.session_id == result.session_id and resumed.failure is None
+    replayed = second.requests[0]["input"]
+    assert replayed[:-1] == stored["messages"]
+    assert replayed[-1] == {"role": "user", "content": "And then?"}
+    assert second.requests[0]["instructions"] == CODING_AGENT_PRESET
+
+
+def test_a_transcript_from_the_other_api_is_never_replayed(
+    endpoint_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    chat, _ = run(FakeTransport([text_chunks("chat answer")]), make_job(tmp_path))
+    monkeypatch.setenv(OPENAI_API_ENV, "responses")
+    job = make_job(tmp_path, resume_session_id=chat.session_id)
+
+    strict = FakeTransport([responses_text("never")])
+    held, _ = run(strict, job.model_copy(update={"require_resume": True}))
+    assert held.failure is not None and held.failure.category == "recovery"
+    assert "made under the chat API" in held.failure.reason
+    assert "speaks responses" in held.failure.reason
+    assert strict.requests == []
+
+    fresh = FakeTransport([responses_text("fresh")])
+    started, _ = run(fresh, job)
+    assert started.session_id != chat.session_id
+    assert fresh.requests[0]["input"] == [{"role": "user", "content": "Read the notes and report."}]
+
+    monkeypatch.setenv(OPENAI_API_ENV, "chat")
+    back = make_job(tmp_path, resume_session_id=started.session_id, require_resume=True)
+    refused, _ = run(FakeTransport([text_chunks("never")]), back)
+    assert refused.failure is not None
+    assert "made under the responses API" in refused.failure.reason
+
+
+def test_responses_credential_never_reaches_an_event_the_model_or_the_transcript(
+    responses_env: Path, tmp_path: Path
+) -> None:
+    job = make_job(tmp_path)
+    (tmp_path / "workspace" / "notes.txt").write_text(f"token here: {KEY}\n")
+    transport = FakeTransport(
+        [
+            responses_calls([("c1", "read_file", '{"path": "notes.txt"}')]),
+            responses_text(f"It said {KEY}."),
+        ]
+    )
+    result, events = run(transport, job)
+    assert KEY not in result.output_text and "[REDACTED]" in result.output_text
+    assert KEY not in json.dumps([data for _, data in events])
+    assert KEY not in json.dumps(transport.requests[1]["input"])
+    assert KEY not in next(responses_env.glob("*.json")).read_text()
+
+
+@pytest.mark.parametrize(
+    ("event", "category"),
+    [
+        (
+            {
+                "type": "response.failed",
+                "response": {"error": {"code": "server_error", "message": "upstream broke"}},
+            },
+            "unavailable",
+        ),
+        ({"type": "error", "code": "rate_limit_exceeded", "message": "slow down"}, "throttle"),
+        ({"type": "error", "code": "mystery", "message": "who knows"}, "unknown"),
+    ],
+)
+def test_responses_stream_errors_are_classified_like_http(
+    responses_env: Path, tmp_path: Path, event: dict[str, Any], category: str
+) -> None:
+    transport = FakeTransport([[{"type": "response.created", "response": {}}, event]])
+    result, _ = run(transport, make_job(tmp_path))
+    assert result.failure is not None and result.failure.category == category
+
+
+def test_responses_404_names_the_chat_api_as_the_way_out(
+    responses_env: Path, tmp_path: Path
+) -> None:
+    result, _ = run(FakeTransport([EndpointError("not found", status=404)]), make_job(tmp_path))
+    assert result.failure is not None and result.failure.http_status == 404
+    assert 'api = "chat"' in result.failure.reason
+
+
+def test_chat_sends_reasoning_effort_only_when_configured(
+    endpoint_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    unset = FakeTransport([text_chunks("ok")])
+    run(unset, make_job(tmp_path))
+    assert "reasoning_effort" not in unset.requests[0]
+    monkeypatch.setenv(OPENAI_REASONING_EFFORT_ENV, "minimal")
+    configured = FakeTransport([text_chunks("ok")])
+    run(configured, make_job(tmp_path))
+    assert configured.requests[0]["reasoning_effort"] == "minimal"
+    assert "reasoning" not in configured.requests[0]
+
+
+def test_endpoint_settings_settle_the_api_and_check_the_effort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(OPENAI_KEY_NAME_ENV, raising=False)
+    monkeypatch.delenv(OPENAI_REASONING_EFFORT_ENV, raising=False)
+    monkeypatch.delenv(OPENAI_API_ENV, raising=False)
+    monkeypatch.setenv("OPENAI_API_KEY", "placeholder")
+    monkeypatch.setenv(OPENAI_BASE_URL_ENV, "https://api.openai.com/v1")
+    assert endpoint_settings().api == "responses"
+    monkeypatch.setenv(OPENAI_API_ENV, "chat")
+    assert endpoint_settings().api == "chat"
+    monkeypatch.setenv(OPENAI_BASE_URL_ENV, "http://vllm:8000/v1")
+    monkeypatch.setenv(OPENAI_API_ENV, "auto")
+    assert endpoint_settings().api == "chat"
+    assert endpoint_settings().reasoning_effort is None
+    monkeypatch.setenv(OPENAI_API_ENV, "completions")
+    with pytest.raises(BackendUnavailableError, match=OPENAI_API_ENV):
+        endpoint_settings()
+    monkeypatch.setenv(OPENAI_API_ENV, "responses")
+    monkeypatch.setenv(OPENAI_REASONING_EFFORT_ENV, "extreme")
+    with pytest.raises(BackendUnavailableError, match=OPENAI_REASONING_EFFORT_ENV):
+        endpoint_settings()
+    monkeypatch.setenv(OPENAI_REASONING_EFFORT_ENV, "xhigh")
+    assert endpoint_settings().reasoning_effort == "xhigh"
+
+
+# -- a request the endpoint rejects is not a provider outage ------------------------
+
+FIELD_400 = (
+    "Error code: 400 - {'error': {'message': \"Function tools with reasoning_effort are not "
+    "supported for gpt-5.6-sol in /v1/chat/completions. To use function tools, use "
+    "/v1/responses or set reasoning_effort to 'none'.\", 'type': 'invalid_request_error', "
+    "'param': 'reasoning_effort'}}"
+)
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_a_rejected_request_fails_the_job_instead_of_holding_the_provider(
+    endpoint_env: Path, tmp_path: Path, status: int
+) -> None:
+    transport = FakeTransport([EndpointError(f"{FIELD_400} {KEY}", status=status)])
+    with pytest.raises(EndpointRequestRejected) as raised:
+        run(transport, make_job(tmp_path, model="gpt-5.6-sol"))
+    message = str(raised.value)
+    assert raised.value.http_status == status
+    assert "vllm:8000" in message and "'gpt-5.6-sol'" in message
+    assert "/v1/chat/completions request" in message
+    assert "not a provider outage" in message
+    assert 'set [agent.openai] api = "responses"' in message
+    assert KEY not in message
+
+
+def test_the_field_400_reaches_the_host_as_a_job_error_without_a_provider_failure(
+    endpoint_env: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The worker's result for the field failure: an error the phase fails
+    on (``error.provider`` unset), never the provider hold that parked the
+    run with "reset unknown"; genuine outages keep their provider failure."""
+    from sbxloop_worker.runner import JobRunner
+
+    def result_for(reply: Exception) -> Any:
+        transport = FakeTransport([reply])
+        monkeypatch.setattr(OpenAIBackend, "_transport", lambda self, settings: transport)
+        return JobRunner(
+            make_job(tmp_path, model="gpt-5.6-sol"),
+            events_path=tmp_path / "events.jsonl",
+            result_path=tmp_path / "result.json",
+            heartbeat_s=0,
+            backend_name="openai",
+        ).run()
+
+    rejected = result_for(EndpointError(FIELD_400, status=400))
+    assert rejected.status == "error" and rejected.error is not None
+    assert rejected.error.type == "EndpointRequestRejected"
+    assert rejected.error.provider is None
+    assert rejected.error.http_status == 400
+    assert 'api = "responses"' in rejected.error.message
+
+    for reply, category in (
+        (EndpointError("slow down", status=429, retry_after_s=5), "throttle"),
+        (EndpointError("upstream broke", status=503), "unavailable"),
+    ):
+        held = result_for(reply)
+        assert held.error is not None and held.error.provider is not None
+        assert held.error.provider.category == category
