@@ -100,6 +100,37 @@ def test_rules_on_later_pages_and_overlapping_wildcards_are_kept() -> None:
     assert any("protected_branches?per_page=100&page=2" in path for _, path, _ in fake.raw_calls)
 
 
+def test_push_and_merge_permission_satisfies_the_merge_access_rule() -> None:
+    fake = FakeGitlab()
+    fake.protected = {
+        "name": "main",
+        "merge_access_levels": [{"access_level": 40}],
+        "push_access_levels": [{"access_level": 30}],
+    }
+    fake.settings["access_level"] = 30
+
+    requirements = fake.base_requirements(REPO, "main")
+
+    assert not requirements.extra_blockers
+
+
+def test_push_and_merge_permission_still_blocks_a_lower_project_role() -> None:
+    fake = FakeGitlab()
+    fake.protected = {
+        "name": "main",
+        "merge_access_levels": [{"access_level": 40}],
+        "push_access_levels": [{"access_level": 30}],
+    }
+    fake.settings["access_level"] = 20
+
+    requirements = fake.base_requirements(REPO, "main")
+
+    assert requirements.extra_blockers == (
+        "the base allows merges by Developers only, and this token's access is Reporters; "
+        "give the token a higher role on the project or lower the branch's merge access",
+    )
+
+
 def test_approval_progress_is_refreshed_even_when_the_head_does_not_move() -> None:
     fake = FakeGitlab()
     fake.enterprise = True
