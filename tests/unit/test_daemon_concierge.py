@@ -340,6 +340,7 @@ class TestJobShape:
             "draft a release checklist and ask the critic to review it",
             author="owner",
             allow_actions=True,
+            agent_role="planner",
             handoff=lambda agent, message: f"queued @{agent}: {message}",
         ).result(timeout=10)
         (job,) = client.jobs
@@ -348,7 +349,8 @@ class TestJobShape:
         assert "does not replace your deliverable" in job.system_message
         handoff = next(tool for tool in job.host_tools if tool.name == "handoff_agent")
         assert "work you complete in this response" in handoff.description
-        assert "concrete work in your final response" in handoff.description
+        assert "exact completed artifact" in handoff.description
+        assert handoff.parameters["required"] == ["agent_slug", "message", "work_product"]
 
     def test_github_tool_present_when_repo_configured(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(tmp_path, [{}], github=FakeGithub())

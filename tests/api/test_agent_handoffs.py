@@ -59,6 +59,58 @@ def test_tool_handoffs_run_with_peer_context_and_inherited_read_only(api: Any) -
     assert len([m for m in messages if m["kind"] == "agent_handoff"]) == 2
 
 
+def test_handoff_work_product_is_visible_and_reaches_the_peer(api: Any, tmp_path: Path) -> None:
+    checklist = (
+        "1. Run the release checks.\n"
+        "2. Verify the staged deployment.\n"
+        "3. Confirm the rollback path."
+    )
+    concierge, client, _, _, _ = make(
+        tmp_path / "concierge",
+        [
+            {
+                "calls": [
+                    (
+                        "handoff_agent",
+                        {
+                            "agent_slug": "critic",
+                            "message": "Review the checklist for missing risks.",
+                            "work_product": checklist,
+                        },
+                    )
+                ],
+                "text": "The critic is queued and will reply shortly.",
+            },
+            {"text": "The checklist also needs an owner for rollback."},
+        ],
+    )
+    api.ctx.concierge = concierge
+    headers = bearer(register(api))
+    channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    try:
+        accepted = api.client.post(
+            f"/v1/channels/{channel}/turns",
+            headers=headers,
+            json={"content": "@planner draft a checklist and ask a peer to review it"},
+        ).json()
+        done = settled(api.client, headers, channel, accepted["turn"]["id"])
+        assert done["status"] == "completed", done
+        messages = api.client.get(f"/v1/channels/{channel}/messages", headers=headers).json()
+        planner = next(
+            message
+            for message in messages
+            if message["kind"] == "agent_result" and message.get("agent_slug") == "planner"
+        )
+        handoff = next(message for message in messages if message["kind"] == "agent_handoff")
+        assert planner["content"].startswith(checklist)
+        assert "queued and will reply shortly" in planner["content"]
+        assert checklist not in handoff["content"]
+        assert "Review the checklist for missing risks." in handoff["content"]
+        assert checklist in client.jobs[1].prompt
+    finally:
+        concierge.close()
+
+
 @pytest.fixture
 def handoff_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
@@ -97,8 +149,22 @@ def test_rejected_handoff_returns_feedback_without_reporting_a_crash(
         [
             {
                 "calls": [
-                    ("handoff_agent", {"agent_slug": agent, "message": message}),
-                    ("handoff_agent", {"agent_slug": "critic", "message": "Review this plan"}),
+                    (
+                        "handoff_agent",
+                        {
+                            "agent_slug": agent,
+                            "message": message,
+                            "work_product": "Draft plan",
+                        },
+                    ),
+                    (
+                        "handoff_agent",
+                        {
+                            "agent_slug": "critic",
+                            "message": "Review this plan",
+                            "work_product": "Draft plan",
+                        },
+                    ),
                 ],
                 "text": "I asked the critic to review the plan.",
             },
@@ -149,7 +215,14 @@ def test_unexpected_handoff_failure_keeps_its_traceback_and_report(
         [
             {
                 "calls": [
-                    ("handoff_agent", {"agent_slug": "critic", "message": "Review this plan"})
+                    (
+                        "handoff_agent",
+                        {
+                            "agent_slug": "critic",
+                            "message": "Review this plan",
+                            "work_product": "Draft plan",
+                        },
+                    )
                 ],
                 "text": "The peer request failed.",
             }
