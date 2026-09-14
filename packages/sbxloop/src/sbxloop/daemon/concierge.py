@@ -571,7 +571,12 @@ class Concierge:
                 "\n\nUse handoff_agent to ask a native peer for help when needed. "
                 "An @mention in prose does not invoke an agent. Handoffs are asynchronous: "
                 "the peer runs after this response and answers in the shared chat. "
-                "Finish your response after queuing; do not poll or invent the peer's reply. "
+                "Complete your assigned work before handing it off, and put the concrete result "
+                "in your final response so the peer can inspect it. A handoff asks a peer to "
+                "review or extend completed work; it does not replace your deliverable. Never "
+                "answer only with coordination status such as 'queued' or 'nothing to do until'. "
+                "After queuing, finish your response without polling or inventing the "
+                "peer's reply. "
                 "You may ping the sender back if they need to synthesize the result. "
                 "Stay within the user's request. Each response can ask two peers, with at "
                 "most six handoffs and three levels per user turn. Read-only access is inherited."
@@ -834,8 +839,10 @@ class Concierge:
                 HostToolSpec(
                     name="handoff_agent",
                     description=(
-                        "Ask a native agent for help in this chat. "
-                        "Queues a peer response after yours; does not wait for it."
+                        "Ask a native agent to review or extend work you complete in this "
+                        "response. "
+                        "Put the concrete work in your final response and the material the peer "
+                        "needs in the request. Queues a peer response after yours; does not wait."
                     ),
                     parameters=_schema(
                         {
