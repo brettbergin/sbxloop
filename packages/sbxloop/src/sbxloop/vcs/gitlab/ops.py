@@ -49,6 +49,7 @@ from sbxloop.vcs.gitlab.content import (
     blob_sha,
     commit_record,
     plan_actions,
+    tree_after_actions,
     tree_handle,
 )
 from sbxloop.vcs.gitlab.permissions import READ_PROBES
@@ -1559,11 +1560,45 @@ class GitlabOps(JobBackend):
         if not actions:
             body["allow_empty"] = True
         path = f"{self._project(repo)}/repository/commits"
-        data = self._dict(f"POST {path}", self.raw("POST", path, body))
+        try:
+            data = self._dict(f"POST {path}", self.raw("POST", path, body))
+        except GithubOpsError as exc:
+            if start_sha and exc.http_status in (None, 500, 502, 503, 504):
+                try:
+                    recovered = self._recover_commit(
+                        repo, branch=branch, start=start_sha, message=message, actions=actions
+                    )
+                except (GithubOpsError, ValueError, KeyError):
+                    recovered = None
+                if recovered:
+                    log.info("gitlab.commit_recovered", repo=repo, branch=branch, commit=recovered)
+                    return recovered
+            raise
         sha = str(data.get("id") or "")
         if not sha:
             raise GithubOpsError(f"POST {path} returned no commit id: {data!r}")
         return sha
+
+    def _recover_commit(
+        self,
+        repo: str,
+        *,
+        branch: str,
+        start: str,
+        message: str,
+        actions: Sequence[Mapping[str, Any]],
+    ) -> str | None:
+        """Accept an uncertain write only when parent, message, and complete tree match."""
+        head = self.ref_lookup(repo, f"heads/{branch}")
+        if head is None:
+            return None
+        commit = self.commit_get(repo, head)
+        if commit["parents"] != [{"sha": start}] or str(commit["message"]).rstrip(
+            "\n"
+        ) != message.rstrip("\n"):
+            return None
+        expected = tree_after_actions(self._tree_entries(repo, start), actions)
+        return head if self._tree_entries(repo, head) == expected else None
 
     def _tree_entries(self, repo: str, ref: str) -> dict[str, tuple[str, str]]:
         """Read a complete tree for a restart, failing closed on malformed pages."""

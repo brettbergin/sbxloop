@@ -112,6 +112,7 @@ class FakeGitlab(GitlabOps):
             "base123": {"id": "base123", "parent_ids": [], "message": "initial", "title": "initial"}
         }
         self._commit_count = 0
+        self.lose_commit_response = False
         self.ci_file = False
         self.issues: dict[int, dict[str, Any]] = {}
         self.notes: dict[int, list[dict[str, Any]]] = {}
@@ -729,7 +730,11 @@ class FakeGitlab(GitlabOps):
             return {"name": name, "commit": {"id": sha}, "protected": False}
         if rest == "/repository/commits" and method == "POST":
             assert body is not None
-            return self._commit_with_actions(method, path, dict(body))
+            result = self._commit_with_actions(method, path, dict(body))
+            if self.lose_commit_response:
+                self.lose_commit_response = False
+                raise GithubOpsError("connection lost after GitLab accepted the commit")
+            return result
         if (match := re.fullmatch(r"/repository/commits/([^/]+)", rest)) and method == "GET":
             sha = unquote(match.group(1))
             if sha in self.commits:

@@ -114,6 +114,39 @@ class TestPureParts:
 
 
 class TestStaging:
+    def test_an_unconfirmed_commit_is_not_replayed(self) -> None:
+        fake = FakeGitlab()
+        fake.fail_always["commit_create"] = GithubOpsError("request timed out")
+        with pytest.raises(GithubOpsError, match="request timed out"):
+            deliver(fake, "sbxloop/recovery", {"new.txt": b"reviewed"}, "deliver")
+        assert len(fake.commit_posts) == 1
+        assert "sbxloop/recovery" not in fake.branches
+
+    def test_a_changed_tree_cannot_be_adopted_as_the_lost_write(self) -> None:
+        fake = FakeGitlab()
+        first = deliver(fake, "sbxloop/recovery", {"new.txt": b"reviewed"}, "deliver")
+        pending = fake._pending[(REPO, first)]
+        fake.trees[first]["unreviewed.txt"] = ("100644", b"not part of the write")
+        assert (
+            fake._recover_commit(
+                REPO,
+                branch="sbxloop/recovery",
+                start=pending.start,
+                message=pending.message,
+                actions=pending.actions,
+            )
+            is None
+        )
+
+    def test_a_lost_commit_response_is_reconciled_without_replaying_the_write(self) -> None:
+        fake = FakeGitlab()
+        fake.lose_commit_response = True
+        sha = deliver(fake, "sbxloop/recovery", {"new.txt": b"reviewed"}, "deliver")
+        assert fake.trees[sha]["new.txt"] == ("100644", b"reviewed")
+        assert len(fake.commit_posts) == 1
+        assert fake.branches["sbxloop/recovery"] == sha
+        assert not any(branch.startswith("sbxloop/pending/") for branch in fake.branches)
+
     def test_restart_preserves_unchanged_symlinks_and_refuses_changed_types(self) -> None:
         fake = FakeGitlab()
         fake.trees["base123"]["link"] = ("120000", b"target")
