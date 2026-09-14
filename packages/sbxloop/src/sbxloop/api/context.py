@@ -50,6 +50,21 @@ IN_FLIGHT_LIMIT = 8
 PAGE_DEFAULT = 50
 PAGE_MAX = 200
 _CONTENT_WORD = re.compile(r"\w+")
+_RUNNER_INTENT = {
+    "code": (
+        "\n\nThe person explicitly selected sbxloop's Code runner for this turn. "
+        "Coordinate the request into one managed repository run through the existing issue "
+        "intake tools. Do not simulate its planner, builder, reviewer, fix rounds, CI, or merge "
+        "stages with chat handoffs. If the configured repository or observed symptom is genuinely "
+        "ambiguous, ask only for the missing intake fact required by the existing code-run policy."
+    ),
+    "workload": (
+        "\n\nThe person explicitly selected sbxloop's Workload runner for this turn. "
+        "Call start_workload once with their request and let the existing plan, execute, judge, "
+        "revision, and publish stages carry it to completion. Do not simulate those stages with "
+        "chat handoffs."
+    ),
+}
 
 
 def _work_product_is_visible(artifact: str, reply: str) -> bool:
@@ -283,8 +298,9 @@ class ApiContext:
             previous_errors = len(errors)
             definition = AGENTS_BY_SLUG.get(target) if target else None
             persona = (definition.persona if definition else ANGIE_PERSONA) + preference_context
+            persona += _RUNNER_INTENT.get(intent, "")
             # Mentioning a role is explicit delegation in Angie's UI.
-            allow_actions = intent == "delegate" or definition is not None
+            allow_actions = intent in {"delegate", "code", "workload"} or definition is not None
             read_only = bool(participant.get("read_only")) or target == "critic"
             prompt = content
             if participant.get("parent_index") is not None:
