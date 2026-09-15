@@ -113,6 +113,12 @@
 
 ### Fixed
 
+- **A usage window is bounded at both ends.** `GET /v1/usage` folded each
+  run it touched from `since` onward with no upper bound, so a run that
+  kept spending after `until` lent those turns to the window. The fold now
+  drops samples at or after `until`; a client that charts one window per
+  bucket counts each sample once, and a run's own report stays unbounded.
+
 - **A chat workload no longer posts "workspace refresh failed" on a private
   forge.** An item with no repository (a chat ask, a legacy id) on a
   single-repo daemon resolved the repository's checkout from the
