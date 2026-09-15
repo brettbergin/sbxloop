@@ -129,8 +129,9 @@ class ProviderRecovery:
     def release_request_rejection(self) -> ProviderHold | None:
         """Release a standing hold that was recorded for a refused request.
 
-        A request the endpoint rejects as malformed or unsupported (HTTP 400
-        or 422, recorded as an ``unknown`` failure with no reset) is not an
+        A request the endpoint rejects as malformed or unsupported (one of
+        ``REQUEST_REJECTED_STATUSES``, recorded as an ``unknown`` failure with
+        no reset) is not an
         outage: no wait makes it succeed, yet the hold asks for "explicit
         operator recovery" and blocks every entry point, the concierge
         included, until someone runs ``resume <backend>``. Such holds were
