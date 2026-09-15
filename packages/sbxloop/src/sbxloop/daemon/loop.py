@@ -1192,6 +1192,29 @@ class DaemonLoop:
     def _provider_recovery(self) -> ProviderRecovery:
         return ProviderRecovery(self.store, self.config.agent.backend, clock=self.clock)
 
+    def _release_request_rejection_hold(self) -> None:
+        """At startup, release a provider hold recorded for a refused request
+        (:meth:`ProviderRecovery.release_request_rejection`), saying so. Never
+        fatal: a daemon that cannot read its holds still starts, and the hold
+        stays for ``resume <backend>``."""
+        try:
+            released = self._provider_recovery().release_request_rejection()
+        except Exception:
+            log.warning("provider.hold_release_failed", exc_info=True)
+            return
+        if released is None:
+            return
+        failure = released.failure
+        self._notice(
+            "provider.hold_released",
+            f"released the {failure.backend} provider hold recorded for a request the endpoint "
+            f"refused (HTTP {failure.http_status}): waiting cannot fix a refused request, so the "
+            f"next call is judged by this release. It was: {failure.reason}",
+            level="warning",
+            backend=failure.backend,
+            http_status=failure.http_status,
+        )
+
     def _provider_item(self, target: str) -> WorkItem | None:
         for item in self.dstore.items():
             if (
@@ -1305,6 +1328,7 @@ class DaemonLoop:
             poll_interval_s=self.config.daemon.poll_interval_s,
             source=self.source.name,
         )
+        self._release_request_rejection_hold()
         self._report_restart()
         ticks = 0
         try:
