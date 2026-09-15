@@ -113,6 +113,18 @@
 
 ### Fixed
 
+- **An upgrade no longer leaves a refused-request provider hold blocking
+  every call.** A request the endpoint refused (HTTP 400 or 422, such as
+  the `openai` backend sending function tools with reasoning to
+  `/v1/chat/completions`) was recorded by earlier releases as a provider
+  failure with no reset, so it waited on explicit operator recovery. That
+  hold outlived the upgrade that fixed the request: runs stayed parked,
+  and every concierge message answered with the old rejection. The
+  daemon now releases such a hold at startup, with a
+  `provider.hold_released` notice naming the recorded failure, and the
+  running release judges the next call. Timed holds (throttles, quotas
+  with a reset) and other failures still wait or need `resume <backend>`.
+
 - **A usage window is bounded at both ends.** `GET /v1/usage` folded each
   run it touched from `since` onward with no upper bound, so a run that
   kept spending after `until` lent those turns to the window. The fold now
