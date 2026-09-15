@@ -103,6 +103,19 @@
 
 ### Fixed
 
+- **A finished run no longer crashes recording its result with "database is
+  locked".** The engine store's read-then-write methods (recording where a
+  run published, appending chat guidance, appending a fix-round task) began a
+  deferred transaction, so their first read pinned a WAL snapshot. When
+  another connection to the state database committed before the write (the
+  remote API's projector and artifact catalogue run on their own connection
+  inside the daemon), SQLite could not upgrade the stale snapshot and failed
+  the write at once, whatever the busy timeout. A workload run that had built,
+  judged and verified its result then crashed in `publishing`, spent an
+  attempt and counted toward the circuit breaker. Those methods now take the
+  write lock with `BEGIN IMMEDIATE` before reading, so the other writer waits
+  instead.
+
 - **Structured answers from the openai backend parse again when they name a
   credential.** Under `[agent] backend = "openai"` the answer was redacted as
   text before its JSON was extracted, and the redactor rewrites the value of a
