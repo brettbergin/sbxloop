@@ -61,7 +61,7 @@ dependencies = [
 [project.optional-dependencies]
 # Host-side SDK access for `sbxloop list-models` (agent sessions get the SDK
 # inside the sandbox via sbxloop-worker[copilot]; runs never need this extra).
-copilot = ["github-copilot-sdk>=1.0.8"]
+copilot = ["github-copilot-sdk>=1.0.13"]
 # Host-side model listing; agent sessions install the worker's matching extra.
 codex = ["openai-codex==0.147.0"]
 # `sbxloop daemon`'s chat bridge (chronology + steering), one extra per
