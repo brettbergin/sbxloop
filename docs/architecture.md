@@ -763,7 +763,12 @@ named per state dir (`sbxloop-daemon-<forge>-<digest>`,
   at daemon stop. Each provision checks inventory and removes only this
   instance's stale box. Inventory or removal failures stop that attempt;
   polling backoff retries cleanup after authentication or the sandbox
-  service recovers, while daemon control stays available;
+  service recovers, while daemon control stays available. The same home's
+  box under any other forge (left by a `[vcs] kind` switch in either
+  direction) is removed once per daemon process, after the new box is
+  ready and best effort: a wedged old box is logged
+  (`github_sandbox.previous_forge_remove_failed`) and never keeps the
+  configured forge from being polled;
 - the **concierge box** (`daemon/agentbox.py`) — the control channel's
   agent (`daemon/concierge.py`), a Copilot session with the agent token
   and **no built-in tools**: everything it can do is a *host tool*

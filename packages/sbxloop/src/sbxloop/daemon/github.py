@@ -18,7 +18,7 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
 
-from sbxloop.config import Config, VcsKind
+from sbxloop.config import VCS_KINDS, Config, VcsKind
 from sbxloop.errors import (
     DaemonError,
     GithubOpsError,
@@ -89,11 +89,17 @@ class DaemonGithub:
         self.install_workers = install_workers
         kind = config.vcs_kind_for(repo)
         self.name = name or sandbox_name_for(config.paths, kind)
-        self._legacy_names = (
+        # The same home's box under every other forge: what a `[vcs] kind`
+        # switch (in any direction) or a pre-forge-naming upgrade leaves
+        # behind. A caller-named box (doctor, init-repo) owns no such names.
+        self._previous_forge_names: tuple[str, ...] = (
             ()
-            if name is not None or kind == "github"
-            else (sandbox_name_for(config.paths, "github"),)
+            if name is not None
+            else tuple(
+                sandbox_name_for(config.paths, other) for other in VCS_KINDS if other != kind
+            )
         )
+        self._previous_forges_cleared = False
         self.clock = clock
         self._last_reprovision_at: float | None = None
         self.provisioner = Provisioner(sbx, config, bus=bus)
@@ -113,18 +119,74 @@ class DaemonGithub:
         absence: Docker authentication errors can say 'secret not found'.
         Run this before every provision so a failed cleanup is retried when
         authentication or the sandbox service recovers.
-        """
-        for name in (self.name, *self._legacy_names):
-            if self._listed(name):
-                Sandbox(self.sbx, name).rm()
-                log.info("github_sandbox.stale_removed", sandbox=name)
-            else:
-                log.debug("github_sandbox.no_stale", sandbox=name)
 
-    def _listed(self, name: str | None = None) -> bool:
+        Only this box's own name: create would collide with it. A previous
+        forge's box has a different name and is cleared after the new box is
+        ready (:meth:`_clear_previous_forges`), so a wedged old box can never
+        keep the configured forge from being polled.
+        """
+        if not self._listed():
+            log.debug("github_sandbox.no_stale", sandbox=self.name)
+            return
+        try:
+            Sandbox(self.sbx, self.name).rm()
+        except SbxNotFoundError:
+            # Listed a moment ago, "not found" now: a teardown already in
+            # flight (seen while sandboxd recovered). Absent is what this
+            # wanted, but only the inventory proves it (see close).
+            if not self._absent():
+                raise
+            log.info("github_sandbox.stale_already_gone", sandbox=self.name)
+            return
+        log.info("github_sandbox.stale_removed", sandbox=self.name)
+
+    def _clear_previous_forges(self) -> None:
+        """Best effort, once per instance: remove this home's box under any
+        other forge.
+
+        Never raises. The field failure it replaces: after a switch to
+        GitLab, removing the old GitHub box timed out on every attempt, and
+        because that removal ran before the GitLab box was created, polling
+        stayed down for hours over a box nothing needed any more. A failure
+        here is logged with the command that clears it, and the next daemon
+        start tries again.
+        """
+        if self._previous_forges_cleared:
+            return
+        self._previous_forges_cleared = True
+        try:
+            listed = {info.name for info in self.sbx.ls()}
+        except SbxError as exc:
+            log.warning(
+                "github_sandbox.previous_forge_check_failed",
+                sandbox=self.name,
+                error=str(exc),
+            )
+            return
+        for name in self._previous_forge_names:
+            if name not in listed:
+                continue
+            try:
+                # settle=False: nothing re-creates this name while the
+                # configured forge is a different one.
+                self.sbx.rm(name, force=True, settle=False)
+            except SbxNotFoundError:
+                log.info("github_sandbox.previous_forge_already_gone", sandbox=name)
+            except SbxError as exc:
+                log.warning(
+                    "github_sandbox.previous_forge_remove_failed",
+                    sandbox=name,
+                    error=str(exc),
+                    hint=f"a box this daemon used under another [vcs] kind is still "
+                    f"present; `sbxloop sandbox rm {name}` removes it, and the next "
+                    "daemon start retries",
+                )
+            else:
+                log.info("github_sandbox.previous_forge_removed", sandbox=name, kind=self.kind)
+
+    def _listed(self) -> bool:
         """Whether ``sbx ls`` lists this instance's box right now."""
-        wanted = name or self.name
-        return any(info.name == wanted for info in self.sbx.ls())
+        return any(info.name == self.name for info in self.sbx.ls())
 
     def ops(self) -> VcsOps:
         # Polling and control requests can arrive together. Cleanup belongs
@@ -273,6 +335,7 @@ class DaemonGithub:
             sandbox=self.name,
             duration_s=round(time.monotonic() - started, 1),
         )
+        self._clear_previous_forges()
         return self.backend(clients[0])
 
     @property

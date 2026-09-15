@@ -103,6 +103,18 @@
 
 ### Fixed
 
+- **Switching `[vcs] kind` no longer stalls the daemon on the old forge's
+  sandbox.** The daemon removed its box under the previous forge before
+  creating the one for the configured forge, and a removal that failed
+  failed the provision: after a switch to GitLab, an old GitHub box whose
+  `sbx rm` timed out kept polling down for hours. The old box is now
+  removed once per daemon process after the new one is ready, and a failure
+  is a warning naming `sbxloop sandbox rm <name>`. The cleanup also runs in
+  every direction; a switch back to GitHub used to leave the GitLab box
+  behind for good. A stale box that `sbx ls` lists and `sbx rm` then calls
+  "not found" counts as removed once the inventory confirms it, instead of
+  failing the provision.
+
 - **A finished run no longer crashes recording its result with "database is
   locked".** The engine store's read-then-write methods (recording where a
   run published, appending chat guidance, appending a fix-round task) began a
