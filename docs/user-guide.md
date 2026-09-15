@@ -1474,7 +1474,10 @@ repositories registered they are shared across all of them —
 - a **circuit breaker** (`max_consecutive_failures`, default 3, then
   `breaker_cooldown_s`, default 1 h) that is persisted, so a restart cannot
   reset it — and counts *consecutive failures across repositories*, so a
-  repo that keeps failing pauses the whole daemon;
+  repo that keeps failing pauses the whole daemon. It is not a hold:
+  `resume --all` leaves it open, and `reset-breaker` (from chat, `ctl` or
+  the console's palette) closes it and zeroes the count without waiting
+  out the cooldown;
 - **pause and cancel**, from Discord or `sbxloop daemon ctl` (below);
 - **reconciliation**: on start, and every tick while nothing is executing,
   runs the store still shows in flight with no process behind them are
@@ -1678,7 +1681,7 @@ for an answer that will never come; and a message that gets a second turn
 against it later (answering a clarifying question does) is never marked
 received again after it has been answered.
 
-`!sbx status|pause [--hold NAME]|resume [--hold NAME|--all]|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>|merge <item|run>|release <item|run>|grant-rounds <run> <n>|resume-repo <owner/name>|schedules [pause <name>|resume <name>]|log [--tail N] [--level L] [--grep T]|stop|restart [--now]` in the control channel drive the daemon
+`!sbx status|pause [--hold NAME]|resume [--hold NAME|--all]|cancel [--retry]|queue|items|abandon <item> [reason]|retry <item>|requeue <item>|merge <item|run>|release <item|run>|grant-rounds <run> <n>|resume-repo <owner/name>|reset-breaker|schedules [pause <name>|resume <name>]|log [--tail N] [--level L] [--grep T]|stop|restart [--now]` in the control channel drive the daemon
 itself. Pause is a set of **named holds**: a bare `pause`/`resume` acts on the
 operator's hold, the deploy pipeline holds `deploy-<run id>` while it waits for
 the daemon to go idle, and the daemon idles while any hold stands — so an

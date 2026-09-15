@@ -267,6 +267,7 @@ NoticeKind = Literal[
     "daemon.restart_marker_stale",
     "breaker.opened",
     "breaker.half_open",
+    "breaker.reset",
     "source.poll_recovered",
     "source.repo_suspended",
     "source.repo_recovered",

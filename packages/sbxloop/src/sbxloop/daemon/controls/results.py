@@ -141,6 +141,15 @@ class RepoResumeOutcome(Outcome):
     health: dict[str, Any]
 
 
+class BreakerResetOutcome(Outcome):
+    #: ``False`` when the breaker was already closed (a no-op).
+    was_open: bool
+    #: The count the reset cleared.
+    consecutive_failures: int
+    #: Holds still standing: a reset breaker does not release them.
+    holds: list[str]
+
+
 class ScheduleListOutcome(Outcome):
     rows: list[dict[str, Any]]
 

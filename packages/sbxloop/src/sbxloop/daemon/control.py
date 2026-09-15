@@ -62,6 +62,7 @@ COMMANDS: tuple[str, ...] = (
     "release <item|run>",
     "grant-rounds <run> <n>",
     "resume-repo <owner/name>",
+    "reset-breaker",
     "schedules [add <name> --profile P --every 1h|--cron 0 7 * * mon-fri [--tz ZONE] "
     "--ask TEXT…|remove <name>|pause <name>|resume <name>]",
     "log [--tail N] [--level LEVEL] [--grep TEXT]",
@@ -615,6 +616,21 @@ def _dispatch_verb(
                 raise
             return CommandReply(f"resume-repo failed: {exc.message}", ok=False)
         return CommandReply(f"polling {code(polled.repo)} again from the next tick.")
+    if word == "reset-breaker":
+        # The breaker is not a hold: `resume --all` never closes it, and
+        # this never releases a hold, so the reply names any still standing.
+        if args:
+            return CommandReply("usage: reset-breaker", ok=False)
+        reset = service.reset_breaker(principal)
+        if not reset.was_open and not reset.consecutive_failures:
+            return CommandReply("the breaker was already closed; nothing to reset.")
+        cleared = f"breaker reset ({reset.consecutive_failures} consecutive failure(s) cleared)"
+        if reset.holds:
+            return CommandReply(
+                f"{cleared}; still paused by {', '.join(code(h) for h in reset.holds)} "
+                f"(`{prefix} resume --all` releases every hold)."
+            )
+        return CommandReply(f"{cleared}; dispatch may proceed.")
     if word == "schedules":
         return _schedules(service, args, principal)
     if word == "log":

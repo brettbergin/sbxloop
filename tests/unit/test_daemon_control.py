@@ -827,6 +827,37 @@ class TestGrantRounds:
         assert not reply.ok and reply.text == "grant-rounds failed: unknown run r_unknown"
 
 
+class TestBreaker:
+    """`reset-breaker`: the only verb that closes the breaker. `resume --all`
+    releases holds and leaves it alone, so the reply must not blur the two."""
+
+    def test_reset_breaker_reaches_the_loop(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        reply = dispatch(floop, "reset-breaker", by="brett")
+        assert reply.ok and floop.breaker_resets == ["brett"]
+        assert plain(reply.text) == (
+            "breaker reset (3 consecutive failure(s) cleared); dispatch may proceed."
+        )
+        reply = dispatch(floop, "reset-breaker")
+        assert reply.ok and plain(reply.text) == "the breaker was already closed; nothing to reset."
+        assert not dispatch(floop, "reset-breaker now").ok
+        assert floop.breaker_resets == ["brett", None]
+
+    def test_reset_names_the_holds_that_still_stand(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        floop.holds = {"operator"}
+        text = plain(dispatch(floop, "reset-breaker").text)
+        assert text == (
+            "breaker reset (3 consecutive failure(s) cleared); still paused by operator "
+            "(!sbx resume --all releases every hold)."
+        )
+
+    def test_resume_all_does_not_reset_the_breaker(self, tmp_path: Path) -> None:
+        floop = FakeLoop(_dstore(SbxloopHome(tmp_path)))
+        assert dispatch(floop, "resume --all").ok
+        assert floop.breaker_resets == []
+
+
 class TestRepoHealth:
     """#516: `resume-repo` and the status line that appears only when a
     repository is not healthy."""

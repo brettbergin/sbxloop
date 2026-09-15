@@ -235,6 +235,7 @@ class TestCapabilities:
             (lambda s: s.retry(READER, "gh:issue:1"), "runs:control"),
             (lambda s: s.requeue(READER, "gh:issue:1"), "runs:control"),
             (lambda s: s.resume_repo(READER, "o/r"), "daemon:manage"),
+            (lambda s: s.reset_breaker(READER), "daemon:manage"),
             (lambda s: s.schedule_control(READER, "pause", "n"), "daemon:manage"),
             (lambda s: s.stop(READER), "daemon:manage"),
             (lambda s: s.restart(READER), "daemon:manage"),
@@ -254,6 +255,7 @@ class TestCapabilities:
         assert excinfo.value.detail["capability"] == capability
         assert floop.hold_calls == [] and floop.cancel_calls == [] and floop.granted == []
         assert floop.approvals == [] and floop.schedule_calls == [] and floop.restarts == []
+        assert floop.breaker_resets == []
 
     def test_reads_need_runs_read(self, service: ControlService) -> None:
         assert service.status(READER).status["queued"] == 2

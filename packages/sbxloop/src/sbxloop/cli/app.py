@@ -3142,7 +3142,8 @@ def daemon_ctl(
         typer.Argument(
             help="status | pause [--hold NAME] | resume [--hold NAME|--all] | cancel "
             "[--retry] | queue | items | abandon <item> [reason] | retry <item> | "
-            "requeue <item> | grant-rounds <run> <n> | log [--tail N] [--level L] [--grep T] "
+            "requeue <item> | grant-rounds <run> <n> | reset-breaker | "
+            "log [--tail N] [--level L] [--grep T] "
             "| stop (the chat !sbx verbs)."
         ),
     ],

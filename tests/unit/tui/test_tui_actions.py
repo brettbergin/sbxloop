@@ -109,6 +109,7 @@ class TestCtlOutcomes:
         assert actions.grant_rounds(deps, "r_live", 2).run().ok
         assert actions.resume_review(deps, "gh:issue:41").run().ok
         assert actions.resume_repo(deps, "o/r").run().ok
+        assert actions.reset_breaker(deps).run().ok
         assert sent(deps) == [
             "pause",
             "resume --all",
@@ -118,7 +119,9 @@ class TestCtlOutcomes:
             "grant-rounds r_live 2",
             "resume gh:issue:41",
             "resume-repo o/r",
+            "reset-breaker",
         ]
+        assert actions.reset_breaker(deps).confirm == "yes"
         stop = actions.stop_daemon(deps)
         assert stop.confirm == "typed" and stop.typed == "stop" and stop.needs_live
         restart = actions.restart_daemon(deps)
