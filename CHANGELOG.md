@@ -113,6 +113,12 @@
 
 ### Fixed
 
+- **A usage window is bounded at both ends.** `GET /v1/usage` folded each
+  run it touched from `since` onward with no upper bound, so a run that
+  kept spending after `until` lent those turns to the window. The fold now
+  drops samples at or after `until`; a client that charts one window per
+  bucket counts each sample once, and a run's own report stays unbounded.
+
 - **A mentioned concierge stays Angie.** `@concierge` in Angie's chat
   used to hand the turn a persona that introduced itself as "sbxloop's
   Concierge", a separate agent from the one that answers unmentioned

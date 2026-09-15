@@ -89,7 +89,7 @@ def window_usage(
         if record.updated_at < since or record.created_at >= until:
             continue
         considered += 1
-        folded = usage_for_run(store, record.run_id, since=since)
+        folded = usage_for_run(store, record.run_id, since=since, until=until)
         if not folded.recorded:
             rows.append(
                 UsageWindowRun(

@@ -18,12 +18,20 @@ def _finish(api: Api, key: str = "1") -> str:
     return api.harness.runs[-1][0]
 
 
-def _sample(api: Api, run_id: str, agent: str, **fields: object) -> None:
+def _sample(
+    api: Api, run_id: str, agent: str, *, ts: float | None = None, **fields: object
+) -> None:
     # Run records and samples carry the wall clock, as they do in a live
     # daemon; the harness clock only drives the daemon's own bookkeeping.
     data = {"agent": agent, "model": "m-1", "backend": "echo", **fields}
     api.harness.store.append_event(
-        Event(ts=time.time(), run_id=run_id, job_id=f"j-{agent}", type="agent.usage", data=data)
+        Event(
+            ts=time.time() if ts is None else ts,
+            run_id=run_id,
+            job_id=f"j-{agent}",
+            type="agent.usage",
+            data=data,
+        )
     )
 
 
@@ -88,6 +96,33 @@ class TestWindow:
             headers=headers,
         )
         assert iso.status_code == 200
+
+    def test_a_straddling_run_counts_only_what_it_spent_inside(self, api: Api) -> None:
+        """A window is bounded at both ends: a run that keeps spending after
+        ``until`` does not lend those turns to the window, so a client that
+        charts one window per bucket never counts a sample twice."""
+        run_id = _finish(api)
+        now = time.time()
+        _sample(api, run_id, "builder", ts=now - 1800, input_tokens=10, output_tokens=1)
+        _sample(api, run_id, "builder", ts=now + 1800, input_tokens=100, output_tokens=10)
+        _sample(api, run_id, "builder", ts=now + 7200, input_tokens=1000, output_tokens=100)
+        headers = api.bearer()
+        # Both windows overlap the run's recorded lifetime (it was created
+        # moments ago), so the run is considered in each; only the samples'
+        # own stamps decide which window a turn belongs to.
+        first = api.client.get(
+            "/v1/usage", params={"since": now - 3600, "until": now + 60}, headers=headers
+        ).json()
+        assert first["runs_considered"] == 1
+        assert first["turns"] == 1 and first["total"]["input_tokens"] == 10
+        second = api.client.get(
+            "/v1/usage", params={"since": now - 60, "until": now + 3600}, headers=headers
+        ).json()
+        assert second["runs_considered"] == 1
+        assert second["turns"] == 1 and second["total"]["input_tokens"] == 100
+        # The run's own report is unbounded: every sample it ever recorded.
+        whole = api.client.get(f"/v1/runs/run_{run_id}/usage", headers=headers).json()
+        assert whole["turns"] == 3 and whole["total"]["input_tokens"] == 1110
 
     def test_bad_windows_are_refused(self, api: Api) -> None:
         headers = api.bearer()
