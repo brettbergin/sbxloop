@@ -103,6 +103,18 @@
 
 ### Fixed
 
+- **Switching `[vcs] kind` no longer stalls the daemon on the old forge's
+  sandbox.** The daemon removed its box under the previous forge before
+  creating the one for the configured forge, and a removal that failed
+  failed the provision: after a switch to GitLab, an old GitHub box whose
+  `sbx rm` timed out kept polling down for hours. The old box is now
+  removed once per daemon process after the new one is ready, and a failure
+  is a warning naming `sbxloop sandbox rm <name>`. The cleanup also runs in
+  every direction; a switch back to GitHub used to leave the GitLab box
+  behind for good. A stale box that `sbx ls` lists and `sbx rm` then calls
+  "not found" counts as removed once the inventory confirms it, instead of
+  failing the provision.
+
 - **Structured answers from the openai backend parse again when they name a
   credential.** Under `[agent] backend = "openai"` the answer was redacted as
   text before its JSON was extracted, and the redactor rewrites the value of a

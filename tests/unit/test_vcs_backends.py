@@ -4,6 +4,8 @@ fails closed by name."""
 
 from __future__ import annotations
 
+import logging
+import sys
 from pathlib import Path
 
 import pytest
@@ -13,7 +15,7 @@ from sbxloop.daemon.github import DaemonGithub, sandbox_name_for
 from sbxloop.errors import GithubOpsError
 from sbxloop.events import EventBus
 from sbxloop.sbx.cli import SbxCLI
-from sbxloop.sbx.models import SandboxInfo
+from sbxloop.sbx.models import SandboxSpec
 from sbxloop.vcs.backends import (
     BackendNotImplemented,
     backend_for,
@@ -86,31 +88,85 @@ class TestTheDaemonsBox:
         assert isinstance(ops, GitlabOps)
         assert ops.transport is not None and ops.transport.api_url == "https://gl.example/api/v4"
 
-    def test_a_renamed_box_cleans_up_the_pre_upgrade_name(self, tmp_path: Path) -> None:
-        config = Config.model_validate(
-            {
-                "home": str(tmp_path / "home"),
-                "vcs": {"kind": "gitlab", "api_url": "https://gl.example/api/v4"},
-                "github": {"repo": "acme/widgets"},
-            }
+    @staticmethod
+    def _switched_box(
+        fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, kind: str
+    ) -> DaemonGithub:
+        monkeypatch.setenv("GH_TOKEN", "github_pat_test")
+        monkeypatch.setenv("GITLAB_TOKEN", "glpat-test")
+        vcs = (
+            {"kind": kind}
+            if kind == "github"
+            else {"kind": kind, "api_url": "https://gl.example/api/v4"}
         )
-        legacy = sandbox_name_for(config.paths, "github")
+        config = Config.model_validate(
+            {"home": str(tmp_path / "home"), "vcs": vcs, "github": {"repo": "acme/widgets"}}
+        )
+        return DaemonGithub(
+            config,
+            SbxCLI(binary=str(fake_sbx.binary)),
+            EventBus(),
+            worker_python=sys.executable,
+            install_workers=False,
+        )
 
-        class StubSbx:
-            def __init__(self) -> None:
-                self.names = {legacy}
+    @pytest.mark.parametrize(
+        ("configured", "previous"), [("gitlab", "github"), ("github", "gitlab")]
+    )
+    def test_a_forge_switch_clears_the_previous_forges_box(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        configured: str,
+        previous: str,
+    ) -> None:
+        """Switching `[vcs] kind` in either direction leaves this home's box
+        under the old forge behind; it used to be cleared only on a switch
+        away from GitHub, and a switch back leaked the GitLab box for good
+        (prune leaves daemon-owned boxes alone)."""
+        box = self._switched_box(fake_sbx, tmp_path, monkeypatch, configured)
+        old = sandbox_name_for(box.config.paths, previous)  # type: ignore[arg-type]
+        for name in (old, "sbxloop-daemon-gitlab-0badf00d"):  # the second: another home's
+            box.sbx.create(SandboxSpec(name=name, role="github", workspace=tmp_path))
 
-            def ls(self) -> list[SandboxInfo]:
-                return [SandboxInfo(name=name) for name in self.names]
+        box.ops()
 
-            def rm(self, name: str, *, force: bool = False) -> None:
-                self.names.remove(name)
+        listed = {info.name for info in box.sbx.ls()}
+        assert box.name in listed
+        assert old not in listed
+        assert "sbxloop-daemon-gitlab-0badf00d" in listed
 
-        cli = StubSbx()
-        box = DaemonGithub(config, cli, EventBus(), worker_python="python")  # type: ignore[arg-type]
-        box.remove_stale()
+    def test_a_wedged_previous_forge_box_does_not_keep_the_new_forge_down(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Field failure: after a switch to GitLab, `sbx rm` of the old
+        GitHub box timed out on every provision, and because that removal ran
+        before the GitLab box was created, polling stayed down for hours. The
+        old box has its own name; the new one never waits on it."""
+        box = self._switched_box(fake_sbx, tmp_path, monkeypatch, "gitlab")
+        old = sandbox_name_for(box.config.paths, "github")
+        box.sbx.create(SandboxSpec(name=old, role="github", workspace=tmp_path))
+        fake_sbx.fail_next(f"rm --force {old}", stderr="ERROR: context deadline exceeded")
 
-        assert legacy not in cli.names
+        with caplog.at_level(logging.INFO, logger="sbxloop.daemon.github"):
+            box.ops()
+
+        assert box.name in {info.name for info in box.sbx.ls()}
+        failed = [
+            r
+            for r in caplog.records
+            if "github_sandbox.previous_forge_remove_failed" in r.getMessage()
+        ]
+        assert len(failed) == 1 and failed[0].levelno == logging.WARNING
+        # Once per daemon process: a re-provision does not pay for it again.
+        box.close()
+        box.ops()
+        assert len([c for c in fake_sbx.invocations("rm") if old in c]) == 1
 
     def test_a_repository_on_its_own_forge(self, fake_sbx: FakeSbx, tmp_path: str) -> None:
         config = Config.model_validate(
