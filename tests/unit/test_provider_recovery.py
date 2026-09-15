@@ -394,3 +394,69 @@ def test_daemon_startup_keeps_any_other_hold(tmp_path):
     h.loop.run_forever()
     assert h.loop._provider_recovery().hold() is not None
     assert not [n for n in front.notices if n.kind == "provider.hold_released"]
+
+
+@pytest.mark.parametrize(
+    ("category", "fields", "waiting"),
+    [
+        ("unknown", {"http_status": 400}, "it waits for an operator"),
+        ("throttle", {"http_status": 429}, "it lifts by itself after"),
+    ],
+    ids=["operator-recovery", "timed"],
+)
+def test_a_held_concierge_names_the_recovery_commands(
+    tmp_path, monkeypatch, category, fields, waiting
+):
+    """While the backend is held the concierge cannot call its model, so it
+    cannot act on "reset the breaker and resume". Field failure: it answered
+    with the bare hold summary. It now names the operator commands, which
+    need no model, and what the hold is waiting for."""
+    from tests.unit.test_daemon_concierge import make, turn
+
+    concierge, client, _, _, _ = make(tmp_path, [{"text": "never reached"}])
+    backend = concierge.config.agent.backend
+    prefix = concierge._chat.command_prefix
+    manager = ProviderRecovery(concierge.store, backend, clock=lambda: 1000.0, jitter=lambda: 0.5)
+    manager.record(job(), rejected(category, **fields))
+    transport = client.submit
+    calls = []
+
+    def guarded(request, **kwargs):
+        def attempt(actual):
+            calls.append(actual)
+            return transport(actual, **kwargs)
+
+        return manager.submit(request, attempt, EventBus())
+
+    monkeypatch.setattr(client, "submit", guarded)
+    try:
+        reply = turn(concierge, "reset the breaker and resume")
+        assert not reply.ok and calls == []
+        assert f"`{prefix} resume {backend}`" in reply.error
+        assert f"`{prefix} reset-breaker`" in reply.error
+        assert f"`sbxloop daemon ctl resume {backend}`" in reply.error
+        assert waiting in reply.error
+        assert "Held because: Provider limit" in reply.error
+    finally:
+        concierge.close()
+
+
+def test_chat_recovery_commands_work_while_the_provider_is_held(tmp_path):
+    """The commands the held concierge names need no model: from chat, while
+    the hold stands, `resume <backend>` releases it and `reset-breaker`
+    answers."""
+    from sbxloop.config import Config
+    from sbxloop.daemon.control import dispatch
+    from tests.unit.test_daemon_loop import Harness
+
+    config = Config.model_validate(
+        {"home": str(tmp_path / "state"), "agent": {"backend": "claude"}, "github": {"repo": "o/r"}}
+    )
+    h = Harness(tmp_path, config)
+    h.loop._provider_recovery().record(job(), rejected("billing", http_status=400))
+    assert h.loop.tick().idle_kind == "provider_held"
+    released = dispatch(h.loop, "resume claude", by="brett")
+    assert released.ok and "provider hold released" in released.text
+    assert h.loop._provider_recovery().hold() is None
+    assert dispatch(h.loop, "reset-breaker", by="brett").ok
+    assert h.loop.tick().idle_kind != "provider_held"
