@@ -435,6 +435,24 @@ class StateStore:
             session.commit()
 
     @contextmanager
+    def _immediate(self) -> Iterator[Session]:
+        """A committing session that takes SQLite's write lock before reading.
+
+        For a method that reads a row and writes a value derived from it.
+        ``_write`` begins deferred, so its first SELECT pins a WAL read
+        snapshot; when another connection to this file (the API's projector
+        and artifact catalogue in the daemon, the operator console, another
+        process) commits before the UPDATE, SQLite cannot upgrade that stale
+        snapshot and fails the write with ``database is locked`` at once,
+        busy timeout or not. ``BEGIN IMMEDIATE`` takes the lock first, so
+        the other writer waits instead. Field failure: a finished workload
+        run crashed recording where it published.
+        """
+        with self._lock, begin_immediate(self._engine) as conn, Session(bind=conn) as session:
+            yield session
+            session.flush()
+
+    @contextmanager
     def _read(self) -> Iterator[Session]:
         """A session for a query. Held under the lock too: one connection
         cannot serve two threads at once, reads included."""
@@ -498,7 +516,7 @@ class StateStore:
         """Record one more place the run's result went (#759), as it lands
         — so a resume at publishing skips it and the record says where the
         result is."""
-        with self._write() as session:
+        with self._immediate() as session:
             current = session.scalar(select(Run.published).where(Run.run_id == run_id))
             if current is None:
                 raise StateError(f"unknown run {run_id}")
@@ -645,7 +663,7 @@ class StateStore:
     def append_run_guidance(self, run_id: str, text: str) -> None:
         """Append one standing chat-guidance entry (a ``steer_run`` verdict)
         to the run. Persisted so a resumed run re-applies it to its prompts."""
-        with self._write() as session:
+        with self._immediate() as session:
             current = session.scalar(select(Run.user_guidance).where(Run.run_id == run_id))
             if current is None:
                 raise StateError(f"unknown run {run_id}")
@@ -917,7 +935,7 @@ class StateStore:
     def append_task(self, run_id: str, spec: TaskSpec) -> TaskRecord:
         """Add one task after every existing one (a fix round). ``save_tasks``
         numbers from zero and would collide with the graph already saved."""
-        with self._write() as session:
+        with self._immediate() as session:
             next_idx = session.scalar(
                 select(func.coalesce(func.max(Task.order_idx), -1) + 1).where(Task.run_id == run_id)
             )

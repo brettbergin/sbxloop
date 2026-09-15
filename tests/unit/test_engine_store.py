@@ -3,9 +3,10 @@
 import json
 import sqlite3
 from pathlib import Path
+from typing import Any
 
 import pytest
-from sqlalchemy import select
+from sqlalchemy import event, select
 
 from sbxloop.db import begin_immediate
 from sbxloop.db.engine_models import Run
@@ -762,7 +763,7 @@ class TestWriterSerialization:
 
         from sbxloop.engine import store as store_module
 
-        for name in ("_write", "_read"):
+        for name in ("_write", "_immediate", "_read"):
             body = inspect.getsource(getattr(store_module.StateStore, name))
             assert "with self._lock" in body, f"{name} does not take the store's lock"
 
@@ -1016,6 +1017,70 @@ class TestTheClaimIsAtomic:
             finally:
                 other.close()
         finally:
+            store.close()
+
+    @pytest.mark.parametrize(
+        ("write", "statement", "landed"),
+        [
+            (
+                lambda store: store.add_run_published(
+                    "r1", Published(sink="artifact", location="/runs/r1/artifacts", tasks=["t1"])
+                ),
+                "UPDATE runs",
+                lambda store: (
+                    [entry.sink for entry in store.get_run("r1").published] == ["artifact"]
+                ),
+            ),
+            (
+                lambda store: store.append_run_guidance("r1", "keep it short"),
+                "UPDATE runs",
+                lambda store: store.get_run_guidance("r1") == ["keep it short"],
+            ),
+            (
+                lambda store: store.append_task("r1", TaskSpec(id="fix-1", title="Fix")),
+                "INSERT INTO tasks",
+                lambda store: [task.spec.id for task in store.get_tasks("r1")] == ["t1", "fix-1"],
+            ),
+        ],
+        ids=["add_run_published", "append_run_guidance", "append_task"],
+    )
+    def test_read_then_write_survives_another_connection_committing(
+        self, tmp_path: Path, write: Any, statement: str, landed: Any
+    ) -> None:
+        """A read-then-write holds the write lock from its first read.
+
+        Field failure: a finished workload run crashed in ``add_run_published``
+        with ``database is locked``. Under a deferred ``BEGIN`` the SELECT pins
+        a WAL snapshot, another connection to the file (the API projector in
+        the daemon) commits, and SQLite refuses to upgrade the stale snapshot
+        for the UPDATE, busy timeout or not. Here the other connection tries
+        to commit just before the method's write: it must be held off, and
+        the method's write must land.
+        """
+        path = tmp_path / "state.db"
+        store = StateStore(path)
+        other = sqlite3.connect(path, timeout=0, isolation_level=None)
+        interleaved: list[str] = []
+
+        def commit_from_another_connection(_conn: Any, _cursor: Any, sql: str, *_args: Any) -> None:
+            if interleaved or not sql.lstrip().upper().startswith(statement.upper()):
+                return
+            try:
+                other.execute("UPDATE runs SET outcome = outcome WHERE run_id = 'r1'")
+                interleaved.append("committed")
+            except sqlite3.OperationalError as exc:
+                interleaved.append(f"held off: {exc}")
+
+        try:
+            store.create_run("r1", "x")
+            store.save_tasks("r1", [TaskSpec(id="t1", title="A")])
+            event.listen(store._engine, "before_cursor_execute", commit_from_another_connection)
+            write(store)
+            assert interleaved and interleaved[0].startswith("held off"), interleaved
+            assert landed(store)
+        finally:
+            event.remove(store._engine, "before_cursor_execute", commit_from_another_connection)
+            other.close()
             store.close()
 
 

@@ -13,7 +13,7 @@ import pytest
 
 from sbxloop.config import Config
 from sbxloop.daemon.github import DaemonGithub
-from sbxloop.errors import DaemonError
+from sbxloop.errors import DaemonError, SbxNotFoundError
 from sbxloop.events import EventBus
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
@@ -128,6 +128,41 @@ def test_close_takes_a_box_already_gone_as_removed(
     # Closed is closed: the next call provisions afresh, as after any close.
     github.ops()
     assert len(fake_sbx.invocations("create")) == 2
+
+
+def test_a_stale_box_whose_teardown_is_already_in_flight_does_not_fail_the_provision(
+    fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Field failure: while sandboxd recovered, `sbx ls` listed the stale box
+    and `sbx rm` then answered "not found". The inventory confirming it gone
+    settles it, as at close; the provision used to fail on it instead."""
+    github = make_github(fake_sbx, tmp_path, monkeypatch)
+    github.sbx.create(SandboxSpec(name=github.name, role="github", workspace=tmp_path))
+    rm = github.sbx.rm
+
+    def rm_racing_a_teardown(name: str, *, force: bool = True, settle: bool = True) -> None:
+        rm(name, force=force, settle=settle)
+        raise SbxNotFoundError(f"ERROR: sandbox '{name}' not found")
+
+    monkeypatch.setattr(github.sbx, "rm", rm_racing_a_teardown)
+
+    github.ops()
+
+    assert len(fake_sbx.invocations("create")) == 2
+
+
+def test_a_stale_box_still_listed_after_not_found_fails_the_provision(
+    fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half: "not found" while the inventory still lists the name
+    proves nothing, and creating over it would collide."""
+    github = make_github(fake_sbx, tmp_path, monkeypatch)
+    github.sbx.create(SandboxSpec(name=github.name, role="github", workspace=tmp_path))
+    fake_sbx.fail_next("rm", stderr=f"ERROR: sandbox '{github.name}' not found")
+
+    with pytest.raises(DaemonError, match="not found"):
+        github.ops()
+    assert len(fake_sbx.invocations("create")) == 1
 
 
 @pytest.mark.parametrize("inventory", ["still lists it", "cannot be read"])
