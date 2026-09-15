@@ -33,6 +33,9 @@ if TYPE_CHECKING:
 MAX_THROTTLE_RETRIES = 3
 BACKOFF_BASE_S = 30.0
 BACKOFF_MAX_S = 300.0
+#: HTTP statuses meaning the endpoint refused the request itself (malformed,
+#: or unsupported for the model), not that the provider is unavailable.
+REQUEST_REJECTED_STATUSES = frozenset({400, 422})
 
 
 @dataclass(frozen=True)
@@ -122,6 +125,32 @@ class ProviderRecovery:
                     generation=ProviderHoldRow.generation + 1,
                 ),
             )
+
+    def release_request_rejection(self) -> ProviderHold | None:
+        """Release a standing hold that was recorded for a refused request.
+
+        A request the endpoint rejects as malformed or unsupported (HTTP 400
+        or 422, recorded as an ``unknown`` failure with no reset) is not an
+        outage: no wait makes it succeed, yet the hold asks for "explicit
+        operator recovery" and blocks every entry point, the concierge
+        included, until someone runs ``resume <backend>``. Such holds were
+        recorded by releases that treated a rejection as a provider failure,
+        and they outlive the upgrade that stopped doing so. Released here
+        (the daemon calls this at startup), the next call is judged by the
+        running release: a rejection it still sees fails that phase with the
+        endpoint's reason, or holds again. Timed holds (throttle, quota) and
+        other failures are left alone. Returns the released hold, or None.
+        """
+        hold = self.hold()
+        if (
+            hold is None
+            or hold.next_at is not None
+            or hold.failure.category != "unknown"
+            or hold.failure.http_status not in REQUEST_REJECTED_STATUSES
+        ):
+            return None
+        self.release(expected_generation=hold.generation)
+        return hold
 
     def pending(self, run_id: str) -> bool:
         with self.store._read() as session:

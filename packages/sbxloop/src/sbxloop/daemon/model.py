@@ -268,6 +268,7 @@ NoticeKind = Literal[
     "breaker.opened",
     "breaker.half_open",
     "breaker.reset",
+    "provider.hold_released",
     "source.poll_recovered",
     "source.repo_suspended",
     "source.repo_recovered",

@@ -318,3 +318,79 @@ def test_steering_hold_persists_the_message_without_spending_attempt(tmp_path):
     assert pending.data["text"] == "Keep the existing output"
     assert engine._steer_attempts == 0
     assert engine.store.phase_attempts("r1") == []
+
+
+@pytest.mark.parametrize("status", [400, 422])
+def test_a_hold_for_a_refused_request_is_released(recovery, status):
+    """A request the endpoint refused (HTTP 400/422) was recorded as an
+    ``unknown`` failure with no reset: "explicit operator recovery required",
+    blocking every entry point, the concierge included. No wait fixes a
+    refused request, so the daemon releases such a hold at startup and the
+    running release judges the next call. Field failure: a hold recorded by
+    an earlier release outlived the upgrade that stopped treating the
+    rejection as a provider failure."""
+    manager, _ = recovery
+    manager.record(job(), rejected("unknown", http_status=status))
+    with pytest.raises(ProviderHeldError, match="reset unknown"):
+        manager.check()
+    released = manager.release_request_rejection()
+    assert released is not None and released.failure.http_status == status
+    assert manager.hold() is None
+    manager.check()
+    assert manager.release_request_rejection() is None
+
+
+@pytest.mark.parametrize(
+    ("category", "fields"),
+    [
+        ("throttle", {"http_status": 429}),
+        ("quota", {"http_status": 400, "reset_at": 5000}),
+        ("billing", {"http_status": 400}),
+        ("unknown", {"http_status": 401}),
+        ("unknown", {}),
+    ],
+    ids=["throttle", "timed-quota", "billing", "credential-refused", "no-status"],
+)
+def test_other_holds_are_not_released(recovery, category, fields):
+    manager, _ = recovery
+    manager.record(job(), rejected(category, **fields))
+    before = manager.hold()
+    assert before is not None
+    assert manager.release_request_rejection() is None
+    assert manager.hold() == before
+
+
+def test_daemon_startup_releases_a_refused_request_hold_and_says_so(tmp_path):
+    from sbxloop.config import Config
+    from tests.unit.test_daemon_loop import Harness, RecordingFrontend
+
+    config = Config.model_validate(
+        {"home": str(tmp_path / "state"), "agent": {"backend": "claude"}, "github": {"repo": "o/r"}}
+    )
+    h = Harness(tmp_path, config)
+    front = RecordingFrontend()
+    h.loop.frontend = front
+    h.loop._provider_recovery().record(job(), rejected("unknown", http_status=400))
+    h.loop._stop.set()  # start, then stop before the first tick
+    h.loop.run_forever()
+    assert h.loop._provider_recovery().hold() is None
+    assert h.loop.status()["provider_hold"] is None
+    (notice,) = [n for n in front.notices if n.kind == "provider.hold_released"]
+    assert "HTTP 400" in notice.text and "Provider limit" in notice.text
+
+
+def test_daemon_startup_keeps_any_other_hold(tmp_path):
+    from sbxloop.config import Config
+    from tests.unit.test_daemon_loop import Harness, RecordingFrontend
+
+    config = Config.model_validate(
+        {"home": str(tmp_path / "state"), "agent": {"backend": "claude"}, "github": {"repo": "o/r"}}
+    )
+    h = Harness(tmp_path, config)
+    front = RecordingFrontend()
+    h.loop.frontend = front
+    h.loop._provider_recovery().record(job(), rejected("billing", http_status=400))
+    h.loop._stop.set()
+    h.loop.run_forever()
+    assert h.loop._provider_recovery().hold() is not None
+    assert not [n for n in front.notices if n.kind == "provider.hold_released"]
