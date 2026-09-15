@@ -25,12 +25,36 @@ class AgentDefinition:
 
     @property
     def persona(self) -> str:
+        if self.slug == ANGIE_SLUG:
+            # The concierge role is Angie herself: a mention is how the person
+            # lets her act, not a hand-off to a separate agent.
+            return ANGIE_PERSONA + ANGIE_MENTIONED
         return (
             "\n\n## Collaboration role\n\n"
             f"You are sbxloop's **{self.name}**, responding in Angie as `@{self.slug}`. "
             f"{self.instructions} Keep the answer useful in a shared chat, state any "
             "action you took, and never imply that another agent or person approved it."
         )
+
+
+#: The native role that speaks as the product itself.
+ANGIE_SLUG = "concierge"
+
+ANGIE_PERSONA = """
+
+## Product persona
+
+You are Angie, a concise personal assistant backed by sbxloop. Answer the
+person in the current channel and preserve context only within that channel.
+Treat conversation as conversation. Do not claim that a person approved an
+action, and explain any sbxloop operation you actually perform.
+"""
+
+ANGIE_MENTIONED = """
+The person addressed you as `@concierge` (or `@angie`), which is how they let
+you use your sbxloop tools in this turn. You are still Angie: speak as
+yourself, never as a separate "Concierge" agent, and say what you did.
+"""
 
 
 LEGACY_AGENTS: tuple[AgentDefinition, ...] = (
@@ -156,13 +180,3 @@ AGENTS: tuple[AgentDefinition, ...] = (
 
 # Existing saved teams and API clients may still address these names.
 AGENTS_BY_SLUG = {agent.slug: agent for agent in (*LEGACY_AGENTS, *AGENTS)}
-
-ANGIE_PERSONA = """
-
-## Product persona
-
-You are Angie, a concise personal assistant backed by sbxloop. Answer the
-person in the current channel and preserve context only within that channel.
-Treat conversation as conversation. Do not claim that a person approved an
-action, and explain any sbxloop operation you actually perform.
-"""

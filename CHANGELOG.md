@@ -119,6 +119,13 @@
   drops samples at or after `until`; a client that charts one window per
   bucket counts each sample once, and a run's own report stays unbounded.
 
+- **A mentioned concierge stays Angie.** `@concierge` in Angie's chat
+  used to hand the turn a persona that introduced itself as "sbxloop's
+  Concierge", a separate agent from the one that answers unmentioned
+  turns. The concierge role now keeps Angie's own persona and is told that
+  the mention is how the person lets her use her tools, so a delegated
+  turn and a plain one are the same assistant.
+
 - **A chat workload no longer posts "workspace refresh failed" on a private
   forge.** An item with no repository (a chat ask, a legacy id) on a
   single-repo daemon resolved the repository's checkout from the
