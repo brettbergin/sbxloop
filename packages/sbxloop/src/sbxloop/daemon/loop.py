@@ -3660,8 +3660,19 @@ class DaemonLoop:
         home first (:meth:`_ensure_workspace`); a checkout whose ``origin``
         names a different repository is refused rather than fast-forwarded
         (#526).
+
+        An item with no repository (a chat workload, a legacy id) on a
+        single-repo daemon refreshes that repository's checkout with that
+        repository's credential: the checkout used to resolve from ``None``
+        while the token did not, so a private forge was fetched anonymously
+        and every chat ask posted a refresh failure. The first-use clone
+        stays keyed on the item's own repository; a repo-less item never
+        starts one.
         """
         self._ensure_workspace(repo)
+        if repo is None:
+            default = self.config.github.default_repo()
+            repo = default.repo if default is not None else None
         if not self.config.daemon.refresh_workspace:
             return
         if self.config.daemon.workspace_isolation == "in-place":
