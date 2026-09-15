@@ -113,6 +113,16 @@
 
 ### Fixed
 
+- **A chat workload no longer posts "workspace refresh failed" on a private
+  forge.** An item with no repository (a chat ask, a legacy id) on a
+  single-repo daemon resolved the repository's checkout from the
+  single-repo fallback but resolved the credential from no repository, so
+  the fetch before dispatch ran anonymously and, on a private GitLab
+  project, every chat ask put a refresh failure in the channel while the
+  run went on from local HEAD. The refresh now folds the sole enabled
+  repository in for both, so the checkout is fetched with that repository's
+  token; the first-use clone stays keyed on the item's own repository.
+
 - **Switching `[vcs] kind` no longer stalls the daemon on the old forge's
   sandbox.** The daemon removed its box under the previous forge before
   creating the one for the configured forge, and a removal that failed

@@ -143,6 +143,63 @@ class TestDaemonClonesOnFirstUse:
         loop._refresh_workspace(repo)
         assert calls == [(checkout, {"token": token, "credential_url": origin})]
 
+    def test_a_repoless_item_refreshes_the_sole_repository_with_its_credential(
+        self, tmp_path, monkeypatch
+    ):
+        """Field failure: a chat workload on a single-repo GitLab daemon
+        resolved the checkout from ``None`` but the token from ``None`` too,
+        so `git fetch` ran anonymously against the private project and
+        every ask posted "workspace refresh failed" to the channel."""
+        loop, home = self.make_loop(tmp_path)
+        loop.config = Config.model_validate(
+            {
+                "home": str(home.root),
+                "vcs": {"kind": "gitlab", "api_url": "http://forge.example:8929/api/v4"},
+                "github": {"repo": "o/n"},
+            }
+        )
+        loop.github = SimpleNamespace(
+            provisioner=Provisioner(SbxCLI(), loop.config, env={"GITLAB_TOKEN": "gitlab-token"})
+        )
+        checkout = home.workspaces / "o" / "n"
+        ensured = []
+        monkeypatch.setattr(loop, "_ensure_workspace", lambda repo: ensured.append(repo))
+        monkeypatch.setattr(loop, "_workspace_checkout", lambda repo: checkout)
+        monkeypatch.setattr(hostgit, "origin_matches_repo", lambda *a: True)
+        calls = []
+
+        def refresh(path, **kwargs):
+            calls.append((path, kwargs))
+            return hostgit.RefreshResult(False, "head", "head", "up to date")
+
+        monkeypatch.setattr(hostgit, "refresh_from_origin", refresh)
+        loop._refresh_workspace(None)
+        # The first-use clone is not started for a repo-less item: the
+        # daemon's own issue runs are what populate the home's checkout.
+        assert ensured == [None]
+        assert calls == [
+            (checkout, {"token": "gitlab-token", "credential_url": "http://forge.example:8929"})
+        ]
+
+    def test_a_repoless_item_on_a_multi_repo_daemon_refreshes_nothing(self, tmp_path, monkeypatch):
+        """With several repositories there is no sole checkout to stand in,
+        so nothing is fetched, and no credential is sent anywhere."""
+        loop, home = self.make_loop(tmp_path)
+        loop.config = Config.model_validate(
+            {
+                "home": str(home.root),
+                "vcs": {"kind": "gitlab", "api_url": "http://forge.example:8929/api/v4"},
+                "github": {"repos": [{"repo": "o/a"}, {"repo": "o/b"}]},
+            }
+        )
+        loop.github = SimpleNamespace(
+            provisioner=Provisioner(SbxCLI(), loop.config, env={"GITLAB_TOKEN": "gitlab-token"})
+        )
+        calls = []
+        monkeypatch.setattr(hostgit, "refresh_from_origin", lambda *a, **k: calls.append(a))
+        loop._refresh_workspace(None)
+        assert calls == []
+
     @pytest.mark.parametrize("empty_directory", [False, True])
     @pytest.mark.parametrize("repo", ["o/n", "group/subgroup/project"])
     def test_gitlab_bootstrap_uses_its_configured_origin(
