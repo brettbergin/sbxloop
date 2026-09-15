@@ -1012,7 +1012,7 @@ class Concierge:
                         "cancel [--retry] | queue | items | abandon <item> [reason] | "
                         "retry <item> | requeue <item> | merge <item|run> | "
                         "release <item|run> | grant-rounds <run> <n> | "
-                        "resume-repo <owner/name> | "
+                        "resume-repo <owner/name> | reset-breaker | "
                         "schedules [pause <name>|resume <name>|remove <name>] | "
                         "restart [--now]. Pass the "
                         "command line without the prefix. Mutating commands take effect "
@@ -1032,7 +1032,9 @@ class Concierge:
                         'rXXXX two more rounds"). Pause is a set '
                         "of named holds: a bare pause/resume acts on the operator's hold, "
                         "a deploy holds `deploy-<id>` while it waits for the daemon to go "
-                        "idle, and `resume --all` clears every hold."
+                        "idle, and `resume --all` clears every hold. The consecutive-failure "
+                        "breaker is not a hold: `resume` never closes it; `reset-breaker` "
+                        "zeroes its failure count and leaves the holds standing."
                     ),
                     parameters=_schema({"command": {"type": "string"}}, ["command"]),
                 ),

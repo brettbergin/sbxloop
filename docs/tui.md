@@ -508,7 +508,7 @@ argument and never logged.
 ### The command palette
 
 `ctrl+p` lists every screen (Secrets included) and every argument-less
-verb (pause, resume, cancel the current run, stop the daemon, start / stop
+verb (pause, resume, reset the circuit breaker, cancel the current run, stop the daemon, start / stop
 / restart the unit, spawn a daemon, upgrade) by name. Verbs with a target
 live on their rows.
 

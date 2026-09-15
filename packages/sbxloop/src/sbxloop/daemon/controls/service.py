@@ -36,6 +36,7 @@ from sbxloop.daemon.controls.principal import Capability, Principal
 from sbxloop.daemon.controls.protocol import ControlLoop
 from sbxloop.daemon.controls.results import (
     AdmitOutcome,
+    BreakerResetOutcome,
     CancelOutcome,
     ControlError,
     GateOutcome,
@@ -755,6 +756,26 @@ class ControlService:
             return RepoResumeOutcome(repo=str(health.get("repo", repo)), health=dict(health))
 
         spec = self._spec("repo.resume", principal, "repo", repo, idempotency=idempotency)
+        return self._record(spec, apply)
+
+    def reset_breaker(
+        self, principal: Principal, *, idempotency: tuple[str, str] | None = None
+    ) -> BreakerResetOutcome:
+        """Close the consecutive-failure breaker now. Holds are untouched:
+        the outcome names the ones still standing."""
+        require(principal, "daemon:manage")
+
+        def apply(_: str | None) -> BreakerResetOutcome:
+            reset = self.loop.reset_breaker(principal.attribution())
+            return BreakerResetOutcome(
+                was_open=bool(reset["was_open"]),
+                consecutive_failures=int(reset["consecutive_failures"]),
+                holds=list(reset["holds"]),
+            )
+
+        spec = self._spec(
+            "daemon.breaker_reset", principal, "breaker", "breaker", idempotency=idempotency
+        )
         return self._record(spec, apply)
 
     def add_schedule(

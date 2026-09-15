@@ -366,6 +366,39 @@ class TestTick:
         assert h.loop.tick().outcome == "done"  # half-open let one through; success
         assert h.loop.status()["breaker_open"] is False
 
+    def test_operator_reset_closes_the_breaker_now(self, tmp_path: Path) -> None:
+        """Releasing every hold never touched the breaker, so an operator
+        who asked for it to be reset still waited out the whole cooldown."""
+        cfg = Config.model_validate(
+            {
+                "home": str(tmp_path / "state"),
+                "daemon": {
+                    "max_attempts_per_item": 1,
+                    "max_consecutive_failures": 1,
+                    "breaker_cooldown_s": 3600,
+                    "max_runs_per_day": 100,
+                },
+            }
+        )
+        h = Harness(tmp_path, cfg)
+        front = RecordingFrontend()
+        h.loop.frontend = front
+        h.source.items = [gh_item("1"), gh_item("2")]
+        h.outcomes = ["raise", "merged"]
+        assert h.loop.tick().outcome == "failed"
+        h.loop.unpause(None, by="brett")
+        assert h.loop.tick().idle_reason == "breaker", "releasing holds is not a reset"
+        got = h.loop.reset_breaker(by="brett")
+        assert got == {"was_open": True, "consecutive_failures": 1, "holds": []}
+        assert h.dstore.breaker() == (None, 0), "persisted, so a restart keeps it closed"
+        (notice,) = [n for n in front.notices if n.kind == "breaker.reset"]
+        assert "brett" in notice.text
+        assert h.loop.tick().outcome == "done"
+        # A closed breaker with no count has nothing to reset: no second notice.
+        again = h.loop.reset_breaker(by="brett")
+        assert again == {"was_open": False, "consecutive_failures": 0, "holds": []}
+        assert len([n for n in front.notices if n.kind == "breaker.reset"]) == 1
+
     def test_paused_loop_idles(self, tmp_path: Path) -> None:
         h = Harness(tmp_path)
         h.source.items = [gh_item()]

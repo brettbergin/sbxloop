@@ -3453,6 +3453,27 @@ class DaemonLoop:
         self._consecutive_failures = consecutive_failures
         self.dstore.set_breaker(opened_at, consecutive_failures)
 
+    def reset_breaker(self, by: str | None = None) -> dict[str, Any]:
+        """Operator: close the breaker and zero its failure count now rather
+        than wait out ``breaker_cooldown_s``. Releasing holds never touches
+        the breaker; this is the one operator path that does. Persisted like
+        every breaker transition, so a restart keeps it closed."""
+        was_open = self._breaker_opened_at is not None
+        failures = self._consecutive_failures
+        self._set_breaker(None, 0)
+        holds = self.holds
+        if was_open or failures:
+            who = by or "operator"
+            self._notice(
+                "breaker.reset",
+                f"{who} reset the circuit breaker ({failures} consecutive failure(s) cleared)"
+                + (f"; still paused by {', '.join(holds)}" if holds else "; dispatching again"),
+                by=who,
+                after_failures=failures,
+                was_open=was_open,
+            )
+        return {"was_open": was_open, "consecutive_failures": failures, "holds": holds}
+
     def _breaker_open(self, now: float) -> bool:
         if self._breaker_opened_at is None:
             return False

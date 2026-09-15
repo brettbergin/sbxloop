@@ -85,6 +85,12 @@ CATALOGUE: tuple[Command, ...] = (
         True,
     ),
     Command(
+        "Reset the circuit breaker",
+        "ctl reset-breaker: zero the failure count; holds stand until released",
+        _act(actions.reset_breaker),
+        True,
+    ),
+    Command(
         "Cancel the current run",
         "ctl cancel: settled as cancelled",
         _act(actions.cancel_current),

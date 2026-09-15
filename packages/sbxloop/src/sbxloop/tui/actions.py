@@ -274,6 +274,20 @@ def resume_repo(deps: Deps, repo: str) -> Action:
     )
 
 
+def reset_breaker(deps: Deps) -> Action:
+    """Close the consecutive-failure breaker now; holds are a separate
+    verb (``resume --all``) and stand until released."""
+    return ctl_action(
+        deps,
+        "reset-breaker",
+        title="reset the circuit breaker",
+        prompt=(
+            "Reset the circuit breaker? Its failure count goes to zero and dispatch resumes "
+            "at the next tick unless a hold stands."
+        ),
+    )
+
+
 # -- item verbs: ctl when live, the CLI's row-only twin when down ----------------
 
 
@@ -797,6 +811,7 @@ __all__ = [
     "prune_sandboxes",
     "remove_one_sandbox",
     "requeue",
+    "reset_breaker",
     "resume",
     "resume_repo",
     "resume_review",

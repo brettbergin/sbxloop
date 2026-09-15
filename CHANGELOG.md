@@ -101,6 +101,16 @@
   `[github.repos.openai]` override, and doctor's endpoint row names the
   path the model calls go to.
 
+- **An operator can reset the circuit breaker.** `reset-breaker` (from
+  chat, `sbxloop daemon ctl`, the concierge's control tool or the
+  console's palette) closes the consecutive-failure breaker and zeroes its
+  count at once, persisted, with a `breaker.reset` notice naming who did
+  it. Before this no verb reached the breaker: `resume --all` releases
+  holds only, and a restart reloads the breaker from the store, so an
+  operator who had fixed the cause still waited out
+  `breaker_cooldown_s`. The reply names any hold still standing, since a
+  reset breaker releases none.
+
 ### Fixed
 
 - **Switching `[vcs] kind` no longer stalls the daemon on the old forge's

@@ -215,6 +215,8 @@ class FakeLoop:
         self.granted: list[tuple[str, int, str | None]] = []
         self.repos: list[dict[str, Any]] = []
         self.resumed_repos: list[tuple[str, str | None]] = []
+        self.breaker_resets: list[str | None] = []
+        self.breaker_failures = 3
         # restart (#969): supervised unless a test says otherwise
         self.supervisor_kind: str | None = "systemd"
         self.restarts: list[dict[str, Any]] = []
@@ -300,6 +302,15 @@ class FakeLoop:
         if repo == "o/zzz":
             raise KeyError(f"unknown repository {repo!r}")
         return {"repo": repo, "state": "ok"}
+
+    def reset_breaker(self, by: str | None = None) -> dict[str, Any]:
+        self.breaker_resets.append(by)
+        failures, self.breaker_failures = self.breaker_failures, 0
+        return {
+            "was_open": bool(failures),
+            "consecutive_failures": failures,
+            "holds": sorted(self.holds),
+        }
 
     def grant_rounds(self, run_id: str, rounds: int, by: str | None = None) -> WorkItem:
         self.granted.append((run_id, rounds, by))

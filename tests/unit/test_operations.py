@@ -400,6 +400,21 @@ class TestReconciler:
             "item is failed"
         )
 
+    @pytest.mark.parametrize(("opened_at", "expected"), [(None, "succeeded"), (5.0, "failed")])
+    def test_a_claimed_breaker_reset_is_judged_from_the_breaker(
+        self, tmp_path: Path, opened_at: float | None, expected: str
+    ) -> None:
+        h = Harness(tmp_path)
+        h.dstore.set_breaker(opened_at, 3)
+        op, _ = h.loop.operations.accept(
+            spec(action="daemon.breaker_reset", target_kind="breaker", target_key="breaker"),
+            now=1.0,
+        )
+        h.loop.operations.claim(op.id, "g_dead", now=2.0)
+        h.loop.recover()
+        settled = h.loop.operations.get(op.id)
+        assert settled is not None and settled.state == expected
+
     def test_what_evidence_cannot_decide_is_reconciling_never_succeeded(
         self, tmp_path: Path
     ) -> None:

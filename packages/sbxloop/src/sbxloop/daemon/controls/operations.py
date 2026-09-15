@@ -59,6 +59,7 @@ EFFECTS: dict[str, str] = {
     "item.retry": "the item is re-queued with attempts reset",
     "item.requeue": "the item is unpinned and re-queued",
     "repo.resume": "the repository is polled again from the next tick",
+    "daemon.breaker_reset": "the breaker is closed and its failure count is zero",
     "schedule.add": "the schedule exists and fires from the next tick",
     "schedule.remove": "the schedule is gone",
     "schedule.pause": "the schedule's ticks are swallowed",
@@ -595,4 +596,9 @@ def _judge(
         if (op.action == "daemon.pause") == held:
             return "succeeded", None, None
         return "failed", "interrupted_before_effect", "the hold did not survive the restart"
+    if op.action == "daemon.breaker_reset":
+        opened_at, _ = loop.dstore.breaker()
+        if opened_at is None:
+            return "succeeded", None, None
+        return "failed", "interrupted_before_effect", "the breaker is still open"
     return "reconciling", None, "the effect could not be established from the record"
