@@ -38,7 +38,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
 
 from sbxloop.agentmodels import ModelSelection, model_for_phase, refreshed_models
@@ -523,7 +523,7 @@ class Concierge:
         except SbxloopError as exc:
             retry = False
             if isinstance(exc, ProviderHeldError):
-                return self._error_reply(exc, started)
+                return self._held_reply(exc, started)
             if session_id is not None and _looks_like_lost_session(exc):
                 # The sandbox forgot the session (rebuilt VM, expired
                 # store): start over rather than fail every message.
@@ -699,6 +699,43 @@ class Concierge:
                 raise WorkerTimeoutError(message)
             raise WorkerError(message)
         return result.session_id, (result.output_text or "").strip()
+
+    def _held_reply(self, exc: ProviderHeldError, started: float) -> ConciergeReply:
+        """A turn the provider hold refused, answered with the way out.
+
+        The concierge is itself an agent call, so while the backend is held
+        it cannot act on "reset the breaker and resume" or anything else,
+        and replying with the bare hold summary left the operator asking the
+        one participant that could not help. The operator commands need no
+        model: ``resume <backend>`` releases the hold and ``reset-breaker``
+        closes the breaker, from chat or from the daemon host. Name them,
+        with what the hold is waiting for.
+        """
+        hold = exc.hold
+        backend = self.config.agent.backend
+        prefix = self._chat.command_prefix
+        if hold.next_at is not None:
+            waiting = (
+                "it lifts by itself after "
+                f"{datetime.fromtimestamp(hold.next_at, UTC).strftime('%H:%M UTC')}, or"
+            )
+        else:
+            waiting = "it waits for an operator:"
+        error = (
+            f"the {backend} provider is held, so I cannot answer until it is released; "
+            f"{waiting} `{prefix} resume {backend}` releases it now "
+            f"(`sbxloop daemon ctl resume {backend}` on the daemon host), and "
+            f"`{prefix} reset-breaker` closes the circuit breaker if runs failed meanwhile. "
+            f"Held because: {_one_line(hold.failure.reason, 160)}"
+        )
+        log.warning(
+            "concierge.turn_held",
+            backend=backend,
+            category=hold.failure.category,
+            next_at=hold.next_at,
+            duration_s=round(time.monotonic() - started, 1),
+        )
+        return ConciergeReply("", ok=False, error=error)
 
     def _error_reply(self, exc: BaseException, started: float) -> ConciergeReply:
         if isinstance(exc, WorkerTimeoutError) or "timed out" in str(exc).lower():

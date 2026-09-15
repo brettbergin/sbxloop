@@ -125,6 +125,15 @@
   running release judges the next call. Timed holds (throttles, quotas
   with a reset) and other failures still wait or need `resume <backend>`.
 
+- **A held concierge says how to release the hold.** While the agent
+  backend is held, the concierge cannot call its model, so a message such
+  as "reset the breaker and resume" could never be acted on, and the reply
+  was the bare hold summary. It now names the operator commands, which need
+  no model: `resume <backend>` releases the hold and `reset-breaker` closes
+  the breaker, from chat with the command prefix or through
+  `sbxloop daemon ctl` on the daemon host. It also says whether the hold
+  lifts on its own and when, and why it was recorded.
+
 - **A usage window is bounded at both ends.** `GET /v1/usage` folded each
   run it touched from `since` onward with no upper bound, so a run that
   kept spending after `until` lent those turns to the window. The fold now
