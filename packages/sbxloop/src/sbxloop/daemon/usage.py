@@ -67,11 +67,16 @@ def usage_from_event(data: dict[str, Any]) -> Usage:
     return Usage(**{k: data[k] for k in _USAGE_FIELDS if k in data})
 
 
-def usage_for_run(store: StateStore, run_id: str, *, since: float = 0.0) -> RunUsage:
+def usage_for_run(
+    store: StateStore, run_id: str, *, since: float = 0.0, until: float | None = None
+) -> RunUsage:
     """Fold a run's ``agent.usage`` events into a total and a per-persona
     breakdown. ``since`` drops samples older than an epoch stamp, which is
     how ``usage_today`` attributes tokens to the day they were spent
-    rather than to the day the run started."""
+    rather than to the day the run started; ``until`` drops samples at or
+    after one, so a bounded window counts only what a run spent inside it
+    and a run that straddles the window's end does not lend it later
+    turns."""
     total = Usage()
     by_agent: dict[str, Usage] = {}
     models: list[str] = []
@@ -84,7 +89,7 @@ def usage_for_run(store: StateStore, run_id: str, *, since: float = 0.0) -> RunU
     turns: dict[str, int] = {}
     jobs: dict[str, set[str]] = {}
     for _seq, event in store.events(run_id, type_prefix=EventTypes.AGENT_USAGE):
-        if event.ts < since:
+        if event.ts < since or (until is not None and event.ts >= until):
             continue
         sample = usage_from_event(event.data)
         phase = event.data.get("agent_phase")
