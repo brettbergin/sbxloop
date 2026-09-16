@@ -134,6 +134,16 @@
   daemon's and the concierge's provisioning hints name `sbx login` and a
   restart as the remedy.
 
+- **One failure, one GlitchTip report.** A provisioning failure was
+  reported twice: once by the daemon's `provision_failed` event and again
+  by the poll that logged the `DaemonError` wrapping it, and because the
+  second report grouped by its full cause chain, one code path opened a
+  GlitchTip issue per underlying sbx failure. The telemetry processor now
+  remembers the exceptions it has sent, causes included, and skips a
+  record whose exception it already reported. The two `provision_failed`
+  events carry their traceback, so the report that remains groups by where
+  it failed and still carries the operator hint.
+
 - **An upgrade no longer leaves a refused-request provider hold blocking
   every call.** A request the endpoint refused (HTTP 400 or 422, such as
   the `openai` backend sending function tools with reasoning to

@@ -340,12 +340,16 @@ class DaemonGithub:
                     "backend, its image and the host's disk are what to check — "
                     "`sbxloop doctor`"
                 )
+            # With its traceback: the report groups by where it failed, and
+            # the poll that logs the DaemonError wrapping this one is then
+            # the same failure seen twice, not a second report (#1168).
             log.error(
                 "github_sandbox.provision_failed",
                 sandbox=self.name,
                 duration_s=round(time.monotonic() - started, 1),
                 error=str(exc),
                 hint=hint,
+                exc_info=True,
             )
             raise DaemonError(f"cannot provision the daemon {forge} sandbox: {exc}") from exc
         self._sandbox, self._client = sandbox, clients[0]
