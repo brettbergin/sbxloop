@@ -9,6 +9,7 @@ rate-limited drop on failure.
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 
@@ -125,6 +126,35 @@ class TestLifecycle:
         # Same handle on the next call, no second create.
         assert agent.client() is client
         assert created_names(fake_sbx) == [agent.name]
+
+    def test_a_missing_docker_session_names_sbx_login(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """A Docker session that expired fails every sbx call the same way;
+        the provisioning report names the remedy, not the image or the disk."""
+        agent = make_agent(fake_sbx, tmp_path, monkeypatch)
+        fake_sbx.fail_next(
+            "create",
+            stderr="ERROR: create sandbox: request failed: 401 Unauthorized: user is not "
+            "authenticated to Docker: secret not found\nno valid user session found, "
+            "please sign in to Docker to proceed",
+        )
+
+        with (
+            caplog.at_level(logging.ERROR, logger="sbxloop.daemon.agentbox"),
+            pytest.raises(DaemonError, match="not authenticated to Docker"),
+        ):
+            agent.client()
+
+        (failed,) = [
+            r for r in caplog.records if "concierge_sandbox.provision_failed" in r.getMessage()
+        ]
+        assert "`sbx login`" in failed.getMessage()
+        assert "disk" not in failed.getMessage()
 
     def test_close_keeps_the_sandbox_and_a_new_process_reuses_it(
         self, fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

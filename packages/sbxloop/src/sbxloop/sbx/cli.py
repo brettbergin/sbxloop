@@ -12,7 +12,7 @@ import subprocess
 import time
 from collections.abc import Sequence
 
-from sbxloop.errors import SbxError, SbxNotFoundError
+from sbxloop.errors import SbxAuthError, SbxError, SbxNotFoundError
 from sbxloop.log import get_logger
 from sbxloop.sbx.models import ExecResult, SandboxInfo, SandboxSpec
 from sbxloop.sbx.parse import parse_ls, parse_version
@@ -34,6 +34,15 @@ RM_SETTLE_TIMEOUT_S = 30.0
 RM_SETTLE_POLL_S = 0.5
 
 _NOT_FOUND_MARKERS = ("not found", "no such sandbox", "does not exist", "unknown sandbox")
+
+# What sbx says when nobody is signed in to Docker on the host (a session
+# that expired, a host that never logged in): every command fails the same
+# way. The field shape ends in "secret not found", so this is classified
+# before the not-found markers or it reads as a missing sandbox (#1167).
+# Specific on purpose: an inner command's own "401 Unauthorized" from some
+# API must never read as the host's Docker session (see #63).
+_AUTH_MARKERS = ("not authenticated to docker", "sign in to docker", "no valid user session")
+_EXEC_AUTH_MARKERS = ("not authenticated to docker", "sign in to docker")
 
 # Stderr shapes meaning sbx itself failed to run the command (daemon
 # unreachable, transport dropped, VM stopped) rather than the command failing
@@ -91,6 +100,8 @@ def _exec_failed_at_sbx_level(stderr: str) -> bool:
     """
     lowered = stderr.lower()
     if any(marker in lowered for marker in _INFRA_MARKERS):
+        return True
+    if any(marker in lowered for marker in _EXEC_AUTH_MARKERS):
         return True
     if any(marker in lowered for marker in ("no such sandbox", "unknown sandbox")):
         return True
@@ -253,7 +264,13 @@ class SbxCLI:
     def _error_for(self, result: ExecResult) -> SbxError:
         message = f"sbx command failed: {' '.join(result.argv[1:3])}"
         lowered = result.stderr.lower()
-        cls = SbxNotFoundError if any(m in lowered for m in _NOT_FOUND_MARKERS) else SbxError
+        cls: type[SbxError]
+        if any(m in lowered for m in _AUTH_MARKERS):
+            cls = SbxAuthError
+        elif any(m in lowered for m in _NOT_FOUND_MARKERS):
+            cls = SbxNotFoundError
+        else:
+            cls = SbxError
         return cls(
             message,
             argv=result.argv,

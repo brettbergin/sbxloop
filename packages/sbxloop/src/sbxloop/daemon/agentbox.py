@@ -32,7 +32,14 @@ from typing import TypeVar
 
 from sbxloop.config import Config
 from sbxloop.engine.store import StateStore
-from sbxloop.errors import DaemonError, SbxError, SbxloopError, WorkerError, WorkerTimeoutError
+from sbxloop.errors import (
+    DaemonError,
+    SbxError,
+    SbxloopError,
+    WorkerError,
+    WorkerTimeoutError,
+    caused_by_sbx_auth,
+)
 from sbxloop.events import EventBus
 from sbxloop.ids import new_job_id
 from sbxloop.log import get_logger
@@ -374,14 +381,27 @@ class DaemonAgent:
                 self.name, self.workspace, post_create=install, run_id=CONCIERGE_RUN_ID
             )
         except SbxloopError as exc:
+            if caused_by_sbx_auth(exc):
+                hint = (
+                    "the sandbox backend refused every call because nobody is signed in "
+                    "to Docker on the host (a session that expired, or a host that never "
+                    "ran `sbx login`), so chat intake is off until someone signs in; "
+                    "`sbx login` as the daemon's user through the home's sbx wrapper, then "
+                    "restart the daemon — `sbxloop doctor` checks it"
+                )
+            else:
+                hint = (
+                    "the long-lived sandbox the concierge answers chat from could not "
+                    "be created, so chat intake is off until it can be; the sandbox "
+                    "backend, its image and the host's disk are what to check — "
+                    "`sbxloop doctor`"
+                )
             log.error(
                 "concierge_sandbox.provision_failed",
                 sandbox=self.name,
                 duration_s=round(time.monotonic() - started, 1),
                 error=str(exc),
-                hint="the long-lived sandbox the concierge answers chat from could not "
-                "be created, so chat intake is off until it can be; the sandbox backend, "
-                "its image and the host's disk are what to check — `sbxloop doctor`",
+                hint=hint,
             )
             raise DaemonError(f"cannot provision the concierge sandbox: {exc}") from exc
         self._sandbox = sandbox
