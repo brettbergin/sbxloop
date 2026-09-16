@@ -193,6 +193,36 @@ class TestTheDaemonsBox:
         assert "GitLab calls" in failed.getMessage()
         assert "GitHub" not in failed.getMessage()
 
+    def test_a_missing_docker_session_names_sbx_login(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """Field failure: a Docker session that expired made every sbx call
+        fail with 401 for two hours, and each report told the operator to
+        check the image and the disk."""
+        box = self._switched_box(fake_sbx, tmp_path, monkeypatch, "gitlab")
+        fake_sbx.fail_next(
+            "ls",
+            stderr="ERROR: list sandboxes: request failed: 401 Unauthorized: user is not "
+            "authenticated to Docker: secret not found\nno valid user session found, "
+            "please sign in to Docker to proceed",
+        )
+
+        with (
+            caplog.at_level(logging.ERROR, logger="sbxloop.daemon.github"),
+            pytest.raises(DaemonError, match="not authenticated to Docker"),
+        ):
+            box.ops()
+
+        (failed,) = [
+            r for r in caplog.records if "github_sandbox.provision_failed" in r.getMessage()
+        ]
+        assert "`sbx login`" in failed.getMessage()
+        assert "disk" not in failed.getMessage()
+
     def test_a_repository_on_its_own_forge(self, fake_sbx: FakeSbx, tmp_path: str) -> None:
         config = Config.model_validate(
             {
