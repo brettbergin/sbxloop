@@ -12,7 +12,7 @@ import pytest
 
 from sbxloop.config import Config
 from sbxloop.daemon.github import DaemonGithub, sandbox_name_for
-from sbxloop.errors import GithubOpsError
+from sbxloop.errors import DaemonError, GithubOpsError
 from sbxloop.events import EventBus
 from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.models import SandboxSpec
@@ -167,6 +167,31 @@ class TestTheDaemonsBox:
         box.close()
         box.ops()
         assert len([c for c in fake_sbx.invocations("rm") if old in c]) == 1
+
+    def test_a_provisioning_failure_names_the_configured_forge(
+        self,
+        fake_sbx: FakeSbx,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        """The report an operator reads under GitLab said "GitHub": the
+        DaemonError and the provision_failed hint name the forge the box
+        actually serves."""
+        box = self._switched_box(fake_sbx, tmp_path, monkeypatch, "gitlab")
+        fake_sbx.fail_next("create", stderr="ERROR: failed to run sandbox container")
+
+        with (
+            caplog.at_level(logging.ERROR, logger="sbxloop.daemon.github"),
+            pytest.raises(DaemonError, match="cannot provision the daemon GitLab sandbox"),
+        ):
+            box.ops()
+
+        (failed,) = [
+            r for r in caplog.records if "github_sandbox.provision_failed" in r.getMessage()
+        ]
+        assert "GitLab calls" in failed.getMessage()
+        assert "GitHub" not in failed.getMessage()
 
     def test_a_repository_on_its_own_forge(self, fake_sbx: FakeSbx, tmp_path: str) -> None:
         config = Config.model_validate(
