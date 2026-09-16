@@ -55,12 +55,13 @@ class TestClassification:
             [
                 info("sbxloop-daemon-github-0badf00d"),
                 info("sbxloop-daemon-gitlab-0badf00d"),
+                info("sbxloop-daemon-gitlab-0badf00d-g2"),  # a later generation of the box
                 info("sbxloop-concierge-0badf00d"),
             ],
             store,
             min_age_s=0.0,
         )
-        assert [v.orphan for v in verdicts] == [False, False, False]
+        assert [v.orphan for v in verdicts] == [False, False, False, False]
         assert all("daemon-owned" in v.reason for v in verdicts)
 
     def test_forge_suffix_is_the_internal_vcs_role(self, store: StateStore) -> None:

@@ -127,14 +127,15 @@ class TestTheDaemonsBox:
         (prune leaves daemon-owned boxes alone)."""
         box = self._switched_box(fake_sbx, tmp_path, monkeypatch, configured)
         old = sandbox_name_for(box.config.paths, previous)  # type: ignore[arg-type]
-        for name in (old, "sbxloop-daemon-gitlab-0badf00d"):  # the second: another home's
+        # A later generation of the old box goes too; another home's box stays.
+        for name in (old, f"{old}-g2", "sbxloop-daemon-gitlab-0badf00d"):
             box.sbx.create(SandboxSpec(name=name, role="github", workspace=tmp_path))
 
         box.ops()
 
         listed = {info.name for info in box.sbx.ls()}
         assert box.name in listed
-        assert old not in listed
+        assert old not in listed and f"{old}-g2" not in listed
         assert "sbxloop-daemon-gitlab-0badf00d" in listed
 
     def test_a_wedged_previous_forge_box_does_not_keep_the_new_forge_down(
@@ -179,7 +180,9 @@ class TestTheDaemonsBox:
         DaemonError and the provision_failed hint name the forge the box
         actually serves."""
         box = self._switched_box(fake_sbx, tmp_path, monkeypatch, "gitlab")
-        fake_sbx.fail_next("create", stderr="ERROR: failed to run sandbox container")
+        # Every create, not just the first: a refused create is retried once
+        # under the next generation of the name (#1165).
+        fake_sbx.script("create", returncode=1, stderr="ERROR: failed to run sandbox container")
 
         with (
             caplog.at_level(logging.ERROR, logger="sbxloop.daemon.github"),

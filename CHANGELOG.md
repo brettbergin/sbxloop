@@ -144,6 +144,18 @@
   events carry their traceback, so the report that remains groups by where
   it failed and still carries the operator hint.
 
+- **A wedged daemon box no longer keeps its forge from being polled.** When
+  the daemon's forge sandbox hung mid-job, every later poll ran `sbx rm`
+  against it, waited out the 120s timeout and failed the provision, so
+  polling stayed down until someone restarted sandboxd: three episodes in
+  four days, 7 to 31 hours each. A box the backend cannot remove, or a
+  name it refuses to re-create (a volume a crashed backend left behind),
+  is now reported once as `github_sandbox.wedged` with the
+  restart-sandboxd hint and left to the backend, and the daemon carries on
+  under the next generation of its name (`-g1`, `-g2`, ...).
+  `sandbox prune` and the concierge's sandbox tools treat every generation
+  as daemon-owned.
+
 - **An upgrade no longer leaves a refused-request provider hold blocking
   every call.** A request the endpoint refused (HTTP 400 or 422, such as
   the `openai` backend sending function tools with reasoning to
