@@ -234,6 +234,51 @@ class TestErrors:
         assert result.returncode == 3
 
 
+class TestCreateFailureMessages:
+    """A failed `sbx create` is told in sbx's own words. The capacity wording
+    is for the one shape where the resource flags are the story; the field
+    failure that wore it was the backend refusing a name whose volume an
+    earlier teardown had left behind."""
+
+    def test_the_backends_own_error_leads(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        fake_sbx.fail_next(
+            "create", stderr="WARN: mcp gateway teardown\nERROR: failed to run sandbox container"
+        )
+        with pytest.raises(SbxError) as excinfo:
+            cli.create(spec("boxa", tmp_path))
+        text = str(excinfo.value)
+        assert text.startswith("cannot create boxa: ERROR: failed to run sandbox container")
+        assert "check host capacity" not in text
+
+    def test_a_name_the_backend_still_holds_names_the_cleanup(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        fake_sbx.fail_next("create", stderr='ERROR: volume "boxa-docker" already exists')
+        with pytest.raises(SbxError) as excinfo:
+            cli.create(spec("boxa", tmp_path))
+        assert "still holds state under that name" in str(excinfo.value)
+        assert "`sbx rm --force boxa`" in str(excinfo.value)
+
+    def test_rejected_resource_flags_keep_the_capacity_wording(
+        self, cli: SbxCLI, fake_sbx: FakeSbx, tmp_path: Path
+    ) -> None:
+        fake_sbx.fail_next("create", stderr="Error: unknown flag: --memory")
+        with pytest.raises(SbxError, match="will not retry without resource limits"):
+            cli.create(spec("boxa", tmp_path))
+
+    def test_a_timeout_has_no_stderr_and_says_so(
+        self, cli: SbxCLI, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def never_returns(argv: list[str], **kwargs: object) -> object:
+            raise subprocess.TimeoutExpired(argv, 600.0)
+
+        monkeypatch.setattr("sbxloop.sbx.cli.subprocess.run", never_returns)
+        with pytest.raises(SbxError, match="cannot create boxa: sbx invocation timed out after"):
+            cli.create(spec("boxa", tmp_path))
+
+
 class TestPolicy:
     def test_policy_allow_global_and_scoped(self, cli: SbxCLI, fake_sbx: FakeSbx) -> None:
         cli.policy_allow("api.githubcopilot.com")

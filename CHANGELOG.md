@@ -113,6 +113,18 @@
 
 ### Fixed
 
+- **A failed `sbx create` says what sbx said.** Every create failure was
+  rewrapped as "check host capacity and that `sbx create --help` supports
+  --cpus and --memory", whatever the cause. On a host with memory to spare
+  the cause was the backend refusing a name whose volume an earlier
+  teardown had left behind, and the report sent its reader to the wrong
+  place. The message now leads with sbx's own error line, keeps the
+  resource-limit wording for the one shape where sbx rejected the flags,
+  and names `sbx rm --force <name>` when the backend still holds state
+  under the name. The daemon's provisioning error and hint name the
+  configured forge, so a GitLab box no longer reports as "the daemon
+  github sandbox".
+
 - **An upgrade no longer leaves a refused-request provider hold blocking
   every call.** A request the endpoint refused (HTTP 400 or 422, such as
   the `openai` backend sending function tools with reasoning to

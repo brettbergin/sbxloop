@@ -47,6 +47,8 @@ DAEMON_SANDBOX_PREFIX = "sbxloop-daemon"
 SANDBOX_NAME_PREFIX = f"{DAEMON_SANDBOX_PREFIX}-github"
 # Ops issued from the daemon (not from a run) carry this run id in events.
 DAEMON_RUN_ID = "daemon"
+# The kind is a config value; prose written for a person names the product.
+_FORGE_NAMES: dict[str, str] = {"github": "GitHub", "gitlab": "GitLab", "gitea": "Gitea"}
 # A dead github sandbox costs one re-provision; a GitHub outage must not
 # cost one per failing call (each is a full microVM boot + worker install),
 # so between re-provisions failures propagate to the caller, whose own
@@ -318,17 +320,20 @@ class DaemonGithub:
             )
         except SbxloopError as exc:
             # ProvisionError, WorkerError, SbxError alike: one daemon-level
-            # error, and nothing left behind.
+            # error, and nothing left behind. The prose names the configured
+            # forge: under GitLab this box is sbxloop-daemon-gitlab-..., and
+            # a report that said "GitHub" sent its reader to the wrong place.
+            forge = _FORGE_NAMES.get(self.kind, self.kind)
             log.error(
                 "github_sandbox.provision_failed",
                 sandbox=self.name,
                 duration_s=round(time.monotonic() - started, 1),
                 error=str(exc),
-                hint="the long-lived sandbox the daemon makes its GitHub calls from "
+                hint=f"the long-lived sandbox the daemon makes its {forge} calls from "
                 "could not be created, so polling and delivery cannot run; the sandbox "
                 "backend, its image and the host's disk are what to check — `sbxloop doctor`",
             )
-            raise DaemonError(f"cannot provision the daemon github sandbox: {exc}") from exc
+            raise DaemonError(f"cannot provision the daemon {forge} sandbox: {exc}") from exc
         self._sandbox, self._client = sandbox, clients[0]
         log.info(
             "github_sandbox.ready",
