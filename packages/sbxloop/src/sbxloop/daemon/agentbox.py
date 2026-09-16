@@ -402,6 +402,7 @@ class DaemonAgent:
                 duration_s=round(time.monotonic() - started, 1),
                 error=str(exc),
                 hint=hint,
+                exc_info=True,
             )
             raise DaemonError(f"cannot provision the concierge sandbox: {exc}") from exc
         self._sandbox = sandbox

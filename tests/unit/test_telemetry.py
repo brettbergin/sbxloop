@@ -221,6 +221,49 @@ def test_an_exception_keeps_its_own_title_and_location(reports) -> None:
     assert event["extra"] == {"attempt": 2}
 
 
+def test_a_failure_is_reported_once_across_the_layers_that_wrap_it(reports) -> None:
+    """The daemon logs a provisioning failure with its traceback, then the
+    poll that called it logs the DaemonError wrapping it. GlitchTip used to
+    get both, as separate issues grouped by different cause chains."""
+
+    def emit(log) -> None:
+        try:
+            try:
+                raise RuntimeError("sbx rm timed out")
+            except RuntimeError as inner:
+                log.error(
+                    "github_sandbox.provision_failed",
+                    exc_info=True,
+                    hint="the box could not be created",
+                )
+                raise ValueError("cannot provision the daemon sandbox") from inner
+        except ValueError:
+            log.warning("source.poll_failed", exc_info=True, failures=1)
+        try:
+            raise RuntimeError("sbx rm timed out")  # the same words, a new failure
+        except RuntimeError:
+            log.warning("github_sandbox.remove_failed", exc_info=True)
+
+    events = reports("diagnostic", emit)
+    assert [e["message"]["message"] for e in events] == [
+        "github_sandbox.provision_failed",
+        "github_sandbox.remove_failed",
+    ]
+    assert events[0]["message"]["formatted"].startswith(
+        "github_sandbox.provision_failed: the box could not be created"
+    )
+    assert events[0]["exception"]["values"][-1]["type"] == "RuntimeError"
+
+
+def test_the_cli_reports_an_unhandled_error_once(reports) -> None:
+    def emit(log) -> None:
+        error = RuntimeError("failure")
+        telemetry.capture_exception(error)
+        telemetry.capture_exception(error)
+
+    assert len(reports("diagnostic", emit)) == 1
+
+
 def test_cli_reports_and_flushes_an_unhandled_error(monkeypatch: pytest.MonkeyPatch) -> None:
     import importlib
 
