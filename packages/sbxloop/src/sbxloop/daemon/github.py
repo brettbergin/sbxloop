@@ -26,6 +26,7 @@ from sbxloop.errors import (
     SbxloopError,
     SbxNotFoundError,
     WorkerError,
+    caused_by_sbx_auth,
 )
 from sbxloop.events import EventBus
 from sbxloop.log import get_logger
@@ -324,14 +325,27 @@ class DaemonGithub:
             # forge: under GitLab this box is sbxloop-daemon-gitlab-..., and
             # a report that said "GitHub" sent its reader to the wrong place.
             forge = _FORGE_NAMES.get(self.kind, self.kind)
+            if caused_by_sbx_auth(exc):
+                hint = (
+                    "the sandbox backend refused every call because nobody is signed in "
+                    "to Docker on the host (a session that expired, or a host that never "
+                    "ran `sbx login`), so polling and delivery cannot run; `sbx login` as "
+                    "the daemon's user through the home's sbx wrapper, then restart the "
+                    "daemon — `sbxloop doctor` checks it"
+                )
+            else:
+                hint = (
+                    f"the long-lived sandbox the daemon makes its {forge} calls from "
+                    "could not be created, so polling and delivery cannot run; the sandbox "
+                    "backend, its image and the host's disk are what to check — "
+                    "`sbxloop doctor`"
+                )
             log.error(
                 "github_sandbox.provision_failed",
                 sandbox=self.name,
                 duration_s=round(time.monotonic() - started, 1),
                 error=str(exc),
-                hint=f"the long-lived sandbox the daemon makes its {forge} calls from "
-                "could not be created, so polling and delivery cannot run; the sandbox "
-                "backend, its image and the host's disk are what to check — `sbxloop doctor`",
+                hint=hint,
             )
             raise DaemonError(f"cannot provision the daemon {forge} sandbox: {exc}") from exc
         self._sandbox, self._client = sandbox, clients[0]

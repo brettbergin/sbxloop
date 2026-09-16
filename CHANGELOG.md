@@ -125,6 +125,15 @@
   configured forge, so a GitLab box no longer reports as "the daemon
   github sandbox".
 
+- **A missing Docker session is reported as one.** When nobody was signed
+  in to Docker on the host (a session that expired), every sbx call failed
+  with "401 Unauthorized: user is not authenticated to Docker: secret not
+  found", the wrapper read the trailing "not found" as a missing sandbox,
+  and the provisioning report told the operator to check the image and the
+  disk. sbx failures of that shape now raise `SbxAuthError`, and the
+  daemon's and the concierge's provisioning hints name `sbx login` and a
+  restart as the remedy.
+
 - **An upgrade no longer leaves a refused-request provider hold blocking
   every call.** A request the endpoint refused (HTTP 400 or 422, such as
   the `openai` backend sending function tools with reasoning to
