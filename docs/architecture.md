@@ -760,13 +760,19 @@ named per state dir (`sbxloop-daemon-<forge>-<digest>`,
 - the **github-ops box** (`daemon/github.py`) — polling and issue lifecycle
   with `GH_TOKEN`, provisioned lazily, dropped and re-provisioned on
   failure at most once per five minutes, removed before provisioning and
-  at daemon stop. Each provision checks inventory and removes only this
-  instance's stale box. Inventory or removal failures stop that attempt;
-  polling backoff retries cleanup after authentication or the sandbox
-  service recovers, while daemon control stays available. The same home's
-  box under any other forge (left by a `[vcs] kind` switch in either
-  direction) is removed once per daemon process, after the new box is
-  ready and best effort: a wedged old box is logged
+  at daemon stop. Each provision checks inventory and removes this
+  instance's stale boxes. A box the backend cannot remove (a hung microVM
+  whose `sbx rm` times out), or a name it refuses to re-create (a volume
+  a crashed backend left behind), is reported once
+  (`github_sandbox.wedged`, with the restart-sandboxd hint) and left to
+  the backend, and the daemon carries on under the next generation of the
+  name (`<name>-g1`, `-g2`, ...). An inventory that cannot be read or a
+  sign-in failure still stops that attempt; polling backoff retries after
+  authentication or the sandbox service recovers, while daemon control
+  stays available. The same home's box under any other forge (left by a
+  `[vcs] kind` switch in either direction), generations included, is
+  removed once per daemon process, after the new box is ready and best
+  effort: a wedged old box is logged
   (`github_sandbox.previous_forge_remove_failed`) and never keeps the
   configured forge from being polled;
 - the **concierge box** (`daemon/agentbox.py`) — the control channel's
