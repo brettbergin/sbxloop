@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
@@ -46,7 +47,12 @@ from sbxloop.db.collaboration_models import (
     WorkspaceMemberRow,
 )
 from sbxloop.ids import _token
+from sbxloop.log import get_logger
 
+log = get_logger(__name__)
+
+#: Characters a provider-suggested username may not keep.
+_USERNAME_UNSAFE = re.compile(r"[^A-Za-z0-9._-]+")
 MAX_HANDOFFS_PER_TURN = 6
 MAX_HANDOFFS_PER_RESPONSE = 2
 # Four hops admit a bounded review return path such as coordinator -> author
@@ -529,6 +535,252 @@ class CollaborationStore:
             raise CollaborationError(
                 "profile_conflict", "username or email is already in use"
             ) from exc
+
+    # -- provider sign-in ----------------------------------------------------------
+
+    @staticmethod
+    def _free_username(session: Any, hint: str) -> str:
+        base = _USERNAME_UNSAFE.sub("-", hint.strip()).strip("-.")[:64] or "user"
+        taken = set(
+            session.scalars(
+                select(LocalUserRow.username).where(
+                    LocalUserRow.username.startswith(base, autoescape=True)
+                )
+            ).all()
+        )
+        if base not in taken:
+            return base
+        suffix = 2
+        while f"{base}{suffix}" in taken:
+            suffix += 1
+        return f"{base}{suffix}"
+
+    def sign_in_external(
+        self,
+        *,
+        issuer: str,
+        subject: str,
+        username: str | None,
+        email: str | None,
+        email_verified: bool,
+        full_name: str | None,
+        role_from_groups: Role | None,
+        default_role: Role,
+        auto_provision: bool,
+        link_verified_email: bool = False,
+        now: float,
+    ) -> LocalUser:
+        """The local account behind a provider identity, created or linked
+        on first sign-in.
+
+        An account already bound to ``(issuer, subject)`` is used as is,
+        with its email and name refreshed. Otherwise, with
+        ``link_verified_email``, an unlinked local account whose email
+        matches is linked, but only when the provider has verified the
+        email. Failing both, a new account is provisioned when
+        ``auto_provision`` allows: the installation's first user owns the
+        workspace, anyone else takes ``role_from_groups`` or
+        ``default_role``. An email another account already holds is not
+        given to the new account, which gets an undeliverable one instead.
+        For an existing member, ``role_from_groups`` (when not ``None``)
+        replaces the role, except that the last owner is never demoted. An
+        inactive user, or one no longer in the workspace, is refused.
+        """
+        email = email.strip().casefold() if email and email.strip() else None
+        try:
+            return self._sign_in_external(
+                issuer=issuer,
+                subject=subject,
+                username=username,
+                email=email,
+                email_verified=email_verified,
+                full_name=full_name,
+                role_from_groups=role_from_groups,
+                default_role=default_role,
+                auto_provision=auto_provision,
+                link_verified_email=link_verified_email,
+                now=now,
+            )
+        except IntegrityError as exc:
+            # A concurrent first sign-in of the same person, or a username
+            # taken between the check and the insert; the retry finds it.
+            raise CollaborationError(
+                "oidc_account_conflict", "the account changed during sign-in; try again"
+            ) from exc
+
+    def _sign_in_external(
+        self,
+        *,
+        issuer: str,
+        subject: str,
+        username: str | None,
+        email: str | None,
+        email_verified: bool,
+        full_name: str | None,
+        role_from_groups: Role | None,
+        default_role: Role,
+        auto_provision: bool,
+        link_verified_email: bool = False,
+        now: float,
+    ) -> LocalUser:
+        with self.dstore.transaction() as session:
+            row: LocalUserRow | None = session.scalars(
+                select(LocalUserRow).where(
+                    LocalUserRow.oidc_issuer == issuer, LocalUserRow.oidc_subject == subject
+                )
+            ).first()
+            created = False
+            new_email = email
+            if row is None and email is not None:
+                holder: LocalUserRow | None = session.scalars(
+                    select(LocalUserRow).where(LocalUserRow.email == email)
+                ).first()
+                if (
+                    holder is not None
+                    and link_verified_email
+                    and email_verified
+                    and holder.oidc_subject is None
+                ):
+                    # The password keeps working, so the account stays
+                    # ``local``; the provider identity is recorded beside it.
+                    holder.oidc_issuer = issuer
+                    holder.oidc_subject = subject
+                    holder.updated_at = now
+                    row = holder
+                    _event(session, "auth.oidc.linked", now, data={"user_id": holder.id})
+                elif holder is not None:
+                    # Not linkable: the person gets an account of their own,
+                    # and the address stays with the account that holds it.
+                    new_email = None
+            if row is None:
+                if not auto_provision:
+                    raise CollaborationError(
+                        "oidc_not_provisioned", "no account exists for this sign-in"
+                    )
+                row = self._provision(
+                    session,
+                    issuer=issuer,
+                    subject=subject,
+                    username=username or (email.split("@", 1)[0] if email else None) or "user",
+                    email=new_email,
+                    full_name=full_name,
+                    role=role_from_groups or default_role,
+                    now=now,
+                )
+                created = True
+            member = self._member_row(session, str(row.id))
+            if not row.active or member is None:
+                raise CollaborationError("oidc_account_disabled", "this account is disabled")
+            if not created:
+                self._refresh_identity(session, row, email, full_name, now)
+                if role_from_groups is not None and role_from_groups != member.role:
+                    if member.role == "owner" and self._owner_count(session) <= 1:
+                        log.info("auth.oidc_last_owner_kept", user_id=row.id)
+                    else:
+                        member.role = role_from_groups
+                        self._grant_role(session, row, role_from_groups)
+                        _event(
+                            session,
+                            "workspace.member.role_changed",
+                            now,
+                            data={"user_id": row.id, "role": role_from_groups},
+                        )
+            _event(session, "auth.oidc.login", now, data={"user_id": row.id})
+            session.flush()
+            return _user(row)
+
+    @staticmethod
+    def _refresh_identity(
+        session: Any, row: LocalUserRow, email: str | None, full_name: str | None, now: float
+    ) -> None:
+        changed = False
+        if email is not None and email != row.email:
+            clash = session.scalars(
+                select(LocalUserRow.id).where(
+                    LocalUserRow.email == email, LocalUserRow.id != row.id
+                )
+            ).first()
+            if clash is None:
+                row.email = email
+                changed = True
+            else:
+                log.info("auth.oidc_email_kept", user_id=row.id)
+        name = full_name.strip() if full_name else None
+        if name and name != row.full_name:
+            row.full_name = name
+            changed = True
+        if changed:
+            row.updated_at = now
+
+    def _provision(
+        self,
+        session: Any,
+        *,
+        issuer: str,
+        subject: str,
+        username: str,
+        email: str | None,
+        full_name: str | None,
+        role: Role,
+        now: float,
+    ) -> LocalUserRow:
+        if not session.scalar(select(func.count()).select_from(LocalUserRow)):
+            role = "owner"  # the installation's first user owns it
+        user_id = "usr_" + _token(12)
+        client_id = "local_" + _token(12)
+        name = self._free_username(session, username)
+        if email is None:
+            # The column is required and unique; a provider that shares no
+            # address gets one that can never receive mail.
+            digest = hashlib.sha256(f"{issuer}\n{subject}".encode()).hexdigest()[:24]
+            email = f"oidc-{digest}@users.invalid"
+        session.execute(
+            insert(ClientRow).values(
+                id=client_id,
+                name=name,
+                # Nobody knows this secret: the account signs in through its
+                # provider, never with client credentials.
+                secret_hash=hash_secret(_token(32)),
+                capabilities_json=_capabilities_json(ROLE_CAPABILITIES[role]),
+                created_at=now,
+                created_by="oidc-sign-in",
+            )
+        )
+        session.execute(
+            insert(LocalUserRow).values(
+                id=user_id,
+                client_id=client_id,
+                username=name,
+                email=email,
+                full_name=full_name.strip() if full_name else None,
+                timezone="UTC",
+                created_at=now,
+                updated_at=now,
+                auth_source="oidc",
+                oidc_issuer=issuer,
+                oidc_subject=subject,
+            )
+        )
+        session.add(
+            WorkspaceMemberRow(
+                workspace_id=WORKSPACE_ID,
+                user_id=user_id,
+                role=role,
+                created_at=now,
+                invited_by=None,
+            )
+        )
+        session.flush()
+        _event(
+            session,
+            "collaboration.user.created",
+            now,
+            actor={"kind": "client", "id": client_id, "display": name, "via": "api"},
+            data={"user_id": user_id},
+        )
+        row: LocalUserRow | None = session.get(LocalUserRow, user_id)
+        assert row is not None  # nosec B101 - inserted in this transaction
+        return row
 
     def user_by_username(self, username: str) -> LocalUser | None:
         with self.dstore.read() as session:

@@ -2167,6 +2167,100 @@ on the WebSocket too (`daemon.hold`, `daemon.release`, `daemon.stop`,
 design: configuration writes, repository registration, backup and restore,
 garbage collection and sandbox deletion stay on the host's own CLI.
 
+#### Sign in with an OIDC provider (Authentik)
+
+A browser client such as Angie can sign people in through an OpenID Connect
+provider instead of (or beside) a local username and password. The browser
+runs Authorization Code with PKCE against the provider and hands the code to
+`POST /v1/auth/oidc/token`; the daemon, as the confidential client, redeems
+it with its client secret, checks the ID token (signature against the
+provider's published keys, `iss`, `aud`, expiry with `leeway_s`, and the
+browser's `nonce`), and answers with the same token pair a local login
+returns. `GET /v1/auth/providers` (no token needed) tells a signed-out client
+what to offer: `{"local": true, "oidc": {id, label, authorize_url, client_id, scopes, end_session_url}}`, with `oidc` null when the section is off or the
+provider's discovery document cannot be read. `auth.oidc` appears in
+`GET /v1/capabilities` features only when the section is enabled.
+
+For Authentik, create an OAuth2/OpenID provider and an application with the
+slug `angie-oidc`, then configure:
+
+- **Client type:** Confidential. **Client ID:** `angie`.
+- **Redirect URI (strict):** `https://angie.example.com/auth/callback`.
+- **Signing key:** choose a certificate, so ID tokens are signed with RS256
+  or ES256. Without one, Authentik signs with HS256 and the client secret,
+  which the daemon refuses.
+- **Scopes:** `openid`, `email` and `profile`; Authentik's `profile` scope
+  carries the `groups` claim the role mapping reads.
+
+```toml
+[api]
+enabled = true
+cors_origins = ["https://angie.example.com"]
+
+[api.oidc]
+enabled = true
+issuer = "https://auth.example.com/application/o/angie-oidc/"
+client_id = "angie"
+redirect_uris = ["https://angie.example.com/auth/callback"]
+# owner_groups = ["sbxloop Owners"]   # optional: roles follow Authentik groups
+# admin_groups = ["sbxloop Admins"]
+# allowed_groups = ["sbxloop Users", "sbxloop Admins", "sbxloop Owners"]
+# link_verified_email = false          # see "Linking an existing local account"
+```
+
+Put the provider's client secret in the home's `config/secrets.env` (never in
+`sbxloop.toml`) and restart the daemon:
+
+```bash
+SBXLOOP_OIDC_CLIENT_SECRET=<the client secret Authentik shows>
+```
+
+`issuer` must match the discovery document's `issuer` exactly, trailing slash
+included; it and every redirect URI must be `https://` (plain `http://` is
+accepted for `localhost` only). A `redirect_uri` the client presents must be
+one of `redirect_uris` exactly, or the exchange is refused before the provider
+is called.
+
+**Who gets in, and as what.** The first person to sign in on an installation
+with no users owns the workspace. After that, a new person is created on first
+sign-in (`auto_provision`) with the role their groups give: `owner_groups`
+first, then `admin_groups`, else `default_role`. With `owner_groups` or
+`admin_groups` set, every sign-in re-derives an existing member's role from
+their groups, except that the workspace's last owner is never demoted; with
+neither set, roles are managed in sbxloop and sign-in leaves them alone.
+`allowed_groups`, when set, refuses anyone in none of them
+(`403 oidc_not_allowed`). A user who was deactivated or removed from the
+workspace is refused (`403 oidc_account_disabled`). Account creation and each
+sign-in are recorded as `collaboration.user.created` and `auth.oidc.login`
+events carrying only the user id.
+
+**Linking an existing local account.** By default a provider identity is
+never linked to an account that already exists: a person whose email matches
+a local account gets a new account of their own, with an undeliverable
+`oidc-...@users.invalid` address, since addresses are unique. With
+`link_verified_email = true`, a first sign-in is linked instead to the
+unlinked local account with the same address, but only when the ID token
+says `email_verified: true`; the account keeps `auth_source = "local"` and its
+password keeps working, and the link is recorded as `auth.oidc.linked`. An
+unverified email, or one whose account is already linked to another
+identity, still gets a new account. Linking trusts the provider's
+`email_verified` claim completely: whoever the provider admits with a
+verified address takes over the account holding it, including the
+workspace owner, and the link is permanent. Turn it on only when people
+cannot change their email at the provider (in Authentik, the user settings
+flow must not let them edit it) and the provider's email scope mapping
+asserts `email_verified` only for addresses it has checked (Authentik's
+stock mapping has sent `true` unconditionally). A safe way to link the
+owner's local account is to enable it, have the owner sign in once, then
+turn it off again.
+
+**When it fails.** A provider error or an ID token that does not check out is
+`401 oidc_exchange_failed` with a generic message (the daemon's log says
+which check failed); repeated failures from one address are rate-limited like
+the other sign-ins (`429 too_many_attempts`). An unreachable provider, key set
+or token endpoint, or a missing client secret, is `503 oidc_unavailable`; a
+failed discovery is retried at most every 30 seconds.
+
 ## Artifacts
 
 Every job in a run executes in the run's **workspace** — a host directory
@@ -3198,6 +3292,17 @@ The notable knobs:
 | `[api] cors_origins`                                                                               | `[]`                                                                                                             | Browser origins allowed to call the API. Empty disables CORS; `*` is refused.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
 | `[api] max_body_bytes` / `max_stream_clients`                                                      | `262144` / `32`                                                                                                  | Request bodies above the limit are refused (413); live streams beyond the count are refused (503).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
 | `[api] replay_retention_s` / `idempotency_retention_s` / `operation_deadline_s`                    | `604800` / `86400` / `300`                                                                                       | How long the public chronology is kept for replay (a client resuming from a pruned cursor is told, 410), how long an `Idempotency-Key` returns the same operation, and how long an accepted command may go unclaimed before it expires rather than applying stale intent.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `[api.oidc] enabled`                                                                               | `false`                                                                                                          | Sign-in through an OpenID Connect provider: `GET /v1/auth/providers` offers it and `POST /v1/auth/oidc/token` redeems the browser's authorization code (see [Sign in with an OIDC provider](#sign-in-with-an-oidc-provider-authentik)). Enabled, `issuer`, `client_id` and `redirect_uris` are required. Off, nothing changes.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `[api.oidc] id` / `label`                                                                          | `authentik` / `Authentik`                                                                                        | The provider id a client sends with the code, and the label its sign-in button shows.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
+| `[api.oidc] issuer`                                                                                | unset                                                                                                            | The provider's issuer, exactly as its discovery document states it (trailing slash included); `https://` only, plain `http://` for `localhost`. Discovery is read from `{issuer}/.well-known/openid-configuration`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `[api.oidc] client_id` / `client_secret_env`                                                       | `""` / `SBXLOOP_OIDC_CLIENT_SECRET`                                                                              | The confidential client's id, and the *name* of the environment variable (in `secrets.env`) holding its secret. The value never appears in config, events or logs; a missing secret answers `503 oidc_unavailable`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `[api.oidc] redirect_uris`                                                                         | `[]`                                                                                                             | The exact redirect URIs a client may present; anything else is refused (`400 oidc_invalid_request`) before the provider is called.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `[api.oidc] scopes` / `audience` / `algorithms`                                                    | `["openid", "email", "profile"]` / unset / `["RS256", "ES256"]`                                                  | The scopes a client requests (`openid` required), the ID token's expected `aud` (unset: `client_id`), and the signature algorithms accepted: asymmetric ones only, so `none` and HMAC are always refused.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
+| `[api.oidc] leeway_s` / `discovery_cache_s` / `jwks_cache_s` / `request_timeout_s`                 | `60` / `3600` / `3600` / `10`                                                                                    | Clock skew allowed on `exp`, `iat` and `nbf`; how long the discovery document and the signing keys are cached (an unknown key id refetches the keys); each call's timeout.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| `[api.oidc] username_claim` / `email_claim` / `name_claim` / `groups_claim`                        | `preferred_username` / `email` / `name` / `groups`                                                               | The ID token claims a new account's username (numbered on a clash), email and full name, and the group list, are read from.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `[api.oidc] owner_groups` / `admin_groups` / `allowed_groups` / `default_role`                     | `[]` / `[]` / `[]` / `member`                                                                                    | Provider groups that make a person an owner or admin (with either set, every sign-in re-derives the role, never demoting the last owner); groups outside which sign-in is refused (empty: anyone the provider admits); the role otherwise (`member` or `admin`). The installation's first user is always the owner.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `[api.oidc] auto_provision`                                                                        | `true`                                                                                                           | Create an account on a first sign-in. Off, only an account already linked (or, with `link_verified_email`, a local one with the same verified email) may sign in.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `[api.oidc] link_verified_email`                                                                   | `false`                                                                                                          | Link a first sign-in to the unlinked local account whose email matches, when the provider says the email is verified. Turn it on only if people cannot change their email at the provider and the provider asserts `email_verified` only for addresses it has checked; otherwise anyone the provider admits could take over the account with that address, the owner's included. Off, or unverified, the person gets a new account of their own.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 The `[sandbox]` resource settings size each VM through `sbx create` CPU and
 memory flags; see [Sandbox CPU and memory](#sandbox-cpu-and-memory).

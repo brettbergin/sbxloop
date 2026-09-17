@@ -9,6 +9,7 @@ from sbxloop.api.auth.deps import Authenticated, current, get_ctx
 from sbxloop.api.auth.ratelimit import FailureLimiter
 from sbxloop.api.context import PAGE_DEFAULT, PAGE_MAX, ApiContext
 from sbxloop.api.models import Capabilities, Limits, Me, Retention, rfc3339
+from sbxloop.config import Config
 from sbxloop.daemon.controls.principal import CAPABILITIES
 
 router = APIRouter(prefix="/v1", tags=["meta"])
@@ -58,6 +59,15 @@ FEATURES: tuple[str, ...] = (
 )
 
 
+def features(config: Config) -> list[str]:
+    """What this daemon serves as configured: the release's features plus
+    the ones an operator switches on."""
+    served = list(FEATURES)
+    if config.api.oidc.enabled:
+        served.append("auth.oidc")
+    return served
+
+
 @router.get("/capabilities", response_model=Capabilities)
 async def capabilities(
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
@@ -67,7 +77,7 @@ async def capabilities(
     limiter = FailureLimiter()
     return Capabilities(
         server_version=__version__,
-        features=list(FEATURES),
+        features=features(ctx.config),
         capabilities=list(CAPABILITIES),
         limits=Limits(
             page_default=PAGE_DEFAULT,

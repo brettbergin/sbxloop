@@ -933,6 +933,40 @@ service_memory = "2g"
 # idempotency_retention_s = 86400  # an Idempotency-Key answers the same for a day
 # operation_deadline_s = 300       # an unclaimed command expires after this
 
+# [api.oidc]
+# Sign-in through an OpenID Connect provider (Authentik, Keycloak, ...).
+# The browser client runs Authorization Code + PKCE and hands the code to
+# POST /v1/auth/oidc/token; the daemon redeems it as the confidential
+# client, checks the ID token and signs the person in, creating their
+# account on first sign-in. Local password sign-in keeps working. The
+# client secret goes in secrets.env under the name client_secret_env gives;
+# its value never appears here, in events or in logs.
+# enabled = false
+# id = "authentik"                 # the provider id clients send
+# label = "Authentik"              # the sign-in button's label
+# issuer = "https://auth.example.com/application/o/angie/"  # exact; https only
+# client_id = "angie"              # the confidential client registered there
+# client_secret_env = "SBXLOOP_OIDC_CLIENT_SECRET"  # the variable's NAME
+# redirect_uris = ["https://angie.example.com/auth/callback"]  # exact matches
+# scopes = ["openid", "email", "profile"]  # what the browser asks for
+# audience = ""                    # the ID token's aud; empty = client_id
+# algorithms = ["RS256", "ES256"]  # asymmetric signatures only
+# leeway_s = 60                    # clock skew allowed on exp/iat/nbf
+# discovery_cache_s = 3600         # provider metadata kept this long
+# jwks_cache_s = 3600              # signing keys kept this long
+# username_claim = "preferred_username"  # a new account's username
+# email_claim = "email"             # its email address
+# name_claim = "name"               # its full name
+# groups_claim = "groups"           # the provider groups roles are read from
+# owner_groups = []                # provider groups whose members are owners
+# admin_groups = []                # ... and admins; either set = role follows groups
+# allowed_groups = []              # only these groups may sign in; empty = anyone
+# default_role = "member"          # a new person's role: member or admin
+# auto_provision = true            # create an account on first sign-in
+# link_verified_email = false      # link a local account with the same verified
+#                                  # email; only if users cannot edit their email
+# request_timeout_s = 10           # each call to the provider
+
 # [concierge]
 # The control channel's agent: @mention the bot (or reply to it) to ask
 # about runs, PRs and diffs, operate the daemon (every !sbx verb) or queue

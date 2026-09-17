@@ -66,6 +66,50 @@ the same short-lived access and rotating refresh tokens as the existing client
 credential flow. Existing machine clients and all existing routes keep their
 original behavior.
 
+### Sign-in through an OpenID Connect provider
+
+With `[api.oidc] enabled = true` (feature `auth.oidc`), a browser client signs
+people in through the provider. `GET /v1/auth/providers` needs no token and
+answers:
+
+```json
+{"local": true,
+ "oidc": {"id": "authentik", "label": "Authentik",
+          "authorize_url": "https://auth.example.com/application/o/authorize/",
+          "client_id": "angie", "scopes": ["openid", "email", "profile"],
+          "end_session_url": "https://auth.example.com/application/o/angie/end-session/"}}
+```
+
+`oidc` is `null` when the section is off or the provider's discovery document
+cannot be read (a failed read is retried at most every 30 seconds). The client
+runs Authorization Code + PKCE against `authorize_url` with its own `state`,
+`nonce` and `code_challenge`, then posts the code, without a bearer token:
+
+```bash
+curl -s -X POST http://127.0.0.1:8420/v1/auth/oidc/token \
+  -H 'Content-Type: application/json' \
+  -d '{"provider":"authentik","code":"…","code_verifier":"…","redirect_uri":"https://angie.example.com/auth/callback","nonce":"…"}'
+```
+
+The daemon redeems the code at the provider's token endpoint as the
+confidential client (`client_secret_basic`, or `client_secret_post` when that
+is all the provider offers), validates the ID token (an asymmetric algorithm
+from `algorithms`, the provider's published key, `iss`, `aud`, `exp`/`iat`/`nbf`
+within `leeway_s`, `azp` when present, a `sub`, and a `nonce` equal to the
+request's), creates the account on a first sign-in, and answers with the same
+`TokenResponse` a local login returns; refresh and revoke work as for any
+other client. Refusals: `400 oidc_invalid_request` (unknown `provider`, or a
+`redirect_uri` that is not exactly one of `redirect_uris`; the provider is not
+called), `401 oidc_exchange_failed` (the provider refused the code, or the ID
+token did not check out; the message is generic), `403 oidc_not_allowed`
+(outside `allowed_groups`), `403 oidc_account_disabled` (inactive, or removed
+from the workspace), `403 oidc_not_provisioned` (unknown person with
+`auto_provision = false`), `409 oidc_account_conflict`
+(a concurrent first sign-in; retry), `429 too_many_attempts`, and
+`503 oidc_unavailable` (discovery, keys or token endpoint unreachable, or the
+client secret is not set). See the [user guide](user-guide.md#sign-in-with-an-oidc-provider-authentik)
+for the configuration and role mapping.
+
 | Resource    | Routes                                                         | Purpose                                                      |
 | ----------- | -------------------------------------------------------------- | ------------------------------------------------------------ |
 | Profile     | `GET/PATCH /v1/users/me`                                       | Local identity and timezone                                  |
@@ -449,6 +493,8 @@ rechecked when it arrives) and a `revision` a command may pin.
 | `GET`    | `/v1/openapi.json`                           | none                   | The contract of record                                                |
 | `POST`   | `/v1/auth/token`, `/v1/auth/revoke`          | none / any             | Mint and refresh; revoke the presented token                          |
 | `POST`   | `/v1/auth/local/register`, `/login`          | none                   | One local user's onboarding and login                                 |
+| `GET`    | `/v1/auth/providers`                         | none                   | The sign-ins a signed-out client may offer                            |
+| `POST`   | `/v1/auth/oidc/token`                        | none                   | Redeem an OpenID Connect authorization code for a token pair          |
 | `GET`    | `/v1/users/me`, `/v1/agents[/{slug}]`        | collaboration read     | Local profile and product agent catalog                               |
 | `GET`    | `/v1/users`                                  | workspace member       | The workspace directory                                               |
 | `PATCH`  | `/v1/workspace/members/{user_id}`            | workspace admin        | Change a role; deactivate or reactivate a user                        |
@@ -558,20 +604,20 @@ its reply frame.
 Every refusal is `application/problem+json` with a stable `code`, the
 request's `X-Request-Id`, and the fields a client needs to act:
 
-| Status | Codes                                                                                                                                                                                                                                                                                                               |
-| ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| 400    | `invalid_request`, `invalid_cursor`                                                                                                                                                                                                                                                                                 |
-| 401    | `unauthenticated`, `invalid_token`, `token_expired`, `token_revoked`, `client_revoked`, `refresh_reuse_detected`                                                                                                                                                                                                    |
-| 403    | `forbidden` (with `capability`)                                                                                                                                                                                                                                                                                     |
-| 404    | `not_found`, `unknown_target`, `agent_not_found`                                                                                                                                                                                                                                                                    |
-| 409    | `not_eligible`, `already_terminal`, `already_in_progress`, `stale_revision`, `unsupported_for_kind`, `capability_unknown`, `capability_unsupported`, `idempotency_conflict`, `hold_owned`, `unsupervised`, `agent_read_only`, `agent_revision_conflict` (with `current_revision`), `agent_exists`, `agent_archived` |
-| 410    | `cursor_expired` (with `snapshot`), `artifact_gone`                                                                                                                                                                                                                                                                 |
-| 411    | `length_required`                                                                                                                                                                                                                                                                                                   |
-| 413    | `body_too_large` (with `limit`)                                                                                                                                                                                                                                                                                     |
-| 422    | `invalid_request` (with `errors`), `invalid_argument`, `idempotency_key_required`, `unknown_action`, `invalid_agent` (with `problems`)                                                                                                                                                                              |
-| 429    | `too_many_attempts`, `too_many_streams`                                                                                                                                                                                                                                                                             |
-| 500    | `internal_error` (never the exception's text)                                                                                                                                                                                                                                                                       |
-| 503    | `daemon_not_ready` (with `Retry-After`), `daemon_stopping`, `source_unavailable`                                                                                                                                                                                                                                    |
+| Status | Codes                                                                                                                                                                                                                                                                                                                                        |
+| ------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| 400    | `invalid_request`, `invalid_cursor`, `oidc_invalid_request`                                                                                                                                                                                                                                                                                  |
+| 401    | `unauthenticated`, `invalid_token`, `token_expired`, `token_revoked`, `client_revoked`, `refresh_reuse_detected`, `oidc_exchange_failed`                                                                                                                                                                                                     |
+| 403    | `forbidden` (with `capability`), `oidc_not_allowed`, `oidc_account_disabled`, `oidc_not_provisioned`                                                                                                                                                                                                                                         |
+| 404    | `not_found`, `unknown_target`, `agent_not_found`                                                                                                                                                                                                                                                                                             |
+| 409    | `not_eligible`, `already_terminal`, `already_in_progress`, `stale_revision`, `unsupported_for_kind`, `capability_unknown`, `capability_unsupported`, `idempotency_conflict`, `hold_owned`, `unsupervised`, `agent_read_only`, `agent_revision_conflict` (with `current_revision`), `agent_exists`, `agent_archived`, `oidc_account_conflict` |
+| 410    | `cursor_expired` (with `snapshot`), `artifact_gone`                                                                                                                                                                                                                                                                                          |
+| 411    | `length_required`                                                                                                                                                                                                                                                                                                                            |
+| 413    | `body_too_large` (with `limit`)                                                                                                                                                                                                                                                                                                              |
+| 422    | `invalid_request` (with `errors`), `invalid_argument`, `idempotency_key_required`, `unknown_action`, `invalid_agent` (with `problems`)                                                                                                                                                                                                       |
+| 429    | `too_many_attempts`, `too_many_streams`                                                                                                                                                                                                                                                                                                      |
+| 500    | `internal_error` (never the exception's text)                                                                                                                                                                                                                                                                                                |
+| 503    | `daemon_not_ready` (with `Retry-After`), `daemon_stopping`, `source_unavailable`, `oidc_unavailable`                                                                                                                                                                                                                                         |
 
 `unknown_target` and `not_eligible` carry the daemon's own sentence in
 `detail` — the same one `ctl` prints.

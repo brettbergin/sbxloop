@@ -828,6 +828,31 @@
         "title": "ArtifactRefOut",
         "type": "object"
       },
+      "AuthProviders": {
+        "additionalProperties": false,
+        "properties": {
+          "local": {
+            "title": "Local",
+            "type": "boolean"
+          },
+          "oidc": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OidcProviderOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "local",
+          "oidc"
+        ],
+        "title": "AuthProviders",
+        "type": "object"
+      },
       "AuthorOut": {
         "additionalProperties": false,
         "description": "Who wrote a message: a person, an agent, or sbxloop itself.",
@@ -3082,6 +3107,102 @@
           "created_at"
         ],
         "title": "MessageOut",
+        "type": "object"
+      },
+      "OidcProviderOut": {
+        "additionalProperties": false,
+        "description": "What a signed-out browser needs to start Authorization Code + PKCE.",
+        "properties": {
+          "authorize_url": {
+            "title": "Authorize Url",
+            "type": "string"
+          },
+          "client_id": {
+            "title": "Client Id",
+            "type": "string"
+          },
+          "end_session_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "End Session Url"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "label": {
+            "title": "Label",
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Scopes",
+            "type": "array"
+          }
+        },
+        "required": [
+          "id",
+          "label",
+          "authorize_url",
+          "client_id",
+          "scopes",
+          "end_session_url"
+        ],
+        "title": "OidcProviderOut",
+        "type": "object"
+      },
+      "OidcTokenRequest": {
+        "additionalProperties": false,
+        "description": "The browser's authorization code, redeemed by the daemon.",
+        "properties": {
+          "code": {
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Code",
+            "type": "string"
+          },
+          "code_verifier": {
+            "maxLength": 128,
+            "minLength": 43,
+            "pattern": "^[A-Za-z0-9._~-]+$",
+            "title": "Code Verifier",
+            "type": "string"
+          },
+          "nonce": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Nonce",
+            "type": "string"
+          },
+          "provider": {
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Provider",
+            "type": "string"
+          },
+          "redirect_uri": {
+            "maxLength": 2048,
+            "minLength": 1,
+            "title": "Redirect Uri",
+            "type": "string"
+          }
+        },
+        "required": [
+          "provider",
+          "code",
+          "code_verifier",
+          "redirect_uri",
+          "nonce"
+        ],
+        "title": "OidcTokenRequest",
         "type": "object"
       },
       "OperationOut": {
@@ -7456,6 +7577,70 @@
         "summary": "Register Local",
         "tags": [
           "collaboration"
+        ]
+      }
+    },
+    "/v1/auth/oidc/token": {
+      "post": {
+        "description": "Redeem an OpenID Connect authorization code (Authorization Code +\nPKCE, run by the browser) for a token pair. The daemon authenticates to\nthe provider as the confidential client, validates the ID token, and\ncreates the account on a first sign-in. Needs no token.",
+        "operationId": "oidc_token_v1_auth_oidc_token_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OidcTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Oidc Token",
+        "tags": [
+          "auth"
+        ]
+      }
+    },
+    "/v1/auth/providers": {
+      "get": {
+        "description": "The sign-ins a signed-out client may offer. Needs no token. ``oidc``\nis null unless a provider is configured and its discovery answered.",
+        "operationId": "providers_v1_auth_providers_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthProviders"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Providers",
+        "tags": [
+          "auth"
         ]
       }
     },

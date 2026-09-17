@@ -19,6 +19,29 @@
   `users.directory` and `workspace.members`. A plain API client acts as an
   owner only with `daemon:manage`.
 
+- **People can sign in through an OpenID Connect provider such as
+  Authentik.** A new `[api.oidc]` section (off by default) names the provider's
+  issuer, the confidential client's id, the environment variable that holds
+  its secret (`SBXLOOP_OIDC_CLIENT_SECRET` in `secrets.env` by default) and
+  the exact redirect URIs a browser client may use. The public
+  `GET /v1/auth/providers` tells a signed-out client what to offer. The
+  client then posts its authorization code, PKCE verifier and nonce to
+  `POST /v1/auth/oidc/token`. The daemon redeems the code, checks the ID
+  token (the provider's published keys with RS256 or ES256, issuer,
+  audience, expiry and nonce) and answers with the same token pair a local
+  login returns. The installation's first user becomes its owner. Anyone
+  later gets an account on first sign-in, with a role taken from optional
+  owner and admin groups (the last owner is never demoted).
+  `allowed_groups` can limit who may sign in at all. Deactivated or removed
+  members are refused. An existing local account is never taken over by
+  default: a person whose email matches one gets a new account. Linking it
+  instead, when the provider says the email is verified, is opt-in
+  (`link_verified_email`), because a provider that lets people edit their
+  email would otherwise hand out any account, the owner's included.
+  `auth.oidc` is advertised only while the
+  section is enabled. Local password sign-in is unchanged, and the secret
+  never appears in config, events or logs.
+
 - **A workspace can hold more than one person.** Local users now belong to
   the installation's workspace as an owner, admin or member, and the
   database upgrade makes every existing local user an owner. A second user
