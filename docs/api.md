@@ -90,7 +90,11 @@ Beside the original fields, each entry carries its identity (`avatar`, a
 `enabled`, `source` (`builtin`, `config` or `user`), `editable` and
 `revision`. Clients that see `agents.registry` among the capability
 features may edit saved agents; the fields are defaulted, so older clients
-keep reading the same shape.
+keep reading the same shape. `GET /v1/agents?include_disabled=true`, which
+needs `collaboration:write`, also lists disabled and archived agents and the
+retired built-in names, so a client can find an agent that was switched off
+and send `PATCH` with `enabled: true` to switch it back on (an archived agent
+stays archived).
 
 | Method  | Path                        | Body                                   | Result                              |
 | ------- | --------------------------- | -------------------------------------- | ----------------------------------- |
@@ -111,13 +115,20 @@ surfaces in the run that uses it. A built-in or configured agent answers
 409 `agent_read_only`; a stale `expected_revision` answers 409
 `agent_revision_conflict` with `current_revision`; a slug already saved
 answers 409 `agent_exists`, and an archived agent 409 `agent_archived`.
+Agents and teams share one mention namespace: saving an agent whose slug or
+new alias is a team's slug, or creating or renaming a team to a slug or
+alias an agent (enabled, disabled or archived) answers to, is refused with
+409 `slug_taken`.
 An archived agent is left out of the listing, can no longer be named in a
 team or mentioned, and still answers `GET /v1/agents/{slug}`.
 
 A saved agent is addressed like a built-in: `@slug` in a turn, a
 `target_slugs` entry or a team member. It answers in a chat session under
 its first run role (Angie's own session when it has none) with its own
-persona.
+persona. When the agent sets `model`, its turns use that model instead of
+the role's configured one, and its `model_source` reads `agent.model`. An
+agent's `handoff_agent` tool may address any enabled agent, saved ones
+included; a disabled or archived agent is refused.
 
 An ordinary turn talks to Angie without host or MCP action tools. A known
 `@agent`, an enabled `@team`, explicit `target_slugs`, or `intent=delegate`

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -1574,9 +1575,18 @@ class CollaborationStore:
         agent_slug: str,
         message: str,
         now: float,
+        *,
+        is_agent: Callable[[str], bool] | None = None,
     ) -> str:
-        """Persist a bounded peer request without changing the user's root targets."""
-        if agent_slug not in {a.slug for a in AGENTS}:
+        """Persist a bounded peer request without changing the user's root targets.
+
+        ``is_agent`` says whether a slug names an agent that may be asked
+        (the caller's registry); without it only the built-ins may.
+        """
+        known = (
+            is_agent(agent_slug) if is_agent is not None else agent_slug in {a.slug for a in AGENTS}
+        )
+        if not known:
             raise CollaborationError("unknown_agent", "Choose a native sbxloop agent.")
         if not 1 <= len(message.strip()) <= 4000:
             raise CollaborationError(

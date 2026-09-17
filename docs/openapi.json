@@ -6238,7 +6238,20 @@
     },
     "/v1/agents": {
       "get": {
+        "description": "The agents a client shows. ``include_disabled`` (for clients that may\nedit agents, ``collaboration:write``) adds disabled and archived agents\nand the legacy built-in names, so an agent switched off can be found and\nswitched back on.",
         "operationId": "list_agents_v1_agents_get",
+        "parameters": [
+          {
+            "in": "query",
+            "name": "include_disabled",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Include Disabled",
+              "type": "boolean"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -6253,6 +6266,16 @@
               }
             },
             "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "List Agents",

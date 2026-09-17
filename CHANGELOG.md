@@ -37,7 +37,11 @@
   @mentioned, targeted and put in a team, and answers in its own persona;
   an archived one cannot. `GET /v1/agents` entries gain the agent's
   identity, narrowing, `source`, `editable` and `revision` as defaulted
-  fields, and the `agents.registry` feature advertises all of it. The new
+  fields, and the `agents.registry` feature advertises all of it. A saved
+  agent that sets `model` answers its turns with that model, peers can hand
+  work to any enabled agent, `GET /v1/agents?include_disabled=true`
+  (`collaboration:write`) finds agents that were switched off, and an agent
+  and a team can no longer share a name (409 `slug_taken`). The new
   `agents` table is additive (migration 0022).
 
 - **Agents can be declared in `sbxloop.toml`.** A `[[agents]]` entry adds an

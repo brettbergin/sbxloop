@@ -427,6 +427,13 @@ def _validate_agents(registry: AgentRegistry, slugs: list[str]) -> tuple[str, ..
     return ordered
 
 
+def _refuse_agent_name(registry: AgentRegistry, slug: str) -> None:
+    """A mention resolves an agent before a team, so a team may not take a
+    name an agent (enabled or not) answers to."""
+    if registry.get(slug) is not None:
+        raise Problem(409, "slug_taken", f"an agent is already called {slug}")
+
+
 @router.get("/teams", response_model=list[TeamOut])
 async def list_teams(
     enabled_only: bool = False,
@@ -461,6 +468,7 @@ async def create_team(
     member: Member = Depends(current_member),  # noqa: B008
 ) -> TeamOut:
     user = member.user
+    await ctx.call(_refuse_agent_name, ctx.agents, body.slug)
     agents = await ctx.call(_validate_agents, ctx.agents, body.agent_slugs)
     try:
         team = await ctx.call(
@@ -490,6 +498,8 @@ async def update_team(
 ) -> TeamOut:
     user = member.user
     values = body.model_dump(exclude_unset=True)
+    if values.get("slug") is not None:
+        await ctx.call(_refuse_agent_name, ctx.agents, values["slug"])
     if "agent_slugs" in values:
         values["agent_slugs"] = await ctx.call(_validate_agents, ctx.agents, values["agent_slugs"])
     if "is_enabled" in values:

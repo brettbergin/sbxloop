@@ -19,6 +19,8 @@ from sbxloop.agents.registry import (
     AgentRegistry,
     AgentRegistryReadOnly,
     AgentRevisionConflict,
+    AgentSlugTaken,
+    addressable,
 )
 from sbxloop.api.agents import AgentDefinition
 from sbxloop.api.auth.deps import Authenticated, get_ctx, require
@@ -29,13 +31,9 @@ from sbxloop.config import Config
 from sbxloop.engine.harness import ROLE_BY_PHASE
 from sbxloop.errors import SbxloopError
 
+__all__ = ["addressable", "agent_out", "router"]
+
 router = APIRouter(prefix="/v1", tags=["collaboration"])
-
-
-def addressable(agent: RegistryAgent | None, slug: str) -> bool:
-    """Whether ``slug`` names an agent a team or a mention may reach: its
-    own slug (not an alias), enabled, and not archived."""
-    return agent is not None and agent.slug == slug and agent.active
 
 
 def agent_out(agent: RegistryAgent, config: Config) -> AgentOut:
@@ -86,6 +84,8 @@ def _problem(exc: SbxloopError) -> Problem:
         return Problem(404, "agent_not_found", "agent not found")
     if isinstance(exc, AgentExists):
         return Problem(409, "agent_exists", str(exc))
+    if isinstance(exc, AgentSlugTaken):
+        return Problem(409, "slug_taken", str(exc))
     if isinstance(exc, AgentArchived):
         return Problem(409, "agent_archived", str(exc))
     if isinstance(exc, AgentRegistryReadOnly):
@@ -100,6 +100,7 @@ _REFUSALS = (
     AgentExists,
     AgentArchived,
     AgentRegistryReadOnly,
+    AgentSlugTaken,
 )
 
 
@@ -112,11 +113,23 @@ def _found(registry: AgentRegistry, slug: str) -> RegistryAgent:
 
 @router.get("/agents", response_model=list[AgentOut])
 async def list_agents(
+    include_disabled: bool = False,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    _auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
 ) -> list[AgentOut]:
+    """The agents a client shows. ``include_disabled`` (for clients that may
+    edit agents, ``collaboration:write``) adds disabled and archived agents
+    and the legacy built-in names, so an agent switched off can be found and
+    switched back on."""
+    if include_disabled and not auth.principal.can("collaboration:write"):
+        raise Problem(
+            403,
+            "forbidden",
+            f"{auth.principal.id} lacks collaboration:write",
+            capability="collaboration:write",
+        )
     config = await ctx.call(refreshed_models, ctx.config)
-    agents = await ctx.call(ctx.agents.list)
+    agents = await ctx.call(ctx.agents.list, include_disabled)
     return [agent_out(agent, config) for agent in agents]
 
 

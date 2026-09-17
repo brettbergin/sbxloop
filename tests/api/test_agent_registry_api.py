@@ -17,6 +17,7 @@ import pytest
 
 from sbxloop.api.routes.meta import FEATURES
 from sbxloop.backends import backend_for
+from sbxloop.errors import ToolRejectedError
 from sbxloop.modelcatalog import catalog_endpoint
 from tests.api.conftest import build
 from tests.api.test_collaboration import FakeConcierge, bearer, register
@@ -397,3 +398,150 @@ def test_the_registry_is_advertised(api: Any) -> None:
     assert "agents.registry" in FEATURES
     response = api.client.get("/v1/capabilities", headers=api.bearer())
     assert "agents.registry" in response.json()["features"]
+
+
+class ScoutHandoffConcierge(FakeConcierge):
+    """The first participant hands off to the saved agent, and then to an
+    archived one, recording what each handoff answered."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.handoffs: list[str] = []
+
+    def submit_turn(self, text: str, **kwargs: Any) -> Any:
+        if not self.calls:
+            self.handoffs.append(kwargs["handoff"]("scout", "Find the facts for this"))
+            try:
+                kwargs["handoff"]("retired", "Are you there?")
+            except ToolRejectedError as exc:
+                self.handoffs.append(f"refused: {exc}")
+        return super().submit_turn(text, **kwargs)
+
+
+def test_an_agent_can_hand_off_to_a_saved_agent_but_not_an_archived_one(api: Any) -> None:
+    concierge = ScoutHandoffConcierge()
+    api.ctx.concierge = concierge
+    headers = bearer(register(api))
+    assert _create(api, headers).status_code == 201
+    assert _create(api, headers, {"slug": "retired", "name": "Retired"}).status_code == 201
+    assert api.client.post("/v1/agents/retired/archive", headers=headers).status_code == 200
+    channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+
+    accepted = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "@planner plan the bake sale"},
+    )
+    assert accepted.status_code == 202, accepted.text
+    done = settled(api.client, headers, channel, accepted.json()["turn"]["id"])
+
+    assert done["status"] == "completed", done
+    assert concierge.handoffs[0].startswith("Queued @scout")
+    assert concierge.handoffs[1].startswith("refused: ")
+    assert [p["agent_slug"] for p in done["participants"]] == ["planner", "scout"]
+    assert [c["session_key"] for c in concierge.calls] == [
+        f"{channel}:planner",
+        f"{channel}:scout",
+    ]
+    # The handoff tool offers the saved agent, not the archived one.
+    offered = concierge.calls[0]["handoff_agents"]
+    assert "scout" in offered and "critic" in offered
+    assert "retired" not in offered
+
+
+def test_disabled_agents_are_listed_on_request_for_writers(api: Any) -> None:
+    headers = bearer(register(api))
+    assert _create(api, headers).status_code == 201
+    assert api.client.post("/v1/agents/scout/archive", headers=headers).status_code == 200
+
+    default = api.client.get("/v1/agents", headers=headers).json()
+    assert "scout" not in {a["slug"] for a in default}
+    everything = api.client.get("/v1/agents?include_disabled=true", headers=headers)
+    assert everything.status_code == 200, everything.text
+    archived = {a["slug"]: a for a in everything.json()}["scout"]
+    assert archived["enabled"] is False
+    assert "planner" in {a["slug"] for a in everything.json()}
+
+    reader = api.bearer(frozenset({"collaboration:read"}))
+    assert api.client.get("/v1/agents", headers=reader).status_code == 200
+    refused = api.client.get("/v1/agents?include_disabled=true", headers=reader)
+    assert refused.status_code == 403
+
+    # A disabled (not archived) agent is found the same way and switched back on.
+    assert _create(api, headers, {"slug": "napper", "name": "Napper"}).status_code == 201
+    off = api.client.patch(
+        "/v1/agents/napper", json={"expected_revision": 1, "enabled": False}, headers=headers
+    )
+    assert off.status_code == 200, off.text
+    assert "napper" not in {a["slug"] for a in api.client.get("/v1/agents", headers=headers).json()}
+    found = {
+        a["slug"]: a
+        for a in api.client.get("/v1/agents?include_disabled=true", headers=headers).json()
+    }["napper"]
+    assert found["enabled"] is False
+    assert found["editable"] is True
+    on = api.client.patch(
+        "/v1/agents/napper",
+        json={"expected_revision": found["revision"], "enabled": True},
+        headers=headers,
+    )
+    assert on.status_code == 200, on.text
+    assert "napper" in {a["slug"] for a in api.client.get("/v1/agents", headers=headers).json()}
+
+
+def test_agent_and_team_slugs_do_not_collide(api: Any) -> None:
+    headers = bearer(register(api))
+    team = api.client.post("/v1/teams", headers=headers, json={"name": "Bakers", "slug": "bakers"})
+    assert team.status_code == 201, team.text
+
+    clash = _create(api, headers, {"slug": "bakers", "name": "Baker"})
+    assert clash.status_code == 409, clash.text
+    assert clash.json()["code"] == "slug_taken"
+    alias_clash = _create(api, headers, {**SCOUT, "aliases": ["bakers"]})
+    assert alias_clash.status_code == 409
+    assert alias_clash.json()["code"] == "slug_taken"
+    assert api.client.get("/v1/agents/bakers", headers=headers).status_code == 404
+
+    assert _create(api, headers, {**SCOUT, "aliases": ["finder"]}).status_code == 201
+    renamed_alias = api.client.patch(
+        "/v1/agents/scout",
+        json={"expected_revision": 1, "aliases": ["bakers"]},
+        headers=headers,
+    )
+    assert renamed_alias.status_code == 409
+    assert renamed_alias.json()["code"] == "slug_taken"
+
+    for slug in ("scout", "finder", "planner", "angie"):
+        refused = api.client.post(
+            "/v1/teams", headers=headers, json={"name": "Clash", "slug": slug}
+        )
+        assert refused.status_code == 409, (slug, refused.text)
+        assert refused.json()["code"] == "slug_taken"
+    renamed = api.client.patch(
+        f"/v1/teams/{team.json()['id']}", headers=headers, json={"slug": "scout"}
+    )
+    assert renamed.status_code == 409
+    assert renamed.json()["code"] == "slug_taken"
+    assert api.client.get("/v1/teams", headers=headers).json()[0]["slug"] == "bakers"
+
+
+def test_a_saved_agent_answers_with_its_own_model(api: Any) -> None:
+    concierge = FakeConcierge()
+    api.ctx.concierge = concierge
+    headers = bearer(register(api))
+    created = _create(api, headers, {**SCOUT, "model": "scout-model"})
+    assert created.status_code == 201, created.text
+    assert created.json()["model"] == "scout-model"
+    assert created.json()["model_source"] == "agent.model"
+    channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+
+    accepted = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "@scout and @planner, what do we need?"},
+    )
+    assert accepted.status_code == 202, accepted.text
+    settled(api.client, headers, channel, accepted.json()["turn"]["id"])
+
+    models = {c["session_key"].rsplit(":", 1)[-1]: c.get("model") for c in concierge.calls}
+    assert models == {"scout": "scout-model", "planner": None}

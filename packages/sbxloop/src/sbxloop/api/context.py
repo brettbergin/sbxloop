@@ -20,7 +20,12 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 
-from sbxloop.agents.registry import AgentRegistry, DbAgentRegistry, default_registry
+from sbxloop.agents.registry import (
+    AgentRegistry,
+    DbAgentRegistry,
+    addressable,
+    default_registry,
+)
 from sbxloop.api.agents import ANGIE_PERSONA, AgentDefinition
 from sbxloop.api.artifacts import ArtifactCatalog
 from sbxloop.api.auth.keys import SigningKeys
@@ -330,6 +335,7 @@ class ApiContext:
             )
             persona = (definition.persona if definition else ANGIE_PERSONA) + preference_context
             persona += _RUNNER_INTENT.get(intent, "")
+            model = definition.agent.spec.model if definition and definition.agent else None
             # Mentioning a role is explicit delegation in Angie's UI.
             allow_actions = intent in {"delegate", "code", "workload"} or definition is not None
             read_only = bool(participant.get("read_only")) or target == "critic"
@@ -365,6 +371,7 @@ class ApiContext:
                         agent_slug,
                         message,
                         self.clock(),
+                        is_agent=lambda slug: addressable(self.agents.get(slug), slug),
                     )
                 except CollaborationError as exc:
                     raise ToolRejectedError(exc.message) from exc
@@ -385,6 +392,9 @@ class ApiContext:
                 store.link_code_work(turn.id, participant_index, repo, number, title, self.clock())
                 self.hub.notify()
 
+            handoff_agents = tuple(
+                agent.slug for agent in self.agents.list() if addressable(agent, agent.slug)
+            )
             try:
                 future = concierge.submit_turn(
                     prompt,
@@ -403,6 +413,8 @@ class ApiContext:
                     handoff=handoff if allow_actions else None,
                     on_tool_activity=tool_activity,
                     on_code_work=code_work,
+                    model=model,
+                    handoff_agents=handoff_agents if allow_actions else None,
                 )
                 reply = future.result()
                 if reply.ok and (reply.text or reply.work_products):

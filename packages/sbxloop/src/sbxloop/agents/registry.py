@@ -24,7 +24,7 @@ from sbxloop.agents.builtin import BUILTIN_AGENTS, PRIMARY_BUILTINS
 from sbxloop.agents.definition import AgentDefinition, AgentRoleName, AgentSpec
 from sbxloop.agents.tools import TOOL_CATALOG
 from sbxloop.db.api_models import ApiEventRow
-from sbxloop.db.collaboration_models import AgentRow
+from sbxloop.db.collaboration_models import AgentRow, TeamRow
 from sbxloop.errors import SbxloopError
 from sbxloop.log import get_logger
 
@@ -42,8 +42,10 @@ __all__ = [
     "AgentRegistry",
     "AgentRegistryReadOnly",
     "AgentRevisionConflict",
+    "AgentSlugTaken",
     "ConfigAgentRegistry",
     "DbAgentRegistry",
+    "addressable",
     "catalog_model_problems",
     "config_agent_problems",
     "default_registry",
@@ -70,6 +72,10 @@ class AgentNotFound(SbxloopError):
 
 class AgentExists(SbxloopError):
     """A stored agent already has that slug."""
+
+
+class AgentSlugTaken(SbxloopError):
+    """A team already answers to a name the agent would take."""
 
 
 class AgentArchived(SbxloopError):
@@ -247,6 +253,12 @@ def config_agent_problems(config: Config) -> builtins.list[str]:
     return problems
 
 
+def addressable(agent: AgentDefinition | None, slug: str) -> bool:
+    """Whether ``slug`` names an agent a team, a mention or a handoff may
+    reach: its own slug (not an alias), enabled, and not archived."""
+    return agent is not None and agent.slug == slug and agent.active
+
+
 def default_registry(config: Config) -> AgentRegistry:
     """The registry a daemon without stored agents uses."""
     return ConfigAgentRegistry(config)
@@ -375,6 +387,17 @@ class DbAgentRegistry:
             )
 
     @staticmethod
+    def _refuse_team_names(session: Session, spec: AgentSpec) -> None:
+        """A mention resolves an agent before a team, so an agent may not
+        take a name any team already has."""
+        names = {spec.slug, *spec.aliases}
+        taken = sorted(
+            {str(slug) for slug in session.scalars(select(TeamRow.slug)) if slug in names}
+        )
+        if taken:
+            raise AgentSlugTaken(f"a team is already called {', '.join(taken)}")
+
+    @staticmethod
     def _event(session: Session, type_: str, slug: str, now: float, by: str) -> None:
         session.execute(
             insert(ApiEventRow).values(
@@ -401,6 +424,7 @@ class DbAgentRegistry:
         with self._dstore.transaction() as session:
             if not problems and session.get(AgentRow, spec.slug) is not None:
                 raise AgentExists(f"agent {spec.slug!r} already exists")
+            self._refuse_team_names(session, spec)
             problems = self._problems(session, spec) + problems
             if problems:
                 raise AgentInvalid(problems)
@@ -440,6 +464,8 @@ class DbAgentRegistry:
                 spec = AgentSpec.model_validate({**current.model_dump(), **values, "slug": key})
             except ValidationError as exc:
                 raise AgentInvalid(_validation_messages(exc)) from exc
+            if set(spec.aliases) - set(current.aliases):
+                self._refuse_team_names(session, spec)
             problems = self._problems(session, spec)
             if spec.model != current.model:
                 problems += catalog_model_problems(self._config, spec)
