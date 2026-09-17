@@ -20,7 +20,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from sbxloop.agents.assignment import memory_section
+from sbxloop.agents.assignment import agent_memory_block
 from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
 from sbxloop.agents.registry import (
     AgentRegistry,
@@ -523,7 +523,9 @@ class ApiContext:
             return "", ()
         try:
             memory = self.memory
-            block = memory.prompt_block(agent.slug, channel_id=channel_id)
+            # The seam a run is planned through, so one protocol
+            # describes the memory service for chat and for runs alike.
+            block = agent_memory_block(memory, agent.slug, channel_id=channel_id)
             tools = (
                 memory_tools(
                     memory,
@@ -539,7 +541,7 @@ class ApiContext:
         except Exception:
             log.warning("collaboration.agent_memory_unavailable", agent=agent.slug, exc_info=True)
             return "", ()
-        return memory_section(block), tuple(tools)
+        return block, tuple(tools)
 
     def service(self) -> ControlService:
         """A service over the loop; one per request, since it collects the

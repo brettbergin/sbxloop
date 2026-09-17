@@ -35,6 +35,7 @@ __all__ = [
     "AgentBinding",
     "MemoryBlocks",
     "RunRole",
+    "agent_memory_block",
     "binding_from_definition",
     "memory_section",
     "plan_assignment",
@@ -57,9 +58,14 @@ _BUILTIN_FOR_ROLE: dict[str, str] = {
 
 
 class MemoryBlocks(Protocol):
-    """Where an agent's remembered context comes from (the memory service)."""
+    """Where an agent's remembered context comes from (the memory service).
 
-    def prompt_block(self, agent_slug: str, *, channel_id: str | None = None) -> str:
+    The parameter names and kinds are :meth:`MemoryService.prompt_block`'s
+    own, so the service satisfies the protocol structurally rather than by
+    happening to be called positionally.
+    """
+
+    def prompt_block(self, agent: str, *, channel_id: str | None) -> str:
         """The block appended to the agent's system message; ``""`` for none."""
 
 
@@ -243,12 +249,14 @@ def memory_section(block: str) -> str:
     return "\n\n" + block.lstrip("\n") if block.strip() else ""
 
 
-def _memory_block(memory: MemoryBlocks | None, slug: str, channel_id: str | None) -> str:
-    """The agent's memories visible in ``channel_id``, taken once, when the
-    run is planned: the run keeps this snapshot, resume included."""
+def agent_memory_block(memory: MemoryBlocks | None, agent: str, *, channel_id: str | None) -> str:
+    """``agent``'s memories visible in ``channel_id`` as a prompt section,
+    and ``""`` without a memory source, so the prompt is unchanged. A run
+    takes it once, when it is planned, and keeps that snapshot, resume
+    included."""
     if memory is None:
         return ""
-    return memory_section(memory.prompt_block(slug, channel_id=channel_id))
+    return memory_section(memory.prompt_block(agent, channel_id=channel_id))
 
 
 def binding_from_definition(
@@ -265,7 +273,7 @@ def binding_from_definition(
         role=role,
         model=spec.model,
         persona=agent.run_persona(),
-        memory_block=_memory_block(memory, agent.slug, channel_id),
+        memory_block=agent_memory_block(memory, agent.slug, channel_id=channel_id),
         tools=None if spec.tools is None else frozenset(spec.tools),
         credentials=tuple(spec.credentials),
         revision=agent.revision,

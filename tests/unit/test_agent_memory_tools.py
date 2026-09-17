@@ -11,12 +11,13 @@ false`` offers no tools at all. Expected values are written out literally.
 
 from __future__ import annotations
 
+import inspect
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from sbxloop.agents.assignment import AgentAssignment, plan_assignment
+from sbxloop.agents.assignment import AgentAssignment, MemoryBlocks, plan_assignment
 from sbxloop.agents.memory import MemoryService, NoWorkspaceVisibility
 from sbxloop.agents.registry import ConfigAgentRegistry
 from sbxloop.agents.tools import MEMORY_TOOL_NAMES, memory_tools
@@ -352,3 +353,27 @@ def test_a_run_is_told_nothing_new_when_ada_has_no_memories(tmp_path: Path) -> N
     with_memory = run_build(config, plan(config, memory, "c1"), memory=memory).jobs[0]
     without = run_build(config, plan(config, None, "c1")).jobs[0]
     assert with_memory.system_message == without.system_message
+
+
+def test_the_memory_service_is_the_memory_source_a_plan_declares(tmp_path: Path) -> None:
+    """``plan_assignment(memory=...)`` is handed the real ``MemoryService``,
+    so ``MemoryBlocks`` has to describe it: every parameter the protocol
+    declares is one the service accepts, under the same name and kind, and
+    the protocol promises no default the service does not have. Otherwise
+    the protocol only happens to work because the one call site passes the
+    agent positionally, and a caller writing the call out by name is
+    refused."""
+    declared = inspect.signature(MemoryBlocks.prompt_block).parameters
+    accepted = inspect.signature(MemoryService.prompt_block).parameters
+    for name, parameter in declared.items():
+        assert name in accepted, f"MemoryService.prompt_block takes no {name!r}"
+        assert accepted[name].kind == parameter.kind, name
+        if parameter.default is not inspect.Parameter.empty:
+            assert accepted[name].default is not inspect.Parameter.empty, name
+
+    memory = service(tmp_path)
+    memory.remember("ada", "Prefers small diffs", channel_id=None, author="user:u1")
+    blocks: MemoryBlocks = memory
+    call: dict[str, Any] = dict.fromkeys(name for name in declared if name != "self")
+    call[next(iter(call))] = "ada"
+    assert "Prefers small diffs" in blocks.prompt_block(**call)
