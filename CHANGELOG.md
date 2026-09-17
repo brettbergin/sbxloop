@@ -44,6 +44,21 @@
   and a team can no longer share a name (409 `slug_taken`). The new
   `agents` table is additive (migration 0022).
 
+- **Each agent has a long-term memory that people can review and edit.**
+  `GET/POST /v1/agents/{slug}/memories` and `PATCH/DELETE .../{id}` list,
+  add, revise (at an expected revision) and forget an agent's memories,
+  advertised as `agents.memory`. A memory is scoped by the channel it was
+  learned in: global memories, the current channel's and those from
+  channels whose visibility is `workspace` are shown. `include_private`
+  shows the rest to an owner or admin; any other member sees only memories
+  from channels they can read. The `agent_memories` table is additive
+  (migration 0023). The new
+  `[memory]` section bounds how many each agent keeps (the oldest unpinned
+  is dropped), how long one may be and how much a prompt may carry, and can
+  turn the feature off. Changes are recorded as `agent.memory.*` events
+  without the text. Nothing reads memories into prompts yet, and agents
+  have no memory tools yet.
+
 - **Agents can be declared in `sbxloop.toml`.** A `[[agents]]` entry adds an
   agent beside Angie and the planner, builder, critic and operator, or
   adjusts the built-in with the same slug: its name, aliases, persona,

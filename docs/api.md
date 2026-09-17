@@ -71,6 +71,7 @@ original behavior.
 | Profile     | `GET/PATCH /v1/users/me`                                       | Local identity and timezone                                  |
 | Agents      | `/v1/agents[/{slug}]`, `POST /v1/agents/{slug}/archive`        | Built-in, configured and saved agents; saved ones are edited |
 | Teams       | `/v1/teams[/{id}]`                                             | Durable named groups of agent roles                          |
+| Memories    | `/v1/agents/{slug}/memories[/{id}]`                            | What each agent keeps beyond one conversation                |
 | Channels    | `/v1/channels[/{id}]`                                          | Revisioned conversation containers; deletion tombstones them |
 | Messages    | `GET /v1/channels/{id}/messages`, `PUT .../{message}/reaction` | Ordered history and persistent message feedback              |
 | Turns       | `POST /v1/channels/{id}/turns`, `GET .../{turn}`               | Idempotent input acceptance and durable completion state     |
@@ -262,6 +263,31 @@ automatically replayed. Provider failures also appear in channel history.
 Deleting a channel prevents queued turns and remaining team members from starting
 and discards late replies. It does not undo an action already running.
 
+Each agent has a long-term memory, reviewed and edited through
+`/v1/agents/{slug}/memories` (advertised as `agents.memory`; an alias names the
+same agent, and an unknown agent is `404 agent_not_found`). `GET` needs
+`collaboration:read`; `POST`, `PATCH` and `DELETE` need `collaboration:write`.
+A memory is `{id, agent_slug, kind, content, source_channel_id, source_run_id, source_message_id, author, pinned, created_at, updated_at, last_used_at, revision}`,
+where `kind` is `fact`, `preference` or `procedure` and `author` is
+`agent:<slug>` or `user:<id>`. A memory with no `source_channel_id` is global;
+one learned in a channel is listed only with `?channel_id=` naming that channel
+(or a channel whose `visibility` is `workspace`). `include_private=true`
+lists every memory for a plain API client or a workspace owner or admin; for
+any other member it adds only the memories from channels that member can read
+(workspace channels and the ones they created or belong to). A member never
+sees a memory from a private channel they cannot read. `q` keeps memories
+sharing a word with it. Listing does not change `last_used_at`.
+
+`POST {content, kind?, pinned?, channel_id?}` stores a memory authored by the
+caller; the text is cut to `[memory] max_item_chars`, and past
+`[memory] max_items_per_agent` the agent's oldest unpinned memory is dropped
+(`409 memory_full` when every one is pinned). `PATCH {content?, pinned?, expected_revision}`
+answers `409 revision_conflict` for a stale revision. `DELETE` forgets the
+memory (a soft delete). With `[memory] enabled = false`, `POST` answers
+`409 memory_disabled`. Changes write `agent.memory.created`, `.updated` and
+`.deleted` events that name the memory, its agent and its source channel but
+never its text.
+
 Connection credentials remain in sbxloop's environment and configuration.
 These routes report redacted readiness and deliberately reject browser-supplied
 secret mutation until protected credential intake is implemented (#1043).
@@ -374,6 +400,7 @@ rechecked when it arrives) and a `revision` a command may pin.
 | `POST`   | `/v1/agents`, `/v1/agents/{slug}/archive`    | collaboration write    | Save a person's own agent; archive it                                 |
 | `PATCH`  | `/v1/agents/{slug}`                          | collaboration write    | Edit a saved agent at the revision last read                          |
 | CRUD     | `/v1/teams`, `/v1/channels`, `/v1/workflows` | collaboration          | Local teams, durable conversations, and workflow definitions          |
+| CRUD     | `/v1/agents/{slug}/memories[/{id}]`          | collaboration          | An agent's long-term memory, scoped by source channel                 |
 | `GET`    | `/v1/channels/{id}/messages`                 | collaboration read     | Immutable ordered conversation history                                |
 | `POST`   | `/v1/channels/{id}/turns`                    | collaboration delegate | Accept an idempotent conversation/delegation turn                     |
 | CRUD     | `/v1/prompts`, `/v1/connections`             | collaboration          | User preferences; redacted operator-managed connection status         |

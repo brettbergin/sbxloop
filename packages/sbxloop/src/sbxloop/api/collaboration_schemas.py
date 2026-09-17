@@ -103,6 +103,35 @@ class AgentUpdate(ApiModel):
     enabled: bool | None = None
 
 
+class MemoryOut(ApiModel):
+    id: str
+    agent_slug: str
+    kind: Literal["fact", "preference", "procedure"]
+    content: str
+    source_channel_id: str | None = None
+    source_run_id: str | None = None
+    source_message_id: str | None = None
+    author: str
+    pinned: bool
+    created_at: str
+    updated_at: str
+    last_used_at: str | None = None
+    revision: int
+
+
+class MemoryCreate(ApiModel):
+    content: str = Field(min_length=1, max_length=16000)
+    kind: Literal["fact", "preference", "procedure"] = "fact"
+    pinned: bool = False
+    channel_id: str | None = Field(default=None, min_length=1, max_length=128)
+
+
+class MemoryUpdate(ApiModel):
+    content: str | None = Field(default=None, min_length=1, max_length=16000)
+    pinned: bool | None = None
+    expected_revision: int = Field(ge=1)
+
+
 class TeamCreate(ApiModel):
     name: str = Field(min_length=1, max_length=120)
     slug: str = Field(pattern=r"^[a-z0-9][a-z0-9_-]{0,63}$")
