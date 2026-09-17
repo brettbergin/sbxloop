@@ -46,6 +46,7 @@ from pydantic import (
     model_validator,
 )
 
+from sbxloop.agents.definition import AgentSpec
 from sbxloop.backends import ANTHROPIC_TOKEN_ENV, COPILOT_TOKEN_ENV, OPENAI_TOKEN_ENV
 from sbxloop.chatservices import CHAT_SERVICES, service_named
 from sbxloop.endpoint import parse_endpoint
@@ -2208,6 +2209,7 @@ DEFAULT_CONFIG_LOCKED: tuple[str, ...] = (
     "credentials",
     "registries",
     "vcs",
+    "agents",
     "github.repos.token_env",
     "telemetry.dsn_env",
 )
@@ -2816,6 +2818,11 @@ class Config(_ConfigModel):
     # Legacy (#818): schedules live in the daemon's database; an entry here
     # is imported into it once on daemon start and then ignored.
     schedules: list[ScheduleConfig] = Field(default_factory=list)
+    # Agents: an entry adds one beside the built-ins, or adjusts the
+    # built-in with its slug (the keys it sets to a non-default value).
+    # Identity, persona and narrowing only; egress stays with `[policy]`
+    # and `[[workloads]]`.
+    agents: list[AgentSpec] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def _fold_vcs_api_url(self) -> Config:
@@ -2973,6 +2980,24 @@ class Config(_ConfigModel):
                     "registers one secret per env var, so give them separate credentials"
                 )
             by_env[entry.env] = server.name
+        return self
+
+    @model_validator(mode="after")
+    def _check_agents(self) -> Config:
+        """``[[agents]]`` slugs are unique, and each entry names only
+        credentials, MCP servers and tools that exist, without shadowing
+        another agent's slug or alias."""
+        seen: set[str] = set()
+        for agent in self.agents:
+            if agent.slug in seen:
+                raise ValueError(f"two [[agents]] entries are both named {agent.slug!r}")
+            seen.add(agent.slug)
+        if self.agents:
+            from sbxloop.agents.registry import config_agent_problems
+
+            problems = config_agent_problems(self)
+            if problems:
+                raise ValueError("; ".join(problems))
         return self
 
     def mcp_for(self, role: str) -> list[McpConfig]:

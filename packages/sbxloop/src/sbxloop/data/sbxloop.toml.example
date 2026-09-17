@@ -356,6 +356,33 @@ service_memory = "2g"
 # roles = ["builder"]
 # description = "forecast lookups for the builder"
 
+# Agents. sbxloop ships Angie (`concierge`, also `@angie`) and the planner,
+# builder, critic and operator; an entry here adds another agent beside
+# them, or adjusts the built-in with the same slug (only the keys it sets
+# to something other than their default). Identity, persona and narrowing
+# only: an agent never carries egress (no hosts, no allow patterns; those
+# stay with [policy] and [[workloads]]). An entry naming a credential, MCP
+# server or tool that does not exist, or another agent's @-name, fails the
+# load.
+# [[agents]]
+# slug = "forecaster"  # the @-name: lowercase letters, digits, '-', '_'; a built-in's slug adjusts it
+# name = "Forecaster"  # shown beside its messages; required for a new agent
+# description = "answers weather questions and runs forecast reports"  # one line for directories
+# avatar = "F"  # an emoji or 1-2 characters, never a URL
+# color = "#0ea5e9"  # "#rrggbb"
+# instructions = "Answer weather questions from the forecast service; say when data is stale."  # its persona
+# model = "auto"  # unset: the model its role gets
+# roles = ["operator"]  # run roles it may take: "lead", "planner", "builder", "critic", "operator"
+# tools = ["load_skill", "call_service", "weather"]  # unset: the role's tools; a list (host tools or [[mcp]] names) only narrows
+# skills = []  # unset: the role's skills; a list only narrows
+# mcp = ["weather"]  # [[mcp]] names it may use; unset: what its role gets
+# credentials = ["weather"]  # [[credentials]] names it may be granted
+# interests = ["weather", "forecast"]  # topics it may speak up about unprompted
+# can_start = ["workload"]  # run kinds it may start itself: "code", "workload" (needs a role)
+# max_runs_per_day = 4  # cap on the runs it starts itself; unset: no own cap
+# aliases = ["weatherbot"]  # other @-names for it, never another agent's
+# enabled = true  # false hides it and routes nothing to it
+
 # Named bounds for `--kind workload` runs. The operator's plan
 # declares what each task needs — hosts, credentials by name, a sink, a
 # repository — and the run's profile decides what is granted; a need
