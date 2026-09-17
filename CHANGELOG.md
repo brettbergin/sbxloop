@@ -59,6 +59,19 @@
   without the text. Nothing reads memories into prompts yet, and agents
   have no memory tools yet.
 
+- **A run can be given named agents.** The engine takes an optional agent
+  assignment (a lead, the agent in each run role, and optionally the agent
+  for a single task), stores it with the run and picks it up again on
+  resume. A custom agent's persona and memory are added to the system
+  message of the sessions it takes, its tool and credential lists narrow
+  what those sessions get, and its model sits below `--model` and the
+  repository's per-phase model and above `[agent].models`. Its slug and
+  name are stamped on the agent events of its jobs (names a worker supplies
+  itself are removed), task, review, chat, follow-up and delivery events are
+  credited to it, and tasks and phase attempts record who took them
+  (migration 0024). A run with no assignment, or with the built-in team, is
+  unchanged. Nothing starts a run with an assignment yet.
+
 - **Agents can be declared in `sbxloop.toml`.** A `[[agents]]` entry adds an
   agent beside Angie and the planner, builder, critic and operator, or
   adjusts the built-in with the same slug: its name, aliases, persona,

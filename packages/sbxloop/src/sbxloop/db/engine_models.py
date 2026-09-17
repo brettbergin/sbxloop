@@ -125,6 +125,9 @@ class Run(Base):
     # Bumped by a trigger on every UPDATE (revision 0010): what a remote
     # command's `expected_revision` is checked against.
     revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
+    # The named agents the run was given (an `AgentAssignment`), NULL for a
+    # run started without one (revision 0020).
+    assignment_json: Mapped[str | None] = mapped_column(Text)
 
 
 class Task(Base):
@@ -158,6 +161,9 @@ class Task(Base):
     verify_reauthors: Mapped[int] = mapped_column(
         Integer, nullable=False, server_default=sql_text("'0'")
     )
+    # The agent slug doing this task's work. Decided by the host, never
+    # part of `spec_json`, which the planning agent writes (revision 0020).
+    assignee: Mapped[str | None] = mapped_column(Text)
 
 
 class PhaseAttempt(Base):
@@ -192,6 +198,9 @@ class PhaseAttempt(Base):
     cache_read_tokens: Mapped[int | None] = mapped_column(Integer)
     cache_write_tokens: Mapped[int | None] = mapped_column(Integer)
     turns: Mapped[int | None] = mapped_column(Integer)
+    # The named agent that took the attempt; NULL for a mechanical stage and
+    # for a run without an assignment (revision 0020).
+    agent_slug: Mapped[str | None] = mapped_column(Text)
 
 
 class Reconciliation(Base):
