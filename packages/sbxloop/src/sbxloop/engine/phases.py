@@ -663,10 +663,20 @@ class PhaseRunner:
                 narrowed.append(spec)
         return tuple(narrowed)
 
-    def _agent_tools(self, custom: AgentBinding | None) -> list[AgentTool]:
+    def _agent_tools(
+        self,
+        custom: AgentBinding | None,
+        *,
+        permission_mode: Literal["auto", "read_only"],
+    ) -> list[AgentTool]:
         """The agent's own tools for one session: its memory, when its
         ``tools`` name ``memory``. A built-in (no list) gets none, so the
-        default team's jobs are unchanged."""
+        default team's jobs are unchanged.
+
+        A session that may change nothing gets ``recall`` alone — a critic,
+        whatever it was asked to do, and any read-only session — exactly as
+        a read-only chat turn does: judging the work is not an occasion to
+        rewrite what the agent remembers of it."""
         if (
             self.memory is None
             or custom is None
@@ -680,6 +690,7 @@ class PhaseRunner:
             channel_id=None if self.assignment is None else self.assignment.channel_id,
             run_id=self.run_id,
             message_id=None,
+            writable=permission_mode != "read_only" and custom.role != "critic",
         )
 
     def _identity(self, binding: AgentBinding | None) -> dict[str, Any]:
@@ -718,7 +729,7 @@ class PhaseRunner:
         # the verification procedure exactly as much as the builder does, and
         # unlike a service call it reaches nothing outside the host.
         host_tools, tool_handler = self._tools_for(phase, service_tools, custom)
-        agent_tools = self._agent_tools(custom)
+        agent_tools = self._agent_tools(custom, permission_mode=permission_mode)
         if agent_tools:
             assert custom is not None
             host_tools = (*host_tools, *(tool.spec for tool in agent_tools))

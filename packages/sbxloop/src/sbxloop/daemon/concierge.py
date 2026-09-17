@@ -3056,19 +3056,31 @@ class Concierge:
 
 
 def _visible_tool_arguments(call: HostToolCall) -> dict[str, Any]:
-    """The call's arguments, with the ones that can carry a credential hidden.
+    """The call's arguments, with the ones that can carry a credential or a
+    memory's text hidden.
 
     A URL a person types can embed a username and password, and a rejected
     one is never canonicalised — so the raw value never reaches the logs or
-    the chat chronology. Every other selector stays visible: a tool call
-    that shows up with no arguments cannot be followed or steered, and the
-    resolved targets are named in the reply either way.
+    the chat chronology. What an agent remembers is scoped to one channel,
+    but the daemon log is not: any agent can read it from any channel
+    through ``daemon_log``, so a memory's text never goes there either — its
+    length is what the call can be followed by, and the reply names the id.
+    Every other selector stays visible: a tool call that shows up with no
+    arguments cannot be followed or steered, and the resolved targets are
+    named in the reply either way.
     """
     arguments = dict(call.arguments)
     if call.name == "handoff_agent":
         return {"agent_slug": arguments.get("agent_slug")}
     if call.name == "start_entrygraph" and arguments.get("url") is not None:
         arguments["url"] = "<redacted url>"
+    if call.name == "remember":
+        content = arguments.get("content")
+        arguments["content"] = f"<{len(content)} chars>" if isinstance(content, str) else "<hidden>"
+    if call.name == "recall" and arguments.get("query") is not None:
+        # A query is written from what the agent remembers; it quotes it
+        # often enough that it belongs on the same side of this line.
+        arguments["query"] = "<redacted query>"
     return arguments
 
 

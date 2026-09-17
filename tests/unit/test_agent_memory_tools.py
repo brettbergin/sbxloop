@@ -160,6 +160,36 @@ class TestMemoryTools:
         )
         assert [tool.spec.name for tool in tools] == ["recall"]
 
+    def test_an_omitted_limit_may_arrive_as_an_explicit_null(self, tmp_path: Path) -> None:
+        # Backends differ: some leave an optional parameter out, some send
+        # it as null. Both mean "you choose", not a bad call.
+        memory = service(tmp_path)
+        for i in range(7):
+            memory.remember("ada", f"Note {i}", channel_id="c1", author="user:u1")
+        recall = tools_by_name(
+            memory_tools(memory, "ada", channel_id="c1", run_id=None, message_id=None)
+        )["recall"]
+        default = recall.impl({"query": "note"})
+        assert default == recall.impl({"query": "note", "limit": None})
+        assert len(default.splitlines()) == 1 + 5
+        with pytest.raises(ToolRejectedError, match="whole number"):
+            recall.impl({"query": "note", "limit": "five"})
+
+    def test_remember_says_a_note_with_no_channel_is_workspace_wide(self, tmp_path: Path) -> None:
+        # A run started from an issue, a schedule or the CLI has no channel,
+        # so what its agent keeps is global. It is told, rather than left to
+        # assume the note stays where it is working.
+        memory = service(tmp_path)
+        here = tools_by_name(
+            memory_tools(memory, "ada", channel_id="c1", run_id=None, message_id=None)
+        )["remember"].spec.description
+        everywhere = tools_by_name(
+            memory_tools(memory, "ada", channel_id=None, run_id="r1", message_id=None)
+        )["remember"].spec.description
+        assert "the place you are working in now" in here
+        assert "any channel" not in here
+        assert "the whole workspace" in everywhere and "any channel" in everywhere
+
     def test_disabled_memory_offers_no_tools(self, tmp_path: Path) -> None:
         memory = service(tmp_path, enabled=False)
         assert memory_tools(memory, "ada", channel_id="c1", run_id=None, message_id=None) == []
@@ -231,6 +261,59 @@ class TestRunTools:
         agent = run_build(config, plan(config, memory, None), memory=memory)
         assert agent.jobs[0].host_tools == []
         assert agent.kwargs[0]["tool_handler"] is None
+
+    def test_a_critic_in_a_run_only_recalls(self, tmp_path: Path) -> None:
+        # The judge of the work does not get to rewrite what the agent
+        # remembers of it, exactly as a read-only chat turn does not.
+        memory = service(tmp_path)
+        carla = {**ADA, "slug": "carla", "name": "Carla", "roles": ["critic"], "tools": ["memory"]}
+        config = cfg(carla)
+        assignment = plan_assignment(
+            ConfigAgentRegistry(config),
+            kind="code",
+            lead=None,
+            requested={"critic": "carla"},
+            memory=memory,
+            channel_id="c1",
+        )
+        agent = RecordingAgent(
+            [{"verdict": "approve", "summary": "Read the diff; nothing to fix."}]
+        )
+        runner = PhaseRunner(  # type: ignore[arg-type]
+            agent, config, "r1", "outcome", assignment=assignment, memory=memory
+        )
+        runner.review(diff="d", pr_number=1, round=1, tasks=[], history="", refuted=set())
+        names = {t.name for t in agent.jobs[0].host_tools} & MEMORY_TOOL_NAMES
+        assert names == {"recall"}
+        answer = agent.kwargs[0]["tool_handler"]
+        refused = answer(
+            HostToolCall(call_id="c1", name="remember", arguments={"content": "Carla was here"})
+        )
+        assert not refused.ok and "unknown tool" in (refused.error or "")
+        assert memory.list("carla", channel_id="c1", include_private=True) == []
+
+    def test_a_read_only_session_only_recalls_whatever_the_role(self, tmp_path: Path) -> None:
+        # `steer` is a planner's session, and read-only: the same rule.
+        memory = service(tmp_path)
+        config = cfg({**ADA, "roles": ["planner"], "tools": ["memory"]})
+        assignment = plan_assignment(
+            ConfigAgentRegistry(config),
+            kind="code",
+            lead=None,
+            requested={"planner": "ada"},
+            memory=memory,
+            channel_id="c1",
+        )
+        agent = RecordingAgent([{"reply": "Carrying on.", "action": "continue"}])
+        runner = PhaseRunner(  # type: ignore[arg-type]
+            agent, config, "r1", "outcome", assignment=assignment, memory=memory
+        )
+        runner.steer("how is it going?", tasks=[], task=None)
+        assert {t.name for t in agent.jobs[0].host_tools} & MEMORY_TOOL_NAMES == {"recall"}
+        # ...while the same agent, in the same role, keeps all three in the
+        # session it is allowed to work in.
+        writing = _decompose_with(config, assignment, memory)
+        assert {t.name for t in writing.jobs[0].host_tools} & MEMORY_TOOL_NAMES == MEMORY_TOOL_NAMES
 
     def test_the_default_team_submits_the_same_jobs_with_memory_wired(self, tmp_path: Path) -> None:
         memory = service(tmp_path)

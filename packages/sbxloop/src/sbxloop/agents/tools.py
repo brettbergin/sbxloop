@@ -159,8 +159,13 @@ def memory_tools(
     What it remembers is written as ``agent:<slug>``, learned in
     ``channel_id`` (None: kept for every channel) from ``run_id`` and
     ``message_id``; what it recalls or forgets is only what that channel may
-    see. ``writable=False`` (a read-only turn) offers ``recall`` alone.
-    Empty when memory is turned off.
+    see. ``writable=False`` (a read-only turn or session) offers ``recall``
+    alone. Empty when memory is turned off.
+
+    ``channel_id=None`` — a run that was not started from a channel — keeps
+    what the agent remembers for the whole workspace, so it is readable in
+    *every* channel. ``remember`` says so in its own description rather than
+    leaving the agent to assume its note stays where it was working.
     """
     from sbxloop.agents.memory import MEMORY_KINDS, AgentMemoryError
 
@@ -169,6 +174,14 @@ def memory_tools(
     author = f"agent:{agent_slug}"
     kinds = sorted(MEMORY_KINDS)
     cap = service.cfg.max_item_chars
+    kept_where = (
+        "It is kept for the place you are working in now."
+        if channel_id is not None
+        else (
+            "You are not working in one channel, so it is kept for the whole workspace "
+            "and anyone may see it in any channel."
+        )
+    )
 
     def remember(args: Mapping[str, Any]) -> str:
         content = _text(args, "content")
@@ -192,7 +205,11 @@ def memory_tools(
 
     def recall(args: Mapping[str, Any]) -> str:
         query = _text(args, "query")[:_QUERY_MAX]
-        raw_limit = args.get("limit", _RECALL_DEFAULT)
+        # A backend that fills every optional parameter sends an omitted
+        # limit as an explicit null; that is the default, not a bad call.
+        raw_limit = args.get("limit")
+        if raw_limit is None:
+            raw_limit = _RECALL_DEFAULT
         if isinstance(raw_limit, bool) or not isinstance(raw_limit, int):
             raise ToolRejectedError("limit must be a whole number")
         limit = max(1, min(raw_limit, _RECALL_MAX))
@@ -228,8 +245,8 @@ def memory_tools(
                 name="remember",
                 description=(
                     "Keep one short, durable note for later conversations and runs: a fact, a "
-                    "preference someone stated, or a procedure that worked. It is kept for "
-                    "the place you are working in. Never store secrets or anything a person "
+                    "preference someone stated, or a procedure that worked. "
+                    f"{kept_where} Never store secrets or anything a person "
                     "asked you not to keep."
                 ),
                 parameters=_schema(

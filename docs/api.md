@@ -340,9 +340,25 @@ alone. What it keeps is authored `agent:<slug>` and scoped to the channel and
 message of the turn. Built-in agents and `[[agents]]` entries with no `tools`
 list get no memory tools. In a run, a custom agent's memory block is taken
 when the run is planned and kept across a resume, and an agent whose `tools`
-names `memory` gets the same tools, writing with the run's id and channel.
-With `[memory] enabled = false` no memory reaches a prompt and no tool is
-offered.
+names `memory` gets the same tools, writing with the run's id and channel; a
+read-only session, and a critic whatever its session, gets `recall` alone, as
+a read-only chat turn does. With `[memory] enabled = false` no memory reaches
+a prompt and no tool is offered.
+
+A run started from a channel keeps what its agents remember for that channel.
+A run with no channel — one a labelled issue, a schedule or the CLI started —
+has no channel to keep it for, so what its agents remember there is
+**workspace-global**: that agent recalls it in every channel, for anyone who
+can address it. This is deliberate, so a run's agent can use next week what it
+learned this week wherever the next ask arrives. The `remember` tool says so
+in its own description whenever the agent is working without a channel, and
+`GET /v1/agents/{slug}/memories` shows such a memory with no source channel.
+Give a run a channel when what its agents keep should stay in one place.
+
+A memory's text stays out of the daemon log: a `remember` or `recall` tool
+call is logged by length, not by content, as `agent.memory.*` events are
+logged by id. The log is one stream for the whole installation, and any agent
+can read it from any channel through `daemon_log`.
 
 Connection credentials remain in sbxloop's environment and configuration.
 These routes report redacted readiness and deliberately reject browser-supplied

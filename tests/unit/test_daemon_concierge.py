@@ -2316,6 +2316,75 @@ class TestDaemonLogTool:
         assert {"tail", "level", "grep"} <= set(properties)
 
 
+class TestMemoryStaysOutOfTheDaemonLog:
+    """A memory belongs to one channel; the daemon log belongs to none.
+
+    ``daemon_log`` quotes the same process-wide ring buffer to whoever asks,
+    from whatever channel, so a note an agent kept in one channel would be
+    readable from every other one if its text were logged. What the call did
+    is logged by length instead, which is enough to follow it.
+    """
+
+    SECRET = "Marisol keeps the launch date in her head until legal signs"
+
+    @pytest.fixture(autouse=True)
+    def _buffer(self) -> Any:
+        from sbxloop.log import log_buffer
+
+        log_buffer().clear()
+        yield
+        log_buffer().clear()
+
+    @pytest.fixture(autouse=True)
+    def _logging(self) -> Any:
+        import io
+
+        from sbxloop.log import configure_logging
+
+        configure_logging("DEBUG", fmt="console", stream=io.StringIO())
+        yield
+        configure_logging("DEBUG")
+
+    def _kept(self, tmp_path: Path, calls: list[tuple[str, dict[str, Any]]]) -> tuple[str, Any]:
+        """One turn in ``chan-a`` making ``calls``, and what an agent asking
+        ``daemon_log`` from anywhere else would be quoted afterwards."""
+        from sbxloop.agents.memory import MemoryService, NoWorkspaceVisibility
+        from sbxloop.agents.tools import memory_tools
+        from sbxloop.config import MemoryConfig
+
+        concierge, client, _, _, dstore = make(tmp_path, [{"calls": calls}])
+        service = MemoryService(dstore, NoWorkspaceVisibility(), MemoryConfig(), lambda: 1_000.0)
+        concierge.submit_turn(
+            "@ada note that",
+            author="Discord user `brett`",
+            agent_tools=memory_tools(
+                service, "ada", channel_id="chan-a", run_id=None, message_id="m1"
+            ),
+        ).result(timeout=10)
+        assert all(response.ok for response in client.responses), client.responses
+        reader, reading, *_ = make(tmp_path / "elsewhere", [{"calls": [("daemon_log", {})]}])
+        turn(reader, "what has the daemon been doing?")
+        (quoted,) = reading.responses
+        assert quoted.ok
+        return quoted.text or "", service
+
+    def test_what_an_agent_remembers_is_logged_by_length_not_by_text(self, tmp_path: Path) -> None:
+        quoted, service = self._kept(tmp_path, [("remember", {"content": self.SECRET})])
+        (stored,) = service.list("ada", channel_id="chan-a", include_private=True)
+        assert stored.content == self.SECRET
+        assert "concierge.tool" in quoted and "remember" in quoted
+        assert self.SECRET not in quoted
+        for word in ("Marisol", "launch", "legal"):
+            assert word not in quoted
+        assert f"{len(self.SECRET)} chars" in quoted
+
+    def test_a_recall_query_is_not_logged_either(self, tmp_path: Path) -> None:
+        quoted, _ = self._kept(tmp_path, [("recall", {"query": self.SECRET})])
+        assert "concierge.tool" in quoted and "recall" in quoted
+        assert self.SECRET not in quoted and "Marisol" not in quoted
+        assert "redacted query" in quoted
+
+
 class TestWatchRun:
     """``watch_run``: register interest, or answer at once if already done."""
 

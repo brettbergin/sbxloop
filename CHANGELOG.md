@@ -12,9 +12,14 @@
   agent assignment snapshots each agent's memory block when it is planned
   and keeps it across a resume, and an agent in a run whose `tools` names
   `memory` gets the same three tools, writing with the run's id and
-  channel. Built-in agents are given no memory tools, so the shipped team's
-  prompts and tools are unchanged. `[memory] enabled = false` turns all of
-  it off.
+  channel; a read-only session, and a critic whatever its session, gets
+  `recall` alone there too. A run with no channel keeps what its agents
+  remember for the whole workspace, so it is recalled in every channel —
+  `remember` says so in its own description when the agent is working
+  without one. A memory's text never reaches the daemon log, which every
+  agent can read from any channel. Built-in agents are given no memory
+  tools, so the shipped team's prompts and tools are unchanged.
+  `[memory] enabled = false` turns all of it off.
 
 - **Owners and admins can manage the workspace's people.** `GET /v1/users`
   lists every member with role, standing, sign-in source and last-seen time
