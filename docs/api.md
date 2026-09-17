@@ -212,8 +212,8 @@ handoffs, Angie for replies and work results that name no agent. The existing
 `author_id`, with `trigger` (`human` for every turn a person submits) and
 `parent_turn_id` (null until agents can start turns of their own), and
 `collaboration.message.created` events carry `author_kind` and `author_id`.
-Each channel records its creator as its owner member; channel access is still
-decided by that owner alone.
+Each channel records its creator as its owner member; who else may open it
+is described under "Channel access, members and participants" below.
 
 The event stream records `collaboration.participant.running`,
 `collaboration.tool.started`, and `collaboration.tool.completed` as the work
@@ -389,6 +389,57 @@ Every change records an event without any token:
 `workspace.invite.created` and `workspace.invite.revoked`, each with the
 acting user or client as `actor`.
 
+### Channel access, members and participants
+
+A channel is `private` (its channel members only) or `workspace` (every
+workspace member). Channels list and read with `visibility`, `created_by`,
+`silenced_until` and the caller's `my_role` (`owner`, `member`, or null when
+the caller has not joined). `GET /v1/channels` lists the channels the caller
+belongs to plus every workspace channel. The rules:
+
+- A private channel the caller does not belong to answers `404 channel_not_found` on every route, exactly like an unknown id, whatever the
+  caller's workspace role.
+- Any workspace member may read and post to a workspace channel. Posting (a
+  turn, a reaction, a participant change) makes the caller a channel member.
+- Managing a channel (`PATCH` title or `visibility`, `DELETE`, adding or
+  removing someone else) takes the channel's owner, or a workspace owner or
+  admin who can see it; anyone else gets `403 channel_forbidden`.
+- A turn may be cancelled by the person who asked or by someone who manages
+  the channel.
+- Teams and preferences stay per person.
+
+When `/v1/capabilities` lists `collaboration.channel_members`:
+
+| Route                                        | Needs  | Result                                                                                                  |
+| -------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------- |
+| `GET /v1/channels/{id}/members`              | read   | `{data: [{user_id, role, joined_at, last_read_sequence, user: {id, username, full_name, avatar_url}}]}` |
+| `POST /v1/channels/{id}/members`             | manage | Body `{user_id, role?}` (`member` by default); `201` with the entry; `409 already_channel_member`       |
+| `DELETE /v1/channels/{id}/members/{user_id}` | manage | `204`; one's own id leaves the channel and needs only read                                              |
+
+The user must be an active workspace member (`404 user_not_found`). The last
+channel owner cannot leave or be removed while anyone else remains (`409 last_channel_owner`): add another owner first. Changes record
+`collaboration.member.added` and `collaboration.member.removed` events with
+`{channel_id, user_id}`.
+
+When `/v1/capabilities` lists `collaboration.participants`, agents are channel
+participants:
+
+| Route                                          | Needs | Result                                                                                         |
+| ---------------------------------------------- | ----- | ---------------------------------------------------------------------------------------------- |
+| `GET /v1/channels/{id}/participants`           | read  | `{data: [{agent_slug, mode, added_by, muted_until, created_at, status, activity}]}`            |
+| `PUT /v1/channels/{id}/participants/{slug}`    | post  | Body `{mode?, muted_until?}`; adds the agent (`mention` by default) or changes the fields sent |
+| `DELETE /v1/channels/{id}/participants/{slug}` | post  | `204`; `404 participant_not_found` when it is not in the channel                               |
+
+`slug` must name an enabled agent in the registry (`404 agent_not_found`).
+`added_by` is an author object. `status` is `thinking` while the agent answers
+a running turn in the channel, `working` while a live run linked to the
+channel is credited to it (`activity` is then the run's title), and `idle`
+otherwise. Mentioning an agent with `@slug`, or targeting it, adds it as a
+`mention` participant when the turn is accepted. Changes record
+`collaboration.participant.added`, `.updated` and `.removed` with
+`{channel_id, agent_slug}`; an agent starting and finishing its part of a
+turn records `collaboration.participant.activity` with `{channel_id, agent_slug, status}` (`thinking`, then `idle`; Angie reports as `concierge`).
+
 ## Clients and tokens
 
 sbxloop issues its own tokens. A client is registered on the host with the
@@ -508,6 +559,7 @@ rechecked when it arrives) and a `revision` a command may pin.
 | CRUD     | `/v1/agents/{slug}/memories[/{id}]`          | collaboration          | An agent's long-term memory, scoped by source channel                 |
 | `GET`    | `/v1/channels/{id}/messages`                 | collaboration read     | Immutable ordered conversation history                                |
 | `POST`   | `/v1/channels/{id}/turns`                    | collaboration delegate | Accept an idempotent conversation/delegation turn                     |
+| CRUD     | `/v1/channels/{id}/members`, `/participants` | collaboration          | The people and agents in a channel                                    |
 | CRUD     | `/v1/prompts`, `/v1/connections`             | collaboration          | User preferences; redacted operator-managed connection status         |
 | `GET`    | `/v1/status`                                 | `runs:read`            | Live state: current run, queue, holds, breaker, stopping, watermark   |
 | `GET`    | `/v1/items[/{id}]`, `/v1/queue`              | `runs:read`            | Work items; the queue in dispatch order                               |

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import os
 import re
-from typing import Annotated
+from typing import Annotated, Literal
 
-from fastapi import APIRouter, Depends, Query, Request
+from fastapi import APIRouter, Depends, Query, Request, Response
 
 from sbxloop.agents.registry import AgentRegistry
 from sbxloop.api.auth.deps import (
@@ -21,6 +21,8 @@ from sbxloop.api.auth.store import AuthError
 from sbxloop.api.collaboration import (
     Author,
     Channel,
+    ChannelMember,
+    ChannelParticipant,
     CollaborationError,
     LocalUser,
     Member,
@@ -34,8 +36,15 @@ from sbxloop.api.collaboration import (
 from sbxloop.api.collaboration_schemas import (
     AuthorOut,
     ChannelCreate,
+    ChannelMemberCreate,
+    ChannelMemberOut,
+    ChannelMemberPage,
+    ChannelMemberUserOut,
     ChannelOut,
     ChannelPage,
+    ChannelParticipantOut,
+    ChannelParticipantPage,
+    ChannelParticipantUpdate,
     ChannelUpdate,
     ChannelWorkOut,
     ConnectionMutation,
@@ -205,7 +214,13 @@ def _problem(exc: CollaborationError) -> Problem:
     status = 404 if exc.code.endswith("not_found") else 409
     if exc.code in {"invalid_profile", "weak_password", "unknown_agent"}:
         status = 422
-    if exc.code in {"invite_invalid", "invite_expired", "invite_email_mismatch", "owner_required"}:
+    if exc.code in {
+        "invite_invalid",
+        "invite_expired",
+        "invite_email_mismatch",
+        "owner_required",
+        "channel_forbidden",
+    }:
         status = 403
     return Problem(status, exc.code, exc.message)
 
@@ -235,6 +250,49 @@ def _channel_out(channel: Channel) -> ChannelOut:
         revision=channel.revision,
         created_at=rfc3339(channel.created_at) or "",
         updated_at=rfc3339(channel.updated_at) or "",
+        visibility="workspace" if channel.visibility == "workspace" else "private",
+        created_by=channel.created_by,
+        silenced_until=channel.silenced_until,
+        my_role=channel.my_role,
+    )
+
+
+def _channel_member_out(member: ChannelMember) -> ChannelMemberOut:
+    return ChannelMemberOut(
+        user_id=member.user.id,
+        role=member.role,
+        joined_at=rfc3339(member.joined_at) or "",
+        last_read_sequence=member.last_read_sequence,
+        user=ChannelMemberUserOut(
+            id=member.user.id,
+            username=member.user.username,
+            full_name=member.user.full_name,
+            avatar_url=member.user.avatar_url,
+        ),
+    )
+
+
+def _participant_out(
+    participant: ChannelParticipant,
+    ctx: ApiContext,
+    thinking: set[str],
+    working: dict[str, str],
+) -> ChannelParticipantOut:
+    slug = participant.agent_slug
+    status: Literal["idle", "thinking", "working"] = "idle"
+    activity = None
+    if slug in working:
+        status, activity = "working", working[slug]
+    elif slug in thinking:
+        status = "thinking"
+    return ChannelParticipantOut(
+        agent_slug=slug,
+        mode=participant.mode,
+        added_by=_author_out(participant.added_by, ctx),
+        muted_until=participant.muted_until,
+        created_at=rfc3339(participant.created_at) or "",
+        status=status,
+        activity=activity,
     )
 
 
@@ -865,9 +923,8 @@ async def list_channels(
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
     member: Member = Depends(current_member),  # noqa: B008
 ) -> ChannelPage:
-    user = member.user
     channels, total = await ctx.call(
-        ctx.collaboration.list_channels, user.id, limit=limit, offset=offset
+        ctx.collaboration.list_channels, member, limit=limit, offset=offset
     )
     return ChannelPage(
         items=[_channel_out(channel) for channel in channels],
@@ -898,8 +955,7 @@ async def get_channel(
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
     member: Member = Depends(current_member),  # noqa: B008
 ) -> ChannelOut:
-    user = member.user
-    channel = await ctx.call(ctx.collaboration.get_channel, user.id, channel_id)
+    channel = await ctx.call(ctx.collaboration.get_channel, member, channel_id)
     if channel is None:
         raise Problem(404, "channel_not_found", "channel not found")
     return _channel_out(channel)
@@ -913,10 +969,17 @@ async def update_channel(
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
     member: Member = Depends(current_member),  # noqa: B008
 ) -> ChannelOut:
-    user = member.user
-    channel = await ctx.call(
-        ctx.collaboration.update_channel, user.id, channel_id, body.title, ctx.clock()
-    )
+    try:
+        channel = await ctx.call(
+            ctx.collaboration.update_channel,
+            member,
+            channel_id,
+            body.title,
+            ctx.clock(),
+            visibility=body.visibility,
+        )
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
     if channel is None:
         raise Problem(404, "channel_not_found", "channel not found")
     ctx.hub.notify()
@@ -930,8 +993,11 @@ async def delete_channel(
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
     member: Member = Depends(current_member),  # noqa: B008
 ) -> None:
-    user = member.user
-    if not await ctx.call(ctx.collaboration.delete_channel, user.id, channel_id, ctx.clock()):
+    try:
+        deleted = await ctx.call(ctx.collaboration.delete_channel, member, channel_id, ctx.clock())
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
+    if not deleted:
         raise Problem(404, "channel_not_found", "channel not found")
     ctx.hub.notify()
 
@@ -944,12 +1010,11 @@ async def list_messages(
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
     member: Member = Depends(current_member),  # noqa: B008
 ) -> list[MessageOut]:
-    user = member.user
-    channel = await ctx.call(ctx.collaboration.get_channel, user.id, channel_id)
+    channel = await ctx.call(ctx.collaboration.get_channel, member, channel_id)
     if channel is None:
         raise Problem(404, "channel_not_found", "channel not found")
     await ctx.call(ctx.project_work, channel_id)
-    messages = await ctx.call(ctx.collaboration.list_messages, user.id, channel_id, after=after)
+    messages = await ctx.call(ctx.collaboration.list_messages, member, channel_id, after=after)
     if messages is None:
         raise Problem(404, "channel_not_found", "channel not found")
     return await ctx.call(_messages_out, list(messages), ctx)
@@ -964,11 +1029,10 @@ async def set_message_reaction(
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
     member: Member = Depends(current_member),  # noqa: B008
 ) -> MessageOut:
-    user = member.user
     try:
         message = await ctx.call(
             ctx.collaboration.set_message_reaction,
-            user.id,
+            member,
             channel_id,
             message_id,
             emoji=body.emoji,
@@ -990,8 +1054,7 @@ async def channel_work(
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
     member: Member = Depends(current_member),  # noqa: B008
 ) -> list[ChannelWorkOut]:
-    user = member.user
-    channel = await ctx.call(ctx.collaboration.get_channel, user.id, channel_id)
+    channel = await ctx.call(ctx.collaboration.get_channel, member, channel_id)
     if channel is None:
         raise Problem(404, "channel_not_found", "channel not found")
     return await ctx.call(ctx.project_work, channel_id)
@@ -1017,6 +1080,25 @@ async def _targets(
         if selector in requested:
             raise Problem(422, "unknown_target", f"unknown agent or team: {selector}")
     return tuple(dict.fromkeys(result))
+
+
+def _mentioned_agents(ctx: ApiContext, content: str, targets: tuple[str, ...]) -> tuple[str, ...]:
+    """The agents a turn names, by ``@slug`` or as a target: each joins the
+    channel. A runner turn's mentions count too, though they seed no reply.
+    Reads the registry, so it runs through ``ctx.call``."""
+    slugs: list[str] = []
+    for selector in (*targets, *(m.group(1).casefold() for m in MENTION.finditer(content))):
+        agent = _addressable(ctx, selector)
+        if agent is not None:
+            slugs.append(agent)
+    return tuple(dict.fromkeys(slugs))
+
+
+def _addressable(ctx: ApiContext, slug: str) -> str | None:
+    """``slug``, when it names an agent a mention may reach. Reads the
+    registry, so it runs through ``ctx.call``."""
+    key = slug.strip().casefold()
+    return key if addressable(ctx.agents.get(key), key) else None
 
 
 @router.post("/channels/{channel_id}/turns", response_model=TurnAccepted, status_code=202)
@@ -1046,6 +1128,7 @@ async def create_turn(
     # parallel chat participants. The runner owns its own internal roles.
     targets = () if runner_selected else await _targets(ctx, user, body.content, body.target_slugs)
     intent = "delegate" if targets else body.intent
+    participants = await ctx.call(_mentioned_agents, ctx, body.content, targets)
     try:
         turn, message, created = await ctx.call(
             ctx.accept_collaboration_turn,
@@ -1057,6 +1140,7 @@ async def create_turn(
             client_message_id=body.client_message_id,
             actor=auth.principal.audit(),
             intent=intent,
+            participants=participants,
         )
     except CollaborationError as exc:
         raise _problem(exc) from exc
@@ -1074,8 +1158,7 @@ async def get_turn(
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
     member: Member = Depends(current_member),  # noqa: B008
 ) -> TurnOut:
-    user = member.user
-    turn = await ctx.call(ctx.collaboration.get_turn, user.id, channel_id, turn_id)
+    turn = await ctx.call(ctx.collaboration.get_turn, member, channel_id, turn_id)
     if turn is None:
         raise Problem(404, "turn_not_found", "turn not found")
     return _turn_out(turn)
@@ -1089,10 +1172,9 @@ async def list_turns(
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
     member: Member = Depends(current_member),  # noqa: B008
 ) -> list[TurnOut]:
-    user = member.user
     try:
         turns = await ctx.call(
-            ctx.collaboration.list_turns, user.id, channel_id, active_only=active_only
+            ctx.collaboration.list_turns, member, channel_id, active_only=active_only
         )
     except CollaborationError as exc:
         raise _problem(exc) from exc
@@ -1107,12 +1189,166 @@ async def cancel_turn(
     auth: Authenticated = Depends(require("collaboration:delegate")),  # noqa: B008
     member: Member = Depends(current_member),  # noqa: B008
 ) -> TurnOut:
-    user = member.user
-    turn = await ctx.call(ctx.collaboration.cancel_turn, user.id, channel_id, turn_id, ctx.clock())
+    try:
+        turn = await ctx.call(
+            ctx.collaboration.cancel_turn, member, channel_id, turn_id, ctx.clock()
+        )
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
     if turn is None:
         raise Problem(404, "turn_not_found", "turn not found")
     ctx.hub.notify()
     return _turn_out(turn)
+
+
+# -- channel members and participants --------------------------------------------
+
+
+@router.get("/channels/{channel_id}/members", response_model=ChannelMemberPage)
+async def list_channel_members(
+    channel_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelMemberPage:
+    try:
+        members = await ctx.call(ctx.collaboration.list_channel_members, member, channel_id)
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
+    return ChannelMemberPage(data=[_channel_member_out(value) for value in members])
+
+
+@router.post("/channels/{channel_id}/members", response_model=ChannelMemberOut, status_code=201)
+async def add_channel_member(
+    channel_id: str,
+    body: ChannelMemberCreate,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelMemberOut:
+    """Add a workspace member to the channel; takes managing the channel."""
+    try:
+        added = await ctx.call(
+            ctx.collaboration.add_channel_member,
+            member,
+            channel_id,
+            body.user_id,
+            body.role,
+            ctx.clock(),
+        )
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
+    ctx.hub.notify()
+    return _channel_member_out(added)
+
+
+@router.delete("/channels/{channel_id}/members/{user_id}", status_code=204)
+async def remove_channel_member(
+    channel_id: str,
+    user_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> Response:
+    """Remove someone from the channel (managing it), or leave it (one's own
+    id). The last owner cannot leave while anyone else remains."""
+    try:
+        await ctx.call(
+            ctx.collaboration.remove_channel_member, member, channel_id, user_id, ctx.clock()
+        )
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
+    ctx.hub.notify()
+    return Response(status_code=204)
+
+
+async def _participants_out(
+    ctx: ApiContext, channel_id: str, participants: list[ChannelParticipant]
+) -> list[ChannelParticipantOut]:
+    """Participants with their current activity: ``thinking`` from the
+    channel's running turns, ``working`` from its live, credited runs."""
+    thinking = await ctx.call(ctx.collaboration.thinking_agents, channel_id)
+    working: dict[str, str] = {}
+    for work in await ctx.call(ctx.project_work, channel_id):
+        snapshot = work if isinstance(work, dict) else work.model_dump()
+        if (
+            snapshot.get("run_id")
+            and snapshot.get("agent_slug")
+            and snapshot.get("state") not in TERMINAL_WORK_STATES
+        ):
+            working.setdefault(str(snapshot["agent_slug"]), str(snapshot.get("title") or ""))
+    return [_participant_out(value, ctx, thinking, working) for value in participants]
+
+
+#: Work states after which a run no longer keeps its agent busy.
+TERMINAL_WORK_STATES = frozenset({"merged", "completed", "failed", "blocked", "cancelled", "gated"})
+
+
+@router.get("/channels/{channel_id}/participants", response_model=ChannelParticipantPage)
+async def list_channel_participants(
+    channel_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelParticipantPage:
+    try:
+        participants = await ctx.call(ctx.collaboration.list_participants, member, channel_id)
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
+    return ChannelParticipantPage(data=await _participants_out(ctx, channel_id, participants))
+
+
+@router.put("/channels/{channel_id}/participants/{slug}", response_model=ChannelParticipantOut)
+async def put_channel_participant(
+    channel_id: str,
+    slug: str,
+    body: ChannelParticipantUpdate,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelParticipantOut:
+    """Add an agent to the channel, or change how it takes part."""
+    channel = await ctx.call(ctx.collaboration.get_channel, member, channel_id)
+    if channel is None:
+        raise Problem(404, "channel_not_found", "channel not found")
+    agent = await ctx.call(_addressable, ctx, slug)
+    if agent is None:
+        raise Problem(404, "agent_not_found", "agent not found")
+    try:
+        participant = await ctx.call(
+            ctx.collaboration.put_participant,
+            member,
+            channel_id,
+            agent,
+            body.model_dump(exclude_unset=True),
+            ctx.clock(),
+        )
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
+    ctx.hub.notify()
+    return (await _participants_out(ctx, channel_id, [participant]))[0]
+
+
+@router.delete("/channels/{channel_id}/participants/{slug}", status_code=204)
+async def remove_channel_participant(
+    channel_id: str,
+    slug: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> Response:
+    try:
+        await ctx.call(
+            ctx.collaboration.remove_participant,
+            member,
+            channel_id,
+            slug.strip().casefold(),
+            ctx.clock(),
+        )
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
+    ctx.hub.notify()
+    return Response(status_code=204)
 
 
 __all__ = ["router"]
