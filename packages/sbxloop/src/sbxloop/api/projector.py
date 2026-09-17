@@ -79,6 +79,14 @@ class Projector:
     def step(self) -> int:
         """One pass: project, notify, prune when due. Returns rows projected."""
         now = self.clock()
+        # Catalogue first: a finished run's work result names its files, so
+        # they must be on record before that result is written.
+        while self._pending and self._catalog is not None:
+            run_id = self._pending.popleft()
+            try:
+                self._catalog(run_id)
+            except Exception:
+                log.warning("api.catalog_failed", run=run_id, exc_info=True)
         if self._deliver_work is not None:
             try:
                 self._deliver_work()
@@ -96,12 +104,6 @@ class Projector:
         if copied or newest != self._last_seen:
             self._last_seen = newest
             self.hub.notify()
-        while self._pending and self._catalog is not None:
-            run_id = self._pending.popleft()
-            try:
-                self._catalog(run_id)
-            except Exception:
-                log.warning("api.catalog_failed", run=run_id, exc_info=True)
         if now - self._last_prune >= PRUNE_EVERY_S:
             self._last_prune = now
             try:

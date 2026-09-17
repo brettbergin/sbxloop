@@ -134,6 +134,17 @@
   stored without an author read back as `concierge`'s without rewriting
   them.
 
+- **A channel's work result names the files the run delivered.** The
+  projector wrote a finished workload run's `work_result` before it catalogued the
+  run's files, so the one result a channel ever got listed none of them. The
+  catalog is now built first, and delivery catalogues a finished run itself
+  when it gets there first. The result's `work.artifacts` lists up to 50
+  available files by catalog id, public run id, path, media type and size,
+  the message text ends with a `Files:` list for text-only surfaces, and
+  `collaboration.message_artifacts` advertises it. A code run's checkout is
+  never listed. A run whose files cannot be catalogued still gets its
+  result, without a file list, and delivery to other channels carries on.
+
 - **A failed `sbx create` says what sbx said.** Every create failure was
   rewrapped as "check host capacity and that `sbx create --help` supports
   --cpus and --memory", whatever the cause. On a host with memory to spare
