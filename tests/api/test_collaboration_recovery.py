@@ -305,7 +305,7 @@ def test_deleting_channel_stops_remaining_team_members(api: Any) -> None:
         concierge.first.set_result(
             ConciergeReply("late result", after=lambda: after_calls.append("delivered"))
         )
-    # Drain the single turn queue without a timing-based assertion.
-    api.ctx.turn_executor.submit(lambda: None).result(timeout=5)
+    # Drain the turn queue without a timing-based assertion.
+    assert api.ctx.turns.wait_idle(timeout=5)
     assert len(concierge.calls) == 1
     assert after_calls == []

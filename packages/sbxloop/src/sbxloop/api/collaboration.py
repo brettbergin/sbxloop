@@ -2358,21 +2358,58 @@ class CollaborationStore:
     def cancel_turn(self, viewer: Viewer, channel_id: str, turn_id: str, now: float) -> Turn | None:
         """Stop a turn. The person who asked, or someone who manages the
         channel, may stop it; ``None`` when either cannot be seen."""
+        return self._cancel_turn(turn_id, now, viewer=viewer, channel_id=channel_id)[0]
+
+    def request_turn_cancel(self, turn_id: str, now: float) -> bool:
+        """Cancel a turn the daemon itself is stopping (its channel's lane).
+
+        The same transition as :meth:`cancel_turn`: an unstarted turn is
+        settled as cancelled, a running one is marked ``cancelling`` for its
+        participant loop to observe. No ownership check: the caller is the
+        scheduler, not a person. Unlike a person's cancel it also applies
+        when the channel is no longer active, because the scheduler drops
+        the turn from its lane and nothing else would settle it. Returns
+        whether the turn was settled or moved to ``cancelling``.
+        """
+        return self._cancel_turn(turn_id, now, scheduler=True)[1]
+
+    def _cancel_turn(
+        self,
+        turn_id: str,
+        now: float,
+        *,
+        viewer: Viewer | None = None,
+        channel_id: str | None = None,
+        scheduler: bool = False,
+    ) -> tuple[Turn | None, bool]:
+        """The turn after the request, and whether this call changed it."""
         settle = False
         with self.dstore.immediate_transaction() as session:
-            try:
-                _, member = _access(session, channel_id, viewer, "read")
-            except CollaborationError:
-                return None
+            member: Member | None = None
+            if not scheduler and channel_id is not None:
+                try:
+                    _, member = _access(session, channel_id, viewer, "read")
+                except CollaborationError:
+                    return None, False
             row = session.get(TurnRow, turn_id)
-            if row is None or row.channel_id != channel_id:
-                return None
-            if member is not None and not (
-                row.author_kind in {"human", None} and row.author_id == member.user.id
-            ):
-                _access(session, channel_id, member, "manage")
+            if row is None or (channel_id is not None and row.channel_id != channel_id):
+                return None, False
+            channel_id = row.channel_id
+            channel = session.get(ChannelRow, channel_id)
+            active = channel is not None and channel.state == "active"
+            if not scheduler:
+                if not active:
+                    return None, False
+                if member is not None and not (
+                    row.author_kind in {"human", None} and row.author_id == member.user.id
+                ):
+                    _access(session, channel_id, member, "manage")
             if row.status not in {"accepted", "running"}:
-                return _turn(session, row)
+                return _turn(session, row), False
+            if not active and row.status == "accepted":
+                # Nothing will start this turn once its lane drops it.
+                self._cancel_deleted_channel_turn(session, row, now)
+                return _turn(session, row), True
             settle = row.status == "accepted"
             row.status = "cancelling"
             progress = json.loads(row.participants_json)
@@ -2387,7 +2424,9 @@ class CollaborationStore:
                 data={"channel_id": channel_id, "turn_id": turn_id},
             )
             result = _turn(session, row)
-        return self.finish_turn(turn_id, error=None, now=now) if settle else result
+        if settle:
+            return self.finish_turn(turn_id, error=None, now=now), True
+        return result, True
 
     def queue_handoff(
         self,

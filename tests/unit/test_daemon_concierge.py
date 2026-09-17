@@ -16,6 +16,7 @@ import json
 import threading
 import time
 from collections.abc import Callable, Iterator
+from concurrent.futures import Future
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -2127,7 +2128,11 @@ class TestQueueing:
         import threading
 
         gate = threading.Event()
-        concierge, client, *_ = make(tmp_path, [{"text": "one"}, {"text": "two"}])
+        concierge, client, *_ = make(
+            tmp_path,
+            [{"text": "one"}, {"text": "two"}],
+            config={"concierge": {"max_concurrent_turns": 1}},
+        )
         original = client.submit
 
         def slow_submit(job: JobRequest, **kwargs: Any) -> JobResult:
@@ -3803,8 +3808,64 @@ class TestConcurrentTurns:
         assert replies == ["one", "two"]
         assert [len(client.jobs) for client in clients] == [1, 1]
 
-    def test_turns_run_one_at_a_time_by_default(self, tmp_path: Path) -> None:
-        concierge, _, host, _, _ = make(tmp_path, [])
+    def test_bridge_turns_share_one_lane_however_wide_the_pool(self, tmp_path: Path) -> None:
+        """Discord, Slack, Mattermost and the TUI send turns with no
+        ``session_key``, so they all resume the one default session and share
+        its ``resume_session_id``, turn counter and model. They run one at a
+        time, in the order they arrived, whatever the width is set to."""
+        concierge, _, host, _, _ = make(
+            tmp_path, [], config={"concierge": {"max_concurrent_turns": 4}}
+        )
+        client = BlockingClient(2)
+        host._client = client  # type: ignore[assignment]
+        futures: list[Future[ConciergeReply]] = []
+        try:
+            futures = [
+                concierge.submit_turn(f"ask {name}", author=name, via=via)
+                for name, via in (("a", "discord"), ("b", "slack"))
+            ]
+            with pytest.raises(TimeoutError):
+                futures[1].result(timeout=0.5)
+            # Only the first is on a worker; the second is still in the lane.
+            assert len(client.jobs) == 1
+        finally:
+            client.gate.abort()
+            for future in futures:
+                future.exception(timeout=20)
+            concierge.close()
+        # The ask is the last line of the prompt the concierge builds.
+        asked = [job.prompt.splitlines()[-1] for job in client.jobs if job.prompt]
+        assert asked == ["ask a", "ask b"]
+
+    def test_turns_for_different_sessions_still_overlap(self, tmp_path: Path) -> None:
+        """The lane is per session, so a product channel's turn is not held
+        up by a bridge turn (or by another channel's)."""
+        concierge, _, host, _, _ = make(
+            tmp_path, [], config={"concierge": {"max_concurrent_turns": 2}}
+        )
+        client = BlockingClient(2)
+        host._client = client  # type: ignore[assignment]
+        try:
+            futures = [
+                concierge.submit_turn("ask bridge", author="a", handoff=lambda agent, message: "q"),
+                concierge.submit_turn(
+                    "ask channel",
+                    author="b",
+                    session_key="channel-1:angie",
+                    handoff=lambda agent, message: "q",
+                ),
+            ]
+            # BlockingClient holds each job until two are in flight at once:
+            # it only answers because the two lanes overlap.
+            replies = sorted(future.result(timeout=20).text for future in futures)
+        finally:
+            concierge.close()
+        assert replies == ["done ask bridge", "done ask channel"]
+
+    def test_turns_run_one_at_a_time_at_width_one(self, tmp_path: Path) -> None:
+        concierge, _, host, _, _ = make(
+            tmp_path, [], config={"concierge": {"max_concurrent_turns": 1}}
+        )
         client = BlockingClient(2)
         host._client = client  # type: ignore[assignment]
         try:
