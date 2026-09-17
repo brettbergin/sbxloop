@@ -419,20 +419,34 @@ def lease_agent(
 
 class TestLeases:
     """Several turns share the one concierge sandbox through leased clients:
-    a bounded pool of worker clients over the same box, each lease knowing
-    which incarnation of the box it was handed out for."""
+    a bounded pool of worker clients over the same box. A lease yields the
+    worker client itself; while it is held, ``lease_generation(client)``
+    names the incarnation of the box it was handed out for."""
+
+    def test_a_lease_yields_the_worker_client_itself(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, _sbx = lease_agent(tmp_path, monkeypatch)
+        try:
+            with agent.lease() as client:
+                assert isinstance(client, WorkerClient)
+                assert agent.lease_generation(client) is not None
+            # Once returned, the client names no lease any more.
+            assert agent.lease_generation(client) is None
+        finally:
+            agent.close()
 
     def test_the_default_width_leases_the_one_client_and_queues_the_next(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         agent, sbx = lease_agent(tmp_path, monkeypatch)
         try:
-            with agent.lease() as lease:
-                assert lease.client is agent.client()
+            with agent.lease() as client:
+                assert client is agent.client()
                 with pytest.raises(WorkerTimeoutError), agent.lease(timeout=0.05):
                     pass
             with agent.lease() as again:
-                assert again.client is lease.client
+                assert again is client
             assert sbx.created == [agent.name]
         finally:
             agent.close()
@@ -443,15 +457,15 @@ class TestLeases:
         agent, sbx = lease_agent(tmp_path, monkeypatch, turns=2)
         try:
             with agent.lease() as first, agent.lease() as second:
-                assert first.client is not second.client
-                assert first.client.sandbox.name == second.client.sandbox.name == agent.name
-                assert second.client.role == "agent"
-                assert second.client.backend == agent.config.agent.backend
-                assert first.generation == second.generation
+                assert first is not second
+                assert first.sandbox.name == second.sandbox.name == agent.name
+                assert second.role == "agent"
+                assert second.backend == agent.config.agent.backend
+                assert agent.lease_generation(first) == agent.lease_generation(second)
             assert sbx.created == [agent.name]
             # Returned clients are reused, not rebuilt.
             with agent.lease() as a, agent.lease() as b:
-                assert {id(a.client), id(b.client)} == {id(first.client), id(second.client)}
+                assert {id(a), id(b)} == {id(first), id(second)}
         finally:
             agent.close()
 
@@ -464,8 +478,8 @@ class TestLeases:
 
         def third() -> None:
             started.set()
-            with agent.lease(timeout=5) as lease:
-                got.append(lease.client)
+            with agent.lease(timeout=5) as client:
+                got.append(client)
 
         try:
             with agent.lease() as first, agent.lease() as second:
@@ -478,7 +492,7 @@ class TestLeases:
                 assert thread.is_alive() and got == []  # waiting while both are out
             thread.join(5)
             assert not thread.is_alive()
-            assert got[0] in (first.client, second.client)
+            assert got[0] in (first, second)
             assert sbx.created == [agent.name]
         finally:
             agent.close()
@@ -490,23 +504,24 @@ class TestLeases:
         agent, sbx = lease_agent(tmp_path, monkeypatch, turns=2, clock=lambda: now[0])
         try:
             with agent.lease() as old:
-                pass
-            assert agent.note_failure(WorkerError("died"), generation=old.generation) is True
+                old_generation = agent.lease_generation(old)
+            assert agent.note_failure(WorkerError("died"), generation=old_generation) is True
             assert sbx.removed == [agent.name]
             with agent.lease() as new:
-                assert new.generation != old.generation
-                assert new.client is not old.client
+                new_generation = agent.lease_generation(new)
+                assert new_generation != old_generation
+                assert new is not old
             assert sbx.created == [agent.name, agent.name]
             now[0] += REPROVISION_MIN_INTERVAL_S + 1
             # A late report from a turn that ran on the old box: the box it
             # blames is already gone, so its retry may go ahead, but nothing
             # is removed.
-            assert agent.note_failure(WorkerError("late"), generation=old.generation) is True
+            assert agent.note_failure(WorkerError("late"), generation=old_generation) is True
             assert sbx.removed == [agent.name]
             assert agent.exists()
             with agent.lease() as after:
-                assert after.generation == new.generation
-                assert after.client is new.client
+                assert agent.lease_generation(after) == new_generation
+                assert after is new
         finally:
             agent.close()
 
@@ -516,21 +531,22 @@ class TestLeases:
         agent, sbx = lease_agent(tmp_path, monkeypatch, turns=2)
         try:
             with agent.lease() as busy:
+                busy_generation = agent.lease_generation(busy)
                 with agent.lease() as failed:
-                    pass
-                assert agent.note_failure(WorkerError("died"), generation=failed.generation)
+                    failed_generation = agent.lease_generation(failed)
+                assert agent.note_failure(WorkerError("died"), generation=failed_generation)
                 # The other turn is still using the box.
                 assert sbx.removed == []
                 assert agent.exists()
                 # A second report for the same condemned box changes nothing.
-                assert agent.note_failure(WorkerError("also"), generation=busy.generation)
+                assert agent.note_failure(WorkerError("also"), generation=busy_generation)
                 assert sbx.removed == []
             # The last lease came back: now the box goes, and the next lease
             # provisions a fresh one.
             assert sbx.removed == [agent.name]
             with agent.lease() as fresh:
-                assert fresh.generation != busy.generation
-                assert fresh.client is not busy.client
+                assert agent.lease_generation(fresh) != busy_generation
+                assert fresh is not busy
             assert sbx.created == [agent.name, agent.name]
         finally:
             agent.close()
@@ -542,8 +558,8 @@ class TestLeases:
         try:
             with agent.lease():
                 with agent.lease() as failed:
-                    pass
-                agent.note_failure(WorkerError("died"), generation=failed.generation)
+                    failed_generation = agent.lease_generation(failed)
+                agent.note_failure(WorkerError("died"), generation=failed_generation)
                 # The failed turn's retry must not land on the box that is
                 # about to be removed; it waits for the replacement.
                 with pytest.raises(WorkerTimeoutError), agent.lease(timeout=0.05):
@@ -560,16 +576,19 @@ class TestLeases:
             with agent.lease() as idle:
                 pass
             with agent.lease() as outstanding:
-                assert outstanding.client is idle.client
+                assert outstanding is idle
+                outstanding_generation = agent.lease_generation(outstanding)
                 agent.remove()
                 with agent.lease() as current:
-                    assert current.generation != outstanding.generation
-                    assert current.client is not outstanding.client
+                    current_generation = agent.lease_generation(current)
+                    assert current_generation != outstanding_generation
+                    assert current is not outstanding
             # Neither the idle client of the old box nor the one handed back
             # after the replacement is ever leased again.
             with agent.lease() as a, agent.lease() as b:
-                assert outstanding.client not in (a.client, b.client)
-                assert current.client in (a.client, b.client)
-                assert a.generation == b.generation == current.generation
+                assert outstanding not in (a, b)
+                assert current in (a, b)
+                assert agent.lease_generation(a) == agent.lease_generation(b)
+                assert agent.lease_generation(a) == current_generation
         finally:
             agent.close()

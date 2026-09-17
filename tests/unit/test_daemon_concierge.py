@@ -24,7 +24,6 @@ from typing import Any, ClassVar
 import pytest
 
 from sbxloop.config import Config
-from sbxloop.daemon.agentbox import AgentLease
 from sbxloop.daemon.concierge import (
     CONCIERGE_AGENT,
     CONCIERGE_RUN_ID,
@@ -115,8 +114,11 @@ class FakeHost:
         return self._client
 
     @contextmanager
-    def lease(self, timeout: float | None = None) -> Iterator[AgentLease]:
-        yield AgentLease(self.client(), self.generation)  # type: ignore[arg-type]
+    def lease(self, timeout: float | None = None) -> Iterator[Any]:
+        yield self.client()
+
+    def lease_generation(self, client: object) -> int | None:
+        return self.generation
 
     def note_failure(self, exc: BaseException, generation: int | None = None) -> bool:
         self.failures.append(exc)
@@ -3716,11 +3718,11 @@ class LeasingHost(FakeHost):
         self.lock = threading.Lock()
 
     @contextmanager
-    def lease(self, timeout: float | None = None) -> Iterator[AgentLease]:
+    def lease(self, timeout: float | None = None) -> Iterator[Any]:
         with self.lock:
             client = self.free.pop(0)
         try:
-            yield AgentLease(client, self.generation)
+            yield client
         finally:
             with self.lock:
                 self.free.append(client)

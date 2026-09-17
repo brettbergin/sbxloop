@@ -79,7 +79,7 @@ REPROVISION_MIN_INTERVAL_S = 300.0
 LEASE_WAIT_MARGIN_S = 60.0
 
 
-class AgentLease(NamedTuple):
+class _Held(NamedTuple):
     """One turn's hold on a worker client in the concierge sandbox."""
 
     client: WorkerClient
@@ -126,6 +126,7 @@ class DaemonAgent:
         # and `_primary_pooled` says whether `_client` is one of them.
         # `_condemned` marks a box that failed while other leases still
         # used it: it is removed when the last of them comes back.
+        # `_leased` maps each leased client (by id) to its generation.
         self._pool = threading.Condition()
         self._provision_lock = threading.RLock()
         self._generation = 0
@@ -134,6 +135,7 @@ class DaemonAgent:
         self._active = 0
         self._primary_pooled = False
         self._condemned = False
+        self._leased: dict[int, int] = {}
 
     @property
     def workspace(self) -> Path:
@@ -158,24 +160,32 @@ class DaemonAgent:
         return self.config.concierge.max_concurrent_turns
 
     @contextmanager
-    def lease(self, timeout: float | None = None) -> Iterator[AgentLease]:
-        """Hold a worker client of the sandbox for one turn.
+    def lease(self, timeout: float | None = None) -> Iterator[WorkerClient]:
+        """Hold a worker client of the sandbox for one turn and yield it.
 
         Clients are made lazily, up to :attr:`max_leases`, and reused once
         returned; with every one out this waits up to ``timeout`` seconds
         (by default a turn's timeout plus :data:`LEASE_WAIT_MARGIN_S`), then
         raises :class:`WorkerTimeoutError`. With one lease allowed, the
-        lease is always :meth:`client`'s own client.
+        lease is always :meth:`client`'s own client. While the lease is
+        held, :meth:`lease_generation` names the box it was handed out for.
         """
         if timeout is None:
             timeout = self.config.concierge.timeout_s + LEASE_WAIT_MARGIN_S
         held = self._acquire(timeout)
         try:
-            yield held
+            yield held.client
         finally:
             self._release(held)
 
-    def _acquire(self, timeout: float) -> AgentLease:
+    def lease_generation(self, client: WorkerClient) -> int | None:
+        """The sandbox generation a currently leased ``client`` was handed
+        out for (``None`` once it is returned), to pass to
+        :meth:`note_failure`."""
+        with self._pool:
+            return self._leased.get(id(client))
+
+    def _acquire(self, timeout: float) -> _Held:
         deadline = time.monotonic() + timeout
         with self._pool:
             while True:
@@ -184,7 +194,7 @@ class DaemonAgent:
                 if not self._condemned:
                     if self._free:
                         self._active += 1
-                        return AgentLease(self._free.pop(), self._generation)
+                        return self._hold_locked(self._free.pop(), self._generation)
                     if self._slots < self.max_leases:
                         self._slots += 1
                         self._active += 1
@@ -205,7 +215,12 @@ class DaemonAgent:
                     self._slots -= 1
                 self._pool.notify_all()
             raise
-        return AgentLease(client, generation)
+        with self._pool:
+            return self._hold_locked(client, generation)
+
+    def _hold_locked(self, client: WorkerClient, generation: int) -> _Held:
+        self._leased[id(client)] = generation
+        return _Held(client, generation)
 
     def _pooled_client(self) -> WorkerClient:
         """A new client for the pool: the provisioning client first, then
@@ -236,8 +251,9 @@ class DaemonAgent:
             **options,
         )
 
-    def _release(self, held: AgentLease) -> None:
+    def _release(self, held: _Held) -> None:
         with self._pool:
+            self._leased.pop(id(held.client), None)
             self._active -= 1
             if held.generation == self._generation:
                 if self._condemned:

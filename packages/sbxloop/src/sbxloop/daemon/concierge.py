@@ -56,7 +56,6 @@ from sbxloop.cli.tui import format_event
 from sbxloop.config import SINK_NAMES, BridgeBackend, Config, ScheduleConfig
 from sbxloop.configedit import ConfigEditError, ConfigEditor, keys as configkeys
 from sbxloop.daemon import configview
-from sbxloop.daemon.agentbox import AgentLease
 from sbxloop.daemon.chat_choices import (
     ChoiceQuestion,
     PendingFiling,
@@ -264,7 +263,9 @@ class SessionHost(Protocol):
 
     def client(self) -> WorkerClient: ...
 
-    def lease(self, timeout: float | None = None) -> AbstractContextManager[AgentLease]: ...
+    def lease(self, timeout: float | None = None) -> AbstractContextManager[WorkerClient]: ...
+
+    def lease_generation(self, client: WorkerClient) -> int | None: ...
 
     def agent_rate_limits(self) -> RateLimitReport: ...
 
@@ -859,9 +860,9 @@ class Concierge:
 
         # The turn holds its own client for the whole session call, so
         # overlapping turns never share one worker process.
-        with self.host.lease() as lease:
-            self._update_turn(lease_generation=lease.generation)
-            result = lease.client.submit(
+        with self.host.lease() as client:
+            self._update_turn(lease_generation=self.host.lease_generation(client))
+            result = client.submit(
                 job,
                 agent=CONCIERGE_AGENT if self._turn_role == "concierge" else self._turn_role,
                 tool_handler=handler if available_tools else None,
