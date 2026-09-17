@@ -22,12 +22,14 @@ not there).
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
+from sbxloop.agents.assignment import RUN_ROLES
 from sbxloop.config import SINK_NAMES, Config
 from sbxloop.daemon.controls.results import ControlError
-from sbxloop.daemon.model import WorkItem
+from sbxloop.daemon.model import WorkItem, requested_roles_json
 from sbxloop.engine.model import RunKind
 from sbxloop.entrygraph import resolve_targets
 from sbxloop.errors import ConfigError, DaemonError, GithubOpsError, SbxError, WorkerError
@@ -35,6 +37,9 @@ from sbxloop.ghids import api_item_id
 from sbxloop.ids import new_run_id
 from sbxloop.log import get_logger
 from sbxloop.recipes import RECIPES
+
+if TYPE_CHECKING:
+    from sbxloop.agents.registry import AgentRegistry
 
 log = get_logger(__name__)
 
@@ -51,6 +56,11 @@ class IssueAdmission:
     repository: str
     number: int
     run_kind: Literal["code", "workload"] = "code"
+    #: The agent that leads the run (None: the built-in lead), the agent
+    #: asked for in each run role, and the channel the work answers to.
+    lead: str | None = None
+    roles: Mapping[str, str] = field(default_factory=dict)
+    channel_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,6 +71,9 @@ class WorkloadAdmission:
     #: The key the item id is minted from; a surface with a durable message
     #: id passes it so a retried turn queues one run. ``None`` mints one.
     key: str | None = None
+    lead: str | None = None
+    roles: Mapping[str, str] = field(default_factory=dict)
+    channel_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,6 +84,63 @@ class ToolAdmission:
 
 
 AdmitRequest = IssueAdmission | WorkloadAdmission | ToolAdmission
+
+
+def _usable_slug(registry: AgentRegistry, slug: str, role: str) -> str:
+    """``slug``'s canonical name when it may take ``role``; a named refusal otherwise."""
+    wanted = slug.strip()
+    agent = registry.get(wanted) if wanted else None
+    if agent is None:
+        raise ControlError("invalid_argument", f"no agent is called {slug!r}")
+    if agent.archived:
+        raise ControlError("invalid_argument", f"agent {agent.slug!r} is archived")
+    if not agent.active:
+        raise ControlError("invalid_argument", f"agent {agent.slug!r} is disabled")
+    if agent.legacy or role not in agent.spec.roles:
+        declared = ", ".join(agent.spec.roles) or "none"
+        raise ControlError(
+            "invalid_argument",
+            f"agent {agent.slug!r} does not declare the {role} role (it declares: {declared})",
+        )
+    return agent.slug
+
+
+def resolve_assignment_request(
+    registry: AgentRegistry, request: AdmitRequest
+) -> tuple[str | None, dict[str, str]]:
+    """The lead and the agent per run role ``request`` asks for, by canonical
+    slug. Every named agent must exist, be active and declare the role it is
+    asked to take; the first that does not is refused by name."""
+    if not isinstance(request, IssueAdmission | WorkloadAdmission):
+        return None, {}
+    roles: dict[str, str] = {}
+    for role, slug in request.roles.items():
+        if role not in RUN_ROLES:
+            raise ControlError(
+                "invalid_argument",
+                f"unknown run role {role!r} (one of {', '.join(RUN_ROLES)}; "
+                "the lead is named by `lead`)",
+            )
+        roles[role] = _usable_slug(registry, slug, role)
+    lead = _usable_slug(registry, request.lead, "lead") if request.lead else None
+    return lead, roles
+
+
+def with_assignment_request(
+    item: WorkItem, request: AdmitRequest, lead: str | None, roles: Mapping[str, str]
+) -> WorkItem:
+    """``item`` carrying the channel, lead and roles the request names."""
+    if not isinstance(request, IssueAdmission | WorkloadAdmission):
+        return item
+    channel_id = (request.channel_id or "").strip() or None
+    update: dict[str, Any] = {}
+    if channel_id is not None:
+        update["channel_id"] = channel_id
+    if lead is not None:
+        update["lead_agent"] = lead
+    if roles:
+        update["assignment_json"] = requested_roles_json(roles)
+    return item.model_copy(update=update) if update else item
 
 
 def _title(text: str, fallback: str) -> str:

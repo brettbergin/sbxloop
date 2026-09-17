@@ -40,7 +40,14 @@ from typing import Any, NamedTuple, Protocol, cast
 from zoneinfo import ZoneInfo
 
 from sbxloop import __version__, hostgit
+from sbxloop.agents.assignment import (
+    AgentAssignment,
+    MemoryBlocks,
+    RunRole,
+    plan_assignment,
+)
 from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
+from sbxloop.agents.registry import AgentRegistry, DbAgentRegistry
 from sbxloop.config import Config, GithubConfig, SandboxConfig, ScheduleConfig
 from sbxloop.daemon.controls.eligibility import Subject, check as check_eligibility
 from sbxloop.daemon.controls.generation import (
@@ -62,6 +69,8 @@ from sbxloop.daemon.model import (
     TickOutcome,
     TickResult,
     WorkItem,
+    is_planned_assignment,
+    requested_roles,
 )
 from sbxloop.daemon.schedule import Cadence, ScheduleRow, format_due
 from sbxloop.daemon.sources import HIDDEN_MARKER_RE, IssueContext, WorkSource
@@ -330,6 +339,14 @@ def _fit_context(block: str, room: int, limit: int) -> str:
     return f"{kept}\n\n{note.format(hidden=hidden)}" if kept else note.format(hidden=hidden)
 
 
+def _item_assignment(item: WorkItem) -> AgentAssignment | None:
+    """The planned assignment ``item`` carries; None before one is planned."""
+    if not is_planned_assignment(item.assignment_json):
+        return None
+    assert item.assignment_json is not None  # nosec B101 - checked above
+    return AgentAssignment.from_json(item.assignment_json)
+
+
 class DaemonLoop:
     def __init__(
         self,
@@ -362,6 +379,12 @@ class DaemonLoop:
         self.worker_python = worker_python
         self.install_workers = install_workers
         self._runner = runner or self._default_runner
+        # Where a run's agents come from: the built-ins, `[[agents]]`, then
+        # the agents people saved (built per config, like the API's).
+        self._agents: tuple[Config, AgentRegistry] | None = None
+        # The agents' remembered context, when a memory service is wired
+        # in; without one each agent's memory block is empty.
+        self.memory: MemoryBlocks | None = None
         self._stop = threading.Event()
         # An operator's `stop`: unlike a signal, it lets a landing the
         # daemon is completing finish before the process exits.
@@ -2392,6 +2415,53 @@ class DaemonLoop:
         self._await(handle)
         return self._settle_run(handle)
 
+    @property
+    def agents(self) -> AgentRegistry:
+        """The agent registry for the config this loop currently holds."""
+        cached = self._agents
+        if cached is None or cached[0] is not self.config:
+            cached = (self.config, DbAgentRegistry(self.config, self.dstore, clock=self.clock))
+            self._agents = cached
+        return cached[1]
+
+    def _assign(self, item: WorkItem, now: float) -> WorkItem:
+        """``item`` carrying the agent assignment its run starts with.
+
+        An item already holding a planned assignment keeps it, so every
+        attempt at the same work goes to the same agents; otherwise the
+        assignment is planned from the lead and roles asked for at
+        admission (none: the built-in team) and stored on the item."""
+        if is_planned_assignment(item.assignment_json):
+            return item
+        requested = cast("dict[RunRole, str]", requested_roles(item.assignment_json))
+        planned = plan_assignment(
+            self.agents,
+            kind=item.kind,
+            lead=item.lead_agent,
+            requested=requested,
+            memory=self.memory,
+            channel_id=item.channel_id,
+        )
+        if item.origin_agent is not None or item.chain_depth:
+            planned = AgentAssignment(
+                lead=planned.lead,
+                roles=planned.roles,
+                agents=planned.agents,
+                channel_id=planned.channel_id,
+                origin_agent=item.origin_agent,
+                chain_depth=item.chain_depth,
+            )
+        text = planned.to_json()
+        self.dstore.set_item_assignment(item.item_id, text, now)
+        log.info(
+            "run.assigned",
+            item=item.item_id,
+            lead=planned.lead,
+            roles=dict(planned.roles),
+            default=planned.is_default(),
+        )
+        return item.model_copy(update={"assignment_json": text})
+
     def _launch(self, item: WorkItem, *, resume_run_id: str | None) -> RunHandle:
         """Mark the item running, build its engine, register the run and
         start its thread. Returns once the run is executing."""
@@ -2399,7 +2469,7 @@ class DaemonLoop:
         run_id = resume_run_id or new_run_id()
         if resume_run_id is None:
             self.dstore.mark_running(item.item_id, run_id, now)
-            item = self.dstore.get(item.item_id) or item
+            item = self._assign(self.dstore.get(item.item_id) or item, now)
             self.source.report_started(item, run_id)
             # Fresh runs only: a resumed run is pinned to the clone it
             # already has, so moving the source would change nothing.
@@ -4330,6 +4400,7 @@ class DaemonLoop:
             # profile; a code item passes the defaults, as it always has.
             kind=item.kind,
             profile=item.profile,
+            assignment=_item_assignment(item),
         )
 
     # -- reporting -----------------------------------------------------------------------

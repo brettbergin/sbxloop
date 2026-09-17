@@ -61,6 +61,20 @@
   section is enabled. Local password sign-in is unchanged, and the secret
   never appears in config, events or logs.
 
+- **Work can be admitted for named agents.** `POST /v1/items` takes an
+  optional `lead`, a `roles` map from run role to agent slug and a
+  `channel_id` on issue and workload bodies (advertised as
+  `intake.assignment`); an agent that does not exist, is disabled or
+  archived, or does not declare the role is refused with a 422 naming it.
+  Dispatch plans each run's agent assignment from what was asked (the
+  built-in team otherwise), stores it with the item and hands it to the
+  engine, and a later attempt reuses it. Items read back with `lead_agent`
+  and `assignment`. A chat turn passes its channel and the run roles of the
+  agents it mentioned to the work it starts, finished work is delivered to
+  the channel the item names, and a result is credited to the item's lead.
+  Revision 0026 adds the channel, lead, assignment and agent-chain columns
+  to work items; polled issues run exactly as before.
+
 - **A workspace can hold more than one person.** Local users now belong to
   the installation's workspace as an owner, admin or member, and the
   database upgrade makes every existing local user an owner. A second user

@@ -234,6 +234,36 @@ The association is durable turn data, independent of event retention; unrelated
 repositories with the same issue number do not match. No source polling or
 runner behavior changes.
 
+### Admitting work for named agents
+
+`POST /v1/items` takes three optional fields on an `issue` or `workload`
+body (advertised as `intake.assignment`): `lead`, the agent that leads the
+run; `roles`, an object mapping a run role (`planner`, `builder`, `critic`,
+`operator`) to an agent slug; and `channel_id`, the channel the work answers
+to. Each named agent must exist, be active (not disabled or archived) and
+declare the role it is asked to take (`lead` for the lead); anything else is
+`422 invalid_argument` naming the agent and the role, and nothing is queued
+or labelled. A `channel_id` the caller cannot read is `404 channel_not_found`.
+A body without them admits work exactly as before.
+
+When the item is dispatched, the daemon plans its assignment: each role takes
+the agent asked for and the built-in agent otherwise, and the lead is the one
+asked for or Angie. The plan is stored with the item, and every later attempt
+at the same item reuses it, even if an agent was archived since. Issues found
+by polling run with the built-in team. Items read back with `lead_agent` (the
+planned lead once dispatched, the requested one before) and `assignment` (the
+agent in each run role, or `null` when none were named and nothing is planned
+yet).
+
+A chat turn passes its channel and, for the agents it mentioned, the run roles
+they declare to the work it starts: a workload it queues carries them, and an
+issue it files or labels leaves a note the polled item picks up. A turn
+answered by Angie names Angie as the lead. An item that names its channel is
+delivered there even when its key names no message in it (as part of the
+channel's latest turn when it was admitted), and never to a channel other
+than its own. A work result is credited to the item's lead when it has one,
+and to the participant that asked otherwise.
+
 A finished workload or tool run's files are catalogued before its work result
 is written, so the first `work_result` message already names them. Its `work.artifacts` (and
 each entry of `GET /v1/channels/{id}/work`) lists up to 50 available files,

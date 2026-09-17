@@ -96,6 +96,17 @@ class WorkItemRow(Base):
     # Bumped by a trigger on every UPDATE (revision 0010): what a remote
     # command's `expected_revision` is checked against.
     revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
+    # Who the work was admitted for (revision 0026): the channel it answers
+    # to, the lead asked for, the agent assignment (the roles requested at
+    # admission, then the plan dispatch made from them), and, for work an
+    # agent started, that agent, the item it came from and how deep the
+    # chain of agent-started work is.
+    channel_id: Mapped[str | None] = mapped_column(Text)
+    lead_agent: Mapped[str | None] = mapped_column(Text)
+    assignment_json: Mapped[str | None] = mapped_column(Text)
+    origin_agent: Mapped[str | None] = mapped_column(Text)
+    parent_item_id: Mapped[str | None] = mapped_column(Text)
+    chain_depth: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
 
 
 class DaemonRunRow(Base):
