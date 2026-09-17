@@ -141,9 +141,11 @@ addopts = [
 ]
 # A test that wedges (a thread never released, a wait with no bound) fails
 # here with every thread's stack instead of holding its xdist worker, and
-# with it the CI job, until the runner's own limit. The slowest tests take
-# well under a minute; this is a ceiling for a hang, not a budget. A test
-# that legitimately needs longer says so with @pytest.mark.timeout.
+# with it the CI job, until the runner's own limit. A whole CI slice takes
+# under four minutes; on a slow host (WSL, where the fake sbx's mount probe
+# crawls) single engine tests have been seen near 220s, so this sits above
+# that. It is a ceiling for a hang, not a budget: a test that legitimately
+# needs longer says so with @pytest.mark.timeout.
 timeout = 300
 
 [tool.coverage.run]
