@@ -50,6 +50,7 @@ FEATURES: tuple[str, ...] = (
     "collaboration.connections.read",
     "collaboration.message_artifacts",
     "collaboration.message_authors",
+    "agents.registry",
 )
 
 

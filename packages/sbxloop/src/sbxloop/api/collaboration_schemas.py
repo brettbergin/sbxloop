@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import Field
 
+from sbxloop.agents.definition import AgentRoleName, AgentSpec, AgentStartKind
 from sbxloop.api.models import ApiModel
 
 
@@ -57,6 +58,49 @@ class AgentOut(ApiModel):
     phase_models: dict[str, str] = Field(default_factory=dict)
     execution_mode: str = "chat_and_managed_runs"
     read_only: bool = False
+    avatar: str = ""
+    color: str = ""
+    roles: list[str] = Field(default_factory=list)
+    tools: list[str] | None = None
+    skills: list[str] | None = None
+    mcp: list[str] | None = None
+    credentials: list[str] = Field(default_factory=list)
+    interests: list[str] = Field(default_factory=list)
+    can_start: list[str] = Field(default_factory=list)
+    max_runs_per_day: int | None = None
+    aliases: list[str] = Field(default_factory=list)
+    enabled: bool = True
+    source: Literal["builtin", "config", "user"] = "builtin"
+    editable: bool = False
+    revision: int = 0
+
+
+class AgentCreate(AgentSpec):
+    """A new agent: the agent spec itself. Unknown keys (hosts, egress) are refused."""
+
+
+class AgentUpdate(ApiModel):
+    """Changes to a person's agent, made against ``expected_revision``.
+    Keys left out keep their value; ``slug`` cannot change."""
+
+    expected_revision: int = Field(ge=0)
+    slug: str | None = None
+    name: str | None = Field(default=None, max_length=120)
+    description: str | None = Field(default=None, max_length=500)
+    avatar: str | None = None
+    color: str | None = None
+    instructions: str | None = Field(default=None, max_length=8000)
+    model: str | None = None
+    roles: list[AgentRoleName] | None = None
+    tools: list[str] | None = None
+    skills: list[str] | None = None
+    mcp: list[str] | None = None
+    credentials: list[str] | None = None
+    interests: list[str] | None = None
+    can_start: list[AgentStartKind] | None = None
+    max_runs_per_day: int | None = Field(default=None, ge=0)
+    aliases: list[str] | None = None
+    enabled: bool | None = None
 
 
 class TeamCreate(ApiModel):

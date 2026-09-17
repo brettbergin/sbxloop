@@ -182,10 +182,18 @@ class AgentDefinition:
     legacy: bool = False
     category: str = ""
     capabilities: tuple[str, ...] = ()
+    #: A person's agent they archived: still resolves by slug so saved
+    #: references can say what it was, but is neither listed nor addressable.
+    archived: bool = False
 
     @property
     def slug(self) -> str:
         return self.spec.slug
+
+    @property
+    def active(self) -> bool:
+        """Enabled and not archived: what a team or a mention may name."""
+        return self.spec.enabled and not self.archived
 
     @property
     def read_only(self) -> bool:

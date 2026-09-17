@@ -20,8 +20,13 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 
-from sbxloop.agents.registry import AgentRegistry, default_registry
-from sbxloop.api.agents import AGENTS_BY_SLUG, ANGIE_PERSONA
+from sbxloop.agents.registry import (
+    AgentRegistry,
+    DbAgentRegistry,
+    addressable,
+    default_registry,
+)
+from sbxloop.api.agents import ANGIE_PERSONA, AgentDefinition
 from sbxloop.api.artifacts import ArtifactCatalog
 from sbxloop.api.auth.keys import SigningKeys
 from sbxloop.api.auth.ratelimit import FailureLimiter
@@ -140,10 +145,17 @@ class ApiContext:
 
     @property
     def agents(self) -> AgentRegistry:
-        """The agent registry for the config this context currently holds."""
+        """The agent registry for the config this context currently holds:
+        the built-ins, ``[[agents]]``, then the agents people saved (a
+        context without a daemon store serves only the first two)."""
         cached = self._agents
         if cached is None or cached[0] is not self.config:
-            cached = (self.config, default_registry(self.config))
+            registry: AgentRegistry = (
+                default_registry(self.config)
+                if self.loop is None
+                else DbAgentRegistry(self.config, self.loop.dstore, clock=self.clock)
+            )
+            cached = (self.config, registry)
             self._agents = cached
         return cached[1]
 
@@ -307,9 +319,23 @@ class ApiContext:
                 break
             self.hub.notify()
             previous_errors = len(errors)
-            definition = AGENTS_BY_SLUG.get(target) if target else None
+            resolved = self.agents.get(target) if target else None
+            if resolved is not None and resolved.slug == target and not resolved.active:
+                # Archived or disabled after the turn was accepted: it no
+                # longer answers in its own persona or with action rights.
+                errors.append(f"@{target} is no longer available")
+                store.participant_failed(turn.id, index, errors[-1])
+                self.hub.notify()
+                index += 1
+                continue
+            definition = (
+                AgentDefinition.from_registry(resolved)
+                if resolved is not None and resolved.slug == target
+                else None
+            )
             persona = (definition.persona if definition else ANGIE_PERSONA) + preference_context
             persona += _RUNNER_INTENT.get(intent, "")
+            model = definition.agent.spec.model if definition and definition.agent else None
             # Mentioning a role is explicit delegation in Angie's UI.
             allow_actions = intent in {"delegate", "code", "workload"} or definition is not None
             read_only = bool(participant.get("read_only")) or target == "critic"
@@ -345,6 +371,7 @@ class ApiContext:
                         agent_slug,
                         message,
                         self.clock(),
+                        is_agent=lambda slug: addressable(self.agents.get(slug), slug),
                     )
                 except CollaborationError as exc:
                     raise ToolRejectedError(exc.message) from exc
@@ -365,6 +392,9 @@ class ApiContext:
                 store.link_code_work(turn.id, participant_index, repo, number, title, self.clock())
                 self.hub.notify()
 
+            handoff_agents = tuple(
+                agent.slug for agent in self.agents.list() if addressable(agent, agent.slug)
+            )
             try:
                 future = concierge.submit_turn(
                     prompt,
@@ -383,6 +413,8 @@ class ApiContext:
                     handoff=handoff if allow_actions else None,
                     on_tool_activity=tool_activity,
                     on_code_work=code_work,
+                    model=model,
+                    handoff_agents=handoff_agents if allow_actions else None,
                 )
                 reply = future.result()
                 if reply.ok and (reply.text or reply.work_products):

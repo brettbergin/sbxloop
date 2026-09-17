@@ -366,6 +366,44 @@ class TestJobShape:
         assert "exact completed artifact" in handoff.description
         assert handoff.parameters["required"] == ["agent_slug", "message", "work_product"]
 
+    def test_a_turn_can_name_its_model_and_handoff_targets(self, tmp_path: Path) -> None:
+        concierge, client, *_ = make(tmp_path, [{"text": "one"}, {"text": "two"}])
+        concierge.submit_turn(
+            "find the facts",
+            author="owner",
+            session_key="channel-a:scout",
+            allow_actions=True,
+            agent_role="planner",
+            model="scout-model",
+            handoff=lambda agent, message: f"queued @{agent}",
+            handoff_agents=("concierge", "critic", "scout"),
+        ).result(timeout=10)
+        concierge.submit_turn(
+            "and again",
+            author="owner",
+            session_key="channel-a:planner",
+            allow_actions=True,
+            agent_role="planner",
+            handoff=lambda agent, message: f"queued @{agent}",
+        ).result(timeout=10)
+        first, second = client.jobs
+        assert first.model == "scout-model"
+        assert second.model == concierge.config.model
+        offered = next(t for t in first.host_tools if t.name == "handoff_agent")
+        assert offered.parameters["properties"]["agent_slug"]["enum"] == [
+            "concierge",
+            "critic",
+            "scout",
+        ]
+        default = next(t for t in second.host_tools if t.name == "handoff_agent")
+        assert default.parameters["properties"]["agent_slug"]["enum"] == [
+            "concierge",
+            "planner",
+            "builder",
+            "critic",
+            "operator",
+        ]
+
     def test_github_tool_present_when_repo_configured(self, tmp_path: Path) -> None:
         concierge, client, *_ = make(tmp_path, [{}], github=FakeGithub())
         turn(concierge)

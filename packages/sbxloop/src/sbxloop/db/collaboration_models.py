@@ -255,3 +255,18 @@ class WorkflowRow(Base):
     enabled: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))
     created_at: Mapped[float] = mapped_column(REAL, nullable=False)
     updated_at: Mapped[float] = mapped_column(REAL, nullable=False)
+
+
+class AgentRow(Base):
+    """A person's own agent. ``spec_json`` is the agent spec as saved; the
+    built-ins and ``[[agents]]`` never land here."""
+
+    __tablename__ = "agents"
+
+    slug: Mapped[str] = mapped_column(Text, primary_key=True)
+    spec_json: Mapped[str] = mapped_column(Text, nullable=False)
+    state: Mapped[str] = mapped_column(Text, nullable=False, server_default=text("'active'"))
+    created_by: Mapped[str | None] = mapped_column(Text)
+    created_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    updated_at: Mapped[float] = mapped_column(REAL, nullable=False)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=text("1"))

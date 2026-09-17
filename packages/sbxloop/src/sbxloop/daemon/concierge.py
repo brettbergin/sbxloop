@@ -196,12 +196,20 @@ class TurnContext:
     role: Role = "concierge"
     read_only: bool = False
     handoff: Callable[[str, str], str] | None = None
+    #: The agents ``handoff_agent`` offers; ``None`` offers the built-ins.
+    handoff_agents: tuple[str, ...] | None = None
+    #: The model this turn's agent names for itself (``AgentSpec.model``);
+    #: ``None`` resolves the role's configured model.
+    model_override: str | None = None
     tool_activity: Callable[[str, str, bool | None], None] | None = None
     code_work: Callable[[str, int, str], None] | None = None
     work_products: list[str] = field(default_factory=list)
     #: Effects the turn's tools promised for after the reply (#969).
     after: list[Callable[[], None]] = field(default_factory=list)
 
+
+#: Who ``handoff_agent`` may address when the turn does not say.
+_HANDOFF_BUILTINS = ("concierge", "planner", "builder", "critic", "operator")
 
 _CURRENT_TURN: ContextVar[TurnContext | None] = ContextVar("sbxloop_concierge_turn", default=None)
 
@@ -525,13 +533,18 @@ class Concierge:
         handoff: Callable[[str, str], str] | None = None,
         on_tool_activity: Callable[[str, str, bool | None], None] | None = None,
         on_code_work: Callable[[str, int, str], None] | None = None,
+        model: str | None = None,
+        handoff_agents: Sequence[str] | None = None,
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
         recorded as the requester of any issue this turn files; ``via`` is
         the bridge the message came in on, so the reply is worded for it;
         ``message_id`` is the transport's id for the message, the key of a
-        workload this turn starts (#760) so asking twice queues once."""
+        workload this turn starts (#760) so asking twice queues once.
+        ``model`` is the model the answering agent names for itself, used
+        instead of the role's configured one; ``handoff_agents`` is who
+        ``handoff_agent`` may address (the built-ins when omitted)."""
         if agent_role not in {*ROLE_BY_PHASE.values(), "concierge"}:
             raise ValueError("unknown chat agent role")
         with self._state_lock:
@@ -555,6 +568,8 @@ class Concierge:
                 role=agent_role,
                 read_only=read_only,
                 handoff=handoff,
+                handoff_agents=None if handoff_agents is None else tuple(handoff_agents),
+                model_override=model,
                 tool_activity=on_tool_activity,
                 code_work=on_code_work,
             )
@@ -610,8 +625,13 @@ class Concierge:
     ) -> ConciergeReply:
         started = time.monotonic()
         try:
-            phase = next((p for p, r in ROLE_BY_PHASE.items() if r == self._turn_role), "concierge")
-            selection = model_for_phase(refreshed_models(self.config), phase)
+            if self._turn.model_override:
+                selection = ModelSelection(self._turn.model_override, "agent.model")
+            else:
+                phase = next(
+                    (p for p, r in ROLE_BY_PHASE.items() if r == self._turn_role), "concierge"
+                )
+                selection = model_for_phase(refreshed_models(self.config), phase)
         except SbxloopError as exc:
             return self._error_reply(exc, started)
         model_key = self._session_state_key(STATE_SESSION_MODEL, session_key)
@@ -1056,7 +1076,7 @@ class Concierge:
                         {
                             "agent_slug": {
                                 "type": "string",
-                                "enum": ["concierge", "planner", "builder", "critic", "operator"],
+                                "enum": list(self._turn.handoff_agents or _HANDOFF_BUILTINS),
                             },
                             "message": {
                                 "type": "string",
