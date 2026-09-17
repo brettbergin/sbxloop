@@ -16,7 +16,7 @@ from typing import Any
 from sqlalchemy import func, insert, select
 from sqlalchemy.exc import IntegrityError
 
-from sbxloop.api.agents import AGENTS
+from sbxloop.api.agents import AGENTS, ANGIE_SLUG
 from sbxloop.api.auth.store import hash_secret
 from sbxloop.daemon.controls.principal import ALL_CAPABILITIES, CAPABILITIES, WORKSPACE_ID
 from sbxloop.daemon.store import DaemonStore
@@ -171,6 +171,13 @@ def _channel(row: ChannelRow) -> Channel:
 
 
 def _message(row: MessageRow) -> Message:
+    agent_slug = None if row.agent_slug is None else str(row.agent_slug)
+    work = json.loads(row.work_json) if row.work_json else None
+    if row.kind == "work_result":
+        # Runner results stored before attribution carry no author; they were Angie's.
+        agent_slug = agent_slug or ANGIE_SLUG
+        if isinstance(work, dict) and work.get("agent_slug") is None:
+            work["agent_slug"] = ANGIE_SLUG
     return Message(
         id=str(row.id),
         channel_id=str(row.channel_id),
@@ -180,9 +187,9 @@ def _message(row: MessageRow) -> Message:
         role=str(row.role),
         kind=str(row.kind),
         content=str(row.content),
-        agent_slug=None if row.agent_slug is None else str(row.agent_slug),
+        agent_slug=agent_slug,
         created_at=float(row.created_at),
-        work=json.loads(row.work_json) if row.work_json else None,
+        work=work,
         reactions=tuple(str(value) for value in json.loads(row.reactions_json or "[]")),
     )
 
