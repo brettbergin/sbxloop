@@ -46,6 +46,30 @@ ALL_CAPABILITIES: frozenset[Capability] = frozenset(CAPABILITIES)
 #: this; nothing here may assume the value.
 WORKSPACE_ID = "local"
 
+#: A person's standing in a workspace.
+Role = Literal["owner", "admin", "member"]
+ROLES: tuple[Role, ...] = get_args(Role)
+
+#: What an API client holds by virtue of its user's workspace role. An
+#: owner holds everything. An admin holds everything except managing
+#: credentials. A member may read and steer runs, ask for new work and take
+#: part in collaboration; run artifacts, controls, gates, budgets, daemon
+#: management, credentials, audit and diagnostics stay with admins.
+ROLE_CAPABILITIES: dict[Role, frozenset[Capability]] = {
+    "owner": ALL_CAPABILITIES,
+    "admin": ALL_CAPABILITIES - {"credentials:manage"},
+    "member": frozenset(
+        {
+            "runs:read",
+            "runs:steer",
+            "items:create",
+            "collaboration:read",
+            "collaboration:write",
+            "collaboration:delegate",
+        }
+    ),
+}
+
 PrincipalKind = Literal["operator", "client", "system"]
 
 

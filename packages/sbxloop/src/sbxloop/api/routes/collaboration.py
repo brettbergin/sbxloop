@@ -197,6 +197,8 @@ def _problem(exc: CollaborationError) -> Problem:
     status = 404 if exc.code.endswith("not_found") else 409
     if exc.code in {"invalid_profile", "weak_password", "unknown_agent"}:
         status = 422
+    if exc.code in {"invite_invalid", "invite_expired"}:
+        status = 403
     return Problem(status, exc.code, exc.message)
 
 
@@ -339,6 +341,7 @@ async def register_local(
             full_name=body.full_name,
             timezone=body.timezone,
             now=ctx.clock(),
+            invite_token=body.invite_token,
         )
     except CollaborationError as exc:
         raise _problem(exc) from exc

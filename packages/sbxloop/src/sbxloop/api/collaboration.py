@@ -18,7 +18,15 @@ from sqlalchemy.exc import IntegrityError
 
 from sbxloop.api.agents import AGENTS, ANGIE_SLUG
 from sbxloop.api.auth.store import hash_secret
-from sbxloop.daemon.controls.principal import ALL_CAPABILITIES, CAPABILITIES, WORKSPACE_ID
+from sbxloop.daemon.controls.principal import (
+    ALL_CAPABILITIES,
+    CAPABILITIES,
+    ROLE_CAPABILITIES,
+    ROLES,
+    WORKSPACE_ID,
+    Capability,
+    Role,
+)
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.db.api_models import ApiEventRow, ClientRow
 from sbxloop.db.collaboration_models import (
@@ -29,6 +37,8 @@ from sbxloop.db.collaboration_models import (
     TeamRow,
     TurnRow,
     WorkflowRow,
+    WorkspaceInviteRow,
+    WorkspaceMemberRow,
 )
 from sbxloop.ids import _token
 
@@ -58,6 +68,32 @@ class LocalUser:
     active: bool
     created_at: float
     updated_at: float
+    auth_source: str = "local"
+    avatar_url: str | None = None
+    last_seen_at: float | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class Member:
+    """A local user and their standing in the workspace."""
+
+    user: LocalUser
+    role: Role
+    workspace_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class Invite:
+    """A workspace invitation, never carrying its token."""
+
+    id: str
+    workspace_id: str
+    email: str | None
+    role: Role
+    expires_at: float
+    accepted_at: float | None
+    created_by: str
+    created_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,7 +189,43 @@ def _user(row: LocalUserRow) -> LocalUser:
         active=bool(row.active),
         created_at=float(row.created_at),
         updated_at=float(row.updated_at),
+        auth_source=str(row.auth_source or "local"),
+        avatar_url=None if row.avatar_url is None else str(row.avatar_url),
+        last_seen_at=None if row.last_seen_at is None else float(row.last_seen_at),
     )
+
+
+def _role(value: str) -> Role:
+    for role in ROLES:
+        if role == value:
+            return role
+    raise CollaborationError("invalid_role", f"unknown workspace role: {value}")
+
+
+def _member(user: LocalUserRow, row: WorkspaceMemberRow) -> Member:
+    return Member(user=_user(user), role=_role(str(row.role)), workspace_id=str(row.workspace_id))
+
+
+def _invite(row: WorkspaceInviteRow) -> Invite:
+    return Invite(
+        id=str(row.id),
+        workspace_id=str(row.workspace_id),
+        email=None if row.email is None else str(row.email),
+        role=_role(str(row.role)),
+        expires_at=float(row.expires_at),
+        accepted_at=None if row.accepted_at is None else float(row.accepted_at),
+        created_by=str(row.created_by),
+        created_at=float(row.created_at),
+    )
+
+
+def _capabilities_json(capabilities: frozenset[Capability]) -> str:
+    return json.dumps([cap for cap in CAPABILITIES if cap in capabilities])
+
+
+def invite_token_hash(raw_token: str) -> str:
+    """The only form of an invite token the store keeps."""
+    return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
 
 def _channel(row: ChannelRow) -> Channel:
@@ -289,8 +361,14 @@ class CollaborationStore:
         full_name: str | None,
         timezone: str,
         now: float,
+        invite_token: str | None = None,
     ) -> LocalUser:
-        """Create the installation's one local user and its API principal."""
+        """Create a local user, its API principal and its membership.
+
+        The installation's first user owns the workspace and holds every
+        capability. Every later user needs an unexpired, unspent invite and
+        joins with the invite's role and exactly that role's capabilities.
+        """
         username = username.strip()
         email = email.strip().casefold()
         if not username or not email:
@@ -301,18 +379,25 @@ class CollaborationStore:
         client_id = "local_" + _token(12)
         try:
             with self.dstore.transaction() as session:
+                invite: WorkspaceInviteRow | None = None
+                role: Role = "owner"
+                capabilities_json = json.dumps(list(CAPABILITIES))
                 if session.scalar(select(func.count()).select_from(LocalUserRow)):
-                    raise CollaborationError(
-                        "local_user_exists", "this installation already has a local user"
-                    )
+                    if invite_token is None:
+                        raise CollaborationError(
+                            "local_user_exists", "this installation already has a local user"
+                        )
+                    invite = self._open_invite(session, invite_token, now)
+                    role = _role(str(invite.role))
+                    capabilities_json = _capabilities_json(ROLE_CAPABILITIES[role])
                 session.execute(
                     insert(ClientRow).values(
                         id=client_id,
                         name=username,
                         secret_hash=hash_secret(password),
-                        capabilities_json=json.dumps(list(CAPABILITIES)),
+                        capabilities_json=capabilities_json,
                         created_at=now,
-                        created_by="local-onboarding",
+                        created_by="local-onboarding" if invite is None else "workspace-invite",
                     )
                 )
                 session.execute(
@@ -327,6 +412,18 @@ class CollaborationStore:
                         updated_at=now,
                     )
                 )
+                session.add(
+                    WorkspaceMemberRow(
+                        workspace_id=WORKSPACE_ID,
+                        user_id=user_id,
+                        role=role,
+                        created_at=now,
+                        invited_by=None if invite is None else invite.created_by,
+                    )
+                )
+                if invite is not None:
+                    invite.accepted_at = now
+                session.flush()
                 row = session.get(LocalUserRow, user_id)
                 assert row is not None  # nosec B101 - inserted in this transaction
                 _event(
@@ -336,6 +433,13 @@ class CollaborationStore:
                     actor={"kind": "client", "id": client_id, "display": username, "via": "api"},
                     data={"user_id": user_id},
                 )
+                if invite is not None:
+                    _event(
+                        session,
+                        "workspace.invite.accepted",
+                        now,
+                        data={"invite_id": invite.id, "user_id": user_id, "role": role},
+                    )
                 return _user(row)
         except IntegrityError as exc:
             raise CollaborationError(
@@ -384,6 +488,192 @@ class CollaborationStore:
                 return _user(row)
         except IntegrityError as exc:
             raise CollaborationError("profile_conflict", "email is already in use") from exc
+
+    # -- workspace membership ------------------------------------------------------
+
+    @staticmethod
+    def _open_invite(session: Any, raw_token: str, now: float) -> WorkspaceInviteRow:
+        row: WorkspaceInviteRow | None = session.scalars(
+            select(WorkspaceInviteRow).where(
+                WorkspaceInviteRow.token_hash == invite_token_hash(raw_token),
+                WorkspaceInviteRow.workspace_id == WORKSPACE_ID,
+            )
+        ).first()
+        if row is None or row.accepted_at is not None:
+            raise CollaborationError("invite_invalid", "the invite is unknown or already used")
+        if float(row.expires_at) <= now:
+            raise CollaborationError("invite_expired", "the invite has expired")
+        return row
+
+    @staticmethod
+    def _grant_role(session: Any, user: LocalUserRow, role: Role | None) -> None:
+        """Rewrite the user's API client to hold what ``role`` grants
+        (nothing, for ``None``). Tokens are narrowed by the client's current
+        capabilities on every request, so the change applies at once."""
+        client = session.get(ClientRow, user.client_id)
+        if client is not None:
+            client.capabilities_json = _capabilities_json(
+                frozenset() if role is None else ROLE_CAPABILITIES[role]
+            )
+
+    @staticmethod
+    def _owner_count(session: Any) -> int:
+        count = session.scalar(
+            select(func.count())
+            .select_from(WorkspaceMemberRow)
+            .where(
+                WorkspaceMemberRow.workspace_id == WORKSPACE_ID,
+                WorkspaceMemberRow.role == "owner",
+            )
+        )
+        return int(count or 0)
+
+    @staticmethod
+    def _member_row(session: Any, user_id: str) -> WorkspaceMemberRow | None:
+        row: WorkspaceMemberRow | None = session.get(WorkspaceMemberRow, (WORKSPACE_ID, user_id))
+        return row
+
+    @staticmethod
+    def _join(session: Any, *conditions: Any) -> list[Member]:
+        rows = session.execute(
+            select(LocalUserRow, WorkspaceMemberRow)
+            .join(WorkspaceMemberRow, WorkspaceMemberRow.user_id == LocalUserRow.id)
+            .where(WorkspaceMemberRow.workspace_id == WORKSPACE_ID, *conditions)
+            .order_by(WorkspaceMemberRow.created_at, LocalUserRow.id)
+        ).all()
+        return [_member(user, member) for user, member in rows]
+
+    def _insert_member(
+        self,
+        session: Any,
+        user_id: str,
+        role: Role,
+        invited_by: str | None,
+        now: float,
+    ) -> Member:
+        user = session.get(LocalUserRow, user_id)
+        if user is None:
+            raise CollaborationError("user_not_found", "user not found")
+        if self._member_row(session, user_id) is not None:
+            raise CollaborationError("already_member", "the user is already a member")
+        row = WorkspaceMemberRow(
+            workspace_id=WORKSPACE_ID,
+            user_id=user_id,
+            role=role,
+            created_at=now,
+            invited_by=invited_by,
+        )
+        session.add(row)
+        self._grant_role(session, user, role)
+        session.flush()
+        _event(
+            session,
+            "workspace.member.added",
+            now,
+            data={"user_id": user_id, "role": role},
+        )
+        return _member(user, row)
+
+    def add_member(self, user_id: str, role: Role, invited_by: str | None, now: float) -> Member:
+        """Make an existing user a member with ``role``."""
+        role = _role(role)
+        with self.dstore.transaction() as session:
+            return self._insert_member(session, user_id, role, invited_by, now)
+
+    def set_role(self, user_id: str, role: Role) -> Member:
+        """Change a member's role. The workspace always keeps an owner."""
+        role = _role(role)
+        with self.dstore.transaction() as session:
+            row = self._member_row(session, user_id)
+            user = session.get(LocalUserRow, user_id)
+            if row is None or user is None:
+                raise CollaborationError("member_not_found", "member not found")
+            if row.role == "owner" and role != "owner" and self._owner_count(session) <= 1:
+                raise CollaborationError("last_owner", "the workspace must keep an owner")
+            row.role = role
+            self._grant_role(session, user, role)
+            session.flush()
+            return _member(user, row)
+
+    def remove_member(self, user_id: str) -> bool:
+        """End a membership; the user's API client keeps no capability."""
+        with self.dstore.transaction() as session:
+            row = self._member_row(session, user_id)
+            if row is None:
+                return False
+            if row.role == "owner" and self._owner_count(session) <= 1:
+                raise CollaborationError("last_owner", "the workspace must keep an owner")
+            session.delete(row)
+            user = session.get(LocalUserRow, user_id)
+            if user is not None:
+                self._grant_role(session, user, None)
+            return True
+
+    def member_for_user(self, user_id: str) -> Member | None:
+        with self.dstore.read() as session:
+            found = self._join(session, LocalUserRow.id == user_id)
+            return found[0] if found else None
+
+    def member_for_client(self, client_id: str) -> Member | None:
+        with self.dstore.read() as session:
+            found = self._join(session, LocalUserRow.client_id == client_id)
+            return found[0] if found else None
+
+    def list_members(self) -> list[Member]:
+        with self.dstore.read() as session:
+            return self._join(session)
+
+    def create_invite(
+        self,
+        role: Role,
+        email: str | None,
+        created_by: str,
+        ttl_s: float,
+        now: float,
+    ) -> tuple[Invite, str]:
+        """A new invite and its raw token. The token is returned only here;
+        the store keeps its SHA-256."""
+        role = _role(role)
+        if ttl_s <= 0:
+            raise CollaborationError("invalid_invite", "an invite must expire in the future")
+        raw = "inv_" + _token(32)
+        row = WorkspaceInviteRow(
+            id="winv_" + _token(12),
+            workspace_id=WORKSPACE_ID,
+            email=email.strip().casefold() if email and email.strip() else None,
+            role=role,
+            token_hash=invite_token_hash(raw),
+            expires_at=now + ttl_s,
+            accepted_at=None,
+            created_by=created_by,
+            created_at=now,
+        )
+        with self.dstore.transaction() as session:
+            session.add(row)
+            session.flush()
+            _event(
+                session,
+                "workspace.invite.created",
+                now,
+                data={"invite_id": row.id, "role": role, "created_by": created_by},
+            )
+            return _invite(row), raw
+
+    def accept_invite(self, raw_token: str, user_id: str, now: float) -> Member:
+        """Spend an invite on an existing user who is not yet a member."""
+        with self.dstore.transaction() as session:
+            invite = self._open_invite(session, raw_token, now)
+            member = self._insert_member(
+                session, user_id, _role(str(invite.role)), str(invite.created_by), now
+            )
+            invite.accepted_at = now
+            _event(
+                session,
+                "workspace.invite.accepted",
+                now,
+                data={"invite_id": invite.id, "user_id": user_id, "role": member.role},
+            )
+            return member
 
     # -- channels ------------------------------------------------------------------
 

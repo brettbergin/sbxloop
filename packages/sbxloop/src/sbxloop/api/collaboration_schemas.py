@@ -15,6 +15,9 @@ class LocalRegisterRequest(ApiModel):
     password: str = Field(min_length=8, max_length=1024)
     full_name: str | None = Field(default=None, max_length=160)
     timezone: str = Field(default="UTC", min_length=1, max_length=100)
+    #: Required for every user after the installation's first: the token of
+    #: a workspace invite, which sets the new user's role.
+    invite_token: str | None = Field(default=None, min_length=1, max_length=256)
 
 
 class LocalLoginRequest(ApiModel):
