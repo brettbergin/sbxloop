@@ -67,6 +67,7 @@ from sbxloop.daemon.sources import HIDDEN_MARKER_RE, IssueContext, WorkSource
 from sbxloop.daemon.store import DaemonStore, MergeGate, ReviewHold
 from sbxloop.engine.checks import check_policy_reader
 from sbxloop.engine.engine import LoopEngine
+from sbxloop.engine.followups import FollowupFiler, recorded_review_rounds
 from sbxloop.engine.landing import (
     UNKNOWN_IDENTITY,
     AwaitingReview,
@@ -3069,6 +3070,7 @@ class DaemonLoop:
             except SbxloopError:
                 log.warning("review.record_update_failed", run=run_id, exc_info=True)
             self.dstore.resolve_review_hold(run_id, "merged", by, now)
+            self._file_followups(run_id, item_id, hold.repo)
             self.dstore.mark_done(item_id, now, pending_report="merged")
             self.dstore.finish_ledger(run_id, "done", now)
             fresh = self.dstore.get(item_id)
@@ -3305,6 +3307,7 @@ class DaemonLoop:
             except SbxloopError:
                 log.warning("gate.record_update_failed", run=run_id, exc_info=True)
             self.dstore.resolve_merge_gate(run_id, "merged", by, now)
+            self._file_followups(run_id, item_id, gate.repo)
             self.dstore.mark_done(item_id, now, pending_report="merged")
             self.dstore.finish_ledger(run_id, "done", now)
             fresh = self.dstore.get(item_id)
@@ -3355,6 +3358,37 @@ class DaemonLoop:
                 item=item_id,
                 run=run_id,
             )
+
+    def _file_followups(self, run_id: str, item_id: str, repo: str) -> None:
+        """File the follow-ups of a parked run the daemon just merged (#517).
+
+        The engine files them when its landing parks; this pass covers what
+        that one could not (a GitHub failure, a restart) and is idempotent
+        against it: the run's ``followup`` rows and the issue markers on the
+        repository mean nothing is filed twice. Best-effort: the PR is
+        merged, so a failure here is logged, never raised."""
+        assert self.github is not None
+        try:
+            item = self.dstore.get(item_id)
+            cfg = self._item_config(item) if item is not None else self.config
+            bus = EventBus()
+            bus.subscribe(self.store.append_event)
+            bus.subscribe(event_log_subscriber)
+            filer = FollowupFiler(
+                self.github.ops(),
+                repo,
+                self.store,
+                bus,
+                cfg,
+                trigger_label=self.config.labels_for(repo).trigger,
+            )
+            filer.file(
+                self.store.get_run(run_id),
+                recorded_review_rounds(self.store, run_id),
+                issues_enabled=None,
+            )
+        except Exception:
+            log.warning("gate.followups_failed", run=run_id, item=item_id, exc_info=True)
 
     def _land_parked(
         self, repo: str, number: int, branch: str | None, run_id: str
