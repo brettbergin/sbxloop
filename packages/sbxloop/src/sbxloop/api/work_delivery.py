@@ -95,12 +95,18 @@ def _links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
     return links
 
 
-def _channel_links(session: Any, channel_id: str | None, linked: set[str]) -> list[WorkLink]:
-    """Items that name their channel but no message in it: delivered as
-    part of the latest turn the channel had when the item was admitted."""
+def _channel_links(
+    session: Any,
+    channel_id: str | None,
+    linked: set[str],
+    kinds: tuple[str, ...] = ("workload", "tool"),
+) -> list[WorkLink]:
+    """Items of ``kinds`` that name their channel but no message in it:
+    delivered as part of the latest turn the channel had when the item was
+    admitted."""
     conditions = [
         WorkItemRow.channel_id.is_not(None),
-        WorkItemRow.run_kind.in_(("workload", "tool")),
+        WorkItemRow.run_kind.in_(kinds),
         ChannelRow.id == WorkItemRow.channel_id,
         ChannelRow.state == "active",
     ]
@@ -132,7 +138,14 @@ def _channel_links(session: Any, channel_id: str | None, linked: set[str]) -> li
         )
         if turn is None:
             # A result is part of a turn; a channel with none has nowhere
-            # to put it yet.
+            # to put it yet. Say so: the work ran and finished, and the
+            # only sign of it in the channel would otherwise be silence.
+            log.info(
+                "api.work_delivery_skipped",
+                item=str(item_id),
+                channel=str(item_channel),
+                reason="channel has no turn to deliver into",
+            )
             continue
         links.append(
             WorkLink(
@@ -195,12 +208,22 @@ def _code_links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
                         continue
                     seen.add(key)
                     found = session.execute(
-                        select(WorkItemRow.item_id, WorkItemRow.lead_agent).where(
+                        select(
+                            WorkItemRow.item_id,
+                            WorkItemRow.lead_agent,
+                            WorkItemRow.channel_id,
+                        ).where(
                             WorkItemRow.repo == ref["repo"],
                             WorkItemRow.source_key == ref["source_key"],
                             WorkItemRow.run_kind == "code",
                         )
                     ).first()
+                    if found is not None and found[2] and found[2] != turn.channel_id:
+                        # The admission named a channel, and it is not this
+                        # one: the result belongs there, not wherever the
+                        # issue happened to be mentioned (_channel_links
+                        # below delivers it).
+                        continue
                     item_id = found[0] if found is not None else None
                     links.append(
                         WorkLink(
@@ -216,6 +239,16 @@ def _code_links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
                             code_agent=participant.get("agent_slug") or ANGIE_SLUG,
                         )
                     )
+        # A code admission that named a channel is delivered to that
+        # channel, whether or not any turn there mentioned the issue.
+        links.extend(
+            _channel_links(
+                session,
+                channel_id,
+                {link.item_id for link in links},
+                kinds=("code",),
+            )
+        )
     return links
 
 

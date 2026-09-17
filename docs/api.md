@@ -261,12 +261,17 @@ yet).
 
 A chat turn passes its channel and, for the agents it mentioned, the run roles
 they declare to the work it starts: a workload it queues carries them, and an
-issue it files or labels leaves a note the polled item picks up. A turn
-answered by Angie names Angie as the lead. An item that names its channel is
-delivered there even when its key names no message in it (as part of the
-channel's latest turn when it was admitted), and never to a channel other
-than its own. A work result is credited to the item's lead when it has one,
-and to the participant that asked otherwise.
+issue it files or labels leaves a note the polled item picks up. The note is
+spent by the item it fills, so an old conversation's request is never replayed
+onto work the same issue is labelled for later. A turn answered by Angie names
+Angie as the lead. An item that names its channel is delivered there even when
+its key names no message in it (as part of the channel's latest turn when it
+was admitted), and never to a channel other than its own; that holds for an
+issue (`code`) admission too, whether or not any turn in the channel named the
+issue. A channel that has had no turn yet has nowhere to put a result, so the
+delivery is skipped and the daemon log says why
+(`api.work_delivery_skipped`). A work result is credited to the item's lead
+when it has one, and to the participant that asked otherwise.
 
 A finished workload or tool run's files are catalogued before its work result
 is written, so the first `work_result` message already names them. Its `work.artifacts` (and

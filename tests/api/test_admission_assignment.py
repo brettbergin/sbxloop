@@ -249,6 +249,76 @@ def test_the_lead_on_the_item_is_credited_for_its_result(tmp_path: Any) -> None:
     api.ctx.close()
 
 
+def test_a_code_admission_is_delivered_to_the_channel_it_names(tmp_path: Any) -> None:
+    """An issue admitted for a channel is answered there, even though no
+    turn in that channel ever named the issue: the admission said where it
+    belongs, and nothing else has to."""
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = FakeConcierge()
+        headers = bearer(register(api))
+        _save(api, "chef", ["lead"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        accepted = api.client.post(
+            f"/v1/channels/{channel}/turns", json={"content": "hello"}, headers=headers
+        ).json()
+        settled(api.client, headers, channel, accepted["turn"]["id"])
+        item = WorkItem(
+            item_id="gh:issue:77",
+            source_key="77",
+            title="Fix the crash",
+            body="It crashes",
+            kind="code",
+            repo="o/r",
+            channel_id=channel,
+            lead_agent="chef",
+        )
+        api.harness.dstore.upsert_new(item, api.clock())
+        work = api.client.get(f"/v1/channels/{channel}/work", headers=headers)
+        assert work.status_code == 200, work.text
+        (snapshot,) = work.json()
+        assert snapshot["kind"] == "code" and snapshot["title"] == "Fix the crash"
+        assert snapshot["agent_slug"] == "chef"
+        # A channel the admission did not name gets nothing.
+        other = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        assert api.client.get(f"/v1/channels/{other}/work", headers=headers).json() == []
+    api.ctx.close()
+
+
+def test_a_channel_with_no_turn_says_why_the_work_was_not_delivered(
+    tmp_path: Any, caplog: Any
+) -> None:
+    """A result is part of a turn. A channel that has had none has nowhere
+    to put it, and the daemon log says so rather than leaving the finished
+    work invisible with no explanation anywhere."""
+    import logging
+
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = FakeConcierge()
+        headers = bearer(register(api))
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        item = WorkItem(
+            item_id=api_item_id("lonely"),
+            source_key="lonely",
+            title="Report",
+            kind="workload",
+            channel_id=channel,
+        )
+        api.harness.dstore.upsert_new(item, api.clock())
+        with caplog.at_level(logging.INFO, logger="sbxloop.api.work_delivery"):
+            assert api.client.get(f"/v1/channels/{channel}/work", headers=headers).json() == []
+        logged = [
+            record.getMessage()
+            for record in caplog.records
+            if "'event': 'api.work_delivery_skipped'" in record.getMessage()
+        ]
+        assert logged, "the skipped delivery was not logged"
+        assert f"'channel': '{channel}'" in logged[0]
+        assert "'reason': 'channel has no turn to deliver into'" in logged[0]
+    api.ctx.close()
+
+
 def test_the_feature_is_advertised(tmp_path: Any) -> None:
     api = _api(tmp_path)
     with api.client:

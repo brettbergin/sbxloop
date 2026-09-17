@@ -22,11 +22,13 @@ from alembic import command
 
 from sbxloop.agents.assignment import AgentAssignment
 from sbxloop.agents.definition import AgentSpec
+from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
 from sbxloop.agents.registry import DbAgentRegistry
 from sbxloop.config import Config
 from sbxloop.daemon.controls import ControlError, ControlService, Principal
 from sbxloop.daemon.controls.intake import IssueAdmission, WorkloadAdmission
 from sbxloop.daemon.model import WorkItem
+from sbxloop.daemon.store import _admission_key
 from sbxloop.db import ensure_schema, open_engine
 from sbxloop.db.schema import _config as alembic_config
 from sbxloop.engine.model import RunResult
@@ -71,6 +73,17 @@ def _agent(harness: Harness, slug: str, roles: list[str], *, archived: bool = Fa
     )
     if archived:
         registry.archive(slug, by="test")
+
+
+def _remember(harness: Harness, agent: str, content: str, *, channel_id: str | None) -> None:
+    """Keep ``content`` for ``agent`` the way the daemon's own memory
+    service does, so a planned run reads it from the same store."""
+    MemoryService(
+        harness.dstore,
+        WorkspaceChannelVisibility(harness.dstore),
+        harness.config.memory,
+        harness.clock,
+    ).remember(agent, content, channel_id=channel_id, author="user:tester")
 
 
 class Capturing(Harness):
@@ -198,6 +211,49 @@ class TestDispatch:
         assert len(harness.dispatched) == 2
         assert harness.dispatched[1].assignment_json == first
         assert _assignment(harness.dispatched[1]).roles["planner"] == "scout"
+
+    def test_a_planned_run_carries_what_its_agents_remember(self, tmp_path: Path) -> None:
+        """S-A5 wired in: the loop's own memory service fills each binding's
+        memory block, so a run really starts with what its agents know."""
+        harness = Capturing(tmp_path)
+        _agent(harness, "scout", ["planner"])
+        _remember(harness, "scout", "The brief is due on Friday.", channel_id="chn_brief")
+        item = (
+            ControlService(harness.loop)
+            .admit(
+                CLIENT,
+                WorkloadAdmission(
+                    ask="Write the brief", roles={"planner": "scout"}, channel_id="chn_brief"
+                ),
+            )
+            .item
+        )
+        harness.source.items = [item]
+        harness.outcomes = ["completed"]
+        harness.loop.tick()
+        (dispatched,) = harness.dispatched
+        planned = _assignment(dispatched)
+        assert "The brief is due on Friday." in planned.agents["scout"].memory_block
+
+    def test_a_run_in_another_channel_does_not_read_a_private_memory(self, tmp_path: Path) -> None:
+        harness = Capturing(tmp_path)
+        _agent(harness, "scout", ["planner"])
+        _remember(harness, "scout", "The brief is due on Friday.", channel_id="chn_other")
+        item = (
+            ControlService(harness.loop)
+            .admit(
+                CLIENT,
+                WorkloadAdmission(
+                    ask="Write the brief", roles={"planner": "scout"}, channel_id="chn_brief"
+                ),
+            )
+            .item
+        )
+        harness.source.items = [item]
+        harness.outcomes = ["completed"]
+        harness.loop.tick()
+        (dispatched,) = harness.dispatched
+        assert _assignment(dispatched).agents["scout"].memory_block == ""
 
     def test_a_polled_issue_runs_with_the_built_in_team(self, tmp_path: Path) -> None:
         harness = Capturing(tmp_path)
@@ -356,6 +412,34 @@ class TestStore:
         other = harness.dstore.get("gh:o2/r:issue:9")
         assert other is not None and other.channel_id is None
 
+    def test_a_consumed_note_is_not_replayed_on_a_later_ask(self, tmp_path: Path) -> None:
+        """A chat request is spent by the item it fills: re-labelling the
+        same issue months later runs it for whoever asks then, not for the
+        channel and the agents of the old conversation."""
+        harness = Capturing(tmp_path)
+        harness.dstore.note_admission(
+            "9",
+            harness.clock(),
+            repo="o/r",
+            channel_id="chn_code",
+            lead="concierge",
+            roles={"builder": "smith"},
+        )
+        assert harness.dstore.upsert_new(gh_item("9", repo="o/r"), harness.clock())
+        assert harness.dstore.get_value(_admission_key("9", "o/r")) is None
+        # The issue is finished, then edited and labelled again much later:
+        # new work, so a new row — and the old conversation's ask is gone,
+        # rather than quietly steering a run nobody asked from chat.
+        harness.dstore.mark_done("gh:9", harness.clock())
+        harness.clock.t += 10_000
+        assert harness.dstore.upsert_new(
+            gh_item("9", repo="o/r", title="Do 9, differently"), harness.clock()
+        )
+        again = harness.dstore.get("gh:9")
+        assert again is not None and again.title == "Do 9, differently"
+        assert again.channel_id is None
+        assert again.lead_agent is None and again.assignment_json is None
+
 
 class TestMigration:
     def _run(self, path: Path, fn: Any, revision: str) -> None:
@@ -368,7 +452,7 @@ class TestMigration:
 
     def test_items_gain_the_columns_once(self, tmp_path: Path) -> None:
         path = tmp_path / "state.db"
-        self._run(path, command.upgrade, "0025")
+        self._run(path, command.upgrade, "0026")
         conn = sqlite3.connect(path)
         conn.execute(
             "INSERT INTO daemon_work_items (item_id, source_key, title, state, created_at,"
@@ -382,7 +466,7 @@ class TestMigration:
         finally:
             engine.dispose()
         # Stamped back and upgraded again: the guarded columns are not re-added.
-        self._run(path, command.stamp, "0025")
+        self._run(path, command.stamp, "0026")
         engine = open_engine(path)
         try:
             ensure_schema(engine)

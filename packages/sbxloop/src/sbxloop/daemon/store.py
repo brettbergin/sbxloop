@@ -2179,13 +2179,15 @@ class DaemonStore:
 
     @staticmethod
     def _admission_note(session: Session, source_key: str, repo: str) -> dict[str, object]:
-        raw = session.scalars(
-            select(DaemonStateRow.value).where(
-                DaemonStateRow.key == _admission_key(source_key, repo)
-            )
-        ).first()
+        """What a chat turn asked for this issue, consumed: the note is read
+        once and deleted in the same transaction as the row it fills, so a
+        request from an old conversation is never replayed onto work the
+        same issue is re-labelled for months later."""
+        key = _admission_key(source_key, repo)
+        raw = session.scalars(select(DaemonStateRow.value).where(DaemonStateRow.key == key)).first()
         if raw is None:
             return {}
+        session.execute(delete(DaemonStateRow).where(DaemonStateRow.key == key))
         try:
             note = json.loads(str(raw))
         except ValueError:

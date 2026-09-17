@@ -382,8 +382,9 @@ class DaemonLoop:
         # Where a run's agents come from: the built-ins, `[[agents]]`, then
         # the agents people saved (built per config, like the API's).
         self._agents: tuple[Config, AgentRegistry] | None = None
-        # The agents' remembered context, when a memory service is wired
-        # in; without one each agent's memory block is empty.
+        # Where a planned assignment reads each agent's remembered
+        # context. None (the default) builds the item's own memory service
+        # at dispatch, the same one its run gets; a test may set it.
         self.memory: MemoryBlocks | None = None
         self._stop = threading.Event()
         # An operator's `stop`: unlike a signal, it lets a landing the
@@ -2424,13 +2425,26 @@ class DaemonLoop:
             self._agents = cached
         return cached[1]
 
+    def _memory(self, item: WorkItem) -> MemoryService:
+        """The memory service for ``item``: the store's memories under the
+        item's own config, so a planned assignment and the run it starts
+        read the same thing."""
+        return MemoryService(
+            self.dstore,
+            WorkspaceChannelVisibility(self.dstore),
+            self._item_config(item).memory,
+            self.clock,
+        )
+
     def _assign(self, item: WorkItem, now: float) -> WorkItem:
         """``item`` carrying the agent assignment its run starts with.
 
         An item already holding a planned assignment keeps it, so every
         attempt at the same work goes to the same agents; otherwise the
         assignment is planned from the lead and roles asked for at
-        admission (none: the built-in team) and stored on the item."""
+        admission (none: the built-in team) and stored on the item. Each
+        binding snapshots its agent's memory block here (S-A5), taken in
+        the channel the item names."""
         if is_planned_assignment(item.assignment_json):
             return item
         requested = cast("dict[RunRole, str]", requested_roles(item.assignment_json))
@@ -2439,7 +2453,7 @@ class DaemonLoop:
             kind=item.kind,
             lead=item.lead_agent,
             requested=requested,
-            memory=self.memory,
+            memory=self.memory if self.memory is not None else self._memory(item),
             channel_id=item.channel_id,
         )
         if item.origin_agent is not None or item.chain_depth:

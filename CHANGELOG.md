@@ -72,10 +72,14 @@
   engine, and a later attempt reuses it (work asked for again after it
   finished is planned afresh). Items read back with `lead_agent`
   and `assignment`. A chat turn passes its channel and the run roles of the
-  agents it mentioned to the work it starts, finished work is delivered to
-  the channel the item names, and a result is credited to the item's lead.
-  Revision 0026 adds the channel, lead, assignment and agent-chain columns
-  to work items; polled issues run exactly as before.
+  agents it mentioned to the work it starts (spending that request on the
+  item it fills, so it is never replayed later), finished work is delivered
+  to the channel the item names, issues included, and a result is credited
+  to the item's lead. A channel with no turn yet has nowhere to put a
+  result, and the daemon log says so. Each planned agent carries what it
+  remembers in that channel. Revision 0027 adds the channel, lead,
+  assignment and agent-chain columns to work items; polled issues run
+  exactly as before.
 
 - **A workspace can hold more than one person.** Local users now belong to
   the installation's workspace as an owner, admin or member, and the

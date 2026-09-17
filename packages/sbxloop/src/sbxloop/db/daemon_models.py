@@ -96,7 +96,7 @@ class WorkItemRow(Base):
     # Bumped by a trigger on every UPDATE (revision 0010): what a remote
     # command's `expected_revision` is checked against.
     revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
-    # Who the work was admitted for (revision 0026): the channel it answers
+    # Who the work was admitted for (revision 0027): the channel it answers
     # to, the lead asked for, the agent assignment (the roles requested at
     # admission, then the plan dispatch made from them), and, for work an
     # agent started, that agent, the item it came from and how deep the
