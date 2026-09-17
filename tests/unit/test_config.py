@@ -152,6 +152,7 @@ def test_daemon_and_discord_sections(tmp_path: Path) -> None:
         "credentials",
         "registries",
         "vcs",
+        "agents",
         "github.repos.token_env",
         "telemetry.dsn_env",
     ]

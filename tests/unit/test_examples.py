@@ -492,7 +492,7 @@ def test_every_commented_key_is_a_real_config_key() -> None:
             parsed = tomllib.loads(f"{key} = {value}")
         except tomllib.TOMLDecodeError:
             continue  # a multi-line value (the exclude list); covered below
-        if section in ("registries", "credentials", "workloads", "schedules", "mcp"):
+        if section in ("registries", "credentials", "workloads", "schedules", "mcp", "agents"):
             continue  # array-of-tables entries load as whole blocks, below
         if section == "github.repos":
             doc: dict[str, Any] = {"github": {"repos": [{"repo": "you/your-repo", **parsed}]}}
@@ -632,6 +632,40 @@ def test_example_mcp_entry_loads_with_its_credential() -> None:
     assert spec.mediated and spec.url == entry["url"]
     assert spec.env == {} and spec.headers == {}
     assert config.mcp_specs_for("critic") == []
+
+
+def test_example_agent_entry_loads_with_its_credential_and_server() -> None:
+    """The commented `[[agents]]` entry loads as one block beside the
+    `[[credentials]]` and `[[mcp]]` entries it names, and joins the
+    built-in agents under its slug and alias."""
+    from sbxloop.agents.registry import ConfigAgentRegistry
+
+    def block_after(header: str) -> dict[str, Any]:
+        text = ""
+        in_block = False
+        for line in EXAMPLE.read_text().splitlines():
+            stripped = re.sub(r"^#\s?", "", line)
+            if stripped == header:
+                in_block = True
+            elif in_block and line.startswith("#") and re.match(r"^[a-z_]+ = ", stripped):
+                text += stripped + "\n"
+            elif in_block and not line.strip():
+                break
+        return tomllib.loads(text)
+
+    agent = block_after("[[agents]]")
+    config = Config.model_validate(
+        {
+            "credentials": [block_after("[[credentials]]")],
+            "mcp": [block_after("[[mcp]]")],
+            "agents": [agent],
+        }
+    )
+    (spec,) = config.agents
+    assert spec.slug == agent["slug"] and spec.credentials == agent["credentials"]
+    resolved = ConfigAgentRegistry(config).get(agent["aliases"][0])
+    assert resolved is not None and resolved.slug == agent["slug"]
+    assert resolved.source == "config"
 
 
 def test_example_credential_entry_loads() -> None:

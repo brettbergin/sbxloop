@@ -20,6 +20,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypeVar
 
+from sbxloop.agents.registry import AgentRegistry, default_registry
 from sbxloop.api.agents import AGENTS_BY_SLUG, ANGIE_PERSONA
 from sbxloop.api.artifacts import ArtifactCatalog
 from sbxloop.api.auth.keys import SigningKeys
@@ -125,6 +126,7 @@ class ApiContext:
         self._chronology: Chronology | None = None
         self._artifacts: ArtifactCatalog | None = None
         self._collaboration: CollaborationStore | None = None
+        self._agents: tuple[Config, AgentRegistry] | None = None
         #: Wakes every live stream; the projector, the frontend and the
         #: routes raise it from their own threads.
         self.hub = StreamHub()
@@ -135,6 +137,15 @@ class ApiContext:
     @property
     def api(self) -> Any:
         return self.config.api
+
+    @property
+    def agents(self) -> AgentRegistry:
+        """The agent registry for the config this context currently holds."""
+        cached = self._agents
+        if cached is None or cached[0] is not self.config:
+            cached = (self.config, default_registry(self.config))
+            self._agents = cached
+        return cached[1]
 
     @property
     def public_ids(self) -> PublicIds:

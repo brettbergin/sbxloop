@@ -758,7 +758,10 @@ class LoopEngine:
         # config was narrowed to its repository, not an operator setting: it
         # differs from the live config by construction and says nothing about
         # drift.
+        # `agents` is the live agent catalogue, not a setting a run is pinned
+        # to.
         ignore = {
+            "agents",
             "github.enabled_repo_count",
             "run_model_override",
             "run_model_repo",

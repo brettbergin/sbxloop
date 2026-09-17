@@ -2,6 +2,17 @@
 
 ### Added
 
+- **Agents can be declared in `sbxloop.toml`.** A `[[agents]]` entry adds an
+  agent beside Angie and the planner, builder, critic and operator, or
+  adjusts the built-in with the same slug: its name, aliases, persona,
+  avatar, colour, model, roles, and the tools, skills, MCP servers and
+  credentials it is narrowed to. An entry carries no egress (host or allow
+  keys are refused), and one that names an undeclared credential, MCP
+  server or tool, or an @-name another agent already has, fails the load.
+  The built-in catalogue and every chat persona are unchanged, `agents` is
+  locked from chat by default, and nothing yet routes turns or runs to a
+  declared agent.
+
 - **A GitLab backend for the read paths.** `[vcs] kind = "gitlab"` with
   `[vcs] api_url` now selects a backend that answers the repository,
   issue, checks and policy roles against GitLab's REST API from the
