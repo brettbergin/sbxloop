@@ -26,7 +26,7 @@ def setup_work(
         json={"content": "Prepare a report"}
         | (request or {"target_slugs": ["concierge", "operator"]}),
     ).json()
-    api.ctx.turn_executor.submit(lambda: None).result(timeout=5)
+    assert api.ctx.turns.wait_idle(timeout=5)
     key = accepted["turn"]["input_message_id"] + suffix
     item = WorkItem(
         item_id=chat_item_id(key),
@@ -284,7 +284,7 @@ def test_a_run_whose_catalog_fails_does_not_stop_delivery(api: Any, monkeypatch:
         headers=headers,
         json={"content": "Prepare a report", "target_slugs": ["concierge", "operator"]},
     ).json()
-    api.ctx.turn_executor.submit(lambda: None).result(timeout=5)
+    assert api.ctx.turns.wait_idle(timeout=5)
     key = accepted["turn"]["input_message_id"]
     second = WorkItem(
         item_id=chat_item_id(key),

@@ -322,6 +322,17 @@
 
 ### Changed
 
+- **Chat turns in different channels now run side by side, up to four at
+  once.** `[concierge] max_concurrent_turns` now defaults to 4 (it was 1).
+  Accepted product-channel turns used to wait in one daemon-wide queue.
+  They now wait in a queue per channel over a shared pool of that many
+  workers, so turns in one channel still run strictly in the order they
+  were accepted, while a slow turn in one channel no longer holds up the
+  others. Turns recovered at startup are queued in each channel's message
+  order. Queued turns left at shutdown stay accepted and run after the next
+  start, as before. Set `max_concurrent_turns = 1` to keep the previous
+  one-at-a-time behaviour; chat bridge turns share the same width.
+
 - **Every request now knows which workspace member is calling.** The
   authenticated principal carries the caller's workspace membership, or none
   for a plain API client, which keeps the reach its capabilities give it.

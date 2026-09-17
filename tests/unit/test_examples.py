@@ -106,15 +106,15 @@ def test_openai_endpoint_selection_is_documented_in_the_shipped_examples() -> No
 
 def test_concurrent_chat_turns_are_documented_in_the_shipped_examples() -> None:
     """The three places every knob lands, for `[concierge] max_concurrent_turns`."""
-    assert Config.model_validate({}).concierge.max_concurrent_turns == 1
+    assert Config.model_validate({}).concierge.max_concurrent_turns == 4
     (line,) = [
         line
         for line in DEFAULT_CONFIG_TOML.splitlines()
         if line.startswith("# max_concurrent_turns = ")
     ]
-    assert tomllib.loads(line.removeprefix("# ")) == {"max_concurrent_turns": 1}
+    assert tomllib.loads(line.removeprefix("# ")) == {"max_concurrent_turns": 4}
     guide = (REPO_ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8")
-    assert "| `[concierge] max_concurrent_turns` | `1`" in " ".join(guide.split())
+    assert "| `[concierge] max_concurrent_turns` | `4`" in " ".join(guide.split())
 
 
 def test_oidc_sign_in_is_documented_in_the_shipped_examples() -> None:

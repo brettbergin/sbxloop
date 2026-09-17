@@ -2358,19 +2358,47 @@ class CollaborationStore:
     def cancel_turn(self, viewer: Viewer, channel_id: str, turn_id: str, now: float) -> Turn | None:
         """Stop a turn. The person who asked, or someone who manages the
         channel, may stop it; ``None`` when either cannot be seen."""
+        return self._cancel_turn(turn_id, now, viewer=viewer, channel_id=channel_id)
+
+    def request_turn_cancel(self, turn_id: str, now: float) -> Turn | None:
+        """Cancel a turn the daemon itself is stopping (its channel's lane).
+
+        The same transition as :meth:`cancel_turn`: an unstarted turn is
+        settled as cancelled, a running one is marked ``cancelling`` for its
+        participant loop to observe. No ownership check: the caller is the
+        scheduler, not a person.
+        """
+        return self._cancel_turn(turn_id, now)
+
+    def _cancel_turn(
+        self,
+        turn_id: str,
+        now: float,
+        *,
+        viewer: Viewer | None = None,
+        channel_id: str | None = None,
+    ) -> Turn | None:
         settle = False
         with self.dstore.immediate_transaction() as session:
-            try:
-                _, member = _access(session, channel_id, viewer, "read")
-            except CollaborationError:
-                return None
+            member: Member | None = None
+            if viewer is not None and channel_id is not None:
+                try:
+                    _, member = _access(session, channel_id, viewer, "read")
+                except CollaborationError:
+                    return None
             row = session.get(TurnRow, turn_id)
-            if row is None or row.channel_id != channel_id:
+            if row is None or (channel_id is not None and row.channel_id != channel_id):
                 return None
-            if member is not None and not (
-                row.author_kind in {"human", None} and row.author_id == member.user.id
-            ):
-                _access(session, channel_id, member, "manage")
+            channel_id = row.channel_id
+            if viewer is not None:
+                if member is not None and not (
+                    row.author_kind in {"human", None} and row.author_id == member.user.id
+                ):
+                    _access(session, channel_id, member, "manage")
+            else:
+                channel = session.get(ChannelRow, channel_id)
+                if channel is None or channel.state != "active":
+                    return None
             if row.status not in {"accepted", "running"}:
                 return _turn(session, row)
             settle = row.status == "accepted"

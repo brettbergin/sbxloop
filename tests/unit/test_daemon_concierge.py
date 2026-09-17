@@ -2127,7 +2127,11 @@ class TestQueueing:
         import threading
 
         gate = threading.Event()
-        concierge, client, *_ = make(tmp_path, [{"text": "one"}, {"text": "two"}])
+        concierge, client, *_ = make(
+            tmp_path,
+            [{"text": "one"}, {"text": "two"}],
+            config={"concierge": {"max_concurrent_turns": 1}},
+        )
         original = client.submit
 
         def slow_submit(job: JobRequest, **kwargs: Any) -> JobResult:
@@ -3730,7 +3734,7 @@ class LeasingHost(FakeHost):
 
 class TestConcurrentTurns:
     def test_the_turn_width_is_a_bounded_concierge_knob(self) -> None:
-        assert Config.model_validate({}).concierge.max_concurrent_turns == 1
+        assert Config.model_validate({}).concierge.max_concurrent_turns == 4
         assert (
             Config.model_validate(
                 {"concierge": {"max_concurrent_turns": 16}}
@@ -3803,8 +3807,10 @@ class TestConcurrentTurns:
         assert replies == ["one", "two"]
         assert [len(client.jobs) for client in clients] == [1, 1]
 
-    def test_turns_run_one_at_a_time_by_default(self, tmp_path: Path) -> None:
-        concierge, _, host, _, _ = make(tmp_path, [])
+    def test_turns_run_one_at_a_time_at_width_one(self, tmp_path: Path) -> None:
+        concierge, _, host, _, _ = make(
+            tmp_path, [], config={"concierge": {"max_concurrent_turns": 1}}
+        )
         client = BlockingClient(2)
         host._client = client  # type: ignore[assignment]
         try:

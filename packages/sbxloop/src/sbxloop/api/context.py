@@ -42,6 +42,7 @@ from sbxloop.api.collaboration import (
 )
 from sbxloop.api.publicids import PublicIds
 from sbxloop.api.stream import StreamHub
+from sbxloop.api.turns import TurnCoordinator
 from sbxloop.config import Config
 from sbxloop.daemon.controls.service import ControlService
 from sbxloop.errors import ToolRejectedError
@@ -124,9 +125,11 @@ class ApiContext:
         self.executor = ThreadPoolExecutor(
             max_workers=EXECUTOR_THREADS, thread_name_prefix="sbxloop-api-worker"
         )
-        self.turn_executor = ThreadPoolExecutor(
-            max_workers=1, thread_name_prefix="sbxloop-collaboration"
-        )
+        #: Accepted chat turns: one FIFO lane per channel over a pool as wide
+        #: as the concierge's own turn pool.
+        self.turns = TurnCoordinator(config.concierge.max_concurrent_turns)
+        # Held while a turn is accepted and queued, so two requests for one
+        # channel queue in the order they were accepted.
         self._turn_admission = threading.Lock()
         self._collaboration_recovered = False
         self._semaphore: asyncio.Semaphore | None = None
@@ -290,11 +293,12 @@ class ApiContext:
         *,
         intent: str,
     ) -> None:
-        """Run an accepted chat turn away from the HTTP event loop.
+        """Queue an accepted chat turn on its channel's lane.
 
-        Explicit agent targets are sequential today because the existing
-        concierge owns one sandbox session executor. Each role still has its
-        own durable session key, and every reply is recorded independently.
+        Turns in one channel run in order; turns in different channels run
+        side by side up to ``[concierge] max_concurrent_turns``. Within a
+        turn its explicit agent targets still answer one after another, each
+        with its own durable session key and independently recorded reply.
         """
         concierge = self.concierge
         if concierge is None:
@@ -322,7 +326,11 @@ class ApiContext:
                 )
             self.hub.notify()
 
-        self.turn_executor.submit(run)
+        def cancel() -> None:
+            self.collaboration.request_turn_cancel(turn.id, self.clock())
+            self.hub.notify()
+
+        self.turns.submit(turn, run, cancel=cancel)
 
     def _execute_collaboration_turn(
         self,
@@ -514,4 +522,4 @@ class ApiContext:
         # Every live stream sees `stopping` on its next wake and ends.
         self.hub.notify()
         self.executor.shutdown(wait=False, cancel_futures=True)
-        self.turn_executor.shutdown(wait=False, cancel_futures=True)
+        self.turns.shutdown()
