@@ -24,6 +24,11 @@ Threading: turns run on the concierge's own worker pool, at most
 ``submit_turn`` returns a Future; ``pending`` says how many are queued
 behind the running ones), each on a worker client of its own leased from
 the session host (:meth:`~sbxloop.daemon.agentbox.DaemonAgent.lease`).
+Turns that resume the same SDK session are serialised into one FIFO lane
+by their ``session_key``, so however wide the pool is set, no two turns
+share a ``resume_session_id`` at once and a surface's messages are still
+answered in the order they arrived; every chat bridge turn carries no
+``session_key`` and so shares the one default session's lane.
 What a turn's tools need to know about it (the speaker, the session, the
 handoff callback...) is a :class:`TurnContext` held in a context
 variable, never in shared instance state, so overlapping turns cannot
@@ -43,9 +48,10 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -405,6 +411,16 @@ class Concierge:
         )
         self._pending = 0
         self._state_lock = threading.Lock()
+        # Turns that resume the same SDK session must not overlap: they share
+        # one ``resume_session_id``, its turn counter and its model, all kept
+        # under one ``session_key`` in ``daemon_state``. Every chat bridge
+        # turn (Discord, Slack, Mattermost, the TUI) carries ``session_key``
+        # None and so resumes the one default session, so they all share a
+        # single reserved lane. Each lane is FIFO in arrival order, so a
+        # surface's messages are still answered in the order they were sent
+        # whatever ``[concierge] max_concurrent_turns`` is set to.
+        self._lanes: dict[str, deque[object]] = {}
+        self._lanes_changed = threading.Condition()
         self._tool_lock = threading.Lock()
         self._closed = False
         self._tools: dict[str, HostTool] = {t.spec.name: t for t in self._build_tools()}
@@ -574,8 +590,11 @@ class Concierge:
             if self._closed:
                 raise RuntimeError("concierge is closed")
             self._pending += 1
+        # Take this turn's place in its session's lane now, under the
+        # caller's ordering, not when a pool thread happens to pick it up.
+        lane_key, ticket = self._join_lane(session_key)
 
-        def run() -> ConciergeReply:
+        def turn() -> ConciergeReply:
             with self._state_lock:
                 self._pending -= 1
             context = TurnContext(
@@ -621,7 +640,64 @@ class Concierge:
                 updates["work_products"] = tuple(dict.fromkeys(turn_work_products))
             return reply._replace(**updates) if updates else reply
 
-        return self._executor.submit(run)
+        def run() -> ConciergeReply:
+            # One turn at a time per session: the next one in the lane starts
+            # only once this one has written the session back.
+            self._await_lane(lane_key, ticket)
+            try:
+                return turn()
+            finally:
+                self._leave_lane(lane_key, ticket)
+
+        def release(future: Future[ConciergeReply]) -> None:
+            # A cancelled turn never runs, so nothing else would give its
+            # lane place back and the turns behind it would wait forever.
+            if future.cancelled():
+                self._leave_lane(lane_key, ticket)
+
+        try:
+            future = self._executor.submit(run)
+        except BaseException:
+            self._leave_lane(lane_key, ticket)
+            with self._state_lock:
+                self._pending -= 1
+            raise
+        future.add_done_callback(release)
+        return future
+
+    # -- session lanes ----------------------------------------------------------
+
+    def _join_lane(self, session_key: str | None) -> tuple[str, object]:
+        """Reserve the back of the lane a turn on ``session_key`` runs in.
+
+        The reserved key ``""`` is the default session every bridge turn
+        resumes; a keyed turn (one product channel's participant) has a lane
+        of its own.
+        """
+        lane_key = session_key or ""
+        ticket = object()
+        with self._lanes_changed:
+            self._lanes.setdefault(lane_key, deque()).append(ticket)
+        return lane_key, ticket
+
+    def _await_lane(self, lane_key: str, ticket: object) -> None:
+        """Block until every turn reserved before this one has finished."""
+        with self._lanes_changed:
+            self._lanes_changed.wait_for(lambda: self._head_of(lane_key) is ticket)
+
+    def _leave_lane(self, lane_key: str, ticket: object) -> None:
+        with self._lanes_changed:
+            lane = self._lanes.get(lane_key)
+            if lane is not None:
+                with suppress(ValueError):
+                    lane.remove(ticket)
+                if not lane:
+                    del self._lanes[lane_key]
+            self._lanes_changed.notify_all()
+
+    def _head_of(self, lane_key: str) -> object | None:
+        lane = self._lanes.get(lane_key)
+        return lane[0] if lane else None
 
     def reset_session(self, session_key: str | None = None) -> None:
         self.dstore.set_value(self._session_state_key(STATE_SESSION_ID, session_key), None)

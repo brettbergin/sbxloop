@@ -326,9 +326,12 @@
   queue.** Accepted product-channel turns now run over a shared pool of
   `[concierge] max_concurrent_turns` workers, so turns in one channel still
   run strictly in the order they were accepted, while with a width above 1
-  a slow turn in one channel no longer holds up the others. The default
-  stays 1: chat bridge turns share one session and are not yet serialized
-  by it, so raising the width also lets bridge turns overlap. Turns
+  a slow turn in one channel no longer holds up the others. Turns that
+  resume the same concierge session run one at a time in the order they
+  arrived, whatever the width: every chat bridge turn (Discord, Slack,
+  Mattermost, the TUI) resumes the one default session, so raising the
+  width never lets two of them interleave over its session id, turn
+  counter and model. The default stays 1 for now. Turns
   recovered at startup are queued in each channel's message order. Queued
   turns left at shutdown stay accepted and run after the next start, as
   before. Cancelling a channel's lane settles its queued turns even when
