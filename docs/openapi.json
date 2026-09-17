@@ -2522,6 +2522,32 @@
       "LocalUserOut": {
         "additionalProperties": false,
         "properties": {
+          "auth_source": {
+            "anyOf": [
+              {
+                "enum": [
+                  "local",
+                  "oidc"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Auth Source"
+          },
+          "avatar_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Url"
+          },
           "created_at": {
             "title": "Created At",
             "type": "string"
@@ -2548,6 +2574,22 @@
           "is_active": {
             "title": "Is Active",
             "type": "boolean"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "enum": [
+                  "owner",
+                  "admin",
+                  "member"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
           },
           "timezone": {
             "title": "Timezone",
@@ -6419,6 +6461,310 @@
           "ask"
         ],
         "title": "WorkloadIntake",
+        "type": "object"
+      },
+      "WorkspaceInviteCreate": {
+        "additionalProperties": false,
+        "properties": {
+          "email": {
+            "anyOf": [
+              {
+                "maxLength": 320,
+                "minLength": 3,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "role": {
+            "enum": [
+              "owner",
+              "admin",
+              "member"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "ttl_hours": {
+            "default": 72,
+            "maximum": 720.0,
+            "minimum": 1.0,
+            "title": "Ttl Hours",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "role"
+        ],
+        "title": "WorkspaceInviteCreate",
+        "type": "object"
+      },
+      "WorkspaceInviteCreated": {
+        "additionalProperties": false,
+        "description": "A new invite. ``token`` appears here and nowhere else.",
+        "properties": {
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "expires_at": {
+            "title": "Expires At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "owner",
+              "admin",
+              "member"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "token": {
+            "title": "Token",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "token",
+          "expires_at",
+          "role",
+          "email"
+        ],
+        "title": "WorkspaceInviteCreated",
+        "type": "object"
+      },
+      "WorkspaceInviteOut": {
+        "additionalProperties": false,
+        "properties": {
+          "accepted_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Accepted At"
+          },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
+          "email": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Email"
+          },
+          "expires_at": {
+            "title": "Expires At",
+            "type": "string"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "role": {
+            "enum": [
+              "owner",
+              "admin",
+              "member"
+            ],
+            "title": "Role",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "role",
+          "email",
+          "expires_at",
+          "accepted_at",
+          "created_by"
+        ],
+        "title": "WorkspaceInviteOut",
+        "type": "object"
+      },
+      "WorkspaceInvitePage": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceInviteOut"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "WorkspaceInvitePage",
+        "type": "object"
+      },
+      "WorkspaceMemberUpdate": {
+        "additionalProperties": false,
+        "properties": {
+          "is_active": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Is Active"
+          },
+          "role": {
+            "anyOf": [
+              {
+                "enum": [
+                  "owner",
+                  "admin",
+                  "member"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Role"
+          }
+        },
+        "title": "WorkspaceMemberUpdate",
+        "type": "object"
+      },
+      "WorkspaceUserOut": {
+        "additionalProperties": false,
+        "description": "One person in the workspace directory.",
+        "properties": {
+          "auth_source": {
+            "enum": [
+              "local",
+              "oidc"
+            ],
+            "title": "Auth Source",
+            "type": "string"
+          },
+          "avatar_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Url"
+          },
+          "email": {
+            "title": "Email",
+            "type": "string"
+          },
+          "full_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Full Name"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "is_active": {
+            "title": "Is Active",
+            "type": "boolean"
+          },
+          "last_seen_at": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Last Seen At"
+          },
+          "role": {
+            "enum": [
+              "owner",
+              "admin",
+              "member"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "username",
+          "email",
+          "full_name",
+          "avatar_url",
+          "role",
+          "is_active",
+          "auth_source",
+          "last_seen_at"
+        ],
+        "title": "WorkspaceUserOut",
+        "type": "object"
+      },
+      "WorkspaceUserPage": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/WorkspaceUserOut"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "WorkspaceUserPage",
         "type": "object"
       }
     }
@@ -10899,6 +11245,28 @@
         ]
       }
     },
+    "/v1/users": {
+      "get": {
+        "description": "Everyone in the workspace, active or not, oldest member first.",
+        "operationId": "list_users_v1_users_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceUserPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Users",
+        "tags": [
+          "workspace"
+        ]
+      }
+    },
     "/v1/users/me": {
       "get": {
         "operationId": "get_local_user_v1_users_me_get",
@@ -11145,6 +11513,191 @@
         "summary": "Update Workflow",
         "tags": [
           "collaboration"
+        ]
+      }
+    },
+    "/v1/workspace/invites": {
+      "get": {
+        "description": "Pending and spent invites, newest first, without their tokens.",
+        "operationId": "list_invites_v1_workspace_invites_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceInvitePage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Invites",
+        "tags": [
+          "workspace"
+        ]
+      },
+      "post": {
+        "description": "A new invite. Its token is in this response only; the daemon keeps a\nhash.",
+        "operationId": "create_invite_v1_workspace_invites_post",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceInviteCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceInviteCreated"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Invite",
+        "tags": [
+          "workspace"
+        ]
+      }
+    },
+    "/v1/workspace/invites/{invite_id}": {
+      "delete": {
+        "description": "Withdraw an unspent invite; its token admits nobody afterwards.",
+        "operationId": "revoke_invite_v1_workspace_invites__invite_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "invite_id",
+            "required": true,
+            "schema": {
+              "title": "Invite Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Revoke Invite",
+        "tags": [
+          "workspace"
+        ]
+      }
+    },
+    "/v1/workspace/members/{user_id}": {
+      "delete": {
+        "description": "End a membership: the user's client keeps no capability and its\nrefresh tokens are revoked in the same transaction.",
+        "operationId": "remove_member_v1_workspace_members__user_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Member",
+        "tags": [
+          "workspace"
+        ]
+      },
+      "patch": {
+        "description": "Change a member's role or deactivate (or reactivate) them. A\ndeactivated user's tokens stop working and their refresh tokens are\nrevoked in the same transaction as the change.",
+        "operationId": "update_member_v1_workspace_members__user_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkspaceMemberUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceUserOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Member",
+        "tags": [
+          "workspace"
         ]
       }
     }

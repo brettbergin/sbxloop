@@ -292,6 +292,59 @@ Connection credentials remain in sbxloop's environment and configuration.
 These routes report redacted readiness and deliberately reject browser-supplied
 secret mutation until protected credential intake is implemented (#1043).
 
+### Workspace people
+
+A workspace holds owners, admins and members. These routes are advertised as
+`users.directory` and `workspace.members`:
+
+| Route                                    | Who          | Result                                                             |
+| ---------------------------------------- | ------------ | ------------------------------------------------------------------ |
+| `GET /v1/users`                          | any member   | `{data: [user]}`, oldest member first                              |
+| `PATCH /v1/workspace/members/{user_id}`  | admin, owner | `{role?, is_active?}`, answers the updated `user`                  |
+| `DELETE /v1/workspace/members/{user_id}` | admin, owner | `204`; the membership ends                                         |
+| `POST /v1/workspace/invites`             | admin, owner | `201 {id, token, expires_at, role, email}`                         |
+| `GET /v1/workspace/invites`              | admin, owner | `{data: [{id, role, email, expires_at, accepted_at, created_by}]}` |
+| `DELETE /v1/workspace/invites/{id}`      | admin, owner | `204`; the invite's token admits nobody                            |
+
+A `user` is `{id, username, email, full_name, avatar_url, role, is_active, auth_source, last_seen_at}`, where `role` is `owner`, `admin` or `member`,
+`auth_source` is `local` or `oidc`, and `last_seen_at` is the last
+authenticated request (recorded at most once a minute) or `null`.
+`GET /v1/users/me` also carries the caller's `role`, `avatar_url` and
+`auth_source`.
+
+Rules:
+
+- Only an owner grants the owner role, invites an owner, or changes,
+  deactivates or removes an owner (`403 owner_required`).
+- Nobody deactivates or removes themselves (`409 self_action`).
+- The workspace always keeps an active owner (`409 last_owner`).
+- A caller below admin is refused with `403 forbidden_role`. A plain API
+  client with no user counts as an owner when it holds `daemon:manage`, and
+  is refused with `forbidden_role` otherwise.
+- An unknown user or invite is `404 user_not_found` or `404 invite_not_found`.
+  An invite already spent cannot be revoked (`409 invite_accepted`).
+
+Deactivating a user (`is_active: false`) revokes their refresh tokens, and
+every access token they hold is refused at once (`401 user_inactive`), as is
+their login. Reactivating restores their role's capabilities. Removing a
+member leaves their client with no capability and revokes its refresh
+tokens. The refresh tokens are revoked in the same database transaction as
+the membership change, so either both happen or neither does.
+
+An invite's token appears only in the creation response; the daemon keeps
+its SHA-256. `ttl_hours` defaults to 72 and may be 1 to 720. An invite with
+an `email` admits only a registration with that email, compared without
+regard to case (`403 invite_email_mismatch`). The `email` is trimmed of
+surrounding whitespace first; an empty or all-whitespace `email` is treated
+as absent, so that invite admits any address. An invite's `created_by`, and
+the `invited_by` of the membership it creates, is the inviting user's id, or
+`client:<client id>` when a plain operator client created it.
+
+Every change records an event without any token:
+`workspace.member.updated`, `workspace.member.removed`,
+`workspace.invite.created` and `workspace.invite.revoked`, each with the
+acting user or client as `actor`.
+
 ## Clients and tokens
 
 sbxloop issues its own tokens. A client is registered on the host with the
@@ -397,6 +450,12 @@ rechecked when it arrives) and a `revision` a command may pin.
 | `POST`   | `/v1/auth/token`, `/v1/auth/revoke`          | none / any             | Mint and refresh; revoke the presented token                          |
 | `POST`   | `/v1/auth/local/register`, `/login`          | none                   | One local user's onboarding and login                                 |
 | `GET`    | `/v1/users/me`, `/v1/agents[/{slug}]`        | collaboration read     | Local profile and product agent catalog                               |
+| `GET`    | `/v1/users`                                  | workspace member       | The workspace directory                                               |
+| `PATCH`  | `/v1/workspace/members/{user_id}`            | workspace admin        | Change a role; deactivate or reactivate a user                        |
+| `DELETE` | `/v1/workspace/members/{user_id}`            | workspace admin        | End a membership                                                      |
+| `POST`   | `/v1/workspace/invites`                      | workspace admin        | Create an invite; the raw token appears only here                     |
+| `GET`    | `/v1/workspace/invites`                      | workspace admin        | List invites                                                          |
+| `DELETE` | `/v1/workspace/invites/{id}`                 | workspace admin        | Withdraw an invite                                                    |
 | `POST`   | `/v1/agents`, `/v1/agents/{slug}/archive`    | collaboration write    | Save a person's own agent; archive it                                 |
 | `PATCH`  | `/v1/agents/{slug}`                          | collaboration write    | Edit a saved agent at the revision last read                          |
 | CRUD     | `/v1/teams`, `/v1/channels`, `/v1/workflows` | collaboration          | Local teams, durable conversations, and workflow definitions          |
