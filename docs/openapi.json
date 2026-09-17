@@ -1347,6 +1347,17 @@
             "title": "Title",
             "type": "string"
           },
+          "unread_count": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Unread Count"
+          },
           "updated_at": {
             "title": "Updated At",
             "type": "string"
@@ -1518,6 +1529,74 @@
           }
         },
         "title": "ChannelParticipantUpdate",
+        "type": "object"
+      },
+      "ChannelReadUpdate": {
+        "additionalProperties": false,
+        "description": "How far the caller has read this channel.",
+        "properties": {
+          "sequence": {
+            "minimum": 0.0,
+            "title": "Sequence",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "sequence"
+        ],
+        "title": "ChannelReadUpdate",
+        "type": "object"
+      },
+      "ChannelSilence": {
+        "additionalProperties": false,
+        "description": "How long the channel's agents stay quiet; null lifts the silence.",
+        "properties": {
+          "until": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Until"
+          }
+        },
+        "title": "ChannelSilence",
+        "type": "object"
+      },
+      "ChannelStopOut": {
+        "additionalProperties": false,
+        "description": "What a stop actually stopped.",
+        "properties": {
+          "cancelled_runs": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Cancelled Runs",
+            "type": "array"
+          },
+          "cancelled_turns": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Cancelled Turns",
+            "type": "array"
+          },
+          "silenced_until": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Silenced Until"
+          }
+        },
+        "title": "ChannelStopOut",
         "type": "object"
       },
       "ChannelUpdate": {
@@ -6714,6 +6793,11 @@
             ],
             "title": "Author Id"
           },
+          "chain_depth": {
+            "default": 0,
+            "title": "Chain Depth",
+            "type": "integer"
+          },
           "channel_id": {
             "title": "Channel Id",
             "type": "string"
@@ -9420,6 +9504,198 @@
           }
         },
         "summary": "Put Channel Participant",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/read": {
+      "put": {
+        "description": "Record how far the caller has read. The sequence only moves forward,\nand never past the newest message.",
+        "operationId": "set_channel_read_v1_channels__channel_id__read_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelReadUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelMemberOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set Channel Read",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/resume": {
+      "post": {
+        "description": "Lift the channel's silence; it does not restart what stop cancelled.",
+        "operationId": "resume_channel_v1_channels__channel_id__resume_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Resume Channel",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/silence": {
+      "put": {
+        "description": "Quiet the channel's agents until ``until``; null lifts it. Nothing in\nflight is cancelled: that is what ``stop`` is for.",
+        "operationId": "silence_channel_v1_channels__channel_id__silence_put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelSilence"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Silence Channel",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/stop": {
+      "post": {
+        "description": "Stop everything this channel has in flight and silence it.\n\nAnyone who may post may stop a channel they are in: a person watching\nagents go somewhere they should not is the only guard that matters, and\nwaiting for whoever owns the channel would defeat it. Queued and\nrunning turns are cancelled, the runs the channel asked for are\ncancelled through the daemon's control service, and the channel is\nsilenced until ``resume`` or a ``silence`` of its own lifts it.",
+        "operationId": "stop_channel_v1_channels__channel_id__stop_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelStopOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Stop Channel",
         "tags": [
           "collaboration"
         ]

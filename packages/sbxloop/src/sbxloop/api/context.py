@@ -44,6 +44,7 @@ from sbxloop.api.channel_summary import ChannelSummarizer
 from sbxloop.api.chronology import Chronology
 from sbxloop.api.collaboration import (
     ChannelLink,
+    Author,
     CollaborationError,
     CollaborationStore,
     LocalUser,
@@ -51,6 +52,8 @@ from sbxloop.api.collaboration import (
     Turn,
     guest_user,
 )
+from sbxloop.api.guardrails import Guardrails
+from sbxloop.api.mentions import MentionRouter
 from sbxloop.api.publicids import PublicIds
 from sbxloop.api.stream import StreamHub
 from sbxloop.api.turns import TurnCoordinator
@@ -190,6 +193,13 @@ def _recorded_assignees(turn: Turn) -> dict[str, str]:
     return {str(role): str(slug) for role, slug in stored.items()}
 
 
+def _addressable_slug(registry: AgentRegistry, slug: str) -> str | None:
+    """``slug`` when it names an agent a mention may reach, else ``None``."""
+    key = slug.strip().casefold()
+    agent = registry.get(key)
+    return key if addressable(agent, key) else None
+
+
 def _work_lead(registry: AgentRegistry, target: str | None) -> str | None:
     """The agent answering the turn when it may lead work; Angie answers a
     turn that addressed nobody."""
@@ -253,6 +263,7 @@ class ApiContext:
         self._memory: tuple[Config, MemoryService] | None = None
         self._summaries: ChannelSummarizer | None = None
         self._oidc: tuple[Any, Any] | None = None
+        self._guardrails: Guardrails | None = None
         #: Wakes every live stream; the projector, the frontend and the
         #: routes raise it from their own threads.
         self.hub = StreamHub()
@@ -462,6 +473,18 @@ class ApiContext:
         if self._collaboration is None:
             self._collaboration = CollaborationStore(self.loop.dstore)
         return self._collaboration
+
+    @property
+    def guardrails(self) -> Guardrails:
+        """What an agent addressing another agent has to pass."""
+        if self._guardrails is None:
+            self._guardrails = Guardrails(
+                self.collaboration,
+                lambda: self.config,
+                clock=self.clock,
+                pool=getattr(self.loop, "usage_pool", None),
+            )
+        return self._guardrails
 
     @property
     def collaboration_available(self) -> bool:
@@ -768,6 +791,8 @@ class ApiContext:
                         now=self.clock(),
                         participant_index=index,
                     )
+                    if delivered is not None:
+                        self._route_agent_mentions(turn, delivered, target or ANGIE_SLUG, user)
                     if delivered is not None and reply.after is not None:
                         reply.after()
                 else:
@@ -801,6 +826,133 @@ class ApiContext:
                 "collaboration.channel_tools_unavailable", channel=channel_id, exc_info=True
             )
             return ()
+
+    def _route_agent_mentions(
+        self, turn: Turn, message: Message, author_slug: str, user: LocalUser
+    ) -> None:
+        """Queue a turn for each agent the reply just posted addresses.
+
+        The chain of agent-started turns is bounded by the guardrails; a
+        refusal is audited and the reply simply stands on its own. Nothing
+        here may fail the turn that produced the reply.
+        """
+        if not self.config.collaboration.max_chain_depth:
+            return
+        # A turn a person stopped does not get to start anything: the reply
+        # was already in flight, the follow-up need not be.
+        live = self.collaboration.get_turn(None, turn.channel_id, turn.id)
+        if live is None or live.status not in {"accepted", "running"}:
+            return
+        # An agent naming itself, however it is spelled, addresses nobody.
+        written_by = message.author
+        reply_to = written_by.id if written_by.kind == "agent" else None
+        try:
+            router = MentionRouter(
+                resolve=lambda slug: _addressable_slug(self.agents, slug),
+                participants=lambda channel_id: [
+                    entry.agent_slug
+                    for entry in self.collaboration.list_participants(None, channel_id)
+                ],
+                join=lambda channel_id, slug: self.collaboration.put_participant(
+                    None,
+                    channel_id,
+                    slug,
+                    {},
+                    self.clock(),
+                    added_by=Author("agent", author_slug),
+                ),
+                admit=lambda channel_id, **kwargs: self.guardrails.admit(
+                    channel_id, source=Author("agent", author_slug), **kwargs
+                ),
+                queue=lambda **kwargs: self._queue_agent_followup(turn, user, **kwargs),
+            )
+            router.route(
+                message.content,
+                channel_id=turn.channel_id,
+                source_message_id=message.id,
+                author_slug=author_slug,
+                reply_to_author=reply_to,
+                depth=turn.chain_depth + 1,
+            )
+        except Exception:
+            log.warning(
+                "collaboration.mention_routing_failed",
+                channel=turn.channel_id,
+                agent=author_slug,
+                exc_info=True,
+            )
+
+    def _queue_agent_followup(
+        self,
+        parent: Turn,
+        user: LocalUser,
+        *,
+        channel_id: str,
+        source_message_id: str,
+        author_slug: str,
+        target_slug: str,
+        depth: int,
+        trigger: str,
+    ) -> None:
+        """Accept and schedule one agent-started turn on its channel's lane.
+
+        Acceptance and submission share the same ordering boundary a person's
+        turn uses, so a turn accepted first is always the one queued first
+        whichever thread accepted it.
+        """
+        with self._turn_admission:
+            follow_up = self.collaboration.accept_agent_turn(
+                channel_id,
+                source_message_id,
+                author=Author("agent", author_slug),
+                targets=(target_slug,),
+                trigger=trigger,
+                parent_turn_id=parent.id,
+                chain_depth=depth,
+                now=self.clock(),
+            )
+            if follow_up is None:
+                return
+            self.start_collaboration_turn(
+                follow_up,
+                user,
+                self.collaboration.message_content(source_message_id) or "",
+                intent=follow_up.intent,
+            )
+        self.hub.notify()
+
+    def cancel_channel(
+        self, channel_id: str, until: float | None, *, principal: Any
+    ) -> dict[str, Any]:
+        """Stop a channel: cancel its turns, cancel the runs it asked for,
+        and silence it until ``until``. What a person reaches for when the
+        agents are going somewhere they should not."""
+        turns = self.turns.cancel_channel(channel_id)
+        runs: list[str] = []
+        for run_id in self._channel_runs(channel_id):
+            try:
+                self.service().cancel_run(principal, run_id)
+            except Exception:
+                log.warning("collaboration.channel_run_cancel_failed", run=run_id, exc_info=True)
+                continue
+            runs.append(run_id)
+        self.hub.notify()
+        return {"cancelled_turns": turns, "cancelled_runs": runs, "silenced_until": until}
+
+    def _channel_runs(self, channel_id: str) -> list[str]:
+        """The live runs the channel's work items are executing."""
+        if self.loop is None:
+            return []
+        try:
+            items = self.loop.dstore.items(["running"])
+        except Exception:
+            log.warning("collaboration.channel_runs_unreadable", exc_info=True)
+            return []
+        return [
+            item.run_id
+            for item in items
+            if getattr(item, "channel_id", None) == channel_id and item.run_id
+        ]
 
     def _agent_memory(
         self,

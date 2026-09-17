@@ -359,6 +359,9 @@ class ChannelOut(ApiModel):
     visibility: ChannelVisibility = "private"
     created_by: str | None = None
     silenced_until: float | None = None
+    #: Messages past the reader's last read sequence. Null for a caller
+    #: with no channel membership to measure against.
+    unread_count: int | None = None
     #: The caller's role in the channel; ``null`` when not a member.
     my_role: ChannelRoleName | None = None
 
@@ -606,6 +609,29 @@ class TurnOut(ApiModel):
     trigger: str | None = None
     parent_turn_id: str | None = None
     intent: str | None = None
+    #: How many agent-started turns separate this one from the human turn
+    #: that started the chain; zero for a turn a person asked for.
+    chain_depth: int = 0
+
+
+class ChannelSilence(ApiModel):
+    """How long the channel's agents stay quiet; null lifts the silence."""
+
+    until: float | None = None
+
+
+class ChannelReadUpdate(ApiModel):
+    """How far the caller has read this channel."""
+
+    sequence: int = Field(ge=0)
+
+
+class ChannelStopOut(ApiModel):
+    """What a stop actually stopped."""
+
+    cancelled_turns: list[str] = Field(default_factory=list)
+    cancelled_runs: list[str] = Field(default_factory=list)
+    silenced_until: float | None = None
 
 
 class TurnAccepted(ApiModel):

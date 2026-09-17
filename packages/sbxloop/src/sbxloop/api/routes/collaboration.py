@@ -58,6 +58,9 @@ from sbxloop.api.collaboration_schemas import (
     ChannelParticipantOut,
     ChannelParticipantPage,
     ChannelParticipantUpdate,
+    ChannelReadUpdate,
+    ChannelSilence,
+    ChannelStopOut,
     ChannelUpdate,
     ChannelWorkOut,
     ConnectionMutation,
@@ -101,6 +104,9 @@ from sbxloop.log import get_logger
 log = get_logger(__name__)
 router = APIRouter(prefix="/v1", tags=["collaboration"])
 MENTION = re.compile(r"(?<![\w@])@([a-z0-9][a-z0-9_-]{0,63})\b", re.IGNORECASE)
+#: How long a stop keeps the channel quiet before it lifts on its own; a
+#: person who wants it quiet for longer says so with `silence`.
+STOP_SILENCE_S = 3600.0
 
 PREFERENCE_DEFINITIONS: tuple[dict[str, str], ...] = (
     {
@@ -274,6 +280,7 @@ def _channel_out(channel: Channel) -> ChannelOut:
         visibility="workspace" if channel.visibility == "workspace" else "private",
         created_by=channel.created_by,
         silenced_until=channel.silenced_until,
+        unread_count=channel.unread_count,
         my_role=channel.my_role,
     )
 
@@ -411,6 +418,7 @@ def _turn_out(turn: Turn) -> TurnOut:
         trigger=turn.trigger,
         parent_turn_id=turn.parent_turn_id,
         intent=turn.intent,
+        chain_depth=turn.chain_depth,
     )
 
 
@@ -1276,6 +1284,91 @@ async def cancel_turn(
         raise Problem(404, "turn_not_found", "turn not found")
     ctx.hub.notify()
     return _turn_out(turn)
+
+
+# -- stopping, silencing and reading a channel -----------------------------------
+
+
+@router.post("/channels/{channel_id}/stop", response_model=ChannelStopOut)
+async def stop_channel(
+    channel_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:delegate")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelStopOut:
+    """Stop everything this channel has in flight and silence it.
+
+    Anyone who may post may stop a channel they are in: a person watching
+    agents go somewhere they should not is the only guard that matters, and
+    waiting for whoever owns the channel would defeat it. Queued and
+    running turns are cancelled, the runs the channel asked for are
+    cancelled through the daemon's control service, and the channel is
+    silenced until ``resume`` or a ``silence`` of its own lifts it.
+    """
+    until = ctx.clock() + STOP_SILENCE_S
+    channel = await ctx.call(ctx.collaboration.set_silence, member, channel_id, until, ctx.clock())
+    if channel is None:
+        raise Problem(404, "channel_not_found", "channel not found")
+    outcome = await ctx.call(
+        ctx.cancel_channel, channel_id, channel.silenced_until, principal=auth.principal
+    )
+    return ChannelStopOut.model_validate(outcome)
+
+
+@router.post("/channels/{channel_id}/resume", response_model=ChannelOut)
+async def resume_channel(
+    channel_id: str,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:delegate")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelOut:
+    """Lift the channel's silence; it does not restart what stop cancelled."""
+    channel = await ctx.call(ctx.collaboration.set_silence, member, channel_id, None, ctx.clock())
+    if channel is None:
+        raise Problem(404, "channel_not_found", "channel not found")
+    ctx.hub.notify()
+    return _channel_out(channel)
+
+
+@router.put("/channels/{channel_id}/silence", response_model=ChannelOut)
+async def silence_channel(
+    channel_id: str,
+    body: ChannelSilence,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:delegate")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelOut:
+    """Quiet the channel's agents until ``until``; null lifts it. Nothing in
+    flight is cancelled: that is what ``stop`` is for."""
+    channel = await ctx.call(
+        ctx.collaboration.set_silence, member, channel_id, body.until, ctx.clock()
+    )
+    if channel is None:
+        raise Problem(404, "channel_not_found", "channel not found")
+    ctx.hub.notify()
+    return _channel_out(channel)
+
+
+@router.put("/channels/{channel_id}/read", response_model=ChannelMemberOut)
+async def set_channel_read(
+    channel_id: str,
+    body: ChannelReadUpdate,
+    ctx: ApiContext = Depends(get_ctx),  # noqa: B008
+    auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
+) -> ChannelMemberOut:
+    """Record how far the caller has read. The sequence only moves forward,
+    and never past the newest message."""
+    try:
+        entry = await ctx.call(
+            ctx.collaboration.set_read_sequence, member, channel_id, body.sequence, ctx.clock()
+        )
+    except CollaborationError as exc:
+        raise _problem(exc) from exc
+    if entry is None:
+        raise Problem(404, "channel_member_not_found", "the user is not in this channel")
+    ctx.hub.notify()
+    return _channel_member_out(entry)
 
 
 # -- channel members and participants --------------------------------------------

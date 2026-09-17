@@ -158,6 +158,9 @@ class Channel:
     silenced_until: float | None = None
     #: The reader's role in the channel, for a read made on someone's behalf.
     my_role: ChannelRole | None = None
+    #: Messages past the reader's last read sequence; None for a reader
+    #: with no membership to track it against (a plain API client).
+    unread_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -284,6 +287,17 @@ class Turn:
 
 
 @dataclass(frozen=True, slots=True)
+class AgentTurnRecord:
+    """One agent-authored turn, as the guardrails count it."""
+
+    turn_id: str
+    source_slug: str | None
+    targets: tuple[str, ...]
+    trigger: str
+    created_at: float
+
+
+@dataclass(frozen=True, slots=True)
 class Team:
     id: str
     user_id: str
@@ -387,7 +401,9 @@ def invite_token_hash(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
 
-def _channel(row: ChannelRow, my_role: ChannelRole | None = None) -> Channel:
+def _channel(
+    row: ChannelRow, my_role: ChannelRole | None = None, unread_count: int | None = None
+) -> Channel:
     return Channel(
         id=str(row.id),
         workspace_id=str(row.workspace_id),
@@ -402,6 +418,7 @@ def _channel(row: ChannelRow, my_role: ChannelRole | None = None) -> Channel:
         created_by=None if row.created_by is None else str(row.created_by),
         silenced_until=None if row.silenced_until is None else float(row.silenced_until),
         my_role=my_role,
+        unread_count=unread_count,
     )
 
 
@@ -501,6 +518,28 @@ def _access(
 
 def _my_role(session: Any, channel_id: str, member: Member | None) -> ChannelRole | None:
     return None if member is None else ChannelAccess.role(session, channel_id, member.user.id)
+
+
+def _unread(session: Any, channel_id: str, member: Member | None) -> int | None:
+    """Messages after the member's last read sequence. ``None`` when there
+    is no membership to measure against, so a plain API client and a
+    workspace member who has not joined read the same as before."""
+    if member is None:
+        return None
+    row = session.get(ChannelMemberRow, (channel_id, member.user.id))
+    if row is None:
+        return None
+    return int(
+        session.scalar(
+            select(func.count())
+            .select_from(MessageRow)
+            .where(
+                MessageRow.channel_id == channel_id,
+                MessageRow.sequence > int(row.last_read_sequence or 0),
+            )
+        )
+        or 0
+    )
 
 
 def _other_owner(session: Any, channel_id: str, user_id: str) -> bool:
@@ -1611,7 +1650,9 @@ class CollaborationStore:
                 )
             except CollaborationError:
                 return None
-            return _channel(row, _my_role(session, channel_id, member))
+            return _channel(
+                row, _my_role(session, channel_id, member), _unread(session, channel_id, member)
+            )
 
     def list_channels(
         self, viewer: Viewer, *, limit: int, offset: int
@@ -1644,7 +1685,11 @@ class CollaborationStore:
                 .limit(limit)
             ).all()
             channels = [
-                _channel(row, None if role is None else ("owner" if role == "owner" else "member"))
+                _channel(
+                    row,
+                    None if role is None else ("owner" if role == "owner" else "member"),
+                    _unread(session, str(row.id), member),
+                )
                 for row, role in rows
             ]
             return channels, total
@@ -1677,7 +1722,9 @@ class CollaborationStore:
             row.revision += 1
             session.flush()
             _event(session, "collaboration.channel.updated", now, data={"channel_id": channel_id})
-            return _channel(row, _my_role(session, channel_id, member))
+            return _channel(
+                row, _my_role(session, channel_id, member), _unread(session, channel_id, member)
+            )
 
     def delete_channel(self, viewer: Viewer, channel_id: str, now: float) -> bool:
         """Tombstone a channel so a late agent result cannot recreate it.
@@ -1821,22 +1868,27 @@ class CollaborationStore:
         agent_slug: str,
         values: dict[str, Any],
         now: float,
+        *,
+        added_by: Author | None = None,
     ) -> ChannelParticipant:
         """Add an agent to the channel or change how it takes part. ``values``
-        holds only the fields the caller set (``mode``, ``muted_until``)."""
+        holds only the fields the caller set (``mode``, ``muted_until``).
+        ``added_by`` credits a caller that is not a person: the agent whose
+        reply addressed this one."""
         mode = values.get("mode")
         if mode is not None and mode not in {"mention", "ambient"}:
             raise CollaborationError("invalid_participant", "mode is mention or ambient")
         with self.dstore.transaction() as session:
             _, member = _access(session, channel_id, viewer, "post", now=now)
+            author = Author("human", member.user.id) if member is not None else added_by
             row = session.get(ChannelParticipantRow, (channel_id, agent_slug))
             if row is None:
                 row = ChannelParticipantRow(
                     channel_id=channel_id,
                     agent_slug=agent_slug,
                     mode=mode or "mention",
-                    added_by_kind=None if member is None else "human",
-                    added_by_id=None if member is None else member.user.id,
+                    added_by_kind=None if author is None else author.kind,
+                    added_by_id=None if author is None else author.id,
                     muted_until=values.get("muted_until"),
                     created_at=now,
                 )
@@ -2129,6 +2181,206 @@ class CollaborationStore:
             for row in rows:
                 session.delete(row)
             return bool(rows)
+
+    # -- agent follow-ups, silence and read state -----------------------------------
+
+    def message_content(self, message_id: str) -> str | None:
+        """One message's text by id: what a follow-up turn is answering."""
+        with self.dstore.read() as session:
+            row = session.get(MessageRow, message_id)
+            return None if row is None else str(row.content)
+
+    def silenced_until(self, channel_id: str) -> float | None:
+        """When the channel's silence lifts, or ``None``. Read by the
+        guardrails, which run for the daemon and not for a viewer."""
+        with self.dstore.read() as session:
+            row = session.get(ChannelRow, channel_id)
+            if row is None or row.silenced_until is None:
+                return None
+            return float(row.silenced_until)
+
+    def set_silence(
+        self, viewer: Viewer, channel_id: str, until: float | None, now: float
+    ) -> Channel | None:
+        """Silence the channel until ``until`` (``None`` lifts it). Anyone
+        who may post may quiet the agents in a channel they are in."""
+        with self.dstore.transaction() as session:
+            try:
+                row, member = _access(session, channel_id, viewer, "post", now=now)
+            except CollaborationError as exc:
+                if exc.code == "channel_not_found":
+                    return None
+                raise
+            row.silenced_until = None if until is None else float(until)
+            row.updated_at = now
+            row.revision += 1
+            _event(
+                session,
+                "collaboration.channel.silenced"
+                if until is not None
+                else "collaboration.channel.resumed",
+                now,
+                data={"channel_id": channel_id, "silenced_until": row.silenced_until},
+            )
+            return _channel(
+                row, _my_role(session, channel_id, member), _unread(session, channel_id, member)
+            )
+
+    def set_read_sequence(
+        self, viewer: Viewer, channel_id: str, sequence: int, now: float
+    ) -> ChannelMember | None:
+        """Record how far the reader has read. The sequence only moves
+        forward, so a stale client cannot un-read a channel."""
+        with self.dstore.transaction() as session:
+            _, member = _access(session, channel_id, viewer, "post", now=now)
+            if member is None:
+                return None
+            entry = session.get(ChannelMemberRow, (channel_id, member.user.id))
+            if entry is None:
+                return None
+            newest = session.scalar(
+                select(func.max(MessageRow.sequence)).where(MessageRow.channel_id == channel_id)
+            )
+            capped = min(int(sequence), int(newest or 0))
+            entry.last_read_sequence = max(int(entry.last_read_sequence or 0), capped)
+            _event(
+                session,
+                "collaboration.channel.read",
+                now,
+                data={
+                    "channel_id": channel_id,
+                    "user_id": member.user.id,
+                    "sequence": entry.last_read_sequence,
+                },
+                audience=member.user.id,
+            )
+            user = session.get(LocalUserRow, member.user.id)
+            assert user is not None  # nosec B101 - membership invariant
+            return _channel_member(entry, user)
+
+    def agent_turns_since(self, channel_id: str, since: float) -> list[AgentTurnRecord]:
+        """The channel's agent-authored turns created at or after ``since``,
+        oldest first: what the rate caps and the pair cooldown count."""
+        with self.dstore.read() as session:
+            rows = session.scalars(
+                select(TurnRow)
+                .where(
+                    TurnRow.channel_id == channel_id,
+                    TurnRow.author_kind == "agent",
+                    TurnRow.created_at >= since,
+                )
+                .order_by(TurnRow.created_at.asc())
+            )
+            return [
+                AgentTurnRecord(
+                    turn_id=str(row.id),
+                    source_slug=None if row.author_id is None else str(row.author_id),
+                    targets=tuple(str(v) for v in json.loads(row.targets_json or "[]")),
+                    trigger=str(row.trigger or "human"),
+                    created_at=float(row.created_at),
+                )
+                for row in rows
+            ]
+
+    def record_followup_decision(
+        self,
+        channel_id: str,
+        *,
+        source_slug: str | None,
+        target_slug: str,
+        trigger: str,
+        depth: int,
+        admission: Any,
+        now: float,
+    ) -> None:
+        """Audit one guardrail decision. The reason travels; the message
+        that caused it never does."""
+        with self.dstore.transaction() as session:
+            _event(
+                session,
+                "collaboration.followup.queued"
+                if admission.ok
+                else "collaboration.followup.suppressed",
+                now,
+                data={
+                    "channel_id": channel_id,
+                    "agent_slug": target_slug,
+                    "source_agent_slug": source_slug,
+                    "trigger": trigger,
+                    "chain_depth": depth,
+                    "reason": admission.reason,
+                    "retry_at": admission.retry_at,
+                },
+            )
+
+    def accept_agent_turn(
+        self,
+        channel_id: str,
+        source_message_id: str,
+        *,
+        author: Author,
+        targets: tuple[str, ...],
+        trigger: str,
+        parent_turn_id: str | None,
+        chain_depth: int,
+        now: float,
+    ) -> Turn | None:
+        """Accept a turn one agent started by addressing another.
+
+        No new message is appended: the agent's own reply, named by
+        ``source_message_id``, is the turn's input. ``None`` when the
+        channel is gone.
+        """
+        with self.dstore.immediate_transaction() as session:
+            channel = session.get(ChannelRow, channel_id)
+            if channel is None or channel.state != "active":
+                return None
+            turn_id = "trn_" + _token(16)
+            session.execute(
+                insert(TurnRow).values(
+                    id=turn_id,
+                    channel_id=channel_id,
+                    client_turn_id=None,
+                    input_message_id=source_message_id,
+                    status="accepted",
+                    targets_json=json.dumps(list(targets)),
+                    intent="conversation",
+                    participants_json=json.dumps(
+                        [
+                            {
+                                "agent_slug": target,
+                                "status": "queued",
+                                "error": None,
+                                "read_only": target == "critic",
+                            }
+                            for target in targets
+                        ]
+                    ),
+                    created_at=now,
+                    author_kind=author.kind,
+                    author_id=author.id,
+                    trigger=trigger,
+                    parent_turn_id=parent_turn_id,
+                    source_message_id=source_message_id,
+                    chain_depth=chain_depth,
+                )
+            )
+            channel.updated_at = now
+            channel.revision += 1
+            row = session.get(TurnRow, turn_id)
+            assert row is not None  # nosec B101 - just inserted
+            _event(
+                session,
+                "collaboration.turn.accepted",
+                now,
+                data={
+                    "channel_id": channel_id,
+                    "turn_id": turn_id,
+                    "targets": list(targets),
+                    "trigger": trigger,
+                },
+            )
+            return _turn(session, row)
 
     # -- messages and turns --------------------------------------------------------
 
