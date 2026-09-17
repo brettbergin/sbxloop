@@ -1,0 +1,245 @@
+"""A participant that speaks without being addressed.
+
+An agent in `ambient` mode is listening in, not waiting to be named. When
+something it cares about is said it may answer on its own. That is only
+tolerable if it is cheap to decide and hard to abuse, so a message reaches
+an ambient agent through three gates in order:
+
+1. its `interests`, matched against the recent messages without calling
+   anything;
+2. the same guardrails an agent-to-agent mention passes, plus its own
+   hourly cap;
+3. a short relevance call on a cheap model, which answers RELEVANT or PASS.
+
+A PASS posts nothing and says so in the audit trail. `ambient = false`,
+the shipped default, turns the whole thing off.
+
+Expected values come from the agents' declared interests, the scripted
+classifier verdicts and the configured caps, never from the code under test.
+"""
+
+from __future__ import annotations
+
+from concurrent.futures import Future
+from typing import Any
+
+from sbxloop.agents.definition import AgentSpec
+from sbxloop.daemon.concierge import ConciergeReply
+from tests.api.conftest import build
+from tests.api.test_collaboration import FakeConcierge, bearer, register
+from tests.api.test_collaboration_recovery import settled
+
+
+class ClassifyingConcierge(FakeConcierge):
+    """Answers the relevance question with a scripted verdict and records
+    which agents were ever asked one."""
+
+    def __init__(self, verdicts: dict[str, str] | None = None) -> None:
+        super().__init__()
+        self.verdicts = verdicts or {}
+        self.classified: list[str] = []
+
+    def submit_turn(self, text: str, **kwargs: Any) -> Future[ConciergeReply]:
+        key = str(kwargs.get("session_key") or "")
+        future: Future[ConciergeReply] = Future()
+        if ":ambient:" in key:
+            slug = key.rsplit(":", 1)[-1]
+            self.classified.append(slug)
+            self.calls.append({"text": text, **kwargs})
+            future.set_result(ConciergeReply(self.verdicts.get(slug, "PASS")))
+            return future
+        return super().submit_turn(text, **kwargs)
+
+
+def _api(tmp_path: Any, **collaboration: Any) -> Any:
+    section = {"ambient": True, "max_chain_depth": 4, **collaboration}
+    return build(tmp_path, config={"collaboration": section})
+
+
+def _agent(api: Any, slug: str, interests: list[str]) -> None:
+    api.ctx.agents.create(
+        AgentSpec.model_validate(
+            {
+                "slug": slug,
+                "name": slug.title(),
+                "instructions": f"Be {slug}.",
+                "interests": interests,
+            }
+        ),
+        by="test",
+    )
+
+
+def _listening(api: Any, headers: dict[str, str], channel: str, slug: str) -> None:
+    response = api.client.put(
+        f"/v1/channels/{channel}/participants/{slug}",
+        json={"mode": "ambient"},
+        headers=headers,
+    )
+    assert response.status_code in {200, 201}, response.text
+
+
+def _say(api: Any, headers: dict[str, str], channel: str, content: str) -> dict[str, Any]:
+    accepted = api.client.post(
+        f"/v1/channels/{channel}/turns", json={"content": content}, headers=headers
+    )
+    assert accepted.status_code == 202, accepted.text
+    turn = accepted.json()["turn"]
+    settled(api.client, headers, channel, turn["id"])
+    assert api.ctx.turns.wait_idle(timeout=10), "the channel never went quiet"
+    return dict(turn)
+
+
+def _turns(api: Any, headers: dict[str, str], channel: str) -> list[dict[str, Any]]:
+    return list(api.client.get(f"/v1/channels/{channel}/turns", headers=headers).json())
+
+
+def _events(api: Any, headers: dict[str, str], channel: str) -> list[dict[str, Any]]:
+    page = api.client.get(
+        "/v1/events",
+        params={"type_prefix": "collaboration.followup", "channel_id": channel, "limit": 100},
+        headers=headers,
+    )
+    assert page.status_code == 200, page.text
+    return list(page.json()["data"])
+
+
+def test_an_ambient_agent_whose_interests_match_speaks_without_being_named(
+    tmp_path: Any,
+) -> None:
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "RELEVANT"})
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread", "sourdough"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        _say(api, headers, channel, "I want to make sourdough this weekend")
+
+        assert api.ctx.concierge.classified == ["baker"]
+        turns = _turns(api, headers, channel)
+        ambient = [turn for turn in turns if turn["trigger"] == "ambient"]
+        assert len(ambient) == 1
+        assert ambient[0]["targets"] == ["baker"]
+        assert ambient[0]["chain_depth"] == 1
+        messages = api.client.get(f"/v1/channels/{channel}/messages", headers=headers).json()
+        assert "baker" in [message["agent_slug"] for message in messages]
+    api.ctx.close()
+
+
+def test_nothing_it_cares_about_costs_nothing(tmp_path: Any) -> None:
+    """The prefilter is the point: an agent with no matching interest is
+    never classified, so an idle channel never calls a model."""
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "RELEVANT"})
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread", "sourdough"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        _say(api, headers, channel, "what time is the meeting tomorrow")
+
+        assert api.ctx.concierge.classified == []
+        assert [turn["trigger"] for turn in _turns(api, headers, channel)] == ["human"]
+    api.ctx.close()
+
+
+def test_a_pass_posts_nothing_and_says_why(tmp_path: Any) -> None:
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "PASS"})
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        _say(api, headers, channel, "the bread is in the oven")
+
+        assert api.ctx.concierge.classified == ["baker"]
+        assert [turn["trigger"] for turn in _turns(api, headers, channel)] == ["human"]
+        suppressed = [e for e in _events(api, headers, channel) if e["type"].endswith("suppressed")]
+        assert [e["data"]["reason"] for e in suppressed] == ["ambient_pass"]
+        assert suppressed[0]["data"]["agent_slug"] == "baker"
+    api.ctx.close()
+
+
+def test_an_agent_never_answers_its_own_message(tmp_path: Any) -> None:
+    """The mention that starts the conversation makes the agent a
+    participant; its own reply must not then be something it answers."""
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "RELEVANT"})
+        headers = bearer(register(api))
+        _agent(api, "baker", ["reply", "bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        _say(api, headers, channel, "@baker how is the bread")
+
+        # The turn it was named in, and nothing it started for itself.
+        assert "baker" not in api.ctx.concierge.classified
+        assert [turn["trigger"] for turn in _turns(api, headers, channel)] == ["human"]
+    api.ctx.close()
+
+
+def test_a_silenced_channel_keeps_an_ambient_agent_quiet(tmp_path: Any) -> None:
+    api = _api(tmp_path)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "RELEVANT"})
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+        silenced = api.client.put(
+            f"/v1/channels/{channel}/silence",
+            json={"until": api.clock() + 300},
+            headers=headers,
+        )
+        assert silenced.status_code == 200, silenced.text
+
+        _say(api, headers, channel, "the bread is rising")
+
+        # Refused before anything was spent on classifying it.
+        assert api.ctx.concierge.classified == []
+        suppressed = [e for e in _events(api, headers, channel) if e["type"].endswith("suppressed")]
+        assert [e["data"]["reason"] for e in suppressed] == ["silenced"]
+        assert [turn["trigger"] for turn in _turns(api, headers, channel)] == ["human"]
+    api.ctx.close()
+
+
+def test_an_ambient_agent_has_an_hourly_cap(tmp_path: Any) -> None:
+    api = _api(tmp_path, ambient_max_per_hour=1, pair_cooldown_s=0)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "RELEVANT"})
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        _say(api, headers, channel, "the bread is rising")
+        _say(api, headers, channel, "the bread is still rising")
+
+        ambient = [t for t in _turns(api, headers, channel) if t["trigger"] == "ambient"]
+        assert len(ambient) == 1
+        suppressed = [e for e in _events(api, headers, channel) if e["type"].endswith("suppressed")]
+        assert "ambient_cap" in [e["data"]["reason"] for e in suppressed]
+    api.ctx.close()
+
+
+def test_ambient_off_is_the_whole_feature_off(tmp_path: Any) -> None:
+    api = _api(tmp_path, ambient=False)
+    with api.client:
+        api.ctx.concierge = ClassifyingConcierge({"baker": "RELEVANT"})
+        headers = bearer(register(api))
+        _agent(api, "baker", ["bread"])
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        _listening(api, headers, channel, "baker")
+
+        _say(api, headers, channel, "the bread is rising")
+
+        assert api.ctx.concierge.classified == []
+        assert _events(api, headers, channel) == []
+        assert [turn["trigger"] for turn in _turns(api, headers, channel)] == ["human"]
+    api.ctx.close()

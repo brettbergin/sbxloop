@@ -652,6 +652,23 @@ decision records `collaboration.followup.queued` or
 inside `window_s`), `pair_cooldown` (that agent addressed this one less
 than `pair_cooldown_s` ago), or the workspace budget's own reason.
 
+With `[collaboration] ambient = true`, a participant whose `mode` is
+`ambient` may also answer a message nobody addressed to it. Every message in
+the channel is put through three gates in order, cheapest first: the agent's
+`interests` matched case-insensitively over the last `ambient_window_messages`
+(no match and no mention means nothing further happens and no model is
+called); the guardrails above, with `trigger: "ambient"`, plus
+`ambient_max_per_hour` for that agent in that channel; and one short
+relevance call on `ambient_model` — the concierge's model when unset — that
+answers RELEVANT or PASS. A PASS posts nothing and records
+`collaboration.followup.suppressed` with reason `ambient_pass`; being over
+the hourly cap records reason `ambient_cap`. What passes all three becomes an
+ordinary turn with `trigger: "ambient"`, and its reply is an ordinary agent
+message. An agent never answers its own message, an agent already answering
+the turn does not also volunteer, and one turn draws at most one unprompted
+answer from each listening agent. `ambient = false`, the default, skips all
+of it.
+
 A person has the last word over all of it:
 
 | Route                           | Needs    | Result                                                               |

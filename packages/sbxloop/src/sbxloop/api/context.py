@@ -17,7 +17,7 @@ import functools
 import re
 import threading
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import (
     Future,
     ThreadPoolExecutor,
@@ -36,6 +36,7 @@ from sbxloop.agents.registry import (
 )
 from sbxloop.agents.tools import AgentTool, chat_memory_granted, memory_tools, work_granted
 from sbxloop.api.agents import ANGIE_PERSONA, ANGIE_SLUG, AgentDefinition
+from sbxloop.api.ambient import AmbientSelector, classifier_prompt, is_relevant
 from sbxloop.api.artifacts import ArtifactCatalog
 from sbxloop.api.auth.keys import SigningKeys
 from sbxloop.api.auth.ratelimit import FailureLimiter
@@ -45,6 +46,7 @@ from sbxloop.api.channel_summary import ChannelSummarizer
 from sbxloop.api.chronology import Chronology
 from sbxloop.api.collaboration import (
     Author,
+    AuthorKind,
     ChannelLink,
     CollaborationError,
     CollaborationStore,
@@ -678,6 +680,13 @@ class ApiContext:
         # Work this turn starts goes to the agents it mentioned, in the run
         # roles they declare.
         turn_roles = work_roles(self.agents, turn.targets or ())
+        listeners = self._ambient_selector(turn, user)
+        self._consider_ambient(
+            listeners,
+            turn,
+            store.get_message(turn.channel_id, turn.input_message_id),
+            answering=tuple(slug for slug in (turn.targets or ()) if slug),
+        )
         for role, slug in _recorded_assignees(turn).items():
             turn_roles.setdefault(role, slug)
         index = 0
@@ -852,6 +861,7 @@ class ApiContext:
                         self._route_agent_mentions(
                             turn, delivered, target or ANGIE_SLUG, user, index
                         )
+                        self._consider_ambient(listeners, turn, delivered)
                     if delivered is not None and reply.after is not None:
                         reply.after()
                 else:
@@ -955,6 +965,113 @@ class ApiContext:
                 exc_info=True,
             )
 
+    def _ambient_selector(self, turn: Turn, user: LocalUser) -> AmbientSelector | None:
+        """One selector for the whole turn, so a listening agent gets one
+        look at the conversation rather than one per message posted in it.
+        ``None`` when ambient speech is off or nobody could be charged."""
+        if not self.config.collaboration.ambient:
+            return None
+        try:
+            return AmbientSelector(
+                config=lambda: self.config,
+                participants=lambda channel_id: self.collaboration.list_participants(
+                    None, channel_id
+                ),
+                resolve=self._ambient_agent,
+                recent=self.collaboration.recent_messages,
+                admit=lambda channel_id, source, **kwargs: self.guardrails.admit(
+                    channel_id, source=source, **kwargs
+                ),
+                record=self._record_ambient,
+                spoken_since=self.collaboration.ambient_turns_since,
+                classify=self._classify_ambient,
+                queue=lambda author_slug, author_kind, **kwargs: self._queue_agent_followup(
+                    turn, user, author_slug=author_slug, author_kind=author_kind, **kwargs
+                ),
+                clock=self.clock,
+            )
+        except Exception:
+            log.warning("collaboration.ambient_unavailable", channel=turn.channel_id, exc_info=True)
+            return None
+
+    def _consider_ambient(
+        self,
+        selector: AmbientSelector | None,
+        turn: Turn,
+        message: Message | None,
+        *,
+        answering: Sequence[str] = (),
+    ) -> None:
+        """Let the channel's listening participants answer ``message``.
+
+        Nothing here may fail the turn that posted it: an agent that cannot
+        be decided about simply stays quiet.
+        """
+        if selector is None or message is None:
+            return
+        try:
+            selector.consider(
+                turn.channel_id,
+                message,
+                author=message.author,
+                depth=turn.chain_depth + 1,
+                answering=tuple(answering),
+            )
+        except Exception:
+            log.warning("collaboration.ambient_failed", channel=turn.channel_id, exc_info=True)
+
+    def _ambient_agent(self, slug: str) -> Any:
+        """The registry entry a listening participant names, when it may
+        still speak."""
+        agent = self.agents.get(slug)
+        if agent is None or agent.slug != slug or not addressable(agent, slug):
+            return None
+        return agent
+
+    def _record_ambient(
+        self, channel_id: str, slug: str, reason: str, depth: int, now: float
+    ) -> None:
+        from sbxloop.daemon.usagepool import Admission
+
+        self.collaboration.record_followup_decision(
+            channel_id,
+            source_slug=None,
+            target_slug=slug,
+            trigger="ambient",
+            depth=depth,
+            admission=Admission(ok=False, reason=reason),
+            now=now,
+        )
+
+    def _classify_ambient(
+        self, channel_id: str, slug: str, interests: Sequence[str], window: Sequence[Any]
+    ) -> bool:
+        """One short call that answers RELEVANT or PASS. It has no tools and
+        no authority; an answer that is not a clear RELEVANT keeps the agent
+        quiet."""
+        concierge = self.concierge
+        if concierge is None:
+            return False
+        from sbxloop.api.ambient import CLASSIFIER_PERSONA
+
+        reply = concierge.submit_turn(
+            classifier_prompt(interests, window),
+            author="sbxloop",
+            via="local",
+            session_key=f"{channel_id}:ambient:{slug}",
+            persona=CLASSIFIER_PERSONA,
+            allow_actions=False,
+            read_only=True,
+            model=self.config.collaboration.ambient_model,
+            channel_id=channel_id,
+            agent_slug=slug,
+        ).result()
+        return bool(reply.ok and is_relevant(reply.text or ""))
+
+    def _turn_user(self, turn: Turn) -> LocalUser | None:
+        """Whoever the turn is spending on: the person whose channel it is."""
+        return self.collaboration.channel_owner(turn.channel_id)
+
     def _queue_agent_followup(
         self,
         parent: Turn,
@@ -963,6 +1080,7 @@ class ApiContext:
         channel_id: str,
         source_message_id: str,
         author_slug: str,
+        author_kind: AuthorKind = "agent",
         target_slug: str,
         depth: int,
         trigger: str,
@@ -971,13 +1089,16 @@ class ApiContext:
 
         Acceptance and submission share the same ordering boundary a person's
         turn uses, so a turn accepted first is always the one queued first
-        whichever thread accepted it.
+        whichever thread accepted it. ``author_kind`` is who the turn answers:
+        the agent whose reply named this one, or the person whose message an
+        ambient agent volunteered on. The turn is still the agent's to take
+        either way.
         """
         with self._turn_admission:
             follow_up = self.collaboration.accept_agent_turn(
                 channel_id,
                 source_message_id,
-                author=Author("agent", author_slug),
+                author=Author(author_kind, author_slug),
                 targets=(target_slug,),
                 trigger=trigger,
                 parent_turn_id=parent.id,

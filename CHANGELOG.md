@@ -95,6 +95,26 @@ a code run's checkout, is `404` like any other id from elsewhere.
   back there; the channel is never read out of the public issue body. New knobs `[agent_team] max_chain_depth` (default 2) and `max_agent_runs_per_day` (default 4); new
   capability `agents.initiative`.
 
+- **A listening agent may speak without being asked.** A channel
+  participant whose `mode` is `ambient` was listed and never heard from: it
+  answered only when named, like every other participant. With the new
+  `[collaboration] ambient = true` it may answer a message nobody addressed
+  to it, through three gates in order. Its `interests` are matched, case
+  insensitively, over the last `ambient_window_messages`; an agent none of
+  whose interests match is dropped there and no model is called for it.
+  What matches passes the mention guardrails with `trigger: "ambient"` —
+  the chain depth, the rate caps, the channel's silence and the token
+  budget — plus `ambient_max_per_hour` for that agent in that channel. What
+  survives gets one short relevance call on `ambient_model` (the
+  concierge's model when unset) that answers RELEVANT or PASS; a PASS posts
+  nothing and records `collaboration.followup.suppressed` with reason
+  `ambient_pass`, and being over the hourly cap records `ambient_cap`. What
+  passes all three becomes an ordinary turn whose reply is an ordinary
+  agent message. An agent never answers its own message, one already
+  answering the turn does not also volunteer, and one turn draws at most
+  one unprompted answer from each listening agent. `ambient = false`, the
+  default, leaves every channel exactly as it was.
+
 - **Agents address each other, under a person's control.** An agent's
   reply is prose in a shared channel, so naming another agent in it now
   addresses that agent: a follow-up turn is accepted for it, carrying
