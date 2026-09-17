@@ -15,6 +15,7 @@ dev = [
     "pytest>=8.3",
     "pytest-cov>=6.0",
     "pytest-xdist>=3.6",
+    "pytest-timeout>=2.3",
     "bandit>=1.8",
     "mdformat>=0.7.22",
     "mdformat-gfm>=0.4.1",
@@ -138,6 +139,12 @@ addopts = [
     "-n=auto",
     "--dist=worksteal",
 ]
+# A test that wedges (a thread never released, a wait with no bound) fails
+# here with every thread's stack instead of holding its xdist worker, and
+# with it the CI job, until the runner's own limit. The slowest tests take
+# well under a minute; this is a ceiling for a hang, not a budget. A test
+# that legitimately needs longer says so with @pytest.mark.timeout.
+timeout = 300
 
 [tool.coverage.run]
 branch = true

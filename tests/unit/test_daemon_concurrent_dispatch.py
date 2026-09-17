@@ -61,11 +61,14 @@ class Gate:
         self.started: dict[str, threading.Event] = {}
         self.release: dict[str, threading.Event] = {}
         self.by_item: dict[str, str] = {}
+        self.closed = False
 
     def _events(self, item_id: str) -> tuple[threading.Event, threading.Event]:
         with self.lock:
             started = self.started.setdefault(item_id, threading.Event())
             release = self.release.setdefault(item_id, threading.Event())
+            if self.closed:
+                release.set()
             return started, release
 
     def runner(
@@ -99,6 +102,16 @@ class Gate:
         _, release = self._events(item_id)
         release.set()
 
+    def finish_all(self) -> None:
+        """Release every run, including one whose runner has not reported in
+        yet: a tick returns once a run's thread is started, so a test can get
+        here first, and a run left unreleased never ends."""
+        with self.lock:
+            self.closed = True
+            releases = list(self.release.values())
+        for release in releases:
+            release.set()
+
 
 def _join(h: Harness, run_id: str) -> None:
     """Wait for one run's engine thread to end (not for it to be settled)."""
@@ -119,12 +132,48 @@ def _tick(h: Harness) -> Any:
 
 
 def _release_all(h: Harness, gate: Gate) -> None:
-    for item_id in list(gate.started):
-        gate.finish(item_id)
+    gate.finish_all()
     for handle in h.loop.runs:
         if handle.thread is not None:
             handle.thread.join(WAIT_S)
+    # drain() waits for as long as any run is alive, which is what a daemon
+    # wants and what hangs a test: a run the gate never released would spin
+    # it forever. Fail here, naming the run, instead.
+    stuck = [r.run_id for r in h.loop.runs if r.thread is not None and r.thread.is_alive()]
+    assert not stuck, f"runs still executing after release: {stuck}"
     h.loop.drain()
+
+
+class TestGate:
+    def test_releasing_everything_ends_a_run_that_had_not_reported_in(self, tmp_path: Path) -> None:
+        # A tick returns once a run's thread is started, not once its runner
+        # has reported in; a release that lands in between must still end it.
+        h = _harness(tmp_path)
+        gate = Gate(h)
+        entered = threading.Event()
+        proceed = threading.Event()
+
+        def late_runner(*args: Any) -> RunResult:
+            entered.set()
+            assert proceed.wait(WAIT_S)
+            return gate.runner(*args)
+
+        h.loop._runner = late_runner
+        h.source.items = [_item("o/a", "1")]
+        assert _tick(h).launched == ("gh:o/a:issue:1",)
+        assert entered.wait(WAIT_S)
+        (handle,) = h.loop.runs
+        assert handle.thread is not None
+        try:
+            gate.finish_all()
+            proceed.set()
+            handle.thread.join(WAIT_S)
+            assert not handle.thread.is_alive(), "a released run kept executing"
+        finally:
+            handle.engine.request_cancel()
+            handle.thread.join(WAIT_S)
+        h.loop.drain()
+        assert h.dstore.get("gh:o/a:issue:1").state == "done"  # type: ignore[union-attr]
 
 
 class TestConcurrentDispatch:
@@ -425,6 +474,7 @@ class TestHalfOpenProbe:
             after = _tick(h)
             assert after.settled == (("gh:o/a:issue:1", "done"),)
             assert after.launched == ("gh:o/b:issue:2",)
+            gate.wait_started("gh:o/b:issue:2")
             assert h.loop.status()["consecutive_failures"] == 0
         finally:
             _release_all(h, gate)
@@ -448,6 +498,7 @@ class TestHalfOpenProbe:
             # The probe's call succeeds, which releases the hold.
             recovery.release()
             assert _tick(h).launched == ("gh:o/b:issue:2",)
+            gate.wait_started("gh:o/b:issue:2")
         finally:
             _release_all(h, gate)
 
