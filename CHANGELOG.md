@@ -145,6 +145,18 @@
   never listed. A run whose files cannot be catalogued still gets its
   result, without a file list, and delivery to other channels carries on.
 
+- **Runs merged through the daemon file their follow-ups.** A run parked
+  at the merge gate or on a review wait was landed by the daemon with gh
+  ops alone, and the out-of-scope notes its reviews left were only filed
+  if the engine's pass at the park had succeeded. The filing now lives in
+  `FollowupFiler`, shared by the engine and the daemon, and the daemon runs
+  it once an approved landing merges. `[landing] followups`,
+  `followup_label` and `max_followups_per_run` apply as before, and the
+  run's recorded filings and the issue markers keep a repeated approval
+  from filing anything twice. A pass that finds every follow-up already
+  recorded emits no `run.followups` event, so a run reports its follow-ups
+  once rather than a second time as "already tracked".
+
 - **A failed `sbx create` says what sbx said.** Every create failure was
   rewrapped as "check host capacity and that `sbx create --help` supports
   --cpus and --memory", whatever the cause. On a host with memory to spare

@@ -82,14 +82,8 @@ from sbxloop.deliver import (
 )
 from sbxloop.engine import sinks
 from sbxloop.engine.checks import CheckJudgment, check_policy_reader
-from sbxloop.engine.followups import (
-    Candidate,
-    checklist_comment,
-    collect_followups,
-    issue_body,
-    marker_key,
-)
-from sbxloop.engine.issue_lookup import IssueLookup, LookupUnavailable
+from sbxloop.engine.followups import FollowupFiler, recorded_review_rounds
+from sbxloop.engine.issue_lookup import IssueLookup
 from sbxloop.engine.landing import (
     AwaitingReview,
     Blocked,
@@ -192,7 +186,7 @@ from sbxloop.sbx.cli import SbxCLI
 from sbxloop.sbx.pair import SandboxPair
 from sbxloop.sbx.provision import ContinueBranch, Provisioner
 from sbxloop.sbx.sandbox import SBXLOOP_DIR
-from sbxloop.vcs.github.labels import FOLLOWUP_DESCRIPTOR, LabelSpec, ensure_label
+from sbxloop.vcs.github.labels import ensure_label
 from sbxloop.vcs.github.ops import (
     FailedCheck,
     Identity,
@@ -3784,30 +3778,9 @@ class LoopEngine:
             return None
 
     def _review_rounds(self, run_id: str) -> list[ReviewRound]:
-        """Earlier review rounds paired with the fix round each led to.
-
-        Read from ``phase_attempts`` in order: a ``review`` row opens a
-        round; the build report of the fix task recorded after it is that
-        round's response. Chronology, not bookkeeping, so a resume sees the
-        same history a live run would.
-        """
-        rounds: list[ReviewRound] = []
-        for row in self.store.phase_attempts(run_id):
-            if row.phase == "review":
-                try:
-                    data = json.loads(row.output_json or "{}")
-                    verdict = ReviewVerdict.model_validate(data.get("verdict") or data)
-                except (ValueError, ValidationError):
-                    continue
-                rounds.append(ReviewRound(len(rounds) + 1, verdict, ""))
-            elif row.phase == "build" and rounds and row.task_id and is_fix_task(str(row.task_id)):
-                try:
-                    report = json.loads(row.output_json or "{}").get("report") or ""
-                except ValueError:
-                    report = ""
-                last = rounds[-1]
-                rounds[-1] = ReviewRound(last.round, last.verdict, str(report))
-        return rounds
+        """Earlier review rounds paired with the fix round each led to
+        (:func:`recorded_review_rounds`)."""
+        return recorded_review_rounds(self.store, run_id)
 
     def _undrafted(self, run_id: str) -> bool:
         """Whether this run's landing has already taken its PR out of draft
@@ -4288,261 +4261,30 @@ class LoopEngine:
         return outcome
 
     def _file_followups(self, p: Pipeline, run: RunRecord) -> None:
-        """File the run's follow-ups on its repository after the merge (#517).
-
-        Best-effort and idempotent: the PR is merged, so a GitHub failure
-        here is logged, never raised. Each filed issue is recorded as a
-        ``followup`` phase row before the next is filed, and the body carries
-        a run/key marker, so a resume between filing and recording finds the
-        issue on the repository rather than filing it twice. Never queued for
-        the loop: the follow-up label, not the trigger label.
-
-        A repository with Issues disabled cannot take them (#631): the mode
-        downgrades to ``comment`` — one checklist on the PR — and the
-        ``run.followups`` event records the downgrade. Decided up front from
-        the repository payload, or on the spot from the 410 GitHub answers
-        the first filing with.
-        """
-        ops, repo, run_id = p.ops, p.repo, p.run_id
-        cfg = self.config.landing
-        if ops is None or repo is None or cfg.followups == "off" or run.pr_number is None:
+        """File the run's follow-ups on its repository after the merge (#517):
+        :meth:`FollowupFiler.file` over this run's review rounds, with the
+        repository's up-front Issues probe (#631)."""
+        filer = self._followup_filer(p)
+        if filer is None:
             return
-        candidates = collect_followups(self._review_rounds(run_id))[: cfg.max_followups_per_run]
-        if not candidates:
-            return
-        already = self._recorded_followups(run_id)
-        filed: list[tuple[str, str]] = []
-        listed: list[str] = []
-        reused: list[tuple[str, str]] = []
-        started = time.time()
-        mode: str = cfg.followups
-        downgraded = False
-        if mode == "issues" and p.issues_enabled is False:
-            mode, downgraded = "comment", True
-        try:
-            if mode == "issues":
-                try:
-                    self._file_followup_issues(
-                        p, run, candidates, already, filed, listed, reused, started
-                    )
-                except GithubOpsError as exc:
-                    if exc.http_status != 410:
-                        raise
-                    # "Issues are disabled for this repo" — the probe had
-                    # no `has_issues` to go on; downgrade now.
-                    log.info("run.followups_issues_gone", run=run_id, repo=repo, error=str(exc))
-                    mode, downgraded = "comment", True
-            if mode == "comment":
-                if "(comment)" not in already:
-                    ops.pr_issue_comment(
-                        repo,
-                        run.pr_number,
-                        checklist_comment(
-                            candidates,
-                            run_id=run_id,
-                            reason=(
-                                "Issues are disabled on this repository" if downgraded else None
-                            ),
-                        ),
-                    )
-                    self._record_followup_comment(
-                        run_id, len(already) + 1, len(candidates), started
-                    )
-                listed = [c.followup.title.strip() for c in candidates]
-        except GithubOpsError:
-            log.warning("run.followups_failed", run=run_id, pr=run.pr_number, exc_info=True)
-        if not filed and not listed:
-            return
-        extra: dict[str, Any] = {}
-        if reused:
-            extra["reused"] = [{"title": t, "url": u} for t, u in reused]
-        if downgraded:
-            extra.update(downgraded_from="issues", reason="issues_disabled")
-        log.info(
-            "run.followups",
-            run=run_id,
-            pr=run.pr_number,
-            mode=mode,
-            filed=[url for _, url in filed],
-            listed=len(listed),
-            **extra,
+        filer.file(run, self._review_rounds(p.run_id), issues_enabled=p.issues_enabled)
+
+    def _followup_filer(self, p: Pipeline) -> FollowupFiler | None:
+        if p.ops is None or p.repo is None:
+            return None
+        return FollowupFiler(
+            p.ops, p.repo, self.store, self.bus, self.config, trigger_label=self.trigger_label
         )
-        self.bus.emit(
-            HostEventTypes.RUN_FOLLOWUPS,
-            run_id,
-            pr=run.pr_number,
-            mode=mode,
-            filed=[{"title": t, "url": u} for t, u in filed],
-            listed=listed,
-            **extra,
-        )
-
-    def _file_followup_issues(
-        self,
-        p: Pipeline,
-        run: RunRecord,
-        candidates: Sequence[Candidate],
-        already: dict[str, str],
-        filed: list[tuple[str, str]],
-        listed: list[str],
-        reused: list[tuple[str, str]],
-        started: float,
-    ) -> None:
-        """The ``issues`` mode of :meth:`_file_followups`: one issue per
-        candidate (recorded as filed as it goes) and one pointer comment on
-        the PR. ``filed`` is appended in place so a 410 midway leaves the
-        caller knowing what landed."""
-        ops, repo, run_id = p.ops, p.repo, p.run_id
-        assert ops is not None and repo is not None and run.pr_number is not None
-        cfg = self.config.landing
-        try:
-            on_repo = self._filed_on_repo(ops, repo, cfg.followup_label, run_id)
-            lookup_error = ""
-        except (GithubOpsError, LookupUnavailable):
-            on_repo = {}
-            lookup_error = "existing follow-up issues could not be read"
-        lookup = IssueLookup(ops, repo, run_id, self.store)
-        held: list[tuple[Candidate, str]] = []
-        label_ready = False
-        url: str | None
-        for cand in candidates:
-            title = cand.followup.title.strip()
-            if cand.key in already:
-                filed.append((title, already[cand.key]))
-                reused.append((title, already[cand.key]))
-                continue
-            existing = True
-            regression_of_match = cand.followup.decision == "regression" and on_repo.get(
-                cand.key, ""
-            ).endswith(f"/issues/{cand.followup.existing_issue}")
-            if cand.key in on_repo and not regression_of_match:
-                url = on_repo[cand.key]
-            else:
-                try:
-                    if lookup_error:
-                        raise LookupUnavailable(lookup_error)
-                    url = lookup.check(cand.followup)
-                except (GithubOpsError, LookupUnavailable) as exc:
-                    held.append((cand, str(exc)))
-                    listed.append(title)
-                    continue
-                if url is None:
-                    if not label_ready:
-                        self._ensure_label(ops, repo, cfg.followup_label)
-                        label_ready = True
-                    ref = ops.issue_create(
-                        repo,
-                        title,
-                        issue_body(
-                            cand,
-                            run_id=run_id,
-                            repo=repo,
-                            pr_number=run.pr_number,
-                            pr_url=run.pr_url or "",
-                            closes=self.config.github.deliver_closes,
-                            trigger_label=self.trigger_label,
-                        ),
-                        labels=[cfg.followup_label],
-                    )
-                    url = ref.url
-                    on_repo[cand.key] = url
-                    existing = False
-            filed.append((title, url))
-            if existing:
-                reused.append((title, url))
-            self.store.record_phase(
-                run_id,
-                "followup",
-                task_id=None,
-                attempt=len(already) + len(filed),
-                status="reused" if existing else "filed",
-                output_json=json.dumps({"key": cand.key, "title": title, "url": url}),
-                started_at=started,
-            )
-            already[cand.key] = url
-        if (filed or held) and "(comment)" not in already:
-            # One pointer on the PR, so the human sees them without opening
-            # the tracker.
-            ops.pr_issue_comment(
-                repo,
-                run.pr_number,
-                checklist_comment(candidates, run_id=run_id, filed=filed, held=held),
-            )
-            self._record_followup_comment(run_id, len(already) + 1, len(filed), started)
-
-    def _record_followup_comment(
-        self, run_id: str, attempt: int, count: int, started: float
-    ) -> None:
-        self.store.record_phase(
-            run_id,
-            "followup",
-            task_id=None,
-            attempt=attempt,
-            status="listed",
-            output_json=json.dumps({"key": "(comment)", "count": count}),
-            started_at=started,
-        )
-
-    def _recorded_followups(self, run_id: str) -> dict[str, str]:
-        """``{key: url}`` of the follow-ups this run already filed (or
-        ``"(comment)"`` when the checklist comment was posted)."""
-        out: dict[str, str] = {}
-        for row in self.store.phase_attempts(run_id):
-            if row.phase != "followup":
-                continue
-            try:
-                data = json.loads(row.output_json or "{}")
-            except ValueError:
-                continue
-            key = str(data.get("key") or "")
-            if key:
-                out[key] = str(data.get("url") or "")
-        return out
-
-    @staticmethod
-    def _filed_on_repo(ops: VcsOps, repo: str, label: str, run_id: str) -> dict[str, str]:
-        """Follow-ups across runs, by key; this run wins for crash recovery.
-        Read from the
-        label's issue list, which unlike search is not eventually consistent."""
-        out: dict[str, str] = {}
-        data: list[Any] = []
-        for page in range(1, 101):
-            try:
-                chunk = ops.issues_list(repo, labels=[label], state="all", page=page)
-            except MalformedResponse as exc:
-                raise LookupUnavailable("follow-up listing was malformed") from exc
-            data.extend(chunk)
-            if len(chunk) < 100:
-                break
-        else:
-            raise LookupUnavailable("follow-up listing was incomplete")
-        for issue in data:
-            # The issues endpoint lists pull requests too (#631): a labelled
-            # PR carrying an old marker in its body must not read as "this
-            # follow-up was filed" and suppress the issue.
-            if not isinstance(issue, dict):
-                raise LookupUnavailable("follow-up listing contained a malformed issue")
-            if "pull_request" in issue:
-                continue
-            found = marker_key(str(issue.get("body") or ""))
-            if found:
-                url = str(issue.get("html_url") or "")
-                if not url:
-                    raise LookupUnavailable("existing follow-up has no issue URL")
-                if found[0] == run_id:
-                    out[found[1]] = url
-                else:
-                    out.setdefault(found[1], url)
-        return out
 
     @staticmethod
     def _ensure_label(ops: VcsOps, repo: str, label: str) -> None:
-        """Make sure the repository carries the follow-up label (best-effort:
-        a refusal must not stop the filing — GitHub accepts an issue whose
-        label it cannot find). See :func:`sbxloop.vcs.github.labels.ensure_label`;
-        ``sbxloop init-repo`` creates this and the lifecycle labels up front
-        (#630)."""
-        ensure_label(ops, repo, LabelSpec(label, *FOLLOWUP_DESCRIPTOR))
+        """See :meth:`FollowupFiler.ensure_label`."""
+        FollowupFiler.ensure_label(ops, repo, label)
+
+    @staticmethod
+    def _filed_on_repo(ops: VcsOps, repo: str, label: str, run_id: str) -> dict[str, str]:
+        """See :meth:`FollowupFiler.filed_on_repo`."""
+        return FollowupFiler.filed_on_repo(ops, repo, label, run_id)
 
     def _login(self, p: Pipeline) -> str:
         """The loop's own GitHub login, read once per drive.

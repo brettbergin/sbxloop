@@ -969,6 +969,11 @@ outcome ─▶ DECOMPOSE (task DAG) ─▶ per task, dependency order:
   by `[landing] max_followups_per_run`, and the label is
   `followup_label`, **never** the trigger label — the 1.0 rule that the
   loop files no work of its own stands; a human promotes a follow-up.
+  `FollowupFiler` does the filing for the engine and the daemon alike: a
+  parked run the daemon lands with gh ops alone (an approved merge gate or
+  review wait) files its follow-ups once the merge succeeds, and the phase
+  rows and markers keep a second pass from filing anything twice (or
+  reporting them again: a pass with nothing new emits no event).
   Before proposing an issue, the reviewer calls the read-only
   `lookup_followup` host tool (`engine/issue_lookup.py`), searching open and
   closed issues with up to three symptom/component queries. The existing
