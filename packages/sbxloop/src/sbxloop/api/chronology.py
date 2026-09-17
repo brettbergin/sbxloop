@@ -20,17 +20,23 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import delete, func, insert, select
+from sqlalchemy import ColumnElement, and_, delete, func, insert, or_, select
 
+from sbxloop.api.channel_access import MANAGING_ROLES, ChannelAccess
 from sbxloop.daemon.controls.steering import SteeringStore
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.db.api_models import ApiEventRow
+from sbxloop.db.collaboration_models import ChannelRow
 from sbxloop.db.daemon_models import DaemonStateRow
 from sbxloop.db.engine_models import EventRow
+from sbxloop.db.event_scope import channel_for_run, event_channel
 from sbxloop.events import HostEventTypes
 from sbxloop.log import get_logger
+
+if TYPE_CHECKING:
+    from sbxloop.api.collaboration import Member
 
 log = get_logger(__name__)
 
@@ -88,6 +94,36 @@ def _int_state(session: Any, key: str) -> int:
         return 0
 
 
+def visibility(viewer: Member | None) -> list[ColumnElement[bool]]:
+    """SQL conditions on :class:`ApiEventRow` for what ``viewer`` may see.
+
+    No member (a plain client, the daemon): everything. Anyone else sees
+    events for everyone or for them alone. A workspace owner or admin sees
+    every channel's and every run's events; a member sees the events of the
+    channels they can open, and a run's events only when a channel they can
+    open asked for the run (``channel_id`` is set when it is recorded).
+    """
+    if viewer is None:
+        return []
+    conditions: list[ColumnElement[bool]] = [
+        or_(
+            ApiEventRow.audience_user_id.is_(None),
+            ApiEventRow.audience_user_id == viewer.user.id,
+        )
+    ]
+    if viewer.role in MANAGING_ROLES:
+        return conditions
+    visible = ChannelAccess.visible_condition(viewer)
+    assert visible is not None  # nosec B101 - a member always narrows
+    conditions.append(
+        or_(
+            ApiEventRow.channel_id.in_(select(ChannelRow.id).where(visible)),
+            and_(ApiEventRow.channel_id.is_(None), ApiEventRow.run_id.is_(None)),
+        )
+    )
+    return conditions
+
+
 def _set_state(session: Any, key: str, value: int) -> None:
     session.execute(
         insert(DaemonStateRow).prefix_with("OR REPLACE").values(key=key, value=str(value))
@@ -110,6 +146,9 @@ class Chronology:
         #: copied. A test commits a concurrent engine event here to exercise
         #: SQLite's deferred-transaction read-to-write upgrade race.
         self.after_read: Callable[[], None] = lambda: None
+        #: Runs whose asking channel is known; a run never changes channel.
+        #: Only found channels are kept: a run's item may be linked later.
+        self._run_channels: dict[str, str] = {}
 
     # -- projection ------------------------------------------------------------
 
@@ -142,6 +181,10 @@ class Chronology:
             if not rows:
                 return 0
             self.after_read()
+            channels = {
+                str(run_id): self._run_channel(session, str(run_id))
+                for run_id in {row[2] for row in rows}
+            }
             session.execute(
                 insert(ApiEventRow).values(
                     [
@@ -155,6 +198,7 @@ class Chronology:
                             "actor_json": None,
                             "source_seq": int(seq),
                             "data_json": None,
+                            "channel_id": channels.get(str(run_id)),
                         }
                         for seq, ts, run_id, type_, _data in rows
                     ]
@@ -183,6 +227,14 @@ class Chronology:
             _set_state(session, WATERMARK_KEY, last)
             return len(rows)
 
+    def _run_channel(self, session: Any, run_id: str) -> str | None:
+        channel_id = self._run_channels.get(run_id)
+        if channel_id is None:
+            channel_id = channel_for_run(session, run_id)
+            if channel_id is not None:
+                self._run_channels[run_id] = channel_id
+        return channel_id
+
     def lag(self) -> int:
         """Engine events not yet in the chronology."""
         with self.dstore.read() as session:
@@ -203,9 +255,16 @@ class Chronology:
         actor: dict[str, Any] | None = None,
         data: dict[str, Any] | None = None,
         occurred_at: float | None = None,
+        audience_user_id: str | None = None,
     ) -> int:
-        """Append one daemon-originated event; returns its ``seq``."""
+        """Append one daemon-originated event; returns its ``seq``. It
+        belongs to the channel that asked for its run or item, if any."""
         with self.dstore.transaction() as session:
+            channel_id = (
+                self._run_channel(session, run_id)
+                if run_id
+                else event_channel(session, type_, run_id=None, item_id=item_id, data=data)
+            )
             result = session.execute(
                 insert(ApiEventRow).values(
                     recorded_at=now,
@@ -217,6 +276,8 @@ class Chronology:
                     actor_json=None if actor is None else json.dumps(actor, default=str),
                     source_seq=None,
                     data_json=json.dumps(data or {}, default=str),
+                    channel_id=channel_id,
+                    audience_user_id=audience_user_id,
                 )
             )
             keys = getattr(result, "inserted_primary_key", None)
@@ -255,9 +316,12 @@ class Chronology:
         type_prefix: str | None = None,
         limit: int = 100,
         newest_first: bool = False,
+        viewer: Member | None = None,
+        channel_id: str | None = None,
     ) -> list[PublicEvent]:
         """Events after a cursor, oldest first; an engine event's data is
-        joined from the engine's own row."""
+        joined from the engine's own row. ``viewer`` narrows to what that
+        member may see, in the query, so a page is never short."""
         stmt = (
             select(ApiEventRow, EventRow.data_json, EventRow.job_id)
             .outerjoin(EventRow, EventRow.seq == ApiEventRow.source_seq)
@@ -269,6 +333,9 @@ class Chronology:
             stmt = stmt.where(ApiEventRow.run_id == run_id)
         if type_prefix:
             stmt = stmt.where(ApiEventRow.type.like(type_prefix.replace("%", "") + "%"))
+        if channel_id is not None:
+            stmt = stmt.where(ApiEventRow.channel_id == channel_id)
+        stmt = stmt.where(*visibility(viewer))
         out: list[PublicEvent] = []
         with self.dstore.read() as session:
             for row, source_data, job_id in session.execute(stmt):

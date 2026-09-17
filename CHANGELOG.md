@@ -56,6 +56,21 @@
   follows; no route reads them yet, and a single-user installation behaves as
   before.
 
+- **Members see only the events they may.** Public events now record the
+  channel they belong to (a channel's own events, an agent memory's source
+  channel, or the channel that asked for a run) and, for a person's own
+  teams, preferences, workflows and profile, the person they are for. `GET /v1/events`,
+  `GET /v1/runs/{id}/events`, the SSE stream and the WebSocket show a
+  workspace member only the events of channels they can open, events for
+  them, and events with no channel; a run's events follow the channel that
+  asked for the run, and a run no channel asked for is shown to workspace
+  owners and admins only. Owners and admins see every channel's events,
+  and a plain API client sees everything as before. The filter runs in the
+  query, so pages are never short, and a live stream moves past what it
+  hides. `GET /v1/events` and the stream accept `channel_id`. Revision 0026
+  adds the two columns and an index, and fills the channel of every
+  collaboration event, and of every agent memory event, already recorded. Advertised as `events.scoped`.
+
 - **Channels can be shared with the workspace.** A channel is private to its
   members or visible to the whole workspace, and every channel route now
   decides access by those rules instead of by the channel's creator alone: a

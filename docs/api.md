@@ -654,6 +654,32 @@ answered by `reply{id, ok, result | problem}`) — `item.*`, `run.*`,
 idempotency scope; a stop or restart sent on the socket takes effect after
 its reply frame.
 
+### Who sees which events
+
+When `/v1/capabilities` lists `events.scoped`, every event is recorded with
+the channel it belongs to (its own channel, the channel a memory was learned
+in, or the channel that asked for its run or item) and, for a person's own
+teams, preferences, workflows and profile, the one user it is for. The page routes, the run's events, the SSE
+stream and the WebSocket all filter in the query, so a page is never short
+and `has_more` means what it always meant:
+
+- A plain API client (no workspace member behind it) sees every event.
+- Every workspace member sees events meant for everyone or for them alone.
+- A workspace owner or admin also sees every channel's and every run's
+  events.
+- A plain member sees the events of the channels they can open (their
+  channels and every workspace channel) and events with neither a channel
+  nor a run. A run's events are shown only when a channel they can open
+  asked for the run (a workload or tool run started from a chat message, or
+  a code run whose issue a chat turn filed); a run no channel asked for, and
+  run events recorded before this release, are not shown to them.
+
+A live subscription moves its cursor past events its member may not see,
+so it does not scan them again. Membership changes apply from the next
+read (the stream and the socket re-read the member when they re-check the
+token). `GET /v1/events` and `GET /v1/events/stream` accept
+`channel_id=<chn_...>` to follow one channel.
+
 ## Errors
 
 Every refusal is `application/problem+json` with a stable `code`, the

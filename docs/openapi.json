@@ -9403,7 +9403,7 @@
     },
     "/v1/events": {
       "get": {
-        "description": "Every public event after ``after`` (an event id, or omitted for\nthe oldest held), oldest first, in the order it was recorded.\n``latest`` instead returns the newest bounded snapshot, oldest first;\nit works after retention and cannot be combined with ``after``.",
+        "description": "Every public event after ``after`` (an event id, or omitted for\nthe oldest held), oldest first, in the order it was recorded.\n``latest`` instead returns the newest bounded snapshot, oldest first;\nit works after retention and cannot be combined with ``after``.\n``channel_id`` narrows to one channel's events (and its runs'). A\nworkspace member sees only what they may: see ``events.scoped``.",
         "operationId": "list_events_v1_events_get",
         "parameters": [
           {
@@ -9475,6 +9475,23 @@
               "default": false,
               "title": "Latest",
               "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Id"
             }
           }
         ],
@@ -9558,6 +9575,23 @@
                 }
               ],
               "title": "Type Prefix"
+            }
+          },
+          {
+            "in": "query",
+            "name": "channel_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 128,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Channel Id"
             }
           }
         ],

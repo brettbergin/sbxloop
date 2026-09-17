@@ -30,6 +30,7 @@ from sqlalchemy.orm import Session
 from sbxloop.daemon.controls.principal import Principal
 from sbxloop.daemon.controls.results import ControlError, Outcome
 from sbxloop.db.api_models import ApiEventRow, OperationRow
+from sbxloop.db.event_scope import event_channel
 from sbxloop.ids import _token
 from sbxloop.log import get_logger
 
@@ -407,6 +408,7 @@ class OperationStore:
                 actor_json=None if principal is None else json.dumps(principal.audit()),
                 source_seq=None,
                 data_json=json.dumps(data, default=str),
+                channel_id=event_channel(session, type_, run_id=run_id, item_id=item_id, data=data),
             )
         )
 
