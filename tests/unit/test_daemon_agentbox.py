@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import logging
 import sys
+import threading
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,9 +25,10 @@ from sbxloop.daemon.agentbox import (
     DaemonAgent,
     sandbox_name_for,
 )
-from sbxloop.errors import DaemonError, WorkerError
+from sbxloop.errors import DaemonError, WorkerError, WorkerTimeoutError
 from sbxloop.events import Event, EventBus
 from sbxloop.sbx.cli import SbxCLI
+from sbxloop.sbx.sandbox import Sandbox
 from sbxloop.worker.client import WorkerClient
 from tests.conftest import FakeSbx
 
@@ -365,3 +368,208 @@ class TestFailureHandling:
         with pytest.raises(WorkerError):
             # inside the window again: call() does not retry
             agent.call(lambda client: (_ for _ in ()).throw(WorkerError("boom")))
+
+
+class StubSbx:
+    """Just enough sandbox backend for the lease pool: which boxes exist,
+    which were created and which removed. Provisioning itself is covered by
+    the fake-sbx tests above."""
+
+    def __init__(self) -> None:
+        self.names: set[str] = set()
+        self.created: list[str] = []
+        self.removed: list[str] = []
+
+    def ls(self) -> list[SimpleNamespace]:
+        return [SimpleNamespace(name=name) for name in sorted(self.names)]
+
+    def rm(self, name: str, *, force: bool = True, settle: bool = True) -> None:
+        self.removed.append(name)
+        self.names.discard(name)
+
+
+def lease_agent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, turns: int = 1, clock=None
+) -> tuple[DaemonAgent, StubSbx]:
+    sbx = StubSbx()
+    config = Config.model_validate(
+        {"home": str(tmp_path / "state"), "concierge": {"max_concurrent_turns": turns}}
+    )
+    kwargs = {"clock": clock} if clock is not None else {}
+    agent = DaemonAgent(
+        config,
+        sbx,  # type: ignore[arg-type]
+        EventBus(),
+        worker_python=sys.executable,
+        install_workers=False,
+        **kwargs,
+    )
+    monkeypatch.setattr(agent.provisioner, "job_env", lambda *args, **kwargs: None)
+
+    def ensure() -> WorkerClient:
+        sbx.created.append(agent.name)
+        sbx.names.add(agent.name)
+        sandbox = Sandbox(sbx, agent.name)  # type: ignore[arg-type]
+        agent._sandbox = sandbox
+        return agent._make_client(sandbox)
+
+    monkeypatch.setattr(agent, "_ensure", ensure)
+    return agent, sbx
+
+
+class TestLeases:
+    """Several turns share the one concierge sandbox through leased clients:
+    a bounded pool of worker clients over the same box, each lease knowing
+    which incarnation of the box it was handed out for."""
+
+    def test_the_default_width_leases_the_one_client_and_queues_the_next(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, sbx = lease_agent(tmp_path, monkeypatch)
+        try:
+            with agent.lease() as lease:
+                assert lease.client is agent.client()
+                with pytest.raises(WorkerTimeoutError), agent.lease(timeout=0.05):
+                    pass
+            with agent.lease() as again:
+                assert again.client is lease.client
+            assert sbx.created == [agent.name]
+        finally:
+            agent.close()
+
+    def test_concurrent_leases_get_distinct_clients_over_the_same_sandbox(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, sbx = lease_agent(tmp_path, monkeypatch, turns=2)
+        try:
+            with agent.lease() as first, agent.lease() as second:
+                assert first.client is not second.client
+                assert first.client.sandbox.name == second.client.sandbox.name == agent.name
+                assert second.client.role == "agent"
+                assert second.client.backend == agent.config.agent.backend
+                assert first.generation == second.generation
+            assert sbx.created == [agent.name]
+            # Returned clients are reused, not rebuilt.
+            with agent.lease() as a, agent.lease() as b:
+                assert {id(a.client), id(b.client)} == {id(first.client), id(second.client)}
+        finally:
+            agent.close()
+
+    def test_a_lease_beyond_the_width_waits_for_one_to_come_back(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, sbx = lease_agent(tmp_path, monkeypatch, turns=2)
+        got: list[WorkerClient] = []
+        started = threading.Event()
+
+        def third() -> None:
+            started.set()
+            with agent.lease(timeout=5) as lease:
+                got.append(lease.client)
+
+        try:
+            with agent.lease() as first, agent.lease() as second:
+                with pytest.raises(WorkerTimeoutError), agent.lease(timeout=0.05):
+                    pass
+                thread = threading.Thread(target=third)
+                thread.start()
+                started.wait(5)
+                thread.join(0.2)
+                assert thread.is_alive() and got == []  # waiting while both are out
+            thread.join(5)
+            assert not thread.is_alive()
+            assert got[0] in (first.client, second.client)
+            assert sbx.created == [agent.name]
+        finally:
+            agent.close()
+
+    def test_a_failure_on_an_old_generation_leaves_the_new_box_alone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        now = [1000.0]
+        agent, sbx = lease_agent(tmp_path, monkeypatch, turns=2, clock=lambda: now[0])
+        try:
+            with agent.lease() as old:
+                pass
+            assert agent.note_failure(WorkerError("died"), generation=old.generation) is True
+            assert sbx.removed == [agent.name]
+            with agent.lease() as new:
+                assert new.generation != old.generation
+                assert new.client is not old.client
+            assert sbx.created == [agent.name, agent.name]
+            now[0] += REPROVISION_MIN_INTERVAL_S + 1
+            # A late report from a turn that ran on the old box: the box it
+            # blames is already gone, so its retry may go ahead, but nothing
+            # is removed.
+            assert agent.note_failure(WorkerError("late"), generation=old.generation) is True
+            assert sbx.removed == [agent.name]
+            assert agent.exists()
+            with agent.lease() as after:
+                assert after.generation == new.generation
+                assert after.client is new.client
+        finally:
+            agent.close()
+
+    def test_a_failure_is_not_torn_down_under_another_active_lease(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, sbx = lease_agent(tmp_path, monkeypatch, turns=2)
+        try:
+            with agent.lease() as busy:
+                with agent.lease() as failed:
+                    pass
+                assert agent.note_failure(WorkerError("died"), generation=failed.generation)
+                # The other turn is still using the box.
+                assert sbx.removed == []
+                assert agent.exists()
+                # A second report for the same condemned box changes nothing.
+                assert agent.note_failure(WorkerError("also"), generation=busy.generation)
+                assert sbx.removed == []
+            # The last lease came back: now the box goes, and the next lease
+            # provisions a fresh one.
+            assert sbx.removed == [agent.name]
+            with agent.lease() as fresh:
+                assert fresh.generation != busy.generation
+                assert fresh.client is not busy.client
+            assert sbx.created == [agent.name, agent.name]
+        finally:
+            agent.close()
+
+    def test_a_condemned_box_is_not_leased_again(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, sbx = lease_agent(tmp_path, monkeypatch, turns=2)
+        try:
+            with agent.lease():
+                with agent.lease() as failed:
+                    pass
+                agent.note_failure(WorkerError("died"), generation=failed.generation)
+                # The failed turn's retry must not land on the box that is
+                # about to be removed; it waits for the replacement.
+                with pytest.raises(WorkerTimeoutError), agent.lease(timeout=0.05):
+                    pass
+            assert sbx.removed == [agent.name]
+        finally:
+            agent.close()
+
+    def test_clients_of_a_replaced_box_are_closed_when_returned(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        agent, _sbx = lease_agent(tmp_path, monkeypatch, turns=2)
+        try:
+            with agent.lease() as idle:
+                pass
+            with agent.lease() as outstanding:
+                assert outstanding.client is idle.client
+                agent.remove()
+                with agent.lease() as current:
+                    assert current.generation != outstanding.generation
+                    assert current.client is not outstanding.client
+            # Neither the idle client of the old box nor the one handed back
+            # after the replacement is ever leased again.
+            with agent.lease() as a, agent.lease() as b:
+                assert outstanding.client not in (a.client, b.client)
+                assert current.client in (a.client, b.client)
+                assert a.generation == b.generation == current.generation
+        finally:
+            agent.close()

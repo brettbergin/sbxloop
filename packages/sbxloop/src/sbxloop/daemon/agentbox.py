@@ -19,16 +19,27 @@ for the configured ``[agent] backend``
 wedged VM falls through to a clean re-provision. ``sbxloop sandbox rm
 --all`` still removes it; ``sandbox prune`` reports it as daemon-owned
 and leaves it alone.
+
+Several turns can run in the box at once: :meth:`DaemonAgent.lease` hands
+each one a worker client of its own from a pool of at most ``[concierge]
+max_concurrent_turns`` clients over the same sandbox (each client is its own
+worker process with its own job ids and transport bookkeeping). A lease
+remembers which *generation* of the sandbox it was handed out for, so a
+failure reported by a turn that ran on a box since replaced never tears
+down the replacement, and a box is never removed while another turn still
+holds a lease on it.
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
-from typing import TypeVar
+from typing import Any, NamedTuple, TypeVar
 
 from sbxloop.config import Config
 from sbxloop.engine.store import StateStore
@@ -63,6 +74,18 @@ CONCIERGE_RUN_ID = "concierge"
 # Same reasoning as the github box: a dead sandbox costs one re-provision,
 # an outage must not cost one per failing message.
 REPROVISION_MIN_INTERVAL_S = 300.0
+# A lease waits this much longer than one concierge turn may run: every
+# client it could be waiting for is bounded by that turn timeout.
+LEASE_WAIT_MARGIN_S = 60.0
+
+
+class AgentLease(NamedTuple):
+    """One turn's hold on a worker client in the concierge sandbox."""
+
+    client: WorkerClient
+    #: Which incarnation of the sandbox the client talks to; a failure is
+    #: reported against it (:meth:`DaemonAgent.note_failure`).
+    generation: int
 
 
 def sandbox_name_for(home: SbxloopHome) -> str:
@@ -97,6 +120,20 @@ class DaemonAgent:
         self._client: WorkerClient | None = None
         self._mcp_client: WorkerClient | None = None
         self._provider_store: StateStore | None = None
+        # The lease pool. `_generation` names the current incarnation of the
+        # sandbox and moves on every removal; `_free` holds its idle
+        # clients, `_slots` counts the clients made for it (idle or leased)
+        # and `_primary_pooled` says whether `_client` is one of them.
+        # `_condemned` marks a box that failed while other leases still
+        # used it: it is removed when the last of them comes back.
+        self._pool = threading.Condition()
+        self._provision_lock = threading.RLock()
+        self._generation = 0
+        self._free: list[WorkerClient] = []
+        self._slots = 0
+        self._active = 0
+        self._primary_pooled = False
+        self._condemned = False
 
     @property
     def workspace(self) -> Path:
@@ -107,14 +144,113 @@ class DaemonAgent:
     # -- access ------------------------------------------------------------
 
     def client(self) -> WorkerClient:
-        if self._client is None:
-            log.info("concierge_sandbox.provision_needed", sandbox=self.name)
-            self._client = self._ensure()
-            if self.install_workers:
-                from sbxloop.modelcatalog import refresh_after_provision
+        with self._provision_lock:
+            if self._client is None:
+                log.info("concierge_sandbox.provision_needed", sandbox=self.name)
+                self._client = self._ensure()
+                if self.install_workers:
+                    from sbxloop.modelcatalog import refresh_after_provision
 
-                refresh_after_provision(self.config)
-        return self._client
+                    refresh_after_provision(self.config)
+            return self._client
+
+    @property
+    def max_leases(self) -> int:
+        return self.config.concierge.max_concurrent_turns
+
+    @contextmanager
+    def lease(self, timeout: float | None = None) -> Iterator[AgentLease]:
+        """Hold a worker client of the sandbox for one turn.
+
+        Clients are made lazily, up to :attr:`max_leases`, and reused once
+        returned; with every one out this waits up to ``timeout`` seconds
+        (by default a turn's timeout plus :data:`LEASE_WAIT_MARGIN_S`), then
+        raises :class:`WorkerTimeoutError`. With one lease allowed, the
+        lease is always :meth:`client`'s own client.
+        """
+        if timeout is None:
+            timeout = self.config.concierge.timeout_s + LEASE_WAIT_MARGIN_S
+        held = self._acquire(timeout)
+        try:
+            yield held
+        finally:
+            self._release(held)
+
+    def _acquire(self, timeout: float) -> AgentLease:
+        deadline = time.monotonic() + timeout
+        with self._pool:
+            while True:
+                if self._condemned and self._active == 0:
+                    self._drop_locked()
+                if not self._condemned:
+                    if self._free:
+                        self._active += 1
+                        return AgentLease(self._free.pop(), self._generation)
+                    if self._slots < self.max_leases:
+                        self._slots += 1
+                        self._active += 1
+                        generation = self._generation
+                        break
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise WorkerTimeoutError(
+                        f"no concierge session came free within {timeout:.0f}s"
+                    )
+                self._pool.wait(remaining)
+        try:
+            client = self._pooled_client()
+        except BaseException:
+            with self._pool:
+                self._active -= 1
+                if generation == self._generation:
+                    self._slots -= 1
+                self._pool.notify_all()
+            raise
+        return AgentLease(client, generation)
+
+    def _pooled_client(self) -> WorkerClient:
+        """A new client for the pool: the provisioning client first, then
+        siblings in the same sandbox."""
+        with self._provision_lock:
+            primary = self.client()
+            if not self._primary_pooled:
+                self._primary_pooled = True
+                return primary
+            client = self._sibling(
+                primary, transport=self.config.worker_transport, limits=self.config.limits
+            )
+            client.provider_recovery = primary.provider_recovery
+            client.mcp_prepare = primary.mcp_prepare
+            return client
+
+    def _sibling(self, active: WorkerClient, **options: Any) -> WorkerClient:
+        """Another worker client in ``active``'s sandbox: its own worker
+        process, job ids and transport bookkeeping, with the same
+        interpreter and credential delivery."""
+        return WorkerClient(
+            active.sandbox,
+            self.bus,
+            python=active.python,
+            role="agent",
+            backend=self.config.agent.backend,
+            job_env=active.job_env,
+            **options,
+        )
+
+    def _release(self, held: AgentLease) -> None:
+        with self._pool:
+            self._active -= 1
+            if held.generation == self._generation:
+                if self._condemned:
+                    # Never handed out again; the box goes below or at the
+                    # next acquire.
+                    self._slots -= 1
+                else:
+                    self._free.append(held.client)
+            # A client of a replaced box is closed: dropped, never reused.
+            if self._condemned and self._active == 0:
+                self._drop_locked()
+            self._pool.notify_all()
 
     def call(self, fn: Callable[[WorkerClient], T]) -> T:
         """Run ``fn(client)``; on failure drop the sandbox (rate-limited, see
@@ -142,16 +278,7 @@ class DaemonAgent:
         active = self._client
         if active is None:
             return unavailable
-        probe = WorkerClient(
-            active.sandbox,
-            self.bus,
-            python=active.python,
-            transport="stream",
-            grace_s=2,
-            role="agent",
-            backend=backend,
-            job_env=active.job_env,
-        )
+        probe = self._sibling(active, transport="stream", grace_s=2)
         job = JobRequest(
             job_id=new_job_id(),
             run_id=CONCIERGE_RUN_ID,
@@ -176,10 +303,32 @@ class DaemonAgent:
             # failure through note_failure(): the active session stays alive.
             return unavailable
 
-    def note_failure(self, exc: BaseException) -> bool:
+    def note_failure(self, exc: BaseException, generation: int | None = None) -> bool:
         """A caller's job failed: drop the sandbox so the next :meth:`client`
         re-provisions — at most once per :data:`REPROVISION_MIN_INTERVAL_S`.
-        Returns whether the sandbox was dropped."""
+        Returns whether the sandbox was (or will be) dropped, i.e. whether a
+        retry gets a fresh one.
+
+        ``generation`` is the failed lease's (``None``: the current box).
+        When that box has already been replaced nothing is removed and the
+        retry lands on the replacement. While other leases still use the
+        box it is only condemned: no lease is handed out on it any more, and
+        it is removed once the last of them comes back.
+        """
+        with self._pool:
+            if generation is not None and generation != self._generation:
+                log.info(
+                    "concierge_sandbox.stale_failure",
+                    sandbox=self.name,
+                    error=str(exc),
+                    action="keeping the sandbox; the failed one was already replaced",
+                )
+                return True
+            if self._condemned:
+                return True
+            return self._note_current_failure(exc)
+
+    def _note_current_failure(self, exc: BaseException) -> bool:
         now = self.clock()
         last = self._last_reprovision_at
         if last is not None and now - last < REPROVISION_MIN_INTERVAL_S:
@@ -199,7 +348,15 @@ class DaemonAgent:
             action="dropping the sandbox; the next message re-provisions",
         )
         self._last_reprovision_at = now
-        self.remove()
+        if self._active:
+            log.info(
+                "concierge_sandbox.removal_deferred",
+                sandbox=self.name,
+                active_leases=self._active,
+            )
+            self._condemned = True
+        else:
+            self._drop_locked()
         return True
 
     # -- lifecycle ---------------------------------------------------------
@@ -207,6 +364,8 @@ class DaemonAgent:
     def close(self) -> None:
         """Forget the handle; the sandbox stays for the next daemon process
         (conversation memory lives inside it)."""
+        with self._pool:
+            self._new_generation()
         self._sandbox, self._client = None, None
         if self._provider_store is not None:
             self._provider_store.close()
@@ -264,6 +423,24 @@ class DaemonAgent:
         ``strict`` propagates a teardown sbx would not confirm, for the one
         caller that is about to create the same name again (#952).
         """
+        with self._pool:
+            self._drop_locked(strict=strict)
+
+    def _new_generation(self) -> None:
+        """Retire the pool's clients; outstanding leases are closed as they
+        come back. Called with ``_pool`` held."""
+        self._generation += 1
+        self._free.clear()
+        self._slots = 0
+        self._primary_pooled = False
+        self._condemned = False
+        self._pool.notify_all()
+
+    def _drop_locked(self, *, strict: bool = False) -> None:
+        self._new_generation()
+        self._discard_sandbox(strict=strict)
+
+    def _discard_sandbox(self, *, strict: bool = False) -> None:
         self._close_mcp()
         sandbox, self._sandbox, self._client = self._sandbox, None, None
         if sandbox is None:
@@ -370,7 +547,8 @@ class DaemonAgent:
                 # finishing. Creating into that window costs the new sandbox
                 # (reaped mid-install) plus a whole retry cycle of chat
                 # silence (#952), so an unconfirmed teardown stops here.
-                self.remove(strict=True)
+                # No client uses the stale box yet: no new generation.
+                self._discard_sandbox(strict=True)
             log.info(
                 "concierge_sandbox.provision_start",
                 sandbox=self.name,

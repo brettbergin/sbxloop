@@ -310,6 +310,16 @@
   that id once, so it resumes and stops gating bridge turns. Host tools
   still run one at a time.
 
+- **Overlapping chat turns each get their own worker in the concierge
+  sandbox.** A turn now leases a worker client from a pool of up to
+  `[concierge] max_concurrent_turns` clients over the one concierge
+  sandbox, made as needed and reused once returned; a turn that finds them
+  all busy waits for one. Each lease remembers which incarnation of the
+  sandbox it was handed out for, so a failure from a turn that ran on a
+  sandbox already replaced no longer removes the replacement, and a failed
+  sandbox that other turns are still using is removed only after the last
+  of them finishes. With the default of one turn at a time nothing changes.
+
 ### Changed
 
 - **Every request now knows which workspace member is calling.** The
