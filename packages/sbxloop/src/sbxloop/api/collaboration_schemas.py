@@ -612,6 +612,9 @@ class TurnOut(ApiModel):
     #: How many agent-started turns separate this one from the human turn
     #: that started the chain; zero for a turn a person asked for.
     chain_depth: int = 0
+    #: The run this turn steered instead of answering (S-A11); null for an
+    #: ordinary turn, so an old client reads what it always did.
+    steered_run_id: str | None = None
 
 
 class ChannelSilence(ApiModel):

@@ -68,6 +68,7 @@ FEATURES: tuple[str, ...] = (
     "collaboration.channel_stop",
     "collaboration.silence",
     "collaboration.read_state",
+    "collaboration.mention_steering",
 )
 
 

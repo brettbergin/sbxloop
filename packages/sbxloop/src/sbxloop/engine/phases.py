@@ -716,8 +716,12 @@ class PhaseRunner:
         selection: ModelSelection | None = None,
         response_only: bool = False,
         task_id: str | None = None,
+        binding: AgentBinding | None = None,
     ) -> JobResult:
-        binding = self._binding(phase, task_id)
+        # An explicit binding overrides the run's assignment for this job:
+        # a steer answered by a mentioned agent speaks as that agent, in
+        # whatever phase the run happens to be in (S-A11).
+        binding = binding or self._binding(phase, task_id)
         custom = self._custom(binding)
         selection = selection or self._selection(phase, binding)
         agent_name = AGENT_NAMES[phase]
@@ -921,6 +925,7 @@ class PhaseRunner:
         repair_check: Callable[[object, ModelT], None] | None = None,
         repair_identity: str = "",
         task_id: str | None = None,
+        binding: AgentBinding | None = None,
     ) -> tuple[ModelT, JobResult]:
         """Run a JSON-expecting job, normally with one validation retry.
 
@@ -940,7 +945,7 @@ class PhaseRunner:
         """
         checkpoint_key: str | None = None
         checkpoint: _ReviewResponseCheckpoint | None = None
-        binding = self._binding(prompt_name, task_id)
+        binding = binding or self._binding(prompt_name, task_id)
         if prompt_name == "review" and self.store is not None:
             identity = {
                 "prompt": render(prompt_name, retry_context="", **context),
@@ -999,6 +1004,7 @@ class PhaseRunner:
                         system_preset=system_preset,
                         selection=selection,
                         task_id=task_id,
+                        binding=binding,
                     )
                 )
             except WorkerError as exc:
@@ -1548,6 +1554,7 @@ class PhaseRunner:
         tasks: Sequence[TaskRecord],
         task: TaskRecord | None,
         stage: str | None = None,
+        binding: AgentBinding | None = None,
     ) -> SteerVerdict:
         """Answer one interactive chat message and rule on its course change.
 
@@ -1555,6 +1562,11 @@ class PhaseRunner:
         tasks, and throughout the post-build stages); ``tasks`` is the whole
         board, so the agent can speak to overall progress; ``stage`` names
         where the run is when no task is active ("awaiting CI on PR #12").
+
+        ``binding`` is the agent the message mentioned (S-A11): the answer
+        comes back in that agent's persona and with its model, rather than
+        in the run's default steering voice. None keeps the voice a steer
+        has always had, so an unmentioned steer is unchanged.
         """
         board = bullet_list(
             [f"{t.spec.id} [{t.state}] {t.spec.title}" for t in tasks],
@@ -1584,6 +1596,7 @@ class PhaseRunner:
                 "user_message": message,
             },
             permission_mode="read_only",
+            binding=binding,
         )
         return verdict
 

@@ -6075,6 +6075,18 @@
       "SteerRequest": {
         "additionalProperties": false,
         "properties": {
+          "agent_slug": {
+            "anyOf": [
+              {
+                "maxLength": 64,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Agent Slug"
+          },
           "expected_revision": {
             "anyOf": [
               {
@@ -6094,6 +6106,18 @@
             "maxItems": 32,
             "title": "Source Refs",
             "type": "array"
+          },
+          "task_id": {
+            "anyOf": [
+              {
+                "maxLength": 128,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Task Id"
           },
           "text": {
             "maxLength": 16384,
@@ -6886,6 +6910,17 @@
           "status": {
             "title": "Status",
             "type": "string"
+          },
+          "steered_run_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Steered Run Id"
           },
           "targets": {
             "items": {

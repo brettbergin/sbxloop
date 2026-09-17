@@ -60,6 +60,25 @@ a code run's checkout, is `404` like any other id from elsewhere.
   run-thread steering and an unlinked surface behave exactly as before.
   Advertised as `collaboration.bridges`.
 
+- **Steer one task, or one agent, by naming it; stop a channel from chat.**
+  Every instruction used to go into one mailbox and be answered by whichever
+  task lane reached a phase boundary first, in the run's own steering voice,
+  so with several lanes in flight "steer the builder working on t2" could be
+  answered by the lane working on t1. `POST /v1/runs/{id}/steering` now takes
+  an optional `task_id`, which puts the instruction in that task's own
+  mailbox so that lane answers it, and an optional `agent_slug`, which makes
+  the answer come back in that agent's persona and with its model; the run's
+  `chat.reply` event carries both. A task that ends with instructions still
+  waiting hands them to the run rather than dropping them. In a channel, a
+  mention of an agent already working live work there is taken as direction
+  for that run instead of a fresh answer, and the turn records
+  `steered_run_id`; the mention has to be unambiguous, or it stays an
+  ordinary turn. Stopping stays explicit: `/stop`, `/cancel` or exactly
+  `@agent stop` cancels that channel's runs through the same control service
+  the API's cancel uses. New capability `collaboration.mention_steering`;
+  revision 0031 adds the turn column. An instruction that names no target is
+  answered exactly as before.
+
 - **Agents can start work and file issues themselves.** An agent whose
   `[[agents]]` entry declares `can_start` is offered two new tools in a chat
   turn: `start_run` (a `workload` run, or a `code` run filed as a queued

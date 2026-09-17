@@ -60,7 +60,9 @@ from sbxloop.api.stream import StreamHub
 from sbxloop.api.turns import TurnCoordinator
 from sbxloop.config import Config
 from sbxloop.daemon.controls.principal import Principal
+from sbxloop.daemon.controls.results import ControlError
 from sbxloop.daemon.controls.service import ControlService
+from sbxloop.daemon.controls.steering import stop_command
 from sbxloop.errors import ToolRejectedError
 from sbxloop.log import get_logger
 
@@ -714,6 +716,32 @@ class ApiContext:
                 if resolved is not None and resolved.slug == target
                 else None
             )
+            stopped = self._stop_from_chat(turn, target, content, author)
+            if stopped is not None:
+                store.append_reply(
+                    turn.id,
+                    content=stopped,
+                    agent_slug=target,
+                    now=self.clock(),
+                    participant_index=index,
+                )
+                self.hub.notify()
+                index += 1
+                continue
+            steered = self._steer_by_mention(turn, target, content, author)
+            if steered is not None:
+                # The agent is working live work in this channel: the
+                # mention is direction for that run, not a fresh answer.
+                store.append_reply(
+                    turn.id,
+                    content=steered,
+                    agent_slug=target,
+                    now=self.clock(),
+                    participant_index=index,
+                )
+                self.hub.notify()
+                index += 1
+                continue
             read_only = (
                 bool(participant.get("read_only")) or target == "critic" or source_agent is not None
             )
@@ -1119,6 +1147,90 @@ class ApiContext:
         except Exception:
             log.warning("collaboration.agent_work_unavailable", agent=agent.slug, exc_info=True)
             return ()
+
+    def _stop_from_chat(self, turn: Turn, target: str | None, text: str, author: str) -> str | None:
+        """Answer an explicit stop from chat (S-A11), or None.
+
+        Only the exact words stop anything -- `/stop`, `/cancel`, or
+        `@agent stop` naming the agent whose turn this is. A message that
+        merely argues for stopping is steering, and goes the other way.
+        Every cancel runs through the control service, so this is the same
+        operation the API's cancel is.
+        """
+        scope = stop_command(text, target)
+        if scope is None or self.loop is None:
+            return None
+        stop = getattr(self.loop, "stop_channel", None)
+        if not callable(stop):
+            return None
+        try:
+            stopped = stop(
+                turn.channel_id,
+                Principal.trusted(author, "collaboration"),
+                agent_slug=target if scope == "agent" else None,
+            )
+        except ControlError as exc:
+            return f"Nothing was stopped: {exc.message}"
+        except Exception:
+            log.warning("collaboration.stop_failed", channel=turn.channel_id, exc_info=True)
+            return None
+        if not stopped:
+            return "Nothing is running here to stop."
+        runs = ", ".join(f"`{run_id}`" for run_id in stopped)
+        return (
+            f"Stopping {runs}. Work already done stays where it is; "
+            "`resume-run` would continue, `retry` would start over."
+        )
+
+    def _steer_by_mention(
+        self, turn: Turn, target: str | None, text: str, author: str
+    ) -> str | None:
+        """Hand this mention to the run ``target`` is working in this
+        channel (S-A11), and say so; None when the mention is not about
+        live work, which leaves it an ordinary turn.
+
+        Nothing here decides *which* run: the loop owns that, because only
+        it knows what is in flight right now, and it refuses to guess when
+        more than one run in the channel names the agent.
+        """
+        if target is None or self.loop is None:
+            return None
+        route = getattr(self.loop, "route_mention", None)
+        if not callable(route):
+            return None
+        try:
+            outcome = route(
+                turn.channel_id,
+                target,
+                text,
+                Principal.trusted(author, "collaboration"),
+            )
+        except ControlError as exc:
+            log.info(
+                "collaboration.mention_steer_refused",
+                channel=turn.channel_id,
+                agent=target,
+                reason=exc.message,
+            )
+            return None
+        except Exception:
+            log.warning(
+                "collaboration.mention_steer_failed",
+                channel=turn.channel_id,
+                agent=target,
+                exc_info=True,
+            )
+            return None
+        if outcome is None:
+            return None
+        try:
+            self.collaboration.record_steered_run(turn.id, outcome.run_id, self.clock())
+        except Exception:
+            log.warning("collaboration.steered_run_unrecorded", turn=turn.id, exc_info=True)
+        return (
+            f"Taken as direction for run `{outcome.run_id}`, which I am working on now. "
+            "I will answer it at my next step and say what I changed."
+        )
 
     def service(self) -> ControlService:
         """A service over the loop; one per request, since it collects the

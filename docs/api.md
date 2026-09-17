@@ -954,6 +954,35 @@ answered by `reply{id, ok, result | problem}`) — `item.*`, `run.*`,
 idempotency scope; a stop or restart sent on the socket takes effect after
 its reply frame.
 
+### Steering one task, or one agent
+
+`POST /v1/runs/{id}/steering` takes two optional targets beside `text`.
+
+- `task_id` addresses one task lane. The instruction waits in that task's
+  own mailbox and is answered when *that* task reaches a phase boundary,
+  which is what makes steering meaningful with `[budgets] max_parallel_tasks` above 1: without it the lane that answers is
+  whichever one got to a boundary first. A task that finishes with
+  instructions still waiting hands them to the run, where they are answered
+  as run-level direction rather than dropped.
+- `agent_slug` names an agent on the run's assignment. The answer comes
+  back in that agent's persona and with its model, and the run's
+  `chat.reply` event carries `agent_slug` so a reader can attribute it.
+
+Both are optional and neither is required to exist: an instruction that
+names no target, or a target this run does not have, is answered exactly as
+it always was. A daemon that does not list `collaboration.mention_steering`
+ignores both fields, so sending them is safe against an older server.
+
+In a channel, `collaboration.mention_steering` means a mention of an agent
+already working live work there is taken as direction for that run instead
+of starting a fresh answer: the turn's `steered_run_id` names the run. The
+mention has to be unambiguous -- one live run in the channel with that agent
+on it -- or it stays an ordinary turn. Stopping stays explicit: `/stop`,
+`/cancel`, or exactly `@agent stop` cancels the channel's runs (that agent's
+alone, for the third), through the same cancel the API's
+`POST /v1/runs/{id}/cancel` uses. A message that merely argues for stopping
+is steering, not a stop.
+
 ### Who sees which events
 
 When `/v1/capabilities` lists `events.scoped`, every event is recorded with
