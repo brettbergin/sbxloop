@@ -20,6 +20,7 @@ from sqlalchemy.exc import IntegrityError
 
 from sbxloop.api.agents import AGENTS, ANGIE_SLUG
 from sbxloop.api.auth.store import hash_secret
+from sbxloop.api.channel_access import ChannelAccess, ChannelRole, Need
 
 # The role names belong to this module's membership contract, so they are
 # re-exported explicitly (``X as X``) for strictly type-checked consumers.
@@ -36,6 +37,7 @@ from sbxloop.daemon.store import DaemonStore
 from sbxloop.db.api_models import ApiEventRow, ClientRow, RefreshTokenRow
 from sbxloop.db.collaboration_models import (
     ChannelMemberRow,
+    ChannelParticipantRow,
     ChannelRow,
     LocalUserRow,
     MessageRow,
@@ -137,6 +139,42 @@ class Channel:
     deleted_at: float | None
     visibility: str = "private"
     created_by: str | None = None
+    silenced_until: float | None = None
+    #: The reader's role in the channel, for a read made on someone's behalf.
+    my_role: ChannelRole | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelMember:
+    """A person in a channel."""
+
+    channel_id: str
+    user: LocalUser
+    role: ChannelRole
+    joined_at: float
+    last_read_sequence: int
+    added_by: str | None
+
+
+ParticipantMode = Literal["mention", "ambient"]
+
+
+@dataclass(frozen=True, slots=True)
+class ChannelParticipant:
+    """An agent in a channel."""
+
+    channel_id: str
+    agent_slug: str
+    mode: ParticipantMode
+    added_by: Author
+    muted_until: float | None
+    created_at: float
+
+
+#: Who a store read or write is made for: a workspace member (or their user
+#: id, resolved to the member), or ``None`` for a plain API client or the
+#: daemon itself, which keep full access.
+type Viewer = Member | str | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -266,7 +304,7 @@ def invite_token_hash(raw_token: str) -> str:
     return hashlib.sha256(raw_token.encode("utf-8")).hexdigest()
 
 
-def _channel(row: ChannelRow) -> Channel:
+def _channel(row: ChannelRow, my_role: ChannelRole | None = None) -> Channel:
     return Channel(
         id=str(row.id),
         workspace_id=str(row.workspace_id),
@@ -279,6 +317,8 @@ def _channel(row: ChannelRow) -> Channel:
         deleted_at=None if row.deleted_at is None else float(row.deleted_at),
         visibility=str(row.visibility or "private"),
         created_by=None if row.created_by is None else str(row.created_by),
+        silenced_until=None if row.silenced_until is None else float(row.silenced_until),
+        my_role=my_role,
     )
 
 
@@ -314,6 +354,97 @@ def _author(session: Any, kind: str | None, author_id: str | None) -> Author | N
 def _owner_id(session: Any, channel_id: str) -> str | None:
     channel = session.get(ChannelRow, channel_id)
     return None if channel is None else str(channel.user_id)
+
+
+def _member_in(session: Any, user_id: str) -> Member | None:
+    row = session.execute(
+        select(LocalUserRow, WorkspaceMemberRow)
+        .join(WorkspaceMemberRow, WorkspaceMemberRow.user_id == LocalUserRow.id)
+        .where(WorkspaceMemberRow.workspace_id == WORKSPACE_ID, LocalUserRow.id == user_id)
+    ).first()
+    return None if row is None else _member(row[0], row[1])
+
+
+def _resolve(session: Any, viewer: Viewer) -> Member | None:
+    """The member a viewer stands for. A user id that is no longer an
+    active workspace member sees nothing: it never falls back to ``None``."""
+    if viewer is None or isinstance(viewer, Member):
+        return viewer
+    member = _member_in(session, viewer)
+    if member is None or not member.user.active:
+        raise CollaborationError("channel_not_found", "channel not found")
+    return member
+
+
+def _access(
+    session: Any,
+    channel_id: str,
+    viewer: Viewer,
+    need: Need,
+    *,
+    now: float | None = None,
+    include_deleted: bool = False,
+) -> tuple[ChannelRow, Member | None]:
+    """The channel, once ``viewer`` may ``need`` it; raises otherwise."""
+    row: ChannelRow | None = session.get(ChannelRow, channel_id)
+    if row is None or (not include_deleted and row.state != "active"):
+        raise CollaborationError("channel_not_found", "channel not found")
+    member = _resolve(session, viewer)
+    ChannelAccess.check(session, row, member, need, now=now)
+    return row, member
+
+
+def _my_role(session: Any, channel_id: str, member: Member | None) -> ChannelRole | None:
+    return None if member is None else ChannelAccess.role(session, channel_id, member.user.id)
+
+
+def _other_owner(session: Any, channel_id: str, user_id: str) -> bool:
+    """Whether the channel has an owner besides ``user_id``."""
+    found = session.scalar(
+        select(ChannelMemberRow.user_id)
+        .where(
+            ChannelMemberRow.channel_id == channel_id,
+            ChannelMemberRow.user_id != user_id,
+            ChannelMemberRow.role == "owner",
+        )
+        .limit(1)
+    )
+    return found is not None
+
+
+def _channel_member(row: ChannelMemberRow, user: LocalUserRow) -> ChannelMember:
+    return ChannelMember(
+        channel_id=str(row.channel_id),
+        user=_user(user),
+        role="owner" if row.role == "owner" else "member",
+        joined_at=float(row.joined_at),
+        last_read_sequence=int(row.last_read_sequence or 0),
+        added_by=None if row.added_by is None else str(row.added_by),
+    )
+
+
+def _participant(session: Any, row: ChannelParticipantRow) -> ChannelParticipant:
+    added_by = _author(session, row.added_by_kind, row.added_by_id) or SYSTEM_AUTHOR
+    return ChannelParticipant(
+        channel_id=str(row.channel_id),
+        agent_slug=str(row.agent_slug),
+        mode="ambient" if row.mode == "ambient" else "mention",
+        added_by=added_by,
+        muted_until=None if row.muted_until is None else float(row.muted_until),
+        created_at=float(row.created_at),
+    )
+
+
+def _participant_activity(
+    session: Any, channel_id: str, agent_slug: str | None, status: str, now: float
+) -> None:
+    """An agent started (``thinking``) or stopped (``idle``) answering."""
+    _event(
+        session,
+        "collaboration.participant.activity",
+        now,
+        data={"channel_id": channel_id, "agent_slug": agent_slug or ANGIE_SLUG, "status": status},
+    )
 
 
 def _message(session: Any, row: MessageRow) -> Message:
@@ -1204,57 +1335,294 @@ class CollaborationStore:
             return _channel(row)
 
     def get_channel(
-        self, user_id: str, channel_id: str, *, include_deleted: bool = False
+        self, viewer: Viewer, channel_id: str, *, include_deleted: bool = False
     ) -> Channel | None:
         with self.dstore.read() as session:
-            row = session.get(ChannelRow, channel_id)
-            if row is None or row.user_id != user_id:
+            try:
+                row, member = _access(
+                    session, channel_id, viewer, "read", include_deleted=include_deleted
+                )
+            except CollaborationError:
                 return None
-            if not include_deleted and row.state != "active":
-                return None
-            return _channel(row)
+            return _channel(row, _my_role(session, channel_id, member))
 
-    def list_channels(self, user_id: str, *, limit: int, offset: int) -> tuple[list[Channel], int]:
+    def list_channels(
+        self, viewer: Viewer, *, limit: int, offset: int
+    ) -> tuple[list[Channel], int]:
+        """The active channels ``viewer`` can see: those they belong to and
+        every workspace channel, newest activity first."""
         with self.dstore.read() as session:
-            condition = (ChannelRow.user_id == user_id, ChannelRow.state == "active")
+            try:
+                member = _resolve(session, viewer)
+            except CollaborationError:
+                return [], 0
+            conditions: list[Any] = [ChannelRow.state == "active"]
+            visible = ChannelAccess.visible_condition(member)
+            if visible is not None:
+                conditions.append(visible)
             total = int(
-                session.scalar(select(func.count()).select_from(ChannelRow).where(*condition)) or 0
+                session.scalar(select(func.count()).select_from(ChannelRow).where(*conditions)) or 0
             )
-            rows = session.scalars(
-                select(ChannelRow)
-                .where(*condition)
+            viewer_id = None if member is None else member.user.id
+            rows = session.execute(
+                select(ChannelRow, ChannelMemberRow.role)
+                .outerjoin(
+                    ChannelMemberRow,
+                    (ChannelMemberRow.channel_id == ChannelRow.id)
+                    & (ChannelMemberRow.user_id == viewer_id),
+                )
+                .where(*conditions)
                 .order_by(ChannelRow.updated_at.desc(), ChannelRow.id.desc())
                 .offset(offset)
                 .limit(limit)
-            )
-            return [_channel(row) for row in rows], total
+            ).all()
+            channels = [
+                _channel(row, None if role is None else ("owner" if role == "owner" else "member"))
+                for row, role in rows
+            ]
+            return channels, total
 
     def update_channel(
-        self, user_id: str, channel_id: str, title: str, now: float
+        self,
+        viewer: Viewer,
+        channel_id: str,
+        title: str | None,
+        now: float,
+        *,
+        visibility: str | None = None,
     ) -> Channel | None:
+        """Rename a channel or change who can see it. ``None`` when the
+        viewer cannot see it; ``channel_forbidden`` when they may not manage it."""
+        if visibility is not None and visibility not in {"private", "workspace"}:
+            raise CollaborationError("invalid_visibility", "visibility is private or workspace")
         with self.dstore.transaction() as session:
-            row = session.get(ChannelRow, channel_id)
-            if row is None or row.user_id != user_id or row.state != "active":
-                return None
-            row.title = title.strip()[:200] or row.title
+            try:
+                row, member = _access(session, channel_id, viewer, "manage", now=now)
+            except CollaborationError as exc:
+                if exc.code == "channel_not_found":
+                    return None
+                raise
+            if title is not None:
+                row.title = title.strip()[:200] or row.title
+            if visibility is not None:
+                row.visibility = visibility
             row.updated_at = now
             row.revision += 1
             session.flush()
             _event(session, "collaboration.channel.updated", now, data={"channel_id": channel_id})
-            return _channel(row)
+            return _channel(row, _my_role(session, channel_id, member))
 
-    def delete_channel(self, user_id: str, channel_id: str, now: float) -> bool:
-        """Tombstone a channel so a late agent result cannot recreate it."""
+    def delete_channel(self, viewer: Viewer, channel_id: str, now: float) -> bool:
+        """Tombstone a channel so a late agent result cannot recreate it.
+        ``False`` when the viewer cannot see it; ``channel_forbidden`` when
+        they may not manage it."""
         with self.dstore.transaction() as session:
-            row = session.get(ChannelRow, channel_id)
-            if row is None or row.user_id != user_id or row.state != "active":
-                return False
+            try:
+                row, _ = _access(session, channel_id, viewer, "manage", now=now)
+            except CollaborationError as exc:
+                if exc.code == "channel_not_found":
+                    return False
+                raise
             row.state = "deleted"
             row.deleted_at = now
             row.updated_at = now
             row.revision += 1
             _event(session, "collaboration.channel.deleted", now, data={"channel_id": channel_id})
             return True
+
+    # -- channel members -----------------------------------------------------------
+
+    def list_channel_members(self, viewer: Viewer, channel_id: str) -> list[ChannelMember]:
+        with self.dstore.read() as session:
+            _access(session, channel_id, viewer, "read")
+            rows = session.execute(
+                select(ChannelMemberRow, LocalUserRow)
+                .join(LocalUserRow, LocalUserRow.id == ChannelMemberRow.user_id)
+                .where(ChannelMemberRow.channel_id == channel_id)
+                .order_by(ChannelMemberRow.joined_at, ChannelMemberRow.user_id)
+            ).all()
+            return [_channel_member(row, user) for row, user in rows]
+
+    def add_channel_member(
+        self,
+        viewer: Viewer,
+        channel_id: str,
+        user_id: str,
+        role: ChannelRole,
+        now: float,
+        *,
+        change_role: bool = False,
+    ) -> tuple[ChannelMember, bool]:
+        """Add a workspace member to the channel (manage permission), and
+        whether they were added. With ``change_role``, a current member
+        whose role differs gets ``role`` instead; the last owner cannot step
+        down. Anything else about a current member is
+        ``already_channel_member``."""
+        with self.dstore.transaction() as session:
+            _, member = _access(session, channel_id, viewer, "manage", now=now)
+            target = _member_in(session, user_id)
+            if target is None or not target.user.active:
+                raise CollaborationError("user_not_found", "no such workspace member")
+            existing = session.get(ChannelMemberRow, (channel_id, user_id))
+            if existing is not None:
+                if not change_role or existing.role == role:
+                    raise CollaborationError(
+                        "already_channel_member", "the user is already in this channel"
+                    )
+                if existing.role == "owner" and not _other_owner(session, channel_id, user_id):
+                    raise CollaborationError(
+                        "last_channel_owner",
+                        "make someone else an owner before the last owner steps down",
+                    )
+                existing.role = role
+                session.flush()
+                _event(
+                    session,
+                    "collaboration.member.updated",
+                    now,
+                    data={"channel_id": channel_id, "user_id": user_id},
+                )
+                user = session.get(LocalUserRow, user_id)
+                assert user is not None  # nosec B101 - an active workspace member
+                return _channel_member(existing, user), False
+            ChannelAccess.join(
+                session,
+                channel_id,
+                user_id,
+                None if member is None else member.user.id,
+                now,
+                role=role,
+            )
+            row = session.get(ChannelMemberRow, (channel_id, user_id))
+            user = session.get(LocalUserRow, user_id)
+            assert row is not None and user is not None  # nosec B101 - inserted above
+            return _channel_member(row, user), True
+
+    def remove_channel_member(
+        self, viewer: Viewer, channel_id: str, user_id: str, now: float
+    ) -> None:
+        """Remove someone from a channel. Removing oneself (leaving) needs
+        only to see the channel; removing anyone else needs manage. The last
+        owner cannot go while anyone else remains."""
+        with self.dstore.transaction() as session:
+            _, member = _access(session, channel_id, viewer, "read")
+            if member is not None and member.user.id != user_id:
+                _access(session, channel_id, member, "manage")
+            row = session.get(ChannelMemberRow, (channel_id, user_id))
+            if row is None:
+                raise CollaborationError(
+                    "channel_member_not_found", "the user is not in this channel"
+                )
+            if row.role == "owner":
+                others = list(
+                    session.scalars(
+                        select(ChannelMemberRow.role).where(
+                            ChannelMemberRow.channel_id == channel_id,
+                            ChannelMemberRow.user_id != user_id,
+                        )
+                    )
+                )
+                if others and "owner" not in others:
+                    raise CollaborationError(
+                        "last_channel_owner",
+                        "make someone else an owner before the last owner leaves",
+                    )
+            session.delete(row)
+            _event(
+                session,
+                "collaboration.member.removed",
+                now,
+                data={"channel_id": channel_id, "user_id": user_id},
+            )
+
+    # -- channel participants ------------------------------------------------------
+
+    def list_participants(self, viewer: Viewer, channel_id: str) -> list[ChannelParticipant]:
+        with self.dstore.read() as session:
+            _access(session, channel_id, viewer, "read")
+            rows = session.scalars(
+                select(ChannelParticipantRow)
+                .where(ChannelParticipantRow.channel_id == channel_id)
+                .order_by(ChannelParticipantRow.created_at, ChannelParticipantRow.agent_slug)
+            )
+            return [_participant(session, row) for row in rows]
+
+    def put_participant(
+        self,
+        viewer: Viewer,
+        channel_id: str,
+        agent_slug: str,
+        values: dict[str, Any],
+        now: float,
+    ) -> ChannelParticipant:
+        """Add an agent to the channel or change how it takes part. ``values``
+        holds only the fields the caller set (``mode``, ``muted_until``)."""
+        mode = values.get("mode")
+        if mode is not None and mode not in {"mention", "ambient"}:
+            raise CollaborationError("invalid_participant", "mode is mention or ambient")
+        with self.dstore.transaction() as session:
+            _, member = _access(session, channel_id, viewer, "post", now=now)
+            row = session.get(ChannelParticipantRow, (channel_id, agent_slug))
+            if row is None:
+                row = ChannelParticipantRow(
+                    channel_id=channel_id,
+                    agent_slug=agent_slug,
+                    mode=mode or "mention",
+                    added_by_kind=None if member is None else "human",
+                    added_by_id=None if member is None else member.user.id,
+                    muted_until=values.get("muted_until"),
+                    created_at=now,
+                )
+                session.add(row)
+                change = "added"
+            else:
+                if mode is not None:
+                    row.mode = mode
+                if "muted_until" in values:
+                    row.muted_until = values["muted_until"]
+                change = "updated"
+            session.flush()
+            _event(
+                session,
+                f"collaboration.participant.{change}",
+                now,
+                data={"channel_id": channel_id, "agent_slug": agent_slug},
+            )
+            return _participant(session, row)
+
+    def remove_participant(
+        self, viewer: Viewer, channel_id: str, agent_slug: str, now: float
+    ) -> None:
+        with self.dstore.transaction() as session:
+            _access(session, channel_id, viewer, "post", now=now)
+            row = session.get(ChannelParticipantRow, (channel_id, agent_slug))
+            if row is None:
+                raise CollaborationError(
+                    "participant_not_found", "the agent is not in this channel"
+                )
+            session.delete(row)
+            _event(
+                session,
+                "collaboration.participant.removed",
+                now,
+                data={"channel_id": channel_id, "agent_slug": agent_slug},
+            )
+
+    def thinking_agents(self, channel_id: str) -> set[str]:
+        """The agents answering a running turn in the channel right now."""
+        with self.dstore.read() as session:
+            rows = session.scalars(
+                select(TurnRow.participants_json).where(
+                    TurnRow.channel_id == channel_id,
+                    TurnRow.status.in_(("running", "cancelling")),
+                )
+            )
+            return {
+                str(participant.get("agent_slug") or ANGIE_SLUG)
+                for value in rows
+                for participant in json.loads(value or "[]")
+                if participant.get("status") == "running"
+            }
 
     # -- messages and turns --------------------------------------------------------
 
@@ -1295,11 +1663,12 @@ class CollaborationStore:
         )
 
     def list_messages(
-        self, user_id: str, channel_id: str, *, after: int = 0
+        self, viewer: Viewer, channel_id: str, *, after: int = 0
     ) -> list[Message] | None:
         with self.dstore.read() as session:
-            channel = session.get(ChannelRow, channel_id)
-            if channel is None or channel.user_id != user_id or channel.state != "active":
+            try:
+                _access(session, channel_id, viewer, "read")
+            except CollaborationError:
                 return None
             rows = session.scalars(
                 select(MessageRow)
@@ -1320,16 +1689,17 @@ class CollaborationStore:
         actor: dict[str, Any] | None,
         now: float,
         intent: str = "conversation",
+        participants: tuple[str, ...] = (),
     ) -> tuple[Turn, Message, bool]:
         """Append the user message and accepted turn atomically.
 
         A repeated client turn id returns the original resources. A reused id
         with different text is rejected instead of silently changing meaning.
+        ``participants`` are the agents the message mentions: each one not in
+        the channel yet joins it, answering when mentioned.
         """
         with self.dstore.immediate_transaction() as session:
-            channel = session.get(ChannelRow, channel_id)
-            if channel is None or channel.user_id != user_id or channel.state != "active":
-                raise CollaborationError("channel_not_found", "channel not found")
+            channel, _ = _access(session, channel_id, user_id, "post", now=now)
             if client_turn_id:
                 existing = session.scalars(
                     select(TurnRow).where(
@@ -1396,6 +1766,24 @@ class CollaborationStore:
                     chain_depth=0,
                 )
             )
+            for slug in dict.fromkeys(participants):
+                if session.get(ChannelParticipantRow, (channel_id, slug)) is None:
+                    session.add(
+                        ChannelParticipantRow(
+                            channel_id=channel_id,
+                            agent_slug=slug,
+                            mode="mention",
+                            added_by_kind="human",
+                            added_by_id=user_id,
+                            created_at=now,
+                        )
+                    )
+                    _event(
+                        session,
+                        "collaboration.participant.added",
+                        now,
+                        data={"channel_id": channel_id, "agent_slug": slug},
+                    )
             channel.updated_at = now
             channel.revision += 1
             turn_row = session.get(TurnRow, turn_id)
@@ -1480,9 +1868,12 @@ class CollaborationStore:
             channel.revision += 1
             if participant_index is not None:
                 progress = json.loads(turn.participants_json)
+                was_running = progress[participant_index]["status"] == "running"
                 progress[participant_index]["status"] = "completed"
                 progress[participant_index]["message_id"] = message_id
                 turn.participants_json = json.dumps(progress)
+                if was_running:
+                    _participant_activity(session, turn.channel_id, agent_slug, "idle", now)
             row = session.get(MessageRow, message_id)
             assert row is not None  # nosec B101
             _event(
@@ -1560,7 +1951,7 @@ class CollaborationStore:
 
     def set_message_reaction(
         self,
-        user_id: str,
+        user_id: Viewer,
         channel_id: str,
         message_id: str,
         *,
@@ -1573,15 +1964,14 @@ class CollaborationStore:
         if not emoji or any(character.isspace() for character in emoji):
             raise CollaborationError("invalid_reaction", "Choose one emoji without spaces.")
         with self.dstore.immediate_transaction() as session:
-            channel = session.get(ChannelRow, channel_id)
+            try:
+                _access(session, channel_id, user_id, "post", now=now)
+            except CollaborationError as exc:
+                if exc.code == "channel_not_found":
+                    return None
+                raise
             row = session.get(MessageRow, message_id)
-            if (
-                channel is None
-                or channel.user_id != user_id
-                or channel.state != "active"
-                or row is None
-                or row.channel_id != channel_id
-            ):
+            if row is None or row.channel_id != channel_id:
                 return None
             reactions = [str(value) for value in json.loads(row.reactions_json or "[]")]
             changed = False
@@ -1622,6 +2012,10 @@ class CollaborationStore:
                 error = "Stopped remaining responses. Work already started may still have effects."
             progress = json.loads(row.participants_json)
             for participant in progress:
+                if participant["status"] == "running":
+                    _participant_activity(
+                        session, row.channel_id, participant["agent_slug"], "idle", now
+                    )
                 if participant["status"] in {"queued", "running"}:
                     participant["status"] = (
                         "cancelled" if cancelled else ("failed" if error else "completed")
@@ -1717,8 +2111,12 @@ class CollaborationStore:
                     interrupted.append((row.id, expected <= replies))
                     continue
                 channel = session.get(ChannelRow, row.channel_id)
-                user = session.get(LocalUserRow, channel.user_id) if channel else None
+                author_id = row.author_id if row.author_kind == "human" else None
+                user_id = author_id or (channel.user_id if channel else None)
+                user = session.get(LocalUserRow, user_id) if user_id else None
                 message = session.get(MessageRow, row.input_message_id)
+                if user is not None and not self._may_read(session, row.channel_id, user.id):
+                    user = None
                 if channel and channel.state == "active" and user and user.active and message:
                     queued.append(
                         (message.sequence, _turn(session, row), _user(user), message.content)
@@ -1739,6 +2137,14 @@ class CollaborationStore:
         # Sequence is authoritative inside each channel even when timestamps tie.
         queued.sort(key=lambda item: (item[1].channel_id, item[0]))
         return [(turn, user, content) for _, turn, user, content in queued]
+
+    @staticmethod
+    def _may_read(session: Any, channel_id: str, user_id: str) -> bool:
+        try:
+            _access(session, channel_id, user_id, "read")
+        except CollaborationError:
+            return False
+        return True
 
     def turn_history(self, turn: Turn, *, max_chars: int = 60_000) -> str:
         """Prior turns and completed peers in this turn, without future input."""
@@ -1798,25 +2204,22 @@ class CollaborationStore:
                 return None
             return _message(session, row)
 
-    def get_turn(self, user_id: str, channel_id: str, turn_id: str) -> Turn | None:
+    def get_turn(self, viewer: Viewer, channel_id: str, turn_id: str) -> Turn | None:
         with self.dstore.read() as session:
-            channel = session.get(ChannelRow, channel_id)
+            try:
+                _access(session, channel_id, viewer, "read")
+            except CollaborationError:
+                return None
             row = session.get(TurnRow, turn_id)
-            if (
-                channel is None
-                or channel.user_id != user_id
-                or channel.state != "active"
-                or row is None
-                or row.channel_id != channel_id
-            ):
+            if row is None or row.channel_id != channel_id:
                 return None
             return _turn(session, row)
 
-    def list_turns(self, user_id: str, channel_id: str, *, active_only: bool = False) -> list[Turn]:
+    def list_turns(
+        self, viewer: Viewer, channel_id: str, *, active_only: bool = False
+    ) -> list[Turn]:
         with self.dstore.read() as session:
-            channel = session.get(ChannelRow, channel_id)
-            if channel is None or channel.user_id != user_id or channel.state != "active":
-                raise CollaborationError("channel_not_found", "channel not found")
+            _access(session, channel_id, viewer, "read")
             statement = (
                 select(TurnRow)
                 .join(MessageRow, MessageRow.id == TurnRow.input_message_id)
@@ -1849,6 +2252,9 @@ class CollaborationStore:
                 ]
             progress[index]["status"] = "running"
             row.participants_json = json.dumps(progress)
+            _participant_activity(
+                session, row.channel_id, progress[index]["agent_slug"], "thinking", now
+            )
             _event(
                 session,
                 "collaboration.participant.running",
@@ -1920,28 +2326,37 @@ class CollaborationStore:
                 },
             )
 
-    def participant_failed(self, turn_id: str, index: int, error: str) -> None:
+    def participant_failed(self, turn_id: str, index: int, error: str, now: float) -> None:
+        """``now`` stamps the agent's ``idle`` activity, so it never predates
+        the ``thinking`` the same participant recorded when it started."""
         with self.dstore.immediate_transaction() as session:
             row = session.get(TurnRow, turn_id)
             if row is None or row.status not in {"running", "cancelling"}:
                 return
             progress = json.loads(row.participants_json)
+            if progress[index]["status"] == "running":
+                _participant_activity(
+                    session, row.channel_id, progress[index]["agent_slug"], "idle", now
+                )
             progress[index].update(status="failed", error=error)
             row.participants_json = json.dumps(progress)
 
-    def cancel_turn(self, user_id: str, channel_id: str, turn_id: str, now: float) -> Turn | None:
+    def cancel_turn(self, viewer: Viewer, channel_id: str, turn_id: str, now: float) -> Turn | None:
+        """Stop a turn. The person who asked, or someone who manages the
+        channel, may stop it; ``None`` when either cannot be seen."""
         settle = False
         with self.dstore.immediate_transaction() as session:
-            channel = session.get(ChannelRow, channel_id)
-            row = session.get(TurnRow, turn_id)
-            if (
-                channel is None
-                or channel.user_id != user_id
-                or channel.state != "active"
-                or row is None
-                or row.channel_id != channel_id
-            ):
+            try:
+                _, member = _access(session, channel_id, viewer, "read")
+            except CollaborationError:
                 return None
+            row = session.get(TurnRow, turn_id)
+            if row is None or row.channel_id != channel_id:
+                return None
+            if member is not None and not (
+                row.author_kind in {"human", None} and row.author_id == member.user.id
+            ):
+                _access(session, channel_id, member, "manage")
             if row.status not in {"accepted", "running"}:
                 return _turn(session, row)
             settle = row.status == "accepted"
@@ -1962,7 +2377,7 @@ class CollaborationStore:
 
     def queue_handoff(
         self,
-        user_id: str,
+        user_id: Viewer,
         channel_id: str,
         turn_id: str,
         source_index: int,
@@ -1989,16 +2404,14 @@ class CollaborationStore:
         message = message.strip()
         key = hashlib.sha256(json.dumps([source_index, agent_slug, message]).encode()).hexdigest()
         with self.dstore.immediate_transaction() as session:
-            channel = session.get(ChannelRow, channel_id)
+            try:
+                channel, _ = _access(session, channel_id, user_id, "post", now=now)
+            except CollaborationError as exc:
+                raise CollaborationError(
+                    "handoff_stopped", "This chat turn is no longer running."
+                ) from exc
             turn = session.get(TurnRow, turn_id)
-            if (
-                channel is None
-                or channel.user_id != user_id
-                or channel.state != "active"
-                or turn is None
-                or turn.channel_id != channel_id
-                or turn.status != "running"
-            ):
+            if turn is None or turn.channel_id != channel_id or turn.status != "running":
                 raise CollaborationError("handoff_stopped", "This chat turn is no longer running.")
             progress = json.loads(turn.participants_json)
             if not 0 <= source_index < len(progress):

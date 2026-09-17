@@ -969,6 +969,126 @@
         "title": "ChannelCreate",
         "type": "object"
       },
+      "ChannelMemberCreate": {
+        "additionalProperties": false,
+        "properties": {
+          "role": {
+            "default": "member",
+            "enum": [
+              "owner",
+              "member"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "user_id": {
+            "maxLength": 128,
+            "minLength": 1,
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id"
+        ],
+        "title": "ChannelMemberCreate",
+        "type": "object"
+      },
+      "ChannelMemberOut": {
+        "additionalProperties": false,
+        "properties": {
+          "joined_at": {
+            "title": "Joined At",
+            "type": "string"
+          },
+          "last_read_sequence": {
+            "default": 0,
+            "title": "Last Read Sequence",
+            "type": "integer"
+          },
+          "role": {
+            "enum": [
+              "owner",
+              "member"
+            ],
+            "title": "Role",
+            "type": "string"
+          },
+          "user": {
+            "$ref": "#/components/schemas/ChannelMemberUserOut"
+          },
+          "user_id": {
+            "title": "User Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "user_id",
+          "role",
+          "joined_at",
+          "user"
+        ],
+        "title": "ChannelMemberOut",
+        "type": "object"
+      },
+      "ChannelMemberPage": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ChannelMemberOut"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ChannelMemberPage",
+        "type": "object"
+      },
+      "ChannelMemberUserOut": {
+        "additionalProperties": false,
+        "properties": {
+          "avatar_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Avatar Url"
+          },
+          "full_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Full Name"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "username": {
+            "title": "Username",
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "username"
+        ],
+        "title": "ChannelMemberUserOut",
+        "type": "object"
+      },
       "ChannelOut": {
         "additionalProperties": false,
         "properties": {
@@ -976,13 +1096,50 @@
             "title": "Created At",
             "type": "string"
           },
+          "created_by": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Created By"
+          },
           "id": {
             "title": "Id",
             "type": "string"
           },
+          "my_role": {
+            "anyOf": [
+              {
+                "enum": [
+                  "owner",
+                  "member"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "My Role"
+          },
           "revision": {
             "title": "Revision",
             "type": "integer"
+          },
+          "silenced_until": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Silenced Until"
           },
           "state": {
             "title": "State",
@@ -994,6 +1151,15 @@
           },
           "updated_at": {
             "title": "Updated At",
+            "type": "string"
+          },
+          "visibility": {
+            "default": "private",
+            "enum": [
+              "private",
+              "workspace"
+            ],
+            "title": "Visibility",
             "type": "string"
           },
           "workspace_id": {
@@ -1040,19 +1206,155 @@
         "title": "ChannelPage",
         "type": "object"
       },
-      "ChannelUpdate": {
+      "ChannelParticipantOut": {
         "additionalProperties": false,
+        "description": "An agent in a channel. ``status`` is ``thinking`` while it answers a\nrunning turn here, ``working`` while a live run in this channel is\ncredited to it, and ``idle`` otherwise; ``activity`` names that run.",
         "properties": {
-          "title": {
-            "maxLength": 200,
-            "minLength": 1,
-            "title": "Title",
+          "activity": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Activity"
+          },
+          "added_by": {
+            "$ref": "#/components/schemas/AuthorOut"
+          },
+          "agent_slug": {
+            "title": "Agent Slug",
+            "type": "string"
+          },
+          "created_at": {
+            "title": "Created At",
+            "type": "string"
+          },
+          "mode": {
+            "enum": [
+              "mention",
+              "ambient"
+            ],
+            "title": "Mode",
+            "type": "string"
+          },
+          "muted_until": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Muted Until"
+          },
+          "status": {
+            "default": "idle",
+            "enum": [
+              "idle",
+              "thinking",
+              "working"
+            ],
+            "title": "Status",
             "type": "string"
           }
         },
         "required": [
-          "title"
+          "agent_slug",
+          "mode",
+          "added_by",
+          "created_at"
         ],
+        "title": "ChannelParticipantOut",
+        "type": "object"
+      },
+      "ChannelParticipantPage": {
+        "additionalProperties": false,
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ChannelParticipantOut"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ChannelParticipantPage",
+        "type": "object"
+      },
+      "ChannelParticipantUpdate": {
+        "additionalProperties": false,
+        "description": "Only the fields sent change; a new participant answers when mentioned.",
+        "properties": {
+          "mode": {
+            "anyOf": [
+              {
+                "enum": [
+                  "mention",
+                  "ambient"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mode"
+          },
+          "muted_until": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Muted Until"
+          }
+        },
+        "title": "ChannelParticipantUpdate",
+        "type": "object"
+      },
+      "ChannelUpdate": {
+        "additionalProperties": false,
+        "description": "Only the fields sent change. Changing either one takes managing the\nchannel: its owner, or a workspace owner or admin.",
+        "properties": {
+          "title": {
+            "anyOf": [
+              {
+                "maxLength": 200,
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          },
+          "visibility": {
+            "anyOf": [
+              {
+                "enum": [
+                  "private",
+                  "workspace"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Visibility"
+          }
+        },
         "title": "ChannelUpdate",
         "type": "object"
       },
@@ -7969,6 +8271,154 @@
         ]
       }
     },
+    "/v1/channels/{channel_id}/members": {
+      "get": {
+        "operationId": "list_channel_members_v1_channels__channel_id__members_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelMemberPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Channel Members",
+        "tags": [
+          "collaboration"
+        ]
+      },
+      "post": {
+        "description": "Add a workspace member to the channel (201); takes managing the\nchannel. An explicit ``role`` for a current member with another role\nchanges it in place (200).",
+        "operationId": "add_channel_member_v1_channels__channel_id__members_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelMemberCreate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelMemberOut"
+                }
+              }
+            },
+            "description": "A current member's role changed"
+          },
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelMemberOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Add Channel Member",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/members/{user_id}": {
+      "delete": {
+        "description": "Remove someone from the channel (managing it), or leave it (one's own\nid). The last owner cannot leave while anyone else remains.",
+        "operationId": "remove_channel_member_v1_channels__channel_id__members__user_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "user_id",
+            "required": true,
+            "schema": {
+              "title": "User Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Channel Member",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
     "/v1/channels/{channel_id}/messages": {
       "get": {
         "operationId": "list_messages_v1_channels__channel_id__messages_get",
@@ -8082,6 +8532,152 @@
           }
         },
         "summary": "Set Message Reaction",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/participants": {
+      "get": {
+        "operationId": "list_channel_participants_v1_channels__channel_id__participants_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelParticipantPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Channel Participants",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/participants/{slug}": {
+      "delete": {
+        "operationId": "remove_channel_participant_v1_channels__channel_id__participants__slug__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Remove Channel Participant",
+        "tags": [
+          "collaboration"
+        ]
+      },
+      "put": {
+        "description": "Add an agent to the channel, or change how it takes part.",
+        "operationId": "put_channel_participant_v1_channels__channel_id__participants__slug__put",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "slug",
+            "required": true,
+            "schema": {
+              "title": "Slug",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ChannelParticipantUpdate"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelParticipantOut"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Put Channel Participant",
         "tags": [
           "collaboration"
         ]

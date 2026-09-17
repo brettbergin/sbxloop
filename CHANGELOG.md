@@ -56,6 +56,26 @@
   follows; no route reads them yet, and a single-user installation behaves as
   before.
 
+- **Channels can be shared with the workspace.** A channel is private to its
+  members or visible to the whole workspace, and every channel route now
+  decides access by those rules instead of by the channel's creator alone: a
+  private channel does not exist for anyone outside it (404), any workspace
+  member may read and post to a workspace channel (posting joins it), and
+  renaming, changing visibility, deleting or managing members takes the
+  channel's owner or a workspace admin (otherwise 403 `channel_forbidden`).
+  Channels report `visibility`, `created_by`, `silenced_until` and the
+  caller's `my_role`, and `PATCH /v1/channels/{id}` accepts `visibility`.
+  New routes list, add and remove channel members; adding a current member
+  with an explicit, different role changes that role in place (200), so an
+  owner can hand over ownership (the last owner cannot leave while others
+  remain, nor step down); and list, add, update and remove the agents
+  taking part; mentioning an agent adds it. Participants report whether they
+  are idle, thinking or working, and member, participant and activity
+  changes are recorded as events; an agent that cannot answer goes idle at
+  the moment it stops, never at the time the turn began. Advertised as
+  `collaboration.channel_members` and `collaboration.participants`. A
+  single-user installation behaves as before.
+
 - **Every chat message says who wrote it.** Messages carry an optional
   `author` (`human`, `agent` or `system`, with an id and a display name) and
   turns an `author_id`, `trigger` and `parent_turn_id`, advertised as the

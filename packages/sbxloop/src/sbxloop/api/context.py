@@ -343,7 +343,9 @@ class ApiContext:
         author = user.full_name or user.username
         index = 0
         while True:
-            current = store.get_turn(user.id, turn.channel_id, turn.id)
+            # The daemon reads its own accepted turn: whoever asked may have
+            # left the channel since, and the turn still has to settle.
+            current = store.get_turn(None, turn.channel_id, turn.id)
             if self.stopping.is_set() or current is None:
                 return
             participants = current.participants or tuple(
@@ -364,7 +366,7 @@ class ApiContext:
                 # Archived or disabled after the turn was accepted: it no
                 # longer answers in its own persona or with action rights.
                 errors.append(f"@{target} is no longer available")
-                store.participant_failed(turn.id, index, errors[-1])
+                store.participant_failed(turn.id, index, errors[-1], self.clock())
                 self.hub.notify()
                 index += 1
                 continue
@@ -474,7 +476,7 @@ class ApiContext:
             except Exception:
                 errors.append(f"@{target or 'angie'} could not finish. Check the daemon logs.")
             if len(errors) > previous_errors:
-                store.participant_failed(turn.id, index, errors[-1])
+                store.participant_failed(turn.id, index, errors[-1], self.clock())
             self.hub.notify()
             index += 1
         store.finish_turn(

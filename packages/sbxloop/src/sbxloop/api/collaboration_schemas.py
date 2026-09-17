@@ -335,8 +335,16 @@ class ChannelCreate(ApiModel):
     title: str | None = Field(default=None, max_length=200)
 
 
+ChannelVisibility = Literal["private", "workspace"]
+ChannelRoleName = Literal["owner", "member"]
+
+
 class ChannelUpdate(ApiModel):
-    title: str = Field(min_length=1, max_length=200)
+    """Only the fields sent change. Changing either one takes managing the
+    channel: its owner, or a workspace owner or admin."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    visibility: ChannelVisibility | None = None
 
 
 class ChannelOut(ApiModel):
@@ -347,12 +355,45 @@ class ChannelOut(ApiModel):
     revision: int
     created_at: str
     updated_at: str
+    #: ``private``: channel members only; ``workspace``: every workspace member.
+    visibility: ChannelVisibility = "private"
+    created_by: str | None = None
+    silenced_until: float | None = None
+    #: The caller's role in the channel; ``null`` when not a member.
+    my_role: ChannelRoleName | None = None
 
 
 class ChannelPage(ApiModel):
     items: list[ChannelOut]
     total: int
     has_more: bool
+
+
+class ChannelMemberUserOut(ApiModel):
+    id: str
+    username: str
+    full_name: str | None = None
+    avatar_url: str | None = None
+
+
+class ChannelMemberOut(ApiModel):
+    user_id: str
+    role: ChannelRoleName
+    joined_at: str
+    last_read_sequence: int = 0
+    user: ChannelMemberUserOut
+
+
+class ChannelMemberPage(ApiModel):
+    data: list[ChannelMemberOut]
+
+
+class ChannelMemberCreate(ApiModel):
+    user_id: str = Field(min_length=1, max_length=128)
+    role: ChannelRoleName = "member"
+
+
+ParticipantModeName = Literal["mention", "ambient"]
 
 
 class ArtifactRefOut(ApiModel):
@@ -428,6 +469,31 @@ class ParticipantOut(ApiModel):
     parent_index: int | None = None
     request: str | None = None
     read_only: bool = False
+
+
+class ChannelParticipantOut(ApiModel):
+    """An agent in a channel. ``status`` is ``thinking`` while it answers a
+    running turn here, ``working`` while a live run in this channel is
+    credited to it, and ``idle`` otherwise; ``activity`` names that run."""
+
+    agent_slug: str
+    mode: ParticipantModeName
+    added_by: AuthorOut
+    muted_until: float | None = None
+    created_at: str
+    status: Literal["idle", "thinking", "working"] = "idle"
+    activity: str | None = None
+
+
+class ChannelParticipantPage(ApiModel):
+    data: list[ChannelParticipantOut]
+
+
+class ChannelParticipantUpdate(ApiModel):
+    """Only the fields sent change; a new participant answers when mentioned."""
+
+    mode: ParticipantModeName | None = None
+    muted_until: float | None = None
 
 
 class TurnOut(ApiModel):
