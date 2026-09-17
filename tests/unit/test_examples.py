@@ -736,3 +736,16 @@ def test_example_memory_section_documents_the_defaults() -> None:
         "prompt_budget_chars",
     }
     assert Config.model_validate({"memory": block}).memory == Config().memory
+
+
+def test_example_documents_the_daily_token_budget_as_an_opt_in() -> None:
+    """`[daemon] daily_token_budget` is shown commented (the model ships it
+    unset, so no budget applies until an operator picks one), and the value
+    it suggests loads."""
+    text = EXAMPLE.read_text()
+    daemon = text[text.index("# [daemon]") :]
+    match = re.search(r"^# daily_token_budget = (\d+)", daemon, re.MULTILINE)
+    assert match is not None, "[daemon] daily_token_budget is not in the example"
+    assert Config().daemon.daily_token_budget is None
+    loaded = Config.model_validate({"daemon": {"daily_token_budget": int(match.group(1))}})
+    assert loaded.daemon.daily_token_budget == int(match.group(1))

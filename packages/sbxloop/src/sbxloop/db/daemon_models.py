@@ -1,4 +1,4 @@
-"""The daemon's fifteen tables: the queue, the ledger, and what it is holding.
+"""The daemon's tables: the queue, the ledger, what it is holding, and what it spent.
 
 The same rules as :mod:`sbxloop.db.engine_models` apply — this describes the
 schema that is on disk rather than the one anyone would design now, because
@@ -430,6 +430,40 @@ class ScheduleRowModel(Base):
     source: Mapped[str | None] = mapped_column(Text)
     created_by: Mapped[str | None] = mapped_column(Text)
     created_at: Mapped[float | None] = mapped_column(REAL)
+
+
+class WorkspaceUsageRow(Base):
+    """One usage sample charged to the workspace budget pool: a run's
+    ``agent.usage`` event or a chat turn's reported usage.
+
+    Append-only. ``ts`` is when the charge landed, which is the day it
+    counts toward; ``source`` is ``run`` or ``turn`` and ``ref_id`` the run
+    id or the turn's message id. Token columns hold what the backend
+    reported, zero for a figure it did not report.
+    """
+
+    __tablename__ = "workspace_usage"
+    __table_args__ = (
+        Index("idx_workspace_usage_ts", "ts"),
+        {"sqlite_autoincrement": True},
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ts: Mapped[float] = mapped_column(REAL, nullable=False)
+    source: Mapped[str] = mapped_column(Text, nullable=False)
+    ref_id: Mapped[str] = mapped_column(Text, nullable=False)
+    agent_slug: Mapped[str | None] = mapped_column(Text)
+    channel_id: Mapped[str | None] = mapped_column(Text)
+    input_tokens: Mapped[int] = mapped_column(Integer, nullable=False, server_default=sql_text("0"))
+    output_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sql_text("0")
+    )
+    cache_read_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sql_text("0")
+    )
+    cache_write_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, server_default=sql_text("0")
+    )
 
 
 # The revision triggers ride with the tables they bump, so a database built

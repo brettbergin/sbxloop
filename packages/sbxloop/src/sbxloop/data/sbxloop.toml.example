@@ -774,6 +774,7 @@ service_memory = "2g"
 # max_runs_per_day = 12           # calendar-day cap, persisted across restarts
 # max_concurrent_runs = 1         # runs executing at once (1-4); two code runs never share a repo
 # run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)
+# daily_token_budget = 2000000   # input+output tokens per day across runs and chat turns; unset: no budget
 # max_attempts_per_item = 2
 # max_resumes_per_item = 2         # interrupted runs resumed at most this often per item
 # claim_stale_after_s = 300        # a claim comment older than this with no run started is reclaimed

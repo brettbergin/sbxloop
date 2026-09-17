@@ -27,7 +27,7 @@ from sbxloop.agents.registry import (
     addressable,
     default_registry,
 )
-from sbxloop.api.agents import ANGIE_PERSONA, AgentDefinition
+from sbxloop.api.agents import ANGIE_PERSONA, ANGIE_SLUG, AgentDefinition
 from sbxloop.api.artifacts import ArtifactCatalog
 from sbxloop.api.auth.keys import SigningKeys
 from sbxloop.api.auth.ratelimit import FailureLimiter
@@ -434,6 +434,8 @@ class ApiContext:
                     on_code_work=code_work,
                     model=model,
                     handoff_agents=handoff_agents if allow_actions else None,
+                    channel_id=turn.channel_id,
+                    agent_slug=target or ANGIE_SLUG,
                 )
                 reply = future.result()
                 if reply.ok and (reply.text or reply.work_products):

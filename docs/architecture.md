@@ -1618,7 +1618,8 @@ key/value state, run watches, requesters, prior attempts, chat threads,
 merge gates and their prompts, review holds, pending clarifications, the
 operator console's mailbox, the schedules and the pause holds) plus the six
 `api_*` tables behind the remote API (operations, the public chronology,
-clients, refresh tokens, revoked tokens, public ids).
+clients, refresh tokens, revoked tokens, public ids), and `workspace_usage`,
+the budget pool's ledger of what runs and chat turns spent.
 
 Both are SQLAlchemy models under `sbxloop/db/` (#539), and Alembic owns the
 upgrade path — one revision chain for the whole file, applied when a store

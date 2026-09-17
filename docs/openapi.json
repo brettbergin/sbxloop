@@ -5935,6 +5935,67 @@
         "title": "UsageAgent",
         "type": "object"
       },
+      "UsagePool": {
+        "additionalProperties": false,
+        "description": "Today's workspace budget pool: runs against the daily cap and\nreported tokens (input plus output) against the daily budget, for the\ncalendar day in ``[daemon] run_cap_timezone``.",
+        "properties": {
+          "daily_token_budget": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Daily Token Budget"
+          },
+          "day_start": {
+            "title": "Day Start",
+            "type": "string"
+          },
+          "max_runs_per_day": {
+            "title": "Max Runs Per Day",
+            "type": "integer"
+          },
+          "resets_at": {
+            "title": "Resets At",
+            "type": "string"
+          },
+          "runs_today": {
+            "title": "Runs Today",
+            "type": "integer"
+          },
+          "runs_tokens_today": {
+            "title": "Runs Tokens Today",
+            "type": "integer"
+          },
+          "tokens_today": {
+            "title": "Tokens Today",
+            "type": "integer"
+          },
+          "turns_tokens_today": {
+            "title": "Turns Tokens Today",
+            "type": "integer"
+          },
+          "workspace_id": {
+            "default": "local",
+            "title": "Workspace Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "day_start",
+          "resets_at",
+          "runs_today",
+          "max_runs_per_day",
+          "tokens_today",
+          "runs_tokens_today",
+          "turns_tokens_today"
+        ],
+        "title": "UsagePool",
+        "type": "object"
+      },
       "UsageTotals": {
         "additionalProperties": false,
         "properties": {
@@ -10811,6 +10872,28 @@
           }
         },
         "summary": "Get Usage",
+        "tags": [
+          "usage"
+        ]
+      }
+    },
+    "/v1/usage/pool": {
+      "get": {
+        "description": "Today's workspace budget pool: runs against `[daemon]\nmax_runs_per_day` and reported input plus output tokens, from runs and\nchat turns, against `[daemon] daily_token_budget`.",
+        "operationId": "get_usage_pool_v1_usage_pool_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UsagePool"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Usage Pool",
         "tags": [
           "usage"
         ]

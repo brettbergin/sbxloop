@@ -4,9 +4,10 @@ kept unknown, and never a currency."""
 from __future__ import annotations
 
 import time
+from pathlib import Path
 
-from sbxloop_worker.protocol import Event
-from tests.api.conftest import Api
+from sbxloop_worker.protocol import Event, Usage
+from tests.api.conftest import Api, build
 from tests.unit.test_daemon_loop import gh_item
 
 
@@ -140,3 +141,42 @@ class TestWindow:
             "/v1/usage", params={"since": 0, "until": 91 * 86400}, headers=headers
         )
         assert wide.status_code == 422 and "90 days" in wide.json()["detail"]
+
+
+class TestPool:
+    def test_the_pool_reports_todays_runs_and_tokens(self, tmp_path: Path) -> None:
+        built = build(tmp_path, config={"daemon": {"daily_token_budget": 5000}})
+        with built.client:
+            run_id = _finish(built)
+            pool = built.loop.usage_pool
+            pool.charge(
+                source="run",
+                ref_id=run_id,
+                agent_slug=None,
+                channel_id=None,
+                usage=Usage(input_tokens=100, output_tokens=20, cache_read_tokens=9),
+            )
+            pool.charge(
+                source="turn",
+                ref_id="turn-1",
+                agent_slug="planner",
+                channel_id="ch-1",
+                usage=Usage(input_tokens=7, output_tokens=3),
+            )
+            body = built.client.get("/v1/usage/pool", headers=built.bearer()).json()
+            assert body["runs_today"] == 1
+            assert body["max_runs_per_day"] == 12
+            assert body["daily_token_budget"] == 5000
+            assert body["runs_tokens_today"] == 120
+            assert body["turns_tokens_today"] == 10
+            assert body["tokens_today"] == 130
+            assert body["day_start"].endswith("Z")
+        built.ctx.close()
+
+    def test_no_budget_reads_null(self, api: Api) -> None:
+        body = api.client.get("/v1/usage/pool", headers=api.bearer()).json()
+        assert body["daily_token_budget"] is None and body["tokens_today"] == 0
+
+    def test_the_pool_needs_runs_read(self, api: Api) -> None:
+        headers = api.bearer(frozenset({"collaboration:read"}))
+        assert api.client.get("/v1/usage/pool", headers=headers).status_code == 403

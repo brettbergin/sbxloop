@@ -72,6 +72,7 @@ from sbxloop.daemon.usage import (
     usage_row,
     usage_rows,
 )
+from sbxloop.daemon.usagepool import UsagePool
 from sbxloop.daemon.versions import VersionProbe
 from sbxloop.engine.harness import ROLE_BY_PHASE, Role, harness_context
 from sbxloop.engine.model import TERMINAL_RUN_STATES, RunState
@@ -203,6 +204,10 @@ class TurnContext:
     model_override: str | None = None
     tool_activity: Callable[[str, str, bool | None], None] | None = None
     code_work: Callable[[str, int, str], None] | None = None
+    #: Where the turn's reported usage is charged in the workspace budget
+    #: pool: the product channel it answers and the agent that speaks.
+    usage_channel_id: str | None = None
+    usage_agent_slug: str | None = None
     work_products: list[str] = field(default_factory=list)
     #: Effects the turn's tools promised for after the reply (#969).
     after: list[Callable[[], None]] = field(default_factory=list)
@@ -367,6 +372,9 @@ class Concierge:
         self._store_factory = store_factory
         self._store: StateStore | None = None
         self.github = github if config.concierge.github_tools else None
+        # The workspace budget pool chat turns are charged to; it keeps its
+        # state in the store, so it agrees with the loop's.
+        self.usage_pool = UsagePool(dstore, lambda: self.config, clock)
 
         self.host = host
         self.bus = bus
@@ -535,6 +543,8 @@ class Concierge:
         on_code_work: Callable[[str, int, str], None] | None = None,
         model: str | None = None,
         handoff_agents: Sequence[str] | None = None,
+        channel_id: str | None = None,
+        agent_slug: str | None = None,
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
@@ -544,7 +554,10 @@ class Concierge:
         workload this turn starts (#760) so asking twice queues once.
         ``model`` is the model the answering agent names for itself, used
         instead of the role's configured one; ``handoff_agents`` is who
-        ``handoff_agent`` may address (the built-ins when omitted)."""
+        ``handoff_agent`` may address (the built-ins when omitted).
+        ``channel_id`` and ``agent_slug`` are where the turn's reported
+        usage is charged in the workspace budget pool: the product channel
+        it answers and the agent that speaks (the role when unset)."""
         if agent_role not in {*ROLE_BY_PHASE.values(), "concierge"}:
             raise ValueError("unknown chat agent role")
         with self._state_lock:
@@ -572,6 +585,8 @@ class Concierge:
                 model_override=model,
                 tool_activity=on_tool_activity,
                 code_work=on_code_work,
+                usage_channel_id=channel_id,
+                usage_agent_slug=agent_slug or agent_role,
             )
             token = _CURRENT_TURN.set(context)
             try:
@@ -841,6 +856,7 @@ class Concierge:
             agent_phase="concierge",
             model_source=self._turn_model.source,
         )
+        self._charge_turn(job.job_id, result.usage)
         if result.status != "ok":
             if result.error is not None and result.error.provider is not None:
                 raise ProviderHeldError(ProviderHold(result.error.provider, None, 0))
@@ -870,6 +886,22 @@ class Concierge:
         if recovery.checkpoint(CONCIERGE_RUN_ID, key) is None:
             return job
         return legacy
+
+    def _charge_turn(self, job_id: str, usage: Usage | None) -> None:
+        """Charge what the turn's job reported to the workspace budget pool,
+        whether or not the job succeeded: the tokens were spent either way.
+        Accounting never fails a turn."""
+        turn = self._turn
+        try:
+            self.usage_pool.charge(
+                source="turn",
+                ref_id=turn.message_id or job_id,
+                agent_slug=turn.usage_agent_slug,
+                channel_id=turn.usage_channel_id,
+                usage=usage,
+            )
+        except Exception:
+            log.warning("concierge.usage_charge_failed", exc_info=True)
 
     def _error_reply(self, exc: BaseException, started: float) -> ConciergeReply:
         if isinstance(exc, WorkerTimeoutError) or "timed out" in str(exc).lower():

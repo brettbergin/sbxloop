@@ -65,6 +65,7 @@ from sbxloop.daemon.model import (
 from sbxloop.daemon.schedule import Cadence, ScheduleRow, format_due
 from sbxloop.daemon.sources import HIDDEN_MARKER_RE, IssueContext, WorkSource
 from sbxloop.daemon.store import DaemonStore, MergeGate, ReviewHold
+from sbxloop.daemon.usagepool import UsagePool, fairness_key
 from sbxloop.engine.checks import check_policy_reader
 from sbxloop.engine.engine import LoopEngine
 from sbxloop.engine.followups import FollowupFiler, recorded_review_rounds
@@ -418,6 +419,11 @@ class DaemonLoop:
         # The import is reached from the loop thread (a tick) and from a
         # concierge command alike; one of them does it.
         self._schedules_lock = threading.Lock()
+        # The workspace budget pool: the daily run cap and token budget
+        # every dispatch is admitted against, and what runs spend.
+        self.usage_pool = UsagePool(dstore, lambda: self.config, clock)
+        # `daemon_state` key: the day start the budget notice last went out for.
+        self._budget_notice_key = "usage_pool_budget_notice_day"
 
     # -- external control ---------------------------------------------------------
 
@@ -1585,7 +1591,12 @@ class DaemonLoop:
                     waits[candidate.item_id] = repo
                 return repo is not None
 
-            item = self.dstore.next_queued(now, self.config.daemon.retry_backoff_s, skip=blocked)
+            item = self.dstore.next_queued(
+                now,
+                self.config.daemon.retry_backoff_s,
+                skip=blocked,
+                busy=self._fairness_busy(),
+            )
             if item is None:
                 if launched:
                     break
@@ -1634,10 +1645,15 @@ class DaemonLoop:
                 idle_kind="breaker",
                 idle_detail=f"half-open; probe run {self._breaker_probe} in flight",
             )
+        admission = self.usage_pool.admit_run(None, now)
+        if admission.ok:
+            return None
+        if admission.reason == "token_budget":
+            if first:
+                self._announce_budget(now)
+            return TickResult(idle_kind="budget")
         day_start, day_end = day_window(now, self.config.daemon.run_cap_timezone)
         started_today = self.dstore.runs_started_since(day_start)
-        if started_today < self.config.daemon.max_runs_per_day:
-            return None
         if not first:
             return TickResult(idle_kind="daily_cap")
         provider_resume = any(
@@ -1645,6 +1661,11 @@ class DaemonLoop:
             for item in self.dstore.queued()
         )
         if provider_resume:
+            # The run cap exempts a provider-held resume; the token budget
+            # does not, even though the pool reported the run cap first.
+            if not self.usage_pool.admit_tokens(now).ok:
+                self._announce_budget(now)
+                return TickResult(idle_kind="budget")
             return None
         if now - self._last_cap_log > 3600:
             self._last_cap_log = now
@@ -1659,6 +1680,38 @@ class DaemonLoop:
                 resets_at=day_end,
             )
         return TickResult(idle_kind="daily_cap")
+
+    def _fairness_busy(self) -> Callable[[WorkItem], bool] | None:
+        """With room for several runs, an item whose requester (its
+        :func:`fairness_key`) already has a run in flight waits behind one
+        whose requester has none. One run at a time: plain FIFO."""
+        if self._serial:
+            return None
+        live = {fairness_key(handle.item) for handle in self.runs}
+        if not live:
+            return None
+        return lambda candidate: fairness_key(candidate) in live
+
+    def _announce_budget(self, now: float) -> None:
+        """Say once per pool day that the token budget holds new runs back.
+        The day is remembered in the store, so a restart does not repeat it."""
+        day_start, day_end = day_window(now, self.config.daemon.run_cap_timezone)
+        stamp = repr(day_start)
+        if self.dstore.get_value(self._budget_notice_key) == stamp:
+            return
+        self.dstore.set_value(self._budget_notice_key, stamp)
+        budget = self.config.daemon.daily_token_budget
+        spent = self.usage_pool.tokens_today(now)
+        tz = self.config.daemon.run_cap_timezone
+        self._notice(
+            "daemon.token_budget",
+            f"token budget reached for today ({tz}): {spent}/{budget} tokens; "
+            f"no new runs until 00:00 {tz}",
+            tokens_today=spent,
+            budget=budget,
+            timezone=tz,
+            resets_at=day_end,
+        )
 
     def _nothing_to_run(self, now: float, discovered: int, waits: dict[str, str]) -> TickResult:
         """Say WHY there is nothing to run: a queue full of items sitting in
@@ -2371,6 +2424,8 @@ class DaemonLoop:
         item_config = self._item_config(item)
         bus = EventBus()
         bus.subscribe(event_log_subscriber)
+        # What the run's agents report spending is charged to the pool.
+        bus.subscribe(self.usage_pool.subscriber(getattr(item, "channel_id", None)))
         engine = LoopEngine(
             item_config,
             store=self.store,

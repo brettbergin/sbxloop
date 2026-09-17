@@ -671,6 +671,23 @@ class UsageWindow(ApiModel):
     spend_basis: str
 
 
+class UsagePool(ApiModel):
+    """Today's workspace budget pool: runs against the daily cap and
+    reported tokens (input plus output) against the daily budget, for the
+    calendar day in ``[daemon] run_cap_timezone``."""
+
+    workspace_id: str = WORKSPACE_ID
+    day_start: str
+    resets_at: str
+    runs_today: int
+    max_runs_per_day: int
+    tokens_today: int
+    #: ``null`` when no budget is configured.
+    daily_token_budget: int | None = None
+    runs_tokens_today: int
+    turns_tokens_today: int
+
+
 # -- diagnostics and administration (#1040) -----------------------------------------
 
 
