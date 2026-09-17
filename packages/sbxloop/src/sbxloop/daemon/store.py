@@ -2098,7 +2098,13 @@ class DaemonStore:
             row = session.scalars(select(WorkItemRow).where(_id_where(item_id))).first()
             return _row_to_item(row) if row else None
 
-    def next_queued(self, now: float, backoff_s: float) -> WorkItem | None:
+    def next_queued(
+        self,
+        now: float,
+        backoff_s: float,
+        *,
+        skip: Callable[[WorkItem], bool] | None = None,
+    ) -> WorkItem | None:
         """Oldest queued item whose retry backoff (attempts * backoff) has
         elapsed since its last update. Ties on ``created_at`` (a batch
         upserted with one ``now``) break on insertion order (rowid), so
@@ -2108,10 +2114,16 @@ class DaemonStore:
         awaiting resume (see :meth:`mark_resume_pending`): it was in flight
         when the previous process died, so it goes first and skips the
         retry backoff — that backoff spaces out *failed* attempts, and an
-        interruption is not a failure."""
+        interruption is not a failure.
+
+        ``skip`` passes over an eligible item that may not start yet (its
+        repository is busy), so the next one in order can."""
         for item in self.queued_in_order():
-            if dispatch_eligible_at(item, backoff_s) <= now:
-                return item
+            if dispatch_eligible_at(item, backoff_s) > now:
+                continue
+            if skip is not None and skip(item):
+                continue
+            return item
         return None
 
     def queued_in_order(self) -> list[WorkItem]:

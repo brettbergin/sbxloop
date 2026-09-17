@@ -3,7 +3,8 @@ notices the loop narrates to a human channel."""
 
 from __future__ import annotations
 
-from typing import Literal, NamedTuple
+from collections.abc import Mapping
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, ConfigDict, ValidationInfo, field_validator, model_validator
 
@@ -217,8 +218,25 @@ TickOutcome = Literal[
     "interrupted",
     "cancelled",
     "requeued",
+    # Launched and still executing: a later tick settles it (only when
+    # `[daemon] max_concurrent_runs` leaves room for more than one run).
+    "started",
 ]
-IdleKind = Literal["paused", "breaker", "daily_cap", "backoff", "no_work", "provider_held"]
+IdleKind = Literal["paused", "breaker", "daily_cap", "backoff", "no_work", "provider_held", "busy"]
+
+
+def live_runs(status: Mapping[str, Any]) -> list[Mapping[str, Any]]:
+    """Every run in flight from a daemon ``status`` snapshot, oldest first.
+    A daemon from before concurrent dispatch reports only ``current``."""
+    runs = status.get("runs")
+    if isinstance(runs, list):
+        return [run for run in runs if isinstance(run, Mapping)]
+    current = status.get("current")
+    return [current] if isinstance(current, Mapping) else []
+
+
+def live_run_ids(status: Mapping[str, Any]) -> set[str]:
+    return {str(run["run_id"]) for run in live_runs(status) if run.get("run_id")}
 
 
 class TickResult(NamedTuple):
@@ -230,6 +248,11 @@ class TickResult(NamedTuple):
     idle_kind: IdleKind | None = None
     # Human detail for the idle kind (e.g. "3 queued; next eligible in 42s").
     idle_detail: str | None = None
+    # Every item this tick dispatched, in order (``dispatched`` is the first).
+    launched: tuple[str, ...] = ()
+    # Runs that had finished and were settled at the start of this tick:
+    # ``(item_id, outcome)``, oldest first.
+    settled: tuple[tuple[str, TickOutcome], ...] = ()
 
     @property
     def idle_reason(self) -> str | None:

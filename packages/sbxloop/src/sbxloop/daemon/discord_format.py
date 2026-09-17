@@ -48,7 +48,7 @@ from sbxloop.cli.tui import (
     TOOL_ARGS_LINE_CLIP,
     _one_line as _one_line_mid,
 )
-from sbxloop.daemon.model import DaemonNotice, RunReport, TaskOutcome, WorkItem
+from sbxloop.daemon.model import DaemonNotice, RunReport, TaskOutcome, WorkItem, live_runs
 from sbxloop.engine.model import PIPELINE_STAGES, WORKLOAD_STAGES, Published
 from sbxloop.events import Event, HostEventTypes
 from sbxloop.excerpt import (
@@ -2268,6 +2268,9 @@ def status_embed(status: dict[str, Any]) -> EmbedSpec:
     )
     resumes = status.get("resumes_today", 0)
     tz = status.get("run_cap_timezone", "UTC")
+    more = len(live_runs(status)) - 1
+    if more > 0:
+        current += f" (+{more} more in flight)"
     fields: tuple[tuple[str, str, bool], ...] = (
         ("Current", current, False),
         ("Queued", str(status.get("queued", 0)), True),

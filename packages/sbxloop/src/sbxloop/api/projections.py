@@ -43,7 +43,7 @@ from sbxloop.api.publicids import PublicIds, item_key, parse_run_id, run_public_
 from sbxloop.daemon.controls.eligibility import Subject, available_actions
 from sbxloop.daemon.controls.intake import RECIPE_PARAMETERS
 from sbxloop.daemon.controls.steering import Steering as SteeringRecord
-from sbxloop.daemon.model import WorkItem
+from sbxloop.daemon.model import WorkItem, live_run_ids
 from sbxloop.daemon.store import MergeGate, dispatch_eligible_at
 from sbxloop.engine.model import RunRecord, TaskRecord
 from sbxloop.errors import SbxloopError
@@ -93,6 +93,10 @@ class Views:
     def current_run_id(self) -> str | None:
         current = self.status().get("current")
         return str(current["run_id"]) if current else None
+
+    def live_run_ids(self) -> set[str]:
+        """Every run in flight, not only the oldest."""
+        return live_run_ids(self.status())
 
     # -- lookups -------------------------------------------------------------------
 
@@ -145,7 +149,7 @@ class Views:
             run_kind=(run.kind if run is not None else item.kind if item else "code"),
             run_state=run.state if run is not None else None,
             item_state=item.state if item is not None else None,
-            is_current=run_id is not None and run_id == self.current_run_id(),
+            is_current=run_id is not None and run_id in self.live_run_ids(),
             pinned=item is not None and run is not None and item.run_id == run.run_id,
             exhausted=run is not None and run.exhausted is not None,
             gate_state=gate_state,

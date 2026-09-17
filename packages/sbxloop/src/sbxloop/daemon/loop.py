@@ -238,13 +238,46 @@ class CancelRequest(NamedTuple):
 
 
 class RunHandle:
-    """The in-flight run: what shutdown and a frontend need to reach."""
+    """A run in flight: what shutdown, a control and a frontend need to
+    reach, and what the loop needs to settle it once its thread ends."""
 
-    def __init__(self, item: WorkItem, run_id: str, engine: LoopEngine, bus: EventBus) -> None:
+    def __init__(
+        self,
+        item: WorkItem,
+        run_id: str,
+        engine: LoopEngine,
+        bus: EventBus,
+        *,
+        resume: bool = False,
+    ) -> None:
         self.item = item
         self.run_id = run_id
         self.engine = engine
         self.bus = bus
+        self.resume = resume
+        self.started = time.monotonic()
+        # The engine thread and what it left behind: ``result`` or ``error``.
+        self.thread: threading.Thread | None = None
+        self.outcome: dict[str, Any] = {}
+        # An operator override (a row changed by another process) was seen
+        # and the engine asked to stop; asked once.
+        self.override_cancel_sent = False
+
+    @property
+    def finished(self) -> bool:
+        """The engine thread ran and has ended: the run is ready to settle."""
+        return self.thread is not None and not self.thread.is_alive()
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "item_id": self.item.item_id,
+            "run_id": self.run_id,
+            "title": self.item.title,
+            # A workload and its profile (#804): the console's "now"
+            # line says which bounds the run is under.
+            "kind": self.item.kind,
+            "profile": self.item.profile,
+        }
 
 
 # (item, per-item config, run_id, bus, resume) -> RunResult. Injectable so
@@ -343,7 +376,11 @@ class DaemonLoop:
         # is its write-through cache, loaded before anything can ask.
         self._holds_lock = threading.Lock()
         self._holds: set[str] = {h.name for h in self.dstore.holds()}
-        self._current: RunHandle | None = None
+        # The runs in flight, oldest first (insertion order), keyed by run
+        # id; at most `[daemon] max_concurrent_runs` of them. Changed only
+        # on the loop thread (launch and reap) and under `_current_lock`;
+        # controls on other threads read it under the lock.
+        self._runs: dict[str, RunHandle] = {}
         self._current_lock = threading.Lock()
         # Every mutating control leaves a durable record here before it
         # acts; `recover()` stamps the generation that claims them.
@@ -353,7 +390,8 @@ class DaemonLoop:
         # restart is never timed into the window between the claim comment
         # landing on the source and the claim being persisted (#530).
         self._claiming: str | None = None
-        self._cancel_request: CancelRequest | None = None
+        # An operator cancel per run in flight, consumed when that run settles.
+        self._cancel_requests: dict[str, CancelRequest] = {}
         # Breaker state lives in the store: a crash-restart loop must not
         # reset it (#254). These attributes are the write-through cache.
         self._breaker_opened_at, self._consecutive_failures = self.dstore.breaker()
@@ -378,7 +416,80 @@ class DaemonLoop:
 
     @property
     def current(self) -> RunHandle | None:
-        return self._current
+        """The oldest run in flight: what a bare ``cancel`` and a
+        single-run reader mean by "the current run"."""
+        with self._current_lock:
+            return next(iter(self._runs.values()), None)
+
+    @property
+    def runs(self) -> list[RunHandle]:
+        """Every run in flight, oldest first."""
+        with self._current_lock:
+            return list(self._runs.values())
+
+    @property
+    def _current(self) -> RunHandle | None:
+        return self.current
+
+    @_current.setter
+    def _current(self, handle: RunHandle | None) -> None:
+        # The single-run shape: the handle becomes the only run in flight.
+        with self._current_lock:
+            self._runs = {} if handle is None else {handle.run_id: handle}
+
+    @property
+    def _cancel_request(self) -> CancelRequest | None:
+        """The oldest pending operator cancel, if any."""
+        with self._current_lock:
+            return next(iter(self._cancel_requests.values()), None)
+
+    def _live_run(self, run_id: str) -> RunHandle | None:
+        with self._current_lock:
+            return self._runs.get(run_id)
+
+    def _register(self, handle: RunHandle) -> None:
+        with self._current_lock:
+            self._runs[handle.run_id] = handle
+
+    @property
+    def _serial(self) -> bool:
+        """One run at a time: a tick settles the run it dispatched before
+        it returns, exactly as the loop always has."""
+        return self.config.daemon.max_concurrent_runs <= 1
+
+    def _run_repo(self, item: WorkItem) -> str | None:
+        """The repository an item's run works on, the single-repo default
+        standing in for an item that names none."""
+        repo = self._item_repo(item)
+        if repo is None:
+            default = self.config.github.default_repo()
+            repo = default.repo if default is not None else None
+        return repo
+
+    def _live_repos(self, *, code_only: bool = False) -> set[str]:
+        repos: set[str] = set()
+        for handle in self.runs:
+            code = handle.item.kind == "code" and handle.item.recipe is None
+            if code_only and not code:
+                continue
+            # A code run works the repository's checkout, named or not; any
+            # other run only a repository it names.
+            repo = self._run_repo(handle.item) if code else self._item_repo(handle.item)
+            if repo is not None:
+                repos.add(repo)
+        return repos
+
+    def _admission_blocked(self, item: WorkItem) -> str | None:
+        """The repository that keeps ``item`` from starting beside the runs
+        in flight, or ``None``. Two code runs never work one repository at
+        once: they would race on its checkout, branches and pull requests."""
+        if item.kind != "code" or item.recipe is not None:
+            return None
+        live = self._live_repos(code_only=True)
+        if not live:
+            return None
+        repo = self._run_repo(item)
+        return repo if repo is not None and repo in live else None
 
     @property
     def stopping(self) -> bool:
@@ -538,7 +649,8 @@ class DaemonLoop:
             supervisor=supervisor,
         )
         if now:
-            self.cancel_current(who)
+            for handle in self.runs:
+                self._cancel_live(handle.run_id, who)
         self.request_stop()
 
     def _report_restart(self) -> None:
@@ -621,12 +733,21 @@ class DaemonLoop:
         run is resolved under the current lock and cancelled by identity
         (:meth:`cancel_run`), so the request can never be attributed to a
         later run. ``False`` when nothing is running."""
-        with self._current_lock:
-            handle = self._current
+        handle = self.current
         if handle is None:
             return False
+        return self._cancel_live(handle.run_id, requester, retry=retry, operation_id=operation_id)
+
+    def _cancel_live(
+        self,
+        run_id: str,
+        requester: str | None,
+        *,
+        retry: bool = False,
+        operation_id: str | None = None,
+    ) -> bool:
         try:
-            self.cancel_run(handle.run_id, by=requester, retry=retry, operation_id=operation_id)
+            self.cancel_run(run_id, by=requester, retry=retry, operation_id=operation_id)
         except ControlError as exc:
             if exc.code in ("already_terminal", "not_eligible", "unknown_target"):
                 # The run finished between the two looks: nothing is running.
@@ -657,15 +778,13 @@ class DaemonLoop:
         rather than applied. ``operation_id`` is the durable record the
         settle step finishes."""
         with self._current_lock:
-            handle = self._current
-            if handle is not None and handle.run_id == run_id:
+            handle = self._runs.get(run_id)
+            if handle is not None:
                 self._check_revision(run_id, expected_revision)
-                previous, self._cancel_request = (
-                    self._cancel_request,
-                    CancelRequest(run_id, by or "operator", retry, operation_id),
+                previous = self._cancel_requests.get(run_id)
+                self._cancel_requests[run_id] = CancelRequest(
+                    run_id, by or "operator", retry, operation_id
                 )
-            else:
-                handle = None
         if handle is not None:
             if previous is not None and previous.operation_id is not None:
                 # Superseded before it was honoured: the later request
@@ -748,10 +867,8 @@ class DaemonLoop:
         current-run lock, so the run cannot end between the check and the
         hand-over."""
         with self._current_lock:
-            handle = self._current
-            if handle is None or handle.run_id != run_id:
-                handle = None
-            else:
+            handle = self._runs.get(run_id)
+            if handle is not None:
                 check_eligibility("steer", Subject(run_kind=handle.item.kind, is_current=True))
                 self._check_revision(run_id, expected_revision)
                 message_id = handle.engine.post_user_message(text)
@@ -802,9 +919,7 @@ class DaemonLoop:
         CLI's ``sbxloop resume`` is for a run no daemon owns. Refused by
         name when the run is in flight, finished, unpinned, past its resume
         budget, exhausted, or its workspace was pruned."""
-        with self._current_lock:
-            handle = self._current
-        if handle is not None and handle.run_id == run_id:
+        if self._live_run(run_id) is not None:
             raise ControlError("not_eligible", f"run {run_id} is in flight")
         self._check_revision(run_id, expected_revision)
         try:
@@ -862,14 +977,21 @@ class DaemonLoop:
 
     def _take_cancel(self, run_id: str) -> CancelRequest | None:
         """The cancel request for ``run_id``, consumed. Any other pending
-        request is stale (its run is gone) and dropped — and its record
-        finished as such, so nobody reads a dropped cancel as honoured."""
+        request whose run is no longer in flight is stale and dropped — and
+        its record finished as such, so nobody reads a dropped cancel as
+        honoured. Requests for the other runs in flight stay."""
         with self._current_lock:
-            request, self._cancel_request = self._cancel_request, None
-        if request is None:
-            return None
-        if request.run_id == run_id:
-            return request
+            request = self._cancel_requests.pop(run_id, None)
+            stale = [
+                self._cancel_requests.pop(other)
+                for other in list(self._cancel_requests)
+                if other not in self._runs
+            ]
+        for dropped in stale:
+            self._drop_cancel(dropped)
+        return request
+
+    def _drop_cancel(self, request: CancelRequest) -> None:
         if request.operation_id is not None:
             self.operations.finish(
                 request.operation_id,
@@ -878,7 +1000,6 @@ class DaemonLoop:
                 error_code="target_already_terminal",
                 error_detail=f"run {request.run_id} was no longer in flight",
             )
-        return None
 
     def _finish_cancel_record(self, cancel: CancelRequest, *, honoured: bool, run_id: str) -> None:
         """Settle the cancel's durable record from what the run did."""
@@ -1145,12 +1266,11 @@ class DaemonLoop:
         return delivered
 
     def _cancel_if_current(self, item_id: str) -> bool:
-        with self._current_lock:
-            handle = self._current
-        if handle is None or handle.item.item_id != normalize_item_id(item_id):
-            return False
-        handle.engine.request_cancel()
-        return True
+        wanted = normalize_item_id(item_id)
+        handles = [h for h in self.runs if h.item.item_id == wanted]
+        for handle in handles:
+            handle.engine.request_cancel()
+        return bool(handles)
 
     def _operator_override(self, item_id: str, run_id: str) -> WorkItem | None:
         """The item row is the daemon's only channel from a CLI running in
@@ -1167,9 +1287,10 @@ class DaemonLoop:
         in-flight engine to cancel, wait briefly. Stable across runs — it
         looks up the current engine at call time."""
         self._stop.set()
-        with self._current_lock:
-            handle = self._current
-        if handle is not None:
+        handles = self.runs
+        if not handles:
+            log.info("daemon.quiesce", run=None)
+        for handle in handles:
             log.info(
                 "daemon.quiesce",
                 item=handle.item.item_id,
@@ -1177,15 +1298,17 @@ class DaemonLoop:
                 grace_s=self.config.daemon.shutdown_grace_s,
             )
             handle.engine.request_cancel()
-        else:
-            log.info("daemon.quiesce", run=None)
-        thread = getattr(self, "_engine_thread", None)
-        if thread is not None and thread.is_alive():
-            thread.join(timeout=self.config.daemon.shutdown_grace_s)
+        # One grace period for all of them, not one each.
+        deadline = time.monotonic() + self.config.daemon.shutdown_grace_s
+        for handle in handles:
+            thread = handle.thread
+            if thread is None or not thread.is_alive():
+                continue
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
             if thread.is_alive():
                 log.warning(
                     "daemon.quiesce_timeout",
-                    run=handle.run_id if handle is not None else None,
+                    run=handle.run_id,
                     grace_s=self.config.daemon.shutdown_grace_s,
                     hint="engine still running past shutdown grace; the run stays resumable",
                 )
@@ -1241,22 +1364,15 @@ class DaemonLoop:
     def status(self) -> dict[str, Any]:
         now = self.clock()
         day_start, day_end = day_window(now, self.config.daemon.run_cap_timezone)
-        with self._current_lock:
-            handle = self._current
+        handles = self.runs
         provider_hold = self._provider_recovery().hold()
         return {
             "provider_hold": provider_hold.summary() if provider_hold else None,
-            "current": {
-                "item_id": handle.item.item_id,
-                "run_id": handle.run_id,
-                "title": handle.item.title,
-                # A workload and its profile (#804): the console's "now"
-                # line says which bounds the run is under.
-                "kind": handle.item.kind,
-                "profile": handle.item.profile,
-            }
-            if handle
-            else None,
+            # The oldest run in flight, as a single-run reader expects it.
+            "current": handles[0].snapshot() if handles else None,
+            # Every run in flight, oldest first.
+            "runs": [{**h.snapshot(), "repo": h.item.repo} for h in handles],
+            "max_concurrent_runs": self.config.daemon.max_concurrent_runs,
             "queued": len(self.dstore.queued()),
             "runs_today": self.dstore.runs_started_since(day_start),
             "runs_today_resets_at": day_end,
@@ -1338,12 +1454,54 @@ class DaemonLoop:
                 result = self.tick()
                 ticks += 1
                 self._log_tick(result, time.monotonic() - started)
-                if result.dispatched is None:
-                    self._stop.wait(self.config.daemon.poll_interval_s)
+                # One run at a time, a tick that ran an item goes straight on
+                # to the next. With room for more, the tick already filled
+                # every slot it could: wait for a run to finish (or the poll).
+                if result.dispatched is None or not self._serial:
+                    self._idle_wait(self.config.daemon.poll_interval_s)
+            # Nothing new is claimed; the runs in flight finish (or, after a
+            # quiesce, stop at their boundary) and are settled here.
+            self.drain()
             if self._graceful:
                 self._join_landings()
         finally:
             self._notice("daemon.stopped", "daemon stopped", ticks=ticks)
+
+    def _idle_wait(self, timeout: float) -> None:
+        """Wait for the next poll. With runs in flight the wait ends as soon
+        as one of them finishes, so its slot is refilled (and its item
+        settled) without sitting out the poll interval, and an operator
+        override from another process is noticed within a second."""
+        if not self.runs:
+            self._stop.wait(timeout)
+            return
+        deadline = time.monotonic() + timeout
+        while not self._stop.is_set():
+            handles = self.runs
+            if any(h.finished for h in handles):
+                return
+            self._poll_overrides(handles)
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            self._stop.wait(min(1.0, left))
+
+    def drain(self) -> tuple[tuple[str, TickOutcome], ...]:
+        """Wait for every run in flight to end and settle each one; what
+        ``run_forever`` does once it stops claiming, and what a one-shot
+        tick does before the process exits. Nothing when no run is live."""
+        settled: list[tuple[str, TickOutcome]] = []
+        while True:
+            handles = [h for h in self.runs if h.thread is not None]
+            if not handles:
+                return tuple(settled)
+            pending = [h for h in handles if not h.finished]
+            if pending:
+                self._poll_overrides(pending)
+                thread = pending[0].thread
+                assert thread is not None  # nosec B101 - filtered above
+                thread.join(timeout=1.0)
+            settled.extend(self._reap())
 
     def _log_tick(self, result: TickResult, duration_s: float) -> None:
         """Every tick at DEBUG; a *change* of why the daemon is idle at INFO,
@@ -1373,6 +1531,14 @@ class DaemonLoop:
             self._last_idle_kind = kind
 
     def tick(self) -> TickResult:
+        # Runs that finished since the last tick settle first, on this
+        # thread: their outcome (a failure, a gate) is what the gates below
+        # judge, and their slot is free for the dispatch that follows.
+        settled = self._reap()
+        result = self._tick()
+        return result._replace(settled=settled) if settled else result
+
+    def _tick(self) -> TickResult:
         now = self.clock()
         # Before the gates: a decision made from another process — or a
         # merged/blocked report GitHub refused last time — reaches the source
@@ -1385,6 +1551,56 @@ class DaemonLoop:
         # A parked PR's review poll (#675) is not new work: it runs even
         # paused, so an approval given during a pause still lands.
         self._review_tick(now)
+        idle = self._dispatch_gate(now, first=True)
+        if idle is not None:
+            return idle
+        discovered = self._discover(now) + self._fire_schedules(now)
+        limit = self.config.daemon.max_concurrent_runs
+        launched: list[str] = []
+        outcome: TickOutcome | None = None
+        while True:
+            if launched and (self._stop.is_set() or self._dispatch_gate(now) is not None):
+                break
+            live = len(self.runs)
+            if live >= limit:
+                if launched:
+                    break
+                return TickResult(
+                    discovered=discovered,
+                    idle_kind="busy",
+                    idle_detail=f"{live} of {limit} runs in flight",
+                )
+            waits: dict[str, str] = {}
+
+            def blocked(candidate: WorkItem, waits: dict[str, str] = waits) -> bool:
+                repo = self._admission_blocked(candidate)
+                if repo is not None:
+                    waits[candidate.item_id] = repo
+                return repo is not None
+
+            item = self.dstore.next_queued(now, self.config.daemon.retry_backoff_s, skip=blocked)
+            if item is None:
+                if launched:
+                    break
+                return self._nothing_to_run(now, discovered, waits)
+            dispatched, item_outcome = self._start_item(item, now)
+            launched.append(dispatched)
+            if outcome is None:
+                outcome = item_outcome
+            if self._serial:
+                # One item per tick, settled before the tick returns.
+                break
+        return TickResult(
+            discovered=discovered,
+            dispatched=launched[0],
+            outcome=outcome,
+            launched=tuple(launched),
+        )
+
+    def _dispatch_gate(self, now: float, *, first: bool = False) -> TickResult | None:
+        """Why nothing new may start right now, or ``None``. ``first`` is
+        the tick's own look, which narrates the daily cap; a look between
+        two launches only stops the loop."""
         if self.paused:
             return TickResult(idle_kind="paused")
         provider_hold = self._provider_recovery().hold()
@@ -1394,47 +1610,63 @@ class DaemonLoop:
             return TickResult(idle_kind="breaker")
         day_start, day_end = day_window(now, self.config.daemon.run_cap_timezone)
         started_today = self.dstore.runs_started_since(day_start)
+        if started_today < self.config.daemon.max_runs_per_day:
+            return None
+        if not first:
+            return TickResult(idle_kind="daily_cap")
         provider_resume = any(
             item.run_id and self._provider_recovery().pending(item.run_id)
             for item in self.dstore.queued()
         )
-        if started_today >= self.config.daemon.max_runs_per_day and not provider_resume:
-            if now - self._last_cap_log > 3600:
-                self._last_cap_log = now
-                cap = self.config.daemon.max_runs_per_day
-                tz = self.config.daemon.run_cap_timezone
-                self._notice(
-                    "daemon.daily_cap",
-                    f"run cap reached for today ({tz}): {started_today}/{cap}; "
-                    f"resets at 00:00 {tz}",
-                    started_today=started_today,
-                    cap=cap,
-                    timezone=tz,
-                    resets_at=day_end,
+        if provider_resume:
+            return None
+        if now - self._last_cap_log > 3600:
+            self._last_cap_log = now
+            cap = self.config.daemon.max_runs_per_day
+            tz = self.config.daemon.run_cap_timezone
+            self._notice(
+                "daemon.daily_cap",
+                f"run cap reached for today ({tz}): {started_today}/{cap}; resets at 00:00 {tz}",
+                started_today=started_today,
+                cap=cap,
+                timezone=tz,
+                resets_at=day_end,
+            )
+        return TickResult(idle_kind="daily_cap")
+
+    def _nothing_to_run(self, now: float, discovered: int, waits: dict[str, str]) -> TickResult:
+        """Say WHY there is nothing to run: a queue full of items sitting in
+        retry backoff reads as "no work" otherwise (field: --once after a
+        failed attempt printed no_work with no explanation)."""
+        if waits:
+            item_id, repo = next(iter(waits.items()))
+            more = f" (+{len(waits) - 1} more)" if len(waits) > 1 else ""
+            return TickResult(
+                discovered=discovered,
+                idle_kind="busy",
+                idle_detail=f"{item_id}{more} waits for the run in flight on {repo}",
+            )
+        waiting = self.dstore.queued()
+        if waiting:
+            soonest = min(
+                max(
+                    0.0,
+                    w.attempts * self.config.daemon.retry_backoff_s - (now - w.updated_at),
+                    (w.not_before - now) if w.not_before is not None else 0.0,
                 )
-            return TickResult(idle_kind="daily_cap")
-        discovered = self._discover(now) + self._fire_schedules(now)
-        item = self.dstore.next_queued(now, self.config.daemon.retry_backoff_s)
-        if item is None:
-            # Say WHY there is nothing to run: a queue full of items sitting
-            # in retry backoff reads as "no work" otherwise (field: --once
-            # after a failed attempt printed no_work with no explanation).
-            waiting = self.dstore.queued()
-            if waiting:
-                soonest = min(
-                    max(
-                        0.0,
-                        w.attempts * self.config.daemon.retry_backoff_s - (now - w.updated_at),
-                        (w.not_before - now) if w.not_before is not None else 0.0,
-                    )
-                    for w in waiting
-                )
-                return TickResult(
-                    discovered=discovered,
-                    idle_kind="backoff",
-                    idle_detail=f"{len(waiting)} queued; next eligible in {soonest:.0f}s",
-                )
-            return TickResult(discovered=discovered, idle_kind="no_work")
+                for w in waiting
+            )
+            return TickResult(
+                discovered=discovered,
+                idle_kind="backoff",
+                idle_detail=f"{len(waiting)} queued; next eligible in {soonest:.0f}s",
+            )
+        return TickResult(discovered=discovered, idle_kind="no_work")
+
+    def _start_item(self, item: WorkItem, now: float) -> tuple[str, TickOutcome]:
+        """Claim ``item`` if it is not yet ours, then dispatch it (fresh or
+        resuming its pinned run). The outcome is ``started`` for a run left
+        executing, or how the item settled when it settled right here."""
         if not item.claimed:
             # The claim's token is persisted before the comment goes up, and
             # SIGTERM/SIGINT are held until the claim is complete (#530): a
@@ -1465,13 +1697,11 @@ class DaemonLoop:
                     item=item.item_id,
                     title=item.title,
                 )
-                return TickResult(discovered=discovered, dispatched=item.item_id, outcome="failed")
+                return item.item_id, "failed"
             log.info("item.claimed", item=item.item_id, title=item.title)
         if item.run_id is not None:
-            outcome = self._resume(item, now)
-        else:
-            outcome = self._dispatch(item, resume_run_id=None)
-        return TickResult(discovered=discovered, dispatched=item.item_id, outcome=outcome)
+            return item.item_id, self._resume(item, now)
+        return item.item_id, self._dispatch(item, resume_run_id=None)
 
     def _resume(self, item: WorkItem, now: float) -> TickOutcome:
         """Resume the run recovery pinned on a queued item — or, past the
@@ -2073,10 +2303,20 @@ class DaemonLoop:
     # -- dispatch ----------------------------------------------------------------------
 
     def _dispatch(self, item: WorkItem, *, resume_run_id: str | None) -> TickOutcome:
-        """Run one item (fresh, or resuming its interrupted run) and settle it."""
+        """Start one item's run (fresh, or resuming its interrupted run).
+        One run at a time, the run is awaited and settled here; with room
+        for more, it is left executing and a later tick reaps it."""
+        handle = self._launch(item, resume_run_id=resume_run_id)
+        if not self._serial:
+            return "started"
+        self._await(handle)
+        return self._settle_run(handle)
+
+    def _launch(self, item: WorkItem, *, resume_run_id: str | None) -> RunHandle:
+        """Mark the item running, build its engine, register the run and
+        start its thread. Returns once the run is executing."""
         now = self.clock()
         run_id = resume_run_id or new_run_id()
-        started = time.monotonic()
         if resume_run_id is None:
             self.dstore.mark_running(item.item_id, run_id, now)
             item = self.dstore.get(item.item_id) or item
@@ -2116,9 +2356,14 @@ class DaemonLoop:
             # can honestly say which label queues it (#631).
             trigger_label=self.config.labels_for(self._item_repo(item)).trigger,
         )
-        handle = RunHandle(item, run_id, engine, bus)
-        with self._current_lock:
-            self._current = handle
+        handle = RunHandle(
+            item,
+            run_id,
+            engine,
+            bus,
+            resume=resume_run_id is not None,
+        )
+        self._register(handle)
         if self.frontend is not None:
             try:
                 self.frontend.run_started(item, run_id, engine, bus)
@@ -2127,44 +2372,74 @@ class DaemonLoop:
                     "frontend.run_started_failed", item=item.item_id, run=run_id, exc_info=True
                 )
 
-        result_box: dict[str, Any] = {}
+        box = handle.outcome
+        resume = resume_run_id is not None
 
         def target() -> None:
             # Context vars are per-thread: stamp run/item on everything the
             # engine logs from here (provisioning, worker client, phases).
             bind_run(run_id, item.item_id, source=self.source.name)
             try:
-                result_box["result"] = self._runner(
-                    item, item_config, run_id, bus, resume_run_id is not None
-                )
+                box["result"] = self._runner(item, item_config, run_id, bus, resume)
             except BaseException as exc:
-                result_box["error"] = exc
+                box["error"] = exc
             finally:
                 clear_run()
 
         thread = threading.Thread(target=target, name=f"sbxloop-daemon-run-{run_id}", daemon=True)
-        self._engine_thread = thread
-        thread.start()
-        cancel_sent = False
+        handle.thread = thread
+        try:
+            thread.start()
+        except BaseException:
+            with self._current_lock:
+                self._runs.pop(run_id, None)
+            raise
+        return handle
+
+    def _await(self, handle: RunHandle) -> None:
+        """Block until ``handle``'s thread ends, honouring an operator
+        override from another process while it runs."""
+        thread = handle.thread
+        assert thread is not None  # nosec B101 - launched
         while thread.is_alive():
             thread.join(timeout=1.0)
-            # `sbxloop daemon abandon|requeue` from another process can only
-            # touch the row; honor it by cancelling the run.
-            if (
-                not cancel_sent
-                and thread.is_alive()
-                and (override := self._operator_override(item.item_id, run_id)) is not None
-            ):
-                log.info(
-                    "run.cancel_requested",
-                    item=item.item_id,
-                    run=run_id,
-                    reason=f"operator override: item now {override.state}",
-                )
-                engine.request_cancel()
-                cancel_sent = True
+            self._poll_overrides([handle])
+
+    def _poll_overrides(self, handles: Sequence[RunHandle]) -> None:
+        """`sbxloop daemon abandon|requeue` from another process can only
+        touch the row; honour it by cancelling the run, once."""
+        for handle in handles:
+            thread = handle.thread
+            if handle.override_cancel_sent or thread is None or not thread.is_alive():
+                continue
+            override = self._operator_override(handle.item.item_id, handle.run_id)
+            if override is None:
+                continue
+            log.info(
+                "run.cancel_requested",
+                item=handle.item.item_id,
+                run=handle.run_id,
+                reason=f"operator override: item now {override.state}",
+            )
+            handle.engine.request_cancel()
+            handle.override_cancel_sent = True
+
+    def _reap(self) -> tuple[tuple[str, TickOutcome], ...]:
+        """Settle every run whose thread has ended, oldest first, on the
+        calling (loop) thread; the rest are checked for an operator
+        override."""
+        handles = self.runs
+        if not handles:
+            return ()
+        settled = [(h.item.item_id, self._settle_run(h)) for h in handles if h.finished]
+        self._poll_overrides([h for h in handles if not h.finished])
+        return tuple(settled)
+
+    def _settle_run(self, handle: RunHandle) -> TickOutcome:
+        """Turn a finished run into what happens to its item, and free its slot."""
+        item, run_id, result_box = handle.item, handle.run_id, handle.outcome
         with self._current_lock:
-            self._current = None
+            self._runs.pop(run_id, None)
 
         error = result_box.get("error")
         result = result_box.get("result")
@@ -2181,7 +2456,7 @@ class DaemonLoop:
                 if error is not None
                 else "unknown"
             ),
-            duration_s=round(time.monotonic() - started, 1),
+            duration_s=round(time.monotonic() - handle.started, 1),
             attempt=item.attempts,
         )
         # An item-level operator decision (abandon/requeue, possibly from
@@ -2189,6 +2464,9 @@ class DaemonLoop:
         # says what the item's fate is.
         override = self._operator_override(item.item_id, run_id)
         if override is not None:
+            stale = self._take_cancel(run_id)
+            if stale is not None:
+                self._drop_cancel(stale)
             return self._settle_override(item, run_id, override, result_box.get("result"))
         cancel = self._take_cancel(run_id)
         if cancel is not None and not (
@@ -2232,10 +2510,10 @@ class DaemonLoop:
                 item=item.item_id,
                 run=run_id,
                 attempt=item.attempts,
-                duration_s=round(time.monotonic() - started, 1),
+                duration_s=round(time.monotonic() - handle.started, 1),
                 exc_info=error,
             )
-        return self._settle(item, run_id, result_box.get("result"), error)
+        return self._settle(item, run_id, result, error)
 
     def _close_run_record(self, run_id: str, reason: str) -> None:
         """Terminate the *run* row for a run this settle just ended for good.
@@ -3727,10 +4005,22 @@ class DaemonLoop:
         stays keyed on the item's own repository; a repo-less item never
         starts one.
         """
-        self._ensure_workspace(repo)
-        if repo is None:
+        resolved = repo
+        if resolved is None:
             default = self.config.github.default_repo()
-            repo = default.repo if default is not None else None
+            resolved = default.repo if default is not None else None
+        if resolved is not None and resolved in self._live_repos():
+            # Another run is working from this checkout right now: moving
+            # it under that run's feet is not ours to do. The next run
+            # started with the repository free refreshes it.
+            log.info(
+                "workspace.refresh_skipped",
+                repo=resolved,
+                reason="a run in flight is using this repository",
+            )
+            return
+        self._ensure_workspace(repo)
+        repo = resolved
         if not self.config.daemon.refresh_workspace:
             return
         if self.config.daemon.workspace_isolation == "in-place":
@@ -3890,10 +4180,10 @@ class DaemonLoop:
     def _default_runner(
         self, item: WorkItem, item_config: Config, run_id: str, bus: EventBus, resume: bool
     ) -> RunResult:
-        # _dispatch built the engine (so cancel_current and the frontend see
-        # the one that is actually running); use it rather than a second one.
-        handle = self._current
-        assert handle is not None and handle.run_id == run_id
+        # _launch built the engine (so a cancel and the frontend see the one
+        # that is actually running); use it rather than a second one.
+        handle = self._live_run(run_id)
+        assert handle is not None  # nosec B101 - registered before its thread starts
         engine = handle.engine
         if resume:
             return engine.resume(run_id, release_provider_hold=False)
@@ -4278,11 +4568,9 @@ class DaemonLoop:
         ``cancelled`` (its item was cancelled) or ``failed`` (orphaned).
         Chronology is only ever appended to.
         """
-        with self._current_lock:
-            handle = self._current
-        live_run_id = handle.run_id if handle is not None else None
+        live = {handle.run_id for handle in self.runs}
         for record in self.store.non_terminal_runs():
-            if record.run_id == live_run_id:
+            if record.run_id in live:
                 continue
             item_id = self.dstore.item_for_run(record.run_id)
             item = self.dstore.get(item_id) if item_id else None
@@ -4343,7 +4631,7 @@ class DaemonLoop:
         if threshold <= 0:
             return
         with self._current_lock:
-            if self._current is not None:
+            if self._runs:
                 return  # a run is genuinely in flight; nothing here is stale
         for record in self.store.non_terminal_runs():
             last_activity = max(record.updated_at, self.store.last_event_ts(record.run_id) or 0.0)

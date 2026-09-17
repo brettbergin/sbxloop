@@ -17,7 +17,7 @@ from typing import Any, Protocol
 from sbxloop.config import TUI_CONTROL_CHANNEL, Config, VcsKind
 from sbxloop.daemon.control import CommandReply
 from sbxloop.daemon.mailbox import MailboxClient
-from sbxloop.daemon.model import WorkItem
+from sbxloop.daemon.model import WorkItem, live_run_ids
 from sbxloop.daemon.store import ChatThread, MergeGate, ReviewHold, dispatch_eligible_at
 from sbxloop.daemon.usage import RunUsage, usage_for_run
 from sbxloop.engine.model import RunRecord, TaskRecord
@@ -78,6 +78,11 @@ class DaemonSnapshot:
         current = (self.status or {}).get("current") or {}
         run = current.get("run_id")
         return str(run) if run else None
+
+    @property
+    def live_runs(self) -> set[str]:
+        """Every run the daemon has in flight."""
+        return live_run_ids(self.status or {})
 
 
 def probe_daemon(

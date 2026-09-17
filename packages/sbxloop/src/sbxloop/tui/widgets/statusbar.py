@@ -8,6 +8,7 @@ import time
 from rich.text import Text
 from textual.widgets import Static
 
+from sbxloop.daemon.model import live_runs
 from sbxloop.tui.data import ConsoleState
 from sbxloop.tui.format import age, clock
 
@@ -64,6 +65,9 @@ def status_lines(
         line.append(f"  {run}", style="bold cyan")
         if title:
             line.append(f" · {title[:40]}", style="dim")
+        more = len(live_runs(status)) - 1
+        if more > 0:
+            line.append(f" +{more}", style="bold cyan")
     if daemon and daemon.live:
         line.append(f"   queue {status.get('queued', 0)}")
         line.append(
