@@ -3,11 +3,13 @@ capability a route needs, and a daemon that is ready to act."""
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable, Coroutine
 from dataclasses import dataclass
 from typing import Any
 
 from fastapi import Depends, Request
+from sqlalchemy.exc import SQLAlchemyError
 
 from sbxloop.api.auth.store import Client
 from sbxloop.api.auth.tokens import AccessClaims, TokenError, verify_access
@@ -15,6 +17,9 @@ from sbxloop.api.collaboration import Member
 from sbxloop.api.context import ApiContext
 from sbxloop.api.errors import Problem
 from sbxloop.daemon.controls.principal import Capability, Principal
+from sbxloop.log import get_logger
+
+log = get_logger(__name__)
 
 
 def get_ctx(request: Request) -> ApiContext:
@@ -54,6 +59,15 @@ def _bearer(request: Request) -> str:
     return token.strip()
 
 
+def _touch_last_seen(ctx: ApiContext, user_id: str, now: float) -> None:
+    """Best effort: a busy, locked or full database never fails the request
+    (or a stream's access re-check) over a last-seen time."""
+    try:
+        ctx.collaboration.touch_last_seen(user_id, now, LAST_SEEN_INTERVAL_S)
+    except (SQLAlchemyError, sqlite3.Error) as exc:
+        log.debug("auth.last_seen_skipped", user_id=user_id, error=str(exc))
+
+
 def _resolve(ctx: ApiContext, token: str) -> Authenticated:
     now = ctx.clock()
     try:
@@ -82,7 +96,7 @@ def _resolve(ctx: ApiContext, token: str) -> Authenticated:
     if member is not None:
         seen = member.user.last_seen_at
         if seen is None or now - seen >= LAST_SEEN_INTERVAL_S:
-            ctx.collaboration.touch_last_seen(member.user.id, now, LAST_SEEN_INTERVAL_S)
+            _touch_last_seen(ctx, member.user.id, now)
     return Authenticated(
         principal=principal, claims=claims, client=client, token=token, member=member
     )

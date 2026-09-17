@@ -1034,7 +1034,6 @@ async def create_turn(
     body: TurnCreate,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:delegate")),  # noqa: B008
-    member: Member = Depends(current_member),  # noqa: B008
 ) -> TurnAccepted:
     if not ctx.collaboration_available:
         raise Problem(
@@ -1042,7 +1041,9 @@ async def create_turn(
             "collaboration_runtime_unavailable",
             "the sbxloop concierge is disabled or still starting",
         )
-    user = member.user
+    # The member is checked after availability, so a stopped concierge is
+    # reported as such whoever asks.
+    user = member_of(auth).user
     runner_selected = body.intent in {"code", "workload"}
     if runner_selected and body.target_slugs:
         raise Problem(

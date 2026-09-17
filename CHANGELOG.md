@@ -175,7 +175,8 @@
   client without an active local profile is still refused with
   `403 local_profile_required`, and a user removed from the workspace is now
   refused the same way. A member's last-seen time is recorded at most once a
-  minute. The single local user sees no change.
+  minute, and a database error while recording it never fails the request
+  or a stream's access re-check. The single local user sees no change.
 
 ### Fixed
 

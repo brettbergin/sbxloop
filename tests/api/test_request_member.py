@@ -4,7 +4,10 @@ member and keeps the reach its capabilities always gave it."""
 
 from __future__ import annotations
 
+import logging
 from typing import Any
+
+from sqlalchemy.exc import OperationalError
 
 from sbxloop.api.auth.deps import resolve_token
 
@@ -96,3 +99,41 @@ def test_last_seen_is_recorded_at_most_once_a_minute(api: Any) -> None:
     api.clock.t += 31
     assert api.client.get("/v1/users/me", headers=_bearer(token)).status_code == 200
     assert store.member_for_user(user_id).user.last_seen_at == started + 61
+
+
+def test_a_failed_last_seen_write_never_fails_the_request(
+    api: Any, monkeypatch: Any, caplog: Any
+) -> None:
+    token = _register(api)
+    store = api.ctx.collaboration
+
+    def busy(*_args: Any, **_kwargs: Any) -> None:
+        raise OperationalError("UPDATE local_users", {}, Exception("database is locked"))
+
+    monkeypatch.setattr(store, "touch_last_seen", busy)
+
+    with caplog.at_level(logging.DEBUG, logger="sbxloop.api.auth.deps"):
+        me = api.client.get("/v1/users/me", headers=_bearer(token))
+        # A stream's periodic access re-check resolves the token the same way.
+        auth = resolve_token(api.ctx, token["access_token"])
+
+    assert me.status_code == 200, me.text
+    assert me.json()["username"] == "owner"
+    assert auth.member is not None
+    assert auth.member.user.username == "owner"
+    assert any(
+        record.levelno == logging.DEBUG and "last_seen" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_a_turn_reports_the_unavailable_concierge_before_the_profile_check(api: Any) -> None:
+    api.ctx.concierge = None
+    response = api.client.post(
+        "/v1/channels/any-channel/turns",
+        headers=api.bearer(),
+        json={"content": "hello", "client_turn_id": "turn-1"},
+    )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["code"] == "collaboration_runtime_unavailable"
