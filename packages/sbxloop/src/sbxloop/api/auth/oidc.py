@@ -78,6 +78,29 @@ class OidcNotAllowed(OidcError):
     message = "this account is not allowed to sign in here"
 
 
+class _RefuseRedirects(urllib.request.HTTPRedirectHandler):
+    """Never follow a redirect: the answer is raised as the 3xx it is.
+
+    Following one would replay the request, the client's credentials
+    included, to a URL the configured provider did not name; a redirect
+    is a provider error instead."""
+
+    def redirect_request(
+        self,
+        req: urllib.request.Request,
+        fp: Any,
+        code: int,
+        msg: str,
+        headers: Any,
+        newurl: str,
+    ) -> urllib.request.Request | None:
+        raise urllib.error.HTTPError(req.full_url, code, msg, headers, fp)
+
+
+#: Every provider call goes through this opener, which follows no redirect.
+_OPENER = urllib.request.build_opener(_RefuseRedirects)
+
+
 def _urllib_request(
     method: str,
     url: str,
@@ -86,12 +109,13 @@ def _urllib_request(
     body: bytes | None,
     timeout: float,
 ) -> tuple[int, bytes]:
-    """One HTTP exchange; a non-2xx answer is returned, not raised."""
+    """One HTTP exchange; a non-2xx answer, a redirect included, is
+    returned, not raised or followed."""
     if urllib.parse.urlsplit(url).scheme not in ("https", "http"):
         raise OSError("unsupported URL scheme")
     request = urllib.request.Request(url, data=body, headers=headers, method=method)
     try:
-        with urllib.request.urlopen(  # nosec B310 - http(s) only, checked above
+        with _OPENER.open(  # nosec B310 - http(s) only, checked above
             request, timeout=timeout
         ) as response:
             return int(response.status), bytes(response.read(MAX_RESPONSE_BYTES + 1))

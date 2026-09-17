@@ -2185,23 +2185,23 @@ For Authentik, create an OAuth2/OpenID provider and an application with the
 slug `angie-oidc`, then configure:
 
 - **Client type:** Confidential. **Client ID:** `angie`.
-- **Redirect URI (strict):** `https://angie.comp.bergco.net/auth/callback`.
+- **Redirect URI (strict):** `https://angie.example.com/auth/callback`.
 - **Signing key:** choose a certificate, so ID tokens are signed with RS256
   or ES256. Without one, Authentik signs with HS256 and the client secret,
-  which the daemon refuses. (field-unverified: Authentik UI labels)
+  which the daemon refuses.
 - **Scopes:** `openid`, `email` and `profile`; Authentik's `profile` scope
-  carries the `groups` claim the role mapping reads. (field-unverified)
+  carries the `groups` claim the role mapping reads.
 
 ```toml
 [api]
 enabled = true
-cors_origins = ["https://angie.comp.bergco.net"]
+cors_origins = ["https://angie.example.com"]
 
 [api.oidc]
 enabled = true
-issuer = "https://auth.comp.bergco.net/application/o/angie-oidc/"
+issuer = "https://auth.example.com/application/o/angie-oidc/"
 client_id = "angie"
-redirect_uris = ["https://angie.comp.bergco.net/auth/callback"]
+redirect_uris = ["https://angie.example.com/auth/callback"]
 # owner_groups = ["sbxloop Owners"]   # optional: roles follow Authentik groups
 # admin_groups = ["sbxloop Admins"]
 # allowed_groups = ["sbxloop Users", "sbxloop Admins", "sbxloop Owners"]

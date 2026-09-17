@@ -15,7 +15,7 @@ import pytest
 from pydantic import BaseModel
 
 from sbxloop.chatservices import CHAT_SERVICES
-from sbxloop.config import Config, load_config, load_secrets_env
+from sbxloop.config import RESERVED_ENV_KEYS, Config, load_config, load_secrets_env
 from sbxloop.data import DEFAULT_CONFIG_TOML, config_presets, render_config_template
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -340,6 +340,7 @@ CREDENTIAL_ENVS = {
     "GITLAB_TOKEN",
     "GITEA_TOKEN",
     "DISCORD_BOT_TOKEN",
+    "SBXLOOP_OIDC_CLIENT_SECRET",
 }
 
 
@@ -386,6 +387,8 @@ def test_env_example_sbxloop_overrides_name_real_config_keys() -> None:
         if not name.startswith("SBXLOOP_"):
             continue
         remainder = name[len("SBXLOOP_") :].lower()
+        if remainder in RESERVED_ENV_KEYS:
+            continue  # a credential or worker variable, never a setting
         dotted = remainder.replace("__", ".")
         assert dotted in known, f"{name} is not a config key ({dotted})"
         seen += 1
@@ -559,7 +562,10 @@ def test_every_commented_key_is_a_real_config_key() -> None:
                 "slack": {"channel_id": "C0123ABCDEF"},
             }
         else:
-            doc = {section: parsed}
+            # A nested table such as `[api.oidc]` nests the same way.
+            doc = parsed
+            for part in reversed(section.split(".")):
+                doc = {part: doc}
         Config.model_validate(doc)
         checked += 1
     assert checked > 50, f"expected the example to document many keys, saw {checked}"

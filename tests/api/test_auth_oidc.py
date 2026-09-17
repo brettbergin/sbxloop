@@ -5,7 +5,8 @@ The browser runs Authorization Code + PKCE and hands the code to
 redeems it, validates the ID token, provisions the user on first sign-in
 and answers with its own token pair. ``GET /v1/auth/providers`` tells a
 signed-out client what it may offer. The provider here is a stub behind the
-module's HTTP seam, signing with a local RSA key: no network is used.
+module's HTTP seam, signing with a local RSA key; only the redirect tests
+open loopback servers, to drive the real transport.
 """
 
 from __future__ import annotations
@@ -805,3 +806,197 @@ def test_discovery_is_cached(served: Api, idp: FakeIdP) -> None:
     assert len(discovery) == 1
     assert len(jwks) == 1
     assert all(r["headers"].get("Authorization") is None for r in discovery + jwks)
+
+
+# -- the provider transport never follows a redirect --------------------------------
+
+
+class _Recorder:
+    """A loopback HTTP server that answers each path from ``routes`` and
+    records every request it receives."""
+
+    def __init__(self, routes: dict[str, tuple[int, dict[str, str], bytes]]) -> None:
+        import http.server
+        import threading
+
+        self.routes = routes
+        self.seen: list[dict[str, Any]] = []
+        recorder = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def _answer(self) -> None:
+                length = int(self.headers.get("Content-Length") or 0)
+                recorder.seen.append(
+                    {
+                        "method": self.command,
+                        "path": self.path,
+                        "headers": dict(self.headers),
+                        "body": self.rfile.read(length) if length else b"",
+                    }
+                )
+                status, headers, body = recorder.routes.get(self.path, (404, {}, b"{}"))
+                self.send_response(status)
+                for name, value in headers.items():
+                    self.send_header(name, value)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            do_GET = _answer
+            do_POST = _answer
+
+            def log_message(self, format: str, *args: Any) -> None:
+                pass
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self) -> _Recorder:
+        self.thread.start()
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.fixture
+def no_proxy(monkeypatch: pytest.MonkeyPatch) -> None:
+    for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+
+
+@pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
+def test_the_transport_returns_a_redirect_instead_of_following_it(
+    no_proxy: None, status: int
+) -> None:
+    with _Recorder({}) as elsewhere:
+        target = f"{elsewhere.base}/capture"
+        with _Recorder({"/token": (status, {"Location": target}, b"")}) as provider:
+            got, _ = oidc._urllib_request(
+                "POST",
+                f"{provider.base}/token",
+                headers={"Authorization": "Basic c2VjcmV0", "Content-Type": "text/plain"},
+                body=b"client_secret=" + SECRET.encode(),
+                timeout=5.0,
+            )
+    assert got == status
+    assert elsewhere.seen == []
+
+
+def _live_provider(provider: _Recorder, elsewhere: _Recorder, **routes: Any) -> None:
+    issuer = f"{provider.base}/o/"
+    moved = (302, {"Location": f"{elsewhere.base}/capture"}, b"")
+    document = {
+        "issuer": issuer,
+        "authorization_endpoint": f"{provider.base}/authorize",
+        "token_endpoint": f"{provider.base}/token",
+        "jwks_uri": f"{provider.base}/jwks",
+        "token_endpoint_auth_methods_supported": ["client_secret_basic"],
+    }
+    provider.routes.update(
+        {
+            "/o/.well-known/openid-configuration": (200, {}, json.dumps(document).encode()),
+            "/jwks": (200, {}, json.dumps({"keys": []}).encode()),
+            "/token": (200, {}, b"{}"),
+        }
+    )
+    for path, redirected in routes.items():
+        if redirected:
+            provider.routes[path] = moved
+
+
+def _live_config(provider: _Recorder) -> ApiOidcConfig:
+    return ApiOidcConfig.model_validate(
+        {
+            **OIDC,
+            "issuer": f"{provider.base}/o/",
+            "redirect_uris": ["http://localhost:3000/auth/callback"],
+            "request_timeout_s": 5.0,
+        }
+    )
+
+
+def test_a_redirected_discovery_is_reported_unavailable(no_proxy: None) -> None:
+    with _Recorder({}) as elsewhere, _Recorder({}) as provider:
+        _live_provider(provider, elsewhere)
+        provider.routes["/o/.well-known/openid-configuration"] = (
+            302,
+            {"Location": f"{elsewhere.base}/capture"},
+            b"",
+        )
+        live = oidc.OidcProvider(_live_config(provider), clock=lambda: 0.0, env={})
+        with pytest.raises(oidc.OidcUnavailable) as caught:
+            live.discovery()
+    assert caught.value.status == 503
+    assert caught.value.code == "oidc_unavailable"
+    assert elsewhere.seen == []
+
+
+def test_a_redirected_key_set_is_reported_unavailable(no_proxy: None) -> None:
+    with _Recorder({}) as elsewhere, _Recorder({}) as provider:
+        _live_provider(provider, elsewhere, **{"/jwks": True})
+        live = oidc.OidcProvider(_live_config(provider), clock=lambda: 0.0, env={})
+        with pytest.raises(oidc.OidcUnavailable) as caught:
+            live._key_set(live.discovery().jwks_uri, refresh=False)
+    assert caught.value.code == "oidc_unavailable"
+    assert elsewhere.seen == []
+
+
+def test_a_redirected_token_endpoint_fails_without_replaying_the_secret(no_proxy: None) -> None:
+    with _Recorder({}) as elsewhere, _Recorder({}) as provider:
+        _live_provider(provider, elsewhere, **{"/token": True})
+        env = {"SBXLOOP_OIDC_CLIENT_SECRET": SECRET}
+        live = oidc.OidcProvider(_live_config(provider), clock=lambda: 0.0, env=env)
+        with pytest.raises(oidc.OidcError) as caught:
+            live.exchange(
+                code="auth-code-1",
+                code_verifier=VERIFIER,
+                redirect_uri="http://localhost:3000/auth/callback",
+                nonce=NONCE,
+            )
+    assert caught.value.status == 401
+    assert caught.value.code == "oidc_exchange_failed"
+    assert [r["path"] for r in provider.seen if r["method"] == "POST"] == ["/token"]
+    assert elsewhere.seen == []
+
+
+def test_a_redirect_from_the_provider_is_refused_through_the_api(served: Api, idp: FakeIdP) -> None:
+    idp.identity("alice")
+    idp.token_status = 302
+    _refused(served, 401, "oidc_exchange_failed")
+    assert len(idp.token_requests()) == 1
+
+
+# -- the operator documentation ------------------------------------------------------
+
+
+def _doc_section(path: Path, heading: str) -> str:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    start = lines.index(heading)
+    level = len(heading.split(" ", 1)[0])
+    fenced = False
+    for end in range(start + 1, len(lines)):
+        line = lines[end]
+        if line.startswith("```"):
+            fenced = not fenced
+        elif not fenced and line.startswith("#") and len(line.split(" ", 1)[0]) <= level:
+            return "\n".join(lines[start:end])
+    return "\n".join(lines[start:])
+
+
+@pytest.mark.parametrize(
+    ("doc", "heading"),
+    [
+        ("user-guide.md", "#### Sign in with an OIDC provider (Authentik)"),
+        ("api.md", "### Sign-in through an OpenID Connect provider"),
+    ],
+)
+def test_the_oidc_docs_speak_to_operators_only(doc: str, heading: str) -> None:
+    root = Path(__file__).resolve().parents[2]
+    section = _doc_section(root / "docs" / doc, heading).lower()
+    for note in ("field-unverified", "unverified:", "todo", "fixme", "note to", "the lead"):
+        assert note not in section, note
+    assert "example.com" in section
