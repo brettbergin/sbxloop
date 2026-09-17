@@ -65,8 +65,10 @@
   channel's owner or a workspace admin (otherwise 403 `channel_forbidden`).
   Channels report `visibility`, `created_by`, `silenced_until` and the
   caller's `my_role`, and `PATCH /v1/channels/{id}` accepts `visibility`.
-  New routes list, add and remove channel members (the last owner cannot
-  leave while others remain) and list, add, update and remove the agents
+  New routes list, add and remove channel members; adding a current member
+  with an explicit, different role changes that role in place (200), so an
+  owner can hand over ownership (the last owner cannot leave while others
+  remain, nor step down); and list, add, update and remove the agents
   taking part; mentioning an agent adds it. Participants report whether they
   are idle, thinking or working, and member, participant and activity
   changes are recorded as events. Advertised as

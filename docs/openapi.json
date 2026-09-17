@@ -7721,7 +7721,7 @@
         ]
       },
       "post": {
-        "description": "Add a workspace member to the channel; takes managing the channel.",
+        "description": "Add a workspace member to the channel (201); takes managing the\nchannel. An explicit ``role`` for a current member with another role\nchanges it in place (200).",
         "operationId": "add_channel_member_v1_channels__channel_id__members_post",
         "parameters": [
           {
@@ -7745,6 +7745,16 @@
           "required": true
         },
         "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelMemberOut"
+                }
+              }
+            },
+            "description": "A current member's role changed"
+          },
           "201": {
             "content": {
               "application/json": {

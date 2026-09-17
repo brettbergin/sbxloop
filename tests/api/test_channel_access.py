@@ -277,6 +277,56 @@ def test_members_are_added_removed_and_may_leave(api: Any) -> None:
     ]
 
 
+def test_an_owner_promotes_a_current_member_and_then_leaves(api: Any) -> None:
+    owner, guest, admin = _people(api)
+    owner_id, guest_id, admin_id = (_user_id(api, h) for h in (owner, guest, admin))
+    channel_id = _channel(api, owner)
+    members = f"/v1/channels/{channel_id}/members"
+    added = api.client.post(members, headers=owner, json={"user_id": guest_id})
+    assert added.status_code == 201, added.text
+    joined_at = added.json()["joined_at"]
+
+    # A plain member cannot promote themselves.
+    refused = api.client.post(members, headers=guest, json={"user_id": guest_id, "role": "owner"})
+    assert refused.status_code == 403
+    assert refused.json()["code"] == "channel_forbidden"
+
+    # An explicit, different role for a current member changes it in place.
+    promoted = api.client.post(members, headers=owner, json={"user_id": guest_id, "role": "owner"})
+    assert promoted.status_code == 200, promoted.text
+    assert promoted.json()["role"] == "owner"
+    assert promoted.json()["joined_at"] == joined_at
+    listed = api.client.get(members, headers=guest).json()["data"]
+    assert {m["user_id"]: m["role"] for m in listed} == {owner_id: "owner", guest_id: "owner"}
+
+    # Nothing to change, or no role given: still already a member.
+    for body in ({"user_id": guest_id, "role": "owner"}, {"user_id": guest_id}):
+        again = api.client.post(members, headers=owner, json=body)
+        assert again.status_code == 409
+        assert again.json()["code"] == "already_channel_member"
+
+    # With another owner in place, the first owner may leave.
+    assert api.client.delete(f"{members}/{owner_id}", headers=owner).status_code == 204
+    assert api.client.get(f"/v1/channels/{channel_id}", headers=guest).json()["my_role"] == "owner"
+
+    # The last owner cannot step down, alone or with others in the channel.
+    step_down = {"user_id": guest_id, "role": "member"}
+    alone = api.client.post(members, headers=guest, json=step_down)
+    assert alone.status_code == 409
+    assert alone.json()["code"] == "last_channel_owner"
+    assert api.client.post(members, headers=guest, json={"user_id": admin_id}).status_code == 201
+    with_others = api.client.post(members, headers=guest, json=step_down)
+    assert with_others.status_code == 409
+    assert with_others.json()["code"] == "last_channel_owner"
+
+    assert _events(api, "collaboration.member.") == [
+        ("collaboration.member.added", {"channel_id": channel_id, "user_id": guest_id}),
+        ("collaboration.member.updated", {"channel_id": channel_id, "user_id": guest_id}),
+        ("collaboration.member.removed", {"channel_id": channel_id, "user_id": owner_id}),
+        ("collaboration.member.added", {"channel_id": channel_id, "user_id": admin_id}),
+    ]
+
+
 def test_an_admin_manages_members_of_a_workspace_channel(api: Any) -> None:
     owner, guest, admin = _people(api)
     guest_id = _user_id(api, guest)

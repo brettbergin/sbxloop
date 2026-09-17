@@ -1218,28 +1218,39 @@ async def list_channel_members(
     return ChannelMemberPage(data=[_channel_member_out(value) for value in members])
 
 
-@router.post("/channels/{channel_id}/members", response_model=ChannelMemberOut, status_code=201)
+@router.post(
+    "/channels/{channel_id}/members",
+    response_model=ChannelMemberOut,
+    status_code=201,
+    responses={200: {"model": ChannelMemberOut, "description": "A current member's role changed"}},
+)
 async def add_channel_member(
     channel_id: str,
     body: ChannelMemberCreate,
+    response: Response,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
     member: Member = Depends(current_member),  # noqa: B008
 ) -> ChannelMemberOut:
-    """Add a workspace member to the channel; takes managing the channel."""
+    """Add a workspace member to the channel (201); takes managing the
+    channel. An explicit ``role`` for a current member with another role
+    changes it in place (200)."""
     try:
-        added = await ctx.call(
+        entry, added = await ctx.call(
             ctx.collaboration.add_channel_member,
             member,
             channel_id,
             body.user_id,
             body.role,
             ctx.clock(),
+            change_role="role" in body.model_fields_set,
         )
     except CollaborationError as exc:
         raise _problem(exc) from exc
+    if not added:
+        response.status_code = 200
     ctx.hub.notify()
-    return _channel_member_out(added)
+    return _channel_member_out(entry)
 
 
 @router.delete("/channels/{channel_id}/members/{user_id}", status_code=204)

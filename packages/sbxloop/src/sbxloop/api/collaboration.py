@@ -398,6 +398,20 @@ def _my_role(session: Any, channel_id: str, member: Member | None) -> ChannelRol
     return None if member is None else ChannelAccess.role(session, channel_id, member.user.id)
 
 
+def _other_owner(session: Any, channel_id: str, user_id: str) -> bool:
+    """Whether the channel has an owner besides ``user_id``."""
+    found = session.scalar(
+        select(ChannelMemberRow.user_id)
+        .where(
+            ChannelMemberRow.channel_id == channel_id,
+            ChannelMemberRow.user_id != user_id,
+            ChannelMemberRow.role == "owner",
+        )
+        .limit(1)
+    )
+    return found is not None
+
+
 def _channel_member(row: ChannelMemberRow, user: LocalUserRow) -> ChannelMember:
     return ChannelMember(
         channel_id=str(row.channel_id),
@@ -1436,17 +1450,41 @@ class CollaborationStore:
         user_id: str,
         role: ChannelRole,
         now: float,
-    ) -> ChannelMember:
-        """Add a workspace member to the channel (manage permission)."""
+        *,
+        change_role: bool = False,
+    ) -> tuple[ChannelMember, bool]:
+        """Add a workspace member to the channel (manage permission), and
+        whether they were added. With ``change_role``, a current member
+        whose role differs gets ``role`` instead; the last owner cannot step
+        down. Anything else about a current member is
+        ``already_channel_member``."""
         with self.dstore.transaction() as session:
             _, member = _access(session, channel_id, viewer, "manage", now=now)
             target = _member_in(session, user_id)
             if target is None or not target.user.active:
                 raise CollaborationError("user_not_found", "no such workspace member")
-            if session.get(ChannelMemberRow, (channel_id, user_id)) is not None:
-                raise CollaborationError(
-                    "already_channel_member", "the user is already in this channel"
+            existing = session.get(ChannelMemberRow, (channel_id, user_id))
+            if existing is not None:
+                if not change_role or existing.role == role:
+                    raise CollaborationError(
+                        "already_channel_member", "the user is already in this channel"
+                    )
+                if existing.role == "owner" and not _other_owner(session, channel_id, user_id):
+                    raise CollaborationError(
+                        "last_channel_owner",
+                        "make someone else an owner before the last owner steps down",
+                    )
+                existing.role = role
+                session.flush()
+                _event(
+                    session,
+                    "collaboration.member.updated",
+                    now,
+                    data={"channel_id": channel_id, "user_id": user_id},
                 )
+                user = session.get(LocalUserRow, user_id)
+                assert user is not None  # nosec B101 - an active workspace member
+                return _channel_member(existing, user), False
             ChannelAccess.join(
                 session,
                 channel_id,
@@ -1458,7 +1496,7 @@ class CollaborationStore:
             row = session.get(ChannelMemberRow, (channel_id, user_id))
             user = session.get(LocalUserRow, user_id)
             assert row is not None and user is not None  # nosec B101 - inserted above
-            return _channel_member(row, user)
+            return _channel_member(row, user), True
 
     def remove_channel_member(
         self, viewer: Viewer, channel_id: str, user_id: str, now: float

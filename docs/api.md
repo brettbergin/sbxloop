@@ -410,15 +410,18 @@ belongs to plus every workspace channel. The rules:
 
 When `/v1/capabilities` lists `collaboration.channel_members`:
 
-| Route                                        | Needs  | Result                                                                                                  |
-| -------------------------------------------- | ------ | ------------------------------------------------------------------------------------------------------- |
-| `GET /v1/channels/{id}/members`              | read   | `{data: [{user_id, role, joined_at, last_read_sequence, user: {id, username, full_name, avatar_url}}]}` |
-| `POST /v1/channels/{id}/members`             | manage | Body `{user_id, role?}` (`member` by default); `201` with the entry; `409 already_channel_member`       |
-| `DELETE /v1/channels/{id}/members/{user_id}` | manage | `204`; one's own id leaves the channel and needs only read                                              |
+| Route                                        | Needs  | Result                                                                                                                       |
+| -------------------------------------------- | ------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `GET /v1/channels/{id}/members`              | read   | `{data: [{user_id, role, joined_at, last_read_sequence, user: {id, username, full_name, avatar_url}}]}`                      |
+| `POST /v1/channels/{id}/members`             | manage | Body `{user_id, role?}` (`member` by default); `201` with the entry; `200` when a role changed; `409 already_channel_member` |
+| `DELETE /v1/channels/{id}/members/{user_id}` | manage | `204`; one's own id leaves the channel and needs only read                                                                   |
 
-The user must be an active workspace member (`404 user_not_found`). The last
-channel owner cannot leave or be removed while anyone else remains (`409 last_channel_owner`): add another owner first. Changes record
-`collaboration.member.added` and `collaboration.member.removed` events with
+The user must be an active workspace member (`404 user_not_found`). Posting a
+current member with an explicit `role` other than theirs changes that role in
+place and answers `200`; with no `role`, or the role they already have, it is
+`409 already_channel_member`. The last channel owner cannot step down (`409 last_channel_owner`), nor leave or be removed while anyone else remains: make
+another member an owner first. Changes record `collaboration.member.added`,
+`collaboration.member.updated` and `collaboration.member.removed` events with
 `{channel_id, user_id}`.
 
 When `/v1/capabilities` lists `collaboration.participants`, agents are channel
