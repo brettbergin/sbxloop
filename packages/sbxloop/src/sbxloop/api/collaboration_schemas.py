@@ -425,6 +425,12 @@ class ChannelWorkOut(ApiModel):
     artifacts: list[ArtifactRefOut] = Field(default_factory=list)
 
 
+class ChannelArtifactPage(ApiModel):
+    """Every file a channel's messages carry."""
+
+    data: list[ArtifactRefOut]
+
+
 class AuthorOut(ApiModel):
     """Who wrote a message: a person, an agent, or sbxloop itself."""
 
@@ -446,6 +452,9 @@ class MessageOut(ApiModel):
     work: ChannelWorkOut | None = None
     reactions: list[str] = Field(default_factory=list)
     author: AuthorOut | None = None
+    #: Files this message carries, readable by anyone who can read the
+    #: channel (feature ``collaboration.message_artifacts``).
+    artifacts: list[ArtifactRefOut] = Field(default_factory=list)
 
 
 class ReactionSet(ApiModel):

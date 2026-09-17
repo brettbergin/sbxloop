@@ -284,6 +284,45 @@ result written before this field reports an empty list. The feature is
 advertised as `collaboration.message_artifacts`. A code run delivers a pull
 request, so its checkout is never listed and its `artifacts` stays empty.
 
+### Files a channel can see
+
+The same files are attached to the message itself: `MessageOut.artifacts` is
+the list of `{id, run_id, relpath, media_type, size}` that message carries,
+served on `GET /v1/channels/{id}/messages` and empty for every message that
+carries none.
+
+`GET /v1/channels/{id}/artifacts` lists every file the channel's messages
+carry, newest message first, as `{"data": [...]}`, and
+`GET /v1/channels/{id}/artifacts/{artifact_id}/content` serves one file's
+bytes as an attachment. Both take `collaboration:read` and channel read
+permission rather than `artifacts:read`, so a workspace member who can read
+the channel can read the files delivered into it. A file the channel does not
+carry is `404` there whatever else the caller may read.
+`GET /v1/runs/{id}/artifacts`, `GET /v1/artifacts/{id}` and
+`GET /v1/artifacts/{id}/content` are unchanged and still take
+`artifacts:read`. The channel routes are advertised as
+`collaboration.channel_artifacts`.
+
+An agent answering in a channel gets one more host tool,
+`read_channel_artifact(artifact_id, offset=0, limit=64000)`. It is offered to
+every participant, read-only roles included, so a critic can read the file it
+is reviewing. It resolves an id only when a message in *this* channel carries
+it, or when a run this channel admitted produced it; it takes no path, returns
+UTF-8 text with a `[truncated ... call again with offset=N]` marker past the
+window, and answers one metadata line for anything that is not text.
+
+### Channel history and its summary
+
+A turn's prompt carries the channel's history as one JSON object per line:
+`{seq, author_kind, author, role, kind, content}`, plus `artifacts`
+(`{id, name, media_type, size}`) on the messages that carry files. It is
+bounded to 200 messages and 60,000 characters. When anything is dropped, the
+history opens with a `channel_summary` line holding the channel's latest
+summary, so the earlier conversation is compacted rather than lost. The
+summary is written after a turn settles by one tool-less call on the
+concierge's own model (`[concierge] model`); it is best effort, and a channel
+without one simply gets a shorter history.
+
 Discovery lists sbxloop's five native roles: `concierge`, `planner`, `builder`,
 `critic`, and `operator`. Chat resolves their models through the existing
 configuration, using the `concierge`, `decompose`, `build`, `review`, and

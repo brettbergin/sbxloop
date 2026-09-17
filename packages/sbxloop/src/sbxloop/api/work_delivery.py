@@ -380,5 +380,6 @@ def project_work(ctx: Any, channel_id: str | None = None) -> list[dict[str, Any]
             agent_slug=_agent(link),
             work=snapshot,
             now=ctx.clock(),
+            artifacts=artifacts,
         )
     return snapshots

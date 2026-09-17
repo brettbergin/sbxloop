@@ -34,6 +34,7 @@ from sbxloop.api.artifacts import ArtifactCatalog
 from sbxloop.api.auth.keys import SigningKeys
 from sbxloop.api.auth.ratelimit import FailureLimiter
 from sbxloop.api.auth.store import ApiAuthStore
+from sbxloop.api.channel_summary import ChannelSummarizer
 from sbxloop.api.chronology import Chronology
 from sbxloop.api.collaboration import (
     CollaborationError,
@@ -65,6 +66,9 @@ IN_FLIGHT_LIMIT = 8
 #: Page sizes for every collection.
 PAGE_DEFAULT = 50
 PAGE_MAX = 200
+#: The session the history compaction job resumes. Its own lane, so a
+#: summary never queues behind (or ahead of) somebody's conversation.
+SUMMARY_SESSION_KEY = "sbxloop:channel-summary"
 _CONTENT_WORD = re.compile(r"\w+")
 _RUNNER_INTENT = {
     "code": (
@@ -169,6 +173,7 @@ class ApiContext:
         self._collaboration: CollaborationStore | None = None
         self._agents: tuple[Config, AgentRegistry] | None = None
         self._memory: tuple[Config, MemoryService] | None = None
+        self._summaries: ChannelSummarizer | None = None
         self._oidc: tuple[Any, Any] | None = None
         #: Wakes every live stream; the projector, the frontend and the
         #: routes raise it from their own threads.
@@ -213,6 +218,43 @@ class ApiContext:
             )
             self._memory = cached
         return cached[1]
+
+    @property
+    def summaries(self) -> ChannelSummarizer:
+        """The channel history compaction job (S-P15). It runs after a turn
+        settles, on the concierge's own model, so a long conversation keeps
+        a summary of what has fallen out of the history window."""
+        if self._summaries is None:
+            self._summaries = ChannelSummarizer(self.collaboration, self._summarize, self.clock)
+        return self._summaries
+
+    def _summarize(self, prompt: str) -> str:
+        """One cheap, tool-less model call through the concierge's session
+        pool. Raises when there is no concierge, which the job treats as
+        "no summary this time"."""
+        concierge = self.concierge
+        if concierge is None:
+            raise RuntimeError("no concierge to summarise with")
+        reply = concierge.submit_turn(
+            prompt,
+            author="sbxloop",
+            via="local",
+            session_key=SUMMARY_SESSION_KEY,
+            allow_actions=False,
+            read_only=True,
+        ).result()
+        return str(reply.text or "") if reply.ok else ""
+
+    def compact_channel(self, channel_id: str) -> None:
+        """Summarise what has fallen out of a channel's history window.
+
+        Best effort and off the turn's critical path: a failure leaves the
+        watermark alone, so the next settled turn tries again.
+        """
+        try:
+            self.summaries.refresh(channel_id)
+        except Exception:
+            log.warning("collaboration.compaction_failed", channel=channel_id, exc_info=True)
 
     @property
     def oidc(self) -> OidcProvider | None:
@@ -420,6 +462,9 @@ class ApiContext:
             memory_block, agent_tools = self._agent_memory(
                 definition, turn.channel_id, turn.input_message_id, writable=not read_only
             )
+            # The channel's own files, for every participant: a read-only
+            # critic reviewing a delivered file has to be able to read it.
+            channel_tools = self._channel_tools(turn.channel_id)
             persona = (definition.persona if definition else ANGIE_PERSONA) + memory_block
             persona += preference_context
             persona += _RUNNER_INTENT.get(intent, "")
@@ -506,6 +551,7 @@ class ApiContext:
                     channel_id=turn.channel_id,
                     agent_slug=target or ANGIE_SLUG,
                     agent_tools=agent_tools,
+                    channel_tools=channel_tools,
                     work_lead=work_lead,
                     work_roles=work_roles,
                 )
@@ -534,6 +580,23 @@ class ApiContext:
             now=self.clock(),
         )
         self.hub.notify()
+        self.compact_channel(turn.channel_id)
+
+    def _channel_tools(self, channel_id: str) -> tuple[AgentTool, ...]:
+        """The tools over the turn's own channel: today, reading a file
+        that was delivered there (S-P15). A daemon-less context brings
+        nothing, so a turn without a loop is unchanged."""
+        if self.loop is None:
+            return ()
+        try:
+            from sbxloop.api.channel_artifacts import channel_artifact_tools
+
+            return tuple(channel_artifact_tools(self, channel_id))
+        except Exception:
+            log.warning(
+                "collaboration.channel_tools_unavailable", channel=channel_id, exc_info=True
+            )
+            return ()
 
     def _agent_memory(
         self,

@@ -221,6 +221,11 @@ class TurnContext:
     #: The answering agent's own tools (its memory), offered beside the
     #: turn's host tools when the turn may act.
     agent_tools: tuple[AgentTool, ...] = ()
+    #: Tools over the turn's channel itself (reading a file delivered
+    #: there). Unlike ``agent_tools`` these belong to the conversation, not
+    #: to the speaker, so they are offered through the roster's own
+    #: allowlist and a read-only role keeps the ones that only read.
+    channel_tools: tuple[AgentTool, ...] = ()
     #: The channel the turn belongs to, and the lead and the agent per run
     #: role the turn asked for: what work the turn starts is admitted with.
     channel_id: str | None = None
@@ -548,6 +553,10 @@ class Concierge:
         return self._turn.agent_tools
 
     @property
+    def _turn_channel_tools(self) -> tuple[AgentTool, ...]:
+        return self._turn.channel_tools
+
+    @property
     def _turn_work_products(self) -> list[str]:
         return self._turn.work_products
 
@@ -594,6 +603,7 @@ class Concierge:
         channel_id: str | None = None,
         agent_slug: str | None = None,
         agent_tools: Sequence[AgentTool] = (),
+        channel_tools: Sequence[AgentTool] = (),
         work_lead: str | None = None,
         work_roles: Mapping[str, str] | None = None,
     ) -> Future[ConciergeReply]:
@@ -647,6 +657,7 @@ class Concierge:
                 usage_channel_id=channel_id,
                 usage_agent_slug=agent_slug or agent_role,
                 agent_tools=tuple(agent_tools),
+                channel_tools=tuple(channel_tools),
                 channel_id=channel_id,
                 work_lead=work_lead,
                 work_roles=dict(work_roles or {}),
@@ -1207,11 +1218,19 @@ class Concierge:
             "github_get",
             "pr_status",
             "list_issues",
+            # A file delivered into this conversation: a reviewer has to be
+            # able to read what it is reviewing.
+            "read_channel_artifact",
         }
+        offered = dict(self._tools)
+        for tool in self._turn_channel_tools:
+            # Adapted to the roster's (args, by) shape: the tool reads the
+            # channel, so who asked does not change what it may see.
+            offered[tool.spec.name] = HostTool(tool.spec, _as_roster_impl(tool))
         available = (
-            {name: tool for name, tool in self._tools.items() if name in reads}
+            {name: tool for name, tool in offered.items() if name in reads}
             if self._turn_role == "critic" or self._turn_read_only
-            else dict(self._tools)
+            else offered
         )
         if self._turn_handoff is not None:
             required = ["agent_slug", "message"]

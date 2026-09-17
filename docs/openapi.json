@@ -950,6 +950,24 @@
         "title": "Capabilities",
         "type": "object"
       },
+      "ChannelArtifactPage": {
+        "additionalProperties": false,
+        "description": "Every file a channel's messages carry.",
+        "properties": {
+          "data": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactRefOut"
+            },
+            "title": "Data",
+            "type": "array"
+          }
+        },
+        "required": [
+          "data"
+        ],
+        "title": "ChannelArtifactPage",
+        "type": "object"
+      },
       "ChannelCreate": {
         "additionalProperties": false,
         "properties": {
@@ -3407,6 +3425,13 @@
               }
             ],
             "title": "Agent Slug"
+          },
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactRefOut"
+            },
+            "title": "Artifacts",
+            "type": "array"
           },
           "author": {
             "anyOf": [
@@ -8380,6 +8405,99 @@
           }
         },
         "summary": "Update Channel",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/artifacts": {
+      "get": {
+        "description": "Every file this channel's messages carry, newest message first.\n\nChannel read permission, not ``artifacts:read``: a file delivered into\na conversation belongs to the people in it. ``GET /v1/runs/{id}/artifacts``\nis unchanged and still takes ``artifacts:read``.",
+        "operationId": "list_channel_artifacts_v1_channels__channel_id__artifacts_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChannelArtifactPage"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Channel Artifacts",
+        "tags": [
+          "collaboration"
+        ]
+      }
+    },
+    "/v1/channels/{channel_id}/artifacts/{artifact_id}/content": {
+      "get": {
+        "description": "The bytes of one of the channel's files, as an attachment.\n\nResolved through the channel: a file this channel does not carry is\n``404`` whatever else the caller may read, so an id from elsewhere\nnever leaks through here.",
+        "operationId": "download_channel_artifact_v1_channels__channel_id__artifacts__artifact_id__content_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "channel_id",
+            "required": true,
+            "schema": {
+              "title": "Channel Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "artifact_id",
+            "required": true,
+            "schema": {
+              "title": "Artifact Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Download Channel Artifact",
         "tags": [
           "collaboration"
         ]
