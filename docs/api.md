@@ -332,6 +332,18 @@ memory (a soft delete). With `[memory] enabled = false`, `POST` answers
 `.deleted` events that name the memory, its agent and its source channel but
 never its text.
 
+A mentioned agent's chat persona carries the memories it may see in the turn's
+channel (nothing is added when it has none). An agent whose `tools` list names
+`memory`, or a person's own agent with no `tools` list, is also given
+`remember`, `recall` and `forget` in chat; a read-only peer turn gets `recall`
+alone. What it keeps is authored `agent:<slug>` and scoped to the channel and
+message of the turn. Built-in agents and `[[agents]]` entries with no `tools`
+list get no memory tools. In a run, a custom agent's memory block is taken
+when the run is planned and kept across a resume, and an agent whose `tools`
+names `memory` gets the same tools, writing with the run's id and channel.
+With `[memory] enabled = false` no memory reaches a prompt and no tool is
+offered.
+
 Connection credentials remain in sbxloop's environment and configuration.
 These routes report redacted readiness and deliberately reject browser-supplied
 secret mutation until protected credential intake is implemented (#1043).

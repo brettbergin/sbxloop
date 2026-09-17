@@ -39,6 +39,7 @@ from pydantic import BaseModel, Field, TypeAdapter
 
 from sbxloop import toolchains
 from sbxloop.agentmodels import ModelSelection, model_for_phase, refreshed_models, run_model_repo
+from sbxloop.agents.tools import MEMORY_TOOL_GROUP, AgentTool, agent_tool_handler, memory_tools
 from sbxloop.config import Config
 from sbxloop.deliver import pr_conventions
 from sbxloop.engine.harness import ROLE_BY_PHASE, brief_for_phase
@@ -90,6 +91,7 @@ from sbxloop_worker.protocol import (
 
 if TYPE_CHECKING:
     from sbxloop.agents.assignment import AgentAssignment, AgentBinding
+    from sbxloop.agents.memory import MemoryService
 
 OUTPUT_CLIP = 6_000
 REVIEW_RESPONSE_PHASE = "review_response_repair"
@@ -460,8 +462,12 @@ class PhaseRunner:
         store: StateStore | None = None,
         assignment: AgentAssignment | None = None,
         narrow_service: Callable[[Sequence[str]], HostToolSpec | None] | None = None,
+        memory: MemoryService | None = None,
     ) -> None:
         self.agent = agent
+        # Every agent's long-term memory: the tools an agent whose `tools`
+        # name `memory` is given. None (embedders, tests) offers none.
+        self.memory = memory
         # The named agents taking this run's phases, when the host assigned
         # any. A default assignment changes no job and no event: only a
         # custom one credits the agents on what the worker reports.
@@ -657,6 +663,25 @@ class PhaseRunner:
                 narrowed.append(spec)
         return tuple(narrowed)
 
+    def _agent_tools(self, custom: AgentBinding | None) -> list[AgentTool]:
+        """The agent's own tools for one session: its memory, when its
+        ``tools`` name ``memory``. A built-in (no list) gets none, so the
+        default team's jobs are unchanged."""
+        if (
+            self.memory is None
+            or custom is None
+            or custom.tools is None
+            or MEMORY_TOOL_GROUP not in custom.tools
+        ):
+            return []
+        return memory_tools(
+            self.memory,
+            custom.slug,
+            channel_id=None if self.assignment is None else self.assignment.channel_id,
+            run_id=self.run_id,
+            message_id=None,
+        )
+
     def _identity(self, binding: AgentBinding | None) -> dict[str, Any]:
         """The ``submit`` keyword that credits the job to its agent, when
         the run's assignment credits anyone."""
@@ -693,6 +718,11 @@ class PhaseRunner:
         # the verification procedure exactly as much as the builder does, and
         # unlike a service call it reaches nothing outside the host.
         host_tools, tool_handler = self._tools_for(phase, service_tools, custom)
+        agent_tools = self._agent_tools(custom)
+        if agent_tools:
+            assert custom is not None
+            host_tools = (*host_tools, *(tool.spec for tool in agent_tools))
+            tool_handler = agent_tool_handler(agent_tools, tool_handler, agent_slug=custom.slug)
         allowed_tools = None if custom is None else custom.tools
         if (
             phase == "review"

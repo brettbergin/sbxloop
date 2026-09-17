@@ -36,6 +36,7 @@ __all__ = [
     "MemoryBlocks",
     "RunRole",
     "binding_from_definition",
+    "memory_section",
     "plan_assignment",
 ]
 
@@ -235,6 +236,21 @@ class AgentAssignment:
         )
 
 
+def memory_section(block: str) -> str:
+    """A memory block as a section appended to a system message or persona,
+    set off by a blank line; ``""`` for an empty block, so what it is
+    appended to is unchanged."""
+    return "\n\n" + block.lstrip("\n") if block.strip() else ""
+
+
+def _memory_block(memory: MemoryBlocks | None, slug: str, channel_id: str | None) -> str:
+    """The agent's memories visible in ``channel_id``, taken once, when the
+    run is planned: the run keeps this snapshot, resume included."""
+    if memory is None:
+        return ""
+    return memory_section(memory.prompt_block(slug, channel_id=channel_id))
+
+
 def binding_from_definition(
     agent: AgentDefinition,
     role: AgentRoleName,
@@ -249,9 +265,7 @@ def binding_from_definition(
         role=role,
         model=spec.model,
         persona=agent.run_persona(),
-        memory_block=(
-            "" if memory is None else memory.prompt_block(agent.slug, channel_id=channel_id)
-        ),
+        memory_block=_memory_block(memory, agent.slug, channel_id),
         tools=None if spec.tools is None else frozenset(spec.tools),
         credentials=tuple(spec.credentials),
         revision=agent.revision,

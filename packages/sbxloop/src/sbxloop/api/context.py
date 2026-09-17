@@ -20,6 +20,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, TypeVar
 
+from sbxloop.agents.assignment import memory_section
 from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
 from sbxloop.agents.registry import (
     AgentRegistry,
@@ -27,6 +28,7 @@ from sbxloop.agents.registry import (
     addressable,
     default_registry,
 )
+from sbxloop.agents.tools import AgentTool, chat_memory_granted, memory_tools
 from sbxloop.api.agents import ANGIE_PERSONA, ANGIE_SLUG, AgentDefinition
 from sbxloop.api.artifacts import ArtifactCatalog
 from sbxloop.api.auth.keys import SigningKeys
@@ -46,11 +48,14 @@ from sbxloop.api.turns import TurnCoordinator
 from sbxloop.config import Config
 from sbxloop.daemon.controls.service import ControlService
 from sbxloop.errors import ToolRejectedError
+from sbxloop.log import get_logger
 
 if TYPE_CHECKING:
     from sbxloop.api.auth.oidc import OidcProvider
 
 T = TypeVar("T")
+
+log = get_logger(__name__)
 
 #: Threads that run store and loop calls for the routes, and how many may
 #: be in flight at once: a reconnect storm queues behind these rather than
@@ -384,12 +389,16 @@ class ApiContext:
                 if resolved is not None and resolved.slug == target
                 else None
             )
-            persona = (definition.persona if definition else ANGIE_PERSONA) + preference_context
+            read_only = bool(participant.get("read_only")) or target == "critic"
+            memory_block, agent_tools = self._agent_memory(
+                definition, turn.channel_id, turn.input_message_id, writable=not read_only
+            )
+            persona = (definition.persona if definition else ANGIE_PERSONA) + memory_block
+            persona += preference_context
             persona += _RUNNER_INTENT.get(intent, "")
             model = definition.agent.spec.model if definition and definition.agent else None
             # Mentioning a role is explicit delegation in Angie's UI.
             allow_actions = intent in {"delegate", "code", "workload"} or definition is not None
-            read_only = bool(participant.get("read_only")) or target == "critic"
             prompt = content
             if participant.get("parent_index") is not None:
                 parent_index = int(participant["parent_index"])
@@ -468,6 +477,7 @@ class ApiContext:
                     handoff_agents=handoff_agents if allow_actions else None,
                     channel_id=turn.channel_id,
                     agent_slug=target or ANGIE_SLUG,
+                    agent_tools=agent_tools,
                 )
                 reply = future.result()
                 if reply.ok and (reply.text or reply.work_products):
@@ -494,6 +504,42 @@ class ApiContext:
             now=self.clock(),
         )
         self.hub.notify()
+
+    def _agent_memory(
+        self,
+        definition: AgentDefinition | None,
+        channel_id: str,
+        message_id: str | None,
+        *,
+        writable: bool,
+    ) -> tuple[str, tuple[AgentTool, ...]]:
+        """What a mentioned agent brings from its long-term memory into a
+        turn in ``channel_id``: its memory block for the persona (``""``
+        when it has none to show, so the persona is unchanged) and the
+        memory tools, when its agent may have them. A daemon-less context,
+        or a store that cannot answer, brings nothing."""
+        agent = definition.agent if definition is not None else None
+        if agent is None or self.loop is None:
+            return "", ()
+        try:
+            memory = self.memory
+            block = memory.prompt_block(agent.slug, channel_id=channel_id)
+            tools = (
+                memory_tools(
+                    memory,
+                    agent.slug,
+                    channel_id=channel_id,
+                    run_id=None,
+                    message_id=message_id,
+                    writable=writable,
+                )
+                if chat_memory_granted(agent)
+                else []
+            )
+        except Exception:
+            log.warning("collaboration.agent_memory_unavailable", agent=agent.slug, exc_info=True)
+            return "", ()
+        return memory_section(block), tuple(tools)
 
     def service(self) -> ControlService:
         """A service over the loop; one per request, since it collects the

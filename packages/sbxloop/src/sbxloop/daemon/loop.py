@@ -40,6 +40,7 @@ from typing import Any, NamedTuple, Protocol, cast
 from zoneinfo import ZoneInfo
 
 from sbxloop import __version__, hostgit
+from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
 from sbxloop.config import Config, GithubConfig, SandboxConfig, ScheduleConfig
 from sbxloop.daemon.controls.eligibility import Subject, check as check_eligibility
 from sbxloop.daemon.controls.generation import (
@@ -2436,6 +2437,14 @@ class DaemonLoop:
             # This daemon watches the item's repository, so a follow-up issue
             # can honestly say which label queues it (#631).
             trigger_label=self.config.labels_for(self._item_repo(item)).trigger,
+            # The agents' long-term memory lives in the daemon's store: an
+            # agent whose `tools` name `memory` remembers and recalls there.
+            memory=MemoryService(
+                self.dstore,
+                WorkspaceChannelVisibility(self.dstore),
+                item_config.memory,
+                self.clock,
+            ),
         )
         handle = RunHandle(
             item,

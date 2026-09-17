@@ -58,6 +58,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol, cast, get_args
 
 from sbxloop.agentmodels import ModelSelection, model_for_phase, refreshed_models
+from sbxloop.agents.tools import AgentTool
 from sbxloop.cli.tui import format_event
 from sbxloop.config import SINK_NAMES, BridgeBackend, Config, ScheduleConfig
 from sbxloop.configedit import ConfigEditError, ConfigEditor, keys as configkeys
@@ -217,6 +218,9 @@ class TurnContext:
     #: pool: the product channel it answers and the agent that speaks.
     usage_channel_id: str | None = None
     usage_agent_slug: str | None = None
+    #: The answering agent's own tools (its memory), offered beside the
+    #: turn's host tools when the turn may act.
+    agent_tools: tuple[AgentTool, ...] = ()
     work_products: list[str] = field(default_factory=list)
     #: The sandbox generation of the turn's last session call, so a failure
     #: is blamed on the box it happened in.
@@ -287,6 +291,15 @@ ToolImpl = Callable[[dict[str, Any], str], str]
 class HostTool(NamedTuple):
     spec: HostToolSpec
     impl: ToolImpl
+
+
+def _as_roster_impl(tool: AgentTool) -> ToolImpl:
+    """An agent tool in the roster's ``(args, by)`` shape."""
+
+    def impl(args: dict[str, Any], _by: str) -> str:
+        return tool.impl(args)
+
+    return impl
 
 
 def compose_issue_body(args: Mapping[str, Any]) -> str:
@@ -526,6 +539,10 @@ class Concierge:
         return self._turn.code_work
 
     @property
+    def _turn_agent_tools(self) -> tuple[AgentTool, ...]:
+        return self._turn.agent_tools
+
+    @property
     def _turn_work_products(self) -> list[str]:
         return self._turn.work_products
 
@@ -571,6 +588,7 @@ class Concierge:
         handoff_agents: Sequence[str] | None = None,
         channel_id: str | None = None,
         agent_slug: str | None = None,
+        agent_tools: Sequence[AgentTool] = (),
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
@@ -583,7 +601,9 @@ class Concierge:
         ``handoff_agent`` may address (the built-ins when omitted).
         ``channel_id`` and ``agent_slug`` are where the turn's reported
         usage is charged in the workspace budget pool: the product channel
-        it answers and the agent that speaks (the role when unset)."""
+        it answers and the agent that speaks (the role when unset);
+        ``agent_tools`` are the answering agent's own tools (its memory),
+        offered only when the turn may act."""
         if agent_role not in {*ROLE_BY_PHASE.values(), "concierge"}:
             raise ValueError("unknown chat agent role")
         with self._state_lock:
@@ -616,6 +636,7 @@ class Concierge:
                 code_work=on_code_work,
                 usage_channel_id=channel_id,
                 usage_agent_slug=agent_slug or agent_role,
+                agent_tools=tuple(agent_tools),
             )
             token = _CURRENT_TURN.set(context)
             try:
@@ -1222,6 +1243,10 @@ class Concierge:
                 ),
                 self._tool_handoff,
             )
+        for tool in self._turn_agent_tools:
+            # Adapted to the roster's (args, by) shape; the agent acts as
+            # itself, so who asked does not change what it keeps.
+            available[tool.spec.name] = HostTool(tool.spec, _as_roster_impl(tool))
         return available
 
     def _tool_handoff(self, args: dict[str, Any], _by: str) -> str:

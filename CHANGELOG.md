@@ -2,6 +2,20 @@
 
 ### Added
 
+- **Agents use their long-term memory in chat and in runs.** A mentioned
+  agent's chat persona now carries the memories it may see in that channel
+  (nothing changes for an agent with none). An agent whose `tools` list
+  names `memory`, or a person's own agent with no `tools` list, can call
+  `remember`, `recall` and `forget`; what it keeps is written as
+  `agent:<slug>` in the turn's channel, `recall` returns only what that
+  channel may see, and a read-only peer turn gets `recall` alone. A run's
+  agent assignment snapshots each agent's memory block when it is planned
+  and keeps it across a resume, and an agent in a run whose `tools` names
+  `memory` gets the same three tools, writing with the run's id and
+  channel. Built-in agents are given no memory tools, so the shipped team's
+  prompts and tools are unchanged. `[memory] enabled = false` turns all of
+  it off.
+
 - **Owners and admins can manage the workspace's people.** `GET /v1/users`
   lists every member with role, standing, sign-in source and last-seen time
   for any member to read. `PATCH` and `DELETE /v1/workspace/members/{user_id}`
@@ -131,8 +145,7 @@
   `[memory]` section bounds how many each agent keeps (the oldest unpinned
   is dropped), how long one may be and how much a prompt may carry, and can
   turn the feature off. Changes are recorded as `agent.memory.*` events
-  without the text. Nothing reads memories into prompts yet, and agents
-  have no memory tools yet.
+  without the text.
 
 - **A run can be given named agents.** The engine takes an optional agent
   assignment (a lead, the agent in each run role, and optionally the agent
