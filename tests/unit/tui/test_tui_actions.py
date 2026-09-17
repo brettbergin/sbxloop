@@ -180,9 +180,9 @@ class TestRunVerbs:
         # The bar said "not current" (current=False) but the daemon drives
         # it: ctl, never the store write that would settle it as a failure.
         stale = actions.cancel_run(deps, record, current=False)
-        assert stale.run().ok and sent(deps) == ["cancel"]
+        assert stale.run().ok and sent(deps) == ["cancel-run r_live"]
         assert actions.cancel_run(deps, record, current=True, retry=True).run().ok
-        assert sent(deps)[-1] == "cancel --retry"
+        assert sent(deps)[-1] == "cancel-run r_live --retry"
 
         class Busy(FakeCtl):
             def submit(self, cmd: str, *, timeout_s: float = 30.0) -> CommandReply | None:
@@ -204,6 +204,20 @@ class TestRunVerbs:
         assert done is not None
         refused = actions.cancel_run(idle, done, current=False).run()
         assert not refused.ok and "already merged" in refused.text
+
+    def test_cancel_names_the_selected_run_when_several_are_live(self, seeded: Path) -> None:
+        """With two runs in flight the oldest is the daemon's "current";
+        cancelling the newer one must stop that run, not the oldest."""
+        older = {"item_id": "gh:issue:40", "run_id": "r_older", "title": "Older"}
+        newer = {"item_id": "gh:issue:41", "run_id": "r_live", "title": "Add retries"}
+        status = live_status(current=older, runs=[older, newer])
+        deps = make_deps(seeded, ctl=FakeCtl(status))
+        record = deps.mailbox.run("r_live")
+        assert record is not None
+        assert actions.cancel_run(deps, record, current=True).run().ok
+        assert sent(deps) == ["cancel-run r_live"]
+        assert actions.cancel_run(deps, record, current=True, retry=True).run().ok
+        assert sent(deps)[-1] == "cancel-run r_live --retry"
 
     def test_resume_and_run_spawn_detached_processes(self, seeded: Path) -> None:
         runner = FakeRunner()

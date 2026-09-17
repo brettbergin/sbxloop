@@ -220,6 +220,14 @@ class Inbound:
     parent_channel_id: str | None = None
 
 
+class _LiveRun(NamedTuple):
+    """A run in flight: the engine steering reaches and the bus
+    subscription its events arrive through."""
+
+    engine: LoopEngine
+    unsubscribe: Callable[[], None]
+
+
 class _Pending:
     """A steering message awaiting its chat.reply. ``status`` is the bridge's
     own "⏳ queued …" note under it, edited in place as the run moves."""
@@ -361,12 +369,11 @@ class ChatBridge(ABC):
         self._events: queue.SimpleQueue[tuple[str, Any]] = queue.SimpleQueue()
         self._drained: asyncio.Event | None = None
         self._drain_wait_s = DRAIN_WAIT_S
-        self._unsubscribe: Callable[[], None] | None = None
-        self._active_run: str | None = None
-        self._active_item: WorkItem | None = None
-        self._engine: LoopEngine | None = None
-        # run_id -> item for every run whose events may still be queued. The
-        # active pair above says "steering is possible"; this says "we can
+        # run_id -> every run in flight (several with `[daemon]
+        # max_concurrent_runs` above 1); each finish removes only its own.
+        self._live: dict[str, _LiveRun] = {}
+        # run_id -> item for every run whose events may still be queued.
+        # `_live` says "steering is possible"; this says "we can
         # still post the headline" — a short run (--once) can finish before
         # the pump ever sees its first event, and its chronology must not
         # be dropped for lack of an item.
@@ -723,12 +730,13 @@ class ChatBridge(ABC):
 
     def run_started(self, item: WorkItem, run_id: str, engine: LoopEngine, bus: EventBus) -> None:
         with self._lock:
-            self._active_run = run_id
-            self._active_item = item
             self._items[run_id] = item
-            self._engine = engine
             # Non-blocking subscriber: just enqueue; the pump renders + sends.
-            self._unsubscribe = bus.subscribe(lambda ev: self._events.put((run_id, ev)))
+            unsubscribe = bus.subscribe(lambda ev: self._events.put((run_id, ev)))
+            previous = self._live.get(run_id)
+            self._live[run_id] = _LiveRun(engine, unsubscribe)
+        if previous is not None:
+            previous.unsubscribe()
         if item.requested_by and self._owns_user_id(item.requested_by):
             # Whoever asked for the work through the concierge is pinged with
             # the outcome without having to ask for a watch — by the bridge
@@ -758,14 +766,12 @@ class ChatBridge(ABC):
 
     def run_finished(self, item: WorkItem, report: RunReport) -> None:
         with self._lock:
-            unsubscribe, self._unsubscribe = self._unsubscribe, None
-            self._active_run = None
-            self._active_item = None
-            # Drop the handle with the run: the liveness check below is the
-            # gate, but a finished run's engine has no business being reachable.
-            self._engine = None
-        if unsubscribe is not None:
-            unsubscribe()
+            # Drop the handle with the run: the liveness check is the gate,
+            # but a finished run's engine has no business being reachable.
+            # Only this run's entry: another run may still be in flight.
+            live = self._live.pop(report.run_id, None)
+        if live is not None:
+            live.unsubscribe()
         state = report.state
         # Which steers went unanswered is decided by the pump in ``_finish``,
         # AFTER it has drained the events queued ahead of this marker: a
@@ -863,9 +869,8 @@ class ChatBridge(ABC):
             self.log.debug("chat.steer_unknown_thread", thread=thread_id)
             return
         with self._lock:
-            live = run_id == self._active_run
-            engine = self._engine
-        if not live or engine is None:
+            live = self._live.get(run_id)
+        if live is None:
             self.log.info(
                 "chat.steer_rejected",
                 run=run_id,
@@ -882,7 +887,7 @@ class ChatBridge(ABC):
             # clock for a steer nothing will ever answer.
             self._ack(msg, ACK_FAILED)
             return
-        mid = engine.post_user_message(text)
+        mid = live.engine.post_user_message(text)
         self.log.info(
             "chat.steer",
             run=run_id,
@@ -2456,8 +2461,10 @@ class ChatBridge(ABC):
     def _recorded_agent_ident(self, run_id: str) -> AgentIdent | None:
         """The backend+model persisted with ``run_id``, or None when this
         bridge has no engine store to ask (the common in-flight case)."""
-        engine = self._engine
-        store = getattr(engine, "store", None)
+        with self._lock:
+            live = self._live.get(run_id) or next(iter(self._live.values()), None)
+        # Every engine of this daemon reads the same run store.
+        store = getattr(live.engine if live else None, "store", None)
         get_config = getattr(store, "get_run_config", None)
         if get_config is None:
             return None

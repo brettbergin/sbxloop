@@ -395,6 +395,13 @@ class DaemonLoop:
         # Breaker state lives in the store: a crash-restart loop must not
         # reset it (#254). These attributes are the write-through cache.
         self._breaker_opened_at, self._consecutive_failures = self.dstore.breaker()
+        # Half-open (a breaker past its cooldown, or a provider hold past its
+        # wait) lets one probe run through: the run id each probe became,
+        # until it settles. While a probe is live nothing else launches.
+        self._breaker_half_open = False
+        self._breaker_probe: str | None = None
+        self._provider_half_open = False
+        self._provider_probe: str | None = None
         self._last_cap_log = 0.0
         self._last_idle_kind: str | None = None
         # Poll backoff: consecutive failures and the earliest next poll, so a
@@ -1585,6 +1592,7 @@ class DaemonLoop:
                 return self._nothing_to_run(now, discovered, waits)
             dispatched, item_outcome = self._start_item(item, now)
             launched.append(dispatched)
+            self._bind_probes(dispatched)
             if outcome is None:
                 outcome = item_outcome
             if self._serial:
@@ -1606,8 +1614,26 @@ class DaemonLoop:
         provider_hold = self._provider_recovery().hold()
         if provider_hold is not None and provider_hold.blocked(now):
             return TickResult(idle_kind="provider_held", idle_detail=provider_hold.summary())
+        # A hold past its wait stays active until a call succeeds: one probe.
+        self._provider_half_open = provider_hold is not None
+        self._provider_probe = self._live_probe(self._provider_probe)
+        if provider_hold is None:
+            self._provider_probe = None
+        elif self._provider_probe is not None:
+            return TickResult(
+                idle_kind="provider_held",
+                idle_detail=(
+                    f"{provider_hold.summary()}; probe run {self._provider_probe} in flight"
+                ),
+            )
         if self._breaker_open(now):
             return TickResult(idle_kind="breaker")
+        self._breaker_probe = self._live_probe(self._breaker_probe)
+        if self._breaker_half_open and self._breaker_probe is not None:
+            return TickResult(
+                idle_kind="breaker",
+                idle_detail=f"half-open; probe run {self._breaker_probe} in flight",
+            )
         day_start, day_end = day_window(now, self.config.daemon.run_cap_timezone)
         started_today = self.dstore.runs_started_since(day_start)
         if started_today < self.config.daemon.max_runs_per_day:
@@ -3784,7 +3810,29 @@ class DaemonLoop:
             except Exception:
                 log.warning("frontend.gate_resolved_failed", run=run_id, exc_info=True)
 
+    def _live_probe(self, run_id: str | None) -> str | None:
+        """``run_id`` while that run is still in flight, else ``None``."""
+        if run_id is None or all(handle.run_id != run_id for handle in self.runs):
+            return None
+        return run_id
+
+    def _bind_probes(self, item_id: str) -> None:
+        """The run just launched for ``item_id`` is the probe of a half-open
+        breaker or provider hold that has none yet. An item that settled at
+        once is no probe: the next launch becomes it."""
+        handle = next((h for h in self.runs if h.item.item_id == item_id), None)
+        if handle is None:
+            return
+        if self._breaker_half_open and self._breaker_probe is None:
+            self._breaker_probe = handle.run_id
+        if self._provider_half_open and self._provider_probe is None:
+            self._provider_probe = handle.run_id
+
     def _set_breaker(self, opened_at: float | None, consecutive_failures: int) -> None:
+        # Any transition ends a half-open window (re-opened, reset, or a
+        # failure counted); the half-open transition itself re-marks it.
+        self._breaker_half_open = False
+        self._breaker_probe = None
         self._breaker_opened_at = opened_at
         self._consecutive_failures = consecutive_failures
         self.dstore.set_breaker(opened_at, consecutive_failures)
@@ -3817,6 +3865,7 @@ class DaemonLoop:
             # Half-open: allow one item through; a success resets, a failure
             # re-opens via the counter.
             self._set_breaker(None, max(self._consecutive_failures - 1, 0))
+            self._breaker_half_open = True
             self._notice(
                 "breaker.half_open",
                 "circuit breaker half-open; allowing one item",

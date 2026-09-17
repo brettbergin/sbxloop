@@ -402,6 +402,56 @@ class TestLiveRunIds:
         assert h.store.get_run("r_orphan").state == "failed"
 
 
+class TestHalfOpenProbe:
+    """A breaker past its cooldown, or a provider hold past its wait, lets
+    one probe run through; the other slots stay empty until it settles."""
+
+    def test_a_half_open_breaker_launches_exactly_one_probe(self, tmp_path: Path) -> None:
+        h = _harness(tmp_path, max_consecutive_failures=2, breaker_cooldown_s=100)
+        gate = Gate(h)
+        h.loop._runner = gate.runner
+        h.loop._set_breaker(h.clock.t - 200, 2)
+        h.source.items = [_item("o/a", "1"), _item("o/b", "2")]
+        try:
+            assert _tick(h).launched == ("gh:o/a:issue:1",)
+            probe = gate.wait_started("gh:o/a:issue:1")
+            # A later tick while the probe runs launches nothing.
+            waiting = _tick(h)
+            assert waiting.launched == () and waiting.idle_kind == "breaker"
+            assert h.dstore.get("gh:o/b:issue:2").state == "queued"  # type: ignore[union-attr]
+            # The probe succeeds: the breaker closes and the slot fills.
+            gate.finish("gh:o/a:issue:1")
+            _join(h, probe)
+            after = _tick(h)
+            assert after.settled == (("gh:o/a:issue:1", "done"),)
+            assert after.launched == ("gh:o/b:issue:2",)
+            assert h.loop.status()["consecutive_failures"] == 0
+        finally:
+            _release_all(h, gate)
+
+    def test_an_expired_provider_hold_launches_exactly_one_probe(self, tmp_path: Path) -> None:
+        from tests.unit.test_provider_recovery import job, rejected
+
+        h = _harness(tmp_path)
+        gate = Gate(h)
+        h.loop._runner = gate.runner
+        recovery = h.loop._provider_recovery()
+        hold = recovery.record(job(run_id="r_held"), rejected("throttle"))
+        assert hold.next_at is not None
+        h.clock.t = hold.next_at + 1
+        h.source.items = [_item("o/a", "1"), _item("o/b", "2")]
+        try:
+            assert _tick(h).launched == ("gh:o/a:issue:1",)
+            gate.wait_started("gh:o/a:issue:1")
+            waiting = _tick(h)
+            assert waiting.launched == () and waiting.idle_kind == "provider_held"
+            # The probe's call succeeds, which releases the hold.
+            recovery.release()
+            assert _tick(h).launched == ("gh:o/b:issue:2",)
+        finally:
+            _release_all(h, gate)
+
+
 class TestKnob:
     def test_default_is_one_run_at_a_time(self, tmp_path: Path) -> None:
         assert Config.model_validate({"home": str(tmp_path)}).daemon.max_concurrent_runs == 1

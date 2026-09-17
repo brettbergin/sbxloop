@@ -20,6 +20,10 @@
   they work, and the next tick settles each one that finished on the loop's
   own thread; cancel and steer address a run by its id, a bare `cancel`
   still means the oldest, and a stop, restart or shutdown covers every run.
+  A circuit breaker past its cooldown, or a provider hold past its wait,
+  still lets exactly one probe run through, and the other slots wait until
+  it settles. The chat bridge relays and steers each run in its own thread,
+  and the console's cancel names the run it was opened on.
   Two code runs never work the same repository at once, and a repository's
   checkout is not refreshed while a run is using it. `status` (and
   `GET /v1/status`, feature `status.runs`) lists every run in flight beside
