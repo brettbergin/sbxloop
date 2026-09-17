@@ -71,7 +71,8 @@
   remain, nor step down); and list, add, update and remove the agents
   taking part; mentioning an agent adds it. Participants report whether they
   are idle, thinking or working, and member, participant and activity
-  changes are recorded as events. Advertised as
+  changes are recorded as events; an agent that cannot answer goes idle at
+  the moment it stops, never at the time the turn began. Advertised as
   `collaboration.channel_members` and `collaboration.participants`. A
   single-user installation behaves as before.
 

@@ -14,9 +14,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 
 from sbxloop.api.routes.meta import FEATURES
 from sbxloop.backends import backend_for
+from sbxloop.db.api_models import ApiEventRow
 from sbxloop.errors import ToolRejectedError
 from sbxloop.modelcatalog import catalog_endpoint
 from tests.api.conftest import build
@@ -37,6 +39,31 @@ SCOUT: dict[str, Any] = {
 
 def _create(api: Any, headers: dict[str, str], body: dict[str, Any] | None = None) -> Any:
     return api.client.post("/v1/agents", json=body or SCOUT, headers=headers)
+
+
+class _Ticking:
+    """A clock a second later on every reading, so an event stamped with the
+    current time can be told apart from one stamped when the turn began."""
+
+    def __init__(self, start: float) -> None:
+        self.t = start
+
+    def __call__(self) -> float:
+        self.t += 1.0
+        return self.t
+
+
+def _activity(api: Any, agent_slug: str) -> list[tuple[str, float]]:
+    """Every ``collaboration.participant.activity`` for one agent, in order,
+    with the time it says it happened."""
+    with api.harness.dstore.read() as session:
+        rows = session.scalars(
+            select(ApiEventRow)
+            .where(ApiEventRow.type == "collaboration.participant.activity")
+            .order_by(ApiEventRow.seq)
+        ).all()
+        data = [(json.loads(row.data_json or "{}"), float(row.occurred_at)) for row in rows]
+    return [(str(d["status"]), at) for d, at in data if d.get("agent_slug") == agent_slug]
 
 
 def test_a_person_creates_lists_reads_updates_and_archives_an_agent(api: Any) -> None:
@@ -361,6 +388,41 @@ def test_an_agent_archived_after_a_turn_was_accepted_does_not_answer(api: Any) -
     messages = api.client.get(f"/v1/channels/{channel}/messages", headers=headers).json()
     assert "scout" not in [m["agent_slug"] for m in messages]
     assert "@scout is no longer available" in result["error"]
+
+
+def test_a_participant_that_fails_goes_idle_when_it_stops_not_when_the_turn_began(
+    api: Any,
+) -> None:
+    """A participant that cannot answer records ``idle`` at the time it
+    stopped. Stamping that with the turn's start time put idle before the
+    ``thinking`` the same participant had recorded a moment earlier, so a
+    reader replaying the channel saw the agent go idle before it began."""
+    concierge = FakeConcierge()
+    api.ctx.concierge = concierge
+    api.ctx.clock = _Ticking(api.clock())
+    headers = bearer(register(api))
+    assert _create(api, headers).status_code == 201
+    channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    assert api.client.post("/v1/agents/scout/archive", headers=headers).status_code == 200
+
+    user = api.ctx.collaboration.user_by_username("owner")
+    turn, _, created = api.ctx.accept_collaboration_turn(
+        user,
+        channel,
+        content="still there?",
+        targets=("scout",),
+        intent="conversation",
+        client_turn_id="before-archive",
+        client_message_id=None,
+        actor=None,
+    )
+    assert created
+    assert settled(api.client, headers, channel, turn.id)["status"] == "failed"
+
+    activity = _activity(api, "scout")
+    assert [status for status, _ in activity] == ["thinking", "idle"]
+    (_, thinking_at), (_, idle_at) = activity
+    assert idle_at > thinking_at
 
 
 def test_a_custom_agent_answers_a_mention_in_its_own_persona(api: Any) -> None:

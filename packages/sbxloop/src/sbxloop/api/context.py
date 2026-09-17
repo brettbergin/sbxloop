@@ -366,7 +366,7 @@ class ApiContext:
                 # Archived or disabled after the turn was accepted: it no
                 # longer answers in its own persona or with action rights.
                 errors.append(f"@{target} is no longer available")
-                store.participant_failed(turn.id, index, errors[-1])
+                store.participant_failed(turn.id, index, errors[-1], self.clock())
                 self.hub.notify()
                 index += 1
                 continue

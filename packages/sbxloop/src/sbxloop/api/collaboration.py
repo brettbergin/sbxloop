@@ -2326,9 +2326,9 @@ class CollaborationStore:
                 },
             )
 
-    def participant_failed(
-        self, turn_id: str, index: int, error: str, now: float | None = None
-    ) -> None:
+    def participant_failed(self, turn_id: str, index: int, error: str, now: float) -> None:
+        """``now`` stamps the agent's ``idle`` activity, so it never predates
+        the ``thinking`` the same participant recorded when it started."""
         with self.dstore.immediate_transaction() as session:
             row = session.get(TurnRow, turn_id)
             if row is None or row.status not in {"running", "cancelling"}:
@@ -2336,11 +2336,7 @@ class CollaborationStore:
             progress = json.loads(row.participants_json)
             if progress[index]["status"] == "running":
                 _participant_activity(
-                    session,
-                    row.channel_id,
-                    progress[index]["agent_slug"],
-                    "idle",
-                    float(row.started_at or row.created_at) if now is None else now,
+                    session, row.channel_id, progress[index]["agent_slug"], "idle", now
                 )
             progress[index].update(status="failed", error=error)
             row.participants_json = json.dumps(progress)
