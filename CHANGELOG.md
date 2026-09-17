@@ -138,6 +138,20 @@
   `breaker_cooldown_s`. The reply names any hold still standing, since a
   reset breaker releases none.
 
+- **The concierge can run chat turns side by side.**
+  `[concierge] max_concurrent_turns` (default 1, at most 16) sets how
+  many turns run at once. What a turn's tools read about it (speaker, message, channel
+  session, handoff and activity callbacks, role) now travels with the turn
+  instead of living in one shared slot, including onto the thread that
+  answers its host tools, so overlapping turns never see each other's.
+  Each product channel session also records interrupted provider calls
+  under its own run id (`concierge:<digest>`), so a call interrupted in one
+  channel no longer parks recovery for another; chat bridge turns keep the
+  `concierge` run id, so a call they left pending still resumes. A channel
+  call an earlier release left pending under `concierge` is retried under
+  that id once, so it resumes and stops gating bridge turns. Host tools
+  still run one at a time.
+
 ### Fixed
 
 - **A runner's result in a conversation is credited to Angie.** A code

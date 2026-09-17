@@ -11,10 +11,13 @@ covered separately (test_worker_client / test_daemon_agentbox).
 
 from __future__ import annotations
 
+import hashlib
 import json
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, ClassVar
 
 import pytest
@@ -22,10 +25,12 @@ import pytest
 from sbxloop.config import Config
 from sbxloop.daemon.concierge import (
     CONCIERGE_AGENT,
+    CONCIERGE_RUN_ID,
     STATE_SESSION_ID,
     STATE_SESSION_TURNS,
     Concierge,
     ConciergeReply,
+    concierge_run_id,
 )
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.daemon.store import DaemonStore
@@ -3597,3 +3602,221 @@ class TestSetConfig:
         turn(concierge, "policy?")
         (resp,) = client.responses
         assert "locked by `[concierge] config_locked` (`policy`)" in resp.text
+
+
+class BlockingClient:
+    """A WorkerClient stand-in that holds every job until ``width`` jobs are in
+    flight at once, then answers each job's one host-tool call from a separate
+    thread, the way ``HostToolBroker`` does."""
+
+    def __init__(self, width: int) -> None:
+        self.gate = threading.Barrier(width, timeout=10)
+        self.jobs: list[JobRequest] = []
+        self.responses: list[HostToolResponse] = []
+
+    def submit(
+        self,
+        job: JobRequest,
+        *,
+        agent: str | None = None,
+        agent_phase: str | None = None,
+        model_source: str | None = None,
+        tool_handler: Callable[[HostToolCall], HostToolResponse] | None = None,
+    ) -> JobResult:
+        self.jobs.append(job)
+        self.gate.wait()
+        assert tool_handler is not None and job.prompt is not None
+        ask = job.prompt.rsplit("\n---\n", 1)[1]
+        call = HostToolCall(
+            call_id="c0", name="handoff_agent", arguments={"agent_slug": "critic", "message": ask}
+        )
+        answers: list[HostToolResponse] = []
+        broker = threading.Thread(target=lambda: answers.append(tool_handler(call)))
+        broker.start()
+        broker.join(timeout=10)
+        self.responses.extend(answers)
+        return JobResult(job_id=job.job_id, status="ok", output_text=f"done {ask}")
+
+
+class TestConcurrentTurns:
+    def test_the_turn_width_is_a_bounded_concierge_knob(self) -> None:
+        assert Config.model_validate({}).concierge.max_concurrent_turns == 1
+        assert (
+            Config.model_validate(
+                {"concierge": {"max_concurrent_turns": 16}}
+            ).concierge.max_concurrent_turns
+            == 16
+        )
+        for bad in (0, 17):
+            with pytest.raises(ValueError):
+                Config.model_validate({"concierge": {"max_concurrent_turns": bad}})
+
+    def test_overlapping_turns_each_see_their_own_speaker_handoff_and_session(
+        self, tmp_path: Path
+    ) -> None:
+        concierge, _, host, _, _ = make(
+            tmp_path, [], config={"concierge": {"max_concurrent_turns": 2}}
+        )
+        client = BlockingClient(2)
+        host._client = client  # type: ignore[assignment]
+        seen: dict[str, tuple[str, str | None, str | None, str | None]] = {}
+
+        def handoff_for(owner: str) -> Callable[[str, str], str]:
+            def handoff(agent: str, message: str) -> str:
+                seen[message] = (
+                    owner,
+                    concierge._turn_author_id,
+                    concierge._turn_session_key,
+                    concierge._turn_message_id,
+                )
+                return "queued"
+
+            return handoff
+
+        try:
+            futures = [
+                concierge.submit_turn(
+                    f"ask {name}",
+                    author=name,
+                    author_id=f"id-{name}",
+                    message_id=f"m-{name}",
+                    session_key=f"channel-{name}",
+                    handoff=handoff_for(name),
+                )
+                for name in ("a", "b")
+            ]
+            replies = [future.result(timeout=20) for future in futures]
+        finally:
+            concierge.close()
+        assert [reply.text for reply in replies] == ["done ask a", "done ask b"]
+        assert all(response.ok for response in client.responses)
+        assert seen == {
+            "ask a": ("a", "id-a", "channel-a", "m-a"),
+            "ask b": ("b", "id-b", "channel-b", "m-b"),
+        }
+        # Outside a turn nothing is left behind.
+        assert concierge._turn_author_id is None and concierge._turn_session_key is None
+
+    def test_turns_run_one_at_a_time_by_default(self, tmp_path: Path) -> None:
+        concierge, _, host, _, _ = make(tmp_path, [])
+        client = BlockingClient(2)
+        host._client = client  # type: ignore[assignment]
+        try:
+            futures = [
+                concierge.submit_turn(
+                    f"ask {name}", author=name, session_key=name, handoff=lambda a, m: "q"
+                )
+                for name in ("a", "b")
+            ]
+            with pytest.raises(TimeoutError):
+                futures[1].result(timeout=0.5)
+            assert len(client.jobs) == 1
+        finally:
+            client.gate.abort()
+            for future in futures:
+                future.exception(timeout=20)
+            concierge.close()
+
+    def test_sessions_keep_their_own_provider_run_id_and_bridges_keep_the_legacy_one(
+        self, tmp_path: Path
+    ) -> None:
+        concierge, client, _, _, _ = make(tmp_path, [{"text": "a"}, {"text": "b"}])
+        try:
+            concierge.submit_turn("hi", author="x").result(timeout=10)
+            concierge.submit_turn("hi", author="x", session_key="channel-1:angie").result(
+                timeout=10
+            )
+        finally:
+            concierge.close()
+        digest = hashlib.sha256(b"channel-1:angie").hexdigest()[:24]
+        assert [job.run_id for job in client.jobs] == ["concierge", f"concierge:{digest}"]
+        assert concierge_run_id(None) == CONCIERGE_RUN_ID == "concierge"
+        assert concierge_run_id("channel-1:angie") == f"concierge:{digest}"
+
+    def test_an_interrupted_call_in_one_session_does_not_block_another(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from sbxloop.provider import ProviderRecovery
+        from sbxloop.worker.client import WorkerClient
+        from tests.unit.test_provider_recovery import rejected
+
+        concierge, _, host, _, _ = make(tmp_path, [], config={"agent": {"backend": "claude"}})
+        now = [1000.0]
+        manager = ProviderRecovery(concierge.store, "claude", clock=lambda: now[0])
+        client = WorkerClient(SimpleNamespace(name="agent"))  # type: ignore[arg-type]
+        client.provider_recovery = manager
+        host._client = client  # type: ignore[assignment]
+        jobs: list[JobRequest] = []
+
+        def submit(request: JobRequest, **_: Any) -> JobResult:
+            jobs.append(request)
+            if len(jobs) == 1:
+                return rejected()
+            return JobResult(job_id=request.job_id, status="ok", output_text=f"answer {len(jobs)}")
+
+        monkeypatch.setattr(client, "_submit_once", submit)
+        try:
+            first = concierge.submit_turn("first ask", author="a", session_key="channel-a")
+            assert not first.result(timeout=10).ok
+            now[0] = manager.hold().next_at  # type: ignore[union-attr]
+            other = concierge.submit_turn("other ask", author="b", session_key="channel-b")
+            assert other.result(timeout=10).text == "answer 2"
+            again = concierge.submit_turn("first ask", author="a", session_key="channel-a")
+            assert again.result(timeout=10).text == "answer 3"
+        finally:
+            concierge.close()
+        assert jobs[1].prompt is not None and jobs[1].prompt.endswith("other ask")
+        assert jobs[2].resume_session_id == "s1"
+        assert not manager.pending(concierge_run_id("channel-a"))
+
+    def test_a_session_call_left_pending_under_the_legacy_run_id_still_recovers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A release that recorded every interrupted call under "concierge"
+        # may leave a channel session's call pending across the upgrade.
+        # Retrying that request must resume and clear it, or every later
+        # bridge turn parks the provider for everyone.
+        from sqlalchemy import update
+
+        from sbxloop.db.engine_models import ProviderJobRow
+        from sbxloop.provider import ProviderRecovery
+        from sbxloop.worker.client import WorkerClient
+        from tests.unit.test_provider_recovery import rejected
+
+        concierge, _, host, _, _ = make(tmp_path, [], config={"agent": {"backend": "claude"}})
+        now = [1000.0]
+        manager = ProviderRecovery(concierge.store, "claude", clock=lambda: now[0])
+        client = WorkerClient(SimpleNamespace(name="agent"))  # type: ignore[arg-type]
+        client.provider_recovery = manager
+        host._client = client  # type: ignore[assignment]
+        jobs: list[JobRequest] = []
+
+        def submit(request: JobRequest, **_: Any) -> JobResult:
+            jobs.append(request)
+            if len(jobs) == 1:
+                return rejected()
+            return JobResult(job_id=request.job_id, status="ok", output_text=f"answer {len(jobs)}")
+
+        monkeypatch.setattr(client, "_submit_once", submit)
+        try:
+            first = concierge.submit_turn("first ask", author="a", session_key="channel-a")
+            assert not first.result(timeout=10).ok
+            # Re-key the row the way the earlier release wrote it.
+            with manager._write() as session:
+                session.execute(
+                    update(ProviderJobRow)
+                    .where(ProviderJobRow.run_id == concierge_run_id("channel-a"))
+                    .values(run_id=CONCIERGE_RUN_ID)
+                )
+            assert manager.pending(CONCIERGE_RUN_ID)
+            now[0] = manager.hold().next_at  # type: ignore[union-attr]
+            again = concierge.submit_turn("first ask", author="a", session_key="channel-a")
+            assert again.result(timeout=10).text == "answer 2"
+            bridge = concierge.submit_turn("bridge ask", author="c")
+            assert bridge.result(timeout=10).text == "answer 3"
+        finally:
+            concierge.close()
+        assert jobs[1].resume_session_id == "s1"
+        assert not manager.pending(CONCIERGE_RUN_ID)
+        assert manager.hold() is None
+        assert jobs[2].prompt is not None and jobs[2].prompt.endswith("bridge ask")

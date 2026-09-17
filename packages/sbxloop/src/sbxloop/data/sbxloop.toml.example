@@ -935,6 +935,8 @@ service_memory = "2g"
 # max_tool_result_chars = 6000     # what one host tool may hand back to the model
 # max_tool_calls = 16
 # session_turns = 40               # rotate the resumed SDK session after N turns
+# max_concurrent_turns = 1         # chat turns that may run at once (1-16); host
+#                                  # tools still run one at a time
 # github_tools = true              # PR/issue/diff/file reads via the github-ops sandbox
 # create_issues = true             # file (queued at once)/list/comment/label/close issues
 #                                  # (a close needs your yes)
