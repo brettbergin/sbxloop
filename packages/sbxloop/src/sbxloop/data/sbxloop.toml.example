@@ -365,7 +365,7 @@ service_memory = "2g"
 # server or tool that does not exist, or another agent's @-name, fails the
 # load.
 # [[agents]]
-# slug = "forecaster"  # the @-name: lowercase letters, digits, '-', '_'
+# slug = "forecaster"  # the @-name: lowercase letters, digits, '-', '_'; a built-in's slug adjusts it
 # name = "Forecaster"  # shown beside its messages; required for a new agent
 # description = "answers weather questions and runs forecast reports"  # one line for directories
 # avatar = "F"  # an emoji or 1-2 characters, never a URL

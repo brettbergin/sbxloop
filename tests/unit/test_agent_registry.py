@@ -279,6 +279,29 @@ class TestConfigAgents:
         assert "operator" in {a.slug for a in registry.list(include_disabled=True)}
         assert registry.for_role("operator") == []
 
+    def test_toml_agent_on_a_legacy_slug_is_a_new_listed_agent(self) -> None:
+        # A legacy name is only kept so old saved teams still resolve; an
+        # operator's entry with that slug is their own agent, not a hidden
+        # adjustment of the retired one.
+        registry = ConfigAgentRegistry(
+            _config([{"slug": "weather", "name": "Forecaster", "roles": ["operator"]}])
+        )
+        weather = registry.get("weather")
+        assert weather is not None
+        assert weather.source == "config" and not weather.legacy
+        assert weather.spec.name == "Forecaster"
+        assert weather.spec.description == "" and weather.spec.instructions == ""
+        assert weather.category == "" and weather.capabilities == ()
+        assert [a.slug for a in registry.list()][-1] == "weather"
+        assert [a.slug for a in registry.for_role("operator")] == ["operator", "weather"]
+        assert "Weather" not in weather.chat_persona()
+        # The other legacy names stay hidden.
+        assert "github" not in {a.slug for a in registry.list()}
+
+    def test_toml_agent_on_a_legacy_slug_needs_a_name(self) -> None:
+        with pytest.raises(ValueError, match="name"):
+            _config([{"slug": "weather", "roles": ["operator"]}])
+
     def test_credentials_and_mcp_by_name(self) -> None:
         config = _config(
             [

@@ -6,7 +6,9 @@
   agent beside Angie and the planner, builder, critic and operator, or
   adjusts the built-in with the same slug: its name, aliases, persona,
   avatar, colour, model, roles, and the tools, skills, MCP servers and
-  credentials it is narrowed to. An entry carries no egress (host or allow
+  credentials it is narrowed to. An entry on a retired agent name (such as
+  `github` or `weather`) is a new, listed agent rather than an adjustment of
+  the hidden one. An entry carries no egress (host or allow
   keys are refused), and one that names an undeclared credential, MCP
   server or tool, or an @-name another agent already has, fails the load.
   The built-in catalogue and every chat persona are unchanged, `agents` is

@@ -13,7 +13,7 @@ import builtins
 from collections.abc import Iterable, Mapping
 from typing import TYPE_CHECKING, Any, Protocol
 
-from sbxloop.agents.builtin import BUILTIN_AGENTS, BUILTIN_BY_SLUG
+from sbxloop.agents.builtin import BUILTIN_AGENTS, PRIMARY_BUILTINS
 from sbxloop.agents.definition import AgentDefinition, AgentRoleName, AgentSpec
 from sbxloop.agents.tools import TOOL_CATALOG
 from sbxloop.errors import SbxloopError
@@ -28,6 +28,10 @@ __all__ = [
     "config_agent_problems",
     "default_registry",
 ]
+
+
+#: The built-ins an entry may adjust without naming the agent again.
+_PRIMARY_SLUGS = frozenset(agent.slug for agent in PRIMARY_BUILTINS)
 
 
 class AgentRegistryReadOnly(SbxloopError):
@@ -59,9 +63,11 @@ class AgentRegistry(Protocol):
 
 
 def _merge(base: AgentDefinition | None, spec: AgentSpec) -> AgentDefinition:
-    """``spec`` over ``base``: a configured entry for a known slug changes
-    only the keys it sets to something other than their default."""
-    if base is None:
+    """``spec`` over ``base``: a configured entry for a current built-in
+    changes only the keys it sets to something other than their default.
+    A legacy name is kept only so old saved teams resolve, so an entry with
+    that slug replaces it outright and is listed like any added agent."""
+    if base is None or base.legacy:
         return AgentDefinition(spec, "config")
     merged = AgentSpec.model_validate(
         {**base.spec.model_dump(), **spec.model_dump(exclude_defaults=True)}
@@ -70,7 +76,6 @@ def _merge(base: AgentDefinition | None, spec: AgentSpec) -> AgentDefinition:
         merged,
         "config",
         revision=base.revision,
-        legacy=base.legacy,
         category=base.category,
         capabilities=base.capabilities,
     )
@@ -85,7 +90,7 @@ def _problems(
 ) -> builtins.list[str]:
     label = f"agent {spec.slug!r}"
     problems: builtins.list[str] = []
-    if not spec.name and spec.slug not in BUILTIN_BY_SLUG:
+    if not spec.name and spec.slug not in _PRIMARY_SLUGS:
         problems.append(f"{label} needs a name")
     unknown_tools = sorted(set(spec.tools or ()) - TOOL_CATALOG - mcp)
     if unknown_tools:
