@@ -320,6 +320,47 @@ def test_an_archived_agent_leaves_teams_and_mentions(api: Any) -> None:
     assert targeted.status_code == 422
     assert targeted.json()["code"] == "unknown_target"
 
+    # A team that still lists the archived agent no longer reaches it.
+    via_team = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "@scouts are you there?"},
+    )
+    assert via_team.status_code == 202, via_team.text
+    assert via_team.json()["turn"]["targets"] == []
+    settled(api.client, headers, channel, via_team.json()["turn"]["id"])
+    assert all(not call["session_key"].endswith(":scout") for call in concierge.calls)
+
+
+def test_an_agent_archived_after_a_turn_was_accepted_does_not_answer(api: Any) -> None:
+    concierge = FakeConcierge()
+    api.ctx.concierge = concierge
+    headers = bearer(register(api))
+    assert _create(api, headers).status_code == 201
+    channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    assert api.client.post("/v1/agents/scout/archive", headers=headers).status_code == 200
+
+    # The turn names scout as if it had been accepted just before the archive.
+    user = api.ctx.collaboration.user_by_username("owner")
+    turn, _, created = api.ctx.accept_collaboration_turn(
+        user,
+        channel,
+        content="still there?",
+        targets=("scout",),
+        intent="conversation",
+        client_turn_id="before-archive",
+        client_message_id=None,
+        actor=None,
+    )
+    assert created
+    result = settled(api.client, headers, channel, turn.id)
+
+    assert concierge.calls == []
+    assert result["status"] == "failed"
+    messages = api.client.get(f"/v1/channels/{channel}/messages", headers=headers).json()
+    assert "scout" not in [m["agent_slug"] for m in messages]
+    assert "@scout is no longer available" in result["error"]
+
 
 def test_a_custom_agent_answers_a_mention_in_its_own_persona(api: Any) -> None:
     concierge = FakeConcierge()

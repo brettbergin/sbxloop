@@ -996,7 +996,9 @@ async def _targets(
             continue
         team = await ctx.call(ctx.collaboration.get_team, user.id, selector)
         if team is not None and team.enabled:
-            result.extend(team.agent_slugs)
+            for slug in team.agent_slugs:
+                if addressable(await ctx.call(ctx.agents.get, slug), slug):
+                    result.append(slug)
             continue
         if selector in requested:
             raise Problem(422, "unknown_target", f"unknown agent or team: {selector}")
