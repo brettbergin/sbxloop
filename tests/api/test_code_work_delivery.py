@@ -91,3 +91,32 @@ def test_code_origin_survives_dispatch_and_store_reopen_without_cross_channel_le
     assert api.client.get(f"/v1/channels/{other}/work", headers=headers).json() == []
     api.client.delete(f"/v1/channels/{channel}", headers=headers)
     assert api.ctx.project_work() == []
+
+
+def test_code_runner_result_is_credited_to_angie(api: Any) -> None:
+    # A code turn names no participant; its pending and final work still have an author.
+    api.ctx.concierge = CodeConcierge()
+    headers = bearer(register(api))
+    channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+    accepted = api.client.post(
+        f"/v1/channels/{channel}/turns",
+        headers=headers,
+        json={"content": "Add a feature", "intent": "code"},
+    ).json()
+    settled(api.client, headers, channel, accepted["turn"]["id"])
+    path = f"/v1/channels/{channel}/work"
+    assert api.client.get(path, headers=headers).json()[0]["agent_slug"] == "concierge"
+    item = WorkItem(
+        item_id=issue_item_id(12, "owner/repo"),
+        source_key="12",
+        repo="owner/repo",
+        title="Add a feature",
+        kind="code",
+    )
+    api.harness.dstore.upsert_new(item, api.clock())
+    api.harness.dstore.mark_failed(item.item_id, "checkout unavailable", api.clock(), requeue=False)
+    messages = api.client.get(f"/v1/channels/{channel}/messages", headers=headers).json()
+    results = [message for message in messages if message["kind"] == "work_result"]
+    assert len(results) == 1
+    assert results[0]["agent_slug"] == "concierge"
+    assert results[0]["work"]["agent_slug"] == "concierge"

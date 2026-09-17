@@ -9,6 +9,7 @@ from typing import Any
 
 from sqlalchemy import and_, func, or_, select
 
+from sbxloop.api.agents import ANGIE_SLUG
 from sbxloop.api.projections import Views
 from sbxloop.db.collaboration_models import ChannelRow, MessageRow, TurnRow
 from sbxloop.db.daemon_models import WorkItemRow
@@ -71,9 +72,10 @@ def _links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
     ]
 
 
-def _agent(link: WorkLink) -> str | None:
+def _agent(link: WorkLink) -> str:
+    """Credit the participant that asked; a runner turn with none is Angie's own."""
     if link.code_title is not None:
-        return link.code_agent
+        return link.code_agent or ANGIE_SLUG
     suffix = link.source_key[len(link.input_message_id) :]
     index = 0
     if suffix.startswith(":"):
@@ -82,8 +84,8 @@ def _agent(link: WorkLink) -> str | None:
             index = int(first)
     if index < len(link.participants):
         slug = link.participants[index].get("agent_slug")
-        return str(slug) if slug else None
-    return link.targets[index] if index < len(link.targets) else None
+        return str(slug) if slug else ANGIE_SLUG
+    return link.targets[index] if index < len(link.targets) else ANGIE_SLUG
 
 
 def _code_links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
@@ -126,7 +128,7 @@ def _code_links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
                             targets=tuple(json.loads(turn.targets_json)),
                             participants=participants,
                             code_title=ref["title"],
-                            code_agent=participant.get("agent_slug"),
+                            code_agent=participant.get("agent_slug") or ANGIE_SLUG,
                         )
                     )
     return links

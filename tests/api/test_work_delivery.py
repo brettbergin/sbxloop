@@ -8,14 +8,20 @@ from sbxloop.ghids import chat_item_id
 from tests.api.test_collaboration import FakeConcierge, bearer, register
 
 
-def setup_work(api: Any, *, suffix: str = "") -> tuple[dict[str, str], str, WorkItem]:
+def setup_work(
+    api: Any,
+    *,
+    suffix: str = "",
+    request: dict[str, Any] | None = None,
+) -> tuple[dict[str, str], str, WorkItem]:
     api.ctx.concierge = FakeConcierge()
     headers = bearer(register(api))
     channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
     accepted = api.client.post(
         f"/v1/channels/{channel}/turns",
         headers=headers,
-        json={"content": "Prepare a report", "target_slugs": ["concierge", "operator"]},
+        json={"content": "Prepare a report"}
+        | (request or {"target_slugs": ["concierge", "operator"]}),
     ).json()
     api.ctx.turn_executor.submit(lambda: None).result(timeout=5)
     key = accepted["turn"]["input_message_id"] + suffix
@@ -101,3 +107,59 @@ def test_source_identity_requires_a_complete_message_id(api: Any) -> None:
     response = api.client.get(f"/v1/channels/{channel}/work", headers=headers)
     assert response.status_code == 200, response.text
     assert response.json() == []
+
+
+def _work_results(api: Any, headers: dict[str, str], channel: str) -> list[dict[str, Any]]:
+    messages = api.client.get(f"/v1/channels/{channel}/messages", headers=headers).json()
+    return [message for message in messages if message["kind"] == "work_result"]
+
+
+def test_workload_runner_result_is_credited_to_angie(api: Any) -> None:
+    # A runner turn names no participant; its result still has an author.
+    headers, channel, item = setup_work(api, request={"intent": "workload"})
+    queued = api.client.get(f"/v1/channels/{channel}/work", headers=headers).json()
+    assert queued[0]["agent_slug"] == "concierge"
+    api.harness.source.items = [item]
+    api.harness.outcomes = ["completed"]
+    api.clock.t += 10
+    api.loop.tick()
+    results = _work_results(api, headers, channel)
+    assert len(results) == 1
+    assert results[0]["agent_slug"] == "concierge"
+    assert results[0]["work"]["agent_slug"] == "concierge"
+
+
+def test_mentioned_agent_keeps_credit_for_its_result(api: Any) -> None:
+    headers, channel, item = setup_work(api, request={"target_slugs": ["operator"]})
+    api.harness.dstore.mark_failed(item.item_id, "sandbox unavailable", api.clock(), requeue=False)
+    results = _work_results(api, headers, channel)
+    assert len(results) == 1
+    assert results[0]["agent_slug"] == "operator"
+    assert results[0]["work"]["agent_slug"] == "operator"
+
+
+def test_stored_unattributed_result_reads_back_as_angie(api: Any) -> None:
+    # Rows written before attribution existed stay as stored; reads credit Angie.
+    headers, channel, _ = setup_work(api, request={"intent": "workload"})
+    snapshot = api.client.get(f"/v1/channels/{channel}/work", headers=headers).json()[0]
+    stored = api.ctx.collaboration.append_work_result(
+        "msg_work_legacy",
+        channel_id=channel,
+        turn_id=snapshot["turn_id"],
+        content="Work completed.",
+        agent_slug=None,
+        work=snapshot | {"agent_slug": None, "state": "completed"},
+        now=api.clock(),
+    )
+    assert stored is not None
+    results = _work_results(api, headers, channel)
+    legacy = next(message for message in results if message["id"] == "msg_work_legacy")
+    assert legacy["agent_slug"] == "concierge"
+    assert legacy["work"]["agent_slug"] == "concierge"
+    assert legacy["work"]["state"] == "completed"
+    with api.harness.dstore.read() as session:
+        from sbxloop.db.collaboration_models import MessageRow
+
+        row = session.get(MessageRow, "msg_work_legacy")
+        assert row is not None
+        assert row.agent_slug is None

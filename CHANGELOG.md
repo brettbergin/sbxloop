@@ -113,6 +113,14 @@
 
 ### Fixed
 
+- **A runner's result in a conversation is credited to Angie.** A code
+  or workload turn names no participant, so the `work_result` message and
+  its work snapshot were stored with no author and clients showed an
+  unattributed result. Those results are now written as `concierge`'s, a
+  mentioned agent keeps the credit for its own work, and results already
+  stored without an author read back as `concierge`'s without rewriting
+  them.
+
 - **A failed `sbx create` says what sbx said.** Every create failure was
   rewrapped as "check host capacity and that `sbx create --help` supports
   --cpus and --memory", whatever the cause. On a host with memory to spare
