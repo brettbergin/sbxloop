@@ -123,6 +123,22 @@ a code run's checkout, is `404` like any other id from elsewhere.
   run from. An ask that genuinely needs work is still started without
   asking for confirmation, and nothing is ever refused as out of scope.
 
+- **A run can say what it is doing in the channel that asked for it.** A
+  run linked to a channel posts under the name of the agent doing the
+  work: an `agent_update` message with that agent as its author, the kind
+  of post it is (`plan`, `progress`, `review`, `delivery`, `reply` or
+  `notice`) on the new `post_kind` field, and the files it delivered on
+  the work snapshot beside it. Every post names a dedupe key, recorded in
+  the new `channel_run_posts` table, so a replayed or resumed run posts a
+  moment once. A deleted channel receives nothing; a silenced channel
+  drops the running commentary and still hears a `delivery` or a
+  `notice`, because nobody is coming to look. An item admitted with a
+  `channel_id` now belongs to that channel for event visibility too, so a
+  member who can open the channel sees the run's events even when no
+  message there names the work. Nothing posts yet: this is the contract
+  (`ChannelPoster`) the daemon and engine will use, advertised as
+  `collaboration.run_progress`.
+
 - **Agents use their long-term memory in chat and in runs.** A mentioned
   agent's chat persona now carries the memories it may see in that channel
   (nothing changes for an agent with none). An agent whose `tools` list

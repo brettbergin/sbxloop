@@ -40,6 +40,7 @@ from sbxloop.api.auth.keys import SigningKeys
 from sbxloop.api.auth.ratelimit import FailureLimiter
 from sbxloop.api.auth.store import ApiAuthStore
 from sbxloop.api.channel_summary import ChannelSummarizer
+from sbxloop.api.channel_posts import ApiChannelPoster
 from sbxloop.api.chronology import Chronology
 from sbxloop.api.collaboration import (
     ChannelLink,
@@ -244,6 +245,7 @@ class ApiContext:
         self._semaphore: asyncio.Semaphore | None = None
         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
         self._public_ids: PublicIds | None = None
+        self._poster: ApiChannelPoster | None = None
         self._chronology: Chronology | None = None
         self._artifacts: ArtifactCatalog | None = None
         self._collaboration: CollaborationStore | None = None
@@ -413,6 +415,13 @@ class ApiContext:
             self._oidc = cached
         provider: OidcProvider = cached[1]
         return provider
+
+    @property
+    def poster(self) -> ApiChannelPoster:
+        """How a run posts into the channel that asked for it."""
+        if self._poster is None:
+            self._poster = ApiChannelPoster(self)
+        return self._poster
 
     @property
     def public_ids(self) -> PublicIds:

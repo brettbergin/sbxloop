@@ -14,11 +14,12 @@ import re
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from sqlalchemy import delete, func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
+from sbxloop.agents.posts import TERMINAL_POST_KINDS, PostKind
 from sbxloop.api.agents import AGENTS, ANGIE_SLUG
 from sbxloop.api.auth.store import hash_secret
 from sbxloop.api.channel_access import MANAGING_ROLES, ChannelAccess, ChannelRole, Need
@@ -43,6 +44,7 @@ from sbxloop.db.collaboration_models import (
     ChannelRow,
     ChannelSummaryRow,
     ExternalIdentityRow,
+    ChannelRunPostRow,
     LocalUserRow,
     MessageArtifactRow,
     MessageRow,
@@ -254,6 +256,8 @@ class Message:
     author: Author = SYSTEM_AUTHOR
     artifacts: tuple[ArtifactRef, ...] = ()
     origin: dict[str, Any] | None = None
+    #: What an ``agent_update`` a run posted is; None for every other message.
+    post_kind: PostKind | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -715,6 +719,7 @@ def _message(
             else attachments.get(str(row.id), ())
         ),
         origin=origin,
+        post_kind=None if row.post_kind is None else cast(PostKind, str(row.post_kind)),
     )
 
 
@@ -2755,6 +2760,102 @@ class CollaborationStore:
             if through is None:
                 return None
             return through, None if previous is None else previous.content, "\n".join(lines)
+
+    def turn_for_post(self, channel_id: str, reply_to_message_id: str | None) -> str | None:
+        """The turn a run's post belongs to: the one that asked the message
+        it answers, or the channel's most recent. A channel with no turn
+        yet has nowhere to hang a work snapshot, and the post carries text
+        alone."""
+        with self.dstore.read() as session:
+            if reply_to_message_id is not None:
+                message = session.get(MessageRow, reply_to_message_id)
+                if message is not None and message.turn_id is not None:
+                    return str(message.turn_id)
+            turn = session.scalars(
+                select(TurnRow)
+                .where(TurnRow.channel_id == channel_id)
+                .order_by(TurnRow.created_at.desc(), TurnRow.id.desc())
+                .limit(1)
+            ).first()
+            return None if turn is None else str(turn.id)
+
+    def post_agent_update(
+        self,
+        *,
+        channel_id: str,
+        author_agent: str,
+        kind: PostKind,
+        text: str,
+        run_id: str,
+        dedupe_key: str,
+        now: float,
+        turn_id: str | None = None,
+        work: dict[str, Any] | None = None,
+    ) -> str | None:
+        """Record one post a run made, idempotently on ``dedupe_key``.
+
+        Returns the message id, or None when the channel is gone or
+        silenced. A silenced channel still hears a run that has finished
+        or stopped: ``delivery`` and ``notice`` are posted anyway.
+        """
+        with self.dstore.immediate_transaction() as session:
+            posted = session.get(ChannelRunPostRow, dedupe_key)
+            if posted is not None:
+                return str(posted.message_id)
+            channel = session.get(ChannelRow, channel_id)
+            if channel is None or channel.state != "active":
+                return None
+            silenced = channel.silenced_until is not None and float(channel.silenced_until) > now
+            if silenced and kind not in TERMINAL_POST_KINDS:
+                return None
+            message_id = "msg_" + _token(16)
+            session.execute(
+                insert(MessageRow).values(
+                    id=message_id,
+                    channel_id=channel_id,
+                    turn_id=turn_id,
+                    sequence=self._next_sequence(session, channel_id),
+                    role="assistant",
+                    kind="agent_update",
+                    content=text,
+                    agent_slug=author_agent,
+                    work_json=None if work is None else json.dumps(work, default=str),
+                    created_at=now,
+                    author_kind="agent",
+                    author_id=author_agent,
+                    post_kind=kind,
+                )
+            )
+            session.execute(
+                insert(ChannelRunPostRow).values(
+                    dedupe_key=dedupe_key,
+                    run_id=run_id,
+                    message_id=message_id,
+                    kind=kind,
+                    posted_at=now,
+                )
+            )
+            channel.updated_at = now
+            channel.revision += 1
+            row = session.get(MessageRow, message_id)
+            assert row is not None  # nosec B101 - just inserted
+            _event(
+                session,
+                "collaboration.message.created",
+                now,
+                data={
+                    "channel_id": channel_id,
+                    "turn_id": turn_id,
+                    "message_id": message_id,
+                    "sequence": row.sequence,
+                    "agent_slug": author_agent,
+                    "author_kind": "agent",
+                    "author_id": author_agent,
+                    "post_kind": kind,
+                    "run_id": run_id,
+                },
+            )
+            return message_id
 
     def message_exists(self, message_id: str) -> bool:
         with self.dstore.read() as session:

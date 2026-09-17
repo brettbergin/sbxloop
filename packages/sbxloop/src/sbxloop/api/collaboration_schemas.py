@@ -509,6 +509,10 @@ class ExternalIdentityPage(ApiModel):
     data: list[ExternalIdentityOut]
 
 
+#: What an ``agent_update`` a run posted is.
+PostKindName = Literal["plan", "progress", "review", "delivery", "reply", "notice"]
+
+
 class MessageOut(ApiModel):
     id: str
     channel_id: str
@@ -527,6 +531,8 @@ class MessageOut(ApiModel):
     artifacts: list[ArtifactRefOut] = Field(default_factory=list)
     #: Where the message arrived from, when it came over a bridge.
     origin: MessageOriginOut | None = None
+    #: Set on the ``agent_update`` messages a run posts; null otherwise.
+    post_kind: PostKindName | None = None
 
 
 class ReactionSet(ApiModel):

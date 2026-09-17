@@ -1,8 +1,9 @@
 """Which channel a run or a work item belongs to.
 
-A chat turn that asks for a workload or tool run records the asking
-message's id as the item's ``source_key``; a turn that files an issue for a
-code run records the repository and issue on its participant. The same
+Admission records the channel on the item itself when it knows one; a chat
+turn that asks for a workload or tool run records the asking message's id
+as the item's ``source_key``; a turn that files an issue for a code run
+records the repository and issue on its participant. The same
 exact identities :mod:`sbxloop.api.work_delivery` delivers results by
 decide which channel's members may see the run's events. Nothing is
 inferred from prose: a run no channel asked for belongs to none.
@@ -27,6 +28,11 @@ def channel_for_item(session: Any, item_id: str) -> str | None:
     item: WorkItemRow | None = session.get(WorkItemRow, item_id)
     if item is None:
         return None
+    if item.channel_id:
+        # Admission named the channel the work answers to (revision 0027):
+        # an exact identity, and the only one a run nobody asked for in a
+        # message has.
+        return str(item.channel_id)
     source_key = str(item.source_key)
     if item.run_kind in _CHAT_KINDS:
         message: MessageRow | None = session.get(MessageRow, source_key.split(":", 1)[0])

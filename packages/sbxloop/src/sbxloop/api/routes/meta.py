@@ -64,6 +64,7 @@ FEATURES: tuple[str, ...] = (
     "collaboration.bridges",
     "agents.initiative",
     "collaboration.lead_orchestrator",
+    "collaboration.run_progress",
 )
 
 

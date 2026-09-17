@@ -342,6 +342,7 @@ def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
         work=ChannelWorkOut.model_validate(message.work) if message.work else None,
         reactions=list(message.reactions),
         author=_author_out(message.author, ctx),
+        post_kind=message.post_kind,
         artifacts=[_artifact_ref_out(ref) for ref in message.artifacts],
         origin=_origin_out(message.origin),
     )

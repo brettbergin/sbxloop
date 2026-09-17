@@ -356,6 +356,31 @@ the next batch. Only the newest summary is kept, and its model call is charged
 to the channel. It is best effort, and a channel without a summary simply gets
 a shorter history.
 
+### What a run says in its channel
+
+A run linked to a channel posts into it under the name of the agent doing
+the work, advertised as `collaboration.run_progress`. A post is a message
+with `kind` `agent_update`, `role` `assistant`, `author`
+`{"kind": "agent", "id": <slug>}` and `agent_slug` set to the same slug.
+It carries `post_kind`, one of `plan`, `progress`, `review`, `delivery`,
+`reply` or `notice`; every other message reports `post_kind` as null. When
+the run names files, they are listed on the post's `work.artifacts` in the
+shape described above. A channel that has had no turn yet has nowhere to
+hang a work snapshot, so such a post carries its text alone.
+
+Each post names a dedupe key, which is what makes a replayed, resumed or
+re-observed run post a moment once: the same key returns the message
+already recorded rather than a second copy of it. A channel that was
+deleted receives nothing. A silenced channel drops the running commentary
+and still hears the posts that end a run: `delivery` and `notice`.
+
+Clients read posts with the message history they already poll, or
+incrementally with `GET /v1/channels/{id}/messages?after=<sequence>`, and
+see each one as a `collaboration.message.created` event carrying
+`post_kind` and `run_id`. The events of a run a channel asked for, and the
+run's catalogued files, belong to that channel: a member who can open it
+sees them.
+
 Discovery lists sbxloop's five native roles: `concierge`, `planner`, `builder`,
 `critic`, and `operator`. Chat resolves their models through the existing
 configuration, using the `concierge`, `decompose`, `build`, `review`, and
