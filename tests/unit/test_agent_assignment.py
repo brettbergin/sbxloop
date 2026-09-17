@@ -417,6 +417,43 @@ class TestPhaseRunner:
         default = run_build(cfg(ADA), None, **tools).jobs[0]
         assert sorted(t.name for t in default.host_tools) == sorted([CALL_SERVICE, SKILL_TOOL_NAME])
 
+    def test_a_tool_left_out_of_the_agent_s_list_is_refused_when_called(self) -> None:
+        served: list[str] = []
+
+        def handler(call: HostToolCall) -> HostToolResponse:
+            served.append(call.name)
+            return HostToolResponse(call_id=call.call_id, ok=True, text="ok")
+
+        fetch = HostToolSpec(
+            name="fetch_dependencies",
+            description="fetch dependencies",
+            parameters={"type": "object", "properties": {}},
+        )
+        tools = {"host_tools": [service_spec("weather"), fetch], "tool_handler": handler}
+        config = cfg({**ADA, "tools": ["load_skill"]})
+        answer = run_build(config, custom_plan(config), **tools).kwargs[0]["tool_handler"]
+        refused = answer(
+            HostToolCall(call_id="c1", name=CALL_SERVICE, arguments={"credential": "weather"})
+        )
+        assert not refused.ok and CALL_SERVICE in (refused.error or "")
+        assert not answer(HostToolCall(call_id="c2", name="fetch_dependencies", arguments={})).ok
+        assert served == []
+
+        config = cfg({**ADA, "tools": ["fetch_dependencies"]})
+        answer = run_build(config, custom_plan(config), **tools).kwargs[0]["tool_handler"]
+        refused = answer(
+            HostToolCall(call_id="c3", name=CALL_SERVICE, arguments={"credential": "weather"})
+        )
+        assert not refused.ok
+        assert answer(HostToolCall(call_id="c4", name="fetch_dependencies", arguments={})).ok
+        assert served == ["fetch_dependencies"]
+
+        # With no list, every run tool is still answered.
+        answer = run_build(cfg(ADA), custom_plan(cfg(ADA)), **tools).kwargs[0]["tool_handler"]
+        assert answer(
+            HostToolCall(call_id="c5", name=CALL_SERVICE, arguments={"credential": "weather"})
+        ).ok
+
     def test_call_service_is_narrowed_to_the_agent_s_credentials(self) -> None:
         calls: list[str] = []
 

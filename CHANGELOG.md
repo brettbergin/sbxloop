@@ -64,7 +64,8 @@
   for a single task), stores it with the run and picks it up again on
   resume. A custom agent's persona and memory are added to the system
   message of the sessions it takes, its tool and credential lists narrow
-  what those sessions get, and its model sits below `--model` and the
+  what those sessions get (a call to a tool or credential it was not given
+  is refused on the host), and its model sits below `--model` and the
   repository's per-phase model and above `[agent].models`. Its slug and
   name are stamped on the agent events of its jobs (names a worker supplies
   itself are removed), task, review, chat, follow-up and delivery events are

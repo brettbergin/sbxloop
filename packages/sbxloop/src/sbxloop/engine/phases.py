@@ -421,6 +421,24 @@ def _credential_guard(delegate: HostToolHandler, binding: AgentBinding) -> HostT
     return handler
 
 
+def _tool_guard(
+    delegate: HostToolHandler, binding: AgentBinding, allowed: frozenset[str]
+) -> HostToolHandler:
+    """``delegate``, refusing a run tool the agent's session was not given:
+    leaving a tool out of the job hides it, and this is the barrier."""
+
+    def handler(call: HostToolCall) -> HostToolResponse:
+        if call.name not in allowed:
+            return HostToolResponse(
+                call_id=call.call_id,
+                ok=False,
+                error=f"tool {call.name!r} is not one @{binding.slug} may use",
+            )
+        return delegate(call)
+
+    return handler
+
+
 class PhaseRunner:
     """Runs the three phases for one run against the agent sandbox's worker."""
 
@@ -821,6 +839,8 @@ class PhaseRunner:
         delegate = self.tool_handler
         if custom is not None and custom.credentials and delegate is not None:
             delegate = _credential_guard(delegate, custom)
+        if custom is not None and custom.tools is not None and delegate is not None:
+            delegate = _tool_guard(delegate, custom, frozenset(tool.name for tool in service_tools))
         if skill_spec is None:
             return tuple(service_tools), delegate if service_tools else None
 
