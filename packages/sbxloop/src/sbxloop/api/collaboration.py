@@ -13,7 +13,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from sqlalchemy import func, insert, select
+from sqlalchemy import func, insert, or_, select, update
 from sqlalchemy.exc import IntegrityError
 
 from sbxloop.api.agents import AGENTS, ANGIE_SLUG
@@ -625,6 +625,22 @@ class CollaborationStore:
     def list_members(self) -> list[Member]:
         with self.dstore.read() as session:
             return self._join(session)
+
+    def touch_last_seen(self, user_id: str, now: float, min_interval_s: float) -> None:
+        """Record that the user was seen, unless that was already recorded
+        within ``min_interval_s``."""
+        with self.dstore.transaction() as session:
+            session.execute(
+                update(LocalUserRow)
+                .where(
+                    LocalUserRow.id == user_id,
+                    or_(
+                        LocalUserRow.last_seen_at.is_(None),
+                        LocalUserRow.last_seen_at <= now - min_interval_s,
+                    ),
+                )
+                .values(last_seen_at=now)
+            )
 
     def create_invite(
         self,

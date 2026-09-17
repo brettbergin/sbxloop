@@ -10,12 +10,20 @@ from fastapi import APIRouter, Depends, Query, Request
 
 from sbxloop.agentmodels import model_for_phase, refreshed_models
 from sbxloop.api.agents import AGENTS, AGENTS_BY_SLUG
-from sbxloop.api.auth.deps import Authenticated, current, get_ctx, require
+from sbxloop.api.auth.deps import (
+    Authenticated,
+    current,
+    current_member,
+    get_ctx,
+    member_of,
+    require,
+)
 from sbxloop.api.auth.store import AuthError
 from sbxloop.api.collaboration import (
     Channel,
     CollaborationError,
     LocalUser,
+    Member,
     Message,
     Preference,
     Team,
@@ -295,10 +303,9 @@ def _workflow_out(workflow: Workflow) -> WorkflowOut:
 
 
 def _local_user(ctx: ApiContext, auth: Authenticated) -> LocalUser:
-    user = ctx.collaboration.user_by_client(auth.client.id)
-    if user is None or not user.active:
-        raise Problem(403, "local_profile_required", "this client is not the local Angie user")
-    return user
+    """The calling member's user; kept for callers of the old helper."""
+    del ctx
+    return member_of(auth).user
 
 
 def _agent_out(slug: str, config: Config) -> AgentOut:
@@ -387,8 +394,9 @@ async def login_local(
 async def get_local_user(
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(current),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> LocalUserOut:
-    return _user_out(await ctx.call(_local_user, ctx, auth))
+    return _user_out(member.user)
 
 
 @router.patch("/users/me", response_model=LocalUserOut)
@@ -396,8 +404,9 @@ async def update_local_user(
     body: LocalUserUpdate,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> LocalUserOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     try:
         updated = await ctx.call(
             ctx.collaboration.update_user,
@@ -449,8 +458,9 @@ async def list_teams(
     enabled_only: bool = False,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> list[TeamOut]:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     teams = await ctx.call(ctx.collaboration.list_teams, user.id, enabled_only=enabled_only)
     return [_team_out(team) for team in teams]
 
@@ -460,8 +470,9 @@ async def get_team(
     team_id: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> TeamOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     team = await ctx.call(ctx.collaboration.get_team, user.id, team_id)
     if team is None:
         raise Problem(404, "team_not_found", "team not found")
@@ -473,8 +484,9 @@ async def create_team(
     body: TeamCreate,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> TeamOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     agents = _validate_agents(body.agent_slugs)
     try:
         team = await ctx.call(
@@ -500,8 +512,9 @@ async def update_team(
     body: TeamUpdate,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> TeamOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     values = body.model_dump(exclude_unset=True)
     if "agent_slugs" in values:
         values["agent_slugs"] = _validate_agents(values["agent_slugs"])
@@ -522,8 +535,9 @@ async def delete_team(
     team_id: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> None:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     if not await ctx.call(ctx.collaboration.delete_team, user.id, team_id, ctx.clock()):
         raise Problem(404, "team_not_found", "team not found")
     ctx.hub.notify()
@@ -554,8 +568,9 @@ async def preference_definitions(
 async def list_preferences(
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> list[PreferenceOut]:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     values = await ctx.call(ctx.collaboration.list_preferences, user.id)
     return [_preference_out(value) for value in values]
 
@@ -564,8 +579,9 @@ async def list_preferences(
 async def reset_preferences(
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> DetailOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     await ctx.call(ctx.collaboration.reset_preferences, user.id, ctx.clock())
     ctx.hub.notify()
     return DetailOut(detail="Preferences reset")
@@ -576,8 +592,9 @@ async def get_preference(
     name: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> PreferenceOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     value = await ctx.call(ctx.collaboration.get_preference, user.id, _preference_name(name))
     if value is None:
         raise Problem(404, "preference_not_found", "preference not found")
@@ -590,8 +607,9 @@ async def update_preference(
     body: PreferenceUpdate,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> PreferenceOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     clean_name = _preference_name(name)
     content = body.content.strip()
     header = f"# {clean_name.replace('_', ' ').title()}"
@@ -618,8 +636,9 @@ async def delete_preference(
     name: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> DetailOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     clean_name = _preference_name(name)
     deleted = await ctx.call(ctx.collaboration.delete_preference, user.id, clean_name, ctx.clock())
     if not deleted:
@@ -759,8 +778,9 @@ async def test_connection(
 async def list_workflows(
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> list[WorkflowOut]:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     values = await ctx.call(ctx.collaboration.list_workflows, user.id)
     return [_workflow_out(value) for value in values]
 
@@ -770,8 +790,9 @@ async def create_workflow(
     body: WorkflowCreate,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> WorkflowOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     try:
         value = await ctx.call(
             ctx.collaboration.create_workflow,
@@ -794,8 +815,9 @@ async def get_workflow(
     workflow_id: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> WorkflowOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     value = await ctx.call(ctx.collaboration.get_workflow, user.id, workflow_id)
     if value is None:
         raise Problem(404, "workflow_not_found", "workflow not found")
@@ -808,8 +830,9 @@ async def update_workflow(
     body: WorkflowUpdate,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> WorkflowOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     values = body.model_dump(exclude_unset=True)
     if "is_enabled" in values:
         values["enabled"] = values.pop("is_enabled")
@@ -834,8 +857,9 @@ async def delete_workflow(
     workflow_id: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> None:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     deleted = await ctx.call(ctx.collaboration.delete_workflow, user.id, workflow_id, ctx.clock())
     if not deleted:
         raise Problem(404, "workflow_not_found", "workflow not found")
@@ -851,8 +875,9 @@ async def list_channels(
     offset: Annotated[int, Query(ge=0)] = 0,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> ChannelPage:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     channels, total = await ctx.call(
         ctx.collaboration.list_channels, user.id, limit=limit, offset=offset
     )
@@ -868,8 +893,9 @@ async def create_channel(
     body: ChannelCreate,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> ChannelOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     channel = await ctx.call(
         ctx.collaboration.create_channel, user.id, body.title or "New conversation", ctx.clock()
     )
@@ -882,8 +908,9 @@ async def get_channel(
     channel_id: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> ChannelOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     channel = await ctx.call(ctx.collaboration.get_channel, user.id, channel_id)
     if channel is None:
         raise Problem(404, "channel_not_found", "channel not found")
@@ -896,8 +923,9 @@ async def update_channel(
     body: ChannelUpdate,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> ChannelOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     channel = await ctx.call(
         ctx.collaboration.update_channel, user.id, channel_id, body.title, ctx.clock()
     )
@@ -912,8 +940,9 @@ async def delete_channel(
     channel_id: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> None:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     if not await ctx.call(ctx.collaboration.delete_channel, user.id, channel_id, ctx.clock()):
         raise Problem(404, "channel_not_found", "channel not found")
     ctx.hub.notify()
@@ -925,8 +954,9 @@ async def list_messages(
     after: Annotated[int, Query(ge=0)] = 0,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> list[MessageOut]:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     channel = await ctx.call(ctx.collaboration.get_channel, user.id, channel_id)
     if channel is None:
         raise Problem(404, "channel_not_found", "channel not found")
@@ -944,8 +974,9 @@ async def set_message_reaction(
     body: ReactionSet,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:write")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> MessageOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     try:
         message = await ctx.call(
             ctx.collaboration.set_message_reaction,
@@ -969,8 +1000,9 @@ async def channel_work(
     channel_id: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> list[ChannelWorkOut]:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     channel = await ctx.call(ctx.collaboration.get_channel, user.id, channel_id)
     if channel is None:
         raise Problem(404, "channel_not_found", "channel not found")
@@ -1009,7 +1041,9 @@ async def create_turn(
             "collaboration_runtime_unavailable",
             "the sbxloop concierge is disabled or still starting",
         )
-    user = await ctx.call(_local_user, ctx, auth)
+    # The member is checked after availability, so a stopped concierge is
+    # reported as such whoever asks.
+    user = member_of(auth).user
     runner_selected = body.intent in {"code", "workload"}
     if runner_selected and body.target_slugs:
         raise Problem(
@@ -1046,8 +1080,9 @@ async def get_turn(
     turn_id: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> TurnOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     turn = await ctx.call(ctx.collaboration.get_turn, user.id, channel_id, turn_id)
     if turn is None:
         raise Problem(404, "turn_not_found", "turn not found")
@@ -1060,8 +1095,9 @@ async def list_turns(
     active_only: bool = False,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:read")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> list[TurnOut]:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     try:
         turns = await ctx.call(
             ctx.collaboration.list_turns, user.id, channel_id, active_only=active_only
@@ -1077,8 +1113,9 @@ async def cancel_turn(
     turn_id: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
     auth: Authenticated = Depends(require("collaboration:delegate")),  # noqa: B008
+    member: Member = Depends(current_member),  # noqa: B008
 ) -> TurnOut:
-    user = await ctx.call(_local_user, ctx, auth)
+    user = member.user
     turn = await ctx.call(ctx.collaboration.cancel_turn, user.id, channel_id, turn_id, ctx.clock())
     if turn is None:
         raise Problem(404, "turn_not_found", "turn not found")
