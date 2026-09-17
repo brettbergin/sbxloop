@@ -210,6 +210,84 @@ class TestDispatch:
         assert dispatched.lead_agent is None and dispatched.channel_id is None
         assert dispatched.chain_depth == 0
 
+    def test_a_finished_issue_asked_for_again_is_planned_for_the_new_lead(
+        self, tmp_path: Path
+    ) -> None:
+        harness = Capturing(tmp_path)
+        _agent(harness, "chief", ["lead"])
+        harness.source.items = [gh_item("7", repo="o/r")]
+        harness.outcomes = ["blocked"]
+        harness.loop.tick()
+        assert _assignment(harness.dispatched[0]).lead == ANGIE
+
+        def admit(repo: str, number: str, kind: Any) -> WorkItem:
+            return gh_item(number, repo=repo, kind=kind)
+
+        harness.source.admit = admit  # type: ignore[attr-defined]
+        outcome = ControlService(harness.loop).admit(
+            CLIENT, IssueAdmission(repository="o/r", number=7, lead="chief")
+        )
+        assert outcome.fresh
+        harness.source.items = [outcome.item]
+        harness.clock.t += 10_000
+        harness.outcomes = ["completed"]
+        harness.loop.tick()
+        assert len(harness.dispatched) == 2
+        planned = _assignment(harness.dispatched[1])
+        assert planned.lead == "chief"
+        assert dict(planned.roles) == BUILTIN_ROLES
+
+    def test_a_finished_issue_relabelled_from_chat_takes_the_new_ask(self, tmp_path: Path) -> None:
+        harness = Capturing(tmp_path)
+        _agent(harness, "smith", ["builder"])
+        harness.source.items = [gh_item("9", repo="o/r")]
+        harness.outcomes = ["blocked"]
+        harness.loop.tick()
+        assert _assignment(harness.dispatched[0]).roles["builder"] == "builder"
+        # The concierge labels the issue again for a person in a channel.
+        harness.dstore.note_admission(
+            "9", harness.clock(), repo="o/r", channel_id="chn_x", roles={"builder": "smith"}
+        )
+        harness.source.items = [gh_item("9", repo="o/r")]
+        harness.clock.t += 10_000
+        harness.outcomes = ["completed"]
+        harness.loop.tick()
+        assert len(harness.dispatched) == 2
+        again = harness.dispatched[1]
+        assert again.channel_id == "chn_x"
+        planned = _assignment(again)
+        assert dict(planned.roles) == {**BUILTIN_ROLES, "builder": "smith"}
+        assert planned.channel_id == "chn_x"
+
+    def test_a_finished_issue_relabelled_with_no_new_ask_keeps_its_plan(
+        self, tmp_path: Path
+    ) -> None:
+        harness = Capturing(tmp_path)
+        _agent(harness, "smith", ["builder"])
+
+        def admit(repo: str, number: str, kind: Any) -> WorkItem:
+            return gh_item(number, repo=repo, kind=kind)
+
+        harness.source.admit = admit  # type: ignore[attr-defined]
+        item = (
+            ControlService(harness.loop)
+            .admit(
+                CLIENT,
+                IssueAdmission(repository="o/r", number=4, roles={"builder": "smith"}),
+            )
+            .item
+        )
+        harness.source.items = [item]
+        harness.outcomes = ["blocked"]
+        harness.loop.tick()
+        first = harness.dispatched[0].assignment_json
+        harness.source.items = [gh_item("4", repo="o/r")]
+        harness.clock.t += 10_000
+        harness.outcomes = ["completed"]
+        harness.loop.tick()
+        assert len(harness.dispatched) == 2
+        assert harness.dispatched[1].assignment_json == first
+
     def test_the_default_runner_hands_the_assignment_to_the_engine(self, tmp_path: Path) -> None:
         harness = Capturing(tmp_path)
         started: list[dict[str, Any]] = []

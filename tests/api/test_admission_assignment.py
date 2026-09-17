@@ -107,6 +107,38 @@ def test_unusable_agents_and_unknown_channels_are_refused(tmp_path: Any) -> None
     api.ctx.close()
 
 
+def test_naming_a_channel_needs_collaboration_write(tmp_path: Any) -> None:
+    api = _api(tmp_path)
+    with api.client:
+        headers = bearer(register(api))
+        channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+        body = {"kind": "workload", "ask": "Bake bread"}
+        intake_only = api.bearer(frozenset({"items:create"}))
+        for index, target in enumerate((channel, "chn_missing")):
+            refused = api.client.post(
+                "/v1/items",
+                json={**body, "channel_id": target},
+                headers={**intake_only, "Idempotency-Key": f"scoped-{index}"},
+            )
+            # The same answer whether or not the channel exists.
+            assert refused.status_code == 403, refused.text
+            assert refused.json()["capability"] == "collaboration:write"
+        assert api.harness.dstore.items() == []
+        # Without a channel the same client admits work as before.
+        plain = api.client.post(
+            "/v1/items", json=body, headers={**intake_only, "Idempotency-Key": "scoped-plain"}
+        )
+        assert plain.status_code == 201, plain.text
+        writer = api.bearer(frozenset({"items:create", "collaboration:write"}))
+        allowed = api.client.post(
+            "/v1/items",
+            json={**body, "channel_id": channel},
+            headers={**writer, "Idempotency-Key": "scoped-writer"},
+        )
+        assert allowed.status_code == 201, allowed.text
+    api.ctx.close()
+
+
 def test_an_item_admitted_without_agents_reads_as_before(tmp_path: Any) -> None:
     api = _api(tmp_path)
     with api.client:

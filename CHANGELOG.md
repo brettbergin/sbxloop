@@ -65,10 +65,12 @@
   optional `lead`, a `roles` map from run role to agent slug and a
   `channel_id` on issue and workload bodies (advertised as
   `intake.assignment`); an agent that does not exist, is disabled or
-  archived, or does not declare the role is refused with a 422 naming it.
+  archived, or does not declare the role is refused with a 422 naming it,
+  and naming a channel takes `collaboration:write`.
   Dispatch plans each run's agent assignment from what was asked (the
   built-in team otherwise), stores it with the item and hands it to the
-  engine, and a later attempt reuses it. Items read back with `lead_agent`
+  engine, and a later attempt reuses it (work asked for again after it
+  finished is planned afresh). Items read back with `lead_agent`
   and `assignment`. A chat turn passes its channel and the run roles of the
   agents it mentioned to the work it starts, finished work is delivered to
   the channel the item names, and a result is credited to the item's lead.

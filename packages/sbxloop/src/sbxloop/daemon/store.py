@@ -1699,10 +1699,16 @@ class DaemonStore:
                     return False
                 if not changed:
                     self._requeue_terminal_row(session, str(row.item_id), str(row.state), now)
-                    admitted = _admission_values(item)
+                    admitted = _admission_values(item) or self._admission_note(
+                        session, item.source_key, repo
+                    )
                     if admitted:
                         # A new ask for the same work: who it is for and
-                        # who should do it are the new ask's.
+                        # who should do it are the new ask's. The plan the
+                        # finished attempt ran with goes, so dispatch plans
+                        # again from the lead and roles now asked for (none:
+                        # the built-in team); a channel not named stays.
+                        admitted = {"lead_agent": None, "assignment_json": None, **admitted}
                         session.execute(
                             update(WorkItemRow)
                             .where(WorkItemRow.item_id == row.item_id)

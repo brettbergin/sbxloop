@@ -46,7 +46,7 @@ from sbxloop.daemon.controls.intake import (
     WorkloadAdmission,
 )
 from sbxloop.daemon.controls.operations import IdempotencyConflict, Operation, OperationReplay
-from sbxloop.daemon.controls.principal import Principal
+from sbxloop.daemon.controls.principal import Capability as PrincipalCapability, Principal
 from sbxloop.daemon.controls.results import AdmitOutcome, ItemOutcome, Outcome
 from sbxloop.daemon.controls.steering import SteeringStore
 from sbxloop.db.collaboration_models import ChannelRow
@@ -146,10 +146,23 @@ def _operation(ctx: ApiContext, op_id: str | None) -> Operation:
 def _check_channel(ctx: ApiContext, auth: Authenticated, channel_id: str | None) -> None:
     """A channel work is admitted for must exist and be one the caller may
     read: a workspace member names their own channels; a plain API client,
-    which reads everything, any active one."""
+    which reads everything, any active one. Work admitted for a channel is
+    delivered and charged there, so naming one takes the capabilities a
+    channel write does, checked before whether the channel exists."""
     if channel_id is None:
         return
     member = auth.member
+    needed: tuple[PrincipalCapability, ...] = ("collaboration:write",)
+    if member is not None:
+        needed = ("collaboration:read", *needed)
+    for capability in needed:
+        if not auth.principal.can(capability):
+            raise Problem(
+                403,
+                "forbidden",
+                f"{auth.principal.id} lacks {capability}",
+                capability=capability,
+            )
     if member is not None:
         found = ctx.collaboration.get_channel(member.user.id, channel_id) is not None
     else:

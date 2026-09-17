@@ -243,7 +243,11 @@ run; `roles`, an object mapping a run role (`planner`, `builder`, `critic`,
 to. Each named agent must exist, be active (not disabled or archived) and
 declare the role it is asked to take (`lead` for the lead); anything else is
 `422 invalid_argument` naming the agent and the role, and nothing is queued
-or labelled. A `channel_id` the caller cannot read is `404 channel_not_found`.
+or labelled. Naming a `channel_id` also takes `collaboration:write` (and
+`collaboration:read` for a workspace member's client), checked first: without
+it the request is `403 forbidden`. A `channel_id` the caller cannot read is
+`404 channel_not_found`. Work asked for again after its last run finished is
+planned afresh from the new request's lead and roles.
 A body without them admits work exactly as before.
 
 When the item is dispatched, the daemon plans its assignment: each role takes
