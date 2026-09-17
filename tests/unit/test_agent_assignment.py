@@ -12,14 +12,16 @@ credentials, and supplies a model below the repository's per-phase model.
 
 from __future__ import annotations
 
+import dataclasses
 import json
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
 from sbxloop.agentmodels import model_for_phase
 from sbxloop.agents.assignment import AgentAssignment, AgentBinding, plan_assignment
-from sbxloop.agents.registry import ConfigAgentRegistry
+from sbxloop.agents.definition import AgentDefinition
+from sbxloop.agents.registry import AgentRegistry, ConfigAgentRegistry
 from sbxloop.config import Config
 from sbxloop.engine.harness import brief_for_phase
 from sbxloop.engine.model import TaskRecord, TaskSpec
@@ -102,6 +104,28 @@ class TestPlanAssignment:
         )
         assert plan.roles["builder"] == "builder"
         assert plan.is_default()
+
+    def test_an_archived_agent_is_not_assigned(self) -> None:
+        boss = {"slug": "boss", "name": "Boss", "roles": ["lead"]}
+        base = registry(boss, ADA)
+
+        class Archived:
+            def get(self, slug_or_alias: str) -> AgentDefinition | None:
+                agent = base.get(slug_or_alias)
+                if agent is None or agent.source == "builtin":
+                    return agent
+                return dataclasses.replace(agent, archived=True)
+
+        plan = plan_assignment(
+            cast("AgentRegistry", Archived()),
+            kind="code",
+            lead="boss",
+            requested={"builder": "ada"},
+            channel_id=None,
+        )
+        assert plan.roles["builder"] == "builder"
+        assert plan.lead == "concierge"
+        assert set(plan.agents) == {"concierge", "planner", "builder", "critic", "operator"}
 
     def test_the_lead_defaults_to_angie_and_takes_a_lead_agent(self) -> None:
         boss = {"slug": "boss", "name": "Boss", "roles": ["lead"]}

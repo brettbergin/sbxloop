@@ -264,7 +264,7 @@ def _usable(
     if not slug:
         return None
     agent = registry.get(slug)
-    if agent is None or not agent.spec.enabled or agent.legacy or role not in agent.spec.roles:
+    if agent is None or not agent.active or agent.legacy or role not in agent.spec.roles:
         return None
     return agent
 
@@ -287,8 +287,8 @@ def plan_assignment(
 ) -> AgentAssignment:
     """The assignment a run of ``kind`` starts with.
 
-    Each role takes the requested agent when it exists, is enabled and
-    declares the role, and the built-in for that role otherwise; the lead
+    Each role takes the requested agent when it exists, is enabled, is not
+    archived and declares the role, and the built-in for that role otherwise; the lead
     is ``lead`` on the same terms, Angie otherwise. A ``tool`` run has no
     agent phases and so no roles. ``memory`` fills each agent's memory
     block for ``channel_id``; without it the blocks are empty.
