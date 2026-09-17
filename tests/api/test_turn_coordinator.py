@@ -149,12 +149,16 @@ class TestCancel:
             release.wait(WAIT_S)
             ran.append("a1")
 
-        turns.submit(turn("a", "a1"), first, cancel=lambda: cancelled.append("a1"))
+        def stop(name: str) -> bool:
+            cancelled.append(name)
+            return True
+
+        turns.submit(turn("a", "a1"), first, cancel=lambda: stop("a1"))
         for name in ("a2", "a3"):
             turns.submit(
                 turn("a", name),
                 lambda name=name: ran.append(name),
-                cancel=lambda name=name: cancelled.append(name),
+                cancel=lambda name=name: stop(name),
             )
         assert started.wait(WAIT_S)
         assert turns.cancel_channel("a") == ["a1", "a2", "a3"]
@@ -172,7 +176,9 @@ class TestCancel:
         turns.submit(turn("a", "a1"), lambda: release.wait(WAIT_S))
         # b1 waits for the only worker; cancelling its channel settles it.
         turns.submit(
-            turn("b", "b1"), lambda: ran.append("b1"), cancel=lambda: cancelled.append("b1")
+            turn("b", "b1"),
+            lambda: ran.append("b1"),
+            cancel=lambda: cancelled.append("b1") or True,
         )
         assert turns.cancel_channel("b") == ["b1"]
         release.set()
@@ -188,13 +194,42 @@ class TestCancel:
         turns.submit(turn("a", "a1"), lambda: release.wait(WAIT_S))
         turns.submit(turn("a", "a2"), lambda: ran.append("a2"))
         turns.submit(
-            turn("c", "c1"), lambda: ran.append("c1"), cancel=lambda: cancelled.append("c")
+            turn("c", "c1"),
+            lambda: ran.append("c1"),
+            cancel=lambda: cancelled.append("c") or True,
         )
         assert turns.cancel_channel("b") == []
         release.set()
         assert turns.wait_idle(WAIT_S)
         assert sorted(ran) == ["a2", "c1"]
         assert cancelled == []
+
+    def test_cancel_channel_reports_only_the_turns_it_stopped(self, coordinator: Any) -> None:
+        turns = coordinator(1)
+        release = threading.Event()
+        started = threading.Event()
+        asked: list[str] = []
+
+        def first() -> None:
+            started.set()
+            release.wait(WAIT_S)
+
+        def already_finished() -> bool:
+            # The running turn completed before the request reached it.
+            asked.append("a1")
+            return False
+
+        def stopped() -> bool:
+            asked.append("a2")
+            return True
+
+        turns.submit(turn("a", "a1"), first, cancel=already_finished)
+        turns.submit(turn("a", "a2"), lambda: None, cancel=stopped)
+        assert started.wait(WAIT_S)
+        assert turns.cancel_channel("a") == ["a2"]
+        assert asked == ["a1", "a2"]
+        release.set()
+        assert turns.wait_idle(WAIT_S)
 
 
 class TestShutdown:
@@ -209,6 +244,10 @@ class TestShutdown:
             started.set()
             release.wait(WAIT_S)
             ran.append("a1")
+
+        def stop(name: str) -> bool:
+            cancelled.append(name)
+            return True
 
         turns.submit(turn("a", "a1"), first)
         turns.submit(
@@ -351,6 +390,52 @@ def test_cancel_channel_settles_queued_turns_and_stops_the_running_one(tmp_path:
                 first.set_result(ConciergeReply("finished anyway"))
             assert api.ctx.turns.wait_idle(WAIT_S)
             assert settled(api.client, headers, channel, ids[0])["status"] == "cancelled"
+            assert calls == ["running"]
+    finally:
+        api.ctx.close()
+
+
+def test_cancel_channel_settles_queued_turns_of_a_deleted_channel(tmp_path: Path) -> None:
+    api = build(tmp_path, config={"concierge": {"max_concurrent_turns": 4}})
+    try:
+        with api.client:
+            first: Future[ConciergeReply] = Future()
+            calls: list[str] = []
+
+            class Held(FakeConcierge):
+                def submit_turn(self, text: str, **kwargs: Any) -> Future[ConciergeReply]:
+                    calls.append(text)
+                    if text == "running":
+                        return first
+                    return super().submit_turn(text, **kwargs)
+
+            api.ctx.concierge = Held()
+            headers = bearer(register(api))
+            channel = api.client.post("/v1/channels", json={}, headers=headers).json()["id"]
+            route = f"/v1/channels/{channel}/turns"
+            running = api.client.post(route, headers=headers, json={"content": "running"}).json()
+            queued = api.client.post(route, headers=headers, json={"content": "queued"}).json()
+            deadline = time.monotonic() + WAIT_S
+            while not calls and time.monotonic() < deadline:
+                time.sleep(0.01)
+            ids = [running["turn"]["id"], queued["turn"]["id"]]
+            try:
+                # The stop flow tombstones the channel first, then clears its lane.
+                assert (
+                    api.client.delete(f"/v1/channels/{channel}", headers=headers).status_code == 204
+                )
+                assert api.ctx.turns.cancel_channel(channel) == ids
+            finally:
+                first.set_result(ConciergeReply("finished anyway"))
+            assert api.ctx.turns.wait_idle(WAIT_S)
+            from sbxloop.db.collaboration_models import MessageRow, TurnRow
+
+            with api.loop.dstore.read() as session:
+                rows = [session.get(TurnRow, turn_id) for turn_id in ids]
+                assert [row.status if row else None for row in rows] == ["cancelled", "cancelled"]
+                input_message = session.get(MessageRow, rows[1].input_message_id)
+                assert input_message is not None
+                assert "⏳" not in input_message.reactions_json
             assert calls == ["running"]
     finally:
         api.ctx.close()

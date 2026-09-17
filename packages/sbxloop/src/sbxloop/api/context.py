@@ -326,9 +326,10 @@ class ApiContext:
                 )
             self.hub.notify()
 
-        def cancel() -> None:
-            self.collaboration.request_turn_cancel(turn.id, self.clock())
+        def cancel() -> bool:
+            changed = self.collaboration.request_turn_cancel(turn.id, self.clock())
             self.hub.notify()
+            return changed
 
         self.turns.submit(turn, run, cancel=cancel)
 

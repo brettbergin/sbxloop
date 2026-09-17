@@ -42,7 +42,7 @@ class _Entry:
     turn_id: str
     channel_id: str
     run: Callable[[], None]
-    cancel: Callable[[], None] | None
+    cancel: Callable[[], bool] | None
     cancelled: bool = False
     future: Future[None] | None = field(default=None, repr=False)
 
@@ -67,13 +67,15 @@ class TurnCoordinator:
         turn: ChannelTurn,
         run: Callable[[], None],
         *,
-        cancel: Callable[[], None] | None = None,
+        cancel: Callable[[], bool] | None = None,
     ) -> None:
         """Queue ``run`` at the back of the turn's channel lane.
 
         ``cancel`` is called by :meth:`cancel_channel`: for a turn that has
-        not started it is the only effect (``run`` is then never called); for
-        the running turn it is a request the turn is expected to observe.
+        not started it is the only effect (``run`` is then never called), so
+        it must settle the turn whatever state its channel is in; for the
+        running turn it is a request the turn is expected to observe. It
+        returns whether it stopped the turn (False for one already over).
         """
         entry = _Entry(turn.id, turn.channel_id, run, cancel)
         with self._changed:
@@ -86,8 +88,10 @@ class TurnCoordinator:
     def cancel_channel(self, channel_id: str) -> list[str]:
         """Cancel the channel's queued turns and ask its current one to stop.
 
-        Returns the affected turn ids, the current turn first, then the
-        queued ones in lane order.
+        Returns the ids of the turns it stopped, the current turn first, then
+        the queued ones in lane order. A turn whose ``cancel`` reports it was
+        already over, or raises, is left out, as is a current turn without a
+        ``cancel``; a queued turn without one is simply dropped and counted.
         """
         with self._changed:
             entries = list(self._lanes.pop(channel_id, ()))
@@ -97,11 +101,15 @@ class TurnCoordinator:
             for entry in entries:
                 entry.cancelled = True
             self._changed.notify_all()
+        stopped: list[str] = []
         for entry in entries:
             if entry.cancel is None:
+                if entry is not current:
+                    stopped.append(entry.turn_id)
                 continue
             try:
-                entry.cancel()
+                if entry.cancel():
+                    stopped.append(entry.turn_id)
             except Exception:
                 log.warning(
                     "collaboration.turn_cancel_failed",
@@ -109,7 +117,7 @@ class TurnCoordinator:
                     channel_id=channel_id,
                     exc_info=True,
                 )
-        return [entry.turn_id for entry in entries]
+        return stopped
 
     def wait_idle(self, timeout: float | None = None) -> bool:
         """Wait until no turn is running or queued; whether that happened."""

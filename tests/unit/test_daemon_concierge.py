@@ -3734,7 +3734,7 @@ class LeasingHost(FakeHost):
 
 class TestConcurrentTurns:
     def test_the_turn_width_is_a_bounded_concierge_knob(self) -> None:
-        assert Config.model_validate({}).concierge.max_concurrent_turns == 4
+        assert Config.model_validate({}).concierge.max_concurrent_turns == 1
         assert (
             Config.model_validate(
                 {"concierge": {"max_concurrent_turns": 16}}
