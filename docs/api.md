@@ -104,8 +104,7 @@ called), `401 oidc_exchange_failed` (the provider refused the code, or the ID
 token did not check out; the message is generic), `403 oidc_not_allowed`
 (outside `allowed_groups`), `403 oidc_account_disabled` (inactive, or removed
 from the workspace), `403 oidc_not_provisioned` (unknown person with
-`auto_provision = false`), `403 oidc_email_conflict` (an existing account has
-the email and the provider has not verified it), `409 oidc_account_conflict`
+`auto_provision = false`), `409 oidc_account_conflict`
 (a concurrent first sign-in; retry), `429 too_many_attempts`, and
 `503 oidc_unavailable` (discovery, keys or token endpoint unreachable, or the
 client secret is not set). See the [user guide](user-guide.md#sign-in-with-an-oidc-provider-authentik)
@@ -609,7 +608,7 @@ request's `X-Request-Id`, and the fields a client needs to act:
 | ------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | 400    | `invalid_request`, `invalid_cursor`, `oidc_invalid_request`                                                                                                                                                                                                                                                         |
 | 401    | `unauthenticated`, `invalid_token`, `token_expired`, `token_revoked`, `client_revoked`, `refresh_reuse_detected`, `oidc_exchange_failed`                                                                                                                                                                            |
-| 403    | `forbidden` (with `capability`), `oidc_not_allowed`, `oidc_account_disabled`, `oidc_not_provisioned`, `oidc_email_conflict`                                                                                                                                                                                         |
+| 403    | `forbidden` (with `capability`), `oidc_not_allowed`, `oidc_account_disabled`, `oidc_not_provisioned`                                                                                                                                                                                                                |
 | 404    | `not_found`, `unknown_target`, `agent_not_found`                                                                                                                                                                                                                                                                    |
 | 409    | `not_eligible`, `already_terminal`, `already_in_progress`, `stale_revision`, `unsupported_for_kind`, `capability_unknown`, `capability_unsupported`, `idempotency_conflict`, `hold_owned`, `unsupervised`, `agent_read_only`, `agent_revision_conflict` (with `current_revision`), `agent_exists`, `agent_archived` |
 | 410    | `cursor_expired` (with `snapshot`), `artifact_gone`                                                                                                                                                                                                                                                                 |

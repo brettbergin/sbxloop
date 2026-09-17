@@ -620,39 +620,106 @@ LOCAL = {
 }
 
 
-def test_a_local_account_is_linked_by_a_verified_email(served: Api, idp: FakeIdP) -> None:
-    registered = served.client.post("/v1/auth/local/register", json=LOCAL)
+@pytest.fixture
+def linking(tmp_path: Path, idp: FakeIdP) -> Iterator[Api]:
+    yield from _serve(tmp_path, idp, link_verified_email=True)
+
+
+def _register_local(api: Api) -> dict[str, Any]:
+    registered = api.client.post("/v1/auth/local/register", json=LOCAL)
     assert registered.status_code == 201, registered.text
+    return dict(registered.json())
 
-    tokens = _sign_in(served, idp, "alice", email="Alice@Example.test")
 
-    assert tokens["client_id"] == registered.json()["client_id"]
-    with served.ctx.collaboration.dstore.read() as session:
+def _users(api: Api) -> dict[str, LocalUserRow]:
+    with api.ctx.collaboration.dstore.read() as session:
+        rows = session.scalars(select(LocalUserRow)).all()
+        session.expunge_all()
+        return {row.client_id: row for row in rows}
+
+
+def _is_separate_account(api: Api, tokens: dict[str, Any], local: dict[str, Any]) -> None:
+    """The sign-in got its own member account; the local one is untouched."""
+    assert tokens["client_id"] != local["client_id"]
+    users = _users(api)
+    assert users[local["client_id"]].oidc_subject is None
+    assert users[local["client_id"]].email == LOCAL["email"]
+    # The clashing address stays with its holder; the new account gets one
+    # that can never receive mail.
+    assert users[tokens["client_id"]].email.endswith("@users.invalid")
+    assert _member(api, tokens).role == "member"
+    assert _member(api, {"client_id": local["client_id"]}).role == "owner"
+
+
+def test_a_local_account_is_linked_by_a_verified_email(linking: Api, idp: FakeIdP) -> None:
+    registered = _register_local(linking)
+
+    tokens = _sign_in(linking, idp, "alice", email="Alice@Example.test")
+
+    assert tokens["client_id"] == registered["client_id"]
+    with linking.ctx.collaboration.dstore.read() as session:
         row = session.scalars(select(LocalUserRow)).one()
         assert (row.oidc_issuer, row.oidc_subject) == (ISSUER, "alice")
         assert row.auth_source == "local"
     # The password still works, and the next sign-in finds the same account.
-    login = served.client.post(
+    login = linking.client.post(
         "/v1/auth/local/login", json={"username": "alice-local", "password": LOCAL["password"]}
     )
     assert login.status_code == 200
+    assert _sign_in(linking, idp, "alice")["client_id"] == tokens["client_id"]
+    assert _member(linking, tokens).role == "owner"
+
+
+def test_a_verified_email_links_nothing_unless_linking_is_enabled(
+    served: Api, idp: FakeIdP
+) -> None:
+    local = _register_local(served)
+
+    tokens = _sign_in(served, idp, "alice")
+
+    _is_separate_account(served, tokens, local)
     assert _sign_in(served, idp, "alice")["client_id"] == tokens["client_id"]
-    assert _member(served, tokens).role == "owner"
-
-
-def test_an_unverified_email_never_links_a_local_account(served: Api, idp: FakeIdP) -> None:
-    registered = served.client.post("/v1/auth/local/register", json=LOCAL)
-    assert registered.status_code == 201
-
-    idp.identity("alice", email_verified=False)
-    _refused(served, 403, "oidc_email_conflict")
-    idp.identity("alice")
-    del idp.claims["email_verified"]
-    _refused(served, 403, "oidc_email_conflict")
-
     with served.ctx.collaboration.dstore.read() as session:
-        (row,) = session.scalars(select(LocalUserRow)).all()
-        assert row.oidc_subject is None
+        types = set(session.scalars(select(ApiEventRow.type)).all())
+    assert "auth.oidc.linked" not in types
+
+
+def test_linking_is_off_by_default() -> None:
+    assert ApiOidcConfig.model_validate(OIDC).link_verified_email is False
+
+
+@pytest.mark.parametrize("verified", [False, None])
+def test_an_unverified_email_gets_a_new_account_instead_of_a_link(
+    linking: Api, idp: FakeIdP, verified: bool | None
+) -> None:
+    local = _register_local(linking)
+
+    idp.identity("alice", email_verified=verified)
+    if verified is None:
+        del idp.claims["email_verified"]
+    response = _exchange(linking)
+    assert response.status_code == 200, response.text
+    tokens = dict(response.json())
+
+    _is_separate_account(linking, tokens, local)
+    # The same person returns to that account, not to the local one.
+    idp.identity("alice", email_verified=False)
+    assert _exchange(linking).json()["client_id"] == tokens["client_id"]
+
+
+def test_an_email_already_linked_to_another_identity_gets_a_new_account(
+    linking: Api, idp: FakeIdP
+) -> None:
+    local = _register_local(linking)
+    _sign_in(linking, idp, "alice")  # links the local account
+
+    other = _sign_in(linking, idp, "mallory", email=LOCAL["email"])
+
+    assert other["client_id"] != local["client_id"]
+    users = _users(linking)
+    assert users[local["client_id"]].oidc_subject == "alice"
+    assert users[other["client_id"]].email.endswith("@users.invalid")
+    assert _member(linking, other).role == "member"
 
 
 def test_an_unverified_new_email_still_provisions(served: Api, idp: FakeIdP) -> None:

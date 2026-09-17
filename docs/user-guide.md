@@ -2205,6 +2205,7 @@ redirect_uris = ["https://angie.comp.bergco.net/auth/callback"]
 # owner_groups = ["sbxloop Owners"]   # optional: roles follow Authentik groups
 # admin_groups = ["sbxloop Admins"]
 # allowed_groups = ["sbxloop Users", "sbxloop Admins", "sbxloop Owners"]
+# link_verified_email = false          # see "Linking an existing local account"
 ```
 
 Put the provider's client secret in the home's `config/secrets.env` (never in
@@ -2229,14 +2230,29 @@ their groups, except that the workspace's last owner is never demoted; with
 neither set, roles are managed in sbxloop and sign-in leaves them alone.
 `allowed_groups`, when set, refuses anyone in none of them
 (`403 oidc_not_allowed`). A user who was deactivated or removed from the
-workspace is refused (`403 oidc_account_disabled`). An existing local account
-is linked to the provider identity when the provider says its email is
-verified (`email_verified: true`) and the address matches; the account keeps
-`auth_source = "local"` and its password keeps working. An unverified email
-that matches an existing account is refused (`403 oidc_email_conflict`)
-rather than creating a second account, since addresses are unique. Account
-creation and each sign-in are recorded as `collaboration.user.created` and
-`auth.oidc.login` events carrying only the user id.
+workspace is refused (`403 oidc_account_disabled`). Account creation and each
+sign-in are recorded as `collaboration.user.created` and `auth.oidc.login`
+events carrying only the user id.
+
+**Linking an existing local account.** By default a provider identity is
+never linked to an account that already exists: a person whose email matches
+a local account gets a new account of their own, with an undeliverable
+`oidc-...@users.invalid` address, since addresses are unique. With
+`link_verified_email = true`, a first sign-in is linked instead to the
+unlinked local account with the same address, but only when the ID token
+says `email_verified: true`; the account keeps `auth_source = "local"` and its
+password keeps working, and the link is recorded as `auth.oidc.linked`. An
+unverified email, or one whose account is already linked to another
+identity, still gets a new account. Linking trusts the provider's
+`email_verified` claim completely: whoever the provider admits with a
+verified address takes over the account holding it, including the
+workspace owner, and the link is permanent. Turn it on only when people
+cannot change their email at the provider (in Authentik, the user settings
+flow must not let them edit it) and the provider's email scope mapping
+asserts `email_verified` only for addresses it has checked (Authentik's
+stock mapping has sent `true` unconditionally). A safe way to link the
+owner's local account is to enable it, have the owner sign in once, then
+turn it off again.
 
 **When it fails.** A provider error or an ID token that does not check out is
 `401 oidc_exchange_failed` with a generic message (the daemon's log says
@@ -3285,7 +3301,8 @@ The notable knobs:
 | `[api.oidc] leeway_s` / `discovery_cache_s` / `jwks_cache_s` / `request_timeout_s`                 | `60` / `3600` / `3600` / `10`                                                                                    | Clock skew allowed on `exp`, `iat` and `nbf`; how long the discovery document and the signing keys are cached (an unknown key id refetches the keys); each call's timeout.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
 | `[api.oidc] username_claim` / `email_claim` / `name_claim` / `groups_claim`                        | `preferred_username` / `email` / `name` / `groups`                                                               | The ID token claims a new account's username (numbered on a clash), email and full name, and the group list, are read from.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
 | `[api.oidc] owner_groups` / `admin_groups` / `allowed_groups` / `default_role`                     | `[]` / `[]` / `[]` / `member`                                                                                    | Provider groups that make a person an owner or admin (with either set, every sign-in re-derives the role, never demoting the last owner); groups outside which sign-in is refused (empty: anyone the provider admits); the role otherwise (`member` or `admin`). The installation's first user is always the owner.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `[api.oidc] auto_provision`                                                                        | `true`                                                                                                           | Create an account on a first sign-in. Off, only an account already linked (or a local one with the same verified email) may sign in.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `[api.oidc] auto_provision`                                                                        | `true`                                                                                                           | Create an account on a first sign-in. Off, only an account already linked (or, with `link_verified_email`, a local one with the same verified email) may sign in.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `[api.oidc] link_verified_email`                                                                   | `false`                                                                                                          | Link a first sign-in to the unlinked local account whose email matches, when the provider says the email is verified. Turn it on only if people cannot change their email at the provider and the provider asserts `email_verified` only for addresses it has checked; otherwise anyone the provider admits could take over the account with that address, the owner's included. Off, or unverified, the person gets a new account of their own.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
 
 The `[sandbox]` resource settings size each VM through `sbx create` CPU and
 memory flags; see [Sandbox CPU and memory](#sandbox-cpu-and-memory).

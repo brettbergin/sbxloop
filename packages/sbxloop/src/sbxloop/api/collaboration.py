@@ -567,22 +567,24 @@ class CollaborationStore:
         role_from_groups: Role | None,
         default_role: Role,
         auto_provision: bool,
+        link_verified_email: bool = False,
         now: float,
     ) -> LocalUser:
         """The local account behind a provider identity, created or linked
         on first sign-in.
 
         An account already bound to ``(issuer, subject)`` is used as is,
-        with its email and name refreshed. Otherwise a local account whose
-        email matches is linked, but only when the provider has verified
-        the email (an unverified match is refused, since the address is
-        unique). Failing both, a new account is provisioned when
+        with its email and name refreshed. Otherwise, with
+        ``link_verified_email``, an unlinked local account whose email
+        matches is linked, but only when the provider has verified the
+        email. Failing both, a new account is provisioned when
         ``auto_provision`` allows: the installation's first user owns the
         workspace, anyone else takes ``role_from_groups`` or
-        ``default_role``. For an existing member, ``role_from_groups``
-        (when not ``None``) replaces the role, except that the last owner
-        is never demoted. An inactive user, or one no longer in the
-        workspace, is refused.
+        ``default_role``. An email another account already holds is not
+        given to the new account, which gets an undeliverable one instead.
+        For an existing member, ``role_from_groups`` (when not ``None``)
+        replaces the role, except that the last owner is never demoted. An
+        inactive user, or one no longer in the workspace, is refused.
         """
         email = email.strip().casefold() if email and email.strip() else None
         try:
@@ -596,6 +598,7 @@ class CollaborationStore:
                 role_from_groups=role_from_groups,
                 default_role=default_role,
                 auto_provision=auto_provision,
+                link_verified_email=link_verified_email,
                 now=now,
             )
         except IntegrityError as exc:
@@ -617,6 +620,7 @@ class CollaborationStore:
         role_from_groups: Role | None,
         default_role: Role,
         auto_provision: bool,
+        link_verified_email: bool = False,
         now: float,
     ) -> LocalUser:
         with self.dstore.transaction() as session:
@@ -626,16 +630,17 @@ class CollaborationStore:
                 )
             ).first()
             created = False
+            new_email = email
             if row is None and email is not None:
                 holder: LocalUserRow | None = session.scalars(
                     select(LocalUserRow).where(LocalUserRow.email == email)
                 ).first()
-                if holder is not None:
-                    if not email_verified or holder.oidc_subject is not None:
-                        raise CollaborationError(
-                            "oidc_email_conflict",
-                            "an account with this email exists and cannot be linked",
-                        )
+                if (
+                    holder is not None
+                    and link_verified_email
+                    and email_verified
+                    and holder.oidc_subject is None
+                ):
                     # The password keeps working, so the account stays
                     # ``local``; the provider identity is recorded beside it.
                     holder.oidc_issuer = issuer
@@ -643,6 +648,10 @@ class CollaborationStore:
                     holder.updated_at = now
                     row = holder
                     _event(session, "auth.oidc.linked", now, data={"user_id": holder.id})
+                elif holder is not None:
+                    # Not linkable: the person gets an account of their own,
+                    # and the address stays with the account that holds it.
+                    new_email = None
             if row is None:
                 if not auto_provision:
                     raise CollaborationError(
@@ -653,7 +662,7 @@ class CollaborationStore:
                     issuer=issuer,
                     subject=subject,
                     username=username or (email.split("@", 1)[0] if email else None) or "user",
-                    email=email,
+                    email=new_email,
                     full_name=full_name,
                     role=role_from_groups or default_role,
                     now=now,

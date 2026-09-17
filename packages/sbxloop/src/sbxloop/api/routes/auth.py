@@ -174,9 +174,7 @@ async def providers(ctx: ApiContext = Depends(get_ctx)) -> AuthProviders:  # noq
 
 
 #: Account refusals from the store, answered as 403 with the store's code.
-_ACCOUNT_REFUSALS = frozenset(
-    {"oidc_account_disabled", "oidc_not_provisioned", "oidc_email_conflict"}
-)
+_ACCOUNT_REFUSALS = frozenset({"oidc_account_disabled", "oidc_not_provisioned"})
 
 
 def _oidc_sign_in(
@@ -206,6 +204,7 @@ def _oidc_sign_in(
             role_from_groups=role_for_groups(settings, identity.groups),
             default_role=settings.default_role,
             auto_provision=settings.auto_provision,
+            link_verified_email=settings.link_verified_email,
             now=ctx.clock(),
         )
     except CollaborationError as exc:

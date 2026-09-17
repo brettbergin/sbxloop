@@ -2784,6 +2784,12 @@ class ApiOidcConfig(_ConfigModel):
     #: Create an account on a first sign-in; off, only linked or existing
     #: accounts may sign in.
     auto_provision: bool = True
+    #: Link a first sign-in to the local account holding the same email when
+    #: the provider says the address is verified. Off by default: a provider
+    #: that lets people edit their email, or asserts ``email_verified`` for
+    #: any address, would otherwise hand them that account (the owner's
+    #: included). Off, or unverified, the person gets an account of their own.
+    link_verified_email: bool = False
     request_timeout_s: float = Field(default=10.0, gt=0, le=60)
 
     @property

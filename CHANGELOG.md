@@ -32,8 +32,12 @@
   later gets an account on first sign-in, with a role taken from optional
   owner and admin groups (the last owner is never demoted).
   `allowed_groups` can limit who may sign in at all. Deactivated or removed
-  members are refused. An existing local account is linked only when the
-  provider has verified its email. `auth.oidc` is advertised only while the
+  members are refused. An existing local account is never taken over by
+  default: a person whose email matches one gets a new account. Linking it
+  instead, when the provider says the email is verified, is opt-in
+  (`link_verified_email`), because a provider that lets people edit their
+  email would otherwise hand out any account, the owner's included.
+  `auth.oidc` is advertised only while the
   section is enabled. Local password sign-in is unchanged, and the secret
   never appears in config, events or logs.
 
