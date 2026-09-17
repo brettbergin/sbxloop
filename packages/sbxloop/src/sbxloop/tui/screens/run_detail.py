@@ -324,7 +324,7 @@ class RunDetailScreen(ConsoleScreen):
 
     def _is_current(self, detail: RunDetail) -> bool:
         daemon = self.console_app.state.daemon
-        return daemon is not None and daemon.live and daemon.current_run == detail.record.run_id
+        return daemon is not None and daemon.live and detail.record.run_id in daemon.live_runs
 
     def _offers(self, detail: RunDetail) -> list[str]:
         """The verbs that apply to this run, as the header's key hints —

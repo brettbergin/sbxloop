@@ -4176,6 +4176,11 @@
             "title": "Holds",
             "type": "array"
           },
+          "max_concurrent_runs": {
+            "default": 1,
+            "title": "Max Concurrent Runs",
+            "type": "integer"
+          },
           "max_runs_per_day": {
             "title": "Max Runs Per Day",
             "type": "integer"
@@ -4223,6 +4228,13 @@
           "run_cap_timezone": {
             "title": "Run Cap Timezone",
             "type": "string"
+          },
+          "runs": {
+            "items": {
+              "$ref": "#/components/schemas/CurrentRun"
+            },
+            "title": "Runs",
+            "type": "array"
           },
           "runs_today": {
             "title": "Runs Today",

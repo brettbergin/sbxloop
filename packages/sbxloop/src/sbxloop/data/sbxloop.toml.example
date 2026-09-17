@@ -761,6 +761,7 @@ service_memory = "2g"
 # `sbxloop init-repo owner/name` creates all seven (plus [landing] followup_label)
 # on a repository, with colors and descriptions; `doctor` reports missing ones.
 # max_runs_per_day = 12           # calendar-day cap, persisted across restarts
+# max_concurrent_runs = 1         # runs executing at once (1-4); two code runs never share a repo
 # run_cap_timezone = "UTC"        # day boundary for the run cap (resets at 00:00 there)
 # max_attempts_per_item = 2
 # max_resumes_per_item = 2         # interrupted runs resumed at most this often per item

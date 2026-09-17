@@ -2464,10 +2464,24 @@ The split is deliberate and worth stating plainly:
 - **Daemon-wide** — the calendar-day run cap (`max_runs_per_day`), the
   per-item attempt cap (`max_attempts_per_item`) and resume cap, the
   consecutive-failure circuit breaker (`max_consecutive_failures`,
-  `breaker_cooldown_s`), and **one run at a time**. A failing repository
-  spends the shared budget and can trip the breaker for every repository;
-  that is the point — the guardrails bound what this host does, not what
-  one project does.
+  `breaker_cooldown_s`), and the **concurrency cap**
+  (`max_concurrent_runs`, one run at a time by default). A failing
+  repository spends the shared budget and can trip the breaker for every
+  repository; that is the point — the guardrails bound what this host
+  does, not what one project does. Two code runs never work one repository
+  at once, whatever the cap.
+
+`DaemonLoop` keeps the runs in flight in `_runs`, keyed by run id, oldest
+first. `_launch` claims nothing itself: it marks the item running, builds
+the engine, registers the handle and starts the engine thread. `_reap`,
+at the start of every tick, settles each run whose thread has ended on the
+loop thread (the same `_settle` / `_settle_cancelled` paths) and asks a run
+whose row an operator changed from another process to stop. With the cap
+at 1 the tick awaits the run it launched and reaps it before returning, so
+the loop behaves as it always has; above 1 the tick launches until the cap
+is reached and returns. Controls address a run by id (`cancel_run`,
+`steer_run`); a bare `cancel` means the oldest run, which is also what
+`status()["current"]` reports beside the full `runs` list.
 
 Discovery polls each enabled repository in turn, and every work item
 carries the `owner/name` it came from, so a run's clone, branch, draft PR,

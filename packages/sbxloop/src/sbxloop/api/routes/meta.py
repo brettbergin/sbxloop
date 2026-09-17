@@ -16,6 +16,7 @@ router = APIRouter(prefix="/v1", tags=["meta"])
 #: What this release serves; a later stage appends to it.
 FEATURES: tuple[str, ...] = (
     "status",
+    "status.runs",
     "operations",
     "auth.client_credentials",
     "auth.refresh",

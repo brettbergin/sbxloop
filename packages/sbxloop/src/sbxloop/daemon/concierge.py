@@ -55,7 +55,7 @@ from sbxloop.daemon.chat_choices import (
 from sbxloop.daemon.configpolicy import refusal
 from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX, dispatch, format_log_tail, plain
 from sbxloop.daemon.loop import day_window
-from sbxloop.daemon.model import WorkItem
+from sbxloop.daemon.model import WorkItem, live_runs
 from sbxloop.daemon.store import ChatThread, DaemonStore
 from sbxloop.daemon.usage import (
     SPEND_NOT_REPORTED,
@@ -846,6 +846,9 @@ class Concierge:
             return f"[situation] daemon status unavailable ({reason}) | speaker: {author}"
         cur = status.get("current")
         current = f"{cur['run_id']} — {_one_line(str(cur.get('title', '')), 80)}" if cur else "idle"
+        more = len(live_runs(status)) - 1
+        if more > 0:
+            current += f" (+{more} more in flight)"
         stamp = time.strftime("%H:%M", time.localtime(self.clock()))
         return (
             f"[situation @ {stamp}] current: {current} | queued: {status.get('queued', 0)} | "
@@ -1702,8 +1705,7 @@ class Concierge:
                 + (f" · requested by <@{item.requested_by}>" if item.requested_by else "")
                 + (f" · {item.url}" if item.url else "")
             )
-        live = self.loop.current
-        if live is not None and live.run_id == run_id:
+        if any(live.run_id == run_id for live in self.loop.runs):
             lines.append("this run is LIVE right now")
         if thread is not None:
             lines.append(
@@ -2886,6 +2888,15 @@ def _status_detail(status: dict[str, Any]) -> str:
     bits: list[str] = []
     if current.get("item_id"):
         bits.append(f"current work item: {normalize_item_id(str(current['item_id']))}")
+    others = [run for run in live_runs(status) if run.get("run_id") != current.get("run_id")]
+    if others:
+        bits.append(
+            "also in flight: "
+            + ", ".join(
+                f"{run.get('run_id')} ({normalize_item_id(str(run.get('item_id', '')))})"
+                for run in others
+            )
+        )
     bits.append(f"consecutive failures: {status.get('consecutive_failures', 0)}")
     if status.get("stopping"):
         bits.append("the daemon is shutting down")

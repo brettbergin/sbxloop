@@ -20,6 +20,7 @@ from textual.css.query import NoMatches
 from textual.widgets import Input, RichLog
 from textual.worker import get_current_worker
 
+from sbxloop.daemon.model import live_runs
 from sbxloop.daemon.versions import VersionProbe
 from sbxloop.errors import SbxloopError
 from sbxloop.log import redact_text
@@ -220,6 +221,8 @@ class DaemonScreen(ConsoleScreen):
             current = status.get("current") or {}
             if current:
                 table.add_row("current", f"{current.get('run_id')} — {current.get('title', '')}")
+                for run in live_runs(status)[1:]:
+                    table.add_row("", f"{run.get('run_id')} — {run.get('title', '')}")
             elif status.get("claiming"):
                 table.add_row("current", f"claiming {status['claiming']}")
             else:

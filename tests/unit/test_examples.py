@@ -689,3 +689,13 @@ def test_example_credential_entry_loads() -> None:
     assert cred.host == entry["host"]
     assert cred.header == entry["header"]
     assert cred.scheme == entry["scheme"]
+
+
+def test_example_documents_concurrent_runs_at_the_model_default() -> None:
+    """`[daemon] max_concurrent_runs` is shown commented at the default the
+    model ships, so uncommenting it changes nothing until it is edited."""
+    text = EXAMPLE.read_text()
+    daemon = text[text.index("# [daemon]") :]
+    match = re.search(r"^# max_concurrent_runs = (\d+)", daemon, re.MULTILINE)
+    assert match is not None, "[daemon] max_concurrent_runs is not in the example"
+    assert int(match.group(1)) == Config().daemon.max_concurrent_runs == 1

@@ -189,6 +189,7 @@ class LoopWithRuns(FakeLoop):
         super().__init__(dstore)
         self.reports: dict[str, RunReport] = {}
         self.current = None
+        self.runs: list[Any] = []
 
     def report_for(self, run_id: str) -> RunReport:
         return self.reports.get(run_id, RunReport(run_id, "completed", "1/1 tasks done"))

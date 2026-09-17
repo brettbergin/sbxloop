@@ -2861,6 +2861,12 @@ def daemon(
             api_server.ctx.ready.set()
         if once:
             result = loop.tick()
+            # With room for several runs the tick returns while they work:
+            # a one-shot process waits for them and settles each before it
+            # exits. A no-op one run at a time.
+            settled = loop.drain()
+            if settled:
+                result = result._replace(settled=result.settled + settled)
             # --once is a smoke/cron probe: its one-line verdict stays on
             # stdout for the human or script that invoked it.
             console.print(f"tick: {result}")

@@ -75,9 +75,11 @@ class ApiServer:
             raise RuntimeError("the API listener did not start within 10 s")
         # The listener starts before recovery: no run is in flight, so a
         # steering instruction still waiting from the last process will
-        # never be answered — its receipt says so.
+        # never be answered — its receipt says so. Any run that is in
+        # flight keeps its own.
         try:
-            SteeringStore(self.ctx.loop.dstore).settle_orphans(None, self.ctx.clock())
+            live = {handle.run_id for handle in self.ctx.loop.runs}
+            SteeringStore(self.ctx.loop.dstore).settle_orphans(live, self.ctx.clock())
         except Exception:
             log.warning("api.steering_settle_failed", exc_info=True)
         self.ctx.projector.start()

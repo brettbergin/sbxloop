@@ -15,6 +15,20 @@
   locked from chat by default, and nothing yet routes turns or runs to a
   declared agent.
 
+- **The daemon can run several items at once.** `[daemon] max_concurrent_runs` (1 to 4, default 1) sets how many runs execute
+  together. Above 1, a tick starts runs up to the cap and returns while
+  they work, and the next tick settles each one that finished on the loop's
+  own thread; cancel and steer address a run by its id, a bare `cancel`
+  still means the oldest, and a stop, restart or shutdown covers every run.
+  A circuit breaker past its cooldown, or a provider hold past its wait,
+  still lets exactly one probe run through, and the other slots wait until
+  it settles. The chat bridge relays and steers each run in its own thread,
+  and the console's cancel names the run it was opened on.
+  Two code runs never work the same repository at once, and a repository's
+  checkout is not refreshed while a run is using it. `status` (and
+  `GET /v1/status`, feature `status.runs`) lists every run in flight beside
+  `current`. At the default of 1 the loop behaves as before.
+
 - **A GitLab backend for the read paths.** `[vcs] kind = "gitlab"` with
   `[vcs] api_url` now selects a backend that answers the repository,
   issue, checks and policy roles against GitLab's REST API from the

@@ -1842,6 +1842,11 @@ class DaemonConfig(_ConfigModel):
     # `trigger_label` is refused, named.
     workload_label: str = "sbxloop:workload"
     max_runs_per_day: int = 12
+    # How many runs execute at once. One (the default) is the serial loop:
+    # a tick dispatches a run and settles it before the next. Above one, a
+    # tick launches runs up to this many and returns; the next tick settles
+    # what finished. Two code runs never share a repository.
+    max_concurrent_runs: int = Field(default=1, ge=1, le=4)
     # The day boundary for max_runs_per_day. An explicit IANA zone rather
     # than the process's ambient local time; the counter resets at 00:00 here.
     run_cap_timezone: str = "UTC"

@@ -8,6 +8,7 @@ rechecks eligibility when the action arrives.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Annotated, Any, Literal
 
@@ -15,6 +16,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from sbxloop.daemon.controls.operations import Operation
 from sbxloop.daemon.controls.principal import WORKSPACE_ID, Capability
+from sbxloop.daemon.model import live_runs
 
 
 def rfc3339(ts: float | None) -> str | None:
@@ -128,6 +130,16 @@ class CurrentRun(ApiModel):
     kind: str
     profile: str | None = None
 
+    @classmethod
+    def from_status(cls, run: Mapping[str, Any]) -> CurrentRun:
+        return cls(
+            item_id=str(run["item_id"]),
+            run_id=str(run["run_id"]),
+            title=str(run.get("title", "")),
+            kind=str(run.get("kind", "code")),
+            profile=run.get("profile"),
+        )
+
 
 class Hold(ApiModel):
     name: str
@@ -151,7 +163,12 @@ class Status(ApiModel):
     observed_at: str
     generation: str | None = None
     version: str
+    #: The oldest run in flight.
     current: CurrentRun | None = None
+    #: Every run in flight, oldest first (``current`` is the first).
+    runs: list[CurrentRun] = Field(default_factory=list)
+    #: How many runs the daemon executes at once (`[daemon] max_concurrent_runs`).
+    max_concurrent_runs: int = 1
     claiming: str | None = None
     queued: int
     runs_today: int
@@ -193,15 +210,9 @@ class Status(ApiModel):
             observed_at=rfc3339(now) or "",
             generation=status.get("generation"),
             version=str(status.get("version", "")),
-            current=CurrentRun(
-                item_id=str(current["item_id"]),
-                run_id=str(current["run_id"]),
-                title=str(current.get("title", "")),
-                kind=str(current.get("kind", "code")),
-                profile=current.get("profile"),
-            )
-            if current
-            else None,
+            current=CurrentRun.from_status(current) if current else None,
+            runs=[CurrentRun.from_status(run) for run in live_runs(status)],
+            max_concurrent_runs=int(status.get("max_concurrent_runs", 1)),
             claiming=status.get("claiming"),
             queued=int(status.get("queued", 0)),
             runs_today=int(status.get("runs_today", 0)),

@@ -46,6 +46,29 @@ class TestStatus:
         )
         assert status.current is not None and status.current.run_id == "r1"
 
+    def test_status_lists_every_run_in_flight(self, api: Api) -> None:
+        from sbxloop.api.models import Status
+
+        runs = [
+            {"item_id": "gh:issue:1", "run_id": "r1", "title": "Do 1", "kind": "code"},
+            {"item_id": "gh:issue:2", "run_id": "r2", "title": "Do 2", "kind": "workload"},
+        ]
+        status = Status.from_status(
+            {**api.loop.status(), "current": runs[0], "runs": runs}, now=api.clock()
+        )
+        assert status.current is not None and status.current.run_id == "r1"
+        assert [(r.run_id, r.kind) for r in status.runs] == [("r1", "code"), ("r2", "workload")]
+        assert status.max_concurrent_runs == 1
+        # An idle daemon lists none; one from before the list reports only
+        # `current`, and the list still names it.
+        body = api.client.get("/v1/status", headers=api.bearer()).json()
+        assert body["runs"] == [] and body["max_concurrent_runs"] == 1
+        older = {k: v for k, v in api.loop.status().items() if k != "runs"}
+        legacy = Status.from_status({**older, "current": runs[0]}, now=api.clock())
+        assert [r.run_id for r in legacy.runs] == ["r1"]
+        features = api.client.get("/v1/capabilities", headers=api.bearer()).json()["features"]
+        assert "status.runs" in features
+
 
 class TestCapabilities:
     def test_capabilities_name_the_contract_and_limits(self, api: Api) -> None:
