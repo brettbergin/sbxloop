@@ -72,6 +72,19 @@ PAGE_MAX = 200
 #: summary never queues behind (or ahead of) somebody's conversation.
 SUMMARY_SESSION_KEY = "sbxloop:channel-summary"
 _CONTENT_WORD = re.compile(r"\w+")
+#: Turn intents that may start managed work, so the agents a turn mentions
+#: are recorded as its run-role assignees.
+WORK_INTENTS = frozenset({"code", "workload", "auto"})
+#: What every chat turn is told: a mention asks for an answer. Managed work
+#: is for asks the reply itself cannot satisfy.
+_INLINE_ANSWER = (
+    "\n\nBeing mentioned is a request to reply, not a request to queue work. "
+    "When the ask can be satisfied in this reply - a list, an explanation, a short "
+    "plan, an opinion, a judgement about work already in this channel - answer it "
+    "inline and in full, and start nothing. Start managed work only when the ask "
+    "needs execution, external sources, a change to a repository or a produced "
+    "file; then start it without asking for confirmation."
+)
 _RUNNER_INTENT = {
     "code": (
         "\n\nThe person explicitly selected sbxloop's Code runner for this turn. "
@@ -85,6 +98,16 @@ _RUNNER_INTENT = {
         "Call start_workload once with their request and let the existing plan, execute, judge, "
         "revision, and publish stages carry it to completion. Do not simulate those stages with "
         "chat handoffs."
+    ),
+    "auto": (
+        "\n\nThe person left this turn's handling to you. Decide, do not ask which "
+        "they meant. When the ask can be satisfied in this reply - a list, an "
+        "explanation, a short plan, an opinion, a judgement about work already in "
+        "this channel - answer it inline and in full, and start nothing. Start "
+        "managed work only when the ask needs execution, external sources, a change "
+        "to a repository or a produced file: a repository change through the "
+        "existing issue intake tools, anything else with one start_workload call, "
+        "no confirmation. Never queue work in place of an answer you could write."
     ),
 }
 
@@ -113,7 +136,7 @@ def _visible_agent_reply(text: str, work_products: tuple[str, ...]) -> str:
     return "\n\n".join((*artifacts, reply)) if artifacts else reply
 
 
-def _work_roles(registry: AgentRegistry, targets: Iterable[str | None]) -> dict[str, str]:
+def work_roles(registry: AgentRegistry, targets: Iterable[str | None]) -> dict[str, str]:
     """The first mentioned agent that declares each run role, by role."""
     roles: dict[str, str] = {}
     for slug in targets:
@@ -124,6 +147,17 @@ def _work_roles(registry: AgentRegistry, targets: Iterable[str | None]) -> dict[
             if role in RUN_ROLES:
                 roles.setdefault(role, agent.slug)
     return roles
+
+
+def _recorded_assignees(turn: Turn) -> dict[str, str]:
+    """The run roles a work-capable turn recorded when it was accepted: the
+    agents it mentioned, by the role each declares."""
+    if not turn.participants:
+        return {}
+    stored = turn.participants[0].get("assignees")
+    if not isinstance(stored, dict):
+        return {}
+    return {str(role): str(slug) for role, slug in stored.items()}
 
 
 def _work_lead(registry: AgentRegistry, target: str | None) -> str | None:
@@ -457,7 +491,9 @@ class ApiContext:
         author = user.full_name or user.username
         # Work this turn starts goes to the agents it mentioned, in the run
         # roles they declare.
-        work_roles = _work_roles(self.agents, turn.targets or ())
+        turn_roles = work_roles(self.agents, turn.targets or ())
+        for role, slug in _recorded_assignees(turn).items():
+            turn_roles.setdefault(role, slug)
         index = 0
         while True:
             # The daemon reads its own accepted turn: whoever asked may have
@@ -506,10 +542,14 @@ class ApiContext:
                 agent_tools += self._agent_work(definition, turn.channel_id, on_behalf_of=author)
             persona = (definition.persona if definition else ANGIE_PERSONA) + memory_block
             persona += preference_context
-            persona += _RUNNER_INTENT.get(intent, "")
+            persona += _RUNNER_INTENT.get(intent, _INLINE_ANSWER)
             model = definition.agent.spec.model if definition and definition.agent else None
-            # Mentioning a role is explicit delegation in Angie's UI.
-            allow_actions = intent in {"delegate", "code", "workload"} or definition is not None
+            # A named agent acts in its own persona, so it keeps its tools;
+            # what it may do with them is the intent's business, not the
+            # mention's.
+            allow_actions = (
+                intent in {"delegate", "code", "workload", "auto"} or definition is not None
+            )
             prompt = content
             if participant.get("parent_index") is not None:
                 parent_index = int(participant["parent_index"])
@@ -592,7 +632,7 @@ class ApiContext:
                     agent_tools=agent_tools,
                     channel_tools=channel_tools,
                     work_lead=work_lead,
-                    work_roles=work_roles,
+                    work_roles=turn_roles,
                 )
                 reply = future.result()
                 if reply.ok and (reply.text or reply.work_products):

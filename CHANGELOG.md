@@ -82,6 +82,27 @@ naming the next offset, and never hands back bytes that are not text.
   back there; the channel is never read out of the public issue body. New knobs `[agent_team] max_chain_depth` (default 2) and `max_agent_runs_per_day` (default 4); new
   capability `agents.initiative`.
 
+- **A mention asks an agent to answer, not to queue a run.** Naming an
+  agent in a chat turn used to rewrite the turn's intent to `delegate`,
+  and the agent was told that anything it could not produce in the chat is
+  a workload to queue with one call and no confirmation, so an ask as
+  ordinary as a list came back as a queued run instead of an answer. The
+  caller's intent now survives a mention — a conversation stays a
+  conversation, and the mention still records the agent as a target and
+  joins it to the channel — and every chat turn carries the rule that an
+  ask the reply itself can satisfy (a list, an explanation, a short plan,
+  an opinion, a judgement about work already in the channel) is answered
+  inline, with managed work reserved for asks that need execution,
+  external sources, a repository change or a produced file. `TurnCreate`
+  also accepts `intent: "auto"` for a client that does not know which it
+  is and wants the lead to decide, advertised as
+  `collaboration.lead_orchestrator`; `TurnOut` now reports the recorded
+  `intent`. On a turn that may start work (`code`, `workload` or `auto`),
+  the mentioned agents that declare a run role are recorded as the first
+  participant's `assignees` (`role -> slug`), which admission assigns the
+  run from. An ask that genuinely needs work is still started without
+  asking for confirmation, and nothing is ever refused as out of scope.
+
 - **Agents use their long-term memory in chat and in runs.** A mentioned
   agent's chat persona now carries the memories it may see in that channel
   (nothing changes for an agent with none). An agent whose `tools` list

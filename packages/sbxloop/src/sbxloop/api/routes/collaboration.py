@@ -88,7 +88,7 @@ from sbxloop.api.collaboration_schemas import (
     WorkflowOut,
     WorkflowUpdate,
 )
-from sbxloop.api.context import PAGE_MAX, ApiContext
+from sbxloop.api.context import PAGE_MAX, WORK_INTENTS, ApiContext, work_roles
 from sbxloop.api.errors import Problem
 from sbxloop.api.models import TokenResponse, rfc3339
 from sbxloop.api.routes.agents import addressable
@@ -390,6 +390,7 @@ def _turn_out(turn: Turn) -> TurnOut:
         author_id=None if turn.author is None else turn.author.id,
         trigger=turn.trigger,
         parent_turn_id=turn.parent_turn_id,
+        intent=turn.intent,
     )
 
 
@@ -1137,6 +1138,13 @@ def _mentioned_agents(ctx: ApiContext, content: str, targets: tuple[str, ...]) -
     return tuple(dict.fromkeys(slugs))
 
 
+def _assignees(ctx: ApiContext, slugs: tuple[str, ...]) -> dict[str, str]:
+    """The run roles the turn's mentions declare, as ``role -> slug``.
+    Admission assigns the run from these. Reads the registry, so it runs
+    through ``ctx.call``."""
+    return work_roles(ctx.agents, slugs)
+
+
 def _addressable(ctx: ApiContext, slug: str) -> str | None:
     """``slug``, when it names an agent a mention may reach. Reads the
     registry, so it runs through ``ctx.call``."""
@@ -1170,8 +1178,13 @@ async def create_turn(
     # Agent mentions remain part of an explicit runner ask, but do not seed
     # parallel chat participants. The runner owns its own internal roles.
     targets = () if runner_selected else await _targets(ctx, user, body.content, body.target_slugs)
-    intent = "delegate" if targets else body.intent
+    # A mention is a request to reply. It records the agent as a target and
+    # joins it to the channel; it never rewrites what the caller asked for.
+    intent = body.intent
     participants = await ctx.call(_mentioned_agents, ctx, body.content, targets)
+    assignees = (
+        await ctx.call(_assignees, ctx, participants) if intent in WORK_INTENTS else None
+    ) or None
     try:
         turn, message, created = await ctx.call(
             ctx.accept_collaboration_turn,
@@ -1184,6 +1197,7 @@ async def create_turn(
             actor=auth.principal.audit(),
             intent=intent,
             participants=participants,
+            assignees=assignees,
         )
     except CollaborationError as exc:
         raise _problem(exc) from exc
