@@ -26,7 +26,9 @@ from sbxloop.engine.harness import brief_for_phase
 from sbxloop.engine.phases import PhaseRunner
 from sbxloop.engine.skilltools import SKILL_TOOL_NAME
 from sbxloop.errors import ToolRejectedError, WorkerError
+from sbxloop.worker.client import WorkerClient
 from sbxloop.worker.hosttools import HostToolCall
+from sbxloop_worker.protocol import JobRequest
 from tests.conftest import FakeSbx
 from tests.unit.test_agent_assignment import RecordingAgent, run_build, run_decompose
 from tests.unit.test_engine import HAPPY_TASK, Harness, task, taskgraph
@@ -289,11 +291,21 @@ def harness(fake_sbx: FakeSbx, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     return Harness(fake_sbx, tmp_path, monkeypatch)
 
 
-def test_the_memory_snapshot_holds_across_a_resume(harness: Harness, tmp_path: Path) -> None:
+def test_the_memory_snapshot_holds_across_a_resume(
+    harness: Harness, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    submitted: list[JobRequest] = []
+    real_submit = WorkerClient.submit
+
+    def recording_submit(self: WorkerClient, job: JobRequest, **kwargs: Any) -> Any:
+        submitted.append(job)
+        return real_submit(self, job, **kwargs)
+
+    monkeypatch.setattr(WorkerClient, "submit", recording_submit)
     memory = service(tmp_path)
     memory.remember("ada", "Known before the run", channel_id="chan-1", author="user:u1")
     harness.script([taskgraph(task("t1")), {"fail": "sandbox exploded"}])
-    engine = harness.engine(agents=[{**ADA, "tools": ["memory"]}], keep_sandboxes=True)
+    engine = harness.engine(agents=[{**ADA, "tools": ["memory"]}])
     engine.memory = memory
     assignment = plan(engine.config, memory, "chan-1")
     with pytest.raises(WorkerError, match="sandbox exploded"):
@@ -302,21 +314,21 @@ def test_the_memory_snapshot_holds_across_a_resume(harness: Harness, tmp_path: P
 
     # Learned while the run was down: the resumed run keeps its snapshot.
     memory.remember("ada", "Learned after the start", channel_id="chan-1", author="user:u1")
+    submitted.clear()
     harness.script([*HAPPY_TASK])
-    engine2 = harness.engine(keep_sandboxes=True)
+    engine2 = harness.engine()
     engine2.memory = memory
     assert engine2.resume(run_id).state == "completed"
     builds = [
         job
-        for job in harness.agent_jobs(run_id)
-        if job.get("kind") == "agent.session"
-        and "Prefer the smallest diff" in (job.get("system_message") or "")
+        for job in submitted
+        if job.kind == "agent.session" and "Prefer the smallest diff" in (job.system_message or "")
     ]
     assert builds
     for job in builds:
-        assert "Known before the run" in job["system_message"]
-        assert "Learned after the start" not in job["system_message"]
-        assert {"remember", "recall", "forget"} <= {tool["name"] for tool in job["host_tools"]}
+        assert "Known before the run" in (job.system_message or "")
+        assert "Learned after the start" not in (job.system_message or "")
+        assert {"remember", "recall", "forget"} <= {tool.name for tool in job.host_tools}
 
 
 def test_the_stored_assignment_keeps_the_memory_it_was_planned_with(tmp_path: Path) -> None:
