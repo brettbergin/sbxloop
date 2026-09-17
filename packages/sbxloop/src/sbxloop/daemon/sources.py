@@ -36,6 +36,7 @@ from datetime import UTC, datetime
 from functools import partial
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
+from sbxloop.agents.origin import origin_from_body
 from sbxloop.daemon.model import RunReport, WorkItem
 from sbxloop.engine.model import RunKind
 from sbxloop.engine.sinks import published_line
@@ -53,6 +54,25 @@ if TYPE_CHECKING:  # pragma: no cover - typing only
     from sbxloop.config import RepoConfig
 
 log = get_logger(__name__)
+
+
+def _origin_fields(body: str) -> dict[str, Any]:
+    """The origin columns an issue's body claims (S-A12), or none.
+
+    A queued issue is discovered minutes or hours after the agent asked for
+    it, by a process that never saw the tool call, so the marker in the body
+    is the only thing that keeps the chain countable. An issue a person
+    wrote carries no marker and reads exactly as it always did.
+    """
+    origin = origin_from_body(body)
+    if origin is None:
+        return {}
+    return {
+        "origin_agent": origin.agent_slug,
+        "parent_item_id": origin.parent_item_id,
+        "chain_depth": origin.chain_depth,
+    }
+
 
 # The claim comment doubles as the claim lock (see GitHubIssueSource.claim);
 # this hidden marker is how competing daemons recognise each other's claims.
@@ -458,6 +478,7 @@ class GitHubIssueSource:
             for number, issue in rows.items():
                 if number in both:
                     continue
+                body = str(issue.get("body") or "")
                 items.append(
                     WorkItem(
                         item_id=issue_item_id(
@@ -465,10 +486,11 @@ class GitHubIssueSource:
                         ),
                         source_key=number,
                         title=str(issue.get("title") or f"issue #{number}"),
-                        body=str(issue.get("body") or ""),
+                        body=body,
                         url=str(issue.get("html_url") or ""),
                         repo=self.repo,
                         kind=kind,
+                        **_origin_fields(body),
                     )
                 )
         log.debug(
@@ -549,14 +571,16 @@ class GitHubIssueSource:
                 label=wanted,
                 kind=kind,
             )
+        body = str(issue.get("body") or "")
         return WorkItem(
             item_id=issue_item_id(int(number), repo=self.repo if self.qualify_ids else None),
             source_key=number,
             title=str(issue.get("title") or f"issue #{number}"),
-            body=str(issue.get("body") or ""),
+            body=body,
             url=str(issue.get("html_url") or ""),
             repo=self.repo,
             kind=kind,
+            **_origin_fields(body),
         )
 
     def _refuse_conflict(self, ops: IssueOps, number: str) -> None:

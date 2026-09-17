@@ -47,6 +47,24 @@ naming the next offset, and never hands back bytes that are not text.
   run-thread steering and an unlinked surface behave exactly as before.
   Advertised as `collaboration.bridges`.
 
+- **Agents can start work and file issues themselves.** An agent whose
+  `[[agents]]` entry declares `can_start` is offered two new tools in a chat
+  turn: `start_run` (a `workload` run, or a `code` run filed as a queued
+  issue) and `file_issue`. Six guardrails run before anything is admitted —
+  the kind must be one the agent declares, the repository must be configured
+  and enabled, the work must sit below `[agent_team] max_chain_depth`, the
+  agent must be under its daily cap (`[[agents]] max_runs_per_day`, else
+  `[agent_team] max_agent_runs_per_day`), the workspace pool must admit
+  another run, and the same ask under the same parent is refused rather than
+  queued twice. The admission runs under a new `Principal.for_agent`, which
+  holds `items:create` and nothing else. Work an agent started carries its
+  channel, the agent, the parent item and the chain depth, and everything it
+  writes to a repository carries an attribution footer and an origin marker
+  that issue discovery reads back, so a chain stays countable across a poll.
+  A queued issue needs `code` in `can_start`; an agent with none can only
+  file one for a person to decide on. New knobs `[agent_team] max_chain_depth` (default 2) and `max_agent_runs_per_day` (default 4); new
+  capability `agents.initiative`.
+
 - **Agents use their long-term memory in chat and in runs.** A mentioned
   agent's chat persona now carries the memories it may see in that channel
   (nothing changes for an agent with none). An agent whose `tools` list

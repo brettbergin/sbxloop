@@ -70,7 +70,7 @@ ROLE_CAPABILITIES: dict[Role, frozenset[Capability]] = {
     ),
 }
 
-PrincipalKind = Literal["operator", "client", "system"]
+PrincipalKind = Literal["operator", "client", "system", "agent"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -102,6 +102,25 @@ class Principal:
     def system(cls, via: str) -> Principal:
         """The daemon acting for itself (a scheduled tick, recovery)."""
         return cls(kind="system", id="daemon", display=None, via=via)
+
+    @classmethod
+    def for_agent(cls, slug: str, on_behalf_of: str | None = None) -> Principal:
+        """An agent asking for work on its own initiative (S-A12).
+
+        The narrowest principal there is: ``items:create`` and nothing
+        else. An agent may put work in the queue; it may not steer, cancel,
+        approve a gate, grant a budget or read anything it was not already
+        given. ``on_behalf_of`` is the person the agent is working for, and
+        rides only in the attribution the source hears -- it grants
+        nothing, so a forged name buys no capability."""
+        for_whom = f" for {on_behalf_of}" if on_behalf_of else ""
+        return cls(
+            kind="agent",
+            id=f"agent:{slug}",
+            display=f"the {slug} agent{for_whom}",
+            via="agent",
+            capabilities=frozenset({"items:create"}),
+        )
 
     def attribution(self) -> str | None:
         """The ``by`` string the loop passes to the source."""
