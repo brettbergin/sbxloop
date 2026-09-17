@@ -18,14 +18,17 @@ from sqlalchemy.exc import IntegrityError
 
 from sbxloop.api.agents import AGENTS, ANGIE_SLUG
 from sbxloop.api.auth.store import hash_secret
+
+# The role names belong to this module's membership contract, so they are
+# re-exported explicitly (``X as X``) for strictly type-checked consumers.
 from sbxloop.daemon.controls.principal import (
     ALL_CAPABILITIES,
     CAPABILITIES,
-    ROLE_CAPABILITIES,
-    ROLES,
+    ROLE_CAPABILITIES as ROLE_CAPABILITIES,
+    ROLES as ROLES,
     WORKSPACE_ID,
     Capability,
-    Role,
+    Role as Role,
 )
 from sbxloop.daemon.store import DaemonStore
 from sbxloop.db.api_models import ApiEventRow, ClientRow
