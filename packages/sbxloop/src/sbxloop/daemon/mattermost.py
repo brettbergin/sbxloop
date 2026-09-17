@@ -817,6 +817,11 @@ class MattermostBridge(ChatBridge):
             return MattermostTarget(thread_id)
         return MattermostTarget(self.mattermost.channel_id or "", root_id=thread_id)
 
+    async def _link_target(self, surface_id: str, thread_id: str | None) -> Any:
+        """A linked surface is any channel, not only the control one, and a
+        thread there is a root post inside it."""
+        return MattermostTarget(surface_id, root_id=thread_id)
+
     async def _fetch_message(self, channel: Any, message_id: str) -> Any:
         """The handle for a post we made, or None when it is not there any
         more.

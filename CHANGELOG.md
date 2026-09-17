@@ -16,6 +16,26 @@ naming the next offset, and never hands back bytes that are not text.
 
 ### Added
 
+- **A channel can have a window onto Slack, Discord or Mattermost.** A
+  bridge surface linked to a channel stops routing to the daemon-wide
+  concierge: what people type there becomes a turn in that channel, with
+  its own history and the agents in it, credited to whoever's account the
+  author is mapped to. People map themselves once, with
+  `POST /v1/users/me/identities/link-code` and `!sbx link <code>` typed on
+  the bridge; `GET` and `DELETE /v1/users/me/identities` show and undo it.
+  An author nobody has mapped is refused with a short reply, unless the
+  link was created with `allow_guests`, in which case the message is stored
+  as a person with no account under the name they use there. Outbound,
+  every message appended to a linked channel is posted to each linked
+  surface under a `**name**` header, never back to the surface it arrived
+  on, so two services mirror each other without looping. `GET /v1/bridges`
+  lists the services and whether one is configured here, and
+  `GET`, `POST` and `DELETE /v1/channels/{id}/links` manage a channel's
+  links (managing the channel). Messages gain `origin`, naming the surface
+  a message arrived on. `!sbx` commands and run-thread steering are
+  untouched, and an unlinked surface behaves exactly as before. Advertised
+  as `collaboration.bridges`.
+
 - **Agents use their long-term memory in chat and in runs.** A mentioned
   agent's chat persona now carries the memories it may see in that channel
   (nothing changes for an agent with none). An agent whose `tools` list

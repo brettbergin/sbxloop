@@ -37,6 +37,7 @@ from sbxloop.api.auth.store import ApiAuthStore
 from sbxloop.api.channel_summary import ChannelSummarizer
 from sbxloop.api.chronology import Chronology
 from sbxloop.api.collaboration import (
+    ChannelLink,
     CollaborationError,
     CollaborationStore,
     LocalUser,
@@ -122,6 +123,23 @@ def _work_roles(registry: AgentRegistry, targets: Iterable[str | None]) -> dict[
             if role in RUN_ROLES:
                 roles.setdefault(role, agent.slug)
     return roles
+
+
+def _guest_user(display_name: str | None) -> LocalUser:
+    """The stand-in a guest's turn runs for: a name, and nothing else. Its
+    empty id belongs to no member, so every check that reads it refuses."""
+    name = (display_name or "guest").strip() or "guest"
+    return LocalUser(
+        id="",
+        client_id="",
+        username=name,
+        email="",
+        full_name=name,
+        timezone="UTC",
+        active=True,
+        created_at=0.0,
+        updated_at=0.0,
+    )
 
 
 def _work_lead(registry: AgentRegistry, target: str | None) -> str | None:
@@ -355,6 +373,38 @@ class ApiContext:
                     intent=turn.intent,
                 )
             return turn, message, created
+
+    def accept_bridge_turn(
+        self,
+        link: ChannelLink,
+        *,
+        content: str,
+        author_user_id: str | None,
+        display_name: str | None,
+        external_message_id: str,
+    ) -> tuple[Turn, Message]:
+        """Accept a message from a linked bridge surface as a turn in the
+        channel that surface mirrors.
+
+        A mapped author answers as themselves. A guest — only where the link
+        admits one — has no account, so the turn runs for a stand-in carrying
+        the name they use on that service: no preferences to read, and no
+        standing to hand work off with.
+        """
+        store = self.collaboration
+        with self._turn_admission:
+            turn, message = store.accept_linked_turn(
+                link,
+                content=content,
+                author_user_id=author_user_id,
+                display_name=display_name,
+                external_message_id=external_message_id,
+                now=self.clock(),
+            )
+            member = None if author_user_id is None else store.member_for_user(author_user_id)
+            user = member.user if member is not None else _guest_user(display_name)
+            self.start_collaboration_turn(turn, user, message.content, intent=turn.intent)
+        return turn, message
 
     def start_collaboration_turn(
         self,
