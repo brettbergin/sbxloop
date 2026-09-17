@@ -52,6 +52,13 @@ def _tokens(inp: int, out: int, **extra: int) -> Usage:
     return Usage(input_tokens=inp, output_tokens=out, **extra)
 
 
+def test_a_refusal_reason_is_an_open_string() -> None:
+    """The shared admission contract types ``reason`` as any string, so a
+    later limit can refuse with its own reason."""
+    assert Admission(ok=False, reason="seat_limit").reason == "seat_limit"
+    assert Admission.__annotations__["reason"] == "str | None"
+
+
 class TestAdmitRun:
     def test_under_every_limit_a_run_is_admitted(self, tmp_path: Path) -> None:
         h = _harness_at_noon(tmp_path, daily_token_budget=1000)
@@ -213,6 +220,38 @@ class TestTick:
         assert [n for n in frontend.notices if n.kind == "daemon.token_budget"] == []
 
 
+class TestProviderResume:
+    @pytest.mark.parametrize("run_cap", [1, 5])
+    def test_a_provider_held_resume_is_still_refused_by_an_exhausted_budget(
+        self, tmp_path: Path, run_cap: int
+    ) -> None:
+        """A resume waiting on a provider is exempt from the run cap, never
+        from the token budget, whichever limit the pool looks at first."""
+        h = _harness_at_noon(tmp_path, max_runs_per_day=run_cap, daily_token_budget=10)
+        now = h.clock()
+        h.dstore.upsert_new(gh_item(), now=now)
+        h.dstore.mark_claimed("gh:issue:1", now=now)
+        h.dstore.mark_running("gh:issue:1", "r_live", now=now)
+        h.store.create_run("r_live", "x")
+        h.store.set_run_state("r_live", "building")
+        h.loop.recover()
+
+        class PendingRecovery:
+            def hold(self) -> None:
+                return None
+
+            def pending(self, run_id: str) -> bool:
+                return True
+
+        h.loop._provider_recovery = PendingRecovery  # type: ignore[assignment,method-assign]
+        _pool(h).charge(
+            source="turn", ref_id="t", agent_slug=None, channel_id=None, usage=_tokens(10, 0)
+        )
+        result = h.loop.tick()
+        assert result.idle_kind == "budget"
+        assert h.runs == []
+
+
 class TestRunCharging:
     def test_a_runs_usage_events_are_charged_to_the_pool(self, tmp_path: Path) -> None:
         h = _harness_at_noon(tmp_path, daily_token_budget=1000)
@@ -220,11 +259,13 @@ class TestRunCharging:
         inner = h.runner
 
         def runner(item: Any, cfg: Config, run_id: str, bus: EventBus, resume: bool) -> RunResult:
+            # Without an assignment the event names only the run role.
             bus.emit("agent.usage", run_id, agent="builder", input_tokens=300, output_tokens=40)
+            # An assigned agent's slug wins over the role it plays.
             bus.emit(
                 "agent.usage",
                 run_id,
-                agent="critic",
+                agent="builder",
                 agent_slug="critic",
                 input_tokens=100,
                 output_tokens=60,
@@ -242,7 +283,7 @@ class TestRunCharging:
         assert snapshot["tokens_today"] == 500
         rows = _pool(h).entries(since=0)
         assert [(r.source, r.ref_id, r.agent_slug) for r in rows] == [
-            ("run", run_id, None),
+            ("run", run_id, "builder"),
             ("run", run_id, "critic"),
         ]
         assert rows[1].cache_read_tokens == 7

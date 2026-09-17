@@ -1661,6 +1661,11 @@ class DaemonLoop:
             for item in self.dstore.queued()
         )
         if provider_resume:
+            # The run cap exempts a provider-held resume; the token budget
+            # does not, even though the pool reported the run cap first.
+            if not self.usage_pool.admit_tokens(now).ok:
+                self._announce_budget(now)
+                return TickResult(idle_kind="budget")
             return None
         if now - self._last_cap_log > 3600:
             self._last_cap_log = now

@@ -39,6 +39,8 @@ if TYPE_CHECKING:
 log = get_logger(__name__)
 
 UsageSource = Literal["run", "turn"]
+#: The reasons this pool refuses with. ``Admission.reason`` is any string
+#: under the shared admission contract, so other limits can add their own.
 RefusalReason = Literal["run_cap", "token_budget"]
 
 
@@ -48,7 +50,7 @@ class Admission:
     again."""
 
     ok: bool
-    reason: RefusalReason | None = None
+    reason: str | None = None
     retry_at: float | None = None
 
 
@@ -132,7 +134,9 @@ class UsagePool:
         def on_event(event: Event) -> None:
             if event.type != EventTypes.AGENT_USAGE:
                 return
-            slug = event.data.get("agent_slug")
+            # The assigned agent's slug when the run has an assignment,
+            # else the run role the event names.
+            slug = event.data.get("agent_slug") or event.data.get("agent")
             try:
                 self.charge(
                     source="run",
@@ -147,6 +151,11 @@ class UsagePool:
         return on_event
 
     # -- admission -----------------------------------------------------------------
+
+    def admit_tokens(self, now: float) -> Admission:
+        """May anything spend tokens now? Only the token budget applies. The
+        loop asks this on its own for work the run cap exempts."""
+        return self._tokens_refusal(now) or Admission(ok=True)
 
     def _tokens_refusal(self, now: float) -> Admission | None:
         budget = self._config().daemon.daily_token_budget
@@ -170,7 +179,7 @@ class UsagePool:
 
     def admit_turn(self, channel_id: str | None, agent_slug: str | None, now: float) -> Admission:
         """May a chat turn start now? Only the token budget applies."""
-        return self._tokens_refusal(now) or Admission(ok=True)
+        return self.admit_tokens(now)
 
     # -- reading -------------------------------------------------------------------
 

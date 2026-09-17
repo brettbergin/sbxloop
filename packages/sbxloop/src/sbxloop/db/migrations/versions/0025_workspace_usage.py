@@ -3,8 +3,8 @@
 A new table only: an older release never reads it, so a rollback keeps
 opening the database.
 
-Revision ID: 0020
-Revises: 0019
+Revision ID: 0025
+Revises: 0024
 """
 
 from __future__ import annotations
@@ -12,8 +12,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0020"
-down_revision = "0019"
+revision = "0025"
+down_revision = "0024"
 branch_labels = None
 depends_on = None
 
