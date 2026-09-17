@@ -2245,6 +2245,9 @@ class ConciergeConfig(_ConfigModel):
     # The SDK session is resumed message after message; after this many
     # turns a fresh session is started so context does not grow forever.
     session_turns: int = Field(default=40, ge=1, le=500)
+    # How many chat turns may run at once. Each turn keeps its own speaker,
+    # session and provider recovery; host tools still run one at a time.
+    max_concurrent_turns: int = Field(default=1, ge=1, le=16)
     # Expose the read-only GitHub tool (PR/issue/diff/file reads through
     # the daemon's github-ops sandbox) when GitHub is configured.
     github_tools: bool = True

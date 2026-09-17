@@ -104,6 +104,19 @@ def test_openai_endpoint_selection_is_documented_in_the_shipped_examples() -> No
     assert '[agent] backend = "openai"' in secrets.read_text()
 
 
+def test_concurrent_chat_turns_are_documented_in_the_shipped_examples() -> None:
+    """The three places every knob lands, for `[concierge] max_concurrent_turns`."""
+    assert Config.model_validate({}).concierge.max_concurrent_turns == 1
+    (line,) = [
+        line
+        for line in DEFAULT_CONFIG_TOML.splitlines()
+        if line.startswith("# max_concurrent_turns = ")
+    ]
+    assert tomllib.loads(line.removeprefix("# ")) == {"max_concurrent_turns": 1}
+    guide = (REPO_ROOT / "docs" / "user-guide.md").read_text(encoding="utf-8")
+    assert "| `[concierge] max_concurrent_turns` | `1`" in " ".join(guide.split())
+
+
 def test_every_chat_backend_credential_is_in_the_secrets_example() -> None:
     """A bridge's token has to appear in the file an operator actually fills
     in. Generic over the descriptor set, so a fourth service cannot land with
