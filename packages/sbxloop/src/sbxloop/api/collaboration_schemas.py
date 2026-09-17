@@ -202,6 +202,17 @@ class ChannelPage(ApiModel):
     has_more: bool
 
 
+class ArtifactRefOut(ApiModel):
+    """A file a run delivered, by catalog identity; its bytes are served by
+    ``GET /v1/artifacts/{id}``."""
+
+    id: str
+    run_id: str
+    relpath: str
+    media_type: str
+    size: int
+
+
 class ChannelWorkOut(ApiModel):
     item_id: str
     turn_id: str
@@ -215,6 +226,9 @@ class ChannelWorkOut(ApiModel):
     run_revision: int | None = None
     item_actions: list[str] = Field(default_factory=list)
     run_actions: list[str] = Field(default_factory=list)
+    #: Available files the run delivered, by path, at most
+    #: ``WORK_ARTIFACTS_MAX``; empty for results written before this field.
+    artifacts: list[ArtifactRefOut] = Field(default_factory=list)
 
 
 class MessageOut(ApiModel):

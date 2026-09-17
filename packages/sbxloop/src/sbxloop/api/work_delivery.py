@@ -11,9 +11,16 @@ from sqlalchemy import and_, func, or_, select
 
 from sbxloop.api.agents import ANGIE_SLUG
 from sbxloop.api.projections import Views
+from sbxloop.api.publicids import run_public_id
 from sbxloop.db.collaboration_models import ChannelRow, MessageRow, TurnRow
 from sbxloop.db.daemon_models import WorkItemRow
+from sbxloop.engine.model import TERMINAL_RUN_STATES, RunRecord
 from sbxloop.errors import SbxloopError
+
+#: Files named on one work result; the run's own catalog lists the rest.
+WORK_ARTIFACTS_MAX = 50
+#: Run kinds whose catalogued files are what a sink delivered.
+DELIVERING_KINDS = frozenset({"workload", "tool"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,6 +141,34 @@ def _code_links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
     return links
 
 
+def _artifacts(ctx: Any, run: RunRecord) -> list[dict[str, Any]]:
+    """The files a workload or tool run delivered, catalogued first when it
+    has finished so the first result written already names them. A code
+    run delivers a pull request; its checkout is not handed to the channel."""
+    if run.kind not in DELIVERING_KINDS:
+        return []
+    if run.state in TERMINAL_RUN_STATES:
+        ctx.artifacts.catalog_run(run)
+    return [
+        {
+            "id": artifact.id,
+            "run_id": run_public_id(artifact.run_id),
+            "relpath": artifact.relpath,
+            "media_type": artifact.media_type,
+            "size": artifact.size,
+        }
+        for artifact in ctx.artifacts.for_run(run.run_id)
+        if artifact.available
+    ][:WORK_ARTIFACTS_MAX]
+
+
+def _with_files(content: str, artifacts: list[dict[str, Any]]) -> str:
+    """Name the files in the text too: a bridge shows only the text."""
+    if not artifacts:
+        return content
+    return content + "\n\nFiles:\n" + "\n".join(f"- {a['relpath']}" for a in artifacts)
+
+
 def _result(ctx: Any, run_id: str, state: str, fallback: str | None) -> str:
     if state == "merged":
         run = ctx.loop.store.get_run(run_id)
@@ -172,6 +207,7 @@ def project_work(ctx: Any, channel_id: str | None = None) -> list[dict[str, Any]
                         "run_revision": None,
                         "item_actions": [],
                         "run_actions": [],
+                        "artifacts": [],
                     }
                 )
             continue
@@ -193,6 +229,7 @@ def project_work(ctx: Any, channel_id: str | None = None) -> list[dict[str, Any]
         message_id = f"msg_work_{digest}"
         if channel_id is None and (not terminal or ctx.collaboration.message_exists(message_id)):
             continue
+        artifacts = _artifacts(ctx, run) if run is not None else []
         snapshot = {
             "item_id": public_item.id,
             "turn_id": link.turn_id,
@@ -206,6 +243,7 @@ def project_work(ctx: Any, channel_id: str | None = None) -> list[dict[str, Any]
             "run_revision": public_run.revision if public_run else None,
             "item_actions": public_item.available_actions,
             "run_actions": public_run.available_actions if public_run else [],
+            "artifacts": artifacts,
         }
         snapshots.append(snapshot)
         if not terminal:
@@ -215,7 +253,9 @@ def project_work(ctx: Any, channel_id: str | None = None) -> list[dict[str, Any]
             channel_id=link.channel_id,
             turn_id=link.turn_id,
             content=(
-                _result(ctx, run.run_id, state, item.last_error or run.reason)
+                _with_files(
+                    _result(ctx, run.run_id, state, item.last_error or run.reason), artifacts
+                )
                 if run is not None
                 else item.last_error or f"Work ended with state: {state}."
             ),

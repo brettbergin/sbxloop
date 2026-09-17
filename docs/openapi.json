@@ -269,6 +269,41 @@
         "title": "ArtifactPage",
         "type": "object"
       },
+      "ArtifactRefOut": {
+        "additionalProperties": false,
+        "description": "A file a run delivered, by catalog identity; its bytes are served by\n``GET /v1/artifacts/{id}``.",
+        "properties": {
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "media_type": {
+            "title": "Media Type",
+            "type": "string"
+          },
+          "relpath": {
+            "title": "Relpath",
+            "type": "string"
+          },
+          "run_id": {
+            "title": "Run Id",
+            "type": "string"
+          },
+          "size": {
+            "title": "Size",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "run_id",
+          "relpath",
+          "media_type",
+          "size"
+        ],
+        "title": "ArtifactRefOut",
+        "type": "object"
+      },
       "Capabilities": {
         "additionalProperties": false,
         "properties": {
@@ -443,6 +478,13 @@
               }
             ],
             "title": "Agent Slug"
+          },
+          "artifacts": {
+            "items": {
+              "$ref": "#/components/schemas/ArtifactRefOut"
+            },
+            "title": "Artifacts",
+            "type": "array"
           },
           "item_actions": {
             "items": {

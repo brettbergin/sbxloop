@@ -47,6 +47,7 @@ FEATURES: tuple[str, ...] = (
     "collaboration.preferences",
     "collaboration.workflows",
     "collaboration.connections.read",
+    "collaboration.message_artifacts",
 )
 
 

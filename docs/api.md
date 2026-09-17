@@ -121,6 +121,17 @@ The association is durable turn data, independent of event retention; unrelated
 repositories with the same issue number do not match. No source polling or
 runner behavior changes.
 
+A finished workload or tool run's files are catalogued before its work result
+is written, so the first `work_result` message already names them. Its `work.artifacts` (and
+each entry of `GET /v1/channels/{id}/work`) lists up to 50 available files,
+ordered by path, as `{id, run_id, relpath, media_type, size}`: `id` is the
+catalog identity served by `GET /v1/artifacts/{id}` and `run_id` is the public
+run ID. Files the retention sweep removed are left out. The message text ends
+with a `Files:` list of the same paths, for surfaces that show only text. A
+result written before this field reports an empty list. The feature is
+advertised as `collaboration.message_artifacts`. A code run delivers a pull
+request, so its checkout is never listed and its `artifacts` stays empty.
+
 Discovery lists sbxloop's five native roles: `concierge`, `planner`, `builder`,
 `critic`, and `operator`. Chat resolves their models through the existing
 configuration, using the `concierge`, `decompose`, `build`, `review`, and
