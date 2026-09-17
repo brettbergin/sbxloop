@@ -11,15 +11,20 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
+from pathlib import Path
 from typing import Any
 
 import pytest
+from fastapi.routing import APIRoute
 from sqlalchemy import select
 
+import sbxloop.api.collaboration as collaboration_module
 from sbxloop.api.collaboration import CollaborationError, Member
+from sbxloop.api.routes.workspace import router as workspace_router
 from sbxloop.daemon.controls.principal import ALL_CAPABILITIES, ROLE_CAPABILITIES
-from sbxloop.db.api_models import ApiEventRow, ClientRow
-from sbxloop.db.collaboration_models import WorkspaceInviteRow
+from sbxloop.db.api_models import ApiEventRow, ClientRow, RefreshTokenRow
+from sbxloop.db.collaboration_models import WorkspaceInviteRow, WorkspaceMemberRow
 
 OWNER = {
     "email": "owner@example.test",
@@ -751,3 +756,173 @@ def test_every_admin_change_is_audited_without_tokens(api: Any) -> None:
     for row in [*updated, *removed, *created, *revoked]:
         text = f"{row.data_json} {row.actor_json}"
         assert not any(secret in text for secret in secrets)
+
+
+def test_capabilities_advertise_the_workspace_people_features(api: Any) -> None:
+    response = api.client.get("/v1/capabilities", headers=api.bearer())
+
+    assert response.status_code == 200
+    features = response.json()["features"]
+    assert "workspace.members" in features
+    assert "users.directory" in features
+
+
+def test_an_invite_email_is_trimmed_and_a_blank_one_is_absent(api: Any) -> None:
+    owner = _headers(_owner_token(api))
+
+    padded = api.client.post(
+        "/v1/workspace/invites",
+        json={"role": "member", "email": "  Bea@Example.test \t"},
+        headers=owner,
+    )
+    assert padded.status_code == 201, padded.text
+    assert padded.json()["email"] == "bea@example.test"
+
+    for blank in ("", " ", "  ", "     ", "\t\n "):
+        response = api.client.post(
+            "/v1/workspace/invites",
+            json={"role": "member", "email": blank},
+            headers=owner,
+        )
+        assert response.status_code == 201, (blank, response.text)
+        assert response.json()["email"] is None
+
+    # Still too short once trimmed: not an email and not blank.
+    short = api.client.post(
+        "/v1/workspace/invites", json={"role": "member", "email": " ab "}, headers=owner
+    )
+    assert short.status_code == 422, short.text
+
+
+def _login_owner(api: Any) -> dict[str, Any]:
+    response = api.client.post(
+        "/v1/auth/local/login",
+        json={"username": OWNER["username"], "password": OWNER["password"]},
+    )
+    assert response.status_code == 200, response.text
+    return dict(response.json())
+
+
+def test_an_operator_invite_names_its_client_as_the_inviter(api: Any) -> None:
+    _owner_token(api)
+    client, secret = api.register("operator", frozenset({"daemon:manage"}))
+    token = api.client.post(
+        "/v1/auth/token",
+        json={"grant_type": "client_credentials", "client_id": client.id, "client_secret": secret},
+    ).json()
+    operator = _headers(token)
+
+    created = api.client.post("/v1/workspace/invites", json={"role": "member"}, headers=operator)
+    assert created.status_code == 201, created.text
+    listed = api.client.get("/v1/workspace/invites", headers=operator).json()["data"]
+    assert [entry["created_by"] for entry in listed] == [f"client:{client.id}"]
+    event = _events(api, "workspace.invite.created")[-1]
+    assert json.loads(event.data_json)["created_by"] == f"client:{client.id}"
+    assert json.loads(event.actor_json)["id"] == client.id
+
+    joined = _register(
+        api,
+        {
+            "email": "bea@example.test",
+            "username": "bea",
+            "password": "bea has a long password",
+            "invite_token": created.json()["token"],
+        },
+    )
+    assert joined.status_code == 201, joined.text
+    member = api.ctx.collaboration.member_for_client(joined.json()["client_id"])
+    assert member is not None
+    with api.ctx.collaboration.dstore.read() as session:
+        row = session.scalars(
+            select(WorkspaceMemberRow).where(WorkspaceMemberRow.user_id == member.user.id)
+        ).one()
+        assert row.invited_by == f"client:{client.id}"
+
+    # A member's invite still names the user who made it.
+    owner = _headers(_login_owner(api))
+    mine = api.client.post("/v1/workspace/invites", json={"role": "member"}, headers=owner)
+    assert mine.status_code == 201, mine.text
+    listed = api.client.get("/v1/workspace/invites", headers=owner).json()["data"]
+    by_id = {entry["id"]: entry["created_by"] for entry in listed}
+    assert by_id[mine.json()["id"]] == _owner_id(api)
+
+
+def _live_refresh_tokens(api: Any, client_id: str) -> int:
+    with api.ctx.collaboration.dstore.read() as session:
+        rows = session.scalars(
+            select(RefreshTokenRow).where(
+                RefreshTokenRow.client_id == client_id, RefreshTokenRow.revoked_at.is_(None)
+            )
+        ).all()
+        return len(rows)
+
+
+def test_deactivation_and_removal_revoke_refresh_tokens_in_the_same_step(api: Any) -> None:
+    _owner_token(api)
+    store = api.ctx.collaboration
+    bea, bea_id = _join(api, "member", "bea")
+    cal, cal_id = _join(api, "member", "cal")
+    assert _live_refresh_tokens(api, bea["client_id"]) == 1
+    assert _live_refresh_tokens(api, cal["client_id"]) == 1
+
+    # The membership change itself revokes: no separate call follows it.
+    store.update_member(bea_id, active=False, now=api.clock())
+    assert _live_refresh_tokens(api, bea["client_id"]) == 0
+    assert store.remove_member(cal_id, now=api.clock())
+    assert _live_refresh_tokens(api, cal["client_id"]) == 0
+
+
+def test_a_failed_membership_change_keeps_refresh_tokens(
+    api: Any, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _owner_token(api)
+    store = api.ctx.collaboration
+    bea, bea_id = _join(api, "member", "bea")
+    cal, cal_id = _join(api, "member", "cal")
+
+    def broken(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("the audit write failed")
+
+    monkeypatch.setattr(collaboration_module, "_event", broken)
+    with pytest.raises(RuntimeError):
+        store.update_member(bea_id, active=False, now=api.clock())
+    with pytest.raises(RuntimeError):
+        store.remove_member(cal_id, now=api.clock())
+    monkeypatch.undo()
+
+    # Both transactions rolled back whole: the members and their tokens stand.
+    assert _live_refresh_tokens(api, bea["client_id"]) == 1
+    assert _live_refresh_tokens(api, cal["client_id"]) == 1
+    member = store.member_for_user(bea_id)
+    assert member is not None and member.user.active
+    assert store.member_for_user(cal_id) is not None
+    refreshed = api.client.post(
+        "/v1/auth/token",
+        json={"grant_type": "refresh_token", "refresh_token": bea["refresh_token"]},
+    )
+    assert refreshed.status_code == 200, refreshed.text
+
+
+def test_the_endpoint_catalog_lists_only_real_workspace_methods() -> None:
+    docs = Path(__file__).resolve().parents[2] / "docs" / "api.md"
+    section = docs.read_text(encoding="utf-8").split("## Endpoint catalog", 1)[1]
+    section = section.split("\n## ", 1)[0]
+    documented: set[tuple[str, str]] = set()
+    for line in section.splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if len(cells) < 2:
+            continue
+        paths = re.findall(r"`([^`]+)`", cells[1])
+        if not any(p.startswith("/v1/workspace/") or p == "/v1/users" for p in paths):
+            continue
+        methods = re.findall(r"`([A-Z]+)`", cells[0])
+        assert methods, line
+        documented.update((method, path) for method in methods for path in paths)
+
+    served = {
+        (method, route.path.replace("{invite_id}", "{id}"))
+        for route in workspace_router.routes
+        if isinstance(route, APIRoute)
+        for method in route.methods
+    }
+    assert documented == served

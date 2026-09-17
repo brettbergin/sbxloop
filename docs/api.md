@@ -328,12 +328,17 @@ Deactivating a user (`is_active: false`) revokes their refresh tokens, and
 every access token they hold is refused at once (`401 user_inactive`), as is
 their login. Reactivating restores their role's capabilities. Removing a
 member leaves their client with no capability and revokes its refresh
-tokens.
+tokens. The refresh tokens are revoked in the same database transaction as
+the membership change, so either both happen or neither does.
 
 An invite's token appears only in the creation response; the daemon keeps
 its SHA-256. `ttl_hours` defaults to 72 and may be 1 to 720. An invite with
 an `email` admits only a registration with that email, compared without
-regard to case (`403 invite_email_mismatch`).
+regard to case (`403 invite_email_mismatch`). The `email` is trimmed of
+surrounding whitespace first; an empty or all-whitespace `email` is treated
+as absent, so that invite admits any address. An invite's `created_by`, and
+the `invited_by` of the membership it creates, is the inviting user's id, or
+`client:<client id>` when a plain operator client created it.
 
 Every change records an event without any token:
 `workspace.member.updated`, `workspace.member.removed`,
@@ -437,56 +442,58 @@ rechecked when it arrives) and a `revision` a command may pin.
 
 ## Endpoint catalog
 
-| Method            | Path                                         | Capability             | Purpose                                                               |
-| ----------------- | -------------------------------------------- | ---------------------- | --------------------------------------------------------------------- |
-| `GET`             | `/health/live`, `/health/ready`              | none                   | Liveness; readiness with generation and projection lag                |
-| `GET`             | `/v1/capabilities`, `/v1/me`                 | any                    | Contract, features, limits; the client's own grant                    |
-| `GET`             | `/v1/openapi.json`                           | none                   | The contract of record                                                |
-| `POST`            | `/v1/auth/token`, `/v1/auth/revoke`          | none / any             | Mint and refresh; revoke the presented token                          |
-| `POST`            | `/v1/auth/local/register`, `/login`          | none                   | One local user's onboarding and login                                 |
-| `GET`             | `/v1/users/me`, `/v1/agents[/{slug}]`        | collaboration read     | Local profile and product agent catalog                               |
-| `GET`             | `/v1/users`                                  | workspace member       | The workspace directory                                               |
-| `PATCH`, `DELETE` | `/v1/workspace/members/{user_id}`            | workspace admin        | Change a role, deactivate or reactivate; end a membership             |
-| `POST`, `GET`     | `/v1/workspace/invites`                      | workspace admin        | Create an invite; list invites                                        |
-| `DELETE`          | `/v1/workspace/invites/{id}`                 | workspace admin        | Withdraw an invite                                                    |
-| `POST`            | `/v1/agents`, `/v1/agents/{slug}/archive`    | collaboration write    | Save a person's own agent; archive it                                 |
-| `PATCH`           | `/v1/agents/{slug}`                          | collaboration write    | Edit a saved agent at the revision last read                          |
-| CRUD              | `/v1/teams`, `/v1/channels`, `/v1/workflows` | collaboration          | Local teams, durable conversations, and workflow definitions          |
-| CRUD              | `/v1/agents/{slug}/memories[/{id}]`          | collaboration          | An agent's long-term memory, scoped by source channel                 |
-| `GET`             | `/v1/channels/{id}/messages`                 | collaboration read     | Immutable ordered conversation history                                |
-| `POST`            | `/v1/channels/{id}/turns`                    | collaboration delegate | Accept an idempotent conversation/delegation turn                     |
-| CRUD              | `/v1/prompts`, `/v1/connections`             | collaboration          | User preferences; redacted operator-managed connection status         |
-| `GET`             | `/v1/status`                                 | `runs:read`            | Live state: current run, queue, holds, breaker, stopping, watermark   |
-| `GET`             | `/v1/items[/{id}]`, `/v1/queue`              | `runs:read`            | Work items; the queue in dispatch order                               |
-| `POST`            | `/v1/items`                                  | `items:create`         | Admit an issue, a workload ask or a tool recipe                       |
-| `POST`            | \`/v1/items/{id}/retry                       | requeue                | abandon\`                                                             |
-| `GET`             | `/v1/runs[/{id}]`, `…/tasks`                 | `runs:read`            | Runs and their tasks                                                  |
-| `POST`            | \`/v1/runs/{id}/cancel                       | resume\`               | `runs:control`                                                        |
-| `POST`            | `/v1/runs/{id}/steering`                     | `runs:steer`           | Direction for the run in flight                                       |
-| `GET`             | `/v1/runs/{id}/steering`                     | `runs:read`            | Every instruction and its fate                                        |
-| `POST`            | `/v1/runs/{id}/round-grants`                 | `budgets:grant`        | More review rounds for an exhausted run                               |
-| `POST`            | `/v1/runs/{id}/review-wait/resume`           | `runs:control`         | Re-arm a run parked for review                                        |
-| `GET`             | `/v1/gates[/{id}]`                           | `runs:read`            | Merge and publication gates                                           |
-| `POST`            | `/v1/gates/{id}/approve`                     | `gates:approve`        | Endorse and release a gate at a revision                              |
-| `GET`             | `/v1/events`, `/v1/runs/{id}/events`         | `runs:read`            | The chronology after a cursor                                         |
-| `GET`             | `/v1/events/stream`                          | `runs:read`            | The same, as server-sent events                                       |
-| `WS`              | `/v1/ws`                                     | `runs:read`            | Events and commands on one socket                                     |
-| `GET`             | `/v1/runs/{id}/artifacts`                    | `artifacts:read`       | The run's artifact catalog and where it published                     |
-| `GET`             | `/v1/artifacts/{id}[/content]`               | `artifacts:read`       | One entry; its bytes as an attachment                                 |
-| `GET`             | `/v1/runs/{id}/usage`, `/v1/usage`           | `runs:read`            | Reported tokens and turns; never a bill                               |
-| `GET`             | `/v1/usage/pool`                             | `runs:read`            | Today's runs and tokens against the daily cap and budget              |
-| `GET`             | `/v1/operations[/{id}]`                      | `audit:read`           | Every command any surface recorded                                    |
-| `GET`             | `/v1/repositories`, `/profiles`, `/recipes`  | `runs:read`            | What work may be admitted against                                     |
-| `POST`            | `/v1/repositories/{id}/resume`               | `daemon:manage`        | Poll a suspended repository again                                     |
-| `GET`             | `/v1/daemon/holds`                           | `runs:read`            | Standing holds and whose they are                                     |
-| `POST`            | `/v1/daemon/holds`                           | `daemon:manage`        | Take a hold attributed to this client                                 |
-| `DELETE`          | `/v1/daemon/holds/{name}`                    | `daemon:manage`        | Release your hold; `?force=true` overrides another's                  |
-| `POST`            | `/v1/daemon/stop`, `/v1/daemon/restart`      | `daemon:manage`        | Graceful stop; a stop the supervisor undoes                           |
-| `GET`             | `/v1/schedules[/{name}]`                     | `runs:read`            | Schedules with cadence, last and next due                             |
-| `PATCH`           | `/v1/schedules/{name}`                       | `daemon:manage`        | Atomically replace or rename a schedule while preserving run history  |
-| `POST`            | \`/v1/schedules\[/{name}/pause               | resume\]\`             | `daemon:manage`                                                       |
-| `DELETE`          | `/v1/schedules/{name}`                       | `daemon:manage`        | Remove                                                                |
-| `GET`             | `/v1/logs`, `/v1/configuration`              | `diagnostics:read`     | The log ring, redacted; the allowlisted configuration with provenance |
+| Method   | Path                                         | Capability             | Purpose                                                               |
+| -------- | -------------------------------------------- | ---------------------- | --------------------------------------------------------------------- |
+| `GET`    | `/health/live`, `/health/ready`              | none                   | Liveness; readiness with generation and projection lag                |
+| `GET`    | `/v1/capabilities`, `/v1/me`                 | any                    | Contract, features, limits; the client's own grant                    |
+| `GET`    | `/v1/openapi.json`                           | none                   | The contract of record                                                |
+| `POST`   | `/v1/auth/token`, `/v1/auth/revoke`          | none / any             | Mint and refresh; revoke the presented token                          |
+| `POST`   | `/v1/auth/local/register`, `/login`          | none                   | One local user's onboarding and login                                 |
+| `GET`    | `/v1/users/me`, `/v1/agents[/{slug}]`        | collaboration read     | Local profile and product agent catalog                               |
+| `GET`    | `/v1/users`                                  | workspace member       | The workspace directory                                               |
+| `PATCH`  | `/v1/workspace/members/{user_id}`            | workspace admin        | Change a role; deactivate or reactivate a user                        |
+| `DELETE` | `/v1/workspace/members/{user_id}`            | workspace admin        | End a membership                                                      |
+| `POST`   | `/v1/workspace/invites`                      | workspace admin        | Create an invite; the raw token appears only here                     |
+| `GET`    | `/v1/workspace/invites`                      | workspace admin        | List invites                                                          |
+| `DELETE` | `/v1/workspace/invites/{id}`                 | workspace admin        | Withdraw an invite                                                    |
+| `POST`   | `/v1/agents`, `/v1/agents/{slug}/archive`    | collaboration write    | Save a person's own agent; archive it                                 |
+| `PATCH`  | `/v1/agents/{slug}`                          | collaboration write    | Edit a saved agent at the revision last read                          |
+| CRUD     | `/v1/teams`, `/v1/channels`, `/v1/workflows` | collaboration          | Local teams, durable conversations, and workflow definitions          |
+| CRUD     | `/v1/agents/{slug}/memories[/{id}]`          | collaboration          | An agent's long-term memory, scoped by source channel                 |
+| `GET`    | `/v1/channels/{id}/messages`                 | collaboration read     | Immutable ordered conversation history                                |
+| `POST`   | `/v1/channels/{id}/turns`                    | collaboration delegate | Accept an idempotent conversation/delegation turn                     |
+| CRUD     | `/v1/prompts`, `/v1/connections`             | collaboration          | User preferences; redacted operator-managed connection status         |
+| `GET`    | `/v1/status`                                 | `runs:read`            | Live state: current run, queue, holds, breaker, stopping, watermark   |
+| `GET`    | `/v1/items[/{id}]`, `/v1/queue`              | `runs:read`            | Work items; the queue in dispatch order                               |
+| `POST`   | `/v1/items`                                  | `items:create`         | Admit an issue, a workload ask or a tool recipe                       |
+| `POST`   | \`/v1/items/{id}/retry                       | requeue                | abandon\`                                                             |
+| `GET`    | `/v1/runs[/{id}]`, `…/tasks`                 | `runs:read`            | Runs and their tasks                                                  |
+| `POST`   | \`/v1/runs/{id}/cancel                       | resume\`               | `runs:control`                                                        |
+| `POST`   | `/v1/runs/{id}/steering`                     | `runs:steer`           | Direction for the run in flight                                       |
+| `GET`    | `/v1/runs/{id}/steering`                     | `runs:read`            | Every instruction and its fate                                        |
+| `POST`   | `/v1/runs/{id}/round-grants`                 | `budgets:grant`        | More review rounds for an exhausted run                               |
+| `POST`   | `/v1/runs/{id}/review-wait/resume`           | `runs:control`         | Re-arm a run parked for review                                        |
+| `GET`    | `/v1/gates[/{id}]`                           | `runs:read`            | Merge and publication gates                                           |
+| `POST`   | `/v1/gates/{id}/approve`                     | `gates:approve`        | Endorse and release a gate at a revision                              |
+| `GET`    | `/v1/events`, `/v1/runs/{id}/events`         | `runs:read`            | The chronology after a cursor                                         |
+| `GET`    | `/v1/events/stream`                          | `runs:read`            | The same, as server-sent events                                       |
+| `WS`     | `/v1/ws`                                     | `runs:read`            | Events and commands on one socket                                     |
+| `GET`    | `/v1/runs/{id}/artifacts`                    | `artifacts:read`       | The run's artifact catalog and where it published                     |
+| `GET`    | `/v1/artifacts/{id}[/content]`               | `artifacts:read`       | One entry; its bytes as an attachment                                 |
+| `GET`    | `/v1/runs/{id}/usage`, `/v1/usage`           | `runs:read`            | Reported tokens and turns; never a bill                               |
+| `GET`    | `/v1/usage/pool`                             | `runs:read`            | Today's runs and tokens against the daily cap and budget              |
+| `GET`    | `/v1/operations[/{id}]`                      | `audit:read`           | Every command any surface recorded                                    |
+| `GET`    | `/v1/repositories`, `/profiles`, `/recipes`  | `runs:read`            | What work may be admitted against                                     |
+| `POST`   | `/v1/repositories/{id}/resume`               | `daemon:manage`        | Poll a suspended repository again                                     |
+| `GET`    | `/v1/daemon/holds`                           | `runs:read`            | Standing holds and whose they are                                     |
+| `POST`   | `/v1/daemon/holds`                           | `daemon:manage`        | Take a hold attributed to this client                                 |
+| `DELETE` | `/v1/daemon/holds/{name}`                    | `daemon:manage`        | Release your hold; `?force=true` overrides another's                  |
+| `POST`   | `/v1/daemon/stop`, `/v1/daemon/restart`      | `daemon:manage`        | Graceful stop; a stop the supervisor undoes                           |
+| `GET`    | `/v1/schedules[/{name}]`                     | `runs:read`            | Schedules with cadence, last and next due                             |
+| `PATCH`  | `/v1/schedules/{name}`                       | `daemon:manage`        | Atomically replace or rename a schedule while preserving run history  |
+| `POST`   | \`/v1/schedules\[/{name}/pause               | resume\]\`             | `daemon:manage`                                                       |
+| `DELETE` | `/v1/schedules/{name}`                       | `daemon:manage`        | Remove                                                                |
+| `GET`    | `/v1/logs`, `/v1/configuration`              | `diagnostics:read`     | The log ring, redacted; the allowlisted configuration with provenance |
 
 Every collection pages by an opaque `cursor` bound to its filters
 (`limit` up to 200; `{"data": […], "next_cursor": …, "has_more": …}`). The

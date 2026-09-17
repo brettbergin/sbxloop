@@ -337,18 +337,6 @@ class ApiAuthStore:
                 .values(revoked_at=now)
             )
 
-    def revoke_client_refresh(self, client_id: str, now: float) -> int:
-        """Revoke every live refresh token a client holds, across all its
-        families, while the client itself stays usable (unlike
-        :meth:`revoke_client`). Returns how many were revoked."""
-        with self.sessions.transaction() as session:
-            result = session.execute(
-                update(RefreshTokenRow)
-                .where(RefreshTokenRow.client_id == client_id, RefreshTokenRow.revoked_at.is_(None))
-                .values(revoked_at=now)
-            )
-            return int(getattr(result, "rowcount", 0) or 0)
-
     def revoke_refresh(self, token: str, now: float) -> bool:
         """Revoke a refresh token's whole family. ``False`` when unknown."""
         with self.sessions.read() as session:

@@ -54,6 +54,15 @@ def _actor(auth: Authenticated) -> dict[str, Any]:
     return {"kind": "client", "id": auth.client.id, "display": auth.client.name, "via": "api"}
 
 
+def _inviter(auth: Authenticated) -> str:
+    """Who an invite names as its creator, and so who a member row names in
+    ``invited_by``: the member's user id, or ``client:<id>`` for a plain
+    operator client, so a client id is never mistaken for a user id."""
+    if auth.member is not None:
+        return auth.member.user.id
+    return f"client:{auth.client.id}"
+
+
 def _is_self(auth: Authenticated, user_id: str) -> bool:
     return auth.member is not None and auth.member.user.id == user_id
 
@@ -107,7 +116,7 @@ async def update_member(
 ) -> WorkspaceUserOut:
     """Change a member's role or deactivate (or reactivate) them. A
     deactivated user's tokens stop working and their refresh tokens are
-    revoked."""
+    revoked in the same transaction as the change."""
     if body.is_active is False and _is_self(auth, user_id):
         raise _self_action()
     now = ctx.clock()
@@ -123,8 +132,6 @@ async def update_member(
         )
     except CollaborationError as exc:
         raise _problem(exc) from exc
-    if not member.user.active:
-        await ctx.call(ctx.auth.revoke_client_refresh, member.user.client_id, now)
     ctx.hub.notify()
     return _member_out(member)
 
@@ -136,26 +143,21 @@ async def remove_member(
     auth: Authenticated = Depends(require_role("admin")),  # noqa: B008
 ) -> Response:
     """End a membership: the user's client keeps no capability and its
-    refresh tokens are revoked."""
+    refresh tokens are revoked in the same transaction."""
     if _is_self(auth, user_id):
         raise _self_action()
-    target = await ctx.call(ctx.collaboration.member_for_user, user_id)
-    if target is None:
-        raise Problem(404, "user_not_found", "user not found")
-    now = ctx.clock()
     try:
         removed = await ctx.call(
             ctx.collaboration.remove_member,
             user_id,
             owner_ok=role_of(auth) == "owner",
             actor=_actor(auth),
-            now=now,
+            now=ctx.clock(),
         )
     except CollaborationError as exc:
         raise _problem(exc) from exc
     if not removed:
         raise Problem(404, "user_not_found", "user not found")
-    await ctx.call(ctx.auth.revoke_client_refresh, target.user.client_id, now)
     ctx.hub.notify()
     return Response(status_code=204)
 
@@ -170,7 +172,7 @@ async def create_invite(
     hash."""
     if body.role == "owner" and role_of(auth) != "owner":
         raise Problem(403, "owner_required", "only an owner may invite an owner")
-    created_by = auth.member.user.id if auth.member is not None else auth.client.id
+    created_by = _inviter(auth)
     try:
         invite, token = await ctx.call(
             ctx.collaboration.create_invite,

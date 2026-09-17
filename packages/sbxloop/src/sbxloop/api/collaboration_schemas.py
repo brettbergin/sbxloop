@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Literal, Self
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from sbxloop.agents.definition import AgentRoleName, AgentSpec, AgentStartKind
 from sbxloop.api.models import ApiModel
@@ -78,9 +78,17 @@ class WorkspaceMemberUpdate(ApiModel):
 class WorkspaceInviteCreate(ApiModel):
     role: WorkspaceRole
     #: When given, only a user registering with this email (in any case)
-    #: can spend the invite.
+    #: can spend the invite. Surrounding whitespace is trimmed first, and an
+    #: empty or all-whitespace email counts as no email at all.
     email: str | None = Field(default=None, min_length=3, max_length=320)
     ttl_hours: int = Field(default=72, ge=1, le=720)
+
+    @field_validator("email", mode="before")
+    @classmethod
+    def _trim_email(cls, value: object) -> object:
+        if isinstance(value, str):
+            return value.strip() or None
+        return value
 
 
 class WorkspaceInviteCreated(ApiModel):

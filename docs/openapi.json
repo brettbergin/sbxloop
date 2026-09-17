@@ -11616,7 +11616,7 @@
     },
     "/v1/workspace/members/{user_id}": {
       "delete": {
-        "description": "End a membership: the user's client keeps no capability and its\nrefresh tokens are revoked.",
+        "description": "End a membership: the user's client keeps no capability and its\nrefresh tokens are revoked in the same transaction.",
         "operationId": "remove_member_v1_workspace_members__user_id__delete",
         "parameters": [
           {
@@ -11650,7 +11650,7 @@
         ]
       },
       "patch": {
-        "description": "Change a member's role or deactivate (or reactivate) them. A\ndeactivated user's tokens stop working and their refresh tokens are\nrevoked.",
+        "description": "Change a member's role or deactivate (or reactivate) them. A\ndeactivated user's tokens stop working and their refresh tokens are\nrevoked in the same transaction as the change.",
         "operationId": "update_member_v1_workspace_members__user_id__patch",
         "parameters": [
           {

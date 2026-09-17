@@ -32,7 +32,7 @@ from sbxloop.daemon.controls.principal import (
     Role as Role,
 )
 from sbxloop.daemon.store import DaemonStore
-from sbxloop.db.api_models import ApiEventRow, ClientRow
+from sbxloop.db.api_models import ApiEventRow, ClientRow, RefreshTokenRow
 from sbxloop.db.collaboration_models import (
     ChannelMemberRow,
     ChannelRow,
@@ -610,6 +610,18 @@ class CollaborationStore:
             )
 
     @staticmethod
+    def _revoke_refresh(session: Any, client_id: str, now: float) -> None:
+        """Revoke every live refresh token of ``client_id`` inside the
+        caller's transaction. The API auth store keeps its tokens in this
+        same daemon database, so the revocation commits or rolls back with
+        the membership change that asked for it."""
+        session.execute(
+            update(RefreshTokenRow)
+            .where(RefreshTokenRow.client_id == client_id, RefreshTokenRow.revoked_at.is_(None))
+            .values(revoked_at=now)
+        )
+
+    @staticmethod
     def _owner_count(session: Any, *, besides: str | None = None) -> int:
         """How many active owners the workspace has, ``besides`` one user
         when named."""
@@ -740,6 +752,8 @@ class CollaborationStore:
             user.updated_at = now
             current = _role(str(row.role))
             self._grant_role(session, user, current if user.active else None)
+            if not user.active:
+                self._revoke_refresh(session, str(user.client_id), now)
             session.flush()
             _event(session, "workspace.member.updated", now, actor=actor, data=data)
             return _member(user, row)
@@ -767,6 +781,8 @@ class CollaborationStore:
             user = session.get(LocalUserRow, user_id)
             if user is not None:
                 self._grant_role(session, user, None)
+                if now is not None:
+                    self._revoke_refresh(session, str(user.client_id), now)
             if now is not None:
                 _event(
                     session,
