@@ -144,15 +144,14 @@ class DaemonAgent:
     # -- access ------------------------------------------------------------
 
     def client(self) -> WorkerClient:
-        with self._provision_lock:
-            if self._client is None:
-                log.info("concierge_sandbox.provision_needed", sandbox=self.name)
-                self._client = self._ensure()
-                if self.install_workers:
-                    from sbxloop.modelcatalog import refresh_after_provision
+        if self._client is None:
+            log.info("concierge_sandbox.provision_needed", sandbox=self.name)
+            self._client = self._ensure()
+            if self.install_workers:
+                from sbxloop.modelcatalog import refresh_after_provision
 
-                    refresh_after_provision(self.config)
-            return self._client
+                refresh_after_provision(self.config)
+        return self._client
 
     @property
     def max_leases(self) -> int:
