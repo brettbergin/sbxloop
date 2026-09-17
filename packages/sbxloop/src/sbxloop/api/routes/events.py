@@ -14,12 +14,13 @@ from fastapi.responses import StreamingResponse
 
 from sbxloop.api.auth.deps import Authenticated, get_ctx, require, resolve_token
 from sbxloop.api.chronology import event_id
+from sbxloop.api.collaboration import Member
 from sbxloop.api.context import PAGE_DEFAULT, PAGE_MAX, ApiContext
 from sbxloop.api.errors import Problem
 from sbxloop.api.models import EventOut
 from sbxloop.api.pagination import Page
 from sbxloop.api.projections import Views, not_found
-from sbxloop.api.replay import cursor_after, envelope_page, read_after
+from sbxloop.api.replay import cursor_after, envelope_page, follow, read_after
 
 router = APIRouter(prefix="/v1", tags=["events"])
 
@@ -36,17 +37,20 @@ STREAM_BATCH = 200
 @router.get("/events", response_model=Page[EventOut])
 async def list_events(
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    _auth: Authenticated = Depends(require("runs:read")),  # noqa: B008
+    auth: Authenticated = Depends(require("runs:read")),  # noqa: B008
     after: Annotated[str | None, Query()] = None,
     run_id: Annotated[str | None, Query()] = None,
     type_prefix: Annotated[str | None, Query(max_length=64)] = None,
     limit: Annotated[int, Query(ge=1, le=PAGE_MAX)] = PAGE_DEFAULT,
     latest: bool = False,
+    channel_id: Annotated[str | None, Query(max_length=128)] = None,
 ) -> Page[EventOut]:
     """Every public event after ``after`` (an event id, or omitted for
     the oldest held), oldest first, in the order it was recorded.
     ``latest`` instead returns the newest bounded snapshot, oldest first;
-    it works after retention and cannot be combined with ``after``."""
+    it works after retention and cannot be combined with ``after``.
+    ``channel_id`` narrows to one channel's events (and its runs'). A
+    workspace member sees only what they may: see ``events.scoped``."""
     if latest and after is not None:
         raise Problem(400, "invalid_cursor", "latest cannot be combined with after")
     start = cursor_after(after)
@@ -57,10 +61,23 @@ async def list_events(
         if latest:
             ctx.chronology.project(views.now)
             rows = ctx.chronology.read(
-                run_id=internal_run, type_prefix=type_prefix, limit=limit, newest_first=True
+                run_id=internal_run,
+                type_prefix=type_prefix,
+                limit=limit,
+                newest_first=True,
+                viewer=auth.member,
+                channel_id=channel_id,
             )
             return envelope_page(views, list(reversed(rows)), more=False)
-        return read_after(views, start, run_id=internal_run, type_prefix=type_prefix, limit=limit)
+        return read_after(
+            views,
+            start,
+            run_id=internal_run,
+            type_prefix=type_prefix,
+            limit=limit,
+            viewer=auth.member,
+            channel_id=channel_id,
+        )
 
     return await ctx.call(read)
 
@@ -69,7 +86,7 @@ async def list_events(
 async def run_events(
     run_id: str,
     ctx: ApiContext = Depends(get_ctx),  # noqa: B008
-    _auth: Authenticated = Depends(require("runs:read")),  # noqa: B008
+    auth: Authenticated = Depends(require("runs:read")),  # noqa: B008
     after: Annotated[str | None, Query()] = None,
     type_prefix: Annotated[str | None, Query(max_length=64)] = None,
     limit: Annotated[int, Query(ge=1, le=PAGE_MAX)] = PAGE_DEFAULT,
@@ -81,7 +98,14 @@ async def run_events(
     def read() -> Page[EventOut]:
         views = Views(ctx)
         record = views.run_by_public_id(run_id)
-        return read_after(views, start, run_id=record.run_id, type_prefix=type_prefix, limit=limit)
+        return read_after(
+            views,
+            start,
+            run_id=record.run_id,
+            type_prefix=type_prefix,
+            limit=limit,
+            viewer=auth.member,
+        )
 
     return await ctx.call(read)
 
@@ -98,34 +122,42 @@ async def sse_frames(
     after: int,
     run_id: str | None,
     type_prefix: str | None,
+    channel_id: str | None = None,
 ) -> AsyncIterator[str]:
     """The stream body: events after the cursor as they land, a comment
     ping while nothing does, and the stream ends when the daemon stops or
-    the token no longer stands."""
+    the token no longer stands. A member is sent only what they may see,
+    re-judged as their membership changes."""
     cursor = after
     token = auth.token
+    viewer = auth.member
     last_check = ctx.clock()
     last_ping = asyncio.get_running_loop().time()
     while not ctx.stopping.is_set():
 
-        def read(start: int = cursor) -> Page[EventOut]:
-            views = Views(ctx)
-            return read_after(
-                views, start, run_id=run_id, type_prefix=type_prefix, limit=STREAM_BATCH
+        def read(start: int = cursor, member: Member | None = viewer) -> tuple[Page[EventOut], int]:
+            return follow(
+                Views(ctx),
+                start,
+                run_id=run_id,
+                type_prefix=type_prefix,
+                limit=STREAM_BATCH,
+                viewer=member,
+                channel_id=channel_id,
             )
 
-        page = await ctx.call(read)
+        page, resume = await ctx.call(read)
         for event in page.data:
             yield _frame(event)
-            cursor = int(event.id.removeprefix("evt_"))
             last_ping = asyncio.get_running_loop().time()
+        cursor = resume
         if page.has_more:
             continue
         now = ctx.clock()
         if now - last_check >= ACCESS_RECHECK_S:
             last_check = now
             try:
-                await ctx.call(resolve_token, ctx, token)
+                viewer = (await ctx.call(resolve_token, ctx, token)).member
             except Problem:
                 yield 'event: stream.closed\ndata: {"reason":"access_revoked"}\n\n'
                 return
@@ -144,6 +176,7 @@ async def stream_events(
     after: Annotated[str | None, Query()] = None,
     run_id: Annotated[str | None, Query()] = None,
     type_prefix: Annotated[str | None, Query(max_length=64)] = None,
+    channel_id: Annotated[str | None, Query(max_length=128)] = None,
 ) -> StreamingResponse:
     """Server-sent events from the same durable cursor space. Resume with
     ``Last-Event-ID`` (or ``after``); each frame's ``id`` is the cursor
@@ -171,7 +204,12 @@ async def stream_events(
     async def body() -> AsyncIterator[str]:
         try:
             async for frame in sse_frames(
-                ctx, auth, after=begin, run_id=internal_run, type_prefix=type_prefix
+                ctx,
+                auth,
+                after=begin,
+                run_id=internal_run,
+                type_prefix=type_prefix,
+                channel_id=channel_id,
             ):
                 yield frame
         finally:

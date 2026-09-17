@@ -172,7 +172,8 @@ def _recent_first(memory: Memory) -> tuple[float, float, str]:
 
 def _event(session: Any, type_: str, now: float, memory: Memory, **extra: Any) -> None:
     """The change, with who made it and where the memory came from; the
-    text stays out of the chronology."""
+    text stays out of the chronology. A memory learned in a channel is
+    that channel's event, so only people who can open it see the change."""
     data = {
         "memory_id": memory.id,
         "agent_slug": memory.agent_slug,
@@ -192,6 +193,7 @@ def _event(session: Any, type_: str, now: float, memory: Memory, **extra: Any) -
             operation_id=None,
             actor_json=None,
             source_seq=None,
+            channel_id=memory.source_channel_id,
             data_json=json.dumps(data, default=str),
         )
     )

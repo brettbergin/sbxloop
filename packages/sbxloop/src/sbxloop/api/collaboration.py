@@ -551,7 +551,12 @@ def _event(
     *,
     actor: dict[str, Any] | None = None,
     data: dict[str, Any] | None = None,
+    audience: str | None = None,
 ) -> None:
+    """Record a collaboration event. It belongs to the channel its data
+    names; ``audience`` is the one user it is for (their own teams,
+    preferences, workflows and profile)."""
+    channel_id = (data or {}).get("channel_id")
     session.execute(
         insert(ApiEventRow).values(
             recorded_at=now,
@@ -563,6 +568,8 @@ def _event(
             actor_json=None if actor is None else json.dumps(actor, default=str),
             source_seq=None,
             data_json=json.dumps(data or {}, default=str),
+            channel_id=channel_id if isinstance(channel_id, str) and channel_id else None,
+            audience_user_id=audience,
         )
     )
 
@@ -653,6 +660,7 @@ class CollaborationStore:
                     now,
                     actor={"kind": "client", "id": client_id, "display": username, "via": "api"},
                     data={"user_id": user_id},
+                    audience=user_id,
                 )
                 if invite is not None:
                     _event(
@@ -951,7 +959,13 @@ class CollaborationStore:
                     row.timezone = timezone.strip() or "UTC"
                 row.updated_at = now
                 session.flush()
-                _event(session, "collaboration.user.updated", now, data={"user_id": row.id})
+                _event(
+                    session,
+                    "collaboration.user.updated",
+                    now,
+                    data={"user_id": row.id},
+                    audience=str(row.id),
+                )
                 return _user(row)
         except IntegrityError as exc:
             raise CollaborationError("profile_conflict", "email is already in use") from exc
@@ -2553,7 +2567,13 @@ class CollaborationStore:
                 )
                 row = session.get(TeamRow, team_id)
                 assert row is not None  # nosec B101
-                _event(session, "collaboration.team.created", now, data={"team_id": team_id})
+                _event(
+                    session,
+                    "collaboration.team.created",
+                    now,
+                    data={"team_id": team_id},
+                    audience=user_id,
+                )
                 return _team(row)
         except IntegrityError as exc:
             raise CollaborationError(
@@ -2577,7 +2597,13 @@ class CollaborationStore:
                     row.enabled = 1 if values["enabled"] else 0
                 row.updated_at = now
                 session.flush()
-                _event(session, "collaboration.team.updated", now, data={"team_id": team_id})
+                _event(
+                    session,
+                    "collaboration.team.updated",
+                    now,
+                    data={"team_id": team_id},
+                    audience=user_id,
+                )
                 return _team(row)
         except IntegrityError as exc:
             raise CollaborationError(
@@ -2590,7 +2616,13 @@ class CollaborationStore:
             if row is None or row.user_id != user_id:
                 return False
             session.delete(row)
-            _event(session, "collaboration.team.deleted", now, data={"team_id": team_id})
+            _event(
+                session,
+                "collaboration.team.deleted",
+                now,
+                data={"team_id": team_id},
+                audience=user_id,
+            )
             return True
 
     # -- user preferences ---------------------------------------------------------
@@ -2643,6 +2675,7 @@ class CollaborationStore:
                 f"collaboration.preference.{event}",
                 now,
                 data={"preference_id": row.id, "name": name},
+                audience=user_id,
             )
             return _preference(row)
 
@@ -2662,6 +2695,7 @@ class CollaborationStore:
                 "collaboration.preference.deleted",
                 now,
                 data={"preference_id": row.id, "name": name},
+                audience=user_id,
             )
             return True
 
@@ -2677,6 +2711,7 @@ class CollaborationStore:
                 "collaboration.preferences.reset",
                 now,
                 data={"user_id": user_id, "deleted": len(rows)},
+                audience=user_id,
             )
 
     # -- workflow definitions -----------------------------------------------------
@@ -2728,6 +2763,7 @@ class CollaborationStore:
                     "collaboration.workflow.created",
                     now,
                     data={"workflow_id": row.id, "slug": row.slug},
+                    audience=user_id,
                 )
                 return _workflow(row)
         except IntegrityError as exc:
@@ -2755,6 +2791,7 @@ class CollaborationStore:
                     "collaboration.workflow.updated",
                     now,
                     data={"workflow_id": row.id, "slug": row.slug},
+                    audience=user_id,
                 )
                 return _workflow(row)
         except IntegrityError as exc:
@@ -2773,6 +2810,7 @@ class CollaborationStore:
                 "collaboration.workflow.deleted",
                 now,
                 data={"workflow_id": workflow_id, "slug": row.slug},
+                audience=user_id,
             )
             return True
 
