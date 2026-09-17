@@ -22,10 +22,12 @@ do the same.
 Threading: turns run on the concierge's own worker pool, at most
 ``[concierge] max_concurrent_turns`` at once (one by default;
 ``submit_turn`` returns a Future; ``pending`` says how many are queued
-behind the running ones). What a turn's tools need to know about it (the
-speaker, the session, the handoff callback...) is a :class:`TurnContext`
-held in a context variable, never in shared instance state, so overlapping
-turns cannot read each other's. Tool handlers run on the WorkerClient's
+behind the running ones), each on a worker client of its own leased from
+the session host (:meth:`~sbxloop.daemon.agentbox.DaemonAgent.lease`).
+What a turn's tools need to know about it (the speaker, the session, the
+handoff callback...) is a :class:`TurnContext` held in a context
+variable, never in shared instance state, so overlapping turns cannot
+read each other's. Tool handlers run on the WorkerClient's
 host-tool pool while the session is blocked; each handler carries its
 turn's context onto that thread, and the handlers are serialised by
 ``_tool_lock`` — the daemon loop and the daemon store have their own
@@ -43,6 +45,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import AbstractContextManager
 from contextvars import ContextVar
 from dataclasses import dataclass, field, replace
 from datetime import datetime
@@ -209,6 +212,9 @@ class TurnContext:
     usage_channel_id: str | None = None
     usage_agent_slug: str | None = None
     work_products: list[str] = field(default_factory=list)
+    #: The sandbox generation of the turn's last session call, so a failure
+    #: is blamed on the box it happened in.
+    lease_generation: int | None = None
     #: Effects the turn's tools promised for after the reply (#969).
     after: list[Callable[[], None]] = field(default_factory=list)
 
@@ -257,9 +263,13 @@ class SessionHost(Protocol):
 
     def client(self) -> WorkerClient: ...
 
+    def lease(self, timeout: float | None = None) -> AbstractContextManager[WorkerClient]: ...
+
+    def lease_generation(self, client: WorkerClient) -> int | None: ...
+
     def agent_rate_limits(self) -> RateLimitReport: ...
 
-    def note_failure(self, exc: BaseException) -> bool: ...
+    def note_failure(self, exc: BaseException, generation: int | None = None) -> bool: ...
 
     def close(self) -> None: ...
 
@@ -689,7 +699,7 @@ class Concierge:
                 # A dead sandbox costs one hiccup: DaemonAgent drops it
                 # (rate-limited) and the retry re-provisions — with a fresh
                 # session store, so the resume id is gone too.
-                if self.host.note_failure(exc):
+                if self.host.note_failure(exc, generation=self._turn.lease_generation):
                     self.reset_session(session_key)
                     session_id, turns, retry = None, 0, True
             if not retry:
@@ -848,14 +858,17 @@ class Concierge:
                     log.debug("concierge.on_tool_failed", exc_info=True)
             return response
 
-        client = self.host.client()
-        result = client.submit(
-            job,
-            agent=CONCIERGE_AGENT if self._turn_role == "concierge" else self._turn_role,
-            tool_handler=handler if available_tools else None,
-            agent_phase="concierge",
-            model_source=self._turn_model.source,
-        )
+        # The turn holds its own client for the whole session call, so
+        # overlapping turns never share one worker process.
+        with self.host.lease() as client:
+            self._update_turn(lease_generation=self.host.lease_generation(client))
+            result = client.submit(
+                job,
+                agent=CONCIERGE_AGENT if self._turn_role == "concierge" else self._turn_role,
+                tool_handler=handler if available_tools else None,
+                agent_phase="concierge",
+                model_source=self._turn_model.source,
+            )
         self._charge_turn(job.job_id, result.usage)
         if result.status != "ok":
             if result.error is not None and result.error.provider is not None:

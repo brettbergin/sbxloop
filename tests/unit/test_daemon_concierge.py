@@ -15,7 +15,8 @@ import hashlib
 import json
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar
@@ -102,6 +103,8 @@ class FakeHost:
     def __init__(self, client: FakeClient) -> None:
         self._client = client
         self.failures: list[BaseException] = []
+        self.failure_generations: list[int | None] = []
+        self.generation = 0
         self.drop = True
         self.closed = False
         self.client_calls = 0
@@ -110,8 +113,16 @@ class FakeHost:
         self.client_calls += 1
         return self._client
 
-    def note_failure(self, exc: BaseException) -> bool:
+    @contextmanager
+    def lease(self, timeout: float | None = None) -> Iterator[Any]:
+        yield self.client()
+
+    def lease_generation(self, client: object) -> int | None:
+        return self.generation
+
+    def note_failure(self, exc: BaseException, generation: int | None = None) -> bool:
         self.failures.append(exc)
+        self.failure_generations.append(generation)
         return self.drop
 
     def close(self) -> None:
@@ -2023,6 +2034,14 @@ class TestFailures:
         assert client.jobs[2].resume_session_id is None
         assert dstore.get_value(STATE_SESSION_ID) == "s1"
 
+    def test_a_failure_names_the_box_generation_the_turn_ran_on(self, tmp_path: Path) -> None:
+        concierge, _client, host, *_ = make(
+            tmp_path, [{"raise": WorkerError("worker died")}, {"text": "back"}]
+        )
+        host.generation = 7
+        assert turn(concierge).text == "back"
+        assert host.failure_generations == [7]
+
     def test_worker_error_without_drop_is_reported(self, tmp_path: Path) -> None:
         concierge, client, host, *_ = make(tmp_path, [{"raise": WorkerError("worker died")}])
         host.drop = False
@@ -3676,6 +3695,39 @@ class BlockingClient:
         return JobResult(job_id=job.job_id, status="ok", output_text=f"done {ask}")
 
 
+class PairedClient:
+    """A WorkerClient stand-in that answers only once every client sharing
+    ``gate`` has a job in flight."""
+
+    def __init__(self, name: str, gate: threading.Barrier) -> None:
+        self.name, self.gate = name, gate
+        self.jobs: list[JobRequest] = []
+
+    def submit(self, job: JobRequest, **kwargs: Any) -> JobResult:
+        self.jobs.append(job)
+        self.gate.wait()
+        return JobResult(job_id=job.job_id, status="ok", output_text=self.name, session_id="s")
+
+
+class LeasingHost(FakeHost):
+    """A host whose leases hand each concurrent turn its own client."""
+
+    def __init__(self, clients: list[Any]) -> None:
+        super().__init__(clients[0])
+        self.free = list(clients)
+        self.lock = threading.Lock()
+
+    @contextmanager
+    def lease(self, timeout: float | None = None) -> Iterator[Any]:
+        with self.lock:
+            client = self.free.pop(0)
+        try:
+            yield client
+        finally:
+            with self.lock:
+                self.free.append(client)
+
+
 class TestConcurrentTurns:
     def test_the_turn_width_is_a_bounded_concierge_knob(self) -> None:
         assert Config.model_validate({}).concierge.max_concurrent_turns == 1
@@ -3734,6 +3786,22 @@ class TestConcurrentTurns:
         }
         # Outside a turn nothing is left behind.
         assert concierge._turn_author_id is None and concierge._turn_session_key is None
+
+    def test_overlapping_turns_each_run_on_their_own_leased_client(self, tmp_path: Path) -> None:
+        concierge, *_ = make(tmp_path, [], config={"concierge": {"max_concurrent_turns": 2}})
+        gate = threading.Barrier(2, timeout=10)
+        clients = [PairedClient("one", gate), PairedClient("two", gate)]
+        concierge.host = LeasingHost(clients)
+        try:
+            futures = [
+                concierge.submit_turn(f"ask {name}", author=name, session_key=name)
+                for name in ("a", "b")
+            ]
+            replies = sorted(future.result(timeout=20).text for future in futures)
+        finally:
+            concierge.close()
+        assert replies == ["one", "two"]
+        assert [len(client.jobs) for client in clients] == [1, 1]
 
     def test_turns_run_one_at_a_time_by_default(self, tmp_path: Path) -> None:
         concierge, _, host, _, _ = make(tmp_path, [])
