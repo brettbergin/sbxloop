@@ -3768,3 +3768,55 @@ class TestConcurrentTurns:
         assert jobs[1].prompt is not None and jobs[1].prompt.endswith("other ask")
         assert jobs[2].resume_session_id == "s1"
         assert not manager.pending(concierge_run_id("channel-a"))
+
+    def test_a_session_call_left_pending_under_the_legacy_run_id_still_recovers(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A release that recorded every interrupted call under "concierge"
+        # may leave a channel session's call pending across the upgrade.
+        # Retrying that request must resume and clear it, or every later
+        # bridge turn parks the provider for everyone.
+        from sqlalchemy import update
+
+        from sbxloop.db.engine_models import ProviderJobRow
+        from sbxloop.provider import ProviderRecovery
+        from sbxloop.worker.client import WorkerClient
+        from tests.unit.test_provider_recovery import rejected
+
+        concierge, _, host, _, _ = make(tmp_path, [], config={"agent": {"backend": "claude"}})
+        now = [1000.0]
+        manager = ProviderRecovery(concierge.store, "claude", clock=lambda: now[0])
+        client = WorkerClient(SimpleNamespace(name="agent"))  # type: ignore[arg-type]
+        client.provider_recovery = manager
+        host._client = client  # type: ignore[assignment]
+        jobs: list[JobRequest] = []
+
+        def submit(request: JobRequest, **_: Any) -> JobResult:
+            jobs.append(request)
+            if len(jobs) == 1:
+                return rejected()
+            return JobResult(job_id=request.job_id, status="ok", output_text=f"answer {len(jobs)}")
+
+        monkeypatch.setattr(client, "_submit_once", submit)
+        try:
+            first = concierge.submit_turn("first ask", author="a", session_key="channel-a")
+            assert not first.result(timeout=10).ok
+            # Re-key the row the way the earlier release wrote it.
+            with manager._write() as session:
+                session.execute(
+                    update(ProviderJobRow)
+                    .where(ProviderJobRow.run_id == concierge_run_id("channel-a"))
+                    .values(run_id=CONCIERGE_RUN_ID)
+                )
+            assert manager.pending(CONCIERGE_RUN_ID)
+            now[0] = manager.hold().next_at  # type: ignore[union-attr]
+            again = concierge.submit_turn("first ask", author="a", session_key="channel-a")
+            assert again.result(timeout=10).text == "answer 2"
+            bridge = concierge.submit_turn("bridge ask", author="c")
+            assert bridge.result(timeout=10).text == "answer 3"
+        finally:
+            concierge.close()
+        assert jobs[1].resume_session_id == "s1"
+        assert not manager.pending(CONCIERGE_RUN_ID)
+        assert manager.hold() is None
+        assert jobs[2].prompt is not None and jobs[2].prompt.endswith("bridge ask")

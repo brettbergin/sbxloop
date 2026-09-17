@@ -147,8 +147,10 @@
   Each product channel session also records interrupted provider calls
   under its own run id (`concierge:<digest>`), so a call interrupted in one
   channel no longer parks recovery for another; chat bridge turns keep the
-  `concierge` run id, so a call they left pending still resumes. Host
-  tools still run one at a time.
+  `concierge` run id, so a call they left pending still resumes. A channel
+  call an earlier release left pending under `concierge` is retried under
+  that id once, so it resumes and stops gating bridge turns. Host tools
+  still run one at a time.
 
 ### Fixed
 

@@ -778,6 +778,7 @@ class Concierge:
             host_tools=[t.spec for t in available_tools.values()],
             host_tool_timeout_s=min(cfg.timeout_s, 120.0),
         )
+        job = self._legacy_recovery_job(job)
 
         # The host-tool broker calls the handler on its own thread, which
         # does not share this one's context: carry the turn there.
@@ -828,6 +829,27 @@ class Concierge:
                 raise WorkerTimeoutError(message)
             raise WorkerError(message)
         return result.session_id, (result.output_text or "").strip()
+
+    def _legacy_recovery_job(self, job: JobRequest) -> JobRequest:
+        """Send a session's call under the legacy run id when it was interrupted there.
+
+        Earlier releases recorded every interrupted concierge call under
+        :data:`CONCIERGE_RUN_ID`. Only a retry with the same run id and
+        request clears such a row, and while it stays pending every bridge
+        turn parks the provider. So a session request that matches one of
+        those checkpoints is retried under the legacy id, once, to resume
+        and clear it; everything else keeps its session's own id.
+        """
+        if job.run_id == CONCIERGE_RUN_ID:
+            return job
+        recovery = ProviderRecovery(self.store, self.config.agent.backend)
+        if not recovery.pending(CONCIERGE_RUN_ID):
+            return job
+        legacy = job.model_copy(update={"run_id": CONCIERGE_RUN_ID})
+        key = recovery.job_key(recovery.pin_model(legacy))
+        if recovery.checkpoint(CONCIERGE_RUN_ID, key) is None:
+            return job
+        return legacy
 
     def _error_reply(self, exc: BaseException, started: float) -> ConciergeReply:
         if isinstance(exc, WorkerTimeoutError) or "timed out" in str(exc).lower():
