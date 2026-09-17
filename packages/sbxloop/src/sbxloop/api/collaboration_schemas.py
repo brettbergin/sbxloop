@@ -234,6 +234,14 @@ class ChannelWorkOut(ApiModel):
     artifacts: list[ArtifactRefOut] = Field(default_factory=list)
 
 
+class AuthorOut(ApiModel):
+    """Who wrote a message: a person, an agent, or sbxloop itself."""
+
+    kind: Literal["human", "agent", "system"]
+    id: str | None = None
+    display_name: str | None = None
+
+
 class MessageOut(ApiModel):
     id: str
     channel_id: str
@@ -246,6 +254,7 @@ class MessageOut(ApiModel):
     created_at: str
     work: ChannelWorkOut | None = None
     reactions: list[str] = Field(default_factory=list)
+    author: AuthorOut | None = None
 
 
 class ReactionSet(ApiModel):
@@ -282,6 +291,9 @@ class TurnOut(ApiModel):
     created_at: str
     started_at: str | None
     completed_at: str | None
+    author_id: str | None = None
+    trigger: str | None = None
+    parent_turn_id: str | None = None
 
 
 class TurnAccepted(ApiModel):

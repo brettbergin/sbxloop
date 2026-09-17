@@ -102,6 +102,22 @@ Clients can persist user feedback on any message with
 `{"emoji": "👍", "active": true}`. Repeating the same request is idempotent;
 set `active` to false to remove the reaction.
 
+When `/v1/capabilities` lists `collaboration.message_authors`, every message
+also carries an `author` object: `{"kind", "id", "display_name"}`. `kind` is
+`human` (a person; `id` is the user id and `display_name` their full name, or
+their username when none is set), `agent` (`id` is the agent slug and
+`display_name` its registry name, so `concierge` shows as `Angie`), or
+`system` (turn error and stop notices; `id` and `display_name` are null).
+Messages written before authorship was recorded report the author they always
+had: the channel's user for user input, the named agent for agent replies and
+handoffs, Angie for replies and work results that name no agent. The existing
+`role` and `agent_slug` fields are unchanged. Turns report the same person as
+`author_id`, with `trigger` (`human` for every turn a person submits) and
+`parent_turn_id` (null until agents can start turns of their own), and
+`collaboration.message.created` events carry `author_kind` and `author_id`.
+Each channel records its creator as its owner member; channel access is still
+decided by that owner alone.
+
 The event stream records `collaboration.participant.running`,
 `collaboration.tool.started`, and `collaboration.tool.completed` as the work
 happens. Tool events include the channel, turn, participant index, agent slug,

@@ -61,6 +61,8 @@ API_TABLES = (
 COLLABORATION_TABLES = (
     "collaboration_users",
     "collaboration_channels",
+    "collaboration_channel_members",
+    "collaboration_channel_participants",
     "collaboration_messages",
     "collaboration_turns",
     "collaboration_teams",

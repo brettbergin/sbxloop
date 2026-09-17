@@ -304,6 +304,48 @@
         "title": "ArtifactRefOut",
         "type": "object"
       },
+      "AuthorOut": {
+        "additionalProperties": false,
+        "description": "Who wrote a message: a person, an agent, or sbxloop itself.",
+        "properties": {
+          "display_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Display Name"
+          },
+          "id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Id"
+          },
+          "kind": {
+            "enum": [
+              "human",
+              "agent",
+              "system"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "AuthorOut",
+        "type": "object"
+      },
       "Capabilities": {
         "additionalProperties": false,
         "properties": {
@@ -2204,6 +2246,16 @@
               }
             ],
             "title": "Agent Slug"
+          },
+          "author": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AuthorOut"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "channel_id": {
             "title": "Channel Id",
@@ -5030,6 +5082,17 @@
       "TurnOut": {
         "additionalProperties": false,
         "properties": {
+          "author_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Author Id"
+          },
           "channel_id": {
             "title": "Channel Id",
             "type": "string"
@@ -5068,6 +5131,17 @@
             "title": "Input Message Id",
             "type": "string"
           },
+          "parent_turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Parent Turn Id"
+          },
           "participants": {
             "items": {
               "$ref": "#/components/schemas/ParticipantOut"
@@ -5096,6 +5170,17 @@
             },
             "title": "Targets",
             "type": "array"
+          },
+          "trigger": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Trigger"
           }
         },
         "required": [

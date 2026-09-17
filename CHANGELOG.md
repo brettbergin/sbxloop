@@ -16,6 +16,17 @@
   follows; no route reads them yet, and a single-user installation behaves as
   before.
 
+- **Every chat message says who wrote it.** Messages carry an optional
+  `author` (`human`, `agent` or `system`, with an id and a display name) and
+  turns an `author_id`, `trigger` and `parent_turn_id`, advertised as the
+  `collaboration.message_authors` feature; `collaboration.message.created`
+  events name the author too. Revision 0021 records the author on every
+  existing message and turn by the rules the transport always implied, adds
+  a channel's visibility (private by default), creator and silence fields,
+  and adds channel member and agent participant tables, with each channel's
+  user as its owner member. Existing fields and who may open a channel are
+  unchanged.
+
 - **Agents can be declared in `sbxloop.toml`.** A `[[agents]]` entry adds an
   agent beside Angie and the planner, builder, critic and operator, or
   adjusts the built-in with the same slug: its name, aliases, persona,

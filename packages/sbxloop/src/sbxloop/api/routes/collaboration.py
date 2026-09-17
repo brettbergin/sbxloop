@@ -20,6 +20,7 @@ from sbxloop.api.auth.deps import (
 )
 from sbxloop.api.auth.store import AuthError
 from sbxloop.api.collaboration import (
+    Author,
     Channel,
     CollaborationError,
     LocalUser,
@@ -32,6 +33,7 @@ from sbxloop.api.collaboration import (
 )
 from sbxloop.api.collaboration_schemas import (
     AgentOut,
+    AuthorOut,
     ChannelCreate,
     ChannelOut,
     ChannelPage,
@@ -235,7 +237,15 @@ def _channel_out(channel: Channel) -> ChannelOut:
     )
 
 
-def _message_out(message: Message) -> MessageOut:
+def _author_out(author: Author, ctx: ApiContext) -> AuthorOut:
+    display_name = author.display_name
+    if author.kind == "agent" and display_name is None and author.id is not None:
+        agent = ctx.agents.get(author.id)
+        display_name = author.id if agent is None else agent.spec.name
+    return AuthorOut(kind=author.kind, id=author.id, display_name=display_name)
+
+
+def _message_out(message: Message, ctx: ApiContext) -> MessageOut:
     return MessageOut(
         id=message.id,
         channel_id=message.channel_id,
@@ -248,6 +258,7 @@ def _message_out(message: Message) -> MessageOut:
         created_at=rfc3339(message.created_at) or "",
         work=ChannelWorkOut.model_validate(message.work) if message.work else None,
         reactions=list(message.reactions),
+        author=_author_out(message.author, ctx),
     )
 
 
@@ -268,6 +279,9 @@ def _turn_out(turn: Turn) -> TurnOut:
         created_at=rfc3339(turn.created_at) or "",
         started_at=rfc3339(turn.started_at),
         completed_at=rfc3339(turn.completed_at),
+        author_id=None if turn.author is None else turn.author.id,
+        trigger=turn.trigger,
+        parent_turn_id=turn.parent_turn_id,
     )
 
 
@@ -964,7 +978,7 @@ async def list_messages(
     messages = await ctx.call(ctx.collaboration.list_messages, user.id, channel_id, after=after)
     if messages is None:
         raise Problem(404, "channel_not_found", "channel not found")
-    return [_message_out(message) for message in messages]
+    return [_message_out(message, ctx) for message in messages]
 
 
 @router.put("/channels/{channel_id}/messages/{message_id}/reaction", response_model=MessageOut)
@@ -992,7 +1006,7 @@ async def set_message_reaction(
     if message is None:
         raise Problem(404, "message_not_found", "message not found")
     ctx.hub.notify()
-    return _message_out(message)
+    return _message_out(message, ctx)
 
 
 @router.get("/channels/{channel_id}/work", response_model=list[ChannelWorkOut])
@@ -1071,7 +1085,9 @@ async def create_turn(
         raise _problem(exc) from exc
     if created:
         ctx.hub.notify()
-    return TurnAccepted(turn=_turn_out(turn), message=_message_out(message), replayed=not created)
+    return TurnAccepted(
+        turn=_turn_out(turn), message=_message_out(message, ctx), replayed=not created
+    )
 
 
 @router.get("/channels/{channel_id}/turns/{turn_id}", response_model=TurnOut)
