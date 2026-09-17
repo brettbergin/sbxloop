@@ -18,6 +18,7 @@
   Every change is audited, and the routes are advertised as
   `users.directory` and `workspace.members`. A plain API client acts as an
   owner only with `daemon:manage`.
+
 - **People can sign in through an OpenID Connect provider such as
   Authentik.** A new `[api.oidc]` section (off by default) names the provider's
   issuer, the confidential client's id, the environment variable that holds
