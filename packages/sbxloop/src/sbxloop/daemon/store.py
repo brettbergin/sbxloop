@@ -60,7 +60,7 @@ from sqlalchemy.orm import InstrumentedAttribute, Session, aliased
 import sbxloop.db.api_models  # registers the operations tables on Base
 import sbxloop.db.collaboration_models  # noqa: F401 - registers collaboration tables on Base
 from sbxloop.config import ScheduleConfig
-from sbxloop.daemon.model import ItemState, PendingReport, WorkItem
+from sbxloop.daemon.model import ItemState, PendingReport, WorkItem, requested_roles_json
 from sbxloop.daemon.schedule import ScheduleRow
 from sbxloop.db import begin_immediate, ensure_schema, open_engine
 from sbxloop.db.daemon_models import (
@@ -856,8 +856,45 @@ def _row_to_item(row: WorkItemRow) -> WorkItem:
         profile=row.profile,
         recipe=row.recipe,
         recipe_target=row.recipe_target,
+        channel_id=row.channel_id,
+        lead_agent=row.lead_agent,
+        assignment_json=row.assignment_json,
+        origin_agent=row.origin_agent,
+        parent_item_id=row.parent_item_id,
+        chain_depth=int(row.chain_depth or 0),
         revision=int(row.revision or 0),
     )
+
+
+#: The ``daemon_state`` key prefix of a chat turn's admission note.
+ADMISSION_NOTE_PREFIX = "admission_note:"
+
+
+def _admission_key(source_key: str, repo: str | None) -> str:
+    return f"{ADMISSION_NOTE_PREFIX}{repo or ''}#{source_key}"
+
+
+def _admission_note(
+    channel_id: str | None, lead: str | None, roles: Mapping[str, str] | None
+) -> dict[str, object] | None:
+    note: dict[str, object] = {}
+    if channel_id:
+        note["channel_id"] = channel_id
+    if lead:
+        note["lead"] = lead
+    if roles:
+        note["roles"] = dict(roles)
+    return note or None
+
+
+def _admission_values(item: WorkItem) -> dict[str, object]:
+    """The admission columns ``item`` sets, and only those."""
+    values = {
+        "channel_id": item.channel_id,
+        "lead_agent": item.lead_agent,
+        "assignment_json": item.assignment_json,
+    }
+    return {key: value for key, value in values.items() if value is not None}
 
 
 def _loggable(fields: dict[str, object]) -> dict[str, object]:
@@ -1662,6 +1699,21 @@ class DaemonStore:
                     return False
                 if not changed:
                     self._requeue_terminal_row(session, str(row.item_id), str(row.state), now)
+                    admitted = _admission_values(item) or self._admission_note(
+                        session, item.source_key, repo
+                    )
+                    if admitted:
+                        # A new ask for the same work: who it is for and
+                        # who should do it are the new ask's. The plan the
+                        # finished attempt ran with goes, so dispatch plans
+                        # again from the lead and roles now asked for (none:
+                        # the built-in team); a channel not named stays.
+                        admitted = {"lead_agent": None, "assignment_json": None, **admitted}
+                        session.execute(
+                            update(WorkItemRow)
+                            .where(WorkItemRow.item_id == row.item_id)
+                            .values(**admitted)
+                        )
                     return True
                 log.debug(
                     "store.item_superseded",
@@ -1700,6 +1752,12 @@ class DaemonStore:
             # being lost with the row (#600).
             item_id = self._free_item_id(session, normalize_item_id(item.item_id), repo)
             prior = self._recover_prior(session, item.source_key, repo, item_id)
+            # What a chat turn asked for this issue, when the item itself
+            # does not say (an issue the concierge filed or labelled, then
+            # discovered by a poll).
+            admitted = _admission_values(item) or self._admission_note(
+                session, item.source_key, repo
+            )
             session.execute(
                 insert(WorkItemRow).values(
                     item_id=item_id,
@@ -1723,6 +1781,10 @@ class DaemonStore:
                     profile=item.profile,
                     recipe=item.recipe,
                     recipe_target=item.recipe_target,
+                    origin_agent=item.origin_agent,
+                    parent_item_id=item.parent_item_id,
+                    chain_depth=item.chain_depth,
+                    **admitted,
                 )
             )
             if prior is not None:
@@ -2091,6 +2153,53 @@ class DaemonStore:
                     created_at=now,
                 )
             )
+
+    def note_admission(
+        self,
+        source_key: str,
+        now: float,
+        *,
+        repo: str | None = None,
+        channel_id: str | None = None,
+        lead: str | None = None,
+        roles: Mapping[str, str] | None = None,
+    ) -> None:
+        """Remember what a chat turn asked for the issue ``source_key``: the
+        channel it answers to, the lead and the agent per role. The item
+        discovery later builds from the issue carries them, as it carries
+        the requester (:meth:`note_requester`). Nothing to remember writes
+        nothing."""
+        note = _admission_note(channel_id, lead, roles)
+        if note is None:
+            return
+        self.set_value(
+            _admission_key(source_key, repo),
+            json.dumps({**note, "created_at": now}, sort_keys=True),
+        )
+
+    @staticmethod
+    def _admission_note(session: Session, source_key: str, repo: str) -> dict[str, object]:
+        """What a chat turn asked for this issue, consumed: the note is read
+        once and deleted in the same transaction as the row it fills, so a
+        request from an old conversation is never replayed onto work the
+        same issue is re-labelled for months later."""
+        key = _admission_key(source_key, repo)
+        raw = session.scalars(select(DaemonStateRow.value).where(DaemonStateRow.key == key)).first()
+        if raw is None:
+            return {}
+        session.execute(delete(DaemonStateRow).where(DaemonStateRow.key == key))
+        try:
+            note = json.loads(str(raw))
+        except ValueError:
+            log.warning("store.admission_note_unreadable", source_key=source_key, repo=repo)
+            return {}
+        roles = note.get("roles") or {}
+        values: dict[str, object] = {
+            "channel_id": note.get("channel_id"),
+            "lead_agent": note.get("lead"),
+            "assignment_json": requested_roles_json(roles) if roles else None,
+        }
+        return {key: value for key, value in values.items() if value is not None}
 
     def get(self, item_id: str) -> WorkItem | None:
         """Look the item up under either spelling of its id: a row stored
@@ -2605,6 +2714,10 @@ class DaemonStore:
         with self._write() as session:
             session.execute(update(WorkItemRow).where(_id_where(item_id)).values(**values))
         log.debug("store.update", item=item_id, **_loggable(fields))
+
+    def set_item_assignment(self, item_id: str, assignment_json: str, now: float) -> None:
+        """Store the agent assignment dispatch planned for the item."""
+        self._update(item_id, now, assignment_json=assignment_json)
 
     def set_state(self, item_id: str, state: ItemState, now: float) -> None:
         self._update(item_id, now, state=state)

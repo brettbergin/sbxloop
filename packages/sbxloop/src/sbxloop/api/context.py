@@ -16,11 +16,11 @@ import functools
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, TypeVar
 
-from sbxloop.agents.assignment import agent_memory_block
+from sbxloop.agents.assignment import RUN_ROLES, agent_memory_block
 from sbxloop.agents.memory import MemoryService, WorkspaceChannelVisibility
 from sbxloop.agents.registry import (
     AgentRegistry,
@@ -105,6 +105,30 @@ def _visible_agent_reply(text: str, work_products: tuple[str, ...]) -> str:
         if artifact and not _work_product_is_visible(artifact, reply) and artifact not in artifacts:
             artifacts.append(artifact)
     return "\n\n".join((*artifacts, reply)) if artifacts else reply
+
+
+def _work_roles(registry: AgentRegistry, targets: Iterable[str | None]) -> dict[str, str]:
+    """The first mentioned agent that declares each run role, by role."""
+    roles: dict[str, str] = {}
+    for slug in targets:
+        agent = registry.get(slug) if slug else None
+        if agent is None or not agent.active or agent.legacy:
+            continue
+        for role in agent.spec.roles:
+            if role in RUN_ROLES:
+                roles.setdefault(role, agent.slug)
+    return roles
+
+
+def _work_lead(registry: AgentRegistry, target: str | None) -> str | None:
+    """The agent answering the turn when it may lead work; Angie answers a
+    turn that addressed nobody."""
+    if target is None:
+        return ANGIE_SLUG
+    agent = registry.get(target)
+    if agent is None or not agent.active or agent.legacy or "lead" not in agent.spec.roles:
+        return None
+    return agent.slug
 
 
 class ApiContext:
@@ -355,6 +379,9 @@ class ApiContext:
             preference_context = f"\n\nUser preferences:\n\n{joined}"
         errors: list[str] = []
         author = user.full_name or user.username
+        # Work this turn starts goes to the agents it mentioned, in the run
+        # roles they declare.
+        work_roles = _work_roles(self.agents, turn.targets or ())
         index = 0
         while True:
             # The daemon reads its own accepted turn: whoever asked may have
@@ -455,6 +482,7 @@ class ApiContext:
             handoff_agents = tuple(
                 agent.slug for agent in self.agents.list() if addressable(agent, agent.slug)
             )
+            work_lead = _work_lead(self.agents, target)
             try:
                 future = concierge.submit_turn(
                     prompt,
@@ -478,6 +506,8 @@ class ApiContext:
                     channel_id=turn.channel_id,
                     agent_slug=target or ANGIE_SLUG,
                     agent_tools=agent_tools,
+                    work_lead=work_lead,
+                    work_roles=work_roles,
                 )
                 reply = future.result()
                 if reply.ok and (reply.text or reply.work_products):

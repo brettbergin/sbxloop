@@ -72,7 +72,7 @@ from sbxloop.daemon.chat_choices import (
 from sbxloop.daemon.configpolicy import refusal
 from sbxloop.daemon.control import LOG_LEVELS, LOG_TAIL_MAX, dispatch, format_log_tail, plain
 from sbxloop.daemon.loop import day_window
-from sbxloop.daemon.model import WorkItem, live_runs
+from sbxloop.daemon.model import WorkItem, live_runs, requested_roles_json
 from sbxloop.daemon.store import ChatThread, DaemonStore
 from sbxloop.daemon.usage import (
     SPEND_NOT_REPORTED,
@@ -221,6 +221,11 @@ class TurnContext:
     #: The answering agent's own tools (its memory), offered beside the
     #: turn's host tools when the turn may act.
     agent_tools: tuple[AgentTool, ...] = ()
+    #: The channel the turn belongs to, and the lead and the agent per run
+    #: role the turn asked for: what work the turn starts is admitted with.
+    channel_id: str | None = None
+    work_lead: str | None = None
+    work_roles: Mapping[str, str] = field(default_factory=dict)
     work_products: list[str] = field(default_factory=list)
     #: The sandbox generation of the turn's last session call, so a failure
     #: is blamed on the box it happened in.
@@ -589,6 +594,8 @@ class Concierge:
         channel_id: str | None = None,
         agent_slug: str | None = None,
         agent_tools: Sequence[AgentTool] = (),
+        work_lead: str | None = None,
+        work_roles: Mapping[str, str] | None = None,
     ) -> Future[ConciergeReply]:
         """Queue one message; the Future resolves with the reply.
         ``author_id`` is the transport's mentionable id for the speaker,
@@ -603,7 +610,10 @@ class Concierge:
         usage is charged in the workspace budget pool: the product channel
         it answers and the agent that speaks (the role when unset);
         ``agent_tools`` are the answering agent's own tools (its memory),
-        offered only when the turn may act."""
+        offered only when the turn may act.
+        ``channel_id``, ``work_lead`` and ``work_roles`` are also what work
+        this turn starts is admitted with: the channel it answers to, the
+        lead and the agent per run role (already checked by the caller)."""
         if agent_role not in {*ROLE_BY_PHASE.values(), "concierge"}:
             raise ValueError("unknown chat agent role")
         with self._state_lock:
@@ -637,6 +647,9 @@ class Concierge:
                 usage_channel_id=channel_id,
                 usage_agent_slug=agent_slug or agent_role,
                 agent_tools=tuple(agent_tools),
+                channel_id=channel_id,
+                work_lead=work_lead,
+                work_roles=dict(work_roles or {}),
             )
             token = _CURRENT_TURN.set(context)
             try:
@@ -2260,6 +2273,11 @@ class Concierge:
             kind="workload",
             profile=profile.name if profile is not None else None,
             requested_by=self._turn_author_id,
+            channel_id=self._turn.channel_id,
+            lead_agent=self._turn.work_lead,
+            assignment_json=(
+                requested_roles_json(self._turn.work_roles) if self._turn.work_roles else None
+            ),
         )
         try:
             queued = self.dstore.upsert_new(item, self.clock())
@@ -2764,6 +2782,7 @@ class Concierge:
             title=title[:80],
             queued=queued,
         )
+        self._note_code_admission(str(ref.number), repo)
         if not queued:
             return (
                 f"filed issue #{ref.number} {ref.url} — NOT queued: it has no "
@@ -2892,6 +2911,19 @@ class Concierge:
         )
         return "\n".join(lines)
 
+    def _note_code_admission(self, number: str, repo: str) -> None:
+        """Leave the turn's channel and agents for the item a poll builds
+        from the issue, as its requester is left."""
+        turn = self._turn
+        self.dstore.note_admission(
+            number,
+            self.clock(),
+            repo=repo,
+            channel_id=turn.channel_id,
+            lead=turn.work_lead,
+            roles=turn.work_roles,
+        )
+
     def _tool_label_issue_for_run(self, args: dict[str, Any], by: str) -> str:
         assert self.github is not None
         repo, repo_error = self._resolve_repo(args)
@@ -2907,6 +2939,7 @@ class Concierge:
         except (GithubOpsError, WorkerError, SbxError, DaemonError) as exc:
             return f"labelling #{number} failed: {_one_line(str(exc), 300)}"
         log.info("concierge.issue_labelled_for_run", number=number, by=by, label=trigger)
+        self._note_code_admission(str(number), repo)
         if self._turn_code_work is not None:
             self._turn_code_work(repo, number, f"Issue #{number}")
         return (

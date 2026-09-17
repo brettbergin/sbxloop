@@ -37,9 +37,17 @@ class WorkLink:
     participants: tuple[dict[str, Any], ...]
     code_title: str | None = None
     code_agent: str | None = None
+    #: The lead the item was admitted with; credited before anyone else.
+    lead_agent: str | None = None
+    #: Linked by the item's channel alone: its key names no message there.
+    detached: bool = False
 
 
 def _links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
+    """Work linked to the conversation that asked for it: by the item's own
+    channel when it names one, and by the message its key names otherwise.
+    A key that names a message in a channel other than the item's does not
+    link it there."""
     boundary = or_(
         WorkItemRow.source_key == MessageRow.id,
         func.substr(WorkItemRow.source_key, 1, func.length(MessageRow.id) + 1)
@@ -47,6 +55,7 @@ def _links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
     )
     conditions = [
         boundary,
+        or_(WorkItemRow.channel_id.is_(None), WorkItemRow.channel_id == MessageRow.channel_id),
         MessageRow.role == "user",
         TurnRow.input_message_id == MessageRow.id,
         TurnRow.channel_id == MessageRow.channel_id,
@@ -66,24 +75,101 @@ def _links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
                 MessageRow.id,
                 TurnRow.targets_json,
                 TurnRow.participants_json,
+                WorkItemRow.lead_agent,
             ).where(and_(*conditions))
         ).all()
-    return [
-        WorkLink(
-            item_id=str(row[0]),
-            source_key=str(row[1]),
-            channel_id=str(row[2]),
-            turn_id=str(row[3]),
-            input_message_id=str(row[4]),
-            targets=tuple(json.loads(row[5] or "[]")),
-            participants=tuple(json.loads(row[6] or "[]")),
-        )
-        for row in rows
+        links = [
+            WorkLink(
+                item_id=str(row[0]),
+                source_key=str(row[1]),
+                channel_id=str(row[2]),
+                turn_id=str(row[3]),
+                input_message_id=str(row[4]),
+                targets=tuple(json.loads(row[5] or "[]")),
+                participants=tuple(json.loads(row[6] or "[]")),
+                lead_agent=row[7],
+            )
+            for row in rows
+        ]
+        links.extend(_channel_links(session, channel_id, {link.item_id for link in links}))
+    return links
+
+
+def _channel_links(
+    session: Any,
+    channel_id: str | None,
+    linked: set[str],
+    kinds: tuple[str, ...] = ("workload", "tool"),
+) -> list[WorkLink]:
+    """Items of ``kinds`` that name their channel but no message in it:
+    delivered as part of the latest turn the channel had when the item was
+    admitted."""
+    conditions = [
+        WorkItemRow.channel_id.is_not(None),
+        WorkItemRow.run_kind.in_(kinds),
+        ChannelRow.id == WorkItemRow.channel_id,
+        ChannelRow.state == "active",
     ]
+    if channel_id is not None:
+        conditions.append(WorkItemRow.channel_id == channel_id)
+    rows = session.execute(
+        select(
+            WorkItemRow.item_id,
+            WorkItemRow.source_key,
+            WorkItemRow.channel_id,
+            WorkItemRow.created_at,
+            WorkItemRow.lead_agent,
+        ).where(and_(*conditions))
+    ).all()
+    links: list[WorkLink] = []
+    for item_id, source_key, item_channel, created_at, lead in rows:
+        if str(item_id) in linked:
+            continue
+        turns = select(TurnRow).where(TurnRow.channel_id == item_channel)
+        turn = (
+            session.scalars(
+                turns.where(TurnRow.created_at <= created_at)
+                .order_by(TurnRow.created_at.desc(), TurnRow.id.desc())
+                .limit(1)
+            ).first()
+            or session.scalars(
+                turns.order_by(TurnRow.created_at.asc(), TurnRow.id.asc()).limit(1)
+            ).first()
+        )
+        if turn is None:
+            # A result is part of a turn; a channel with none has nowhere
+            # to put it yet. Say so: the work ran and finished, and the
+            # only sign of it in the channel would otherwise be silence.
+            log.info(
+                "api.work_delivery_skipped",
+                item=str(item_id),
+                channel=str(item_channel),
+                reason="channel has no turn to deliver into",
+            )
+            continue
+        links.append(
+            WorkLink(
+                item_id=str(item_id),
+                source_key=str(source_key),
+                channel_id=str(item_channel),
+                turn_id=str(turn.id),
+                input_message_id=str(turn.input_message_id),
+                targets=tuple(json.loads(turn.targets_json or "[]")),
+                participants=tuple(json.loads(turn.participants_json or "[]")),
+                lead_agent=lead,
+                detached=True,
+            )
+        )
+    return links
 
 
 def _agent(link: WorkLink) -> str:
-    """Credit the participant that asked; a runner turn with none is Angie's own."""
+    """Credit the lead the item was admitted with, then the participant that
+    asked; a runner turn with none is Angie's own."""
+    if link.lead_agent:
+        return link.lead_agent
+    if link.detached:
+        return ANGIE_SLUG
     if link.code_title is not None:
         return link.code_agent or ANGIE_SLUG
     suffix = link.source_key[len(link.input_message_id) :]
@@ -121,16 +207,28 @@ def _code_links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
                     if key in seen:
                         continue
                     seen.add(key)
-                    item_id = session.scalar(
-                        select(WorkItemRow.item_id).where(
+                    found = session.execute(
+                        select(
+                            WorkItemRow.item_id,
+                            WorkItemRow.lead_agent,
+                            WorkItemRow.channel_id,
+                        ).where(
                             WorkItemRow.repo == ref["repo"],
                             WorkItemRow.source_key == ref["source_key"],
                             WorkItemRow.run_kind == "code",
                         )
-                    )
+                    ).first()
+                    if found is not None and found[2] and found[2] != turn.channel_id:
+                        # The admission named a channel, and it is not this
+                        # one: the result belongs there, not wherever the
+                        # issue happened to be mentioned (_channel_links
+                        # below delivers it).
+                        continue
+                    item_id = found[0] if found is not None else None
                     links.append(
                         WorkLink(
                             item_id=item_id or f"pending_code:{turn.id}:{index}:{ref_index}",
+                            lead_agent=found[1] if found is not None else None,
                             source_key=ref["source_key"],
                             channel_id=turn.channel_id,
                             turn_id=turn.id,
@@ -141,6 +239,16 @@ def _code_links(ctx: Any, channel_id: str | None) -> list[WorkLink]:
                             code_agent=participant.get("agent_slug") or ANGIE_SLUG,
                         )
                     )
+        # A code admission that named a channel is delivered to that
+        # channel, whether or not any turn there mentioned the issue.
+        links.extend(
+            _channel_links(
+                session,
+                channel_id,
+                {link.item_id for link in links},
+                kinds=("code",),
+            )
+        )
     return links
 
 
