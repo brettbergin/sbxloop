@@ -57,7 +57,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from pydantic import ValidationError
 
@@ -204,6 +204,9 @@ from sbxloop.verifylint import services_evidence
 from sbxloop.worker.client import WorkerClient
 from sbxloop_worker.protocol import JobRequest
 
+if TYPE_CHECKING:
+    from sbxloop.agents.memory import MemoryService
+
 log = get_logger(__name__)
 
 GithubOpsFactory = Callable[[WorkerClient, str], VcsOps]
@@ -338,6 +341,7 @@ class LoopEngine:
         github_ops: GithubOpsFactory | None = None,
         service_ops: ServiceOpsFactory | None = None,
         trigger_label: str | None = None,
+        memory: MemoryService | None = None,
     ) -> None:
         # Library parity with the CLI: the home's secrets.env supplies tokens
         # and settings even when the caller passes a prebuilt Config (real
@@ -350,6 +354,9 @@ class LoopEngine:
         # daemon watches the repository and the instruction would mislead.
         self.trigger_label = trigger_label
         self.store = store or StateStore(self.config.paths.state_db)
+        # Every agent's long-term memory, for the memory tools of an agent
+        # whose `tools` name `memory` (the daemon's store). None offers none.
+        self.memory = memory
         self.bus = bus or EventBus()
         self.sbx = sbx or SbxCLI(app_name=self.config.app_name or None)
         self.worker_python = (
@@ -1073,6 +1080,7 @@ class LoopEngine:
                         session_models=self.store.session_models(run_id),
                         store=self.store,
                         assignment=self._assignment,
+                        memory=self.memory,
                         narrow_service=(
                             service.narrowed_tool_spec if service is not None else None
                         ),
